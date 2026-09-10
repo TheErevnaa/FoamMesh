@@ -88,7 +88,7 @@
 ### Known gaps in this build
 
 - The live Foundation-v13 converter/export matrix (real utilities on the
-  validation machine) is pending — see the.
+  validation machine) is pending.
 - Gmsh and CGNS export remain **experimental** until live round-trip
   fixtures pass.
 - Tutorials are shipped with the local FoamMesh documentation set.
