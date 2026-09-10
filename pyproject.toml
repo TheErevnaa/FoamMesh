@@ -1,0 +1,59 @@
+# FoamMesh â€” packaging / dev configuration
+#
+# Source layout:
+#   src/      first-party code (foammesh, foammesh.support, widgets,
+#             analytics, resources, app_properties)
+#   vendor/   vendored third-party dependency (PyFoam) kept in-tree
+#
+# Both roots are placed on sys.path by the launchers and by an editable install.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foammesh"
+version = "1.0.0"
+description = "FoamMesh â€” standalone OpenFOAM Foundation 13 meshing workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+# CAD import (STEP/IGES/BREP) â€” phase 05
+cad = ["pythonocc-core>=7.7"]
+# REST/WebSocket API facade + CLI â€” phase 09
+api = ["fastapi>=0.110", "uvicorn>=0.27", "websockets>=12"]
+# Agent strategy layer â€” phase 10
+agent = ["anthropic>=0.40"]
+# Neutral export: Gmsh â€” phase 11 (CGNS via VTK which is already a core dep)
+export = ["gmsh>=4.11"]
+# Everything optional, for development
+all = ["pythonocc-core>=7.7", "fastapi>=0.110", "uvicorn>=0.27",
+       "websockets>=12", "anthropic>=0.40", "gmsh>=4.11"]
+
+[project.scripts]
+foammesh = "foammesh.cli.main:main"
+foammesh-gui = "foammesh.main:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["app_properties", "resource_rc"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.package-data]
+"*" = ["*.ui", "*.json", "*.yaml", "*.csv", "*.qss", "*.qm", "*.png",
+       "*.svg", "*.ico", "*.icns", "*.ttf", "openfoam/**/*", "branding/**/*",
+       "images/**/*", "graphicsIcons/**/*", "ionicons/**/*", "ioniconsWhite/**/*"]
+
+[tool.setuptools.packages.find]
+# Discover top-level packages from both source roots. PEP 660 editable installs
+# add both directories to the import path.
+where = ["src", "vendor"]
+exclude = ["*.__pycache__", "*.__pycache__.*"]

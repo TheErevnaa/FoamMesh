@@ -1,0 +1,27 @@
+FoamMesh
+========
+
+FoamMesh is a standalone, OpenFOAM-focused meshing workbench.
+
+Derivation and attribution
+---------------------------
+FoamMesh is derived from the BARAM / BaramMesh open-source project developed by
+NEXTfoam Co., Ltd. (https://github.com/nextfoam/baram), and is distributed under
+the GNU General Public License version 3 (GPL-3.0-or-later). The original
+copyright notices of NEXTfoam and other upstream authors are retained throughout
+the source tree. See the LICENSE file for the full license text.
+
+This repository was forked from BARAM/BaramMesh at version 26.2.1
+(upstream tag/commit recorded as `baram-base-26.2.1`).
+
+Trademark disclaimer
+--------------------
+This offering is not approved or endorsed by OpenCFD Limited, producer and
+distributor of the OpenFOAM software and owner of the OPENFOAM® and OpenCFD®
+trademarks; nor by the OpenFOAM Foundation, CFD Direct, or NEXTfoam Co., Ltd.
+"OpenFOAM" is a registered trademark of OpenCFD Limited.
+
+Third-party components
+----------------------
+FoamMesh bundles and depends on third-party software. See THIRD_PARTY.md for a
+list of components and their licenses.

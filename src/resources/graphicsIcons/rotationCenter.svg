@@ -1,0 +1,19 @@
+      <svg
+         id="icons"
+         viewBox="0 0 512 512"
+         xmlns="http://www.w3.org/2000/svg">
+        <circle style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" cx="256" cy="256" r="72" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 256,64 V 152" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 256,360 V 448" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 64,256 H 152" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 360,256 H 448" />
+<circle style="fill:#000000;stroke:none" cx="256" cy="256" r="18" />
+      </svg>

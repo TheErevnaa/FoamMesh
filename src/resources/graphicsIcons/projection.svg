@@ -1,0 +1,17 @@
+      <svg
+         id="icons"
+         viewBox="0 0 512 512"
+         xmlns="http://www.w3.org/2000/svg">
+        <path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 64,208 H 192 V 336 H 64 Z" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 288,128 H 464 V 400 H 288 Z" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 192,208 288,128" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 192,336 288,400" />
+      </svg>

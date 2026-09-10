@@ -1,0 +1,9 @@
+      <svg
+         id="icons"
+         viewBox="0 0 512 512"
+         xmlns="http://www.w3.org/2000/svg">
+        <path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 48,152 H 160 L 200,96 H 312 L 352,152 H 464 V 416 H 48 Z" />
+<circle style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" cx="256" cy="280" r="82" />
+      </svg>

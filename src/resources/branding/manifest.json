@@ -1,0 +1,79 @@
+{
+  "generator": {
+    "command": "python scripts/generate_branding_assets.py",
+    "crop": "centred square from source, then Lanczos resize",
+    "pillow": "12.1.1"
+  },
+  "outputs": {
+    "foammesh.icns": {
+      "decoded_pixel_sizes": [
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "sha256": "fda41d4d095a27f131ce88fbf2df926dfa462390bdb28d1883c57a96e4bee525"
+    },
+    "foammesh.ico": {
+      "sha256": "1670525531d94afa26947b46f2105b19bf0b6d3f6f0f6378e9ab0ebf32563ce7",
+      "sizes": [
+        16,
+        24,
+        32,
+        48,
+        64,
+        128,
+        256
+      ]
+    },
+    "foammesh_icon_128.png": {
+      "sha256": "3221efb4582d97195fd9f7a6467791512b5156638528f913c91f6fe0e776852a",
+      "size": [
+        128,
+        128
+      ]
+    },
+    "foammesh_icon_256.png": {
+      "sha256": "25c1ce30df8ff4385619659538bd6cd555692d3813e13ef8bdeb84dba4caf4b6",
+      "size": [
+        256,
+        256
+      ]
+    },
+    "foammesh_watermark_dark.png": {
+      "artwork": "approved white Erevnaa wordmark",
+      "sha256": "93ae122931afc283a6c5843bc6c63c3488cc2c05585f3938163961893d13f430",
+      "size": [
+        256,
+        256
+      ],
+      "theme": "dark"
+    },
+    "foammesh_watermark_light.png": {
+      "artwork": "approved white Erevnaa wordmark",
+      "sha256": "93ae122931afc283a6c5843bc6c63c3488cc2c05585f3938163961893d13f430",
+      "size": [
+        256,
+        256
+      ],
+      "theme": "light"
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "approval": "approved_by_implementation_request_2026-07-13",
+    "path": "foammesh_app_icon.png",
+    "sha256": "3f4d8f79e4c7c735c6be2a9b1f715ec4f5bd433cce0880c2b7d9a446847b0549",
+    "size": [
+      1030,
+      1024
+    ]
+  },
+  "wordmark": {
+    "sha256": "fb7308609efeb8b729f6263f407cca5418bda95e1caccaddd9f8255d295a2d13",
+    "source": "white_logo.png",
+    "status": "approved"
+  }
+}

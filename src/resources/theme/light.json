@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "light",
+  "tokens": {
+    "background.canvas": "#f3f4f6", "background.surface": "#ffffff", "background.elevated": "#eceef1",
+    "foreground.primary": "#1c1e21", "foreground.secondary": "#4a4f57", "foreground.muted": "#5f636b",
+    "border.default": "#d0d4da", "accent.default": "#3b7dff", "accent.hover": "#2f6bea", "accent.text": "#ffffff", "focus.ring": "#3b7dff", "selection.background": "#cfe0ff",
+    "status.success": "#1a7f37", "status.warning": "#9a6700", "status.error": "#cf222e", "status.info": "#3b7dff",
+    "disabled.background": "#f3f4f6", "disabled.foreground": "#93979e", "input.background": "#ffffff",
+    "viewport.top": "#dfe3e8", "viewport.bottom": "#aeb6c0", "console.background": "#ffffff", "console.foreground": "#1c1e21",
+    "tooltip.background": "#ffffff", "tooltip.foreground": "#1c1e21",
+    "viewport.surface": "#b3bac3", "viewport.silhouette": "#22252a",
+    "viewport.patch.1": "#6a9fd4", "viewport.patch.2": "#e0a458", "viewport.patch.3": "#78b489",
+    "viewport.patch.4": "#cc8592", "viewport.patch.5": "#9d8fc7", "viewport.patch.6": "#7fb3bd",
+    "viewport.zone.1": "#7d6b5d", "viewport.zone.2": "#5d7d6b",
+    "viewport.zone.3": "#6b5d7d", "viewport.zone.4": "#7d5d5d"
+  }
+}

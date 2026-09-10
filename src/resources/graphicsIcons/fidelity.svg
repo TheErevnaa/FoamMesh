@@ -1,0 +1,20 @@
+<svg
+   id="icons"
+   viewBox="0 0 512 512"
+   xmlns="http://www.w3.org/2000/svg">
+  <path
+     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+     d="M 64,320 C 160,224 224,224 320,288 400,340 432,336 464,320" />
+  <path
+     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+     d="M 64,208 C 160,112 224,112 320,176 400,228 432,224 464,208" />
+  <path
+     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+     d="M 128,264 V 160" />
+  <path
+     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+     d="M 256,246 V 142" />
+  <path
+     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+     d="M 384,334 V 220" />
+</svg>

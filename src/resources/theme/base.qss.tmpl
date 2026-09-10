@@ -1,0 +1,430 @@
+/*
+ * FoamMesh global theme. All colour values are strict semantic tokens.
+ *
+ * Deliberately NOT a blanket `QWidget { background }` rule. Window and text
+ * base colours come from QPalette (see palette.py), so screens that still
+ * carry local styles keep reading correctly and owner-drawn Qt widgets adapt
+ * on their own. A blanket rule painted every container the same flat tone,
+ * which flattened the surface/elevated hierarchy and was most of why FoamMesh
+ * and FoamFlow read as different applications despite sharing this system.
+ *
+ * Metrics are shared with FoamFlow on purpose: 6px radii, 5px/14px on buttons,
+ * 4px/8px inside fields, 16px indicators. Two apps in one suite should not
+ * disagree about the size of a button.
+ */
+
+QMainWindow, QDialog {
+    background: {{background.canvas}};
+}
+
+QToolTip {
+    background: {{tooltip.background}};
+    color: {{tooltip.foreground}};
+    border: 1px solid {{border.default}};
+    padding: 4px 6px;
+}
+
+/* -- buttons ------------------------------------------------------------- */
+/* Buttons are raised surfaces, not input fields. Lumping them into one rule
+ * with QLineEdit made a button and a text box indistinguishable. */
+
+QPushButton, QToolButton {
+    background: {{background.surface}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    padding: 5px 14px;
+    color: {{foreground.primary}};
+}
+QToolButton {
+    padding: 4px 6px;
+}
+QPushButton:hover, QToolButton:hover {
+    background: {{background.elevated}};
+    border-color: {{accent.default}};
+}
+QPushButton:pressed, QToolButton:pressed {
+    background: {{background.elevated}};
+}
+QPushButton:checked, QToolButton:checked {
+    background: {{selection.background}};
+    border-color: {{accent.default}};
+}
+QPushButton:disabled, QToolButton:disabled {
+    color: {{disabled.foreground}};
+    background: {{disabled.background}};
+    border-color: {{border.default}};
+}
+QPushButton:default {
+    background: {{accent.default}};
+    color: {{accent.text}};
+    border: 1px solid {{accent.default}};
+}
+QPushButton:default:hover {
+    background: {{accent.hover}};
+    border-color: {{accent.hover}};
+}
+/* R4. A disabled default button read as enabled: `:default` and `:disabled`
+   have equal specificity, and the later rule wins, so the Import STL dialog's
+   OK button -- disabled from the moment it opens, while the Files list is
+   still empty -- was painted in the accent colour and invited a click that
+   could do nothing. Restated after the `:default` rules so a disabled button
+   looks disabled whichever else applies. */
+QPushButton:default:disabled, QPushButton:default:disabled:hover {
+    color: {{disabled.foreground}};
+    background: {{disabled.background}};
+    border: 1px solid {{border.default}};
+}
+QToolButton::menu-indicator { image: none; width: 0; }
+
+/* -- input fields -------------------------------------------------------- */
+
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit,
+QAbstractSpinBox, QDateEdit, QTimeEdit {
+    background: {{input.background}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    padding: 4px 8px;
+    selection-background-color: {{selection.background}};
+    selection-color: {{foreground.primary}};
+}
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+QComboBox::down-arrow { width: 10px; height: 10px; }
+
+/* Styling QAbstractSpinBox at all switches Qt to the style-sheet box model,
+ * and the step buttons then come out at a default size that has room for
+ * neither the arrow nor a mouse: they rendered as two dots in a 12px column
+ * on every spin box in the application. Sizing the sub-controls explicitly
+ * restores both. No `image` is set, so the arrow stays the base style's own
+ * and follows the palette into dark mode. */
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 20px;
+    background: {{background.surface}};
+    border-left: 1px solid {{border.default}};
+}
+QAbstractSpinBox::up-button {
+    subcontrol-position: top right;
+    border-top-right-radius: 5px;
+    margin: 1px 1px 0 0;
+}
+QAbstractSpinBox::down-button {
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: 5px;
+    margin: 0 1px 1px 0;
+}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {
+    background: {{background.elevated}};
+}
+QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed {
+    background: {{selection.background}};
+}
+QAbstractSpinBox::up-button:disabled, QAbstractSpinBox::down-button:disabled {
+    background: {{disabled.background}};
+    border-left-color: {{border.default}};
+}
+QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow {
+    width: 9px;
+    height: 9px;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QPlainTextEdit:disabled, QTextEdit:disabled, QAbstractSpinBox:disabled {
+    background: {{disabled.background}};
+    color: {{disabled.foreground}};
+    border-color: {{border.default}};
+}
+
+/* The focus ring stays 1px and is scoped to widgets that already carry a
+ * border, so gaining focus never changes a widget's content box and shifts
+ * the layout under the cursor. */
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QAbstractSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus,
+QPushButton:focus, QToolButton:focus,
+QTreeView:focus, QListView:focus, QTableView:focus {
+    border: 1px solid {{focus.ring}};
+}
+
+/* -- item views ---------------------------------------------------------- */
+
+QTreeView, QListView, QTableView {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    selection-background-color: {{selection.background}};
+    selection-color: {{foreground.primary}};
+    outline: none;
+}
+QAbstractItemView::item { padding: 3px; }
+QTreeView::item:hover, QListView::item:hover, QTableView::item:hover {
+    background: {{background.elevated}};
+}
+QAbstractItemView::item:selected { background: {{selection.background}}; }
+QHeaderView::section {
+    background: {{background.canvas}};
+    color: {{foreground.primary}};
+    border: none;
+    border-bottom: 1px solid {{border.default}};
+    padding: 5px 8px;
+}
+
+/* -- tabs ---------------------------------------------------------------- */
+
+QTabWidget::pane {
+    border: 1px solid {{border.default}};
+    top: -1px;
+}
+QTabBar::tab {
+    background: {{background.canvas}};
+    color: {{foreground.muted}};
+    border: 1px solid {{border.default}};
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 6px 14px;
+}
+QTabBar::tab:hover { background: {{background.elevated}}; }
+QTabBar::tab:selected {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+}
+
+/* -- menus, bars, containers -------------------------------------------- */
+
+QMenuBar { background: {{background.canvas}}; color: {{foreground.primary}}; }
+QMenuBar::item { padding: 4px 10px; background: transparent; }
+QMenuBar::item:selected, QMenuBar::item:pressed { background: {{background.elevated}}; }
+QMenu {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    padding: 4px;
+}
+QMenu::item { padding: 5px 24px 5px 8px; border-radius: 4px; }
+QMenu::item:selected { background: {{selection.background}}; }
+QMenu::item:disabled { color: {{disabled.foreground}}; }
+QMenu::separator { height: 1px; background: {{border.default}}; margin: 4px; }
+QToolBar { background: {{background.surface}}; border: none; spacing: 3px; }
+QToolBar::separator { background: {{border.default}}; width: 1px; margin: 4px; }
+QStatusBar { background: {{background.surface}}; }
+QDockWidget { background: {{background.surface}}; }
+QDockWidget::title { background: {{background.elevated}}; color: {{foreground.primary}}; padding: 5px; }
+QSplitter::handle { background: {{border.default}}; }
+
+QGroupBox {
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 6px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: {{foreground.muted}};
+}
+
+/* -- scrollbars ---------------------------------------------------------- */
+
+QScrollBar:vertical { background: transparent; width: 12px; margin: 0; }
+QScrollBar::handle:vertical {
+    background: {{border.default}};
+    border-radius: 6px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover { background: {{foreground.muted}}; }
+QScrollBar:horizontal { background: transparent; height: 12px; margin: 0; }
+QScrollBar::handle:horizontal {
+    background: {{border.default}};
+    border-radius: 6px;
+    min-width: 24px;
+}
+QScrollBar::handle:horizontal:hover { background: {{foreground.muted}}; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QProgressBar {
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    text-align: center;
+    color: {{foreground.primary}};
+}
+QProgressBar::chunk { background: {{accent.default}}; border-radius: 5px; }
+/* F6. Rounding the groove *and* the chunk is right for a bar that fills, but
+ * Qt draws a busy bar by sweeping one chunk across the groove -- with both
+ * rounded that read on screen as two detached blue blocks rather than a bar.
+ * The run dialog's bar is always the busy kind, so its chunk stays square. */
+ProgressDialog QProgressBar::chunk { border-radius: 0px; margin: 0px; }
+
+/* -- checkboxes and radios ---------------------------------------------- */
+/* These were left entirely unstyled, so they rendered in the native Windows
+ * look while every other control was themed -- the single loudest difference
+ * between the two applications on a settings page. */
+
+QCheckBox, QRadioButton, QLabel {
+    color: {{foreground.primary}};
+    background: transparent;
+}
+QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid {{border.default}};
+    background: {{input.background}};
+}
+QCheckBox::indicator, QGroupBox::indicator { border-radius: 4px; }
+QRadioButton::indicator { border-radius: 9px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover,
+QGroupBox::indicator:hover { border-color: {{accent.hover}}; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked,
+QGroupBox::indicator:checked {
+    background: {{accent.default}};
+    border-color: {{accent.default}};
+}
+QCheckBox::indicator:checked, QGroupBox::indicator:checked {
+    image: url(:/icons/checkmark.svg);
+}
+QRadioButton::indicator:checked { image: url(:/icons/radio-button-on.svg); }
+QCheckBox::indicator:focus, QRadioButton::indicator:focus,
+QGroupBox::indicator:focus { border-color: {{focus.ring}}; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
+QGroupBox::indicator:disabled {
+    border-color: {{disabled.foreground}};
+    background: {{disabled.background}};
+}
+/* R110. Only the indicator ever looked disabled. The `color:` rule above is a
+   stylesheet rule, and a stylesheet colour beats the palette's Disabled group,
+   so `setEnabled(False)` on an engine radio left its text at full contrast:
+   MEASURED on the Meshing Method page, where "Gmsh (SU2 export)" was ruled out
+   for the chosen solver, carried a greyed dot and full-strength text, and read
+   as merely unselected -- clicking it did nothing and said nothing. Buttons
+   already restate this at line 52 for the same reason. */
+QCheckBox:disabled, QRadioButton:disabled {
+    color: {{disabled.foreground}};
+}
+
+/* -- FoamMesh's own controls -------------------------------------------- */
+
+QLabel[foammeshStatus="success"] { color: {{status.success}}; }
+QLabel[foammeshStatus="warning"] { color: {{status.warning}}; }
+QLabel[foammeshStatus="error"] { color: {{status.error}}; }
+QLabel[foammeshStatus="info"] { color: {{status.info}}; }
+QLabel[foammeshTone="muted"] { color: {{foreground.muted}}; }
+QLabel[foammeshTone="secondary"] { color: {{foreground.secondary}}; }
+QLabel[foammeshAccentSurface="true"] { background: {{selection.background}}; margin: 2px; }
+ListTable[foammeshSurface="true"] { background: {{background.surface}}; }
+QLabel#regionEmptyMessage, QLabel#regionValidationMessage {
+    padding: 10px;
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+}
+*[foammeshColorSwatch="true"] {
+    background-color: palette(window);
+    border: 1px solid {{border.default}};
+    border-radius: 3px;
+}
+QPlainTextEdit[foammeshConsole="true"] {
+    background-color: {{console.background}};
+    color: {{console.foreground}};
+    selection-background-color: {{selection.background}};
+}
+/* G2. A page whose four stacked buttons all look alike hides which one is
+   the action: `Apply Method` read exactly like `Re-probe Runtimes`. The one
+   button that advances the workflow is drawn in the accent. */
+QPushButton[foammeshRole="primary"] {
+    background: {{accent.default}};
+    color: {{accent.text}};
+    border: 1px solid {{accent.default}};
+}
+QPushButton[foammeshRole="primary"]:hover {
+    background: {{accent.hover}};
+    border-color: {{accent.hover}};
+}
+QPushButton[foammeshRole="primary"]:disabled {
+    background: {{background.elevated}};
+    color: {{foreground.muted}};
+    border-color: {{border.default}};
+}
+FlatPushButton[foammeshFlat="true"], IconCheckBox[foammeshFlat="true"] {
+    background: transparent;
+    border: none;
+}
+QPushButton[foammeshFlat="true"], QToolButton[foammeshFlat="true"] {
+    background: transparent;
+    border: none;
+}
+QPushButton[foammeshFlat="true"]:hover, QToolButton[foammeshFlat="true"]:hover {
+    background: {{background.elevated}};
+    border-radius: 6px;
+}
+QToolButton[foammeshFlat="true"]:checked {
+    background: {{selection.background}};
+    border-radius: 6px;
+}
+QToolButton[foammeshFlat="true"]:disabled { background: transparent; }
+
+/* Indicator-as-icon controls opt out of the box-and-tick indicator above. */
+QCheckBox#rendering::indicator {
+    width: 32px; height: 32px;
+    border: none; background: transparent; border-radius: 0;
+}
+QCheckBox#rendering::indicator:unchecked { image: url(:/images/toggle_off); padding: 0; }
+QCheckBox#rendering::indicator:checked { image: url(:/images/toggle_on); padding: 0; }
+FolderHeader { spacing: 5px; }
+FolderHeader::indicator {
+    width: 14px; height: 14px;
+    border: none; background: transparent; border-radius: 0;
+}
+FolderHeader::indicator:unchecked { image: url(:/icons/chevron-forward.svg); }
+FolderHeader::indicator:checked { image: url(:/icons/chevron-down.svg); }
+
+/* Body text, like FoamFlow's outline. It used to be 12pt DemiBold -- declared
+ * both here and in navigation code -- which made the one tree a user reads
+ * most look like it belonged to a different application. */
+QTreeView#workflowStepTree {
+    background: transparent;
+    border: none;
+    font-weight: 500;
+    outline: none;
+}
+QTreeView#workflowStepTree::item {
+    padding: 6px 6px;
+    border-radius: 6px;
+    margin: 1px 4px;
+}
+QTreeView#workflowStepTree::item:selected {
+    background: {{selection.background}};
+    border-left: 3px solid {{accent.default}};
+}
+QTreeView#workflowStepTree::item:hover:!selected {
+    background: {{background.elevated}};
+}
+QTreeView#workflowStepTree::item:disabled {
+    color: {{disabled.foreground}};
+}
+QWidget#sidebarShell, QGroupBox#groupBox_9 {
+    background: {{background.surface}};
+    border: none;
+}
+QLabel#engineBranchHeading, QLabel#meshingMethodTitle {
+    font-size: 12pt;
+    font-weight: 600;
+}
+QLabel#salomeTaskTitle {
+    font-size: 13pt;
+    font-weight: 700;
+}
+
+/* The parts/section overlay floats over the viewport, so it needs a surface
+ * of its own rather than inheriting the transparent render window. */
+QFrame#viewportOverlay {
+    background: {{background.surface}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+}
+QLabel#overlayChip { color: {{foreground.muted}}; }
+QLabel#overlayChip[partial="true"] { color: {{status.warning}}; font-weight: 600; }
+QLabel#viewportScale { color: {{foreground.muted}}; padding: 0 8px; }
+QLabel#captureStale { color: {{status.warning}}; }

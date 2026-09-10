@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FoamMesh
+GenericName=OpenFOAM Meshing Workbench
+Comment=Prepare, inspect, repair and export OpenFOAM meshes
+Exec=FoamMesh %F
+Icon=foammesh
+Terminal=false
+Categories=Science;Engineering;
+Keywords=OpenFOAM;CFD;mesh;meshing;
+StartupWMClass=FoamMesh

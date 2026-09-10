@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.erevnaa.FoamMesh</id>
+  <name>FoamMesh</name>
+  <summary>OpenFOAM meshing workbench</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description><p>FoamMesh prepares, inspects, repairs and exports meshes for OpenFOAM workflows.</p></description>
+  <launchable type="desktop-id">com.erevnaa.FoamMesh.desktop</launchable>
+  <provides><binary>FoamMesh</binary></provides>
+  <developer id="com.erevnaa"><name>Erevnaa</name></developer>
+  <releases><release version="1.0.0" date="2026-09-10"/></releases>
+</component>

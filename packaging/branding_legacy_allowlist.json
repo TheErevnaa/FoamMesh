@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "scope": "active runtime UI strings and external links",
+  "entries": [
+    {
+      "path": "src/foammesh/view/menu/help/about_dialog.py",
+      "contains": "Derived from NEXTfoam BaramMesh 26.2.1",
+      "reason": "GPL derivation and upstream attribution required by NOTICE"
+    },
+    {
+      "path": "src/foammesh/view/menu/help/about_dialog.py",
+      "contains": "CFD Direct, or NEXTfoam Co., Ltd.",
+      "reason": "Required trademark and non-affiliation notice in the About dialog"
+    }
+  ]
+}

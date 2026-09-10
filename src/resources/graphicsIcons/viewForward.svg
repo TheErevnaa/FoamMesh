@@ -1,0 +1,8 @@
+   <svg
+      id="icons"
+      viewBox="0 0 512 512"
+      xmlns="http://www.w3.org/2000/svg">
+     <path
+style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+d="M 160,128 336,256 160,384" />
+   </svg>

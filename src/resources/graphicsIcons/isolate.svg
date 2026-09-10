@@ -1,0 +1,32 @@
+      <svg
+         id="icons"
+         viewBox="0 0 512 512"
+         xmlns="http://www.w3.org/2000/svg">
+        <path
+   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
+   d="M 176,176 H 336 V 336 H 176 Z" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 80,80 H 128" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 80,432 H 128" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 384,80 H 432" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 384,432 H 432" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 80,80 V 128" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 432,80 V 128" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 80,432 V 384" />
+<path
+   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
+   d="M 432,432 V 384" />
+      </svg>
