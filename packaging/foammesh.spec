@@ -10,9 +10,36 @@ ICON_ICO = ROOT / 'src' / 'resources' / 'branding' / 'foammesh.ico'
 ICON_ICNS = ROOT / 'src' / 'resources' / 'branding' / 'foammesh.icns'
 VERSION_INFO = ROOT / 'packaging' / 'windows' / 'version_info.txt'
 
+BYTECODE_SUFFIXES = frozenset({'.pyc', '.pyo'})
+
+
+def tree(source, prefix):
+    """Every file under `source`, as PyInstaller (file, destination-dir) pairs.
+
+    PyInstaller's (directory, name) form copies a directory wholesale, which is
+    the wrong shape for these two trees. `src/resources` is an importable
+    package, so merely starting the app -- or running any script with
+    PYTHONPATH=src -- leaves a `__pycache__` beside its source, and the next
+    build shipped it: two builds of identical source produced 5,496 and 5,498
+    entries, differing only by the .pyc files under `resources/`. That made the
+    contents of a release depend on whether anyone had run the app before
+    packaging. Listing the files ourselves is what keeps byte-compiled
+    droppings out, and it covers `docs/` too in case anything importable ever
+    lands there.
+    """
+    collected = []
+    for path in sorted(source.rglob('*')):
+        if not path.is_file():
+            continue
+        if '__pycache__' in path.parts or path.suffix in BYTECODE_SUFFIXES:
+            continue
+        collected.append((str(path), str(Path(prefix) / path.parent.relative_to(source))))
+    return collected
+
+
 datas = [
-    (str(ROOT / 'src' / 'resources'), 'resources'),
-    (str(ROOT / 'docs'), 'docs'),
+    *tree(ROOT / 'src' / 'resources', 'resources'),
+    *tree(ROOT / 'docs', 'docs'),
     (str(ROOT / 'LICENSE'), '.'),
     (str(ROOT / 'NOTICE'), '.'),
     (str(ROOT / 'THIRD_PARTY.md'), '.'),

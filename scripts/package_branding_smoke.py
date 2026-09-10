@@ -61,6 +61,24 @@ def _windows_shell_icon(executable: Path) -> dict[str, object]:
     }
 
 
+def _stray_bytecode(bundle: Path) -> list[str]:
+    """Byte-compiled droppings that a wholesale directory copy would sweep in.
+
+    A correct bundle has none anywhere: pure Python lives in the PYZ archive,
+    not as loose .pyc beside the data files. So anything here came from a
+    __pycache__ that existed in the source tree at packaging time, which means
+    the release's contents depended on whether someone had run the app first.
+    Reported as paths rather than a count so the failure names the culprit.
+    """
+    stray = []
+    for path in sorted(bundle.rglob('*')):
+        if not path.is_file():
+            continue
+        if '__pycache__' in path.parts or path.suffix in {'.pyc', '.pyo'}:
+            stray.append(path.relative_to(bundle).as_posix())
+    return stray
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('bundle', nargs='?', default=ROOT / 'dist' / 'FoamMesh', type=Path)
@@ -72,6 +90,7 @@ def main() -> int:
     payload_root = bundle / '_internal'
     executable = bundle / ('FoamMesh.exe' if sys.platform == 'win32' else 'FoamMesh')
     payloads = {name: (payload_root / Path(name)).is_file() for name in REQUIRED_PAYLOADS}
+    stray_bytecode = _stray_bytecode(bundle)
     report: dict[str, object] = {
         'schema_version': 1,
         'host': {'system': platform.system(), 'release': platform.release()},
@@ -82,6 +101,7 @@ def main() -> int:
             'size_bytes': executable.stat().st_size if executable.is_file() else 0,
         },
         'required_payloads': payloads,
+        'stray_bytecode': stray_bytecode,
     }
 
     if sys.platform == 'win32' and executable.is_file():
@@ -94,6 +114,11 @@ def main() -> int:
     failures = [name for name, present in payloads.items() if not present]
     if not executable.is_file():
         failures.append('FoamMesh executable')
+    if stray_bytecode:
+        shown = ', '.join(stray_bytecode[:3])
+        if len(stray_bytecode) > 3:
+            shown += f' (+{len(stray_bytecode) - 3} more)'
+        failures.append(f'{len(stray_bytecode)} byte-compiled file(s) in the bundle: {shown}')
     if sys.platform == 'win32' and executable.is_file():
         version = report['windows_version_info']
         if version.get('CompanyName') != 'Erevnaa' or version.get('ProductName') != 'FoamMesh':
