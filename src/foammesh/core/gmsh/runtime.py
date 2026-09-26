@@ -123,10 +123,13 @@ class GmshRuntimeProbe:
 
     def probe(self, profile: GmshLaunchProfile, *,
               refresh: bool = False) -> GmshRuntimeReport:
-        if not refresh and profile.profile_id in self._cache:
-            return self._cache[profile.profile_id]
+        # Keyed on the fingerprint, not the id: the id stays the same when
+        # the distribution or user changes, and would answer for the old one.
+        key = profile.fingerprint
+        if not refresh and key in self._cache:
+            return self._cache[key]
         report = self._probe_uncached(profile)
-        self._cache[profile.profile_id] = report
+        self._cache[key] = report
         return report
 
     def _failure(self, profile, category, reason, raw=''):

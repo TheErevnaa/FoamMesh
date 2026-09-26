@@ -187,6 +187,43 @@ class App(QObject):
                 expected_version='13',
             ),
         ))
+        # Gmsh runs in the same distribution, so it follows the same setting.
+        from foammesh.core.gmsh.launch_profiles import use_runtime
+        use_runtime(runtime['wsl_distro'], runtime['wsl_user'])
+
+    def findOpenFoamRuntime(self):
+        """Look through WSL for OpenFOAM 13 and Gmsh; blocking, so off the GUI thread.
+
+        The stored distribution and user are tried first, then every other
+        distribution as ``foamuser`` and then as its default user.
+        """
+        from foammesh.core.openfoam_runtime.detect import detect
+        runtime = self._settings.getOpenFoamRuntime()
+        return detect(runtime['wsl_distro'], runtime['wsl_user'])
+
+    def useOpenFoamRuntime(self, found):
+        """Store a detected runtime and probe it straight away."""
+        runtime = self._settings.getOpenFoamRuntime()
+        self._settings.updateOpenFoamRuntime(
+            profile_id=runtime['profile_id'], wsl_distro=found.distribution,
+            wsl_user=found.user, bashrc=found.bashrc,
+            stage_timeout=int(runtime['stage_timeout']))
+        self.applyOpenFoamRuntime()
+
+    async def detectOpenFoamRuntime(self):
+        """On a first start, find the WSL runtime instead of assuming its name.
+
+        Runs once: as soon as a runtime is stored -- found here or entered in
+        Preferences -- it is used as it is. When nothing is found nothing is
+        stored, so a runtime installed later is found on the next start.
+        """
+        import asyncio
+        if self._settings is None or self._settings.hasOpenFoamRuntime():
+            return None
+        found = await asyncio.to_thread(self.findOpenFoamRuntime)
+        if found is not None:
+            self.useOpenFoamRuntime(found)
+        return found
 
     def applyLanguage(self):
         """Keep the desktop UI on its source-language English strings."""

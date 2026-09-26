@@ -182,6 +182,16 @@ def main():
         # consent, or optional case inspection can delay the shell.
         await app.window.start(initial_case)
         await asyncio.sleep(0)
+        # A first start looks for OpenFOAM 13 and Gmsh in WSL rather than
+        # assuming the distribution is called OpenFOAM13Runtime.
+        try:
+            found = await app.detectOpenFoamRuntime()
+        except Exception:                                   # noqa: BLE001
+            logger.warning('OpenFOAM runtime detection failed', exc_info=True)
+            found = None
+        if found is not None:
+            app.window.statusBar().showMessage(QApplication.translate(
+                'main', f'Using {found.describe()}.'), 10000)
         mpi = await asyncio.to_thread(app.capabilities.utility, 'mpirun')
         if not mpi.available:
             message = QApplication.translate(

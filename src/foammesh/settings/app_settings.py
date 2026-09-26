@@ -294,6 +294,10 @@ class AppSettings:
                 SettingKey.OPENFOAM_STAGE_TIMEOUT, 3600)),
         }
 
+    def hasOpenFoamRuntime(self) -> bool:
+        """Whether a runtime has been stored, by Preferences or by detection."""
+        return self._get(SettingKey.OPENFOAM_WSL_DISTRO) is not None
+
     def updateOpenFoamRuntime(self, *, profile_id: str, wsl_distro: str,
                               wsl_user: str, bashrc: str,
                               stage_timeout: int = 3600):

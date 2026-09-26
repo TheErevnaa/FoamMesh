@@ -12,7 +12,9 @@ for it would change nothing.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import threading
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
     QLineEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
@@ -52,14 +54,19 @@ def _note(text: str = '') -> QLabel:
 class PreferencesDialog(QDialog):
     """One page per preference; OK and Apply write, Cancel leaves them."""
 
+    #: A search for the WSL runtime finished (a DetectedRuntime, or None).
+    runtimeFound = Signal(object)
+
     def __init__(self, parent=None, *, settings, themeManager,
-                 applyRuntime=None, privacy=None):
+                 applyRuntime=None, findRuntime=None, privacy=None):
         super().__init__(parent)
         self.setObjectName('preferencesDialog')
         self.setWindowTitle(self.tr('Preferences'))
         self._settings = settings
         self._themes = themeManager
         self._applyRuntime = applyRuntime
+        self._findRuntime = findRuntime
+        self.runtimeFound.connect(self._showFoundRuntime)
         self._runtime = settings.getOpenFoamRuntime()
 
         self.pages = QTabWidget(self)
@@ -123,6 +130,16 @@ class PreferencesDialog(QDialog):
         form.addRow(self.tr('WSL user'), self.userEdit)
         form.addRow(self.tr('OpenFOAM 13 bashrc'), self.bashrcEdit)
         form.addRow(self.tr('Stage time limit'), unit_cell(self.stageTimeout, 's', page))
+        if self._findRuntime is not None:
+            self.findRuntimeButton = QPushButton(self.tr('Find automatically'), page)
+            self.findRuntimeButton.setObjectName('preferencesFindRuntime')
+            self.findRuntimeButton.setToolTip(self.tr(
+                'Look through the WSL distributions for OpenFOAM 13 and Gmsh, '
+                'trying the user foamuser first'))
+            self.findRuntimeButton.clicked.connect(self.findRuntime)
+            self._findNote = _note()
+            self._findNote.setObjectName('preferencesFindRuntimeNote')
+            form.addRow(self.findRuntimeButton, self._findNote)
         form.addRow(_note(self.tr(
             'The OpenFOAM 13 environment is checked again as soon as these are applied.')))
         return page
@@ -185,6 +202,35 @@ class PreferencesDialog(QDialog):
     def _showMode(self):
         self._modeNote.setText(self.tr(
             _MODE_NOTES[QualificationMode(self.qualificationMode.currentData())]))
+
+    # Finding the runtime ---------------------------------------------------
+    def findRuntime(self):
+        """Search WSL off the GUI thread; the fields are filled when it answers."""
+        self.findRuntimeButton.setEnabled(False)
+        self._findNote.setText(self.tr(
+            'Looking through WSL; a stopped distribution can take 20 s to start…'))
+
+        def search():
+            try:
+                found = self._findRuntime()
+            except Exception:                           # noqa: BLE001
+                found = None
+            self.runtimeFound.emit(found)
+
+        threading.Thread(target=search, name='find-openfoam-runtime',
+                         daemon=True).start()
+
+    def _showFoundRuntime(self, found):
+        self.findRuntimeButton.setEnabled(True)
+        if found is None:
+            self._findNote.setText(self.tr(
+                'No WSL distribution with OpenFOAM 13 (/opt/openfoam13) was found.'))
+            return
+        self.distroEdit.setText(found.distribution)
+        self.userEdit.setText(found.user)
+        self.bashrcEdit.setText(found.bashrc)
+        self._findNote.setText(self.tr('Found {0}. Apply or OK to use it.').format(
+            found.describe()))
 
     # Writing --------------------------------------------------------------
     def _runtimeValues(self) -> dict:

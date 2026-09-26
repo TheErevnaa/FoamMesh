@@ -3708,6 +3708,7 @@ class MainWindow(QMainWindow):
         self._dialog = PreferencesDialog(
             self, settings=app.settings, themeManager=app.themeManager,
             applyRuntime=app.applyOpenFoamRuntime,
+            findRuntime=app.findOpenFoamRuntime,
             privacy=self._openPrivacySettings if self._privacyConfigured else None)
         self._dialog.open()
 

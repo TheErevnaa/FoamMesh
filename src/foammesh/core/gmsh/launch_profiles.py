@@ -194,6 +194,19 @@ class GmshLaunchProfile:
         )
 
 
+#: The distribution and user the application's OpenFOAM runtime names. Gmsh
+#: runs in the same distribution, so it follows that setting; the
+#: ``FOAMMESH_GMSH_WSL_*`` variables still win for a deliberate override.
+_shared_runtime: dict[str, str | None] = {'distribution': None, 'user': None}
+
+
+def use_runtime(distribution: str | None, user: str | None) -> None:
+    """Make Gmsh run in *distribution* as *user* (None restores the default)."""
+    _shared_runtime['distribution'] = (str(distribution).strip() or None
+                                       if distribution else None)
+    _shared_runtime['user'] = str(user).strip() or None if user else None
+
+
 def configured_profiles(environment: Mapping[str, str] | None = None
                         ) -> tuple[GmshLaunchProfile, ...]:
     """The qualified Gmsh profiles for this host.
@@ -203,14 +216,18 @@ def configured_profiles(environment: Mapping[str, str] | None = None
     qualified runtime without changing callers.
     """
     env = dict(os.environ if environment is None else environment)
+    distribution = (env.get('FOAMMESH_GMSH_WSL_DISTRO')
+                    or _shared_runtime['distribution'] or 'OpenFOAM13Runtime')
+    user = (env.get('FOAMMESH_GMSH_WSL_USER')
+            or _shared_runtime['user'] or 'foamuser')
     if os.name != 'nt' and not env.get('FOAMMESH_GMSH_WSL_DISTRO'):
         # No WSL to launch: report no profile rather than inventing a native
         # one that would re-create the host-PATH precedence defect.
         return ()
     return (GmshLaunchProfile(
         profile_id=env.get('FOAMMESH_GMSH_PROFILE_ID', 'wsl-openfoam13-gmsh'),
-        distribution=env.get('FOAMMESH_GMSH_WSL_DISTRO', 'OpenFOAM13Runtime'),
-        user=env.get('FOAMMESH_GMSH_WSL_USER', 'foamuser'),
+        distribution=distribution,
+        user=user,
         python=env.get('FOAMMESH_GMSH_PYTHON', 'python3'),
         wsl_executable=env.get('FOAMMESH_WSL_EXECUTABLE', 'wsl.exe'),
         minimum_version=env.get('FOAMMESH_GMSH_MINIMUM_VERSION', '4.11'),
