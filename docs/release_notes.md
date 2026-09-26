@@ -1,5 +1,40 @@
 # FoamMesh Release Notes
 
+## 1.1.0 — 2026-09-25
+
+- **Viewport.** A region picker and a selectable parts list show one region or
+  several; Fit to selection frames only what is selected, and Back/Forward
+  history follows every fit and is cleared when another model loads. Mesh
+  lines have an opacity, colour and width control in the toolbar and the
+  display panel. A section plane moves when its origin handle is dragged
+  along its normal, and a locked plane keeps moving for the whole Ctrl+drag. The
+  background colour can be reset to the theme.
+- **Comparing the mesh with its geometry.** Deviation from the loaded geometry
+  is painted on one symmetric scale with a titled legend, a histogram and the
+  share of faces within a tolerance. Poor cells are coloured on a scale over
+  their band, drawn in front of the surfaces behind them.
+- **Render quality.** View > Render quality offers Performance, Balanced (the
+  default) and Quality. See-through geometry is anti-aliased again, and the
+  lighting shows the shape of curved parts. Performance is 40-50 % faster than
+  before on meshes of 100k-200k cells.
+- **Menus and settings.** Settings opens one Preferences dialog. The Parallel
+  menu is gone; Meshing resources in the workflow is the only core count. Dead
+  and duplicate menu entries were removed, Redo and Close have standard
+  shortcuts, and Undo is locked while a batch writes the case.
+- **Workflow.** Quality verdicts name the check that produced them, the
+  outline ticks finished steps, and a snappy stage's mesh appears in the
+  viewport as soon as that stage finishes.
+- **Advice when a mesh fails.** A skewed or non-orthogonal snappy mesh is told
+  that finer cells help; layers that were not grown are told what to change; a
+  Gmsh refusal with Optimize off names Optimize, not the repair pass.
+- **Mesh > Scale, Translate and Rotate** open on a cold WSL start (the first
+  one can take about 20 s while WSL starts; later ones open in under half a
+  second), and Scale takes a single factor such as 200.
+- A mesh changed outside FoamMesh is no longer credited to the run that made
+  the previous one, and a single-region mesh no longer reads "in 1 region ()".
+- A timed-out runtime probe no longer leaves a `.pid` file in the folder the
+  app was started from.
+
 ## Plan 22 — Gmsh replaces the SALOME pipeline — 2026-07-31
 
 - **The SALOME hybrid pipeline is gone.** Its code, tests, scripts, schema
