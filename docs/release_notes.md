@@ -1,6 +1,6 @@
 # FoamMesh Release Notes
 
-## 1.1.0 — 2026-09-25
+## 1.1.0 — 2026-09-26
 
 - **Viewport.** A region picker and a selectable parts list show one region or
   several; Fit to selection frames only what is selected, and Back/Forward
@@ -30,6 +30,16 @@
 - **Mesh > Scale, Translate and Rotate** open on a cold WSL start (the first
   one can take about 20 s while WSL starts; later ones open in under half a
   second), and Scale takes a single factor such as 200.
+- **Viewport toolbar.** The toolbar holds tools rather than readouts: the
+  whole-mesh cell count and the model size are shown on the overlay card, and
+  the count returns to the toolbar only while a section is cut. The
+  background is one button, painted with the current gradient, whose menu sets
+  the top and bottom colours or resets them. Smaller buttons mean fewer tools
+  go into the ⋯ menu (none at a 1600 px window).
+- **Section plane.** The plane now goes through the model on screen. It used
+  to stay at the centre of the first model opened, and could miss a later
+  model altogether. Hidden, switched-off and empty parts no longer move it, and
+  the cut stays visible while the plane is dragged or the view is turned.
 - A mesh changed outside FoamMesh is no longer credited to the run that made
   the previous one, and a single-region mesh no longer reads "in 1 region ()".
 - A timed-out runtime probe no longer leaves a `.pid` file in the folder the
