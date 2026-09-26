@@ -27,7 +27,7 @@
        <item>
         <widget class="QGroupBox" name="groupBox_1">
          <property name="title">
-          <string>Feature Angle (Degree)</string>
+          <string>Feature angle</string>
          </property>
          <layout class="QGridLayout" name="gridLayout">
           <property name="verticalSpacing">
@@ -122,7 +122,7 @@
        <item>
         <widget class="QGroupBox" name="groupBox_3">
          <property name="title">
-          <string>Area Threshold (%)</string>
+          <string>Area threshold</string>
          </property>
          <layout class="QVBoxLayout" name="verticalLayout_4">
           <item>
@@ -269,7 +269,7 @@
              <item>
               <widget class="QLabel" name="label_6">
                <property name="text">
-                <string>Number of Segments</string>
+                <string>Number of segments</string>
                </property>
               </widget>
              </item>
@@ -300,12 +300,12 @@
             </column>
             <column>
              <property name="text">
-              <string>Color</string>
+              <string>Colour</string>
              </property>
             </column>
             <column>
              <property name="text">
-              <string>Area(%)</string>
+              <string>Area (%)</string>
              </property>
             </column>
            </widget>
@@ -410,7 +410,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> Set the axis direction based on the origin</string>
+             <string>Show or hide the origin axes</string>
             </property>
             <property name="icon">
              <iconset resource="../../../resource.qrc">
@@ -439,7 +439,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> Display x,y and z axis coordinates</string>
+             <string>Show or hide the viewport cube axes</string>
             </property>
             <property name="icon">
              <iconset>
@@ -465,7 +465,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> Toggle between Perspective and Orthogonal views</string>
+             <string>Use parallel rather than perspective projection</string>
             </property>
             <property name="icon">
              <iconset resource="../../../resource.qrc">
@@ -491,7 +491,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> Show the entire model in the windows to fit the view</string>
+             <string>Fit all visible geometry and mesh objects in the viewport</string>
             </property>
             <property name="icon">
              <iconset resource="../../../resource.qrc">
@@ -514,7 +514,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> View the model from cross-section of the closest-axis, aligning with current state</string>
+             <string>Align the camera with a principal axis</string>
             </property>
             <property name="icon">
              <iconset resource="../../../resource.qrc">
@@ -537,7 +537,7 @@
              </size>
             </property>
             <property name="toolTip">
-             <string> Rotate the model by 90 degrees</string>
+             <string>Roll the current camera view by 90 degrees</string>
             </property>
             <property name="icon">
              <iconset resource="../../../resource.qrc">
@@ -609,7 +609,7 @@
       <item>
        <widget class="QPushButton" name="okButton">
         <property name="text">
-         <string>Ok</string>
+         <string>OK</string>
         </property>
        </widget>
       </item>

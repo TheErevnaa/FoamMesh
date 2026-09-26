@@ -15,6 +15,7 @@ from vtkmodules.vtkRenderingCore import vtkPolyDataMapper, vtkActor
 from foammesh.view.geometry.split_dialog_ui import Ui_SplitDialog
 from foammesh.view.geometry.stl_utility import StlImporter
 from foammesh.app import app
+from foammesh.view.theming.metrics import FORM_MARGIN, place_unit
 from foammesh.view.theming.status_colors import apply_color_swatch
 from foammesh.view.theming.vtk_theme import rgb
 
@@ -64,7 +65,7 @@ class SegmentItem(QTreeWidgetItem):
 
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(9, 1, 9, 1)
+        layout.setContentsMargins(FORM_MARGIN, 0, FORM_MARGIN, 0)
         layout.addWidget(self._colorWidget)
 
         self._colorWidget.setMinimumSize(16, 16)
@@ -90,6 +91,14 @@ class SplitDialog(QDialog):
 
         self._ui.minAreaSlider.setRange(0, 100)
         self._ui.minAreaText.setValidator(QDoubleValidator(0, 100, -1))
+
+        # DP-198. Both groups named their unit in their own title --
+        # `Feature angle (deg)`, `Area threshold (%)` -- which put it at the
+        # top of a group whose numbers are at the bottom. It sits beside the
+        # box it belongs to now. The tree's `Area (%)` stays as it is: a
+        # column of numbers is where a heading is the right place for one.
+        place_unit(self._ui.featureAngleText, 'deg')
+        place_unit(self._ui.minAreaText, '%')
 
         self._ui.segments.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self._ui.segments.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)

@@ -50,7 +50,7 @@ class AnalyticsConsent:
         Returns the current consent value (True if user allowed, False
         otherwise). The dialog is shown window-modally and awaited, so the
         shared qasync owner loop keeps running while it is open. The dialog
-        blocks dismissal so the user must click Allow or Don't Allow.
+        blocks dismissal so the user must click Allow or Don't allow.
         """
         if not self.hasDecision():
             from .consent_dialog import ConsentDialog

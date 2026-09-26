@@ -190,6 +190,14 @@ class CaseSession:
         session._probe_volume(read_only_on_lock)
         if not session.read_only:
             session._acquire_writer(read_only_on_lock)
+        if not session.read_only and config_path.exists():
+            # DP-691. An old case's Parallel Environment count moves onto
+            # Meshing resources, the only core-count input, once.
+            from foammesh.settings.local_settings import carryLegacyCoreCount
+            try:
+                carryLegacyCoreCount(storage_path, db)
+            except Exception:  # noqa: BLE001 - never block opening a case
+                pass
         session._load_or_create_identity()
         if not session.read_only:
             session._start_journal()

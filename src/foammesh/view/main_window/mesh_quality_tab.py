@@ -1,4 +1,4 @@
-"""The Mesh Quality tab: the metric table, the offending elements, Accept anyway.
+"""The Mesh quality tab: the metric table, the offending elements, Accept anyway.
 
 Plan 26 WP3.2. This is where the quality gate's refusal stops being a dead end.
 The gate can discard a 141,486-element mesh over three elements; before this
@@ -18,11 +18,15 @@ Three things live here and nowhere else:
 """
 from __future__ import annotations
 
+from foammesh.core.quantities import aligned
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+from foammesh.core.quality.phrasing import NO_MESH_YET
+from foammesh.core.quality.verdict import verdict_source
 
 from .quality_histogram import QualityHistogram
 
@@ -83,9 +87,14 @@ class MeshQualityTab(QWidget):
 
         self._metrics = _table(_METRIC_COLUMNS, self,
                                'Quality metrics and their limits')
-        metrics_box = QGroupBox(self.tr('Metrics'), self)
-        QVBoxLayout(metrics_box).addWidget(self._metrics)
-        layout.addWidget(metrics_box, 1)
+        # DP-108. Held on the instance because it has to be hideable. On a
+        # case with no mesh this group drew its heading row and then a third
+        # of the window of empty grid -- R187 again, the fault the task pages
+        # closed with `claimBodyStretch`, on a panel that does not go through
+        # that machinery and so never got the fix.
+        self._metrics_box = QGroupBox(self.tr('Metrics'), self)
+        QVBoxLayout(self._metrics_box).addWidget(self._metrics)
+        layout.addWidget(self._metrics_box, 1)
 
         self._elements = _table(_ELEMENT_COLUMNS, self,
                                 'Elements below the requested limit')
@@ -103,11 +112,29 @@ class MeshQualityTab(QWidget):
         self._distribution_box.setVisible(False)
         layout.addWidget(self._distribution_box)
 
+        # DP-108. Takes the body space when no table is there to take it, so
+        # the sentence at the top of the panel stays at the top instead of
+        # being stretched down the middle of an empty tab. Exactly one of
+        # this and the groups above is ever visible; see `_claim_body_space`.
+        self._filler = QWidget(self)
+        self._filler.setObjectName('meshQualityFiller')
+        layout.addWidget(self._filler, 1)
+
         self._accept = QPushButton(self.tr('Accept anyway'), self)
         self._accept.setObjectName('meshQualityAccept')
         self._accept.clicked.connect(self._on_accept)
+        # DP-109. The reason this button is disabled was computed, written to
+        # a tooltip and to the accessible description, and shown on screen
+        # nowhere -- so a disabled control sat alone in the corner of the
+        # window with nothing beside it, and a user cannot tell a control
+        # that is waiting from one that is forbidden from one that is broken.
+        # It goes next to the button because the two are one statement.
+        self._accept_reason = QLabel(self)
+        self._accept_reason.setObjectName('meshQualityAcceptReason')
+        self._accept_reason.setWordWrap(True)
+        self._accept_reason.setProperty('foammeshTone', 'secondary')
         buttons = QHBoxLayout()
-        buttons.addStretch(1)
+        buttons.addWidget(self._accept_reason, 1)
         buttons.addWidget(self._accept)
         layout.addLayout(buttons)
         self.clear()
@@ -116,14 +143,15 @@ class MeshQualityTab(QWidget):
 
     def clear(self) -> None:
         self._verdict = {}
-        self._headline.setText(self.tr(
-            'No mesh has been produced in this case yet.'))
+        self._headline.setText(self.tr(NO_MESH_YET))
         self._metrics.setRowCount(0)
         self._elements.setRowCount(0)
         self._populate_findings((), ())
+        self._metrics_box.setVisible(False)
         self._elements_box.setVisible(False)
         self._distribution.clear()
         self._distribution_box.setVisible(False)
+        self._claim_body_space()
         self._set_accept(False, self.tr('There is no verdict to accept.'))
 
     def show_verdict(self, verdict: dict) -> None:
@@ -139,20 +167,21 @@ class MeshQualityTab(QWidget):
         headline = str(self._verdict.get('reason')
                        or self.tr('Every requested quality limit was met. '
                                   'checkMesh runs its own separate checks; '
-                                  'the Mesh QA task reports those.'))
+                                  'the Quality task reports those.'))
         if self._verdict.get('stale'):
             headline = str(self.tr(
                 'This check was run against a different mesh than the one now '
-                'loaded. Re-run Mesh > Check Mesh. ')) + headline
+                'loaded. Re-run Mesh → Mesh check. ')) + headline
         elif self._verdict.get('checkedAt'):
-            headline += str(self.tr(' (checkMesh, %s)')
-                            % self._verdict['checkedAt'])
+            headline += ' ({0}, {1})'.format(verdict_source(self._verdict),
+                                             self._verdict['checkedAt'])
         self._headline.setText(headline)
         self._populate_findings(self._verdict.get('blocking') or (),
                                 self._verdict.get('advisory') or ())
         self._populate_metrics(self._verdict.get('metrics') or ())
         self._populate_elements(self._verdict.get('offending') or ())
         self._update_accept()
+        self._claim_body_space()
 
     def set_distribution(self, metric: str, histogram: dict, *,
                          limit: float | None = None,
@@ -161,6 +190,7 @@ class MeshQualityTab(QWidget):
         self._distribution.set_distribution(
             metric, histogram, limit=limit, beyond_is_above=beyond_is_above)
         self._distribution_box.setVisible(bool(histogram))
+        self._claim_body_space()
 
     # -- rendering --------------------------------------------------------- #
 
@@ -183,8 +213,24 @@ class MeshQualityTab(QWidget):
         self._findings.setVisible(bool(lines))
         self._findings.setAccessibleDescription('\n'.join(lines))
 
+    def _claim_body_space(self) -> None:
+        """Either a table takes the body of the panel, or the filler does.
+
+        DP-108. A hidden widget is skipped by the layout, so with every group
+        below the headline hidden -- the state a case with no mesh is in --
+        the headline itself would be stretched down the middle of an empty
+        tab. `isHidden` rather than `isVisible` because this is asked while
+        the tab is still off screen, where nothing is visible yet.
+        """
+        drawn = any(not box.isHidden() for box in (
+            self._metrics_box, self._elements_box, self._distribution_box))
+        self._filler.setVisible(not drawn)
+
     def _populate_metrics(self, metrics) -> None:
         rows = list(metrics)
+        # DP-108. No rows, no table. The heading row of an empty grid states
+        # nothing the sentence at the top of the panel has not already said.
+        self._metrics_box.setVisible(bool(rows))
         self._metrics.setRowCount(len(rows))
         for row, metric in enumerate(rows):
             values = (
@@ -208,7 +254,9 @@ class MeshQualityTab(QWidget):
             values = (
                 str(element.get('tag') or ''),
                 _number(element.get('value')),
-                ', '.join(_number(axis) for axis in centroid),
+                # DP-165. One point, so one precision: `0.1, 4, 0.006`
+                # reads as three unrelated numbers.
+                ', '.join(aligned(centroid)),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -218,34 +266,55 @@ class MeshQualityTab(QWidget):
 
     def _update_accept(self) -> None:
         verdict = str(self._verdict.get('verdict') or '')
+        source = verdict_source(self._verdict)
         if verdict in ('', 'pass'):
-            self._set_accept(False, self.tr(
-                'This mesh met its limits; there is nothing to accept.'))
+            # DP-761. A pass is only as wide as what was measured: a Gmsh
+            # gate pass over checkMesh metrics that were never run said
+            # "met its limits" about limits nothing had checked.
+            metrics = [item for item in (self._verdict.get('metrics') or ())
+                       if isinstance(item, dict)]
+            unmeasured = sum(1 for item in metrics
+                             if str(item.get('verdict') or '') == 'unrated')
+            if unmeasured:
+                self._set_accept(False, str(self.tr(
+                    '{0} passed, but {1} of {2} metrics were not measured; '
+                    'there is nothing to accept.')).format(
+                        source, unmeasured, len(metrics)))
+            else:
+                self._set_accept(False, str(self.tr(
+                    'This mesh met the {0} limits; there is nothing to '
+                    'accept.')).format(source))
         elif verdict == 'unrated':
             self._set_accept(False, self.tr(
                 'This mesh has not been measured, so there is no verdict to '
-                'accept. Run Mesh > Check Mesh first.'))
+                'accept. Run Mesh → Mesh check first.'))
         elif not self._verdict.get('overridable') \
-                and str(self._verdict.get('source') or '') == 'checkMesh':
+                and self._verdict.get('source'):
             # An opened mesh has no run behind it to re-publish, so there is
             # nothing a waiver could bind to. Saying that is honest; offering
             # the button and failing afterwards would not be.
-            self._set_accept(False, self.tr(
-                'This verdict comes from checkMesh on an existing mesh. There '
+            self._set_accept(False, str(self.tr(
+                'This verdict comes from the {0} on an existing mesh. There '
                 'is no run to re-publish, so it cannot be accepted here.'))
+                .format(source if source != 'checkMesh' else 'checkMesh run'))
         elif self._verdict.get('overridable') and verdict in OVERRIDABLE_VERDICTS:
             self._set_accept(True, self.tr(
                 'Publish this mesh and record the decision against it.'))
         else:
             self._set_accept(False, self.tr(
                 'This mesh contains inverted or zero-volume cells. A solver '
-                'cannot integrate over one, so it cannot be accepted - '
+                'cannot integrate over one, so it cannot be accepted — '
                 're-mesh instead.'))
 
     def _set_accept(self, enabled: bool, reason: str) -> None:
         self._accept.setEnabled(enabled)
         self._accept.setToolTip(reason)
         self._accept.setAccessibleDescription(reason)
+        # DP-109. On screen only while the button cannot be pressed: once it
+        # can be, the button's own words are the whole of what there is to
+        # say, and a sentence beside it would only compete with them.
+        self._accept_reason.setText('' if enabled else str(reason))
+        self._accept_reason.setVisible(not enabled)
 
     # -- interaction ------------------------------------------------------- #
 

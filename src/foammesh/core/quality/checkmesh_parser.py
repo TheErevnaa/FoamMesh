@@ -22,6 +22,8 @@ import math
 import re
 from dataclasses import dataclass, field
 
+from foammesh.core.quantities import agreeing, count_text
+
 #: Checks that only ``-allGeometry`` / ``-allTopology`` perform. Failing one
 #: means the quality is poor, not that the mesh is unusable -- plain
 #: ``checkMesh``, which is what a solver run implies, does not even ask.
@@ -391,6 +393,15 @@ def parse_checkmesh(log: str) -> CheckMeshResult:
         else:
             result.blocking_findings.append(detail)
 
+    # DP-450. Size before faults. checkMesh grades what it looked for and
+    # an empty domain is not on its list, so a mesh with no interior arrived
+    # here with two advisory findings and left graded runnable.
+    empty = empty_mesh_finding(result)
+    if empty:
+        result.blocking_findings.insert(0, empty)
+        if empty not in result.failed_check_details:
+            result.failed_check_details.insert(0, empty)
+
     if result.incomplete:
         result.runnable = None
     else:
@@ -417,30 +428,106 @@ def _verdict(result: CheckMeshResult) -> str:
     Two facts, in the order a user needs them: can this mesh be run, and how
     good is it. Counting findings -- "2 blocking problem(s)" -- says neither,
     so the problems are named and the quality is graded instead.
+
+    DP-137. The second fact is *not* called "quality" here. The verdict strip
+    a centimetre above this line is labelled ``Quality limits:`` and carries
+    the other scale -- ``pass``/``blemish``/``fail`` -- so a sentence reading
+    ``Quality: marginal`` under a strip reading ``Quality limits: blemish``
+    put one word over two scales and left a user no way to tell which of the
+    two judged the mesh. The grade is named for what it grades instead, and
+    it points at the box by the title that box actually wears.
     """
     if result.incomplete:
-        return 'Mesh Check did not finish - no verdict.'
+        return 'Mesh check did not finish — no verdict.'
     if result.blocking_findings:
         named = '; '.join(item.rstrip('.') for item in result.blocking_findings[:2])
         more = (f'; and {len(result.blocking_findings) - 2} more'
                 if len(result.blocking_findings) > 2 else '')
-        return f'Mesh is NOT runnable - {named}{more}.'
+        return f'Mesh is NOT runnable — {named}{more}.'
 
     grade = result.quality_grade
     worst = result.worst_indicator
     if grade == 'good':
-        return 'Mesh is runnable. Quality: good.'
-    detail = (f' - {worst["name"]} {worst["value"]:g}'
-              if worst and worst['value'] is not None else '')
-    return (f'Mesh is runnable. Quality: {grade}{detail}. '
-            'See the quality indicators below.')
+        return 'Mesh is runnable. Every metric grades good.'
+    if worst is None or worst.get('value') is None:
+        # Nothing is bad enough to name -- the grade came from an advisory
+        # finding rather than from a number -- so it is the mesh as a whole
+        # being graded, and "worst metric" would point at a figure that is
+        # fine. The elbow case is exactly this one.
+        return (f'Mesh is runnable. The mesh grades {grade}. '
+                'See the metrics below.')
+    # DP-137. Written the way the strip writes it: direction, figure, unit.
+    # The strip said `max 71.9472 deg` and this line said `71.9472`, so the
+    # same measurement appeared twice in one band in two different shapes.
+    units = str(worst.get('units') or '')
+    figure = '{0} {1:g}{2}'.format(
+        str(worst.get('critical_kind') or '').strip(), worst['value'],
+        ' ' + units if units else '').strip()
+    return (f'Mesh is runnable. Worst metric grades {grade} — '
+            f'{worst["name"]} {figure}. See the metrics below.'
+            + _REMEDY.get(str(worst['name']), ''))
+
+
+#: DP-781. The one move that lowers each metric, said where the grade is
+#: read. MEASURED on mesh campaign 0925: S3 (snappy elbow, base cell 0.015 m)
+#: finished at max skewness 4.36 with 2 checkMesh checks failed; S3B, the same
+#: case at 0.01 m, read `Mesh OK`, max skewness 3.04. The remedy lived only in
+#: the Mesh check dialog, which the guided Quality and Export steps never open.
+_FINER = (' Finer cells where the surface bends lower it: a smaller base cell '
+          'size or a higher surface refinement level on snappyHexMesh, a '
+          'smaller target size on Gmsh.')
+_REMEDY = {'skewness': _FINER, 'non-orthogonality': _FINER}
+
+
+def empty_mesh_finding(result: CheckMeshResult) -> str | None:
+    """Why this mesh cannot carry a solve, from its size rather than its faults.
+
+    DP-450, MEASURED on `flat helical_pipe/snappy`: 8 points, 6 faces, 0
+    internal faces, 1 cell, 1 patch -- one hexahedron. checkMesh named two
+    findings, a small determinant and a concave cell, one cell each; both
+    classify advisory, which is correct for what they are. So
+    `blocking_findings` was empty, the mesh graded `runnable: true, severity:
+    warning`, and the sentence beside it advised the reader on refinement
+    transitions and `nCellsBetweenLevels` -- on a mesh with no internal face.
+    The paired refined leg published the identical mesh and graded the same.
+
+    A mesh with nothing in it passed by having too little to be wrong with,
+    because runnability was decided entirely by which of checkMesh's named
+    checks fired. checkMesh is not wrong here and adding a check to it is not
+    the repair: it reports the faults it looks for, and "there is no mesh" is
+    not one of them. The counts are already parsed a hundred lines above and
+    were consulted by nothing.
+
+    `internal_faces` is the discriminator and it is unambiguous. A flux
+    crosses internal faces; a domain that has none has no interior, whatever
+    its cell count says, so nothing can be solved on it. Zero cells is the
+    same statement one step earlier and is named separately, because a reader
+    told "no cells" and a reader told "no internal faces" are being told
+    different things about what went wrong upstream.
+
+    Returns the sentence to file as a blocking finding, or None when the mesh
+    has an interior or when the log did not report the counts -- a count that
+    was never parsed is unknown, and grading unknown as empty would be this
+    fault inverted.
+    """
+    if result.cells is not None and result.cells <= 0:
+        return ('The mesh has no cells, so there is nothing to solve on it.')
+    if result.internal_faces is not None and result.internal_faces <= 0:
+        if result.cells is None:
+            return ('The mesh has no internal faces, so it has no interior '
+                    'for a solver to work across.')
+        return (f'The mesh has no internal faces across its '
+                f'{count_text(result.cells, "cell")}, so it has no interior '
+                f'for a flux to cross; whatever else checkMesh reported, '
+                f'nothing can be solved on this.')
+    return None
 
 
 def _recommendations(result: CheckMeshResult) -> list[str]:
     recommendations = []
     joined = ' '.join(result.failed_check_details + result.warnings).lower()
     if result.incomplete:
-        recommendations.append('Run Mesh Check again; the log ended before a final verdict.')
+        recommendations.append('Run Mesh check again; the log ended before a final verdict.')
     if result.max_non_ortho is not None and result.max_non_ortho > 70:
         recommendations.append('Review highly non-orthogonal cells and local refinement or geometry quality.')
     if result.max_skewness is not None and result.max_skewness > 4:
@@ -451,14 +538,16 @@ def _recommendations(result: CheckMeshResult) -> list[str]:
         recommendations.append('Inspect the reported sets and patch topology before meshing again.')
     if result.advisory_findings and not result.blocking_findings:
         recommendations.append(
-            f'{len(result.advisory_findings)} quality finding(s) come from the '
-            'exhaustive checks only; the mesh is runnable. Improve them if the '
-            'solver struggles, rather than treating the run as blocked.')
+            count_text(len(result.advisory_findings), 'quality finding')
+            + agreeing(len(result.advisory_findings), ' comes', ' come')
+            + ' from the exhaustive checks only; the mesh is runnable. '
+            'Improve them if the solver struggles, rather than treating the '
+            'run as blocked.')
     if 'concave cell' in joined:
         recommendations.append(
             'Concave cells are inherent to cut-cell meshing at refinement '
             'transitions; reduce them with fewer refinement levels or a '
             'higher nCellsBetweenLevels if they matter to your solver.')
     if result.mesh_ok is True and not recommendations:
-        recommendations.append('Mesh Check passed; review any application-specific quality limits before solving.')
+        recommendations.append('Mesh check passed; review any application-specific quality limits before solving.')
     return recommendations

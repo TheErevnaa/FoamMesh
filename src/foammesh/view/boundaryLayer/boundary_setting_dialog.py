@@ -11,6 +11,8 @@ from widgets.multi_selector_dialog import SelectorItem, MultiSelectorDialog
 from foammesh.app import app
 from foammesh.db.configurations_schema import CFDType, LayerPolicy
 from foammesh.view.geometry.merged_boundaries import MergedBoundaries
+from foammesh.view.widgets.commit_guard import (
+    CONFLICT_ERRORS, commit_guard, conflict_message)
 from .thickness_form import ThicknessForm
 from .boundary_setting_dialog_ui import Ui_BoundarySettingDialog
 
@@ -107,53 +109,97 @@ class BoundarySettingDialog(QDialog):
 
     @qasync.asyncSlot()
     async def _accept(self):
-        try:
-            groupName = self._ui.groupName.text().strip()
-            if self._db.getKeys('addLayers/layers', lambda i, e: e['groupName'] == groupName and i != self._groupId):
-                await AsyncMessageBox().information(self, self.tr('Input Error'),
-                                                    self.tr('Group name "{0}" already exists.').format(groupName))
-                return
+        # DP-119. Everything this dialog writes used to go into the working
+        # copy the *page* handed it, and nothing ever committed that copy:
+        # `boundary_layer_page.save()` takes a fresh `addLayers` subtree
+        # (F-33) and then replaces `self._db` outright, so every layer group
+        # and every `geometry/<id>/layerGroup` set here was dropped on the
+        # floor. MEASURED across the `9f6abca1` sweep: ten cases meshed, ten
+        # wrote `addLayersControls { layers { } }`, and not one geometry
+        # carried a layerGroup. The write is this dialog's, so this dialog
+        # commits it -- which is what every other dialog in the window does.
+        with commit_guard(self._ui.ok):
+            try:
+                groupName = self._ui.groupName.text().strip()
+                if self._db.getKeys('addLayers/layers',
+                                    lambda i, e: e['groupName'] == groupName and i != self._groupId):
+                    await AsyncMessageBox().warning(self, self.tr('Input error'),
+                                                        self.tr('Group name "{0}" already exists.').format(groupName))
+                    return
 
-            if not self._boundaries:
-                await AsyncMessageBox().information(self, self.tr('Input Error'), self.tr('Select boundaries'))
-                return
+                if not self._boundaries:
+                    await AsyncMessageBox().warning(self, self.tr('Input error'), self.tr('Select at least one boundary.'))
+                    return
 
-            self._dbElement.setValue('groupName', groupName, self.tr('Group Name'))
-            policy = self._ui.layerPolicy.currentData()
-            self._dbElement.setValue('layerPolicy', policy, None)
-            # A frozen group *is* `nSurfaceLayers 0`; storing the count the
-            # spin box happens to hold would leave the two disagreeing.
-            self._dbElement.setValue(
-                'nSurfaceLayers',
-                '0' if policy == LayerPolicy.FREEZE
-                else self._ui.numberOfLayers.text(),
-                self.tr('Number of Layers'))
-            self._thicknessForm.save(self._dbElement)
+                self._dbElement.setValue('groupName', groupName, self.tr('Group name'))
+                policy = self._ui.layerPolicy.currentData()
+                self._dbElement.setValue('layerPolicy', policy, None)
+                # A frozen group *is* `nSurfaceLayers 0`; storing the count the
+                # spin box happens to hold would leave the two disagreeing.
+                self._dbElement.setValue(
+                    'nSurfaceLayers',
+                    '0' if policy == LayerPolicy.FREEZE
+                    else self._ui.numberOfLayers.text(),
+                    self.tr('Number of layers'))
+                self._thicknessForm.save(self._dbElement)
 
-            if self._groupId:
-                self._db.commit(self._dbElement)
-            else:
-                self._groupId = self._db.addElement('addLayers/layers', self._dbElement)
-
-            boundaries = {gId: None for gId in self._oldBoundaries}
-            for gId in self._boundaries:
-                if gId in boundaries:
-                    boundaries.pop(gId)
+                # Taken here rather than at load(): the window between OK and
+                # the commit is microseconds, where the window between opening
+                # the dialog and OK is however long the user spends in it, and
+                # a copy that old collides with every unrelated edit made
+                # since -- the collision F-33 was filed for.
+                db = app.facadeClient.checkout()
+                if self._groupId:
+                    db.commit(self._dbElement)
+                    groupId = self._groupId
                 else:
-                    boundaries[gId] = self._groupId
+                    groupId = db.addElement('addLayers/layers', self._dbElement)
 
-            for key, group in boundaries.items():
-                gId, isSlave = self._extractSelectorKey(key)
-                field = 'slaveLayerGroup' if isSlave else 'layerGroup'
-                # R137. A merged boundary is one entry standing for several
-                # rows; every solid it covers has to carry the group, or the
-                # layers reach one side of the wall only.
-                for member in self._merged.cover(gId):
-                    self._db.setValue(f'geometry/{member}/{field}', group)
+                boundaries = {gId: None for gId in self._oldBoundaries}
+                for gId in self._boundaries:
+                    if gId in boundaries:
+                        boundaries.pop(gId)
+                    else:
+                        boundaries[gId] = groupId
 
-            super().accept()
-        except ValidationError as error:
-            await AsyncMessageBox().information(self, self.tr("Input Error"), error.toMessage())
+                for key, group in boundaries.items():
+                    gId, isSlave = self._extractSelectorKey(key)
+                    field = 'slaveLayerGroup' if isSlave else 'layerGroup'
+                    # R137. A merged boundary is one entry standing for several
+                    # rows; every solid it covers has to carry the group, or the
+                    # layers reach one side of the wall only.
+                    for member in self._merged.cover(gId):
+                        db.setValue(f'geometry/{member}/{field}', group)
+
+                await app.facadeClient.commit_working_copy(db, action='update boundary layers')
+
+                # Only now: a refused commit added no group, and a dialog that
+                # had already taken the id would reopen editing an element the
+                # case has never heard of.
+                self._groupId = groupId
+                super().accept()
+            except CONFLICT_ERRORS as error:
+                # Stay open. The user's entries are still in the widgets, and
+                # everything below is read back off them on the next OK.
+                self._reopenElement()
+                await AsyncMessageBox().warning(
+                    self, self.tr('Case changed'), self.tr(conflict_message(error)))
+            except ValidationError as error:
+                await AsyncMessageBox().warning(self, self.tr("Input error"), error.toMessage())
+
+    def _reopenElement(self):
+        """Take the element again after a commit the case refused.
+
+        Committing an element marks it read-only, so the OK pressed after
+        "the case changed" would raise ``LookupError`` out of a slot instead
+        of re-trying. Every value this dialog writes is read back off its
+        widgets, so a fresh element and a fresh copy are all that is needed.
+        """
+        self._db = app.facadeClient.checkout()
+        if self._groupId:
+            self._dbElement = self._db.checkout(f'addLayers/layers/{self._groupId}')
+        else:
+            self._dbElement = self._db.newElement('addLayers/layers')
 
     def _layerPolicyChanged(self, *_args):
         """A count and a thickness only mean something when layers grow."""
@@ -233,7 +279,7 @@ class BoundarySettingDialog(QDialog):
 
     def _selectBoundaries(self):
         if self._dialog is None:
-            self._dialog = MultiSelectorDialog(self, self.tr('Select Boundaries'),
+            self._dialog = MultiSelectorDialog(self, self.tr('Select boundaries'),
                                                self._availableBoundaries, self._boundaries,
                                                app.selectionService)
             self._dialog.itemsSelected.connect(self._setBoundaries)

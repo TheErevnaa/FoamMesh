@@ -11,6 +11,8 @@ from foammesh.view.step_page import StepPage
 from widgets.progress_dialog import ProgressDialog
 
 from .export_dialog import ExportDialog
+from .export_form import (
+    EXPORT_OPERATIONS, MESH_FORMATS, extrude_payload, inline_export_page)
 from .export_2D_plane_dialog import Export2DPlaneDialog
 from .export_2D_wedge_dialog import Export2DWedgeDialog
 from foammesh.view.facade_client import query
@@ -28,7 +30,7 @@ class ExportPage(StepPage):
     def __init__(self, ui):
         super().__init__(ui, ui.exportPage)
         self._dialog = None
-        self._ui.export_.setText(self.tr('Export Mesh'))
+        self._ui.export_.setText(self.tr('Export mesh'))
         self._connectSignalsSlots()
 
     def isNextStepAvailable(self):
@@ -42,12 +44,21 @@ class ExportPage(StepPage):
         empty case directory. A probe that cannot answer never takes the
         buttons away: a disabled Export the user cannot explain is worse
         than an Export that fails with a message.
+
+        DP-62. It used to ask only whether there is a ``constant/polyMesh``,
+        and a Gmsh run targeting SU2 publishes none: the solver reads the
+        file Gmsh wrote. MEASURED in leg t7-su2 -- ten cases meshed, ten
+        exports refused, every one of them on this line, with a ``mesh.su2``
+        sitting in the run directory the whole time. So the question is the
+        wider one, and the older key is still the fallback for a payload
+        written before there was a wider one to ask.
         """
         try:
             payload = query(app.facadeClient, 'case.classify').payload or {}
         except Exception:                                     # noqa: BLE001
             return True
-        return bool(payload.get('has_mesh', True))
+        return bool(payload.get('has_exportable_mesh',
+                                payload.get('has_mesh', True)))
 
     def _updateControlButtons(self):
         # R50. Called from `updateWorkingStatus()` every time the page is
@@ -81,19 +92,16 @@ class ExportPage(StepPage):
     #: dialog does not read. ``.vtk`` from the same writer is deliberately
     #: still absent: FC-A measured it back with the right element counts and
     #: no physical groups at all.
-    MESH_FORMATS = ('openfoam', 'su2', 'gmsh', 'vtk', 'cgns', 'med', 'unv')
+    #:
+    #: Plan 33 EXPORT-04. Both lists live in ``export_form`` now, beside the
+    #: form that reads them, and are bound here under the names this page has
+    #: always offered them under. Two copies of "which operation writes which
+    #: format" is exactly the second home this package exists to remove.
+    MESH_FORMATS = MESH_FORMATS
 
     #: entry_id -> the operation that writes it. OpenFOAM keeps the authored
     #: pipeline it has always used; the rest are single-file writers.
-    EXPORT_OPERATIONS = {
-        'openfoam': 'case.export.authored',
-        'su2': 'case.export.su2',
-        'gmsh': 'case.export.gmsh',
-        'vtk': 'case.export.vtk',
-        'cgns': 'case.export.cgns',
-        'med': 'case.export.med',
-        'unv': 'case.export.unv',
-    }
+    EXPORT_OPERATIONS = EXPORT_OPERATIONS
 
     @qasync.asyncSlot()
     async def _openExport3DDialog(self):
@@ -105,7 +113,16 @@ class ExportPage(StepPage):
         The wizard's Export row needs to know whether an export actually
         happened before it marks the workflow complete, so this resolves to
         that answer rather than firing a signal into the dark.
+
+        Plan 33 EXPORT-04. When the Export step is on screen, its form has
+        already been answered and the press is an export of what the reader
+        can see; opening a window to ask the same questions a second time is
+        the fault this package exists to remove. The window stays for the
+        menu route, where there is no form on screen to answer.
         """
+        step = inline_export_page()
+        if step is not None:
+            return bool(await step.runExport())
         entries, recommended, solver_name = await self._exportFormats()
         dialog = ExportDialog(self._widget, entries, recommended, solver_name)
         if not await self._askDialog(dialog):
@@ -171,10 +188,11 @@ class ExportPage(StepPage):
 
     @staticmethod
     def _options_payload(options):
-        return {
-            'model': options.model.value, 'thickness': options.thickness,
-            'point': options.point, 'axis': options.axis, 'angle': options.angle,
-        }
+        # Plan 33 EXPORT-04. One spelling of the extrusion payload, in the
+        # module the form lives in, because the inline step writes the same
+        # one and a second copy is a second chance to send a solver a wedge
+        # with somebody else's angle in it.
+        return extrude_payload(options)
 
     def _chosenOperation(self, to2d: bool) -> str:
         """Which writer the user picked.
@@ -193,14 +211,35 @@ class ExportPage(StepPage):
         await self._runExport(to2d)
 
     async def _runExport(self, to2d=False) -> bool:
-        """Write the chosen format, and say whether a file was produced."""
+        """Write what the open dialog asked for."""
+        operation = self._chosenOperation(to2d)
+        parameters = {'destination': str(self._dialog.projectPath())}
+        # The 2D dialogs are an extrusion by construction; the shared form
+        # carries the same choice as a setting, and either way the regions
+        # and the extrusion travel with the destination.
+        extruding = to2d or bool(
+            getattr(self._dialog, 'dimensionality', lambda: '')())
+        if extruding:
+            boundaries, options = self._dialog.extrudeOptions()
+            parameters.update({'boundaries': boundaries,
+                               'options': self._options_payload(options)})
+        return await self.runExportOperation(operation, parameters)
+
+    async def runExportOperation(self, operation, parameters) -> bool:
+        """Run one export operation, and say whether a file was produced.
+
+        Plan 33 EXPORT-04. The step page reaches this rather than repeating
+        it: what an export needs around it -- a saved case, a progress
+        window, a cleared stage, the console, and the one announcement that
+        settles the Export row -- is the same act wherever it was asked for.
+        """
         # Exporting from a case that lives in the temporary directory produces
         # a real deliverable whose source is about to be swept, so the case
         # gets a home first.
         if not await app.window._requireSavedCase(self.tr('exporting')):
             return False
-        progress = ProgressDialog(self._widget, self.tr('Mesh Exporting'))
-        progress.setLabelText(self.tr('Preparing'))
+        progress = ProgressDialog(self._widget, self.tr('Mesh exporting'))
+        progress.setLabelText(self.tr('Preparing…'))
         progress.open()
         self.lock()
         # C31-12. `clearResult()` schedules its write now, and this one clears
@@ -213,20 +252,13 @@ class ExportPage(StepPage):
         console = app.consoleView
         console.clear()
         try:
-            operation = self._chosenOperation(to2d)
-            parameters = {'destination': str(self._dialog.projectPath())}
             if operation == 'case.export.authored':
                 # The authored pipeline runs OpenFOAM utilities and has
                 # progress to report. The single-file writers do not run
                 # anything, and a callback they never call is only noise.
-                parameters.update({'on_line': console.append,
-                                   'on_progress': progress.setLabelText})
-            if to2d:
-                boundaries, options = self._dialog.extrudeOptions()
-                parameters.update({
-                    'boundaries': boundaries,
-                    'options': self._options_payload(options),
-                })
+                parameters = dict(parameters,
+                                  on_line=console.append,
+                                  on_progress=progress.setLabelText)
             result = await app.facadeClient.run(operation, parameters)
             if result.status != 'accepted':
                 raise RuntimeError(result.payload.get('error', 'export operation failed'))
@@ -237,9 +269,20 @@ class ExportPage(StepPage):
             self.exported.emit()
             return True
         except Exception as error:
-            self.clearResult()
+            # Plan 32 check 8. This branch used to call `clearResult()`, and
+            # `artifact.stage.clear` is not a private tidy-up: when it removes
+            # anything it returns through `_artifact_result` with
+            # `invalidates=('mesh', 'quality')` and publishes
+            # ARTIFACT_MESH_CHANGED. So the one branch that runs when an
+            # export produced no file was the branch that told the rest of the
+            # application the mesh had changed -- staling the quality reports
+            # and dropping the viewport actor over an SU2 writer that was
+            # unavailable or a destination that was not writable. A failed
+            # optional export is a statement about the export. The accepted
+            # native result stays inspectable; the pre-write clear above is
+            # the only clear this method performs.
             console.appendError(str(error))
-            progress.finish(self.tr('Export failed. ') + str(error))
+            progress.finish(self.tr('Export failed: {0}').format(error))
             return False
         finally:
             self.unlock()

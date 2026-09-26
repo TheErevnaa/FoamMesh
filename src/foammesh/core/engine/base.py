@@ -117,6 +117,16 @@ class MeshingEngine(Protocol):
     #: empty string for an engine that has no such gate.
     blocking_gate_task: str = ''
 
+    #: Whether one case may hold solid models (STEP/IGES/BREP) beside
+    #: triangulated surfaces (STL/OBJ). snappy meshes both from the surfaces
+    #: it stages; the Gmsh job imports one kind or the other (DP-638).
+    mixes_cad_and_surfaces: bool = True
+
+    #: Whether a non-conformal (NCC) interface pair is built by this engine.
+    #: snappy stages it for OpenFOAM's NCC; Gmsh has no such coupling
+    #: (DP-641), so the Geometry page disables the choice for it.
+    builds_non_conformal_interfaces: bool = True
+
     #: What one whole-mesh run of this engine performs, in order.
     ATOMIC_RUN_TASKS: tuple = ()
 

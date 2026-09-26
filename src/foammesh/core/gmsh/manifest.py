@@ -35,6 +35,34 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+#: Where a run records the processor layout it actually ran with.
+MESH_LAYOUT_KEY = 'mesh_layout'
+
+
+def mesh_layout_of_job(job) -> dict:
+    """The ``{'cores', 'decomposed'}`` this run will mesh with.
+
+    Plan 32 UX-13 / DP-229. The rank count a run resolved lived only in the
+    job payload it was launched from, so anything downstream that needed to
+    know whether ``processor*`` directories exist had to read a per-project
+    settings dialog instead -- a different store, answering a different
+    question, and never updated by a run. Recording it on the run makes the
+    honest answer readable after the fact.
+
+    A job with no allocation at all -- which is every Gmsh job, because Gmsh
+    meshes in one process -- ran serially, and one rank is what that means.
+    """
+    allocation = (job or {}).get('allocation')
+    ranks = 1
+    if isinstance(allocation, dict):
+        try:
+            ranks = int(allocation.get('effective_ranks') or 1)
+        except (TypeError, ValueError):
+            ranks = 1
+    ranks = max(1, ranks)
+    return {'cores': ranks, 'decomposed': ranks > 1}
+
+
 @dataclass(frozen=True)
 class RunLayout:
     """Where one run keeps its inputs and outputs."""
@@ -68,6 +96,18 @@ class RunLayout:
     @property
     def su2(self) -> Path:
         return self.root / 'mesh.su2'
+
+    @property
+    def surface(self) -> Path:
+        """DP-133. The surface pass of a 3D run, kept so it can be looked at.
+
+        Deliberately not one of :meth:`outputs`. Those are the formats the
+        user asked to export, they are checked for round-trip identity and
+        they are what the Export page offers; this is a byproduct the
+        viewport can draw, and putting it in that list would offer it as a
+        format to export to.
+        """
+        return self.root / 'surface.msh'
 
     def outputs(self, formats=('msh',)) -> dict:
         names = {'msh': self.mesh, 'su2': self.su2,
@@ -175,6 +215,7 @@ class RunBuilder:
             'warnings': list(job.get('intent', {}).get('warnings', ())),
             'artifacts': _artifact_rows(
                 layout, tuple((job.get('output') or {}).keys())),
+            MESH_LAYOUT_KEY: mesh_layout_of_job(job),
         }
         manifest = RunManifest(run_id, layout, document)
         manifest.write()
@@ -211,10 +252,29 @@ class RunBuilder:
             'control_mismatches': list(result.get('controlMismatches') or ()),
             'unresolved_scopes': list(result.get('unresolvedScopes') or ()),
             'runner_warnings': list(result.get('warnings') or ()),
+            # DP-549. Each authored interface pair and what the mesh holds
+            # where it points, at the top of the receipt beside the warnings,
+            # so "did my pair take effect" is one lookup rather than a search
+            # through the statistics.
+            'interface_pairs': list(
+                (statistics.get('interfacePairs') or {}).get('pairs') or ()),
         })
         manifest.document['meshed_by'] = _meshed_by(statistics)
         if manifest.layout.mesh.is_file():
             manifest.document['mesh_sha256'] = sha256_of(manifest.layout.mesh)
+        # DP-133. The surface pass, recorded in its own key rather than as an
+        # `artifacts` row. Everything that reads that list reads it as the
+        # formats this run can hand on -- the Export page offers them, the
+        # publisher and the census read them, `latest_artifact` hands them to
+        # callers outside this package -- and the surface pass is none of
+        # those. It is a byproduct the viewport can draw, so it is recorded
+        # where something looking for it will find it and nothing looking for
+        # an export will trip over it.
+        surface = manifest.layout.surface
+        if surface.is_file():
+            manifest.document['surface_artifact'] = {
+                'name': surface.name, 'path': str(surface),
+                'bytes': surface.stat().st_size}
         rows = manifest.document.get('artifacts')
         if not rows:
             # An older run, or one created before the artifact list existed.
@@ -313,6 +373,23 @@ def run_artifacts(document, fmt: str = '') -> tuple[dict, ...]:
     if fmt:
         rows = [row for row in rows if row.get('format') == fmt]
     return tuple(rows)
+
+
+def run_surface_artifact(document) -> dict | None:
+    """The surface pass a run recorded, if that file is still on disk.
+
+    DP-133. Re-checked rather than trusted: the record is an absolute path
+    from the machine the run happened on, and a run directory that has been
+    copied, moved or cleaned out would otherwise be reported as holding a
+    mesh nobody could open.
+    """
+    record = (document or {}).get('surface_artifact')
+    if not isinstance(record, dict):
+        return None
+    path = Path(str(record.get('path') or ''))
+    if not path.is_file():
+        return None
+    return {**record, 'path': str(path)}
 
 
 def latest_artifact(case_path: str | Path, fmt: str) -> dict | None:
@@ -498,6 +575,74 @@ def accepted_artifact(case_path: str | Path, fmt: str) -> dict | None:
             if path.is_file():
                 return {**row, 'run_id': document.get('run_id', root.name),
                         'run_path': str(root), 'run_manifest': document}
+    return None
+
+
+def recorded_mesh_layout(document) -> dict | None:
+    """The processor layout a run recorded, or ``None`` if it recorded none.
+
+    ``None`` says the record is absent -- a case meshed by a build that did
+    not write one -- and never that the run was serial. The two have to stay
+    distinguishable: a caller that read a missing record as serial would be
+    guessing on the user's behalf about where the mesh is.
+    """
+    layout = (document or {}).get(MESH_LAYOUT_KEY)
+    if not isinstance(layout, dict):
+        return None
+    try:
+        cores = int(layout.get('cores') or 0)
+    except (TypeError, ValueError):
+        return None
+    if cores < 1:
+        return None
+    return {'cores': cores, 'decomposed': bool(layout.get('decomposed'))}
+
+
+def _layout_from_job_file(root) -> dict | None:
+    """The layout of a run recorded before the manifest carried one.
+
+    ``job.json`` is written beside the manifest when the run directory is
+    opened, and a snappy job has always carried its allocation there, so a
+    case meshed by the previous build is still readable rather than being
+    pushed onto a fallback it does not need.
+    """
+    try:
+        job = json.loads(
+            (Path(root) / 'job.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(job, dict) or 'allocation' not in job:
+        return None
+    return mesh_layout_of_job(job)
+
+
+def accepted_run_layout(case_path: str | Path) -> dict | None:
+    """The processor layout of the newest run the user kept, or ``None``.
+
+    Plan 32 UX-13 / DP-229. An export is built from the result the user
+    accepted -- that is what :func:`accepted_artifact` is for -- so the layout
+    it has to reproduce is the one that run used, not whatever a settings
+    dialog was last left holding. MEASURED: a serial native mesh failed its
+    first export because the per-project Parallel Environment dialog still
+    said two, and the export went looking for a ``processor0`` the run had
+    never created.
+
+    ``None`` is returned when the newest kept run records no layout, which is
+    what a case meshed by an older build looks like; the caller then keeps
+    whatever behaviour it had before. Older runs are not consulted, because
+    the mesh being exported belongs to the newest kept one.
+    """
+    for root, document in run_documents(case_path):
+        if run_disposition(document) not in EXPORTABLE:
+            continue
+        layout = recorded_mesh_layout(document)
+        if layout is None:
+            layout = _layout_from_job_file(root)
+        if layout is None:
+            return None
+        return {**layout,
+                'run_id': str(document.get('run_id') or root.name),
+                'run_path': str(root)}
     return None
 
 

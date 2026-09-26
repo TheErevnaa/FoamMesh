@@ -26,6 +26,9 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.core.gmsh import fields as _gmsh_fields
+from foammesh.db.configurations_schema import (
+    GmshPeriodicTransform, InterfaceTransform, ThicknessModel,
+)
 
 
 #: ``translation_x`` / ``centre.x`` -- both spellings are in the schema.
@@ -58,10 +61,10 @@ _size_field_keys = _gmsh_fields.editor_keys_for_field_type
 RELEVANCE: dict = {
     'geometry.interface_pairs': ('transform', {
         # Faces already touch; there is no transform to describe.
-        'coincident': frozenset(),
-        'translational': frozenset({
+        InterfaceTransform.COINCIDENT.value: frozenset(),
+        InterfaceTransform.TRANSLATIONAL.value: frozenset({
             'translation_x', 'translation_y', 'translation_z'}),
-        'rotational': frozenset({
+        InterfaceTransform.ROTATIONAL.value: frozenset({
             'rotation_centre_x', 'rotation_centre_y', 'rotation_centre_z',
             'rotation_axis_x', 'rotation_axis_y', 'rotation_axis_z',
             'rotation_angle_degrees'}),
@@ -112,17 +115,122 @@ RELEVANCE: dict = {
         'geometry': frozenset(),
         'pattern': frozenset({'patch_pattern'}),
     }),
-    # The same idea, in the Gmsh schema's dotted spelling.
+    # The same idea, in the Gmsh schema's dotted spelling -- and in the Gmsh
+    # schema's own two words. PERIODIC-01: this branch map was copied from the
+    # geometry pair above and kept that field's three values, which a Gmsh
+    # periodic pair has never been able to hold. Every lookup missed, every
+    # miss took the "unrecognised value" path below, and that path shows the
+    # union of all branches: a translation pair offered a rotation centre, a
+    # rotation axis and an angle, and a rotation pair offered a translation.
+    # The values are read off the enum the field is typed by now, so a
+    # renamed member cannot leave a rule behind that quietly matches nothing.
     'gmsh.periodic_pairs.controls': ('transform', {
-        'coincident': frozenset(),
-        'translational': frozenset({
+        GmshPeriodicTransform.TRANSLATION.value: frozenset({
             'translation.x', 'translation.y', 'translation.z'}),
-        'rotational': frozenset({
+        GmshPeriodicTransform.ROTATION.value: frozenset({
             'rotation_centre.x', 'rotation_centre.y', 'rotation_centre.z',
             'rotation_axis.x', 'rotation_axis.y', 'rotation_axis.z',
             'rotation_angle_degrees'}),
     }),
 }
+
+
+#: DP-596 (field audit 0924 snappy-back D4). Rules a collection needs *beside*
+#: its ``RELEVANCE`` entry, because one row can be decided by more than one
+#: field. A layer group's pattern box follows its patch selector, and its
+#: thickness boxes follow its thickness model: the writer
+#: (``CaseBuilder._canonical_layer_values``) reads exactly two of the four
+#: stack values per model, so the other two were boxes a user filled in and
+#: the mesh never saw. A row is shown only when every rule naming it agrees.
+ALSO_RELEVANT: dict = {
+    'meshing.layers.groups': (('thickness_model', {
+        ThicknessModel.FIRST_AND_OVERALL.value: frozenset({
+            'first_layer_thickness', 'thickness'}),
+        ThicknessModel.FIRST_AND_EXPANSION.value: frozenset({
+            'first_layer_thickness', 'expansion_ratio'}),
+        ThicknessModel.FINAL_AND_OVERALL.value: frozenset({
+            'final_layer_thickness', 'thickness'}),
+        ThicknessModel.FINAL_AND_EXPANSION.value: frozenset({
+            'final_layer_thickness', 'expansion_ratio'}),
+        ThicknessModel.OVERALL_AND_EXPANSION.value: frozenset({
+            'thickness', 'expansion_ratio'}),
+        ThicknessModel.FIRST_AND_RELATIVE_FINAL.value: frozenset({
+            'first_layer_thickness', 'final_layer_thickness'}),
+    }),),
+}
+
+
+def relevance_rules(collection_id: str) -> tuple:
+    """Every ``(controlling field, branches)`` rule *collection_id* has."""
+    rules = []
+    if collection_id in RELEVANCE:
+        rules.append(RELEVANCE[collection_id])
+    rules.extend(ALSO_RELEVANT.get(collection_id, ()))
+    return tuple(rules)
+
+
+def _as_rules(relevance) -> tuple:
+    """One rule, or a sequence of them, as a tuple of rules."""
+    if not relevance:
+        return ()
+    if len(relevance) == 2 and isinstance(relevance[0], str):
+        return (tuple(relevance),)
+    return tuple(relevance)
+
+
+def check_relevance(relevance: dict) -> None:
+    """Refuse a rule written against a value the field cannot hold.
+
+    PERIODIC-01. A branch keyed by a word the controlling field has never
+    offered is not a rule with no effect: it is a rule that never matches, and
+    a value that matches nothing falls through to the union of every branch --
+    so the one collection whose map was copied from another schema showed
+    every conditional row on every pair, which is the arrangement this whole
+    table exists to prevent. It is silent, it survives a rename, and it looks
+    exactly like a table that works.
+
+    So the map is checked against the registry the editors are built from: the
+    branches of a rule must be the controlling field's own values, and a
+    branch may only name fields that collection has. Checked at import, on the
+    module the dialog lives in, so a rule written against the wrong spelling
+    cannot reach a user.
+    """
+    from foammesh.core.facade.field_adapters import EntityAdapter
+    from foammesh.core.facade.fields import REGISTRY
+
+    for collection_id, (controlling, branches) in dict(relevance).items():
+        collection = REGISTRY.collections.get(collection_id)
+        if collection is None:
+            raise ValueError(
+                f'{collection_id} has a relevance rule and no collection')
+        fields = EntityAdapter(collection).fields
+        descriptor = getattr(fields.get(controlling), 'descriptor', None)
+        if descriptor is None:
+            raise ValueError(
+                f'{collection_id} is branched on {controlling!r}, which is '
+                f'not one of its fields')
+        offered = frozenset(descriptor.enum or ())
+        if not offered:
+            raise ValueError(
+                f'{collection_id}.{controlling} holds no fixed set of '
+                f'values, so it cannot decide which rows apply')
+        written = frozenset(str(value) for value in branches)
+        if written != offered:
+            raise ValueError(
+                f'{collection_id} branches on {sorted(written)} and '
+                f'{controlling} holds {sorted(offered)}')
+        for value, keys in branches.items():
+            unknown = sorted(str(key) for key in keys if key not in fields)
+            if unknown:
+                raise ValueError(
+                    f'{collection_id} shows {unknown} for {value!r} and has '
+                    f'no such field')
+
+
+check_relevance(RELEVANCE)
+for _collection, _rules in ALSO_RELEVANT.items():
+    for _rule in _rules:
+        check_relevance({_collection: _rule})
 
 
 def component_groups(keys) -> list:
@@ -186,7 +294,8 @@ class ChildEditorDialog(QDialog):
         self.setObjectName('childEditorDialog')
         self.setModal(True)
         self._editors = editors
-        self._relevance = relevance
+        # DP-596: one rule or several, held as a tuple of rules.
+        self._relevance = _as_rules(relevance)
         self._annotations = dict(annotations or {})
         self._form = None
         self._rowKeys: list = []
@@ -257,13 +366,54 @@ class ChildEditorDialog(QDialog):
     def _connectRelevance(self):
         if not self._relevance:
             return
-        controlling, _branches = self._relevance
-        editor = self._editors.get(controlling)
-        if editor is None:
-            self._relevance = None
-            return
-        editor.valueChanged.connect(lambda *_args: self.applyRelevance())
+        self._relevance = tuple(
+            rule for rule in self._relevance if rule[0] in self._editors)
+        self._relevanceSources = []
+        for controlling, _branches in self._relevance:
+            editor = self._editors[controlling]
+            self._relevanceSources.append(editor)
+            editor.valueChanged.connect(self._relevanceChanged)
         self.applyRelevance()
+
+    def _relevanceChanged(self, *_args):
+        self.applyRelevance()
+
+    def releaseEditors(self, owner=None):
+        """Hand the panel's widgets back before this dialog is destroyed.
+
+        DP-495 (audit MA-07). The form lays out the panel's own editor widgets,
+        so while it exists they are this dialog's children -- and deleting a
+        dialog deletes its children. The panel drops the dialog whenever a
+        scope picker is rebuilt, which is every time the geometry is prepared
+        or discarded, and every editor it had *not* rebuilt went with it: the
+        next Add wrote its default into a Name box that no longer existed and
+        opened nothing, on both engine routes. The editors are the panel's and
+        outlive any one opening, so each widget goes back to the editor that
+        owns it, the annotations go back to their owner, and the relevance
+        rule stops listening before the dialog it drives is gone.
+
+        *owner* is where the annotation widgets wait for the next opening.
+        """
+        for source in getattr(self, '_relevanceSources', ()):
+            try:
+                source.valueChanged.disconnect(self._relevanceChanged)
+            except (RuntimeError, TypeError):
+                pass
+        self._relevanceSources = []
+        for editor in list(self._editors.values()):
+            for widget in (editor.label, editor.editor, editor.unit_label):
+                try:
+                    if widget is not None and widget.parent() is not editor:
+                        widget.setParent(editor)
+                except RuntimeError:
+                    # Already gone with an editor the panel replaced.
+                    continue
+        for widget in self._annotations.values():
+            try:
+                widget.setParent(owner)
+                widget.hide()
+            except RuntimeError:
+                continue
 
     def applyRelevance(self):
         """Hide the rows this kind of item does not have.
@@ -274,20 +424,24 @@ class ChildEditorDialog(QDialog):
         """
         if not self._relevance or self._form is None:
             return
-        controlling, branches = self._relevance
-        value = self._editors[controlling].value()
-        value = getattr(value, 'value', value)
-        applicable = branches.get(str(value))
-        if applicable is None:
-            # An unrecognised value is not a reason to hide fields: showing
-            # too much is a nuisance, hiding a field someone needs is a wall.
-            applicable = frozenset().union(*branches.values()) if branches \
+        judged = []
+        for controlling, branches in self._relevance:
+            value = self._editors[controlling].value()
+            value = getattr(value, 'value', value)
+            applicable = branches.get(str(value))
+            if applicable is None:
+                # An unrecognised value is not a reason to hide fields: showing
+                # too much is a nuisance, hiding a field someone needs is a wall.
+                applicable = frozenset().union(*branches.values()) if branches \
+                    else frozenset()
+            conditional = frozenset().union(*branches.values()) if branches \
                 else frozenset()
-        conditional = frozenset().union(*branches.values()) if branches \
-            else frozenset()
+            judged.append((conditional, applicable))
         for row, keys in enumerate(self._rowKeys):
-            optional = keys & conditional
-            self._form.setRowVisible(row, not optional or bool(keys & applicable))
+            # DP-596: a row stays only if every rule naming it keeps it.
+            visible = all(not (keys & conditional) or bool(keys & applicable)
+                          for conditional, applicable in judged)
+            self._form.setRowVisible(row, visible)
         self.adjustSize()
 
     def _scalar(self, editor) -> QWidget:

@@ -10,6 +10,7 @@ from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
 from widgets.async_message_box import AsyncMessageBox
 from widgets.radio_group import RadioGroup
+from foammesh.view.theming.metrics import place_unit
 from widgets.rendering.point_widget import PointWidget
 
 from foammesh.app import app
@@ -48,6 +49,11 @@ class RegionForm(QWidget):
 
         self._pointWidget.off()
         self._typeRadios.setObjectMap(self._types)
+
+        # DP-198. The row label said `Point inside the region (m)`, three
+        # boxes away from the numbers it was describing. One `m` closes the
+        # row instead, after the last of them.
+        place_unit(self._ui.z, 'm')
 
         self.hide()
 
@@ -109,7 +115,7 @@ class RegionForm(QWidget):
         db = app.facadeClient.checkout()
         self._dbElement = db.newElement('region')
 
-        self._ui.regionForm.setTitle(self.tr('Add Region'))
+        self._ui.regionForm.setTitle(self.tr('Add region'))
         self._ui.name.setText(f"{self._baseName}{db.getUniqueSeq('region', 'name', self._baseName, 1)}")
         self._setPoint(self._defaultPoint)
         self._ui.ok.setText(self.tr('Add'))
@@ -121,7 +127,7 @@ class RegionForm(QWidget):
         self._id = id_
         self._dbElement = app.facadeClient.checkout(f'region/{id_}')
 
-        self._ui.regionForm.setTitle(self.tr('Edit Region'))
+        self._ui.regionForm.setTitle(self.tr('Edit region'))
         self._ui.name.setText(self._dbElement.getValue('name'))
         self._typeRadios.setValue(self._dbElement.getValue('type'))
         x, y, z = self._dbElement.getVector('point')
@@ -176,21 +182,22 @@ class RegionForm(QWidget):
             name = self._ui.name.text()
             if app.facadeClient.checkout().getElements(
                     'region', lambda i, e: e['name'] == name and i != self._id):
-                QMessageBox.information(self, self.tr('Input Error'), self.tr('Region "{0}" already exists.').format(name))
+                QMessageBox.warning(self, self.tr('Input error'), self.tr('Region "{0}" already exists.').format(name))
                 return
 
             try:
-                x = self._ui.x.pFloat(self.tr('X Coordinate'))
-                y = self._ui.y.pFloat(self.tr('Y Coordinate'))
-                z = self._ui.z.pFloat(self.tr('Z Coordinate'))
+                x = self._ui.x.pFloat(self.tr('X coordinate'))
+                y = self._ui.y.pFloat(self.tr('Y coordinate'))
+                z = self._ui.z.pFloat(self.tr('Z coordinate'))
 
             except ValueError as e:
-                await AsyncMessageBox().warning(self, self.tr('Warning'), str(e))
+                await AsyncMessageBox().warning(
+                    self, self.tr('Input error'), str(e))
                 return
 
             if not self._pointWidget.bounds().includes((float(x), float(y), float(z))):
-                QMessageBox.information(self, self.tr('Input Error'),
-                                        self.tr('Invalid Point - outside bounding box').format(name))
+                QMessageBox.warning(self, self.tr('Input error'),
+                                        self.tr('The point is outside the bounding box.'))
                 return
 
             try:
@@ -218,7 +225,7 @@ class RegionForm(QWidget):
             except CONFLICT_ERRORS as error:
                 # Stay open: the user's entries are still here, and the only
                 # thing that changed is what the case looked like underneath.
-                QMessageBox.information(
-                    self, self.tr('Case Changed'), self.tr(conflict_message(error)))
+                QMessageBox.warning(
+                    self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                QMessageBox.information(self, self.tr("Input Error"), e.toMessage())
+                QMessageBox.warning(self, self.tr("Input error"), e.toMessage())

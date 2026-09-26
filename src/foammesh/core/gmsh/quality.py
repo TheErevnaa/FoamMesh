@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from foammesh.core.quantities import agreeing, count_text
+
 CALCULATION_VERSION = 'gmsh.quality.v2'
 
 #: Gmsh quality measures and whether a higher value is better.
@@ -411,9 +413,11 @@ def _judge(limit: QualityLimit, block: dict) -> MetricVerdict:
         inverted = int(block.get('inverted', 0) or 0) or None
         counted = inverted if inverted is not None else below
         verdict, reason = INVALID, (
-            f'{counted} element(s) are at or below the hard floor of '
-            f'{limit.hard_floor:g} for {limit.measure} (worst {minimum:.4g}); '
-            'an inverted or zero-volume cell cannot be accepted')
+            f'{count_text(counted, "element")} '
+            f'{agreeing(counted, "is", "are")} at or below the hard '
+            f'floor of {limit.hard_floor:g} for {limit.measure} '
+            f'(worst {minimum:.4g}); an inverted or zero-volume cell cannot '
+            'be accepted')
     elif below == 0:
         verdict, reason = PASS, ''
     elif below <= allowance:
@@ -433,6 +437,102 @@ def _judge(limit: QualityLimit, block: dict) -> MetricVerdict:
         achieved_minimum=minimum, achieved_mean=mean, below_threshold=below,
         total=total, allowance=allowance, verdict=verdict, reason=reason,
         substituted_for=substituted, offending=offending)
+
+
+def _the_remedy_that_can_act(governing, per_measure: dict, *,
+                             optimize: bool = True) -> str:
+    """What to advise a user whose mesh was refused and whose repair pass is off.
+
+    DP-82. The repair pass moves nodes, so it can only help where moving a
+    node helps. When the surface the volume was built on reads no better than
+    the volume does, moving nodes cannot: a cell resting on a sliver face is a
+    sliver, and the face is where the surface put it. MEASURED on gmsh
+    drone_quadcopter -- 1405 of 5228 boundary faces below gamma 0.1 against
+    5097 of 259863 cells, and turning the repair pass on left 5741 cells below
+    the limit instead of 5097, worst 0.000344 to 0.000388. Advice that costs a
+    second run to disprove is worse than no advice, which is the same reason
+    DP-76 stopped advising it on a layered mesh.
+    """
+    surface = {}
+    for block in per_measure.values():
+        candidate = dict(block or {}).get('surface') or {}
+        if int(candidate.get('total', 0) or 0):
+            surface = candidate
+            break
+    faces = int(surface.get('total', 0) or 0)
+    bad_faces = int(surface.get('below_threshold', 0) or 0)
+    cells = int(governing.total or 0)
+    bad_cells = int(governing.below_threshold or 0)
+    surface_share = (bad_faces / faces) if faces else 0.0
+    volume_share = (bad_cells / cells) if cells else 0.0
+    if (not bad_faces or surface_share < volume_share) and not optimize:
+        # DP-780. MEASURED on mesh campaign 0925 run G9A (elbow, Optimize and
+        # Netgen off): refused at 24 of 9150 below sICN 0.1. Re-run with the
+        # repair pass on it came back INVALID, 3 inverted; with Optimize on
+        # it passed, 0 of 8482 below, worst 0.4932.
+        return ("the mesh was refused on quality with 'Optimize' switched "
+                'off, so Gmsh ran no optimisation pass over the tetrahedra it '
+                "built. Turn 'Optimize' back on (its default) under Advanced "
+                'on the Generate mesh step; the repair pass is not a '
+                'substitute for it.')
+    if not bad_faces or surface_share < volume_share:
+        return ('the mesh was refused on quality and the repair pass was off; '
+                "turning on 'Repair poor elements' runs Gmsh's untangling and "
+                'relocation optimisers on the elements that failed, before '
+                'the mesh is judged. It acts on straight-sided elements only.')
+    geometry = (
+        ' This run meshed the imported triangulation as it was supplied, so '
+        'that surface is the geometry: repair or replace the tessellation, or '
+        'raise the allowance for this case.'
+        if surface.get('keptTessellation') else
+        ' Refine or remesh the surface before the volume is built on it, or '
+        'raise the allowance for this case.')
+    return (
+        f'the mesh was refused on quality, and the surface it was built on '
+        f'carries the same fault: {bad_faces:,} of '
+        f'{count_text(faces, "boundary face")} '
+        f'({surface_share:.1%}) {agreeing(bad_faces, "is", "are")} '
+        'themselves below the requested '
+        f'{governing.measure} of {governing.requested_minimum:g}, the worst at '
+        f"{float(surface.get('minimum', 0.0) or 0.0):.3g}, against "
+        f'{bad_cells} of {cells} ({volume_share:.1%}) in the volume. A cell '
+        f'resting on a sliver face is a sliver, so the repair pass cannot lift '
+        f'it: it moves nodes, and these nodes are where the surface put them.'
+        + geometry)
+
+
+def refusal_words(verdict) -> str:
+    """The refusal a user reads: the verdict's reason and the remedy it found.
+
+    DP-94. :func:`assess` is the only place that knows both why a mesh was
+    refused and what can act on it, and it writes the second half into
+    ``warnings`` -- which the failure the user is shown never carried.
+    MEASURED on gmsh drone_quadcopter: the window said `4991 of 260945
+    elements (1.91%) fall below the requested gamma of 0.1; the worst is
+    0.0003504 and the allowance is 1304` and stopped there, while the
+    verdict beside it held `the surface it was built on carries the same
+    fault: 1703 of 5240 boundary face(s) (32.5%) are themselves below the
+    requested gamma of 0.1 ... repair or replace the tessellation, or raise
+    the allowance for this case`. The count is the symptom; the sentence
+    that was dropped is the only one that says what to do next.
+
+    Each piece was written to sit alone, so each is given a stop and an
+    opening capital here rather than running the second one on in the middle
+    of a sentence it did not start.
+    """
+    parts: list[str] = []
+    for text in (verdict.reason, *verdict.warnings):
+        text = str(text or '').strip()
+        if not text:
+            continue
+        if text[:1].islower():
+            text = text[:1].upper() + text[1:]
+        if not text.endswith(('.', '!', '?')):
+            text += '.'
+        if text in parts:
+            continue
+        parts.append(text)
+    return ' '.join(parts)
 
 
 def assess(thresholds: QualityThresholds, achieved: dict | None) -> QualityVerdict:
@@ -459,7 +559,27 @@ def assess(thresholds: QualityThresholds, achieved: dict | None) -> QualityVerdi
             total=0, accepted=False, verdict=FAIL,
             reason='the run recorded no element qualities to judge')
 
+    # DP-76. The runner judges the limit against the cells it means something
+    # for and records the boundary layer beside them, because gamma condemns
+    # anisotropy and a layer cell is anisotropic on purpose. The gate reads
+    # that here for two reasons: to say the layer was counted and not judged,
+    # and because the remedy it would otherwise advise cannot touch a prism.
+    layers = [dict(block or {}).get('layerCells') or {}
+              for block in per_measure.values()]
+    layers = [block for block in layers if int(block.get('total', 0) or 0)]
+    layered = bool(layers)
+
     verdicts, warnings = [], []
+    if layered:
+        seen = layers[0]
+        warnings.append(
+            count_text(int(seen.get('total', 0) or 0), 'boundary-layer cell')
+            + agreeing(int(seen.get('total', 0) or 0), ' is', ' are')
+            + ' counted beside this judgement rather than inside it '
+            f"({int(seen.get('below_threshold', 0) or 0)} of them fall below "
+            f'the limit): the measure reads a deliberately thin cell as a bad '
+            f'one. They are still required not to invert, and '
+            f"{int(seen.get('inverted', 0) or 0)} did.")
     for limit in thresholds.limits:
         block = per_measure.get(limit.measure)
         if block is None and limit.measure not in GMSH_QUERY_NAME:
@@ -501,12 +621,29 @@ def assess(thresholds: QualityThresholds, achieved: dict | None) -> QualityVerdi
     # Plan 31 FC-D. A refusal that does not name its own remedy leaves the
     # user to find it. Gmsh's repair optimisers exist for exactly this mesh,
     # and this is the only place that knows the mesh was refused.
-    if overall in (FAIL, INVALID) and not thresholds.repair_poor_elements:
-        warnings.append(
-            'the mesh was refused on quality and the repair pass was off; '
-            "turning on 'Repair poor elements' runs Gmsh's untangling and "
-            'relocation optimisers on the elements that failed, before the '
-            'mesh is judged. It acts on straight-sided elements only.')
+    # DP-780. With the mesher's own optimiser switched off, the refusal is
+    # judged too: that switch, not the repair pass, is the remedy to name.
+    if overall in (FAIL, INVALID) and (not thresholds.repair_poor_elements
+                                       or not thresholds.optimize):
+        # DP-76. Only where the remedy can act. A mesh carrying a boundary
+        # layer is one it cannot: MEASURED on drone_quadcopter, with the
+        # repair pass turned on, UntangleMeshGeometry refused the mesh
+        # outright -- 'prism not supported yet, abort' -- and Relocate3D ran
+        # over 276574 cells without moving one. Advice that costs the user a
+        # second run to disprove is worse than no advice.
+        if layered and thresholds.repair_poor_elements:
+            pass                    # the pass ran; there is nothing to name
+        elif layered:
+            warnings.append(
+                'the mesh was refused on quality and the repair pass was '
+                "off, but turning on 'Repair poor elements' would not "
+                'rescue this mesh: it carries a boundary layer, and Gmsh '
+                "refuses to untangle prisms ('prism not supported yet') "
+                'while the relocation pass was measured moving nothing. '
+                'Change the layer, the surface sizing, or the geometry.')
+        else:
+            warnings.append(_the_remedy_that_can_act(
+                governing, per_measure, optimize=thresholds.optimize))
     return QualityVerdict(
         measure=governing.measure,
         requested_minimum=governing.requested_minimum,

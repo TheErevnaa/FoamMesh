@@ -525,3 +525,69 @@ def _persist(case: Path, verdict: dict, *, mesh_source=None) -> str:
         verdict.setdefault('warnings', []).append(
             'the readiness report could not be filed: {0}'.format(error))
         return ''
+
+
+def _rounded(value) -> str:
+    """A measured number as the check itself recorded it."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number == int(number):
+        return str(int(number))
+    return '{0:.4g}'.format(number)
+
+
+def su2_readiness_readout(document):
+    """Project a stored readiness report the way checkMesh reports are.
+
+    Plan 33 QA-05. The SU2 route is the one route that publishes no polyMesh,
+    so it was also the route with the least evidence on screen: a paragraph
+    explaining that checkMesh would not run, above no table at all. The check
+    had measured cells, markers, non-orthogonality and skewness the whole
+    time. This is the same shape of answer
+    :func:`core.quality.readout.checkmesh_readout` gives -- named rows, a
+    verdict beside each, a headline -- so the two routes cannot describe the
+    same kind of evidence differently.
+
+    Additive: nothing here changes what the check measures or what it files.
+    """
+    from foammesh.core.quality.readout import Readout, ReadoutRow, absent
+
+    if not document:
+        return absent('su2-readiness', 'SU2 readiness')
+    result = dict(document.get('result') or {})
+    rated = 'pass' if result.get('mesh_ok') else 'unrated'
+    rows = []
+    for finding in result.get('blocking_findings') or ():
+        rows.append(ReadoutRow('blocking', 'fail', str(finding)))
+    for finding in result.get('advisory_findings') or ():
+        rows.append(ReadoutRow('advisory', 'warning', str(finding)))
+    if not rows:
+        for finding in result.get('warnings') or ():
+            rows.append(ReadoutRow('advisory', 'warning', str(finding)))
+    # The counts first, because they are what a user checks a converted mesh
+    # against, then the metrics SU2 itself is sensitive to.
+    for label, key in (('Volume cells', 'cells'),
+                       ('Boundary markers', 'patches'),
+                       ('Points', 'points'),
+                       ('Faces', 'faces'),
+                       ('Max non-orthogonality', 'max_non_ortho'),
+                       ('Max skewness', 'max_skewness'),
+                       ('Min cell volume', 'min_cell_volume')):
+        if result.get(key) is not None:
+            rows.append(ReadoutRow(label, rated, _rounded(result[key])))
+    severity = str(result.get('severity') or 'unrated')
+    blocking = len(result.get('blocking_findings') or ())
+    advisory = len(result.get('advisory_findings') or ())
+    headline = '{0} — {1} blocking and {2} advisory findings.'.format(
+        severity, blocking, advisory)
+    caveat = ''
+    if document.get('stale'):
+        caveat = ('This report was written against a different mesh than the '
+                  'one the case holds now; re-run the check.')
+    elif result.get('incomplete'):
+        caveat = ('The readiness reading was cut short, so this is an '
+                  'incomplete reading rather than a pass.')
+    return Readout('su2-readiness', severity, headline, tuple(rows), caveat,
+                   len(rows), len(rows))

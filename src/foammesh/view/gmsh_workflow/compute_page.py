@@ -152,9 +152,30 @@ class GmshComputePage(GmshTaskPage):
         than each claiming a label of their own.
         """
         lines = list(getattr(self, '_orderRefusals', ()))
+        # DP-115. This is the button the refused run is launched from, so the
+        # pre-flight belongs here as well as on Boundary Layers -- the page
+        # that holds the controls is not necessarily the page the user is
+        # standing on when they start the run.
+        refusal = self.assemblyRefusal()
+        if refusal:
+            lines.append(refusal)
         if self.gateCondemnsLayers():
             lines.append(self.gateNoteText())
         return lines
+
+    def assemblyRefusal(self) -> str:
+        """The run-start pre-flight, read with this page's layer switch.
+
+        DP-115. The patch selection is read from storage -- it is authored on
+        Boundary Layers -- while the switch is taken from the editor here,
+        which is the one term of the condition this page can change.
+        """
+        return self.assemblyLayerRefusal(enabled=bool(
+            self.gateValues().get('gmsh.boundary_layers.enabled')))
+
+    def runAllRefusal(self) -> str:
+        """DP-123. Graded with this page's switch, not only with storage."""
+        return self.assemblyRefusal()
 
     def gateNoteText(self) -> str:
         return self.tr(
@@ -163,10 +184,24 @@ class GmshComputePage(GmshTaskPage):
             'construction: measured on venturi.stl, a four-layer stack put '
             '20.4% of elements below the default 0.1 and a gentler stack made '
             'it worse (41.7%), while the same case without layers passed. '
-            'Set an Allowed Fraction or Allowed Count you can defend, or turn '
-            'layers off on Boundary Layers, before running.')
+            'Set an Allowed fraction or Allowed count you can defend, or turn '
+            'layers off on Boundary layers, before running.')
 
     def updateGateNote(self) -> None:
+        # DP-115. A refusal is not a warning: when one is in the note the
+        # note says so, and the run button carries the same sentence.
+        refusal = self.assemblyRefusal()
         lines = self.noteLines()
         self._gateNote.setText('\n'.join(lines))
         self._gateNote.setVisible(bool(lines))
+        status = 'error' if refusal else 'warning'
+        if self._gateNote.property('foammeshStatus') != status:
+            self._gateNote.setProperty('foammeshStatus', status)
+            style = self._gateNote.style()
+            style.unpolish(self._gateNote)
+            style.polish(self._gateNote)
+        self.setRunStageAvailable(not refusal, refusal)
+        # DP-123. `_runStage` is hidden on every Gmsh page -- none of them
+        # declares `run_stage` -- so the line above shuts a button no user can
+        # see. This is the one that reaches "Run to end".
+        self.runAllRefusalChanged.emit(refusal)

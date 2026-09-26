@@ -3,7 +3,7 @@
 Plan 26 WP2.2. The warning entries carry ``requested`` and ``applied`` beside
 the message precisely so a user can see the substitution rather than read a
 description of it -- "the first group's value was written" is not actionable,
-"0.3 -> 0.25" is. Both display sites rendered only ``message``, so a shared
+"0.3 → 0.25" is. Both display sites rendered only ``message``, so a shared
 formatter is the difference between the extra fields being carried and the
 extra fields being used.
 
@@ -24,7 +24,7 @@ def format_warning(item) -> str:
         line += f' [{field_id}]'
     requested, applied = item.get('requested'), item.get('applied')
     if requested is not None or applied is not None:
-        line += f'\n    requested {_value(requested)} -> applied {_value(applied)}'
+        line += f'\n    requested {_value(requested)} → applied {_value(applied)}'
     return line
 
 

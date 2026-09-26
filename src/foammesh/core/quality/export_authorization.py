@@ -175,7 +175,7 @@ def authorize(operation_id: str, *, summary: Mapping | None,
             reason='missing_summary')
     if (summary or {}).get('stale'):
         raise ExportRefused(
-            'the qualification summary is stale -- the mesh or its inputs '
+            'the qualification summary is stale — the mesh or its inputs '
             'changed after it was computed; re-run the summary',
             reason='stale_summary')
 

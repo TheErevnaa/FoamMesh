@@ -22,6 +22,8 @@ from dataclasses import dataclass
 import math
 import re
 
+from foammesh.core.quantities import agreeing
+
 #: Variables Gmsh binds when evaluating a size expression.
 VARIABLES = frozenset({'x', 'y', 'z'})
 
@@ -109,7 +111,8 @@ def validate_syntax(expression: str) -> str:
         and name not in CONSTANTS})
     if unknown:
         raise ExpressionError(
-            f'unknown name(s) in the expression: {", ".join(unknown)}. '
+            f'unknown {agreeing(len(unknown), "name")} in the expression: '
+            f'{", ".join(unknown)}. '
             f'Available: {", ".join(sorted(VARIABLES))} and '
             f'{", ".join(sorted(FUNCTIONS))}')
     if not (names & VARIABLES):

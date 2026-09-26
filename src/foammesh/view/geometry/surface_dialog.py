@@ -117,8 +117,8 @@ class SurfaceDialog(QDialog):
                             'geometry_id': self._gIds[0],
                             'name': self._ui.name.text()})
                     except ValidationFailedError as error:
-                        await AsyncMessageBox().information(
-                            self, self.tr('Input Error'), str(error))
+                        await AsyncMessageBox().warning(
+                            self, self.tr('Input error'), str(error))
                         return
 
                 db = app.facadeClient.checkout()
@@ -151,10 +151,10 @@ class SurfaceDialog(QDialog):
             except CONFLICT_ERRORS as error:
                 # Stay open: the user's entries are still here, and the only
                 # thing that changed is what the case looked like underneath.
-                await AsyncMessageBox().information(
-                    self, self.tr('Case Changed'), self.tr(conflict_message(error)))
+                await AsyncMessageBox().warning(
+                    self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                await AsyncMessageBox().information(self, self.tr("Input Error"), e.toMessage())
+                await AsyncMessageBox().warning(self, self.tr("Input error"), e.toMessage())
 
     def _connectSignalsSlots(self):
         self._typeRadios.selectionChanged.connect(self._onTypeChanged)
@@ -245,7 +245,7 @@ class SurfaceDialog(QDialog):
                 await app.facadeClient.run('geometry.transform', {
                     'geometry_id': entry['geometry_id'], 'operations': operations})
             except FacadeError as error:
-                await AsyncMessageBox().information(
+                await AsyncMessageBox().warning(
                     self, self.tr('Transform'),
                     self.tr('The mesher\'s copy of {0} was not transformed: {1}')
                     .format(entry.get('name', ''), error))

@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from uuid import uuid4
 from .job import JobStatus
 from .process_control import kill_process_tree, new_process_group_kwargs
 from foammesh.core.project.events import Event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,8 @@ class JobManager:
         self._cancelled: set[str] = set()
         self._cancelling: set[str] = set()
         self._state_callbacks = set()
+        self._read_barriers = set()
+        self._starting_mutations = 0
         self._events = event_bus
 
     def _publish(self, event, **payload):
@@ -172,6 +177,11 @@ class JobManager:
     @property
     def has_mutating_job(self) -> bool:
         return self._mutating_job is not None
+
+    @property
+    def mesh_write_pending(self) -> bool:
+        """A mutating job is running, or waiting out reads to start (DP-485)."""
+        return self._mutating_job is not None or self._starting_mutations > 0
 
     @property
     def active_job_ids(self) -> tuple[str, ...]:
@@ -217,6 +227,31 @@ class JobManager:
             self._state_callbacks.discard(callback)
         return unsubscribe
 
+    def add_read_barrier(self, barrier):
+        """Hold every mutating job until ``barrier()`` has been awaited.
+
+        DP-485. The viewport reads the case's polyMesh -- twelve processor
+        directories of it on a parallel run -- and a mutating job rewrites
+        exactly those files. MEASURED on `centrifugal_impeller`: the layers
+        button commits its settings and starts snappy in one press; the
+        commit schedules a viewport reload of the snap mesh, the reader was
+        still inside `processor7..11/constant/polyMesh/faces` when addLayers
+        rewrote them, VTK hit "Unexpected EOF" and the process died rc=139.
+        A reader registers here so a writer waits for the read in flight.
+        """
+        self._read_barriers.add(barrier)
+
+        def remove():
+            self._read_barriers.discard(barrier)
+        return remove
+
+    async def _wait_for_readers(self):
+        for barrier in tuple(self._read_barriers):
+            try:
+                await barrier()
+            except Exception:       # noqa: BLE001 - a failed read holds nothing
+                logger.exception('read barrier failed')
+
     def _notify_state(self):
         for callback in tuple(self._state_callbacks):
             callback()
@@ -224,38 +259,49 @@ class JobManager:
     async def run(self, request: JobRequest, *, on_line=None) -> JobResult:
         if not request.argv:
             raise ValueError('job argv must not be empty')
-        if request.mutation and self._mutating_job is not None:
+        if request.mutation and self.mesh_write_pending:
             raise RuntimeError('a mutating job is already active for this case')
         if request.timeout is not None and request.timeout <= 0:
             raise ValueError('job timeout must be positive')
         if request.max_output_bytes < 0:
             raise ValueError('max_output_bytes must not be negative')
 
-        job_id = uuid4().hex
-        started_at = _now()
-        environment = os.environ.copy()
-        if request.environment:
-            environment.update(request.environment)
-        environment_id = environment_fingerprint(environment)
-        safe_argv = redact_argv(request.argv)
-        if request.log_path:
-            request.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # DP-485. Counted as mutating from here, so no viewport read can
+        # start while this job waits out the reads already in flight.
+        starting = bool(request.mutation)
+        if starting:
+            self._starting_mutations += 1
         try:
-            process = await asyncio.create_subprocess_exec(
-                *request.argv, cwd=request.cwd, env=environment,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                **new_process_group_kwargs())
-        except OSError as error:
-            result = JobResult(
-                job_id, request.name, JobStatus.FAILED, None, '', request.log_path,
-                str(error), JobErrorCategory.LAUNCH, started_at=started_at,
-                finished_at=_now(), argv=safe_argv, cwd=str(request.cwd),
-                environment_fingerprint=environment_id, mutation=request.mutation)
-            self._results[job_id] = result
-            self._persist_result(request.cwd, result)
-            self._publish(Event.JOB_FAILED, job_id=job_id, result=result.to_dict())
-            return result
+            if starting:
+                await self._wait_for_readers()
+            job_id = uuid4().hex
+            started_at = _now()
+            environment = os.environ.copy()
+            if request.environment:
+                environment.update(request.environment)
+            environment_id = environment_fingerprint(environment)
+            safe_argv = redact_argv(request.argv)
+            if request.log_path:
+                request.log_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *request.argv, cwd=request.cwd, env=environment,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    **new_process_group_kwargs())
+            except OSError as error:
+                result = JobResult(
+                    job_id, request.name, JobStatus.FAILED, None, '', request.log_path,
+                    str(error), JobErrorCategory.LAUNCH, started_at=started_at,
+                    finished_at=_now(), argv=safe_argv, cwd=str(request.cwd),
+                    environment_fingerprint=environment_id, mutation=request.mutation)
+                self._results[job_id] = result
+                self._persist_result(request.cwd, result)
+                self._publish(Event.JOB_FAILED, job_id=job_id, result=result.to_dict())
+                return result
 
+        finally:
+            if starting:
+                self._starting_mutations -= 1
         self._jobs[job_id] = process
         self._requests[job_id] = request
         if request.mutation:

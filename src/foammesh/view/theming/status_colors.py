@@ -35,3 +35,22 @@ def apply_color_swatch(widget, color: QColor | None) -> None:
     style.polish(widget)
     widget.update()
 
+
+
+def swatch_color(widget) -> QColor | None:
+    """The colour :func:`apply_color_swatch` last painted on *widget*.
+
+    Plan 33 W-B. The swatch is a stylesheet, so the only way to ask a row
+    what colour it is showing was to parse that stylesheet at the call site.
+    Every reader that wants the answer -- the geometry list repainting a row,
+    a gate proving the row matches its actor -- asks here instead, so one
+    spelling of the declaration cannot drift from another.
+    """
+    if not widget.property('foammeshColorSwatch'):
+        return None
+    for declaration in str(widget.styleSheet()).split(';'):
+        name, _, value = declaration.partition(':')
+        if name.strip() == 'background-color':
+            color = QColor(value.strip())
+            return color if color.isValid() else None
+    return None

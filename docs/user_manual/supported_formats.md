@@ -6,7 +6,7 @@ with the exact reason (a missing utility or Python extra). Nothing
 unavailable is ever presented as runnable. `foammesh formats` prints the
 same matrix as JSON.
 
-## Geometry import (File → Load Model → Geometry)
+## Geometry import (File → Import → Geometry)
 
 | Format | Provider | Availability |
 |---|---|---|
@@ -32,11 +32,11 @@ same matrix as JSON.
   structured (transfinite) Gmsh surfaces and the boolean farfield box are
   refused on it with the reason, rather than attempted and half-applied.
 
-## Mesh import (File → Load Model → Mesh)
+## Mesh import (File → Import → Mesh)
 
 | Format | Utility | Notes |
 |---|---|---|
-| Native `polyMesh` case | — (validated staged copy) | Asks **Replace Current Mesh** (recovery-backed) or **Import into New Case Copy** (current case untouched) |
+| Native `polyMesh` case | — (validated staged copy) | Asks **Replace current mesh** (recovery-backed) or **Import into new case copy** (current case untouched) |
 | Fluent `.msh` | `fluentMeshToFoam` | ASCII input only; conversion warnings are surfaced after import |
 | Gmsh `.msh` | `gmshToFoam` | **MSH 2.2 only.** OpenFOAM 13's `gmshToFoam` cannot read 4.1, and this application's own MSH readers — the polyMesh publisher, the element census and the geometry-fidelity check — parse 2.2 as well. A 4.1 file is not partially read: the census takes its block-count header for an entity count and reports no volume elements at all |
 | GAMBIT `.neu` | `gambitToFoam` | |
@@ -60,10 +60,10 @@ refusals — see [legacy case migration](legacy_case_migration.md).
 |---|---|---|---|
 | OpenFOAM case (native) | stable | staged case copy | case validation + atomic copy |
 | VTK `.vtu` | stable | built-in VTK writer | written file re-read with an independent reader; point/cell counts must match |
-| SU2 `.su2` | stable | the `mesh.su2` a Gmsh run wrote, or the built-in writer for a mesh from elsewhere | elements re-counted from the written file; first order only |
+| SU2 `.su2` | stable | the `mesh.su2` a Gmsh run wrote, or the built-in writer for a mesh from elsewhere | elements re-counted from the written file; first order only; four cell families only, so a mesh with polyhedral cells is refused |
 | OpenFOAM ASCII/binary (in place) | stable | `foamFormatConvert` | recovery-backed; `controlDict` write settings are restored afterwards unless you choose **Keep these write settings** |
 | Fluent `.msh` | stable | `foamMeshToFluent` | expected-output validation; documented Fluent zone/boundary limitations are shown |
-| Gmsh `.msh` | **experimental** | `[export]` extra (gmsh) | arbitrary polyhedral cells may not round-trip; hex/tet recommended |
+| Gmsh `.msh` | **experimental** | `[export]` extra (gmsh) | four cell families only; a mesh with polyhedral cells is refused before writing, with the count |
 | CGNS `.cgns` | **experimental** | VTK CGNS writer | requires a VTK build with `vtkCGNSWriter` |
 | Case archive `.zip` | stable | built-in | manifest + checksums |
 
@@ -73,7 +73,7 @@ each exporter can carry.
 
 Experimental formats are labelled in the export dialog and warn before
 writing. Every completed export shows the exact output path, size, and
-warnings, offers **Open Folder**, and is recorded in the case's transaction
+warnings, offers **Open folder**, and is recorded in the case's transaction
 history.
 
 Headless equivalents: `foammesh export <case> <format> [dest]` and the

@@ -23,10 +23,44 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+#: EXPORT-01. Every conversion this module runs, said out loud: what was
+#: invoked, where from, what it exited with and every byte it wrote to its own
+#: two streams. MEASURED before this: a CGNS export died with exit 3221225786
+#: and the application reported a malformed file, with nothing anywhere on
+#: disk or in the log saying what had actually been run or what it had said.
+logger = logging.getLogger(__name__)
+
+#: The conversion was stopped; it did not disagree with its input.
+#: ``3221225786`` is ``0xC000013A``, Windows' ``STATUS_CONTROL_C_EXIT`` -- the
+#: code the measured export came back with. ``130`` and ``-2`` are the two
+#: spellings of the same event on POSIX.
+INTERRUPTED_RETURNCODES = frozenset({3221225786, 130, -2})
+
+#: The three answers a conversion that produced no usable file can give.
+INTERRUPTED = 'interrupted'
+MALFORMED = 'malformed'
+FAILED = 'failed'
+
+
+class ExportRunError(RuntimeError):
+    """A conversion that produced no file, and which of the three it was.
+
+    EXPORT-01. The three are not the same sentence to a reader: `interrupted`
+    means nothing is wrong with the mesh and the act can be repeated,
+    `malformed` means a file landed and cannot be trusted, and `failed` means
+    the conversion refused the input it was given. One message for all three
+    sent the reader who had interrupted an export looking for a bad mesh.
+    """
+
+    def __init__(self, message: str, kind: str = FAILED):
+        super().__init__(message)
+        self.kind = kind
 
 #: What this module will write, and what a cold read-back measured it keeps.
 #:
@@ -186,7 +220,7 @@ def unavailable_reason() -> str:
         return ''
     return ('Gmsh export needs Gmsh, and neither route is present here: '
             '"import gmsh" fails on the host, and no qualified WSL Gmsh '
-            'runtime is configured. Either one fixes it -- pip install '
+            'runtime is configured. Either one fixes it — pip install '
             '"foammesh[export]" for the host module, or configure the WSL '
             'Gmsh runtime the meshing engine already uses.')
 
@@ -194,6 +228,91 @@ def unavailable_reason() -> str:
 def require() -> None:
     if not is_available():
         raise RuntimeError(unavailable_reason())
+
+
+def staging_path(dest) -> Path:
+    """Where a conversion writes before it has earned the reader's own path.
+
+    EXPORT-01. The writer used to be pointed straight at the destination the
+    user named, so an interrupted conversion left whatever it had managed to
+    put there under that name, indistinguishable from a finished export. The
+    staging name keeps the destination's suffix, because Gmsh chooses the
+    format it writes from the extension it is handed and a ``.part`` at the
+    end of the name would leave it with nothing to choose from.
+    """
+    dest = Path(dest)
+    return dest.with_name(f'{dest.stem}.part{dest.suffix}')
+
+
+def _discard(staging: Path) -> None:
+    """Take the half-written file away, and say so if it will not go."""
+    try:
+        staging.unlink(missing_ok=True)
+    except OSError as error:                                 # noqa: PERF203
+        logger.warning('Gmsh export could not remove %s: %s', staging, error)
+
+
+def _promote(staging: Path, out: Path) -> None:
+    os.replace(staging, out)
+    logger.info('Gmsh export promoted %s to %s', staging, out)
+
+
+def _tail(completed) -> str:
+    said = (completed.stderr or completed.stdout or '').strip().splitlines()
+    return ' | '.join(said[-5:])
+
+
+def _run_conversion(profile, argv, timeout, staging: Path):
+    """Run the conversion, logging what it was asked and what it answered.
+
+    EXPORT-01. Everything a reader outside the application needs in order to
+    repeat the run by hand goes through here once: the invocation, the
+    directory it was launched from, the return code and both streams. An
+    interruption is classified here too, because it is the same event however
+    it arrives -- a return code, a timeout, or a keyboard.
+    """
+    spoken = ' '.join(str(argument) for argument in argv)
+    logger.info('Gmsh export through %s runs %s (cwd %s)',
+                profile.profile_id, spoken, os.getcwd())
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True,
+                                   timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        logger.info('Gmsh export through %s was interrupted: no answer within '
+                    '%s seconds (cwd %s, stdout and stderr unread)',
+                    profile.profile_id, timeout, os.getcwd())
+        _discard(staging)
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} was interrupted: it '
+            f'did not answer within {timeout} seconds. Nothing was written.',
+            INTERRUPTED) from error
+    except KeyboardInterrupt as error:
+        logger.info('Gmsh export through %s was interrupted from the keyboard '
+                    '(cwd %s, stdout and stderr unread)',
+                    profile.profile_id, os.getcwd())
+        _discard(staging)
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} was interrupted from '
+            'the keyboard. Nothing was written.', INTERRUPTED) from error
+    except OSError as error:
+        logger.info('Gmsh export through %s did not start (cwd %s): %s; '
+                    'stdout and stderr unread',
+                    profile.profile_id, os.getcwd(), error)
+        _discard(staging)
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} did not run: {error}',
+            FAILED) from error
+    logger.info('Gmsh export through %s exited %s (cwd %s); stdout: %s; '
+                'stderr: %s', profile.profile_id, completed.returncode,
+                os.getcwd(), (completed.stdout or '').strip(),
+                (completed.stderr or '').strip())
+    if completed.returncode in INTERRUPTED_RETURNCODES:
+        _discard(staging)
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} was interrupted '
+            f'(exit {completed.returncode}). The mesh is untouched and the '
+            'export can be run again.', INTERRUPTED)
+    return completed
 
 
 def convert_with_gmsh(input_mesh, dest) -> Path:
@@ -235,58 +354,87 @@ def convert_and_census(input_mesh, dest, *, timeout: float = 900,
     """
     supported_target(dest)
     out = Path(dest)
+    staging = staging_path(out)
+    _discard(staging)
     if host_available():
         import gmsh
-        gmsh.initialize()
-        if save_all:
-            gmsh.option.setNumber('Mesh.SaveAll', 1)
+        # EXPORT-01. The read-back is a check, and a check the destination has
+        # already been given the file for is no check at all: what is censused
+        # here is the staging file, and only a census that came back promotes
+        # it to the path the reader named.
         try:
-            gmsh.open(str(input_mesh))
-            gmsh.write(str(out))
-        finally:
-            gmsh.finalize()
-        gmsh.initialize()
-        try:
-            gmsh.open(str(out))
-            return census(gmsh)
-        finally:
-            gmsh.finalize()
+            gmsh.initialize()
+            if save_all:
+                gmsh.option.setNumber('Mesh.SaveAll', 1)
+            try:
+                gmsh.open(str(input_mesh))
+                gmsh.write(str(staging))
+            finally:
+                gmsh.finalize()
+            gmsh.initialize()
+            try:
+                gmsh.open(str(staging))
+                answered = census(gmsh)
+            finally:
+                gmsh.finalize()
+        except BaseException:
+            _discard(staging)
+            raise
+        _promote(staging, out)
+        return answered
     profile = runtime_profile()
     if profile is None:
         require()
     argv = profile.python_argv(
         _convert_and_census_script(save_all),
         profile.translate_host_path(Path(input_mesh).resolve()),
-        profile.translate_host_path(out.resolve()))
-    try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(
-            f'Gmsh export through {profile.profile_id} did not run: {error}') from error
-    for line in (completed.stdout or '').splitlines():
-        if line.startswith(CENSUS_MARKER):
-            return json.loads(line[len(CENSUS_MARKER):])
-    tail = (completed.stderr or completed.stdout or '').strip().splitlines()[-5:]
-    raise RuntimeError(
+        profile.translate_host_path(staging.resolve()))
+    completed = _run_conversion(profile, argv, timeout, staging)
+    answered = next((line for line in (completed.stdout or '').splitlines()
+                     if line.startswith(CENSUS_MARKER)), None)
+    written = staging.exists()
+    if answered is not None and written:
+        _promote(staging, out)
+        return json.loads(answered[len(CENSUS_MARKER):])
+    _discard(staging)
+    if answered is not None:
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} counted a file that is '
+            f'not there (exit {completed.returncode}): ' + _tail(completed),
+            MALFORMED)
+    if written:
+        # A file landed and the session that wrote it could not read it back.
+        # That is a statement about the file, and the only one of the three
+        # that earns the word malformed.
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} wrote a file it could '
+            f'not read back (exit {completed.returncode}): ' + _tail(completed),
+            MALFORMED)
+    raise ExportRunError(
         f'Gmsh export through {profile.profile_id} did not say what it wrote '
-        f'(exit {completed.returncode}): ' + ' | '.join(tail))
+        f'(exit {completed.returncode}): ' + _tail(completed), FAILED)
 
 
 def convert_in_runtime(profile, input_mesh, dest, *, timeout: float = 600) -> Path:
     """Convert through the runtime's own Gmsh, with paths it can see."""
     out = Path(dest)
+    staging = staging_path(out)
+    _discard(staging)
     argv = profile.python_argv(
         _CONVERT_SCRIPT,
         profile.translate_host_path(Path(input_mesh).resolve()),
-        profile.translate_host_path(out.resolve()))
-    try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError(
-            f'Gmsh export through {profile.profile_id} did not run: {error}') from error
-    if completed.returncode != 0 or not out.exists():
-        tail = (completed.stderr or completed.stdout or '').strip().splitlines()[-5:]
-        raise RuntimeError(
-            f'Gmsh export through {profile.profile_id} failed '
-            f'(exit {completed.returncode}): ' + ' | '.join(tail))
-    return out
+        profile.translate_host_path(staging.resolve()))
+    completed = _run_conversion(profile, argv, timeout, staging)
+    written = staging.exists()
+    if completed.returncode == 0 and written:
+        _promote(staging, out)
+        return out
+    _discard(staging)
+    if written:
+        raise ExportRunError(
+            f'Gmsh export through {profile.profile_id} left a file it had not '
+            f'finished (exit {completed.returncode}): ' + _tail(completed),
+            MALFORMED)
+    raise ExportRunError(
+        f'Gmsh export through {profile.profile_id} failed '
+        f'(exit {completed.returncode}): ' + _tail(completed), FAILED)

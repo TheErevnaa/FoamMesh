@@ -6,7 +6,7 @@ entities."
 
 MEASURED before this: there was no mode concept anywhere in
 ``view/display_control``. The only thing resembling one was the per-actor
-right-click menu (Wireframe / Surface / Surface with Edges), which changes one
+right-click menu (Wireframe / Surface / Surface with edges), which changes one
 prop at a time. Getting from "look at my imported geometry" to "look at the
 boundary mesh on it" meant hiding the internal volume by hand, then remembering
 to unhide it; getting to a slice meant opening the section panel and aiming a
@@ -27,6 +27,9 @@ disappears when it would be useful is the harder thing to debug.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from foammesh.core.mesh.presentation import count_text
+from foammesh.core.quality.phrasing import no_mesh_yet
 
 
 #: Mode ids. Strings rather than an enum so a saved view state, a test and a
@@ -122,11 +125,13 @@ def _split(scene: Scene, wanted) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 _NO_GEOMETRY = ('No geometry is loaded, so there is nothing to compare the '
                 'mesh against. Import a surface or a CAD file first.')
-_NO_MESH = ('No mesh has been generated yet, so there are no cells to show. '
-            'Run the meshing workflow first.')
+# DP-107. One opening clause for "this case has produced no mesh"; the
+# consequence and the recourse are this surface's own.
+_NO_MESH = no_mesh_yet('there are no cells to show. '
+                       'Run the meshing workflow first.')
 _NO_PATCHES = ('This mesh has no named boundary patches, so there is no '
                'boundary mesh to show separately from the volume.')
-_NO_VOLUME = ('This result has no internal volume -- it is a surface mesh, '
+_NO_VOLUME = ('This result has no internal volume — it is a surface mesh, '
               'so there is nothing to cut open or fill.')
 
 
@@ -144,7 +149,7 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
             return ViewPlan(mode_id, unavailable=_NO_GEOMETRY)
         visible, hidden = _split(scene, scene.geometry)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
-                        summary=_summary('geometry part', len(visible)))
+                        summary=count_text(len(visible), 'geometry part'))
 
     if mode_id == BOUNDARY:
         if not scene.mesh_parts():
@@ -153,8 +158,8 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
             return ViewPlan(mode_id, unavailable=_NO_PATCHES)
         visible, hidden = _split(scene, scene.patches)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
-                        summary=_summary('boundary patch', len(visible),
-                                         'boundary patches'))
+                        summary=count_text(len(visible), 'boundary patch',
+                                           'boundary patches'))
 
     if mode_id == VOLUME:
         if not scene.mesh_parts():
@@ -164,7 +169,7 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
         wanted = tuple(scene.volume) + tuple(scene.zones)
         visible, hidden = _split(scene, wanted)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
-                        summary=_summary('volume part', len(visible)))
+                        summary=count_text(len(visible), 'volume part'))
 
     if mode_id == SLICE:
         if not scene.mesh_parts():
@@ -186,11 +191,6 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
     visible, hidden = _split(scene, wanted)
     return ViewPlan(mode_id, visible, hidden, SURFACE, quality=True,
                     summary='the volume coloured by cell quality')
-
-
-def _summary(singular: str, count: int, plural: str = '') -> str:
-    plural = plural or singular + 's'
-    return f'{count:,} {singular if count == 1 else plural}'
 
 
 # --------------------------------------------------------------------------- #
@@ -327,11 +327,12 @@ class LayerCoverage:
         if not short:
             frozen = len(self.frozen)
             tail = (f' ({frozen} asked for none)' if frozen else '')
-            return (f'All {len(self.rows) - frozen} patches that asked for '
-                    f'layers got them{tail}.')
+            covered = count_text(len(self.rows) - frozen, 'patch', 'patches')
+            return f'{covered} asked for layers and got them{tail}.'
         listed = '; '.join(row.describe() for row in short)
-        return (f'{len(short)} of {len(self.rows)} patches fell short and are '
-                f'highlighted -- {listed}.')
+        total = count_text(len(self.rows), 'patch', 'patches')
+        return (f'Highlighted {len(short):,} of {total} that fell '
+                f'short — {listed}.')
 
 
 def summarise_layers(document) -> LayerCoverage:

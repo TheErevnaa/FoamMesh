@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget)
 
 from foammesh.rendering.plane_widget import AXIS_NORMAL
+from foammesh.view.theming.metrics import GAP
 
 
 #: How many independent section planes a user can raise at once. Three is the
@@ -95,7 +96,7 @@ class SectionPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(GAP)
 
         layout.addWidget(self._buildModeRow())
         layout.addWidget(self._buildPlaneRows())
@@ -122,10 +123,10 @@ class SectionPanel(QWidget):
         self._clipRadio = QRadioButton(self.tr('Clip'))
         self._clipRadio.setChecked(True)
         self._clipRadio.setToolTip(
-            self.tr('Remove everything on one side of the plane.'))
+            self.tr('Remove everything on one side of the plane'))
         self._sliceRadio = QRadioButton(self.tr('Slice'))
         self._sliceRadio.setToolTip(
-            self.tr('Keep only the surface where the plane meets the mesh.'))
+            self.tr('Keep only the surface where the plane meets the mesh'))
         self._typeGroup = QButtonGroup(self)
         self._typeGroup.addButton(self._clipRadio, CutType.CLIP.value)
         self._typeGroup.addButton(self._sliceRadio, CutType.SLICE.value)
@@ -133,7 +134,7 @@ class SectionPanel(QWidget):
         self._crinkle = QCheckBox(self.tr('Whole cells'))
         self._crinkle.setToolTip(self.tr(
             'Keep every cell the plane passes through intact instead of '
-            'cutting it. Ragged, but cell shapes stay readable -- this is the '
+            'cutting it. Ragged, but cell shapes stay readable — this is the '
             'view that shows whether prism layers are there.'))
 
         row.addWidget(self._clipRadio)
@@ -268,7 +269,16 @@ class SectionPanel(QWidget):
         self._snapCentre.setToolTip(self.tr('Put the plane through the middle of the model'))
         self._snapOrigin = QPushButton(self.tr('Origin'))
         self._snapOrigin.setToolTip(self.tr('Put the plane through (0, 0, 0)'))
+        # DP-695. A placed plane that any handle press can move is a plane
+        # that moves while the user only meant to turn the model.
+        self._lock = QCheckBox(self.tr('Lock'))
+        self._lock.setToolTip(self.tr(
+            'Keep the plane where it is: its handles stay visible but every '
+            'drag in the viewport turns the camera. Ctrl+drag a handle to '
+            'move the plane anyway; untick to drag handles without Ctrl.'))
+        self._lock.setAccessibleName(self.tr('Lock section plane'))
         dragRow.addWidget(self._dragAxis)
+        dragRow.addWidget(self._lock)
         dragRow.addWidget(self._snapCentre)
         dragRow.addWidget(self._snapOrigin)
         dragRow.addStretch(1)
@@ -315,6 +325,12 @@ class SectionPanel(QWidget):
 
     def dragAxis(self):
         return self._dragAxis.currentData()
+
+    def isLocked(self) -> bool:
+        return self._lock.isChecked()
+
+    def setLocked(self, locked: bool):
+        self._lock.setChecked(bool(locked))
 
     def activeIndex(self) -> int:
         return self._active
@@ -395,6 +411,7 @@ class SectionPanel(QWidget):
             index = self._dragAxis.findData(other.dragAxis())
             if index >= 0:
                 self._dragAxis.setCurrentIndex(index)
+            self._lock.setChecked(other.isLocked())
             wanted = set(other.gizmoIndexes())
             for position, button in enumerate(self._gizmoButtons):
                 button.setChecked(position in wanted)
@@ -412,6 +429,7 @@ class SectionPanel(QWidget):
         self._live.toggled.connect(lambda _checked: self.setDegradedNote(''))
         self._dragAxis.currentIndexChanged.connect(
             lambda _index: self.gizmosChanged.emit())
+        self._lock.toggled.connect(self._lockToggled)
         self._viewNormalButton.clicked.connect(self.viewNormalRequested)
         self._flipButton.clicked.connect(self._flip)
         self._snapCentre.clicked.connect(self._snapToCentre)
@@ -436,6 +454,10 @@ class SectionPanel(QWidget):
     def _emitChanged(self, *_args):
         if not self._updating:
             self.sectionChanged.emit()
+
+    def _lockToggled(self, _checked):
+        if not self._updating:
+            self.gizmosChanged.emit()
 
     def _clearClicked(self):
         self.clear()

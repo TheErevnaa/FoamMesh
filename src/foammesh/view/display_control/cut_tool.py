@@ -30,14 +30,32 @@ LIVE_CELL_BUDGET = 400_000
 
 
 def sceneBounds():
-    """Union of the geometry and mesh bounds, or ``None`` for an empty scene."""
+    """Where the model on screen is, or ``None`` for an empty scene.
+
+    DP-813. This was the union of *every* actor either manager held. A
+    manager keeps its actors when it hides them -- ``meshManager.unload()``
+    and the geometry that a volume mesh hides both only take the props out
+    of the renderer -- so a mesh the user had left, or an STL in millimetres
+    hidden under a mesh in metres, still decided where the plane went, and
+    the plane was placed somewhere the user could not see anything. Only
+    what is drawn counts now; the full union is the fallback for a scene
+    with nothing drawn, so the tool still has something to stand on.
+    """
+    displayed = _mergedBounds('getDisplayedBounds')
+    if displayed is not None:
+        return displayed
+    return _mergedBounds('getBounds')
+
+
+def _mergedBounds(method):
     window = app.window
     merged = None
     for name in ('geometryManager', 'meshManager'):
         manager = getattr(window, name, None)
         if manager is None:
             continue
-        getBounds = getattr(manager, 'getBounds', None)
+        getBounds = (getattr(manager, method, None)
+                     or getattr(manager, 'getBounds', None))
         if getBounds is None:
             continue
         bounds = getBounds()
@@ -49,6 +67,20 @@ def sceneBounds():
             merged.merge(bounds)
 
     return merged
+
+
+def _holds(bounds, point) -> bool:
+    """Whether ``point`` lies in ``bounds``, faces included.
+
+    ``Bounds.includes`` is strict, which a flat model -- zero thickness on
+    one axis -- can never satisfy.
+    """
+    size = bounds.size()
+    slack = 1e-9 * max(max(size), 1e-30)
+    low = bounds.toTuple()[0::2]
+    high = bounds.toTuple()[1::2]
+    return all(low[axis] - slack <= point[axis] <= high[axis] + slack
+               for axis in range(3))
 
 
 class CutTool(QObject):
@@ -94,10 +126,28 @@ class CutTool(QObject):
         panel.gizmosChanged.connect(self._mirrorGizmos)
         panel.viewNormalRequested.connect(self._useViewNormal)
 
-    def hide(self):
+    def isSectionActive(self) -> bool:
+        """Whether a section is currently cutting the model.
+
+        The panel already knew; nothing outside it could ask, so the toolbar
+        button that raises a section in one press had no way to tell whether
+        it was looking at a cut model or a whole one.
+        """
+        return bool(self._panel.enabledPlanes())
+
+    def clearSection(self):
+        """Take every plane down and put the whole model back.
+
+        The same three steps `hide` takes, without hiding the panel: the
+        toolbar can turn a section off while the panel stays open, which is
+        what a user watching the picture expects a second press to do.
+        """
         self._panel.clear()
         self._apply()
         self._handlesOff()
+
+    def hide(self):
+        self.clearSection()
         self._widget.hide()
 
     def show(self):
@@ -108,8 +158,11 @@ class CutTool(QObject):
     def updateBounds(self):
         """Re-place the handles against whatever is currently in the scene."""
         bounds = sceneBounds()
-        first = self._bounds is None
+        previous = self._bounds
         self._bounds = bounds
+        moved = False
+        if bounds is not None:
+            moved = self._placePlanes(bounds, previous)
         self._panel.setBounds(bounds)
         for panel in self._mirrors:
             panel.setBounds(bounds)
@@ -119,12 +172,40 @@ class CutTool(QObject):
 
         for widget in self._planeWidgets:
             widget.setBounds(bounds)
-        if first:
-            for plane in self._panel.planes():
-                plane.origin = list(bounds.center())
-            self._panel.setBounds(bounds)
-        self._syncGizmos()
+        if moved:
+            self._apply()
+        else:
+            self._syncGizmos()
         return True
+
+    def _placePlanes(self, bounds, previous) -> bool:
+        """Put every plane the scene has left behind back through the model.
+
+        DP-812. Plane origins were set to the model's centre once -- on the
+        very first bounds the tool ever saw -- and never again. The first
+        scene is often not the model (a region seed, the first of several
+        parts), and a second model, a second project or a mesh scaled from
+        millimetres to metres never moved them; the toolbar Section then
+        raised its plane at the old centre, off the model, where it cut
+        everything or nothing. A lowered plane follows the scene whenever
+        the scene changes, or whenever it lies off the model (swept out and
+        dropped); a raised one is moved only when the scene changed under it
+        and left it outside. Returns whether a raised plane moved, because
+        the cut on screen is then stale.
+        """
+        changed = (previous is None
+                   or tuple(previous.toTuple()) != tuple(bounds.toTuple()))
+        centre = [float(value) for value in bounds.center()]
+        moved = False
+        for plane in self._panel.planes():
+            outside = not _holds(bounds, plane.origin)
+            if plane.enabled:
+                if changed and outside:
+                    plane.origin = list(centre)
+                    moved = True
+            elif changed or outside:
+                plane.origin = list(centre)
+        return moved
 
     def applyTheme(self, tokens):
         for widget in self._planeWidgets:
@@ -165,6 +246,7 @@ class CutTool(QObject):
         wanted = set(self._panel.gizmoIndexes())
         active = self._panel.activeIndex()
         dragAxis = self._panel.dragAxis()
+        locked = self._panel.isLocked()
         for index, widget in enumerate(self._planeWidgets):
             plane = self._panel.planes()[index]
             if index in wanted and plane.enabled:
@@ -175,6 +257,7 @@ class CutTool(QObject):
                 widget.setDragAxis(dragAxis if index == active else None)
             else:
                 widget.off()
+            widget.setLocked(locked)
         self._syncPanels()
         self._view.refresh()
 

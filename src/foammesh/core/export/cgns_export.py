@@ -45,7 +45,7 @@ def unavailable_reason() -> str:
         f'CGNS export needs a VTK build that includes the CGNS writer: '
         f'"import {WRITER_MODULE}" raises ModuleNotFoundError here, while VTK '
         'itself is installed and working. No pip extra ships that module, so '
-        'installing "foammesh[export]" will not change this -- a VTK build '
+        'installing "foammesh[export]" will not change this — a VTK build '
         'carrying vtkCGNSWriter is what this route needs. A case with an '
         'accepted Gmsh run exports CGNS through Gmsh instead and needs no VTK '
         'module at all.')

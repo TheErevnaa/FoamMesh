@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from .checkmesh_parser import CheckMeshResult
 from .policy import DEFAULT_POLICY, QualityPolicy
+from foammesh.core.quantities import count_text
 
 # The acceptability thresholds, from the one policy that also fixes the limits
 # snappyHexMesh meshes against (Plan 30 F-25). Kept as module constants because
@@ -35,7 +36,9 @@ def readiness_verdict(result: CheckMeshResult,
     reasons: list[str] = []
 
     if result.mesh_ok is False or (result.failed_checks or 0) > 0:
-        reasons.append(f'checkMesh reported {result.failed_checks} failed check(s).')
+        reasons.append(
+            'checkMesh reported '
+            + count_text(result.failed_checks, 'failed check') + '.')
     if result.max_non_ortho is not None and result.max_non_ortho > limits.max_non_ortho:
         reasons.append(
             f'Max non-orthogonality {result.max_non_ortho} > {limits.max_non_ortho}.')

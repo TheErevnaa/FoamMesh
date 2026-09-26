@@ -13,7 +13,7 @@ A FoamMesh case is a normal OpenFOAM case directory plus one sidecar folder:
                                   # mesh fingerprint, provenance
     artifact_history.json         # append-only history of mesh mutations,
                                   # imports, exports, and restores
-    quality/latest.json           # last structured Mesh Check report
+    quality/latest.json           # last structured Mesh check report
     logs/                         # raw utility logs (checkMesh, transformPoints, ...)
     recovery/<id>/                # verified polyMesh recovery points
 ```
@@ -26,7 +26,7 @@ recovery points, and workflow provenance, not the mesh.
 Every mutation records a SHA-256 fingerprint of `constant/polyMesh`.
 FoamMesh uses it to:
 
-- mark Mesh Check results **stale** the moment the mesh no longer matches;
+- mark Mesh check results **stale** the moment the mesh no longer matches;
 - decide whether a case can reopen in the authored workflow (provenance must
   agree with the mesh on disk, otherwise the case degrades safely to
   external-mesh mode with an explanation);
@@ -41,7 +41,7 @@ conversion) snapshot `constant/polyMesh` first:
   records `restored`.
 - **Success** → the snapshot is kept as an *available* recovery point.
 
-**Mesh → Restore Previous Mesh...** replaces the current mesh with the most
+**Mesh → Restore previous mesh...** replaces the current mesh with the most
 recent verified recovery point. This is an explicit artifact operation — it is
 *not* Edit → Undo — and it creates its own history event. A point whose backup
 fails fingerprint verification is never offered.
@@ -51,7 +51,7 @@ Headless equivalents: `foammesh restore <case>` and semantic operation
 
 ## Transaction history
 
-**Edit → Transaction History** shows one auditable timeline of:
+**Edit → Transaction history** shows one auditable timeline of:
 
 - reversible state edits (also reachable through Undo/Redo), and
 - artifact events — mesh mutations, imports, exports, restores — with command,

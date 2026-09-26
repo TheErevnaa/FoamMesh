@@ -63,10 +63,12 @@ class CadImporter(StlImporter):
         from foammesh.core.geometry.cad.tessellate import tessellate
         from foammesh.core.geometry.cad.surface_split import split_by_face_id_indexed
 
-        from foammesh.core.geometry.units import to_metres
+        from foammesh.core.geometry.units import si_factor, to_metres
 
         shape, model = read_cad(path, unit)
-        polydata = tessellate(shape, params or TessellationParams())
+        # DP-520. The deflection is in metres; the shape is in model.unit.
+        polydata = tessellate(shape, params or TessellationParams(),
+                              unit_factor=si_factor(model.unit))
         # STEP and IGES declare their length unit and most CAD is written in
         # millimetres. The artifact store has always converted; this copy --
         # the one the viewport draws and the one the geometry database keeps --

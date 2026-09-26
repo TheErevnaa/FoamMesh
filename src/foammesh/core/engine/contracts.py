@@ -15,6 +15,22 @@ from types import MappingProxyType
 from typing import Iterable, Mapping
 
 
+#: Keys whose values are prose for a reader rather than structure for the
+#: engine. They are excluded from ``WorkflowDescriptor.digest`` so that
+#: re-wording the product never invalidates a user's saved progress.
+_PROSE_KEYS = frozenset({'title', 'description', 'display_name', 'reason'})
+
+
+def _structural(node):
+    """``node`` with every prose value removed, at any depth."""
+    if isinstance(node, dict):
+        return {key: _structural(value) for key, value in node.items()
+                if key not in _PROSE_KEYS}
+    if isinstance(node, list):
+        return [_structural(value) for value in node]
+    return node
+
+
 class ContractError(ValueError):
     """Raised when an engine publishes an invalid descriptor or plan."""
 
@@ -258,6 +274,42 @@ class WorkflowDescriptor:
                     frontier.append(task.task_id)
         return tuple(task.task_id for task in self.ordered_tasks() if task.task_id in found)
 
+    def required_prerequisites(self, task_id: str) -> tuple[str, ...]:
+        """The prerequisites a user has to settle, named without the optional ones.
+
+        Plan 31 DP-144. `depends_on` is a chain, not a set: Gmsh threads its
+        five optional tasks in a line, so `gmsh.compute` depends on
+        `gmsh.periodic`, which depends on `gmsh.boundary_layers`, and so on
+        back to `gmsh.global_sizing`. MEASURED on the `dp143-labels` leg: the
+        Compute Mesh page read "Requires: Periodic Pairs", and the three
+        snappy pages after Boundary Layers read "Requires: Boundary Layers" --
+        eight pages across the two engines naming as a requirement a step the
+        run skips on its own (`task_state_store._record`, DP-35).
+
+        Walking through the tasks that are not REQUIRED leaves the ones that
+        are, which is the answer to the question the line is asked: what must
+        I do before this. The state-aware sibling is
+        :meth:`EngineWorkflowGraph.blocking_prerequisites`, which answers the
+        same question about one live run.
+        """
+        self.task(task_id)
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def walk(current: str) -> None:
+            for parent in self.task(current).depends_on:
+                if parent in seen:
+                    continue
+                seen.add(parent)
+                if self.task(parent).cardinality is TaskCardinality.REQUIRED:
+                    found.append(parent)
+                else:
+                    walk(parent)
+
+        walk(task_id)
+        order = {task.task_id: task.order for task in self.tasks}
+        return tuple(sorted(found, key=lambda item: order[item]))
+
     def editable_fields(self) -> tuple[FieldBinding, ...]:
         by_id: dict[str, FieldBinding] = {}
         for task in self.ordered_tasks():
@@ -283,8 +335,23 @@ class WorkflowDescriptor:
 
     @property
     def digest(self) -> str:
+        """The structural identity of this workflow, wording excluded.
+
+        This value is the invalidation key for persisted task state
+        (``EngineTaskStateStore.load_result``): a case whose stored digest
+        does not match this one has its saved progress discarded. It must
+        therefore answer one question only -- *is this the same workflow?* --
+        and a display label is not part of that answer. Hashing the raw
+        ``to_dict()`` payload made it part of the answer anyway, so
+        re-wording a stage title, or fixing a typo in a task description,
+        silently reset every saved case in the field. The same hazard was
+        already recognised for *dynamic* text, which is why task warnings
+        ride beside the descriptor rather than inside it (WP2.1); this is the
+        static half of it.
+        """
         payload = json.dumps(
-            self.to_dict(), sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            _structural(self.to_dict()), sort_keys=True,
+            separators=(',', ':'), ensure_ascii=False)
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 

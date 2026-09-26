@@ -18,6 +18,7 @@ belongs to which run are the part worth testing, and they are all here.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,8 +61,15 @@ _DISPOSITION = {
 POLY_MESH = 'openfoam.polymesh'
 #: A native Gmsh ``.msh``, opened directly.
 GMSH_MSH = 'gmsh.msh'
+#: DP-133. The surface pass of a three-dimensional Gmsh run: the same file
+#: format, read the other way. It is a separate format rather than a flag on
+#: :data:`GMSH_MSH` because the reader has to be *told* -- a surface mesh
+#: arriving where a volume was expected is the silent failure
+#: ``read_msh_scene`` refuses by default, and one identity that sometimes
+#: means a volume and sometimes a surface would hand that refusal back.
+GMSH_SURFACE_MSH = 'gmsh.surface.msh'
 #: Formats the viewport has a reader for.
-READABLE_FORMATS = (POLY_MESH, GMSH_MSH)
+READABLE_FORMATS = (POLY_MESH, GMSH_MSH, GMSH_SURFACE_MSH)
 
 #: The artifact the mesher itself wrote.
 NATIVE = 'native'
@@ -83,6 +91,7 @@ _STATE = {
 _FORMAT_LABEL = {
     POLY_MESH: 'polyMesh',
     GMSH_MSH: 'native Gmsh mesh',
+    GMSH_SURFACE_MSH: 'surface pass, before the volume pass',
 }
 
 #: Where a run keeps a polyMesh a viewer could open, relative to its own
@@ -157,6 +166,81 @@ def failure_payload(*, task: str, reason: str, log='',
     }
 
 
+#: How much of a log's end is read for its cause. A failing utility says why
+#: in its last lines; a 4 MiB stage log is not read whole to find them.
+_CAUSE_TAIL_BYTES = 256 * 1024
+#: OpenFOAM's header for the message it dies with, in either form.
+_FOAM_FATAL = re.compile(r'FOAM FATAL (?:IO )?ERROR', re.IGNORECASE)
+#: The lines OpenFOAM prints after the message: where in its source it was.
+_FOAM_TRAILER = ('From ', 'in file', 'FOAM exiting', 'FOAM aborting')
+#: A line that says something went wrong, in the words tools use for it --
+#: Gmsh's ``Error   : ...``, Python's ``Traceback`` and ``...Error:``, a shell's
+#: ``command not found``.
+_ERROR_LINE = re.compile(
+    r'(?:error|fatal|exception|traceback|abort(?:ed|ing)?|not found|'
+    r'segmentation fault|killed)\b', re.IGNORECASE)
+#: How many error lines make a cause, and how many make its details.
+_CAUSE_LINES = 3
+_DETAIL_LINES = 40
+
+
+def failure_cause(text: str) -> tuple[str, str]:
+    """``(cause, details)`` for a failed run, read from its output.
+
+    DP-506 (MA-02). A snappy stage that exited 1 reached the user as "The
+    stage could not run." while its log held the one sentence that says what
+    to change -- OpenFOAM's ``FOAM FATAL ERROR`` block naming the unknown
+    region and listing the valid ones. That block is the cause when there is
+    one: its message lines are the gist, the whole block is the details.
+    Otherwise the last lines that say *error* are the cause, and the log's
+    tail is the details. The cause is empty when no line says what went
+    wrong; nothing is made up to fill it.
+    """
+    lines = [line.rstrip() for line in str(text or '').splitlines()]
+    start = None
+    for index, line in enumerate(lines):
+        if _FOAM_FATAL.search(line):
+            start = index
+    if start is not None:
+        block = []
+        for line in lines[start:]:
+            block.append(line)
+            if line.strip().startswith(('FOAM exiting', 'FOAM aborting')):
+                break
+        header = _FOAM_FATAL.split(lines[start], maxsplit=1)[-1]
+        message = [header.strip(' :')] if header.strip(' :') else []
+        for line in block[1:]:
+            stripped = line.strip()
+            if stripped.startswith(_FOAM_TRAILER):
+                break
+            if stripped:
+                message.append(stripped)
+        details = '\n'.join(block).strip('\n')
+        return '\n'.join(message) or details, details
+    meaningful = [line for line in lines if line.strip()]
+    errors = [line.strip() for line in meaningful if _ERROR_LINE.search(line)]
+    if not errors:
+        return '', '\n'.join(meaningful[-_DETAIL_LINES:])
+    return ('\n'.join(errors[-_CAUSE_LINES:]),
+            '\n'.join(meaningful[-_DETAIL_LINES:]))
+
+
+def read_failure_cause(log) -> tuple[str, str]:
+    """:func:`failure_cause` of the log at *log*; ``('', '')`` if unreadable."""
+    if not log:
+        return '', ''
+    try:
+        path = Path(log)
+        with path.open('rb') as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - _CAUSE_TAIL_BYTES))
+            raw = stream.read()
+    except (OSError, ValueError):
+        return '', ''
+    return failure_cause(raw.decode('utf-8', errors='replace'))
+
+
 def drawable_root(run_root) -> str:
     """The case root under ``run_root`` the polyMesh loader can open, or ''.
 
@@ -184,6 +268,28 @@ def _content_id(payload: dict) -> str:
     """
     manifest = payload.get('run_manifest') or {}
     return str(manifest.get('mesh_sha256') or payload.get('mesh_sha256') or '')
+
+
+def _surface_path(payload: dict, run_path) -> str:
+    """Where this run left its surface pass, or '' -- DP-133.
+
+    The run's own manifest records it. The fallback to the run directory is
+    for a run that finished before that key existed and whose `surface.msh`
+    is nonetheless sitting there; it is a re-read of a file the run wrote,
+    not a guess at one it might have.
+
+    Either way the file is checked. A recorded path is an absolute path from
+    the machine the run happened on, and a run directory that has since been
+    moved or cleaned out must read as "no surface pass" rather than as one
+    the viewport will fail to open.
+    """
+    record = (payload.get('run_manifest') or {}).get('surface_artifact') or {}
+    candidate = str(record.get('path') or '')
+    if not candidate and run_path:
+        candidate = str(Path(run_path) / 'surface.msh')
+    if candidate and Path(candidate).is_file():
+        return candidate
+    return ''
 
 
 def _cell_count(payload: dict) -> int:
@@ -226,6 +332,12 @@ class RunResultHandle:
     #: Set when this handle is a deliberate re-selection of an earlier result
     #: rather than the result of the run that just finished.
     label: str = ''
+    #: DP-133. The surface pass this run kept, if it kept one. Carried on the
+    #: handle rather than looked for at the moment of asking, because by then
+    #: the only thing that knows which run directory to look in is the handle.
+    #: Empty for a section, for a run that wrote none, and for snappy, which
+    #: shows its stages as it goes and has never needed this.
+    surface_path: str = ''
 
     # -- producing side ---------------------------------------------------- #
 
@@ -261,11 +373,19 @@ class RunResultHandle:
         built = (bool(payload.get('quality_verdict'))
                  or bool(payload.get('built')))
         verdict = _verdict_for(str(status), built)
+        run_path = payload.get('run_path') or (
+            case / 'foammesh' / 'runs' / run_id if run_id else '')
+        # DP-133. Read before the branches below and given to every one of
+        # them, because a run that left a surface pass left it whichever way
+        # the run ended -- and the run whose volume pass failed outright is
+        # the one for which it is worth the most.
+        surface = _surface_path(payload, run_path)
 
         root_mesh = case / 'constant' / 'polyMesh'
         if verdict == NOTHING:
             return cls(run_id=run_id, engine=engine_id, verdict=verdict,
-                       cell_count=_cell_count(payload))
+                       cell_count=_cell_count(payload),
+                       surface_path=surface)
         if engine_id != 'gmsh':
             # snappyHexMesh meshes the case in place: its candidate *is* the
             # root mesh, refused or not, because it has already overwritten
@@ -284,7 +404,8 @@ class RunResultHandle:
                 fingerprint=(str(mesh_state.get('fingerprint') or '')
                              or fingerprint_of(root_mesh)),
                 cell_count=_cell_count(payload),
-                case_root=str(case), artifact_format=POLY_MESH)
+                case_root=str(case), artifact_format=POLY_MESH,
+                surface_path=surface)
 
         # A Gmsh run. C31-03: the polyMesh at the case root is claimed only
         # when *this* run's publication record says this run wrote it. An
@@ -301,10 +422,8 @@ class RunResultHandle:
                     Path(published) / 'constant' / 'polyMesh'),
                 cell_count=_cell_count(payload),
                 case_root=str(published), artifact_format=POLY_MESH,
-                content_id=_content_id(payload))
+                content_id=_content_id(payload), surface_path=surface)
 
-        run_path = payload.get('run_path') or (
-            case / 'foammesh' / 'runs' / run_id if run_id else '')
         artifact = payload.get('artifact_path') or (
             str(Path(run_path) / 'mesh.msh') if run_path else '')
         # The mesher's own file is the result. The viewport reads it directly
@@ -317,7 +436,8 @@ class RunResultHandle:
                 artifact_path=str(artifact),
                 fingerprint=str(payload.get('artifact_fingerprint') or ''),
                 cell_count=_cell_count(payload), case_root='',
-                artifact_format=GMSH_MSH, content_id=_content_id(payload))
+                artifact_format=GMSH_MSH, content_id=_content_id(payload),
+                surface_path=surface)
         # No native file to read -- but a step may have staged a polyMesh
         # inside the run directory. That is a labelled derivative *under the
         # run*, not a publication.
@@ -329,14 +449,14 @@ class RunResultHandle:
                 fingerprint=str(payload.get('artifact_fingerprint') or ''),
                 cell_count=_cell_count(payload), case_root=str(staged),
                 artifact_format=POLY_MESH, artifact_role=DERIVATIVE,
-                content_id=_content_id(payload))
+                content_id=_content_id(payload), surface_path=surface)
         return cls(
             run_id=run_id, engine=engine_id, verdict=verdict,
             artifact_path=str(artifact or ''),
             fingerprint=str(payload.get('artifact_fingerprint') or ''),
             cell_count=_cell_count(payload), case_root='',
             artifact_format=GMSH_MSH if artifact else '',
-            content_id=_content_id(payload))
+            content_id=_content_id(payload), surface_path=surface)
 
     # -- what the viewport asks it ----------------------------------------- #
 
@@ -368,10 +488,35 @@ class RunResultHandle:
         """Whether the viewport has a reader for this run's own artifact."""
         if self.artifact_format == POLY_MESH:
             return bool(self.case_root)
-        if self.artifact_format == GMSH_MSH:
+        if self.artifact_format in (GMSH_MSH, GMSH_SURFACE_MSH):
             return (bool(self.artifact_path)
                     and Path(self.artifact_path).is_file())
         return False
+
+    def surface_result(self) -> 'RunResultHandle | None':
+        """This run's surface pass as a result in its own right, or ``None``.
+
+        DP-133. A separate handle rather than a second path on this one,
+        because everything downstream of a handle -- the reader that opens
+        it, the sentence above the picture, the identity the overlay and the
+        selection are bound to -- has to change together when the user asks
+        for the surface instead of the volume. Two artifacts of one run are
+        two results; treating them as one result with a flag is how a
+        selection computed on the volume ends up drawn over the surface.
+
+        The cell count is dropped rather than carried over: it counts the
+        volume's cells, and this mesh has none. No ``label`` either: the
+        format already names itself in the sentence, and a label would say
+        the same words twice.
+        """
+        if not self.surface_path:
+            return None
+        return RunResultHandle(
+            run_id=self.run_id, engine=self.engine,
+            artifact_path=self.surface_path,
+            fingerprint=fingerprint_of(self.surface_path),
+            verdict=self.verdict, cell_count=0, case_root='',
+            artifact_format=GMSH_SURFACE_MSH, artifact_role=NATIVE)
 
     def describe(self) -> str:
         """The line the viewport header shows above the picture."""
@@ -595,7 +740,7 @@ def unclaimed_case_mesh(case_path):
         artifact_format=POLY_MESH, label='mesh already in this case')
 
 
-def result_on_open(case_path):
+def result_on_open(case_path, *, root_mesh_stale=False):
     """What to draw when a case is opened, named by the run that made it.
 
     The published mesh when the case has one; otherwise the newest run that
@@ -603,7 +748,18 @@ def result_on_open(case_path):
     case with no solver target, and the whole of a case whose last run was
     refused. ``None`` when the case holds neither, and *that* is when the
     viewport is right to be empty.
+
+    DP-794. ``root_mesh_stale`` says the case's ``constant/polyMesh`` is no
+    longer the mesh any run of ours wrote (its content fingerprint differs
+    from the authored provenance). A run's publication record cannot tell
+    that -- it is honoured whenever *a* polyMesh is there -- so such a mesh
+    is drawn on its own account, and never swapped for a run's native file,
+    which holds the old mesh.
     """
+    if root_mesh_stale:
+        unclaimed = unclaimed_case_mesh(case_path)
+        if unclaimed is not None:
+            return unclaimed
     accepted = accepted_result(case_path)
     if accepted is not None and accepted.drawable:
         return accepted

@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foammesh"
-version = "1.0.0"
+version = "1.1.0"
 description = "FoamMesh â€” standalone OpenFOAM Foundation 13 meshing workbench"
 readme = "README.md"
 requires-python = ">=3.11"

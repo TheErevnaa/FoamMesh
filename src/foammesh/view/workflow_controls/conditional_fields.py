@@ -1,4 +1,4 @@
-"""Grey the editors the current configuration cannot reach.
+"""Take away the inputs the current configuration cannot reach.
 
 Plan 31 CP-09 item 4: "use conditional editors from shared metadata; preserve
 inactive settings visibly where useful, but ensure they do not affect the job
@@ -17,10 +17,19 @@ that refuse it.)
 
 Two rules, both here so the two page families cannot drift apart:
 
-* an editor whose clauses do not hold is disabled, labelled "(inactive)" and
-  carries the sentence saying which setting would make it live again; and
+* an editor whose clauses do not hold is taken off the form -- label, editor
+  and unit, and the row itself, so it costs no height -- and carries the
+  sentence saying which setting would make it live again; and
 * its field is dropped from the pending patch, so an inactive control cannot
   write from off screen.
+
+Plan 33 FIELD-02 changed the first rule from greying to absence. CP-09 chose
+greying to "preserve inactive settings visibly", and MEASURED afterwards that
+came to twelve greyed rows across the twenty-nine task pages -- twelve rows a
+reader could read, count, and try to click, on settings the run would not
+read whatever they said. A control that cannot be used is not a setting; the
+reason it is gone is still on the editor, so a page can still say how many
+of its inputs the current configuration puts out of reach.
 """
 from __future__ import annotations
 
@@ -28,7 +37,7 @@ from foammesh.core.facade import applicability
 
 
 def refresh_applicability(client, editors, pending=None) -> dict:
-    """Judge every editor, grey the inactive ones, clean the patch.
+    """Judge every editor, take the inactive ones away, clean the patch.
 
     Returns ``{field_id: reason}`` for the fields that do not apply, which is
     what a page needs to say "3 settings on this page are inactive" without
@@ -73,6 +82,6 @@ def condition_context(client, editors) -> tuple[dict, dict]:
             values[field_id] = client.field_values((field_id,))[field_id]
         except Exception:                                    # noqa: BLE001
             # Unreadable is not false: `applicability.evaluate` leaves a
-            # clause it cannot judge alone rather than greying the control.
+            # clause it cannot judge alone rather than taking the row away.
             continue
     return values, titles

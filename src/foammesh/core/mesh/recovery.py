@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,30 @@ from foammesh.core.case import (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+#: DP-111. A snappy castellation on the parallel path lost a stage that had
+#: already meshed to `[WinError 5] Access is denied` swapping this journal's
+#: `manifest.json.tmp` over `manifest.json`. The call was already `os.replace`,
+#: which does overwrite an existing destination on Windows -- so the denial is
+#: a sharing violation, not a rename that refused to replace: something held
+#: one of the two paths open for the instant the swap needed them. Those holds
+#: are short. Give the swap more than one attempt rather than letting the first
+#: one decide the fate of a mesh that is already written to disk.
+_REPLACE_ATTEMPTS = 8
+_REPLACE_BACKOFF_SECONDS = 0.05
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """``os.replace``, with a short bounded retry for a transient denial."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
 
 @dataclass(frozen=True)
@@ -33,7 +58,7 @@ class MeshRecoveryPoint:
 
 @dataclass(frozen=True)
 class MeshRestoreOutcome:
-    """Result of an explicit user-facing Restore Previous Mesh operation."""
+    """Result of an explicit user-facing Restore previous mesh operation."""
     point: MeshRecoveryPoint
     operation: str
     created_at: str
@@ -72,7 +97,7 @@ class MeshRecoveryService:
             with temporary.open('w', encoding='utf-8', newline='\n') as output:
                 json.dump(payload, output, indent=2, sort_keys=True)
                 output.write('\n'); output.flush(); os.fsync(output.fileno())
-            os.replace(temporary, manifest)
+            _replace_with_retry(temporary, manifest)
         except Exception:
             shutil.rmtree(root, ignore_errors=True)
             raise
@@ -90,8 +115,8 @@ class MeshRecoveryService:
             shutil.copytree(point.mesh_backup, staging, copy_function=shutil.copy2)
             displaced = mesh.with_name(f'.polyMesh.displaced-{point.recovery_id}')
             if mesh.exists():
-                os.replace(mesh, displaced)
-            os.replace(staging, mesh)
+                _replace_with_retry(mesh, displaced)
+            _replace_with_retry(staging, mesh)
             shutil.rmtree(displaced, ignore_errors=True)
             self._mark(point.manifest, 'restored')
         finally:
@@ -121,7 +146,7 @@ class MeshRecoveryService:
         """Cheap probe for the action policy: any restorable point exists?
 
         Only reads manifests; full fingerprint verification is deferred to the
-        moment the user actually triggers Restore Previous Mesh.
+        moment the user actually triggers Restore previous mesh.
         """
         return any(self.manifest_payload(point).get('state') == 'available'
                    for point in self.list_points(case_path))
@@ -150,7 +175,7 @@ class MeshRecoveryService:
         return None
 
     def restore_previous(self, case_path: str | Path) -> MeshRestoreOutcome:
-        """Explicit §5.3.5 Restore Previous Mesh artifact operation.
+        """Explicit §5.3.5 Restore previous mesh artifact operation.
 
         Restores the newest verified recovery point left behind by a
         successful transform/repair, refreshes the sidecar mesh fingerprint so
@@ -208,7 +233,7 @@ class MeshRecoveryService:
         temporary = manifest.with_suffix('.json.tmp')
         try:
             temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-            os.replace(temporary, manifest)
+            _replace_with_retry(temporary, manifest)
         finally:
             if temporary.exists():
                 temporary.unlink()

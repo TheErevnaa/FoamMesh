@@ -167,6 +167,37 @@ def dedupe(polydata, degenerate_area_frac: float = 1e-16):
             polydata.GetNumberOfCells()) if i not in set(keep)][:50_000]}
 
 
+def _carry_face_ids(source, output) -> None:
+    """Put *source*'s ``cadFaceId`` back on the cells *output* kept.
+
+    DP-486. vtkFillHolesFilter passes the points through and drops every
+    cell array, so a filled multi-solid STL came back with no record of which
+    solid each triangle belonged to and was written as one solid under
+    vtkSTLWriter's own header -- every ``regions`` entry the dictionary
+    generated from the same records then failed with "Unknown region name".
+    The kept cells are matched by their point ids, which the filter does not
+    renumber; a cell with no match is one the fill created (-1).
+    """
+    from vtkmodules.vtkCommonCore import vtkIntArray
+
+    source_ids = source.GetCellData().GetArray('cadFaceId')
+    if source_ids is None or output.GetCellData().GetArray('cadFaceId') is not None:
+        return
+    owner = {}
+    for cell_id in range(source.GetNumberOfCells()):
+        cell = source.GetCell(cell_id)
+        key = tuple(sorted(cell.GetPointId(i) for i in range(cell.GetNumberOfPoints())))
+        owner.setdefault(key, int(source_ids.GetTuple1(cell_id)))
+    carried = vtkIntArray()
+    carried.SetName('cadFaceId')
+    carried.SetNumberOfTuples(output.GetNumberOfCells())
+    for cell_id in range(output.GetNumberOfCells()):
+        cell = output.GetCell(cell_id)
+        key = tuple(sorted(cell.GetPointId(i) for i in range(cell.GetNumberOfPoints())))
+        carried.SetValue(cell_id, owner.get(key, -1))
+    output.GetCellData().AddArray(carried)
+
+
 def fill_holes(polydata, hole_size: float = 1e6, smooth_fill: bool = True):
     """Fill bounded boundary loops and report every loop's threshold outcome."""
     if hole_size <= 0:
@@ -181,6 +212,7 @@ def fill_holes(polydata, hole_size: float = 1e6, smooth_fill: bool = True):
     tri.Update()
     out = _copy(tri.GetOutput())
     new_cells = max(0, out.GetNumberOfCells() - polydata.GetNumberOfCells())
+    _carry_face_ids(polydata, out)
     face_ids = out.GetCellData().GetArray('cadFaceId')
     if face_ids is not None:
         for cell_id in range(polydata.GetNumberOfCells(), out.GetNumberOfCells()):
@@ -473,8 +505,13 @@ REPAIR_BANDS = {
 }
 
 TESSELLATED_ACTIONS = {
-    'tess.weld': TessellatedAction(clean, ('duplicate_points',), {}, 'low',
-        band=1),
+    # ``dropped_facets`` (DP-44) belongs here rather than with the sliver
+    # actions: the reader already welded the surface in memory, so what the
+    # user needs is that weld written back to the artifact. Applying this
+    # rewrites the file from the surface everything was graded against, and
+    # the file and the report agree from then on.
+    'tess.weld': TessellatedAction(clean,
+        ('duplicate_points', 'dropped_facets'), {}, 'low', band=1),
     'tess.dedupe': TessellatedAction(dedupe,
         ('duplicate_triangles', 'degenerate_triangles'), {}, 'low', band=1),
     'tess.orient': TessellatedAction(consistent_normals,
@@ -585,8 +622,19 @@ def apply_action(polydata, action: str, params: dict | None = None,
     return RepairOutcome(resolved, output, before, assess(output), changes)
 
 
-def write_surface(polydata, destination) -> Path:
-    """Write a repaired surface beside its source, in the source's format."""
+def write_surface(polydata, destination, *, solid_name: str | None = None) -> Path:
+    """Write a repaired surface beside its source, in the source's format.
+
+    DP-362. ``solid_name`` is the name the written block must carry. In an
+    ASCII STL the header *is* the solid name, and a repair that leaves it to
+    vtkSTLWriter gets `solid Visualization Toolkit generated SLA File` --
+    four words OpenFOAM cannot key a ``regions`` entry on and the user never
+    chose. DP-64 fixed that in the store's own writer and this one, the
+    sibling the repair path uses, kept dropping the name: MEASURED on
+    `annulus_shell`, whose repaired revision meshed as `FOAM FATAL ERROR:
+    Unknown region name annulus_shell`. A repair changes the triangles and
+    nothing about what the surface is called.
+    """
     from vtkmodules.vtkIOGeometry import vtkOBJWriter, vtkSTLWriter
 
     path = Path(destination)
@@ -594,6 +642,8 @@ def write_surface(polydata, destination) -> Path:
     suffix = path.suffix.lower()
     if suffix == '.stl':
         writer = vtkSTLWriter()
+        if solid_name:
+            writer.SetHeader(str(solid_name))
     elif suffix == '.obj':
         writer = vtkOBJWriter()
     else:

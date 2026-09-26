@@ -1,11 +1,9 @@
-      <svg
-         id="icons"
-         viewBox="0 0 512 512"
-         xmlns="http://www.w3.org/2000/svg">
-        <path
-   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-   d="M 400,256 A 144,144 0 1 1 256,112" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-   d="M 208,64 256,112 208,160" />
-      </svg>
+<svg
+   id="icons"
+   viewBox="0 0 512 512"
+   xmlns="http://www.w3.org/2000/svg">
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 168,184 H 344 V 328 H 168 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 72,189 A 196 196 0 0 1 440,189" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 460,128 440,189 386,155" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 256,200 V 232" />
+</svg>

@@ -6,18 +6,35 @@ from typing import Optional
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QColorDialog, QHeaderView, QMenu, QTreeWidgetItem)
+    QColorDialog, QHeaderView, QMenu, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from foammesh.app import app
 from foammesh.rendering.actor_info import (
     DisplayMode, Properties, RegionMarkerActor)
 from widgets.rendering.rendering_widget import RenderingWidget
+from foammesh.view.main_window.mesh_lines_control import MeshLinesPanel
+from foammesh.view.widgets.folder_header import FolderHeader
 from .mesh_quality_info import MeshQualityInfo
 
 from .opacity_dialog import OpacityDialog
+from foammesh.view.theming.metrics import GAP
 from .display_item import DisplayItem, Column
 from .cut_tool import CutTool, sceneBounds
 from .section_panel import CutType
+
+
+def countedPartIds(items) -> list:
+    """The row ids the parts chip counts: the parts of the model on screen.
+
+    DP-679. A snappy case with one imported STL read "2 of 2 parts shown"
+    once a region seed existed, because the seed's marker is a row too. A
+    seed is a landmark the user placed, not a part of what they imported, and
+    a row ``DisplayControl.hide`` took out of the scene is not on screen at
+    all; neither is counted. Both keep their rows.
+    """
+    return [key for key, item in items.items()
+            if not item.isHidden()
+            and not isinstance(item.actorInfo(), RegionMarkerActor)]
 
 
 class ContextMenu(QMenu):
@@ -44,17 +61,17 @@ class ContextMenu(QMenu):
         self._showAction = self.addAction(self.tr('Show'), lambda: self.showActionTriggered.emit())
         self._hideAction = self.addAction(self.tr('Hide'), lambda: self.hideActionTriggered.emit())
         self._opacityAction = self.addAction(self.tr('Opacity'), self._openOpacityDialog)
-        self._colorAction = self.addAction(self.tr('Color'), self._openColorDialog)
+        self._colorAction = self.addAction(self.tr('Colour'), self._openColorDialog)
 
-        displayMenu = self.addMenu(self.tr('Display Mode'))
+        displayMenu = self.addMenu(self.tr('Display mode'))
         self._wireFrameDisplayAction = displayMenu.addAction(
             self.tr('Wireframe'), lambda: self.wireframeDisplayModeSelected.emit())
         self._surfaceDisplayAction = displayMenu.addAction(
             self.tr('Surface'), lambda: self.surfaceDisplayModeSelected.emit())
         self._surfaceEdgeDisplayAction = displayMenu.addAction(
-            self.tr('Surface with Edges'), lambda: self.surfaceEdgeDisplayModeSelected.emit())
+            self.tr('Surface with edges'), lambda: self.surfaceEdgeDisplayModeSelected.emit())
 
-        self._noCutAction = self.addAction(self.tr('No Cut'), self._noCutActionTriggered)
+        self._noCutAction = self.addAction(self.tr('No cut'), self._noCutActionTriggered)
 
         self.addSeparator()
         # Right-clicking the thing itself is the natural verb. This menu has
@@ -63,7 +80,7 @@ class ContextMenu(QMenu):
         self._isolateAction = self.addAction(
             self.tr('Isolate'), lambda: self.isolateActionTriggered.emit())
         self._showAllAction = self.addAction(
-            self.tr('Show All'), lambda: self.showAllActionTriggered.emit())
+            self.tr('Show all'), lambda: self.showAllActionTriggered.emit())
 
         self._wireFrameDisplayAction.setCheckable(True)
         self._surfaceDisplayAction.setCheckable(True)
@@ -126,6 +143,7 @@ class DisplayControl(QObject):
 
         self._cutTool = CutTool(ui)
         self._meshQualityInfo = MeshQualityInfo(ui)
+        self._meshLines = self._addMeshLinesFold(ui)
         self._menu = ContextMenu(self._list)
 
         self._items: dict[str, DisplayItem] = {}
@@ -143,6 +161,36 @@ class DisplayControl(QObject):
         self._list.header().setSectionResizeMode(Column.TYPE_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
 
         self._connectSignalsSlots()
+
+    def _addMeshLinesFold(self, ui) -> Optional[MeshLinesPanel]:
+        """DP-738. The mesh-line control, in the panel with the other folds.
+
+        DP-710 put it only behind a toolbar icon. It is the same control on
+        the same global style, so the two cannot disagree; it sits just above
+        the parts list, after Cut and Mesh Quality.
+        """
+        layout = ui.displayControl.layout()
+        if layout is None or layout.indexOf(ui.actors) < 0:
+            return None
+        fold = QWidget(ui.displayControl)
+        fold.setObjectName('meshLinesTool')
+        foldLayout = QVBoxLayout(fold)
+        foldLayout.setContentsMargins(0, 0, 0, 0)
+        foldLayout.setSpacing(GAP)
+        header = FolderHeader(fold)
+        header.setObjectName('meshLinesHeader')
+        header.setText(self.tr('Mesh lines'))
+        panel = MeshLinesPanel(fold)
+        panel.setToolTip(self.tr(
+            'Opacity, colour and width of the grid drawn on every part; '
+            'the same setting as the Mesh lines button on the viewport '
+            'toolbar'))
+        foldLayout.addWidget(header)
+        foldLayout.addWidget(panel)
+        header.setContents(panel)
+        layout.insertWidget(layout.indexOf(ui.actors), fold)
+        panel.styleChanged.connect(self._view.refresh)
+        return panel
 
     def setEnabled(self, enabled):
         self._ui.displayControl.setEnabled(enabled)
@@ -178,7 +226,10 @@ class DisplayControl(QObject):
     #: Zones used to sit in the same flat list as the boundary patches, so a
     #: two-zone case meant reading every row to find the two that mattered.
     #: The grouping is already in the actor ids -- ``region:category:name``.
-    ZONE_GROUPS = {'cellZones': 'Cell Zones', 'faceZones': 'Face Zones'}
+    #: DP-711. `regions` holds the named pieces of a mesh whose regions carry
+    #: no cell zones -- the fluid and solid of a snappy multi-region mesh.
+    ZONE_GROUPS = {'cellZones': 'Cell Zones', 'faceZones': 'Face Zones',
+                   'regions': 'Regions'}
 
     def _groupPath(self, actorInfo) -> tuple[str, ...]:
         # A region seed marker is a landmark in the scene, not a patch of a
@@ -263,6 +314,13 @@ class DisplayControl(QObject):
             self._view.removeActor(prop)
         item.setHidden(True)
 
+    def isShown(self, actorInfo) -> bool:
+        """Whether ``actorInfo`` is in the scene: added and not `hide`-den."""
+        item = self._items.get(actorInfo.id())
+        if item is None:
+            item = self._items.get(str(actorInfo.id()))
+        return item is not None and not item.isHidden()
+
     def refreshView(self):
         self._view.refresh()
 
@@ -277,14 +335,27 @@ class DisplayControl(QObject):
         self._view.refresh()
 
     def fitView(self):
-        self._view.fitCamera()
+        # DP-736. A load's fit: the view decides whether the model is the one
+        # its Back/Forward history was recorded on (record the refit) or not
+        # (clear the history). A bare fitCamera recorded nothing.
+        frameScene = getattr(self._view, 'frameScene', None)
+        if frameScene is None:
+            self._view.fitCamera()
+        else:
+            frameScene()
 
     def orientIsometric(self):
         """Frame the scene from the isometric preset (G4).
 
-        `setViewPreset` fits after it turns, so this both aims and frames.
+        The preset fits after it turns, so this both aims and frames. It goes
+        through the scene fit (DP-736): the preset alone pushed the camera it
+        replaced, which after a load of another model aimed at the old one.
         """
-        self._view.setViewPreset('isometric')
+        frameScene = getattr(self._view, 'frameScene', None)
+        if frameScene is None:
+            self._view.setViewPreset('isometric')
+        else:
+            frameScene('isometric')
 
     def openedStepChanged(self, step):
         self._workingStep = int(step)
@@ -323,6 +394,13 @@ class DisplayControl(QObject):
                 self._meshQualityInfo.show()
         elif self._meshQualityInfo.isVisible():
             self._meshQualityInfo.hide()
+
+        # DP-136. Peeling was re-decided only when somebody moved the opacity
+        # slider, so a scene that arrived already carrying a translucent part
+        # -- which is now how an enclosure arrives -- was drawn in whatever
+        # order its props happened to sit in. A content change is exactly when
+        # the question needs asking again.
+        self._updateTransparency()
 
     def _sceneHasMesh(self):
         manager = getattr(app.window, 'meshManager', None)
@@ -506,11 +584,62 @@ class DisplayControl(QObject):
         self._visibilityChanged()
         return True
 
+    def hiddenActorCount(self) -> int:
+        """How many parts are in the scene but not on screen.
+
+        DP-353. `Show all` had no way to say what it had just done, because
+        the only thing that knew was this dictionary. The count is the
+        difference the press makes, and a press that makes none is worth
+        saying out loud too.
+        """
+        return sum(1 for item in self._items.values()
+                   if not item.isActorVisible())
+
     def showAll(self):
         for item in self._items.values():
             item.setActorVisible(True)
         self._isolated = False
         self._visibilityChanged()
+
+    def selectParts(self, keys, additive: bool = False) -> list[str]:
+        """Select parts named by id, as a viewport click on them would.
+
+        DP-712 (viewport audit 0925 F2/F3). The overlay's rows are the parts
+        a user is looking at, so a click on one selects it -- Ctrl adds to or
+        removes from the selection -- and Fit and Isolate then act on it
+        through ``selectedActorIds`` like any other selection. It selects
+        the part's row exactly as a pick in the viewport does
+        (`_actorPicked`), so a part the selection service holds an entity for
+        reaches the service by the same road -- the geometry manager forwards
+        `selectedActorsChanged` to it -- and every view of it agrees.
+        """
+        keys = [str(key) for key in keys if str(key) in self._items]
+        if not additive:
+            self._list.clearSelection()
+        for key in keys:
+            item = self._items[key]
+            item.setSelected(not item.isSelected() if additive else True)
+        return self.selectedActorIds()
+
+    def setVisibilities(self, mapping: dict) -> int:
+        """Show and hide many parts in one step; ids not held are skipped.
+
+        DP-711. The Region picker turns one tick into a visibility for every
+        part of a region. Setting them row by row would repaint and recount
+        once per row; this repaints once. Returns how many ids it held.
+        """
+        held = 0
+        for key, visible in mapping.items():
+            item = self._items.get(key)
+            if item is None:
+                continue
+            item.setActorVisible(bool(visible))
+            held += 1
+        # Show all reads this flag: parts a picker hid are parts to bring back.
+        self._isolated = any(not item.isActorVisible()
+                             for item in self._items.values())
+        self._visibilityChanged()
+        return held
 
     _PLAN_DISPLAY_MODES = {
         'wireframe': DisplayMode.WIREFRAME,
@@ -547,7 +676,7 @@ class DisplayControl(QObject):
                 item.setActorVisible(False)
         # Isolation is a *user* state ("show only what I picked") and the Show
         # All button reads it. A mode hides things too, so the flag has to
-        # follow, or Show All would look spent while parts are still hidden.
+        # follow, or Show all would look spent while parts are still hidden.
         self._isolated = bool(plan.hidden)
         self._visibilityChanged()
         return len(visible)
@@ -582,10 +711,10 @@ class DisplayControl(QObject):
 
     def visibilitySummary(self) -> tuple[int, int]:
         """(shown, total) -- what the "3 of 11 parts shown" chip reports."""
-        total = len(self._items)
-        shown = sum(1 for item in self._items.values()
-                    if item.actorInfo().isVisible())
-        return shown, total
+        keys = countedPartIds(self._items)
+        shown = sum(1 for key in keys
+                    if self._items[key].actorInfo().isVisible())
+        return shown, len(keys)
 
     def isIsolated(self) -> bool:
         return self._isolated

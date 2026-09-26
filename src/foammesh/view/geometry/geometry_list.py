@@ -3,13 +3,16 @@
 
 from enum import IntEnum, auto
 
-from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QHeaderView
-from PySide6.QtCore import Signal, QObject, QCoreApplication
+from PySide6.QtWidgets import (QColorDialog, QHBoxLayout, QHeaderView, QLabel,
+                               QTreeWidget, QTreeWidgetItem, QWidget)
+from PySide6.QtCore import Qt, Signal, QObject, QCoreApplication
 
 from foammesh.app import app
 from foammesh.core.geometry.patches.ops import (
     BOUNDARY_CATEGORIES, boundary_category_for_name)
 from foammesh.db.configurations_schema import CFDType, GeometryType
+from foammesh.view.theming.metrics import MARGIN_TIGHT
+from foammesh.view.theming.status_colors import apply_color_swatch
 from widgets.themed_icon import load_themed_icon
 
 VOLUME_ICON_FILE = ':/graphicsIcons/volume.svg'
@@ -69,6 +72,32 @@ def typeColumnText(geometry):
 class Column(IntEnum):
     NAME_COLUMN = 0
     TYPE_COLUMN = auto()
+    #: GEO-03. Last, like the colour column of Display control, so the two
+    #: indices every other reader of this tree already uses do not move.
+    COLOUR_COLUMN = auto()
+
+
+class ColorSwatch(QLabel):
+    """The colour a boundary is drawn in, and the way to change it.
+
+    GEO-03/GEO-07. A feature split leaves seven rows called
+    ``<part>_1`` .. ``<part>_7``, and the colour each is drawn in was the only
+    thing on screen that said which row was the inlet -- shown in the viewport
+    and nowhere in the list. Clicking a row to find out re-selected it and
+    painted it the highlight colour, which is not its colour.
+    """
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(16, 16)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            self.clicked.emit()
 
 
 class GeometryItem(QTreeWidgetItem):
@@ -92,8 +121,14 @@ class GeometryItem(QTreeWidgetItem):
         return self._geometry.value('gType') == GeometryType.SURFACE.value
 
     def setGeometry(self, geometry):
-        self.setText(Column.NAME_COLUMN, geometry.value('name'))
-        self.setText(Column.TYPE_COLUMN, typeColumnText(geometry))
+        name = geometry.value('name')
+        kind = typeColumnText(geometry)
+        self.setText(Column.NAME_COLUMN, name)
+        self.setText(Column.TYPE_COLUMN, kind)
+        # DP-510. A name longer than the column is elided, so the whole of
+        # it is what the row says when the pointer rests on it.
+        self.setToolTip(Column.NAME_COLUMN, str(name or ''))
+        self.setToolTip(Column.TYPE_COLUMN, str(kind or ''))
 
         self._geometry = geometry
 
@@ -109,11 +144,13 @@ class GeometryList(QObject):
 
         self._tree = tree
         self._items = None
+        self._swatches = {}
+        self._setupColourColumn()
         self._applyTheme()
         if app.themeManager is not None:
             app.themeManager.themeChanged.connect(lambda _name: self._applyTheme())
 
-        self._tree.header().setSectionResizeMode(Column.NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
+        self._fitColumns()
         # R171. The header sorts on click, and a sorted tree re-orders itself
         # on the next rename for the same reason the load-time sort did.
         self._tree.header().setSectionsClickable(False)
@@ -130,6 +167,37 @@ class GeometryList(QObject):
 
         self._connectSignalsSlots()
 
+    def _fitColumns(self):
+        """Name takes the slack; Type and Colour are as wide as they read.
+
+        DP-510. Only Name was given a resize mode, so Type kept Qt's default
+        100 px and `Boundary (wall)` was cut to `Boundary (w...` at the
+        width the column normally has -- the one word on the row that says
+        which patch type the solver will write. Type is sized to its longest
+        value and its header, Colour to its swatch, and Name stretches over
+        what is left and elides (its tooltip carries the full name).
+        """
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(48)
+        header.setSectionResizeMode(int(Column.NAME_COLUMN),
+                                    QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(int(Column.TYPE_COLUMN),
+                                    QHeaderView.ResizeMode.ResizeToContents)
+        self._tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+
+    def _setupColourColumn(self):
+        """Give the tree its colour column, whatever the .ui asked for."""
+        if self._tree.columnCount() <= int(Column.COLOUR_COLUMN):
+            self._tree.setColumnCount(int(Column.COLOUR_COLUMN) + 1)
+        header = self._tree.headerItem()
+        if header is not None:
+            header.setText(int(Column.COLOUR_COLUMN),
+                           QCoreApplication.translate('GeometryPage', 'Colour'))
+        self._tree.header().setSectionResizeMode(
+            int(Column.COLOUR_COLUMN),
+            QHeaderView.ResizeMode.ResizeToContents)
+
     def _applyTheme(self):
         self.volumeIcon = load_themed_icon(VOLUME_ICON_FILE)
         self.surfaceIcon = load_themed_icon(SURFACE_ICON_FILE)
@@ -137,10 +205,79 @@ class GeometryList(QObject):
             for item in self._items.values():
                 item.setIcon(Column.NAME_COLUMN,
                              self.volumeIcon if item.isVolume() else self.surfaceIcon)
+        # DP-B2. A theme swap re-resolves every other colour on the page; the
+        # swatch is a stylesheet on a widget the theme does not know about, so
+        # it is asked for again here or it keeps the old theme's palette.
+        for gId in list(self._swatches):
+            self._repaintSwatch(gId)
+
+    # -- the colour column ------------------------------------------------- #
+
+    def _actorInfo(self, gId):
+        """The actor this row stands for, or None when there is no scene."""
+        window = getattr(app, 'window', None)
+        manager = getattr(window, 'geometryManager', None)
+        if manager is None:
+            return None
+        try:
+            return manager.actorInfo(str(gId))
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def _mountSwatch(self, gId, item):
+        gId = str(gId)
+        swatch = ColorSwatch(self._tree)
+        swatch.setObjectName(f'geometrySwatch_{gId}')
+        swatch.setAccessibleName(
+            QCoreApplication.translate('GeometryPage', 'Boundary colour'))
+        swatch.setToolTip(QCoreApplication.translate(
+            'GeometryPage', 'The colour this surface is drawn in. '
+                            'Click to change it.'))
+        swatch.clicked.connect(lambda key=gId: self._pickColour(key))
+        cell = QWidget(self._tree)
+        row = QHBoxLayout(cell)
+        row.setContentsMargins(MARGIN_TIGHT, 0, MARGIN_TIGHT, 0)
+        row.addWidget(swatch)
+        self._tree.setItemWidget(item, int(Column.COLOUR_COLUMN), cell)
+        self._swatches[gId] = swatch
+        actorInfo = self._actorInfo(gId)
+        if actorInfo is not None:
+            actorInfo.colorChanged.connect(
+                lambda key=gId: self._repaintSwatch(key))
+        self._repaintSwatch(gId)
+
+    def _repaintSwatch(self, gId):
+        swatch = self._swatches.get(str(gId))
+        if swatch is None:
+            return
+        actorInfo = self._actorInfo(gId)
+        try:
+            colour = None if actorInfo is None else actorInfo.color()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            colour = None
+        apply_color_swatch(swatch, colour)
+
+    def _pickColour(self, gId):
+        """Change the colour this surface is drawn in, from its own row."""
+        actorInfo = self._actorInfo(gId)
+        if actorInfo is None:
+            return
+        colour = QColorDialog.getColor(
+            actorInfo.color(), self._tree,
+            QCoreApplication.translate('GeometryPage', 'Boundary colour'))
+        if colour is None or not colour.isValid():
+            return
+        actorInfo.setColor(colour)
+        self._repaintSwatch(gId)
+
+    def swatchFor(self, gId):
+        """The colour swatch of one row, keyed by geometry id and not by row."""
+        return self._swatches.get(str(gId))
 
     def load(self):
         self._tree.clear()
         self._items = {}
+        self._swatches = {}
 
         # R171. In the order the case made them, not alphabetical. Sorting by
         # name was applied on every rebuild, and a rename rebuilds -- so
@@ -172,6 +309,7 @@ class GeometryList(QObject):
 
         item.setIcon(Column.NAME_COLUMN,
                      self.volumeIcon if geometry.value('gType') == GeometryType.VOLUME.value else self.surfaceIcon)
+        self._mountSwatch(gId, item)
         self._tree.scrollToBottom()
 
         self._items[gId] = item
@@ -191,20 +329,39 @@ class GeometryList(QObject):
             while item.childCount():
                 citem = item.takeChild(0)
                 del self._items[str(citem.gId())]
+                self._swatches.pop(str(citem.gId()), None)
                 del citem
 
             del self._items[str(gId)]
+            self._swatches.pop(str(gId), None)
             del item
 
     def clear(self):
         self._tree.clear()
         self._items = {}
+        self._swatches = {}
         
     def selectedIDs(self):
         return [str(item.gId()) for item in self._tree.selectedItems()]
 
     def selectedItems(self):
         return self._tree.selectedItems()
+
+    def rowIDs(self):
+        """The geometry ids the tree is showing, or `None` before it loads.
+
+        DP-454. The tree and the geometry store are filled by different paths
+        -- the store by a queued facade commit, the tree by the rebuild that
+        runs when that commit's await comes back -- so "what does the case
+        hold" and "what is on screen" are two questions, and the whole of
+        DP-413/417/437 lived in the gap between them. Anything that drives a
+        row has to ask this one, which is why it is public.
+
+        `None` and `[]` are kept apart on purpose: `_items` is `None` until
+        the first `load()`, and a tree that has never been built is a
+        different fault from one that was built from an empty case.
+        """
+        return None if self._items is None else list(self._items)
 
     def setSelectedItems(self, ids):
         self.clearSelection()

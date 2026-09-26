@@ -8,6 +8,7 @@ from .service import (
     SelectionSignal,
     SelectionSnapshot,
     SelectionStatus,
+    notify_prepared_case,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     'SelectionSignal',
     'SelectionSnapshot',
     'SelectionStatus',
+    'notify_prepared_case',
 ]

@@ -7,6 +7,11 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from foammesh.core.naming import humanise_option
+from foammesh.view.widgets.folder_header import FolderHeader
+from foammesh.view.workflow_controls.field_group_page import (
+    ExecutionPreferencesPage,
+)
 from foammesh.view.workflow_controls.warning_text import format_warnings
 from foammesh.view.facade_client import FailedResult, query, submit
 
@@ -31,13 +36,12 @@ def _submit(client, operation, parameters, on_result):
 
 
 class MeshingMethodPage(QWidget):
-    #: Display names for registered engines. An engine absent here is offered
-    #: under its own id rather than hidden, so registering an engine without
-    #: adding a label degrades visibly instead of silently.
-    ENGINE_LABELS = {
-        'snappy': 'Snappy Hex Mesh',
-        'gmsh': 'Gmsh',
-    }
+    # DP-226. The table that lived here spelled the second mesher
+    # `Snappy Hex Mesh`, while the modal reporting every run called it
+    # `Snappy` and the readiness banner called it `snappyHexMesh`. One
+    # rule spells a stored name and it knows both meshers; an engine
+    # registered without a name still degrades visibly, because the
+    # rule falls back to sentence case over the id it was given.
 
     #: Plan 28. Only the two solvers a user can pick; 'unselected' is a state,
     #: not an option, and is shown by leaving both unchecked.
@@ -75,9 +79,13 @@ class MeshingMethodPage(QWidget):
         self._lastProbe = {}
         self._probedEngines = ()
         self.setObjectName('meshingMethodPage')
-        self.setAccessibleName(self.tr('Meshing method'))
+        # Plan 32 section 4.1. The page is `2. Mesh setup` in the outline and
+        # says so at its head. The object name, the token and the class name
+        # are unchanged: they are addressed by saved cases, by the strict-GUI
+        # harness and by eight call sites, and none of them is read by a user.
+        self.setAccessibleName(self.tr('Mesh setup'))
         layout = QVBoxLayout(self)
-        title = QLabel(self.tr('Meshing Method'))
+        title = QLabel(self.tr('Mesh setup'))
         title.setObjectName('meshingMethodTitle')
         layout.addWidget(title)
 
@@ -126,7 +134,7 @@ class MeshingMethodPage(QWidget):
         self._reasons = {}
         self._incompatible = {}
         for engine_id in self._engine_ids():
-            label = self.ENGINE_LABELS.get(engine_id, engine_id)
+            label = humanise_option(engine_id)
             button = QRadioButton(label, self)
             button.setProperty('engineId', engine_id)
             self._group.addButton(button)
@@ -140,44 +148,138 @@ class MeshingMethodPage(QWidget):
             reason.setProperty('foammeshTone', 'muted')
             self._reasons[engine_id] = reason
             engineLayout.addWidget(reason)
-        self._apply = QPushButton(self.tr('Apply Method'), self)
-        # G2. Of four identical full-width buttons this is the only one that
-        # advances the workflow; the other three open read-only reports.
-        self._apply.setProperty('foammeshRole', 'primary')
-        self._apply.clicked.connect(self._apply_selection)
-        layout.addWidget(self._apply)
-        # R131. MEASURED: pressing Apply Method with no engine radio checked
-        # did nothing whatsoever -- no dialog, no message, no status line --
-        # so the button read as broken rather than as waiting for an input.
-        # This line is where that is said. It is kept at the height of one
-        # line whether or not there is anything in it, so pressing the button
-        # does not shift the panel under the cursor.
-        self._applyHint = QLabel(self)
-        self._applyHint.setWordWrap(True)
-        self._applyHint.setObjectName('meshingMethodApplyHint')
-        self._applyHint.setProperty('foammeshTone', 'muted')
-        self._applyHint.setMinimumHeight(
-            self._applyHint.fontMetrics().lineSpacing())
-        layout.addWidget(self._applyHint)
+        # Plan 33 SETUP-05. `Apply method` stood here, the one control on a
+        # four-button page that moved the work forward, beside a footer whose
+        # Proceed is what every other step is committed with. MEASURED: the
+        # footer press applied the method itself, so the two did the same
+        # thing and the page's own button was the one a reader had to guess
+        # about -- and the settings below it were saved by one of them and
+        # not the other. There is one commit now, `commitSelection`, and the
+        # footer is what calls it. A press that cannot go forward says why
+        # through the same route every other refusal takes.
+        for engine_button in self._buttons.values():
+            engine_button.toggled.connect(
+                lambda _checked=False: self._syncExecutionRoute())
 
-        diagnosticsBox = QGroupBox(self.tr('Diagnostics'), self)
-        diagnosticsBox.setObjectName('meshingDiagnosticsBox')
-        diagnosticsLayout = QVBoxLayout(diagnosticsBox)
+        # Plan 33 SETUP-04. The settings that govern the run were folded away
+        # behind `Advanced` together with three buttons that open read-only
+        # reports, so the middle column of `2. Mesh setup` showed a reader two
+        # radio groups and a fold, and the core count the run reads was two
+        # presses from sight. The settings are the page now, under the name of
+        # what they are; the reports keep the fold, because a report is not a
+        # setting and nothing on this page has to be read before meshing.
+        self._execution = ExecutionPreferencesPage(facade_client, self)
+        # DP-155/157. A section of a page does not scroll itself and does not
+        # carry a commit pair of its own.
+        self._execution.setEmbedded(True)
+        layout.addWidget(self._execution)
+
+        self._diagnosticsBody = QWidget(self)
+        self._diagnosticsBody.setObjectName('meshingDiagnosticsBody')
+        diagnosticsLayout = QVBoxLayout(self._diagnosticsBody)
+        diagnosticsLayout.setContentsMargins(0, 0, 0, 0)
         self._runtimeDiagnostics = QPushButton(
-            self.tr('OpenFOAM Runtime Diagnostics...'), self)
+            self.tr('OpenFOAM runtime diagnostics…'),
+            self._diagnosticsBody)
         self._runtimeDiagnostics.clicked.connect(self._show_runtime_diagnostics)
         diagnosticsLayout.addWidget(self._runtimeDiagnostics)
         self._effectiveDictionaries = QPushButton(
-            self.tr('Effective Meshing Setup...'), self)
+            self.tr('Effective meshing setup…'), self._diagnosticsBody)
         self._effectiveDictionaries.clicked.connect(
             self._show_effective_dictionaries)
         diagnosticsLayout.addWidget(self._effectiveDictionaries)
-        self._reprobe = QPushButton(self.tr('Re-probe Runtimes'), self)
+        self._reprobe = QPushButton(self.tr('Re-probe runtimes'),
+                                    self._diagnosticsBody)
         self._reprobe.clicked.connect(lambda: self.refresh(force=True))
         diagnosticsLayout.addWidget(self._reprobe)
-        layout.addWidget(diagnosticsBox)
+
+        self._diagnostics = FolderHeader(self.tr('Diagnostics'), self)
+        self._diagnostics.setObjectName('meshingMethodDiagnosticsHeader')
+        # Not a settings fold. SETUP-04 left the settings on the page and put
+        # the runtime probe reports behind this one, and section 1.1 routes
+        # reports to an on-demand view. A fold opens open everywhere it holds
+        # editors (W-O2, `FolderHeader`); this one holds none, and says so.
+        self._diagnostics.setChecked(False)
+        # DP-186/187. A header read aloud has to say which disclosure it is.
+        self._diagnostics.setAccessibleName(
+            self.tr('Diagnostics for the meshing runtimes'))
+        layout.addWidget(self._diagnostics)
+        layout.addWidget(self._diagnosticsBody)
+        self._diagnostics.setContents(self._diagnosticsBody)
         layout.addStretch(1)
         self.refresh()
+
+    # -- the Advanced disclosure ------------------------------------------- #
+
+    def executionPanel(self):
+        """The embedded execution settings, reachable without a private name.
+
+        Plan 32 W1. The wizard and the tests have to be able to ask this page
+        for the panel it hosts; before W1 they reached it as an outline row.
+        """
+        return self._execution
+
+    def diagnosticsHeader(self):
+        """The folded disclosure the three report buttons live under."""
+        return self._diagnostics
+
+    def runtimeDiagnosticsButton(self):
+        """The OpenFOAM runtime report, which a Gmsh route is not offered."""
+        return self._runtimeDiagnostics
+
+    def advancedHeader(self):
+        """The fold this page still has, for the harnesses that open it.
+
+        Plan 33 SETUP-04 left one fold on the page and the settings outside
+        it, so `Advanced` is now the diagnostics fold; the walkthrough scripts
+        open it to reach the report buttons.
+        """
+        return self._diagnostics
+
+    def setAdvancedOpen(self, open_: bool) -> None:
+        """Open or close the diagnostics fold."""
+        self._diagnostics.setChecked(bool(open_))
+
+    def isAdvancedOpen(self) -> bool:
+        """True while the diagnostics fold is showing."""
+        return self._diagnostics.isChecked()
+
+    def _syncExecutionRoute(self) -> None:
+        """Tell the settings which mesher they are being read for.
+
+        Plan 33 SETUP-02 and SETUP-04. The route decides both which settings
+        a run reads and which report is worth opening: `openfoam.runtime.
+        diagnostics` describes the runtime a Gmsh mesh never goes near.
+        """
+        engine_id = self._checkedEngineId()
+        self._execution.setEngine(engine_id)
+        self._runtimeDiagnostics.setVisible(engine_id != 'gmsh')
+
+    def hasPendingExecutionEdits(self) -> bool:
+        """True when the Advanced band holds an edit nobody has committed.
+
+        The band has no Apply of its own (DP-157), so the page it sits on is
+        what has to notice, and the forward action is what has to commit.
+        """
+        return self._execution.is_dirty
+
+    def applyPendingExecution(self):
+        """Commit whatever the Advanced band is holding."""
+        return self._execution.apply()
+
+    async def savePendingExecution(self) -> bool:
+        """Commit the Advanced band and say whether the case took it.
+
+        DP-251. `applyPendingExecution` schedules the write and answers a
+        task that completes before the facade replies (DP-227), so a caller
+        that has to decide whether to move on learns nothing from it. The
+        forward press is exactly such a caller: MEASURED on the guided walk,
+        `serial` was typed here, the press applied the method, the method
+        change refreshed this page, the refresh reloaded the band -- and the
+        case still read `auto`. So the band is saved, awaited, and a refusal
+        is answered False rather than walked past.
+        """
+        return await self._execution.save()
 
     def _track(self, task):
         if task is not None:
@@ -187,6 +289,13 @@ class MeshingMethodPage(QWidget):
     def refresh(self, *, force=False):
         self._probeGeneration += 1
         generation = self._probeGeneration
+        # Plan 32 W1. The execution band narrows its decomposition methods
+        # from a runtime probe that is usually still cold on the first render,
+        # so every revisit of this page re-reads it. Before W1 the band was a
+        # row of its own and did this on its own show.
+        # DP-339. A revisit of this page is not a write, so the band
+        # keeps an edit that has not reached the case yet.
+        self._execution.reload(discard_pending=False)
         result = query(self._client, 'mesh.engine.list').payload
         current = result['current_engine']
         # Absent on an older payload or a test double, and permissive when
@@ -203,8 +312,8 @@ class MeshingMethodPage(QWidget):
             self._lastProbe.clear()
         self._probedEngines = engine_ids
         self._refresh_target_solver()
-        # R130. MEASURED: click OpenFOAM, click Snappy Hex Mesh, press Apply
-        # Method -- nothing was applied and both engine radios were empty.
+        # R130. MEASURED: click OpenFOAM, click snappyHexMesh, press Apply
+        # method -- nothing was applied and both engine radios were empty.
         # `chooseTargetSolver()` sets the solver through an async facade call
         # and calls this from the reply; this used to clear every engine radio
         # and re-check only the engine the facade currently holds, which on a
@@ -236,8 +345,9 @@ class MeshingMethodPage(QWidget):
                 self._apply_probe(cached, current, engine_id)
                 continue
             button.setEnabled(current == engine_id)
-            self._reasons[engine_id].setText(self.tr('Probing the runtime...'))
+            self._reasons[engine_id].setText(self.tr('Probing the runtime…'))
             self._submit_probe(engine_id, current, generation, force)
+        self._syncExecutionRoute()
 
     def _checkedEngineId(self) -> str:
         """Which engine radio is checked right now, if any (R130/R131)."""
@@ -257,7 +367,7 @@ class MeshingMethodPage(QWidget):
         for solver_id, button in self._solverButtons.items():
             button.setChecked(solver_id == self._targetSolver)
         self._solverGroup.setExclusive(True)
-        blocked = [self.ENGINE_LABELS.get(engine_id, engine_id)
+        blocked = [humanise_option(engine_id)
                    for engine_id, reason in sorted(self._incompatible.items())
                    if reason]
         if self._targetSolver == 'unselected':
@@ -302,7 +412,7 @@ class MeshingMethodPage(QWidget):
                 # Not repaired here: which engine to move to is the user's
                 # call, and silently switching would discard their settings.
                 QMessageBox.warning(
-                    self, self.tr('Meshing Method'),
+                    self, self.tr('Meshing method'),
                     self.tr('The selected meshing method cannot serve '
                             'this solver.'
                             '\n\n{0}\n\n'
@@ -323,7 +433,7 @@ class MeshingMethodPage(QWidget):
             # Say so and ask again shortly, rather than reporting a cold
             # WSL boot as a missing runtime.
             self._reasons[engine_id].setText(
-                self.tr('Still probing the runtime...'))
+                self.tr('Still probing the runtime…'))
             QTimer.singleShot(
                 self.PROBE_RETRY_MS, self,
                 lambda: self._retry_probe(engine_id, current, generation))
@@ -358,8 +468,20 @@ class MeshingMethodPage(QWidget):
             # E6. The fingerprint identifies a build for a bug report; it is
             # not something to weigh when choosing an engine. It moves to
             # where someone looking for it will still find it.
-            self._reasons[engine_id].setText(
-                self.tr('Runtime {0}').format(version) if version else text)
+            label = self.tr('Runtime {0}').format(version) if version else text
+            # DP-50. An engine can be available and still have something worth
+            # saying: Gmsh runs without OpenFOAM's checkMesh, and the mesh it
+            # publishes then goes unvalidated. This line was overwritten with
+            # the runtime version whenever the engine was usable, so the one
+            # advisory the probe had to offer was dropped in exactly the case
+            # it was written for. The advisory is the selected profile's own,
+            # not the first one found: a reason belonging to some other
+            # profile that failed to probe describes a runtime the user is not
+            # about to use.
+            advisory = str(selected.get('reason') or '').strip()
+            if advisory:
+                label = f'{label} · {advisory}' if label else advisory
+            self._reasons[engine_id].setText(label)
             self._reasons[engine_id].setToolTip(
                 text + (self.tr(' · fingerprint {0}').format(fingerprint)
                         if fingerprint else ''))
@@ -373,7 +495,7 @@ class MeshingMethodPage(QWidget):
         def show(result):
             if getattr(result, 'status', '') != 'accepted':
                 QMessageBox.warning(
-                    self, self.tr('OpenFOAM Runtime'),
+                    self, self.tr('OpenFOAM runtime'),
                     str(getattr(result, 'message', '')
                         or self.tr('Runtime diagnostics failed.')))
                 return
@@ -384,7 +506,7 @@ class MeshingMethodPage(QWidget):
                     str(item.get('reason') or item.get('profile_id'))
                     for item in profiles)
                 QMessageBox.warning(
-                    self, self.tr('OpenFOAM Runtime'),
+                    self, self.tr('OpenFOAM runtime'),
                     reason or self.tr('No qualified runtime is available.'))
                 return
             utilities = selected.get('utilities') or {}
@@ -404,7 +526,7 @@ class MeshingMethodPage(QWidget):
                   for name, path in sorted(utilities.items())),
             ]
             QMessageBox.information(
-                self, self.tr('OpenFOAM Runtime Diagnostics'),
+                self, self.tr('OpenFOAM runtime diagnostics'),
                 '\n'.join(lines))
 
         self._track(_submit(
@@ -420,7 +542,7 @@ class MeshingMethodPage(QWidget):
         def show(result):
             if getattr(result, 'status', '') != 'accepted':
                 QMessageBox.warning(
-                    self, self.tr('Effective Dictionaries'),
+                    self, self.tr('Effective meshing setup'),
                     str(getattr(result, 'message', '')
                         or self.tr('Generate dictionaries first.')))
                 return
@@ -431,7 +553,7 @@ class MeshingMethodPage(QWidget):
                 window.showEffectiveSetup(payload)
                 return
             dialog = QDialog(self)
-            dialog.setWindowTitle(self.tr('Effective OpenFOAM Dictionaries'))
+            dialog.setWindowTitle(self.tr('Effective meshing setup'))
             dialog.resize(1000, 760)
             layout = QVBoxLayout(dialog)
             tabs = QTabWidget(dialog)
@@ -487,7 +609,7 @@ class MeshingMethodPage(QWidget):
         def show(result):
             if getattr(result, 'status', '') != 'accepted':
                 QMessageBox.warning(
-                    self, self.tr('Effective Engine Plan'),
+                    self, self.tr('Effective engine plan unavailable'),
                     str(getattr(result, 'message', '')
                         or self.tr('The engine plan is not available.')))
                 return
@@ -498,58 +620,98 @@ class MeshingMethodPage(QWidget):
                 window.showEffectiveEnginePlan(result.payload or {})
                 return
             QMessageBox.information(
-                self, self.tr('Effective Engine Plan'),
+                self, self.tr('Effective engine plan'),
                 str((result.payload or {}).get('plan_digest') or
                     self.tr('Engine plan derived.')))
 
         self._track(_submit(self._client, 'mesh.plan.derive', {}, show))
 
-    def _apply_selection(self):
+    async def _run(self, operation, parameters):
+        """One facade call, awaited, with a refusal shaped like a result.
+
+        Plan 30 WP-08: a write from a view module goes on the scheduler or it
+        does not happen, and a client with no awaitable `run` is answered with
+        a refusal rather than served from the GUI thread.
+        """
+        runner = getattr(self._client, 'run', None)
+        if runner is None:
+            return FailedResult(
+                RuntimeError('This window cannot reach the case.'))
+        try:
+            return await runner(operation, parameters)
+        except Exception as error:                           # noqa: BLE001
+            return FailedResult(error)
+
+    async def commitSelection(self):
+        """Save what this page holds and say whether it can be left.
+
+        Plan 33 SETUP-05. This is the whole commit of `2. Mesh setup`: the
+        target solver, the meshing method, and the resource settings below
+        them, in that order, awaited, with the first refusal answered rather
+        than walked past. It returns `(accepted, reason)` -- the caller is
+        the footer's Proceed, and the reason is what the window says on the
+        status bar when the press cannot move.
+
+        R131 lives here now. MEASURED before Plan 33: with no engine radio
+        checked the page's own button was a silent no-op, and the version
+        that replaced it wrote an inline hint under a button that no longer
+        exists. A press that will not move says why in the one place this
+        window says it.
+        """
         button = self._group.checkedButton()
         if button is None:
-            # R131. Pressing this with nothing checked used to be a no-op with
-            # no facade call and no feedback of any kind.
-            self._applyHint.setText(self.tr(
-                'Choose a meshing engine above, then press Apply Method.'))
-            return
-        self._applyHint.setText('')
-        engine_id = button.property('engineId')
+            return False, self.tr(
+                'Choose a meshing method before moving on.')
+        engine_id = str(button.property('engineId') or '')
+        if not button.isEnabled():
+            return False, self.tr(
+                'This meshing method cannot run here. {0}').format(
+                    self.engineReason(engine_id))
+        solver = self._targetSolver
+        if solver and solver != 'unselected':
+            result = await self._run('mesh.target_solver.set',
+                                     {'target_solver': solver})
+            if getattr(result, 'status', 'accepted') != 'accepted':
+                return False, str(getattr(result, 'message', '')
+                                  or self.tr('The solver could not be set.'))
+        if self._execution.is_dirty and not await self._execution.save():
+            return False, self.tr(
+                'The meshing resources on this page were refused, so nothing '
+                'was saved.')
+        preview = await self._run('mesh.engine.select',
+                                  {'engine_id': engine_id, 'dry_run': True})
+        if getattr(preview, 'status', 'accepted') != 'accepted':
+            message = str(getattr(preview, 'message', ''))
+            self._reasons[engine_id].setText(message)
+            return False, message
+        document = (preview.payload or {}).get('preview') or {}
+        confirmation_required = bool(document.get('confirmation_required'))
+        if confirmation_required and not self._confirmMethodChange(document):
+            self.refresh()
+            return False, ''
+        result = await self._run('mesh.engine.select', {
+            'engine_id': engine_id,
+            'confirmed': confirmation_required,
+            'retained_artifacts': document.get('retained_artifacts', []),
+        })
+        if getattr(result, 'status', 'accepted') != 'accepted':
+            message = str(getattr(result, 'message', ''))
+            self._reasons[engine_id].setText(message)
+            return False, message
+        self.engineChanged.emit(engine_id)
+        return True, ''
 
-        def on_preview(result):
-            if getattr(result, 'status', 'accepted') == 'failed':
-                self._reasons[engine_id].setText(result.message)
-                return
-            preview = result.payload['preview']
-            confirmation_required = bool(
-                preview.get('confirmation_required'))
-            if confirmation_required:
-                artifacts = preview.get('retained_artifacts') or []
-                detail = '\n'.join(f'- {item}' for item in artifacts)
-                prompt = self.tr(
-                    'Changing the meshing method will retain the previous '
-                    'engine settings but mark its generated artifacts stale.')
-                if detail:
-                    prompt += self.tr('\n\nAffected retained artifacts:\n') + detail
-                choice = QMessageBox.question(
-                    self, self.tr('Change Meshing Method'), prompt,
-                    QMessageBox.StandardButton.Yes |
-                    QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Cancel)
-                if choice != QMessageBox.StandardButton.Yes:
-                    self.refresh()
-                    return
-            self._track(_submit(self._client, 'mesh.engine.select', {
-                'engine_id': engine_id,
-                'confirmed': confirmation_required,
-                'retained_artifacts': preview.get('retained_artifacts', []),
-            }, on_select))
-
-        def on_select(result):
-            if result.status == 'accepted':
-                self.engineChanged.emit(engine_id)
-            else:
-                self._reasons[engine_id].setText(result.message)
-
-        self._track(_submit(
-            self._client, 'mesh.engine.select',
-            {'engine_id': engine_id, 'dry_run': True}, on_preview))
+    def _confirmMethodChange(self, preview) -> bool:
+        artifacts = preview.get('retained_artifacts') or []
+        detail = '\n'.join(f'- {item}' for item in artifacts)
+        prompt = self.tr(
+            'Changing the meshing method will retain the previous '
+            'engine settings but mark its generated artifacts stale.')
+        if detail:
+            prompt += self.tr('\n\nAffected retained artifacts:\n') + detail
+        choice = QMessageBox.question(
+            self, self.tr('Change meshing method'), prompt,
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return choice == QMessageBox.StandardButton.Yes

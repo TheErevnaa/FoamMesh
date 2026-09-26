@@ -32,7 +32,7 @@
       <item row="0" column="0">
        <widget class="QLabel" name="label">
         <property name="text">
-         <string>Project Name</string>
+         <string>Project name</string>
         </property>
        </widget>
       </item>
@@ -46,7 +46,7 @@
       <item row="1" column="0">
        <widget class="QLabel" name="label_2">
         <property name="text">
-         <string>Project Location</string>
+         <string>Project location</string>
         </property>
        </widget>
       </item>
@@ -65,7 +65,7 @@
         <item>
          <widget class="QPushButton" name="select">
           <property name="text">
-           <string>Browse...</string>
+           <string>Browse…</string>
           </property>
          </widget>
         </item>
@@ -80,19 +80,6 @@
          <widget class="QLabel" name="locationDescription">
           <property name="foammeshTone" stdset="0">
            <string>muted</string>
-          </property>
-          <property name="text">
-           <string/>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLabel" name="folderName">
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Expanding" vsizetype="Preferred">
-            <horstretch>0</horstretch>
-            <verstretch>0</verstretch>
-           </sizepolicy>
           </property>
           <property name="text">
            <string/>

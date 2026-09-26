@@ -1,7 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from PySide6.QtCore import QEvent, QSize
 from PySide6.QtWidgets import QCheckBox
+
+from foammesh.view.theming.icons import load_themed_icon
+
+#: DP-150.  The disclosure chevron used to come from the stylesheet, as
+#: `image: url(:/icons/chevron-forward.svg)`.  The ionicons carry
+#: `stroke:#000`, and a stylesheet `image:` is the one icon path in the
+#: application that skips `load_themed_icon`'s recolouring, so on the dark
+#: canvas the closed header drew black on `#1e1f22` -- MEASURED as an
+#: indicator area with no ink in it at all.  Painting the chevron as the
+#: button own icon puts it back on the themed path, where it follows the
+#: palette in both themes and in every icon mode.
+_CHEVRON_CLOSED = ':/icons/chevron-forward.svg'
+_CHEVRON_OPEN = ':/icons/chevron-down.svg'
 
 
 class FolderHeader(QCheckBox):
@@ -12,6 +26,38 @@ class FolderHeader(QCheckBox):
 
         self._pos = None
         self._size = None
+
+        # Plan 33 section 6 check 2, W-O2. A fold opens open.
+        #
+        # FORM-01 put that rule in `EngineTaskPage` as one `setChecked(True)`,
+        # and every page that inherits from it got the rule for nothing. The
+        # Preparation page does not inherit from it. It builds two folds of
+        # its own: the wrap section, which had to write the same line out by
+        # hand, and the Gmsh import-and-healing section, which did not --
+        # MEASURED, twenty-four editors behind a press. A rule that lives in
+        # one base class is a rule the next page outside that class misses,
+        # so it lives here instead, where every fold in the tree reaches it.
+        #
+        # A fold that must open closed now says so at its own site, which is
+        # where the reason for it belongs. Section 1.1 sanctions two of
+        # those -- CAD tessellation and interface pairs on Geometry -- and
+        # the folds that hold reports rather than settings say it too.
+        self.setChecked(True)
+        self.setIconSize(QSize(12, 12))
+        self._refreshChevron()
+        self.toggled.connect(self._refreshChevron)
+
+    def _refreshChevron(self, *_):
+        self.setIcon(load_themed_icon(
+            _CHEVRON_OPEN if self.isChecked() else _CHEVRON_CLOSED,
+            QSize(64, 64)))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # A theme swap replaces the palette and empties the icon cache; the
+        # chevron has to be asked for again or it keeps the old theme ink.
+        if event.type() == QEvent.Type.PaletteChange:
+            self._refreshChevron()
 
     def setContents(self, widget):
         self._contents = widget

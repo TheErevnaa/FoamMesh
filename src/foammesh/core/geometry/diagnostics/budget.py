@@ -78,6 +78,18 @@ FALLBACK_UNITS_PER_SECOND = 2.0e7
 #: deliberately a separate constant rather than a shared fallback.
 FALLBACK_LOCATOR_UNITS_PER_SECOND = 5.0e6
 
+#: Within-shell work units per second, used only when the probe cannot run.
+#: DP-435. A third constant because the scan it describes is a third work
+#: shape: a bin query per triangle, numpy pruning of its candidates, and
+#: ``TrianglesIntersect`` on the few that survive. Measured on this machine
+#: over seven sphere skins from 4,416 to 403,200 triangles -- a 91x range --
+#: at 4.0e5, 4.4e5, 4.4e5, 4.2e5, 4.4e5, 4.2e5 and 4.15e5 units a second.
+#: Agreement that flat across that range is what says the exponent in
+#: :func:`within_shell_workload` is the right one; the first exponent tried,
+#: 1.5, read 3.1e6 at the small end and 1.05e7 at the large, and would have
+#: refused a 403,200-triangle skin it can finish in 24 s.
+FALLBACK_WITHIN_SHELL_UNITS_PER_SECOND = 4.2e5
+
 _CALIBRATION_CACHE: dict[str, float] = {}
 
 
@@ -278,6 +290,28 @@ class DiagnosticBudget:
         return 'cost_ratio'
 
     @property
+    def beyond_any_allowance(self) -> bool:
+        """True when the estimate already says this cannot be afforded.
+
+        DP-406. ``workload`` is assigned before the first unit of work, so
+        ``expected_seconds`` is a verdict the budget holds from the start. It
+        was only ever allowed to take effect by being *outlived*: ``check_in``
+        compared elapsed time against the deadline, so a check that needed a
+        hundred and three seconds against a sixty-second ceiling spent the
+        full sixty in order to report that it was not allowed to run. The
+        propeller paid that seven times in one leg and twenty-six in another.
+
+        Only the patience gate can be beyond reach this way. The ratio gate is
+        ``expected * ABORT_RATIO`` with a ratio above one, so it can never be
+        under the estimate; anything this returns True for is
+        ``limited_by == 'maximum_wait'``, which is the "honestly too large"
+        case whose remedy is a longer allowance, not a repair.
+        """
+        if self.policy in (BudgetPolicy.NEVER_LIMIT, BudgetPolicy.WARN_ONLY):
+            return False
+        return self.expected_seconds > self.abort_seconds
+
+    @property
     def warn_seconds(self) -> float:
         return max(self.expected_seconds * WARN_RATIO, self.minimum_seconds / 2)
 
@@ -343,6 +377,12 @@ class DiagnosticBudget:
             raise Cancelled(f'{self.check} cancelled by request')
         if self.policy is BudgetPolicy.NEVER_LIMIT:
             return
+        if self.beyond_any_allowance:
+            # DP-406. Said before the first pair rather than after the ceiling
+            # has been spent. The message is the same one either way, because
+            # the reason is the same one: this input is larger than the
+            # allowance, and no amount of running will make it smaller.
+            raise BudgetExceeded(self.overrun_message(progress), progress=progress)
         elapsed = self.elapsed
         if not self._warned and elapsed > self.warn_seconds:
             self._warned = True
@@ -505,6 +545,118 @@ def locator_budget(sample_count: float, target_cell_count: float, *,
     budget = budget_from_settings(check, on_progress=on_progress)
     budget.workload = locator_workload(sample_count, target_cell_count)
     budget.rate = locator_rate()
+    return budget
+
+
+def within_shell_workload(triangle_count: float, done: float | None = None
+                          ) -> float:
+    """Work units for the within-shell triangle scan (DP-435).
+
+    Each triangle asks a bin tree which triangles could reach it, and the
+    number it gets back grows with the skin: the tree's divisions are capped,
+    so a finer skin over the same bounds puts more triangles in every bin.
+    So the cost is neither ``M`` -- which under-budgets a large skin several
+    times over -- nor ``M**2``, which is what a naive all-pairs reading gives
+    and would refuse every real model.
+
+    MEASURED, seven sphere skins from 4,416 to 403,200 triangles: candidates
+    per triangle went 60.2, 70.3, 91.3, 111.8, 135.7, 174.9, 213.0 and the
+    scan went 0.09 s to 24.33 s. A 91x range in count against 270x in time is
+    an exponent of 1.24, so the model is ``M**1.25`` and the rate it implies
+    is flat to five percent across the whole range.
+
+    ``done`` gives the units spent after that many triangles, for the progress
+    the budget observes as the scan runs.
+    """
+    cells = max(float(triangle_count), 1.0)
+    walked = cells if done is None else max(float(done), 0.0)
+    return walked * cells ** 0.25
+
+
+def _measure_within_shell_units_per_second() -> float:
+    """Time the scan's own shape, not a closest-point sweep.
+
+    The locator probe times ``FindClosestPoint``, which touches one bin and
+    returns one cell. This scan's cost is dominated by what comes after the
+    query -- pruning tens of candidates and testing the survivors -- so the
+    locator rate would hand it a budget it blows through immediately, which is
+    exactly what it did before this existed.
+    """
+    import numpy as np
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    from vtkmodules.vtkCommonCore import vtkIdList
+    from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator, vtkTriangle
+    from vtkmodules.vtkFiltersCore import vtkTriangleFilter
+    from vtkmodules.vtkFiltersSources import vtkSphereSource
+
+    source = vtkSphereSource()
+    source.SetThetaResolution(64)
+    source.SetPhiResolution(64)
+    triangulate = vtkTriangleFilter()
+    triangulate.SetInputConnection(source.GetOutputPort())
+    triangulate.Update()
+    surface = triangulate.GetOutput()
+    cells = int(surface.GetNumberOfCells())
+
+    started = time.process_time()
+    corners = vtk_to_numpy(surface.GetPolys().GetConnectivityArray()
+                           ).reshape(-1, 3)
+    points = vtk_to_numpy(surface.GetPoints().GetData()).astype(float)
+    triangles = points[corners]
+    lower, upper = triangles.min(axis=1), triangles.max(axis=1)
+    locator = vtkStaticCellLocator()
+    locator.SetNumberOfCellsPerNode(4)
+    locator.SetDataSet(surface)
+    locator.BuildLocator()
+
+    neighbours, bounds = vtkIdList(), [0.0] * 6
+    for index in range(cells):
+        surface.GetCellBounds(index, bounds)
+        locator.FindCellsWithinBounds(bounds, neighbours)
+        total = neighbours.GetNumberOfIds()
+        candidates = np.fromiter(
+            (neighbours.GetId(slot) for slot in range(total)),
+            dtype=np.int64, count=total)
+        candidates = candidates[candidates > index]
+        if candidates.size == 0:
+            continue
+        candidates = candidates[
+            np.all(lower[candidates] <= upper[index], axis=1)
+            & np.all(upper[candidates] >= lower[index], axis=1)]
+        mine = corners[index]
+        candidates = candidates[~(corners[candidates][:, :, None]
+                                  == mine[None, None, :]).any(axis=(1, 2))]
+        left = triangles[index]
+        for candidate in candidates:
+            right = triangles[candidate]
+            vtkTriangle.TrianglesIntersect(left[0], left[1], left[2],
+                                           right[0], right[1], right[2])
+    elapsed = time.process_time() - started
+    if elapsed <= 0:
+        return FALLBACK_WITHIN_SHELL_UNITS_PER_SECOND
+    return within_shell_workload(cells) / elapsed
+
+
+def within_shell_rate(*, refresh: bool = False) -> float:
+    """Within-shell work units per second here, cached against the machine."""
+    key = 'within_shell|' + machine_fingerprint()
+    if not refresh and key in _CALIBRATION_CACHE:
+        return _CALIBRATION_CACHE[key]
+    try:
+        rate = _measure_within_shell_units_per_second()
+    except Exception:
+        rate = FALLBACK_WITHIN_SHELL_UNITS_PER_SECOND
+    _CALIBRATION_CACHE[key] = rate
+    return rate
+
+
+def within_shell_budget(triangle_count: float, *,
+                        check: str = 'self_intersections', on_progress=None
+                        ) -> DiagnosticBudget:
+    """A budget sized for the within-shell scan, at its own measured rate."""
+    budget = budget_from_settings(check, on_progress=on_progress)
+    budget.workload = within_shell_workload(triangle_count)
+    budget.rate = within_shell_rate()
     return budget
 
 

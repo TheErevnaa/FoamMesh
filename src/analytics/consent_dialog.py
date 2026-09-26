@@ -12,13 +12,13 @@ class ConsentDialog(QDialog):
 
     Two modes:
       - First-launch (cancellable=False, default): GDPR-friendly active opt-in;
-        the dialog cannot be dismissed without a definitive Allow / Don't Allow
+        the dialog cannot be dismissed without a definitive Allow / Don't allow
         choice (close button hidden, Esc key disabled).
       - Settings (cancellable=True): user can dismiss to keep the existing
-        decision unchanged; Allow / Don't Allow still update consent.
+        decision unchanged; Allow / Don't allow still update consent.
 
     Use `explicitChoice()` after `exec()` to disambiguate dismissal from a
-    deliberate Don't Allow click — both return QDialog.Rejected by themselves.
+    deliberate Don't allow click — both return QDialog.Rejected by themselves.
     """
 
     def __init__(self, parent=None, app_name: str = 'FoamMesh', cancellable: bool = False):
@@ -27,7 +27,7 @@ class ConsentDialog(QDialog):
         self._cancellable = cancellable
         self._explicitChoice = None  # None=dismissed, True=allow, False=deny
 
-        self.setWindowTitle(self.tr('Help Improve {0}').format(app_name))
+        self.setWindowTitle(self.tr('Help improve {0}').format(app_name))
         self.setModal(True)
         self.setMinimumSize(640, 600)
         if not cancellable:
@@ -37,13 +37,13 @@ class ConsentDialog(QDialog):
         self._buildUi()
 
     def explicitChoice(self):
-        """True if user clicked Allow, False if Don't Allow, None if dismissed."""
+        """True if user clicked Allow, False if Don't allow, None if dismissed."""
         return self._explicitChoice
 
     def _buildUi(self):
         layout = QVBoxLayout(self)
 
-        title = QLabel(self.tr('Help Improve {0}').format(self._appName), self)
+        title = QLabel(self.tr('Help improve {0}').format(self._appName), self)
         title_font = title.font()
         title_font.setPointSize(14)
         title_font.setBold(True)
@@ -53,7 +53,8 @@ class ConsentDialog(QDialog):
         intro = QLabel(self.tr(
             '{0} can send anonymous usage data and error reports so we can find bugs '
             'and improve the product. Your participation is optional. You can change '
-            'your choice at any time in Help → Privacy Settings.'
+            'your choice at any time on the Privacy page of '
+            'Settings → Preferences.'
         ).format(self._appName), self)
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -67,7 +68,7 @@ class ConsentDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
 
-        self._denyButton = QPushButton(self.tr("Don't Allow"), self)
+        self._denyButton = QPushButton(self.tr("Don't allow"), self)
         self._allowButton = QPushButton(self.tr('Allow'), self)
         for b in (self._denyButton, self._allowButton):
             b.setDefault(False)
@@ -127,7 +128,7 @@ class ConsentDialog(QDialog):
 
     def reject(self):
         # In non-cancellable mode, block all paths to dismiss the dialog
-        # without an explicit Allow / Don't Allow click.
+        # without an explicit Allow / Don't allow click.
         if self._cancellable:
             super().reject()
 

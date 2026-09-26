@@ -170,7 +170,7 @@ class StepPage(QObject):
             app.window.meshManager.show(
                 self._displayTime(self.OUTPUT_TIME - 1))
 
-    async def _reloadResultMesh(self) -> None:
+    async def _reloadResultMesh(self, stage: str = '') -> None:
         """Put the mesh a stage just wrote in front of the user (R95).
 
         This page hierarchy still speaks the numbered-time-directory model
@@ -191,7 +191,11 @@ class StepPage(QObject):
         load = getattr(manager, 'load', None)
         if load is None:
             return
-        await load(0)
+        # DP-96. ``stage`` names the button that made this mesh, so the
+        # line beside it says which of the three snappy phases the user
+        # is looking at. Three consecutive meshes of the same object are
+        # otherwise told apart only by their cell counts.
+        await load(0, stage=stage)
 
     def updateMesh(self):
         if self.isNextStepAvailable():

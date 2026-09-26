@@ -30,7 +30,11 @@ class ProjectDialog(QDialog):
         self._ui.setupUi(self)
 
         self.setWindowIcon(meshAppProperties.icon())
-        self.setWindowTitle(f'{meshAppProperties.fullName} Start')
+        # DP-171. The launcher is the first title bar a user reads, and
+        # "FoamMesh Start" is not a phrase in any language. Say what the
+        # window does, with the product name where a name belongs.
+        self.setWindowTitle(
+            self.tr('Start {0}').format(meshAppProperties.fullName))
 
         self._dialog = None
         self._projectDirectory = None
@@ -74,7 +78,7 @@ class ProjectDialog(QDialog):
                 selectedPos = i
 
         if await AsyncMessageBox().confirm(self, self.tr('Remove from list'),
-                                           self.tr('Do you want to remove project "{}"" from list?'.format(path))):
+                                           self.tr('Do you want to remove project "{0}" from the list?').format(path)):
             self._ui.recentCases.takeItem(selectedPos)
             app.settings.removeProject(selectedPos)
 

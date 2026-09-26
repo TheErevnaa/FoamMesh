@@ -7,6 +7,7 @@ from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QTreeWidgetItem, QLabel, QWidget, QHBoxLayout
 
 from foammesh.rendering.actor_info import ActorInfo, ActorType
+from foammesh.view.theming.metrics import FORM_MARGIN
 from foammesh.view.theming.status_colors import apply_color_swatch
 
 
@@ -46,7 +47,7 @@ class DisplayItem(QTreeWidgetItem):
     def setupColorWidget(self, parent):
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(9, 1, 9, 1)
+        layout.setContentsMargins(FORM_MARGIN, 0, FORM_MARGIN, 0)
         layout.addWidget(self._colorWidget)
         # self._colorWidget.setFrameShape(QFrame.Shape.Box)
         self._colorWidget.setMinimumSize(16, 16)

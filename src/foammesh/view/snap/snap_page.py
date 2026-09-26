@@ -30,6 +30,8 @@ class SnapPage(StepPage):
         else:
             self._ui.concaveAngle.hide()
             self._ui.minAreaRatio.hide()
+        # `castellatedBufferLayer` is not a Foundation 13 snap mode, so
+        # the whole group goes; it has no form row to remove.
         self._ui.bufferLayer.hide()
         # ``nSmoothInternal`` is not a Foundation-13 snapControls key.
         internal_form = getattr(self._ui, 'formLayout_4', None)
@@ -57,10 +59,10 @@ class SnapPage(StepPage):
             # one page's commit collide with another's.
             snap = app.facadeClient.checkout('snap')
 
-            snap.setValue('nSmoothPatch', self._ui.smoothingForSurface.text(), self.tr('Smoothing for Surface'))
+            snap.setValue('nSmoothPatch', self._ui.smoothingForSurface.text(), self.tr('Smoothing for surface'))
             snap.setValue('nSolveIter', self._ui.meshDisplacementRelaxation.text(),
-                        self.tr('Mesh Displacement Relaxation'))
-            snap.setValue('nRelaxIter', self._ui.globalSnappingRelaxation.text(), self.tr('Global Snapping Relaxation'))
+                        self.tr('Mesh displacement relaxation'))
+            snap.setValue('nRelaxIter', self._ui.globalSnappingRelaxation.text(), self.tr('Global snapping relaxation'))
             # F-41. Two switches, not two halves of one. OpenFOAM 13 reads
             # implicitFeatureSnap and explicitFeatureSnap independently and
             # accepts both on; the enum this replaced could only ever write
@@ -70,19 +72,19 @@ class SnapPage(StepPage):
             snap.setValue('explicitFeatureSnap',
                           self._ui.explicitFeatureSnap.isChecked())
             snap.setValue('nFeatureSnapIter', self._ui.featureSnappingRelaxation.text(),
-                        self.tr('Feature Snapping Relaxation'))
+                        self.tr('Feature snapping relaxation'))
             snap.setValue('multiRegionFeatureSnap', self._ui.multiSurfaceFeatureSnap.isChecked())
             snap.setValue('tolerance', self._ui.tolerance.text(), self.tr('Tolerance'))
             await app.facadeClient.commit_working_copy(snap, action='update snap')
 
             return True
         except CONFLICT_ERRORS as error:
-            await AsyncMessageBox().information(
-                self._widget, self.tr('Case Changed'), self.tr(conflict_message(error)))
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Case changed'), self.tr(conflict_message(error)))
 
             return False
         except ValidationError as e:
-            await AsyncMessageBox().information(self._widget, self.tr('Input Error'), e.toMessage())
+            await AsyncMessageBox().warning(self._widget, self.tr('Input error'), e.toMessage())
 
             return False
 
@@ -111,8 +113,8 @@ class SnapPage(StepPage):
     @qasync.asyncSlot()
     async def _loadDefaults(self):
         if await AsyncMessageBox().confirm(
-                self._widget, self.tr('Reset Settings'),
-                self.tr('Would you like to reset all Snap settings to default, excluding the Buffer Layer Surfaces?')):
+                self._widget, self.tr('Reset settings'),
+                self.tr('Would you like to reset all Snap settings to default, excluding the Buffer layer surfaces?')):
             self._setConfigurations(defaultsDB.getElement('snap'))
 
     def _setConfigurations(self, snap):
@@ -202,13 +204,13 @@ class SnapPage(StepPage):
                     self._widget, self.tr('Snapping failed'),
                     self.stageFailureDetail(execution))
         except Exception as e:
-            await AsyncMessageBox().information(self._widget, self.tr('Error'),
-                                                self.tr('Snapping Failed:') + str(e))
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Snapping failed'), str(e))
 
         if not result:
             self.clearResult()
         else:
-            await self._reloadResultMesh()
+            await self._reloadResultMesh(self.tr('Snapped mesh'))
 
         return result
 

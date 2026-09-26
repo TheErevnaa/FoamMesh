@@ -1,17 +1,9 @@
-      <svg
-         id="icons"
-         viewBox="0 0 512 512"
-         xmlns="http://www.w3.org/2000/svg">
-        <path
-   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-   d="M 64,208 H 192 V 336 H 64 Z" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-   d="M 288,128 H 464 V 400 H 288 Z" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-   d="M 192,208 288,128" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-   d="M 192,336 288,400" />
-      </svg>
+<svg
+   id="icons"
+   viewBox="0 0 512 512"
+   xmlns="http://www.w3.org/2000/svg">
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 64,448 216,96" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 448,448 296,96" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 82,406 H 430 M 128,300 H 384 M 164,216 H 348 M 195,145 H 317" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:8,40" d="M 32,96 H 480" />
+</svg>

@@ -83,7 +83,7 @@ GMSH_WORKFLOW = WorkflowDescriptor(
         'controls, periodic pairs and 3D prism boundary layers.'),
     tasks=(
         WorkflowTask(
-            'gmsh.describe_geometry', 'Describe Geometry', 10,
+            'gmsh.describe_geometry', 'Describe geometry', 10,
             description=(
                 'Confirm the prepared geometry Gmsh will import, and the '
                 'healing options applied on import.'),
@@ -106,12 +106,12 @@ GMSH_WORKFLOW = WorkflowDescriptor(
         # GF0. Evidence readiness rather than an engineering decision, so it
         # does not accept an override (§8.6).
         WorkflowTask(
-            'common.reference_readiness', 'Reference Readiness', 15,
+            'common.reference_readiness', 'Reference readiness', 15,
             depends_on=('gmsh.describe_geometry',),
             description='Confirm a validation reference and feature manifest '
                         'exist for the prepared geometry.'),
         WorkflowTask(
-            'gmsh.global_sizing', 'Global Sizing', 20,
+            'gmsh.global_sizing', 'Global sizing', 20,
             depends_on=('gmsh.describe_geometry',),
             description=(
                 'Target and minimum element size, curvature adaptation, and '
@@ -149,53 +149,66 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/algorithms/splitQuadrangles',
                 'gmsh/parallel/threads')),
         WorkflowTask(
-            'gmsh.size_fields', 'Size Fields', 30,
+            'gmsh.size_fields', 'Size fields', 30,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.global_sizing',),
             description=(
                 'Spatial refinement: distance-to-surface thresholds and '
                 'analytic box, ball, cylinder and frustum regions.')),
         WorkflowTask(
-            'gmsh.curve_controls', 'Curve Controls', 40,
+            'gmsh.curve_controls', 'Curve controls', 40,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.size_fields',),
             description='Structured (transfinite) or locally sized curves.'),
         WorkflowTask(
-            'gmsh.volume_controls', 'Volume Controls', 50,
+            'gmsh.volume_controls', 'Volume controls', 50,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.curve_controls',),
             description='Per-volume sizing, inclusion, and region typing.',
             fields=_fields('gmsh/structuring/automatic',
                            'gmsh/structuring/transfiniteTri')),
         WorkflowTask(
-            'gmsh.boundary_layers', 'Boundary Layers', 60,
+            'gmsh.boundary_layers', 'Boundary layers', 60,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.volume_controls',),
             # R118. The description used to say the stack could only apply
             # to the whole boundary. MEASURED: that put prisms on the venturi
             # inlet and outlet planes. The runner rebuilds an un-extruded
             # patch from the extrusion's inner rim, so a selection closes.
+            # Plan 33 section 1.1 retired the second half of that sentence:
+            # an empty selection grew layers on every boundary, which is the
+            # very thing the first half warns against.
             description=(
-                'Prism layers grown into the volume. Name the patches that '
-                'grow layers -- normally the walls; layers on an inlet or an '
-                'outlet distort the flow face. Left empty, every boundary '
-                'surface grows them.'),
+                'Prism layers grown into the volume. Choose the surfaces '
+                'that grow layers — normally the walls; layers on an inlet '
+                'or an outlet distort the flow face.'),
             fields=_fields(
-                'gmsh/boundaryLayers/enabled', 'gmsh/boundaryLayers/patches',
+                'gmsh/boundaryLayers/enabled',
+                'gmsh/boundaryLayers/patchMode',
+                'gmsh/boundaryLayers/patches',
                 'gmsh/boundaryLayers/mode',
                 'gmsh/boundaryLayers/firstHeight', 'gmsh/boundaryLayers/ratio',
                 'gmsh/boundaryLayers/layerCount',
                 'gmsh/boundaryLayers/totalThickness',
                 'gmsh/boundaryLayers/quads')),
         WorkflowTask(
-            'gmsh.periodic', 'Periodic Pairs', 70,
+            'gmsh.periodic', 'Periodic pairs', 70,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.boundary_layers',),
             description=(
                 'Translational or rotational periodicity, published as '
                 'matched OpenFOAM cyclic patches.')),
         WorkflowTask(
-            'gmsh.compute', 'Compute Mesh', 80,
+            # Plan 32 §4.3 names this row `Generate mesh`, and the title is
+            # what a reader sees: it is the outline row, the panel heading and
+            # the name every "waiting on ..." sentence uses, and it was the
+            # one surface still calling the step compute.
+            #
+            # The title only. `gmsh.compute` is the task id -- persisted in
+            # saved task state, named by `depends_on` and `invalidates` across
+            # both engines, and the key of the `compute` stage -- and renaming
+            # it would strand every case saved before this release.
+            'gmsh.compute', 'Generate mesh', 80,
             depends_on=('gmsh.periodic',), engine_stage='compute',
             capabilities=(CapabilityRequirement('gmsh'),),
             artifacts=(_GMSH_MESH,), run_gated=True,
@@ -209,7 +222,14 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                          'common.summary', 'common.export'),
             description='Run Gmsh and record requested against achieved values.',
             fields=_fields(
-                'gmsh/optimization/optimize', 'gmsh/optimization/netgenPasses',
+                'gmsh/optimization/optimize',
+                # DP-627 (field audit 0924 gmsh-generate-export D2). The
+                # runner reads these three and no page offered them: Netgen
+                # was a hidden switch left on, and the smoothing steps and
+                # the optimiser's threshold could not be changed at all.
+                'gmsh/optimization/netgen', 'gmsh/optimization/netgenPasses',
+                'gmsh/optimization/smoothing',
+                'gmsh/optimization/optimizeThreshold',
                 'gmsh/optimization/qualityType',
                 'gmsh/optimization/minQuality',
                 'gmsh/optimization/allowedFraction',
@@ -228,14 +248,28 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 # register and reachable from no page at all.
                 'gmsh/output/secondOrderLinear',
                 'gmsh/optimization/highOrderOptimize',
-                'gmsh/output/renumber')),
+                'gmsh/output/renumber',
+                # DP-672 (field audit 0924 gmsh-generate-export D2). The
+                # runner reads the mode when it picks `generate(2)` or
+                # `generate(3)` and the publisher builds the one-cell
+                # extrusion or wedge from the other five, and no page offered
+                # any of them: a 2D or axisymmetric mesh was reachable from a
+                # script only.
+                'gmsh/dimensionality/mode',
+                'gmsh/dimensionality/thickness',
+                'gmsh/dimensionality/wedgeAngle',
+                'gmsh/dimensionality/wedgeAxis',
+                'gmsh/dimensionality/frontPatch',
+                'gmsh/dimensionality/backPatch',
+                # DP-675 (D11): names for the section's boundary curves.
+                'gmsh/dimensionality/edgeNames')),
         # GF1 on Gmsh is OPTIONAL and diagnostic -- it measures the native
         # .msh before publication. It does not gate: Gmsh meshes the CAD volume
         # directly, so a boundary face cannot be lost the way snappy can lose
         # one, and making it blocking would stop the engine for a reading that
         # carries no equivalent risk.
         WorkflowTask(
-            'gmsh.fidelity_native', 'Native Mesh Fidelity', 85,
+            'gmsh.fidelity_native', 'Native mesh fidelity', 85,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.compute', 'common.reference_readiness'),
             artifacts=(_FIDELITY_NATIVE,), run_gated=True,
@@ -251,7 +285,7 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'Write constant/polyMesh directly, typing patches from the '
                 'prepared boundary categories.')),
         WorkflowTask(
-            'common.fidelity', 'Geometry Fidelity', 95,
+            'common.fidelity', 'Geometry fidelity', 95,
             depends_on=('gmsh.publish', 'common.reference_readiness'),
             artifacts=(_FIDELITY,), accepts_override=True,
             run_gated=True,
@@ -260,21 +294,21 @@ GMSH_WORKFLOW = WorkflowDescriptor(
         # Run-gated: a checkMesh run is the only thing that accepts it, so a
         # QA row can never read "passed" for a mesh OpenFOAM did not open.
         WorkflowTask(
-            'gmsh.qa', 'Mesh QA', 100,
+            'gmsh.qa', 'Quality', 100,
             depends_on=('gmsh.publish',), engine_stage='checkMesh',
             capabilities=(CapabilityRequirement('checkMesh'),),
             artifacts=(_QUALITY,), accepts_override=True, run_gated=True,
             invalidates=('common.summary', 'common.export'),
             description='OpenFOAM 13 checkMesh on the published mesh.'),
         WorkflowTask(
-            'common.resolution', 'Resolution Adequacy', 105,
+            'common.resolution', 'Resolution adequacy', 105,
             depends_on=('gmsh.publish', 'common.reference_readiness'),
             artifacts=(_RESOLUTION,), accepts_override=True,
             run_gated=True,
             invalidates=('common.summary', 'common.export'),
             description='Whether the mesh resolves the geometry it captured.'),
         WorkflowTask(
-            'common.summary', 'Qualification Summary', 108,
+            'common.summary', 'Qualification summary', 108,
             depends_on=('common.fidelity', 'common.resolution', 'gmsh.qa'),
             artifacts=(_SUMMARY,), run_gated=True,
             invalidates=('common.export',),
@@ -339,6 +373,11 @@ class GmshMeshingEngine:
     needs_generated_dictionaries = False
     #: No gate blocks a later Gmsh task: its one gate is inside the atomic run.
     blocking_gate_task = ''
+    #: DP-638. The job imports solid models or surfaces, never both
+    #: (runner_v1.py refuses the mix), so the case is refused it up front.
+    mixes_cad_and_surfaces = False
+    #: DP-641. Gmsh has no non-conformal coupling to build an NCC pair with.
+    builds_non_conformal_interfaces = False
 
     def __init__(self, *, profile=None, runtime_probe=None):
         self._profile = profile
@@ -378,10 +417,17 @@ class GmshMeshingEngine:
 
         from foammesh.core.engine.registry import configured_target_solver
 
+        from foammesh.core.gmsh.sizing import SizingError
+
         try:
             intent = derive_from_native(
                 _native_section(db), bbox=bbox,
                 target_solver=configured_target_solver(db))
+        except SizingError as error:
+            # DP-614: an "Auto" size with no geometry to derive it from, or a
+            # size the domain cannot hold. Said on the page that owns it
+            # rather than swallowed with every other warning.
+            return {'gmsh.global_sizing': [str(error)]}
         except (PlanDerivationError, ValueError, KeyError, TypeError):
             return {}
         return {task_id: list(texts) for task_id, texts
@@ -399,14 +445,28 @@ class GmshMeshingEngine:
 
     def probe(self, capabilities=None, *, refresh: bool = False,
               target_solver: str = '') -> EngineProbe:
-        """Report the Gmsh runtime, and OpenFOAM's only when OpenFOAM is next.
+        """Report whether Gmsh can mesh, and say separately what will not run.
 
-        Plan 30 WP-07 (F-40). This used to require checkMesh whatever the mesh
-        was being built for, so a machine with Gmsh and no OpenFOAM reported
-        the Gmsh engine unavailable even on the SU2 route, where nothing this
-        run produces is ever read by OpenFOAM. checkMesh is asked for when the
-        target is OpenFOAM -- or when no target has been chosen yet, because
-        the stricter of the two answers is the honest one to show then.
+        DP-50. Two questions were being answered with one word. Whether Gmsh
+        can build a mesh is about Gmsh; whether OpenFOAM will approve of the
+        result is about checkMesh; and this returned the *conjunction*, so a
+        host with a working Gmsh and no OpenFOAM reported the Gmsh engine
+        unavailable and greyed its card out. The reason offered named
+        OpenFOAM, on a route the user may never have pointed at OpenFOAM.
+
+        Nothing in the pipeline justified it. `publish` writes
+        `constant/polyMesh` in pure Python -- no `gmshToFoam`, no utility, no
+        shell -- so Gmsh meshes and publishes for OpenFOAM without OpenFOAM
+        being present at all. checkMesh reads a mesh that by then already
+        exists and says whether the solver will like it. It is a quality gate,
+        and it was wired as a power switch.
+
+        Plan 30 WP-07 (F-40) had already carved out the SU2 route, which was
+        right as far as it went, but it treated the exemption as the special
+        case. It is the general one: the check is a check on every route. So
+        availability is Gmsh's own answer, the checkMesh row is reported for
+        what it is, and a missing check becomes an advisory the page shows
+        next to an engine the user can still choose.
         """
         from foammesh.core.gmsh.plan_derivation import solver_token
         from foammesh.core.gmsh.runtime import (
@@ -439,20 +499,21 @@ class GmshMeshingEngine:
                 getattr(capability, 'reason', '') or '')
         results = (*report.capabilities, ('checkMesh', checkmesh))
         reason = report.reason
-        if not needs_checkmesh:
-            # SU2 reads the file Gmsh wrote. checkMesh is an OpenFOAM concern
-            # and cannot stand between this route and a mesh; it is still
-            # reported, so the row says what is on the machine.
-            checkmesh = True
-        elif report.available and not checkmesh:
+        if needs_checkmesh and report.available and not checkmesh:
+            # Reported, not enforced. The run itself has always coped with the
+            # check being absent -- the publish path records the mesh as
+            # unchecked and leaves QA to be run rather than claiming it passed
+            # -- so the only thing the old refusal added was to stop the user
+            # reaching a pipeline that would have worked.
+            #
             # R194. Which is it: no OpenFOAM on this machine, or a
             # distribution that had not finished starting when the page
             # opened? The sentence used to read the same either way.
             reason = ('Gmsh is available but OpenFOAM 13 checkMesh is not; a '
                       'published mesh could not be validated'
-                      + (f' -- {checkmesh_reason}' if checkmesh_reason else ''))
+                      + (f' — {checkmesh_reason}' if checkmesh_reason else ''))
         return EngineProbe(
-            self.engine_id, bool(report.available and checkmesh), results, reason,
+            self.engine_id, bool(report.available), results, reason,
             profile_id=report.profile_id,
             runtime_fingerprint=report.runtime_fingerprint,
             version=report.version,
@@ -604,6 +665,21 @@ class GmshMeshingEngine:
             'omitted': tuple(omitted),
         }
 
+    def meshes_a_section(self, db) -> bool:
+        """Whether this case asks for a 2D or axisymmetric section.
+
+        DP-673. A section is one planar face and bounds no volume by design,
+        so the run seams must not refuse it for that. Asked of the engine
+        rather than decided in the facade by engine name: only an engine
+        that meshes sections answers this at all.
+        """
+        try:
+            mode = db.getValue('gmsh/dimensionality/mode')
+        except Exception:                                   # noqa: BLE001
+            return False
+        mode = str(getattr(mode, 'value', mode) or '')
+        return mode.split('.')[-1].lower() in ('two_d', 'axisymmetric')
+
     def requested_cell_size(self, db, *, bounds=None, hex_bounds=None):
         """The element size Gmsh was asked for (Plan 30 F-14).
 
@@ -637,7 +713,7 @@ class GmshMeshingEngine:
             return None, 'unavailable', str(error)
         size = float(sizing.target_size) * float(sizing.size_factor or 1.0)
         return (size, str(sizing.sources.get('targetSize') or 'derived'),
-                f'gmsh target size {sizing.target_size:.4g} x '
+                f'gmsh target size {sizing.target_size:.4g} × '
                 f'size factor {sizing.size_factor:g}')
 
     def create_plan(self, request: EnginePlanRequest) -> EngineExecutionPlan:
@@ -691,9 +767,23 @@ class GmshMeshingEngine:
     # -- execution --------------------------------------------------------- #
 
     def generate_config(self, db, bbox, case_path, prepared_geometry=None):
-        from foammesh.core.gmsh.execution import write_job
+        """Write the job this run will be given, threads and all.
 
-        return write_job(db, bbox, case_path,
+        Plan 33 DP-X2. The job the runner reads is derived from the ``gmsh``
+        section of the project, and the thread count lives in the execution
+        policy, which that section knows nothing about. MEASURED: a case whose
+        page said three cores wrote a job saying one thread, and the runner
+        read the job. The policy is resolved into the section here, once, so
+        the writer keeps deriving from one place and the number it derives is
+        the number the page asked for.
+        """
+        from foammesh.core.gmsh.execution import write_job
+        from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
+
+        policy = execution_policy(db)
+        threads = resolve_parallel_threads(
+            policy, requested=_saved_thread_request(db))
+        return write_job(_ResolvedThreads(db, threads), bbox, case_path,
                          prepared_geometry=prepared_geometry,
                          profile=self.resolve_profile())
 
@@ -707,3 +797,63 @@ class GmshMeshingEngine:
         from foammesh.core.quality import MeshCheckService
 
         return MeshCheckService.load_report(case_path)
+
+
+def _project_data(db) -> dict:
+    reader = getattr(db, 'data', None)
+    if not callable(reader):
+        return {}
+    try:
+        return dict(reader() or {})
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def execution_policy(db) -> dict:
+    """The execution policy, read off the project the run is starting from.
+
+    The same two readings the facade takes from the configuration document,
+    taken here from the database the engine seam is handed, because the seam
+    is given no configuration and the runner needs the answer.
+    """
+    execution = ((_project_data(db).get('mesh') or {}).get('execution') or {})
+    try:
+        ceiling = int(execution.get('maxCpuCores') or 0)
+    except (TypeError, ValueError):
+        ceiling = 0
+    return {'mode': str(execution.get('mode', 'auto')).split('.')[-1].lower(),
+            'max_cpu_cores': ceiling or None}
+
+
+def _saved_thread_request(db) -> int:
+    parallel = ((_project_data(db).get('gmsh') or {}).get('parallel') or {})
+    try:
+        threads = int(parallel.get('threads') or 0)
+    except (TypeError, ValueError):
+        return 0
+    return threads if threads > 1 else 0
+
+
+class _ResolvedThreads:
+    """The project, with the thread count the execution policy resolved.
+
+    A view rather than a write: the number is derived per run from the ceiling
+    and the machine, and saving it into the project would turn this machine's
+    core count into a stored setting that travels with the case.
+    """
+
+    def __init__(self, db, threads: int):
+        self._db = db
+        self._threads = int(threads)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def data(self) -> dict:
+        data = _project_data(self._db)
+        gmsh = dict(data.get('gmsh') or {})
+        parallel = dict(gmsh.get('parallel') or {})
+        parallel['threads'] = self._threads
+        gmsh['parallel'] = parallel
+        data['gmsh'] = gmsh
+        return data

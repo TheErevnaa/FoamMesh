@@ -13,8 +13,8 @@ What FoamMesh guarantees:
 
 - **Keyboard**: New (Ctrl+N), Open (Ctrl+O), Save (Ctrl+S), Close (Ctrl+E),
   Undo/Redo (Ctrl+Z / Ctrl+Shift+Z), and all menu actions are reachable by
-  keyboard; Mesh Check runs from the Mesh menu without the mouse.
-- **No colour-only verdicts**: Mesh Check severity is always a word
+  keyboard; Mesh check runs from the Mesh menu without the mouse.
+- **No colour-only verdicts**: Mesh check severity is always a word
   (pass/warning/fail/incomplete); failed-cell overlays are labelled
   (`Failed: <set>`), not just red.
 - **Safe defaults**: every confirmation for a destructive action (repair,

@@ -202,6 +202,11 @@ CONTROLS = _register(
     SnappyControl('castellation/featureBands', WRITER, CASTELLATED, 'features',
                   note='the levels ramp of the features entries; empty leaves '
                        'each entry with the single level it always had'),
+    # DP-586
+    SnappyControl('castellation/volumeBands', WRITER, CASTELLATED,
+                  'refinementRegions',
+                  note='the levels ramp of a distance-mode volume group; empty '
+                       'leaves the group with its single distance and level'),
 
     # -- snapping -------------------------------------------------------- #
     SnappyControl('snap/nSmoothPatch', WRITER, SNAP, 'nSmoothPatch'),

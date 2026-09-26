@@ -114,9 +114,12 @@ def derive_global_sizing(values: dict, bbox=None) -> GlobalSizing:
                 'because the geometry has no usable bounding box')
         target = diagonal / DEFAULT_DIAGONAL_DIVISOR
         sources['targetSize'] = 'derived'
+        # DP-614: the number itself, because this is where the Global
+        # Sizing page tells the user what "Auto" came to.
         warnings.append(
-            f'target size derived from the bounding-box diagonal '
-            f'({diagonal:.6g} m / {DEFAULT_DIAGONAL_DIVISOR:g})')
+            f'target size {target:.4g} m derived from the bounding-box '
+            f'diagonal ({diagonal:.6g} m / {DEFAULT_DIAGONAL_DIVISOR:g}); '
+            'type a size to override it')
     else:
         sources['targetSize'] = 'configured'
 

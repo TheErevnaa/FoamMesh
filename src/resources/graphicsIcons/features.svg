@@ -2,16 +2,7 @@
    id="icons"
    viewBox="0 0 512 512"
    xmlns="http://www.w3.org/2000/svg">
-  <path
-     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-     d="M 64,352 256,256 448,352" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-     d="M 64,352 V 176 L 256,80" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-     d="M 448,352 V 176 L 256,80" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 256,80 V 256" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round;stroke-opacity:0.6" d="M 256,72 415,164 415,348 256,440 97,348 97,164 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 97,164 256,256 415,164 M 256,256 V 440" />
+  <circle style="fill:#000000;stroke:none" cx="256" cy="256" r="22" />
 </svg>

@@ -34,6 +34,8 @@ import json
 import os
 from pathlib import Path
 
+from foammesh.core.quality.layer_report import coverage_rows
+
 REPORT_SCHEMA_VERSION = 1
 #: Where the document lands by default, beside the machine-readable reports.
 DEFAULT_REPORT_PATH = 'foammesh/quality/mesh-report.html'
@@ -46,7 +48,7 @@ _VERDICT = {
     'warning': ('WARNING', 'warn'),
     'fail': ('FAIL', 'fail'),
     'invalid': ('INVALID', 'fail'),
-    'waived': ('WAIVED - accepted by a recorded decision', 'warn'),
+    'waived': ('WAIVED — accepted by a recorded decision', 'warn'),
     'unrated': ('NOT RATED', 'muted'),
     'incomplete': ('INCOMPLETE', 'muted'),
 }
@@ -260,32 +262,42 @@ class MeshReport:
                       f'</tr></thead><tbody>{written}</tbody></table>')
         return table
 
+    #: Row verdict -> the tag colour that reinforces it. The word is the
+    #: carrier; the colour never is.
+    _LAYER_TAG = {'complete': 'pass', 'partial': 'warn',
+                  'not grown': 'fail', 'frozen': 'muted'}
+
     def layers(self) -> str:
-        layers = self.document.get('layers') or {}
-        patches = layers.get('patches') or ()
-        if not patches:
+        """Requested against achieved, per patch, with both units named.
+
+        Plan 32 check 5. This table existed and was right, but it did not say
+        which of its right-hand numbers was a length and which was a share,
+        and it kept its own opinion of what `complete` meant. Both now come
+        from :func:`core.quality.layer_report.coverage_rows`, which the
+        Quality page reads as well -- a document and a page that disagree
+        about the same run is the failure this module opens by refusing.
+        """
+        rows = coverage_rows(self.document.get('layers') or {})
+        if not rows:
             return _missing(
                 'No boundary layers were requested, or the layer stage has '
                 'not run.')
-        rows = ''
-        for item in patches:
-            requested = item.get('requested_layers')
-            achieved = item.get('layers')
-            share = (100.0 * float(achieved) / float(requested)
-                     if requested else None)
-            verdict = ('pass' if share is None or share >= 100 else
-                       'warn' if share >= 50 else 'fail')
-            rows += (
-                f'<tr><td>{_e(item.get("patch"))}</td>'
-                f'<td class="num">{_number(requested) if requested else "-"}</td>'
-                f'<td class="num">{_number(achieved)}</td>'
-                f'<td class="num">{_number(item.get("coverage_pct"))}%</td>'
-                f'<td><span class="tag {verdict}">'
-                f'{"complete" if verdict == "pass" else "partial" if verdict == "warn" else "not grown"}'
-                '</span></td></tr>')
+        body = ''
+        for row in rows:
+            verdict = row['verdict']
+            body += (
+                f'<tr><td>{_e(row["patch"])}</td>'
+                f'<td class="num">{_e(row["requested_text"])}</td>'
+                f'<td class="num">{_e(row["achieved_text"])}</td>'
+                f'<td class="num">{_e(row["thickness_text"])}</td>'
+                f'<td class="num">{_e(row["coverage_text"])}</td>'
+                f'<td><span class="tag '
+                f'{self._LAYER_TAG.get(verdict, "muted")}">'
+                f'{_e(verdict)}</span></td></tr>')
         return ('<table><thead><tr><th>Patch</th><th>Requested</th>'
-                '<th>Achieved</th><th>Coverage</th><th></th></tr></thead>'
-                f'<tbody>{rows}</tbody></table>')
+                '<th>Achieved</th><th>Overall thickness</th>'
+                '<th>Of requested thickness</th><th></th></tr></thead>'
+                f'<tbody>{body}</tbody></table>')
 
     def warnings(self) -> str:
         warnings = self.document.get('warnings') or ()
@@ -324,7 +336,7 @@ class MeshReport:
     def to_html(self) -> str:
         header = self.document.get('header') or {}
         verdict = str(self.document.get('verdict') or 'unrated')
-        title = f'Mesh report - {header.get("case") or "case"}'
+        title = f'Mesh report — {header.get("case") or "case"}'
         sections = (
             ('Header', self.header()),
             ('Geometry', self.geometry()),

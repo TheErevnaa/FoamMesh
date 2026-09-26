@@ -4,21 +4,30 @@
 """CAD assembly panel: shows the imported CAD tree (bodies -> faces with names &
 colors) and exposes tessellation controls.
 
-Built programmatically (no .ui) so it is self-contained. It binds to the
-``cad_tree_rows`` view-model, so its data logic is tested headlessly even though
-the widget itself needs a display. ``retessellateRequested`` carries the chosen
-TessellationParams back to the import flow (re-mesh without re-import).
+Built programmatically (no .ui) so it is self-contained.
+``retessellateRequested`` carries the chosen TessellationParams back to the
+import flow (re-mesh without re-import).
+
+The panel is filled from the geometry artifact store, by ``setStoreEntries``,
+because the store is what the case keeps. It once had a second filler,
+``setModel``, written against a live ``CadModel`` held by an importer the
+Geometry page discards the moment an import finishes. DP-293 recorded that it
+was reached by no product code and left it standing; Plan 33 W-O2 took it out,
+and with it the last caller of the ``cad_tree_rows`` view-model, which is
+still exercised on its own by ``tests/unit/test_cad_pipeline.py``.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QGroupBox, QTreeWidget, QTreeWidgetItem,
-    QDoubleSpinBox, QCheckBox, QPushButton, QLabel,
+    QCheckBox, QPushButton, QLabel,
 )
 
 from foammesh.core.geometry.cad import TessellationParams
-from foammesh.view.view_models import cad_tree_rows
+from foammesh.core.geometry.store import stored_tessellation
+from foammesh.core.mesh.presentation import count_text
+from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
 
 
 class CadPanel(QWidget):
@@ -29,29 +38,47 @@ class CadPanel(QWidget):
         layout = QVBoxLayout(self)
 
         self._summary = QLabel('No CAD imported.')
+        self._summary.setObjectName('cadSummary')
         layout.addWidget(self._summary)
 
         self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(['Body / Face', 'Patch', 'Color'])
+        self._tree.setObjectName('cadTree')
+        # DP-B2. The third column was headed `Colour` and the only live
+        # writer of it -- ``setStoreEntries`` -- put the tessellation *unit*
+        # in it for the part row and nothing at all in the face rows. The
+        # colour a surface is drawn in lives on the Geometry list, which is
+        # where the user is choosing between the surfaces.
+        self._tree.setHeaderLabels([self.tr('Body / face'), self.tr('Patch')])
         layout.addWidget(self._tree)
 
         box = QGroupBox(self.tr('Tessellation'))
         form = QFormLayout(box)
-        self._linear = QDoubleSpinBox()
-        self._linear.setDecimals(4); self._linear.setRange(1e-4, 1e4)
-        self._linear.setValue(0.1)
-        self._angular = QDoubleSpinBox()
+        self._linear = CompactDoubleSpinBox()
+        self._linear.setObjectName('cadLinearDeflection')
+        # DP-520. In metres, as its unit cell says and as the import and the
+        # repair route now both apply it. Four decimals of a metre could not
+        # show the 0.1 mm a CAD part is faceted at by default.
+        self._linear.setDecimals(6); self._linear.setRange(1e-6, 10.0)
+        self._linear.setValue(TessellationParams().linear_deflection)
+        self._angular = CompactDoubleSpinBox()
+        self._angular.setObjectName('cadAngularDeflection')
         self._angular.setRange(1.0, 179.0); self._angular.setValue(20.0)
         self._relative = QCheckBox()
+        self._relative.setObjectName('cadRelativeDeflection')
         self._parallel = QCheckBox(); self._parallel.setChecked(True)
-        form.addRow(self.tr('Linear deflection'), self._linear)
-        form.addRow(self.tr('Angular deflection (deg)'), self._angular)
+        self._parallel.setObjectName('cadParallelTessellation')
+        # DP-164. `(deg)` was one of seven spellings of one unit. The unit
+        # goes where the registry rows put it: its own column after the box.
+        form.addRow(self.tr('Linear deflection'), unit_cell(self._linear, 'm'))
+        form.addRow(self.tr('Angular deflection'),
+                    unit_cell(self._angular, 'deg'))
         form.addRow(self.tr('Relative'), self._relative)
         form.addRow(self.tr('Parallel'), self._parallel)
         layout.addWidget(box)
 
         self._entries = []
         self._retess = QPushButton(self.tr('Re-tessellate'))
+        self._retess.setObjectName('cadRetessellate')
         self._retess.clicked.connect(self._emitRetessellate)
         layout.addWidget(self._retess)
 
@@ -98,44 +125,30 @@ class CadPanel(QWidget):
             formats = sorted({str(entry.get('format') or '').upper()
                               for entry in entries} - {''})
             self._summary.setText(
-                f"{'/'.join(formats) or 'CAD'} · {len(entries)} parts · "
-                f"{faces} faces · unit {entries[-1].get('unit') or 'm'}")
+                f"{'/'.join(formats) or 'CAD'} · "
+                f"{count_text(len(entries), 'part')} · "
+                f"{count_text(faces, 'face')} · "
+                f"unit {entries[-1].get('unit') or 'm'}")
         else:
             self._summary.setText('No CAD imported.')
         self._tree.clear()
         for entry in entries:
-            item = QTreeWidgetItem(
-                [str(entry.get('name') or ''), '', str(entry.get('unit') or 'm')])
+            item = QTreeWidgetItem([str(entry.get('name') or ''), ''])
             for patch in entry.get('patches') or ():
                 source = patch.get('source_ref') or {}
                 face = source.get('original_name') or (
                     f"face{source.get('face_index')}"
                     if source.get('face_index') is not None else '')
                 item.addChild(QTreeWidgetItem(
-                    [str(face), str(patch.get('name') or ''), '']))
+                    [str(face), str(patch.get('name') or '')]))
             self._tree.addTopLevelItem(item)
             item.setExpanded(True)
         if entries:
-            self.setParams(entries[-1].get('tessellation'))
+            self.setParams(stored_tessellation(entries[-1]))
 
     def geometryIds(self) -> list:
         """The CAD geometries the panel is showing, newest last."""
         return [str(entry.get('geometry_id')) for entry in getattr(self, '_entries', ())]
-
-    def setModel(self, model) -> None:
-        """Populate the tree from a CadModel (via the cad_tree_rows view-model)."""
-        data = cad_tree_rows(model)
-        self._summary.setText(
-            f"{data['format'].upper()} · {data['n_bodies']} bodies · "
-            f"{data['n_faces']} faces · unit {data['unit']}")
-        self._tree.clear()
-        for body in data['bodies']:
-            bitem = QTreeWidgetItem([body['name'], '', body.get('color', '')])
-            for face in body['faces']:
-                bitem.addChild(QTreeWidgetItem(
-                    [face['name'] or face['id'], face['patch'], face.get('color', '')]))
-            self._tree.addTopLevelItem(bitem)
-            bitem.setExpanded(True)
 
     def _emitRetessellate(self):
         self.retessellateRequested.emit(self.params())

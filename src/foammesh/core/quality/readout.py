@@ -153,7 +153,7 @@ def fidelity_readout(document: Mapping | None,
     exceeded = tuple(str(section.get('name') or '(unnamed)')
                      for section in sections
                      if _exceeds_tolerance(section))
-    headline = (f'{verdict} - {measured} of {total} sections were measured '
+    headline = (f'{verdict} — {measured} of {total} sections were measured '
                 'against the reference.')
     caveat = ''
     if total and not measured:
@@ -174,7 +174,7 @@ def fidelity_readout(document: Mapping | None,
                   'have not been calibrated, so these rows are readings '
                   'rather than verdicts.')
     if not total:
-        headline = f'{verdict} - the report contains no sections.'
+        headline = f'{verdict} — the report contains no sections.'
         caveat = ('Nothing was reconciled against the prepared geometry, so '
                   'this is a report about the check rather than the mesh.')
     if exceeded:
@@ -231,7 +231,7 @@ def resolution_readout(document: Mapping | None) -> Readout:
                                or 'no measurement recorded'))
     verdict = str(document.get('verdict') or 'unrated')
     total = len(sections)
-    headline = (f'{verdict} - {measured} channel'
+    headline = (f'{verdict} — {measured} channel'
                 f'{"" if measured == 1 else "s"} traversed across {total} '
                 f'section{"" if total == 1 else "s"}.')
     caveat = ''
@@ -241,7 +241,7 @@ def resolution_readout(document: Mapping | None) -> Readout:
                   'min_cells_across policy applies to these sections, so the '
                   'counts below are readings, not a pass.')
     elif not total:
-        headline = f'{verdict} - the report contains no sections.'
+        headline = f'{verdict} — the report contains no sections.'
         caveat = ('No section could be joined to a prepared patch, so nothing '
                   'was traversed.')
     return Readout('resolution', verdict, headline, tuple(rows), caveat,
@@ -277,7 +277,7 @@ def summary_readout(document: Mapping | None) -> Readout:
     disposition = str(document.get('disposition') or 'unqualified')
     qualified = bool(document.get('qualified'))
     worst = str(document.get('worst_verdict') or 'unrated')
-    headline = (f'{disposition} - '
+    headline = (f'{disposition} — '
                 f'{"qualified" if qualified else "not qualified"}; worst '
                 f'block verdict {worst}.')
     caveats = []
@@ -348,7 +348,7 @@ def checkmesh_readout(document: Mapping | None) -> Readout:
                 _number(result[key], spec)))
     severity = str(result.get('severity') or 'unrated')
     failed = int(result.get('failed_checks') or 0)
-    headline = (f'{severity} - {failed} failed mesh check'
+    headline = (f'{severity} — {failed} failed mesh check'
                 f'{"" if failed == 1 else "s"}, '
                 f'{len(result.get("blocking_findings") or ())} blocking and '
                 f'{len(result.get("advisory_findings") or ())} advisory '
@@ -369,7 +369,7 @@ def checkmesh_readout(document: Mapping | None) -> Readout:
 # R201. All three fidelity tasks shared one projection, and its not-run
 # sentence names its subject in prose: "Geometry fidelity has produced no
 # report for this case yet". MEASURED on tee / gmsh, that sentence appeared
-# under the heading "Native Mesh Fidelity", telling a user a different check
+# under the heading "Native mesh fidelity", telling a user a different check
 # had not run and sending them to look at a task that had already passed.
 # One projection still, bound to the name each page shows.
 READOUTS = {

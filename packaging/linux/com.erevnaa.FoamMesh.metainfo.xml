@@ -9,5 +9,5 @@
   <launchable type="desktop-id">com.erevnaa.FoamMesh.desktop</launchable>
   <provides><binary>FoamMesh</binary></provides>
   <developer id="com.erevnaa"><name>Erevnaa</name></developer>
-  <releases><release version="1.0.0" date="2026-09-10"/></releases>
+  <releases><release version="1.1.0" date="2026-09-25"/><release version="1.0.0" date="2026-09-10"/></releases>
 </component>

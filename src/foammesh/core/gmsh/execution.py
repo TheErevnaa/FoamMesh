@@ -34,6 +34,43 @@ class ExecutionError(RuntimeError):
     pass
 
 
+def assembly_layer_refusal(volumes: int) -> str:
+    """Word for word what ``runner_v1`` says, said before the run starts.
+
+    DP-52/DP-53. The runner is a standalone script executed inside WSL and
+    cannot import this package, so the sentence necessarily exists twice;
+    `test_the_seam_refuses_in_the_words_the_runner_would_have_used`
+    reconstructs the runner's copy from its source and compares the two, so
+    the pair cannot drift into two explanations of one refusal.
+    """
+    return (f'boundary layers are not supported on a {volumes}'
+            '-volume assembly unless every patch they grow on bounds '
+            'one and the same volume: the layer is carved out of a '
+            'single core, and a selection spanning more than one '
+            'leaves neither side closed. Name the patches of one '
+            'volume, mesh this geometry without layers, or split it '
+            'into one job per volume.')
+
+
+def prepared_volume_count(prepared_geometry) -> tuple[int, str]:
+    """How many volumes the prepared revision recorded, and who counted them.
+
+    The count is read rather than recomputed: `ensure_prepared` wrote it at
+    prepare time from whichever route imported the geometry, and re-running
+    the classifier here would put a cold read of a large STL in front of
+    every run. ``unknown`` is returned for a revision prepared before this
+    was recorded, and an unknown count refuses nothing.
+    """
+    topology = (prepared_manifest(prepared_geometry).get('preparation')
+                or {}).get('topology') or {}
+    source = str(topology.get('volumes_source') or 'unknown')
+    try:
+        volumes = int(topology.get('volumes') or 0)
+    except (TypeError, ValueError):
+        return 0, 'unknown'
+    return volumes, source
+
+
 def runner_path() -> Path:
     """Where the runner script lives on the host filesystem."""
     from resources import resource
@@ -42,6 +79,18 @@ def runner_path() -> Path:
 
 
 def _native_section(db) -> dict:
+    """The ``gmsh`` section, with the Geometry page's cyclic pairs joined in.
+
+    DP-641 (field audit 0924 gmsh-sizing D9). A cyclic interface pair is a
+    periodic pair; Gmsh builds one with ``setPeriodic``, which is what the
+    section's own ``periodicPairs`` reach. They are joined here, the one
+    reader every Gmsh plan, scope check and job goes through, as copies: the
+    project's rows are not rewritten by reading them.
+    """
+    return _with_interface_periodic_pairs(_gmsh_section(db), db)
+
+
+def _gmsh_section(db) -> dict:
     """Read the ``gmsh`` configuration section out of the project database.
 
     MEASURED: ``SimpleDB.getValue`` resolves leaf scalars only and raises
@@ -119,6 +168,21 @@ def group_surface_indices(group) -> list[int]:
         index = reference.get('face_index')
         if isinstance(index, int) and not isinstance(index, bool):
             derived.append(index)
+            continue
+        # DP-58. A tessellated file holding one `solid` block has no face to
+        # index: the group is the whole file, and the store records
+        # `face_index: null` beside the body it came from. Reading only the
+        # two CAD keys made that group cover nothing, so it produced neither
+        # an entity identity nor a legacy name.
+        #
+        # MEASURED across every prepared group manifest under `test_cases`: a
+        # null face index appears on exactly one shape, 90 single-group STL
+        # files, and on no STEP, IGES or OBJ source and no file that more than
+        # one group names -- the multi-solid STL carries face indices 0 and 1.
+        # The body index is the surface index there and nowhere else.
+        body = reference.get('body_index')
+        if isinstance(body, int) and not isinstance(body, bool):
+            derived.append(body)
     return derived
 
 
@@ -200,6 +264,208 @@ def region_volume_entities(region) -> list[str]:
             for index in region_volume_indices(region)]
 
 
+def shared_surface_aliases(prepared_geometry) -> dict:
+    """Source id -> ``{second listing: first listing}`` of one shared face.
+
+    DP-546. The CAD import walks each solid's faces in turn, so a face two
+    solids share -- one ``TopoDS_Face`` in both shells, which is what a
+    fragmented assembly is -- is listed twice: once per solid. Gmsh binds it
+    once, at the first listing, and numbers every later face from there, so
+    the second listing has no surface of its own. MEASURED on G6
+    ``tee_with_plug.brep`` (audit 0924): eight listings, seven surfaces;
+    ``body0_face2`` and ``body1_face4`` are the plug's end face seen from each
+    body, and the positional join left ``body1_face4`` and its scope
+    ``640cae55...`` pointing at a ninth surface that does not exist.
+
+    The import marks such a listing as its own interface twin
+    (``interface_patch_uuid == patch_uuid``: "one face, both solids"). Two
+    such listings in one source are the same face when they measure the same
+    area and border the same faces -- every edge of one is an edge of the
+    other, so each lists the other as a neighbour. A listing that matches no
+    earlier listing, or more than one, is left alone rather than guessed at.
+    """
+    manifest = _group_manifest(prepared_geometry)
+    shared: dict[str, list[tuple]] = {}
+    for group in manifest.get('groups') or ():
+        if not isinstance(group, dict):
+            continue
+        uuid_ = str(group.get('patch_uuid') or '').strip()
+        if not uuid_ or str(group.get('interface_patch_uuid') or '').strip() \
+                != uuid_:
+            continue
+        indices = group_surface_indices(group)
+        try:
+            area = float(group.get('area'))
+        except (TypeError, ValueError):
+            continue
+        if len(indices) != 1:
+            continue
+        rim = frozenset(str(item) for item in
+                        group.get('adjacent_patch_uuids') or ()) | {uuid_}
+        shared.setdefault(_source_of(group), []).append(
+            (int(indices[0]), area, rim))
+    aliases: dict[str, dict[int, int]] = {}
+    for source, listings in shared.items():
+        listings.sort(key=lambda item: item[0])
+        for position, (index, area, rim) in enumerate(listings):
+            partners = [earlier for earlier, other_area, other_rim
+                        in listings[:position]
+                        if other_rim == rim
+                        and abs(other_area - area) <= 1e-9 * max(abs(area),
+                                                                 1e-30)]
+            if len(partners) == 1:
+                first = aliases.get(source, {}).get(partners[0], partners[0])
+                aliases.setdefault(source, {})[index] = first
+    return aliases
+
+
+def import_surface_position(aliases: dict, index: int) -> int:
+    """Where listing *index* lands among the surfaces Gmsh imports, from 0.
+
+    DP-546. A shared face's second listing is the first listing's surface,
+    and every listing after a skipped one moves down by one.
+    """
+    first = int((aliases or {}).get(int(index), int(index)))
+    return first - sum(1 for alias in (aliases or {}) if int(alias) < first)
+
+
+#: Geometry-page transform -> the Gmsh periodic pair's. A coincident cyclic
+#: pair has no transform to give ``setPeriodic`` and is left to the run
+#: record, which says so.
+_PERIODIC_TRANSFORMS = {'translational': 'translation',
+                        'rotational': 'rotation'}
+
+
+def _with_interface_periodic_pairs(section: dict, db) -> dict:
+    extra = []
+    declared = set()
+    existing = section.get('periodicPairs') or {}
+    for row in (existing.values() if isinstance(existing, dict)
+                else existing):
+        if isinstance(row, dict) and row.get('enabled', True):
+            declared.add(frozenset((
+                str(row.get('masterScopeToken') or '').strip(),
+                str(row.get('slaveScopeToken') or '').strip())))
+    for pair in interface_pair_rows(db):
+        transform = _PERIODIC_TRANSFORMS.get(pair['transform'])
+        if pair['coupling'] != 'cyclic' or transform is None:
+            continue
+        sides = frozenset((pair['masterScope'], pair['slaveScope']))
+        if sides in declared:
+            # The Periodic page already declares this pairing; it wins,
+            # rather than the plan refusing a pairing made twice.
+            continue
+        declared.add(sides)
+        x, y, z = pair['translation']
+        cx, cy, cz = pair['rotationCentre']
+        ax, ay, az = pair['rotationAxis']
+        extra.append({
+            'name': pair['name'], 'enabled': True,
+            'masterScopeToken': pair['masterScope'],
+            'slaveScopeToken': pair['slaveScope'],
+            'transform': transform,
+            'translation': {'x': x, 'y': y, 'z': z},
+            'rotationCentre': {'x': cx, 'y': cy, 'z': cz},
+            'rotationAxis': {'x': ax, 'y': ay, 'z': az},
+            'rotationAngleDegrees': pair['rotationAngleDegrees'],
+            'matchTolerance': pair['matchTolerance'],
+            'origin': 'interfacePairs'})
+    if not extra:
+        return section
+    section = dict(section)
+    if isinstance(existing, dict):
+        merged = dict(existing)
+        for row in extra:
+            merged[f'interface-{row["name"]}'] = row
+    else:
+        merged = [*existing, *extra]
+    section['periodicPairs'] = merged
+    return section
+
+
+def interface_pair_rows(db) -> list[dict]:
+    """The enabled ``interfacePairs`` rows, in the job's shape.
+
+    DP-548. The Geometry page's pair editor saves a row, the snappy route
+    reads it (``CaseBuilder.interface_pairs``), and the Gmsh job never carried
+    it: MEASURED on G6 ``tee_with_plug.brep`` (audit 0924), whose H5 held
+    ``tee_plug_contact`` while ``job.json`` and ``result.json`` named no pair,
+    so nothing could say whether the 36-face interface came from the pair or
+    from the face the two solids share. The runner acts on none of these; it
+    is given them so it can say, pair by pair, what the mesh did there.
+    """
+    rows = None
+    content = getattr(db, 'data', None)
+    if callable(content):
+        try:
+            rows = (content() or {}).get('interfacePairs')
+        except Exception:
+            rows = None
+    if not isinstance(rows, dict):
+        getter = getattr(db, 'getElements', None)
+        if getter is None:
+            return []
+        try:
+            rows = dict(getter('interfacePairs'))
+        except Exception:
+            return []
+
+    def field(row, key, default=None):
+        if isinstance(row, dict):
+            value = row.get(key, default)
+        else:
+            try:
+                value = row.value(key)
+            except Exception:
+                return default
+        return getattr(value, 'value', value)
+
+    pairs = []
+    for key, row in sorted((rows or {}).items(), key=lambda item: str(item[0])):
+        if not bool(field(row, 'enabled', True)):
+            continue
+        master = str(field(row, 'masterScopeToken', '') or '').strip()
+        slave = str(field(row, 'slaveScopeToken', '') or '').strip()
+        name = str(field(row, 'name', '') or '').strip()
+        try:
+            tolerance = float(field(row, 'matchTolerance', 1e-6))
+        except (TypeError, ValueError):
+            tolerance = 1e-6
+        transform = str(field(row, 'transform', 'coincident') or '')
+        entry = {
+            'pairId': name or str(key),
+            'name': name or str(key),
+            'coupling': str(field(row, 'coupling', 'conformal') or ''),
+            'transform': transform,
+            'masterScope': master,
+            'slaveScope': slave,
+            'matchTolerance': tolerance,
+        }
+        if transform != 'coincident':
+            # DP-641. The values a transformed pair is built from; dropped
+            # here, the transform could not reach the job at all.
+            def vector(stem, default):
+                values = []
+                for axis, fallback in zip('XYZ', default):
+                    try:
+                        values.append(float(field(row, f'{stem}{axis}',
+                                                  fallback)))
+                    except (TypeError, ValueError):
+                        values.append(fallback)
+                return values
+            try:
+                angle = float(field(row, 'rotationAngleDegrees', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                angle = 0.0
+            entry.update({
+                'translation': vector('translation', (0.0, 0.0, 0.0)),
+                'rotationCentre': vector('rotationCentre', (0.0, 0.0, 0.0)),
+                'rotationAxis': vector('rotationAxis', (0.0, 0.0, 1.0)),
+                'rotationAngleDegrees': angle})
+        pairs.append(entry)
+    return pairs
+
+
 def seed_point(prepared_geometry):
     """The fluid seed the prepared revision recorded, in metres, or ``None``.
 
@@ -256,6 +522,9 @@ def scope_surface_map(prepared_geometry) -> dict:
         return {}
     manifest = _group_manifest(prepared_geometry)
     groups = manifest.get('groups') or ()
+    # DP-546. The index a group records is its listing in the face walk; the
+    # index Gmsh gives it skips every second listing of a shared face.
+    shared = shared_surface_aliases(prepared_geometry)
     mapping: dict[str, list[int]] = {}
     for group in groups:
         if not isinstance(group, dict):
@@ -266,7 +535,9 @@ def scope_surface_map(prepared_geometry) -> dict:
         indices = group_surface_indices(group)
         if not indices:
             continue
-        mapping[token] = indices
+        aliases = shared.get(_source_of(group)) or {}
+        mapping[token] = [import_surface_position(aliases, index)
+                          for index in indices]
     return mapping
 
 
@@ -292,22 +563,162 @@ def scope_volume_map(prepared_geometry) -> dict:
     return mapping
 
 
-def volume_names(prepared_geometry) -> dict:
+def region_display_names(db) -> dict:
+    """Prepared region UUID -> the name the project tree shows for that body.
+
+    DP-419. A Gmsh cell zone was named from the prepared region record alone,
+    which is written once at import from whatever the CAD file called its
+    solid and is never rewritten. The snappy branch names the same thing from
+    the *volume row in the tree*, which the user can rename and type a
+    CellZone on. MEASURED on all four models this campaign meshed on both
+    engines: Gmsh published `Part_1_solid_1_11ff99c5` where snappy published
+    `coaxial_ducts_core`, for the same model and the same two regions. Two
+    stores with nothing between them.
+
+    The volume row now carries the region it stands for, so this is the link.
+    A row with no `regionUuid` -- every row a project saved before DP-419, and
+    every volume the tree composed rather than read -- simply is not here, and
+    the region keeps the name it always had.
+    """
+    rows = None
+    content = getattr(db, 'data', None)
+    if callable(content):
+        try:
+            rows = (content() or {}).get('geometry')
+        except Exception:
+            rows = None
+    if not isinstance(rows, dict):
+        getter = getattr(db, 'getElements', None)
+        if getter is None:
+            return {}
+        try:
+            rows = dict(getter('geometry'))
+        except Exception:
+            return {}
+
+    def field(row, key):
+        if isinstance(row, dict):
+            value = row.get(key)
+        else:
+            try:
+                value = row.value(key)
+            except Exception:
+                return ''
+        return str(getattr(value, 'value', value) or '').strip()
+
+    names: dict[str, str] = {}
+    for row in (rows or {}).values():
+        if field(row, 'gType') != 'volume':
+            continue
+        token = field(row, 'regionUuid')
+        label = field(row, 'name')
+        if token and label:
+            names[token] = label
+    return names
+
+
+def _patch_labels(manifest) -> set:
+    """Every name the surfaces of this revision publish under.
+
+    DP-419. A Gmsh model holds its physical surfaces and its physical volumes
+    in one namespace, so a region cannot take a name a patch already has. The
+    region's own ``solver_name`` was disambiguated against exactly this set
+    when it was prepared; a name read off the tree has not been, so it is
+    checked here before it is taken.
+    """
+    labels = set()
+    for group in (manifest or {}).get('groups') or ():
+        label = str((group or {}).get('solver_name')
+                    or (group or {}).get('name') or '').strip()
+        if label:
+            labels.add(label)
+    return labels
+
+
+def _chosen_name(region, chosen: dict, taken: set | None = None) -> str:
+    """What the region publishes under: the tree's word for it, or its own.
+
+    DP-419. The tree's name is a display name -- the user may have typed a
+    space into it -- so it makes the same trip through ``solver_stem`` that
+    every patch name makes. It is taken only when that trip leaves a word: not
+    empty, not one of the names OpenFOAM reserves, and not one a patch of the
+    same revision already publishes under. Anything else and the region keeps
+    the name it was prepared with, which is already safe on all three counts.
+    """
+    from foammesh.core.geometry.patches.ops import RESERVED_NAMES
+    from foammesh.core.geometry.prepared import solver_stem
+
+    own = str((region or {}).get('solver_name')
+              or (region or {}).get('name') or '').strip()
+    token = str((region or {}).get('region_uuid') or '').strip()
+    label = str((chosen or {}).get(token) or '').strip() if token else ''
+    if not label:
+        return own
+    stem = solver_stem(label)
+    if not stem or stem in RESERVED_NAMES or stem in (taken or set()):
+        return own
+    return stem
+
+
+def volume_names(prepared_geometry, chosen: dict | None = None) -> dict:
     """Imported volume tag (1-based, as a string) -> region name."""
     if prepared_geometry is None:
         return {}
     manifest = _group_manifest(prepared_geometry)
+    taken = _patch_labels(manifest)
     names: dict[str, str] = {}
     for region in manifest.get('regions') or ():
         if not isinstance(region, dict):
             continue
         indices = region_volume_indices(region)
-        label = str(region.get('name') or region.get('solver_name') or '').strip()
+        label = _chosen_name(region, chosen, taken)
         if not label:
             continue
         for index in indices:
             names[str(int(index) + 1)] = label
     return names
+
+
+def volume_fallback_names(prepared_geometry,
+                          chosen: dict | None = None) -> dict:
+    """Source ID -> what to call a volume of that source no region claimed.
+
+    DP-423. An imported surface that closes into more than one volume gets
+    one region record, not one per volume: the feature-angle split path
+    writes ``regions = [{...'solid_index': 0}]`` at ``geometry/store.py:975``
+    whatever the file turns out to hold. So only the first volume is ever
+    named, and the runner called the rest after the Gmsh tag they happened to
+    get. MEASURED on six meshes: ``box_with_cavity`` named 1 of 8 zones,
+    ``venturi`` 1 of 8, ``heat_exchanger`` 1 of 11, ``manifold`` 1 of 12,
+    ``centrifugal_impeller`` 1 of 49, ``finned_tube`` 1 of 52 -- 134 of 140
+    zones carrying a name with no relation to the model.
+
+    The volumes are not unattributed, though. The runner knows which file
+    produced each one and in what order (``{source}:volume:{n}``), and the
+    user named that file once. So an unclaimed volume is named after the
+    region that file prepared, with its position appended -- and the first
+    volume, which the region already names, is left exactly as it was.
+
+    Only where the file prepared exactly one region. Where it prepared
+    several there is no telling which of them an unclaimed volume belongs to,
+    and naming it after whichever came first would be a guess presented as a
+    fact. That is not a narrow escape: all six models above prepare one
+    region per source, including the two-source ``centrifugal_impeller``.
+    """
+    manifest = _group_manifest(prepared_geometry)
+    taken = _patch_labels(manifest)
+    counted: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    for region in manifest.get('regions') or ():
+        if not isinstance(region, dict):
+            continue
+        source = _source_of(region)
+        if not source:
+            continue
+        counted[source] = counted.get(source, 0) + 1
+        labels[source] = _chosen_name(region, chosen, taken)
+    return {source: label for source, label in labels.items()
+            if counted.get(source) == 1 and label}
 
 
 def scope_entity_map(prepared_geometry) -> dict:
@@ -334,7 +745,7 @@ def scope_entity_map(prepared_geometry) -> dict:
     return {'surfaces': surfaces, 'volumes': volumes}
 
 
-def entity_name_map(prepared_geometry) -> dict:
+def entity_name_map(prepared_geometry, chosen: dict | None = None) -> dict:
     """Entity ID -> the solver name its group or region publishes under.
 
     The same collision as the scopes: ``surface_names`` keys on a global tag
@@ -352,9 +763,9 @@ def entity_name_map(prepared_geometry) -> dict:
         for identity in group_surface_entities(group):
             surfaces[identity] = label
     volumes: dict[str, str] = {}
+    taken = set(surfaces.values())
     for region in manifest.get('regions') or ():
-        label = str((region or {}).get('solver_name')
-                    or (region or {}).get('name') or '').strip()
+        label = _chosen_name(region, chosen, taken)
         if not label:
             continue
         for identity in region_volume_entities(region):
@@ -374,6 +785,7 @@ def source_identity_records(prepared_geometry) -> list[dict]:
     """
     manifest = prepared_manifest(prepared_geometry)
     groups = _group_manifest(prepared_geometry).get('groups') or ()
+    shared = shared_surface_aliases(prepared_geometry)
     confidence: dict[str, float] = {}
     counted: dict[str, int] = {}
     for group in groups:
@@ -397,6 +809,12 @@ def source_identity_records(prepared_geometry) -> list[dict]:
             'source_format': str(record.get('source_format') or ''),
             'declared_surfaces': counted.get(source_id, 0),
             'mapping_confidence': confidence.get(source_id, 1.0),
+            # DP-546. Listings of a face two solids share, second -> first:
+            # Gmsh imports that face once, so the runner must not spend an
+            # imported surface on the second listing.
+            'shared_surfaces': {
+                str(alias): int(first) for alias, first in sorted(
+                    (shared.get(source_id) or {}).items())},
         })
     return records
 
@@ -434,34 +852,125 @@ def _group_manifest(prepared_geometry) -> dict:
         return {}
 
 
+def surface_tag_offsets(prepared_geometry) -> dict:
+    """Source id -> how many surfaces were imported before that source.
+
+    DP-470. `group_surface_indices` counts within one file, and the two
+    readers of it below turned a source-local index into a Gmsh tag by adding
+    one -- which is right for a single source and wrong for every source after
+    the first. Two single-solid STLs both yield index 0, both claim tag 1, and
+    the DP-58 rule then drops the tag rather than let one name the other's
+    surface. Correct, and it means no multi-source model can offer a boundary
+    to size at all: MEASURED on `tube_bundle`, whose prepared geometry holds
+    two named groups and answered zero names.
+
+    What was missing when DP-58 was written is now on the record. C31-04 added
+    the source table, and each entry carries `declared_surfaces` and the
+    `index` the job lists its geometry in -- which is the same order Gmsh
+    imports in, and so is the offset. `tube_bundle` declares one surface and
+    `tube_bundle_farfield` declares one, so their tags are 1 and 2 rather than
+    1 and 1.
+
+    Empty when the table cannot carry the arithmetic -- a source declaring no
+    surfaces leaves every source after it unplaceable -- and an empty answer
+    puts both readers back on the source-local path, where the DP-58 rule
+    still protects them.
+    """
+    records = source_identity_records(prepared_geometry)
+    if not records:
+        return {}
+    offsets: dict[str, int] = {}
+    running = 0
+    for record in sorted(records, key=lambda item: int(item.get('index') or 0)):
+        source = str(record.get('source_id') or '').strip()
+        declared = int(record.get('declared_surfaces') or 0)
+        if not source or declared < 1:
+            return {}
+        offsets[source] = running
+        # DP-546. What the file adds to the model, not what it lists.
+        running += declared - len(record.get('shared_surfaces') or {})
+    return offsets
+
+
+def _global_surface_rows(prepared_geometry) -> list:
+    """One `(token, label, source, tags)` per prepared group.
+
+    The single place the source-local index is turned into a Gmsh tag, so the
+    map from tag to name and the map from tag back to boundary cannot disagree
+    -- and they must not, because a row is authored by tag and stamped with
+    the boundary that tag stands for at that moment.
+
+    `group_surface_indices` is the reader of the store's ordering. Without the
+    `source_refs` fallback it holds, the lookup found nothing for every real
+    manifest, the runner fell back to `face_<tag>`, and every published patch
+    failed the identity join -- so no Gmsh mesh could carry a per-section
+    fidelity verdict (Plan 23 §4). MEASURED on the heat sink: 132/132 unrated.
+    """
+    manifest = _group_manifest(prepared_geometry)
+    offsets = surface_tag_offsets(prepared_geometry)
+    shared = shared_surface_aliases(prepared_geometry)
+    rows = []
+    for group in manifest.get('groups') or ():
+        if not isinstance(group, dict):
+            continue
+        source = _source_of(group)
+        base = offsets.get(source, 0) if offsets else 0
+        aliases = shared.get(source) or {}
+        tags = [import_surface_position(aliases, index) + 1 + base
+                for index in group_surface_indices(group)]
+        rows.append((str(group.get('patch_uuid') or '').strip(),
+                     str(group.get('solver_name') or group.get('name')
+                         or '').strip(),
+                     source, tags))
+    return rows
+
+
 def surface_names(prepared_geometry) -> dict:
     """Imported surface index (as a string tag) -> solver patch name."""
     if prepared_geometry is None:
         return {}
-    manifest = _group_manifest(prepared_geometry)
     names: dict[str, str] = {}
-    for group in manifest.get('groups') or ():
-        if not isinstance(group, dict):
-            continue
-        # `group_surface_indices` is the single reader of the store's
-        # ordering. Without the `source_refs` fallback it holds, the lookup
-        # found nothing for every real manifest, the runner fell back to
-        # `face_<tag>`, and every published patch failed the identity join
-        # -- so no Gmsh mesh could carry a per-section fidelity verdict
-        # (Plan 23 §4). MEASURED on the heat sink: 132/132 unrated.
-        indices = group_surface_indices(group)
-        label = str(group.get('solver_name') or group.get('name') or '').strip()
+    # DP-58. This map is keyed by the *global* Gmsh surface tag, and the
+    # body-index fallback in `group_surface_indices` counts within one file:
+    # two single-solid STLs both yield index 0, so both claim tag 1 and one
+    # names the other's surface. That is the collapse `entity_id` above
+    # already records for a two-STEP case, and the fallback would recreate it
+    # for tessellated imports -- MEASURED, 12 prepared manifests across the
+    # six farfield models.
+    #
+    # DP-470. `_global_surface_rows` applies the per-source offset when the
+    # source table can carry it, so those two STLs now claim 1 and 2 and
+    # neither is dropped. The guard below stays for the manifests where it
+    # cannot -- a source declaring no surfaces leaves the ones after it
+    # unplaceable -- and there a tag two sources claim is still dropped
+    # rather than guessed.
+    owner: dict[str, str] = {}
+    poisoned: set[str] = set()
+    for _token, label, source, tags in _global_surface_rows(prepared_geometry):
         if not label:
             continue
-        for index in indices:
-            # Gmsh surface tags are 1-based in import order.
-            names[str(int(index) + 1)] = label
+        for tag in tags:
+            key = str(tag)
+            if key in poisoned:
+                continue
+            if key in owner and owner[key] != source:
+                poisoned.add(key)
+                names.pop(key, None)
+                continue
+            if key in names:
+                # DP-546. Both listings of a shared face land on one tag; the
+                # surface publishes under the first, as the runner names it.
+                continue
+            owner[key] = source
+            names[key] = label
     return names
 
 
 def build_job(intent: JobIntent, *, geometry, outputs: dict,
               prepared_geometry=None, run_id: str = '',
-              profile=None) -> dict:
+              profile=None, surface_output=None,
+              region_names: dict | None = None,
+              interface_pairs=(), execution: dict | None = None) -> dict:
     """Assemble the immutable job the runner consumes.
 
     Paths are written in the runtime's own namespace when a WSL profile is
@@ -499,17 +1008,36 @@ def build_job(intent: JobIntent, *, geometry, outputs: dict,
         'entitySchemaVersion': ENTITY_SCHEMA_VERSION,
         'sources': source_identity_records(prepared_geometry),
         'scopeEntities': scope_entity_map(prepared_geometry),
-        'entityNames': entity_name_map(prepared_geometry),
+        'entityNames': entity_name_map(prepared_geometry, region_names),
         'scopeSurfaces': scope_surface_map(prepared_geometry),
         'scopeVolumes': scope_volume_map(prepared_geometry),
         'surfaceNames': surface_names(prepared_geometry),
-        'volumeNames': volume_names(prepared_geometry),
+        'volumeNames': volume_names(prepared_geometry, region_names),
+        # DP-423. What to call a volume the maps above do not name, per
+        # source, so an artifact that closed into eight volumes publishes
+        # eight zones of its own name rather than seven Gmsh tag numbers.
+        'volumeFallback': volume_fallback_names(prepared_geometry,
+                                                region_names),
         # WP-06a's shell topology, wired: the seed decides which shell is the
         # domain and a declared role overrides what nesting would infer.
         # Absent means "infer", which is what every job carried until now.
         'seedPoint': seed_point(prepared_geometry),
         'shellRoles': shell_roles(prepared_geometry),
+        # DP-548. Every enabled interface pair the user authored, so the
+        # result can say what became of each one.
+        'interfacePairs': [dict(pair) for pair in interface_pairs or ()],
         'output': {key: translate(value) for key, value in outputs.items()},
+        # DP-133. Where to leave the surface pass of a 3D run. Separate from
+        # `output` because it is not an export: nothing asked for it, it is
+        # not offered as a format, and the round-trip identity check that
+        # guards an export does not apply to a mesh that is deliberately
+        # half-built. A runner that meshes a section writes nothing here --
+        # for a 2D case the surface pass *is* the mesh.
+        'surfaceOutput': translate(surface_output) if surface_output else '',
+        # DP-678. The CPU cap this run was given and the threads it used.
+        # The runner reads threads from `intent.parallel`; this is the record
+        # of where that number came from, so a case says what it was capped at.
+        'execution': dict(execution or {}),
     }
 
 
@@ -528,7 +1056,30 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     intent = derive_from_native(
         _native_section(db), bbox=bbox,
         target_solver=configured_target_solver(db),
+        # Plan 33 W-G1. Per-surface size rows name a prepared boundary; which
+        # Gmsh tag that is belongs to the revision being written, not to the
+        # saved row.
+        prepared_geometry=prepared_geometry,
         metadata={'engine_id': 'gmsh', 'run_id': run_id})
+    # DP-52/DP-53. The runner refuses this, and it refuses it after WSL has
+    # booted and the geometry has been imported -- MEASURED at 71 s on
+    # `annulus_shell`, and graded against the geometry rather than against
+    # the request. Everything that grading needs is already on the prepared
+    # revision, so the same refusal is made for free, here, before anything
+    # is written.
+    #
+    # DP-123. Including the case the R118 wording of this comment claimed
+    # and the code did not do: asking for the whole boundary of an assembly
+    # is a selection that spans volumes, and naming every patch is asking
+    # for the whole boundary. MEASURED on `two_solid_block`, whose two
+    # ticked patches passed the old "is a patch named" test and were then
+    # refused 76 s into the run by the runner, which grades which volume
+    # each named patch bounds. Anything this cannot place is still left to
+    # the runner rather than guessed at.
+    refusal = layer_selection_refusal(
+        prepared_geometry, intent.layers.enabled, intent.layers.patches)
+    if refusal:
+        raise ExecutionError(refusal)
     if intent.export.mesh_format == 'su2' and 'su2' not in formats:
         # A second-order mesh only survives in Gmsh's own SU2 file, so the run
         # has to be given somewhere to write it.
@@ -548,7 +1099,12 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     layout = RunLayout(builder.root(run_id))
     job = build_job(
         intent, geometry=geometry, outputs=layout.outputs(formats),
-        prepared_geometry=prepared_geometry, run_id=run_id, profile=profile)
+        prepared_geometry=prepared_geometry, run_id=run_id, profile=profile,
+        surface_output=layout.surface,
+        # DP-419. What the user called each body, where the tree knows.
+        region_names=region_display_names(db),
+        interface_pairs=interface_pair_rows(db),
+        execution=_execution_record(db, intent.parallel.threads))
     try:
         script = runner_path()
     except Exception:
@@ -563,6 +1119,15 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         'run_path': str(layout.root),
         'warnings': list(intent.warnings),
     }
+
+
+def _execution_record(db, threads: int) -> dict:
+    """DP-678. The execution cap read off ``db`` and the threads the job got."""
+    from foammesh.core.engine.gmsh import execution_policy
+    from foammesh.core.execution.resources import execution_record
+
+    return execution_record(execution_policy(db), effective=threads,
+                            unit='threads')
 
 
 def prepared_manifest(prepared_geometry) -> dict:
@@ -598,6 +1163,287 @@ def prepared_source_names(prepared_geometry) -> tuple[str, ...]:
         str(record['prepared_name'])
         for record in (manifest.get('sources') or ())
         if isinstance(record, dict) and record.get('prepared_name'))
+
+
+def measured_faces(manifest) -> dict:
+    """Patch name -> what the CAD import measured about that face.
+
+    DP-92, and DP-123 which moved it here. Three answers, keyed by the name
+    the user sees: `planar`, the `adjacent` patches it shares an edge with,
+    and `interface`, the name the mesher will know this face by where the
+    file carries an interface as two coincident faces. Empty for a revision
+    written before the import measured them, and for the STL route.
+    """
+    groups = [group for group in (manifest or {}).get('groups') or ()
+              if isinstance(group, dict)]
+    names, orders = {}, {}
+    for group in groups:
+        uuid = str(group.get('patch_uuid') or '').strip()
+        name = str(group.get('solver_name') or group.get('name') or '').strip()
+        if uuid and name:
+            names[uuid] = name
+            orders[uuid] = group.get('face_order')
+
+    def keeper(uuid, twin):
+        """Healing merges a coincident pair and keeps the earlier face."""
+        here, there = orders.get(uuid), orders.get(twin)
+        if here is None or there is None:
+            return uuid
+        return uuid if int(here) <= int(there) else twin
+
+    measured = {}
+    for group in groups:
+        uuid = str(group.get('patch_uuid') or '').strip()
+        name = names.get(uuid)
+        if not name or group.get('planar') is None:
+            continue
+        twin = str(group.get('interface_patch_uuid') or '').strip()
+        measured[name] = {
+            'planar': bool(group.get('planar')),
+            'adjacent': [names[str(other)] for other in
+                         group.get('adjacent_patch_uuids') or ()
+                         if str(other) in names],
+            'interface': (names.get(keeper(uuid, twin), name)
+                          if twin in names or twin == uuid else ''),
+        }
+    return measured
+
+
+def canonical_patch_names(manifest) -> dict:
+    """Patch name -> the name the mesher will know it by."""
+    return {name: (fact['interface'] or name)
+            for name, fact in measured_faces(manifest).items()}
+
+
+def prepared_regions(manifest) -> list:
+    """``(volume label, [patch names])`` for each prepared region.
+
+    DP-88. The runner grades a layer selection by the volume its bases bound
+    and refuses one that spans two, and the membership it grades against is
+    already on the prepared revision: every region lists the patch uuids of
+    its own boundary. MEASURED on `annulus_shell.step`: region `Part 1 solid
+    1` owns annulus_shell_wall1/2/3 and `Part 1 solid 2` owns wall4/5/6/7.
+
+    DP-123. The wrapped-STL route lists no boundary uuids at all -- MEASURED
+    on `two_solid_block`, where both regions carry `boundary_patch_uuids:
+    []` -- so a region with none falls back to the `geometry_id` its patches
+    were imported under. That link is only unambiguous while one geometry
+    yields one region, so a geometry_id claimed by two regions is left
+    ungraded rather than guessed at.
+    """
+    manifest = manifest or {}
+    names, by_geometry = {}, {}
+    for group in manifest.get('groups') or ():
+        if not isinstance(group, dict):
+            continue
+        uuid = str(group.get('patch_uuid') or '').strip()
+        name = str(group.get('solver_name') or group.get('name') or '').strip()
+        if uuid and name:
+            names[uuid] = name
+        geometry_id = str(group.get('geometry_id') or '').strip()
+        if geometry_id and name:
+            by_geometry.setdefault(geometry_id, []).append(name)
+    canonical = canonical_patch_names(manifest)
+    canonical = {name: canonical.get(name, name) for name in names.values()}
+    claims: dict = {}
+    for region in manifest.get('regions') or ():
+        if isinstance(region, dict):
+            claims.setdefault(
+                str(region.get('geometry_id') or '').strip(), []).append(region)
+    regions = []
+    for region in manifest.get('regions') or ():
+        if not isinstance(region, dict):
+            continue
+        label = str(region.get('display_name')
+                    or region.get('solver_name') or '').strip()
+        # DP-92. The merged-away half of an interface is listed here by its
+        # own uuid, so without this the volume it bounds looks as though it
+        # does not bound the face the mesher actually has.
+        members, held = [], set()
+        for uuid in region.get('boundary_patch_uuids') or ():
+            name = canonical.get(names.get(str(uuid)))
+            if name and name not in held:
+                held.add(name)
+                members.append(name)
+        geometry_id = str(region.get('geometry_id') or '').strip()
+        if not members and geometry_id and len(claims.get(geometry_id, ())) == 1:
+            for name in by_geometry.get(geometry_id, ()):
+                name = canonical.get(name, name)
+                if name and name not in held:
+                    held.add(name)
+                    members.append(name)
+        if label and members:
+            regions.append((label, members))
+    return regions
+
+
+def regions_by_patch(regions) -> dict:
+    """Patch name -> the set of volumes that patch bounds."""
+    owners: dict = {}
+    for label, members in regions:
+        for name in members:
+            owners.setdefault(name, set()).add(label)
+    return owners
+
+
+def grade_layer_selection(selected, owners) -> tuple:
+    """Which volume a selection bounds, by the rule the runner applies.
+
+    DP-88. `volume_the_layer_grows_into` intersects the volumes each base
+    bounds: one volume left means a core can be carved, more than one means
+    every base is a shared interface and nothing says which side the layer is
+    for, none means the selection spans volumes.
+    """
+    known = [name for name in selected if name in owners]
+    if not known:
+        return 'ungraded', []
+    common = set(owners[known[0]])
+    for name in known[1:]:
+        common &= owners[name]
+    if len(common) == 1:
+        return 'single', sorted(common)
+    if common:
+        return 'shared', sorted(common)
+    return 'spanning', []
+
+
+#: The two states :func:`grade_layer_selection` returns for a selection the
+#: runner will not grow layers on.
+REFUSED_LAYER_GRADES = ('shared', 'spanning')
+
+
+def shells_by_source(topology) -> dict:
+    """Source name -> ``(domain shells, void shells)`` the import classified.
+
+    DP-123. `preparation.topology` names every closed shell the prepared
+    revision found and suffixes `#N` when one source file contributed more
+    than one of them. That suffix is the only record anywhere on the revision
+    that a patch covers more than one shell: the group manifest lists one
+    patch and one region per *file*, so on `two_solid_block` it reads as one
+    patch on one volume while the file itself holds a box inside a box.
+    """
+    counts: dict = {}
+    for key, index in (('domains', 0), ('voids', 1)):
+        for shell in topology.get(key) or ():
+            base = str(shell).split('#')[0].strip()
+            if not base:
+                continue
+            tally = counts.setdefault(base, [0, 0])
+            tally[index] += 1
+    return {name: (tally[0], tally[1]) for name, tally in counts.items()}
+
+
+def sources_that_span_volumes(prepared_geometry) -> frozenset:
+    """The prepared patch names whose faces cannot all bound one volume.
+
+    A void is a hole in whichever domain encloses it, so a source that
+    contributed a domain shell *and* anything else names faces of that domain
+    and of the domain it sits inside. MEASURED on `two_solid_block`, whose
+    single `two_solid_block.stl` yields `two_solid_block#1` -- a void in the
+    farfield -- and `two_solid_block#2`, a domain of its own: the runner reads
+    surfaces 3-18 as one patch, intersects the volumes they bound to nothing
+    and refuses. The group manifest cannot say this, and the patch/volume
+    grading below cannot either: one patch has one entry in `owners`, and one
+    entry can never intersect to nothing.
+
+    A source of nothing but voids may still be several holes in one domain,
+    which the topology does not record either way, so it is left to the
+    runner rather than refused on a guess.
+    """
+    topology = (prepared_manifest(prepared_geometry).get('preparation')
+                or {}).get('topology') or {}
+    return frozenset(
+        name for name, (domains, voids) in shells_by_source(topology).items()
+        if domains and domains + voids > 1)
+
+
+def patches_by_source(prepared_geometry) -> dict:
+    """Source display name -> the prepared patch names imported from it.
+
+    DP-365. :func:`sources_that_span_volumes` names *sources*; a layer
+    selection names *patches*, and the pre-flight compared the two with a set
+    intersection. Where a source yields exactly one surface group the two
+    strings coincide -- `two_solid_block` is both the file and its only patch
+    -- so DP-123's own fixture matched and the check read as working. A source
+    that yields several groups gets them suffixed, `two_cubes_one_file_wall1`
+    and `_wall2`, and no patch name has equalled a source name since.
+
+    The link that does hold is the one the prepared revision writes down: each
+    group carries the ``geometry_id`` it was imported under, and each entry in
+    ``sources`` carries that id and the file's display name.
+    """
+    manifest = prepared_manifest(prepared_geometry)
+    named_by_geometry = {}
+    for source in manifest.get('sources') or ():
+        if not isinstance(source, dict):
+            continue
+        geometry_id = str(source.get('geometry_id') or '').strip()
+        name = str(source.get('display_name') or '').strip()
+        if geometry_id and name:
+            named_by_geometry[geometry_id] = name
+    held: dict = {}
+    for group in (_group_manifest(prepared_geometry) or {}).get('groups') or ():
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get('solver_name') or group.get('name') or '').strip()
+        source = named_by_geometry.get(
+            str(group.get('geometry_id') or '').strip())
+        if name and source:
+            held.setdefault(source, set()).add(name)
+    return held
+
+
+def selection_covers_a_spanning_source(prepared_geometry, named) -> bool:
+    """Whether *named* holds every patch of a source that spans volumes.
+
+    DP-365. The topology records how many shells a file contributed but not
+    which of the file's patches sits on which shell, so a selection naming
+    *some* of them cannot be graded here and is left to the runner -- guessing
+    would refuse a mesh that works. A selection naming *all* of them needs no
+    guess: the patches between them cover every triangle the file contributed,
+    those triangles lie on more than one shell, and a layer grown on them is
+    therefore grown on more than one volume.
+    """
+    spanning = sources_that_span_volumes(prepared_geometry)
+    if not spanning:
+        return False
+    for source, patches in patches_by_source(prepared_geometry).items():
+        if source in spanning and patches and patches <= named:
+            return True
+    return False
+
+
+def layer_selection_refusal(prepared_geometry, enabled, patches) -> str:
+    """The sentence the run refuses a layer selection with, or ``''``.
+
+    DP-123. The pre-flight used to read "a patch is named" as "graded", so
+    `two_solid_block` passed it with both of its patches ticked and was
+    refused 76 s later by the runner, which had graded *which volume each
+    named patch bounds*. Everything that grading needs is on the prepared
+    revision, so it is done here instead -- once, for the page that shows the
+    selection, the button that starts the run, and the job writer.
+
+    Unknown refuses nothing, in both of its forms: a revision that never
+    counted its volumes, and one that records no membership for the patches
+    named. Guessing either way would refuse a mesh that works.
+    """
+    if not enabled:
+        return ''
+    volumes, counted_by = prepared_volume_count(prepared_geometry)
+    if counted_by == 'unknown' or volumes <= 1:
+        return ''
+    if not patches:
+        return assembly_layer_refusal(volumes)
+    named = {str(name).strip() for name in patches}
+    if named & sources_that_span_volumes(prepared_geometry):
+        return assembly_layer_refusal(volumes)
+    # DP-365. The same question asked of the patches a source actually owns,
+    # for the imports whose patch names are not the source's own name.
+    if selection_covers_a_spanning_source(prepared_geometry, named):
+        return assembly_layer_refusal(volumes)
+    owners = regions_by_patch(prepared_regions(_group_manifest(prepared_geometry)))
+    state, _common = grade_layer_selection(patches, owners)
+    return assembly_layer_refusal(volumes) if state in REFUSED_LAYER_GRADES else ''
 
 
 def prepared_geometry_paths(prepared_geometry, case_path: Path) -> tuple[Path, ...]:

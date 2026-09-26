@@ -62,7 +62,9 @@ from pathlib import Path
 
 import numpy as np
 
+from foammesh.core.mesh.census import SU2_ADVICE, SU2_READER
 from foammesh.core.mesh.model import CanonicalMesh, CellType
+from foammesh.core.quantities import count_text
 
 #: VTK type codes, which SU2 adopts verbatim.
 VTK_TYPE = {
@@ -352,9 +354,7 @@ def _refuse_unreadable(interior, patches) -> None:
             f'{"face has" if surface_offenders == 1 else "faces have"} '
             'five or more vertices')
     raise Su2ExportError(
-        'SU2 reads tetrahedra, hexahedra, prisms and pyramids only; '
-        + ', and '.join(parts)
-        + '. Mesh with Gmsh to export this case for SU2.')
+        SU2_READER + '; ' + ', and '.join(parts) + '. ' + SU2_ADVICE)
 
 
 
@@ -423,8 +423,8 @@ def _write_from_vtk(interior, patches, destination: Path, *,
     if unmatched:
         temporary.unlink(missing_ok=True)
         raise Su2ExportError(
-            f'{unmatched} boundary face(s) could not be matched to an interior '
-            'point; the exported markers would be incomplete')
+            f'{count_text(unmatched, "boundary face")} could not be matched '
+            'to an interior point; the exported markers would be incomplete')
     temporary.replace(destination)
     return Su2ExportReport(
         destination=str(destination), dimensions=3, points=len(points),

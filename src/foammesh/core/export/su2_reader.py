@@ -129,8 +129,8 @@ def parse_su2(path) -> Su2Mesh:
         entry = SU2_TO_VTK.get(code)
         if entry is None and code in SU2_SECOND_ORDER_CODES:
             raise Su2ReadError(
-                f'{path.name} holds second-order elements -- type code {code}, '
-                f'a quadratic {SU2_SECOND_ORDER_CODES[code]} -- and this '
+                f'{path.name} holds second-order elements — type code {code}, '
+                f'a quadratic {SU2_SECOND_ORDER_CODES[code]} — and this '
                 'reader implements the linear SU2 element types only, so the '
                 'file cannot be displayed. The mesh itself is intact; it is '
                 'this application that has not qualified second-order SU2')

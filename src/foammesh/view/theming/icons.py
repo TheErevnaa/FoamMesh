@@ -51,7 +51,12 @@ def _render(data: bytes, path: str, size: QSize, dpr: float,
         return _PIXMAP_CACHE[key]
     text = data.decode('utf-8').replace('#000000', color).replace('#000', color)
     text = text.replace('currentColor', color)
-    text = re.sub(r'<svg\b', f'<svg fill="{color}"', text, count=1)
+    # DP-699. An <svg> that already names its fill keeps it: a second fill
+    # attribute is a duplicate, the document is invalid, and the icon drew
+    # as nothing (the blank show/hide eye on the viewport overlay).
+    start = re.search(r'<svg\b[^>]*>', text)
+    if start is not None and not re.search(r'\sfill\s*=', start.group(0)):
+        text = text[:start.start() + 4] + f' fill="{color}"' + text[start.start() + 4:]
     renderer = QSvgRenderer(text.encode('utf-8'))
     pixmap = QPixmap(round(size.width() * dpr), round(size.height() * dpr))
     pixmap.fill(Qt.GlobalColor.transparent)

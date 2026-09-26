@@ -15,6 +15,7 @@ from foammesh.app import app
 from foammesh.db.configurations_schema import Shape, GeometryType, CFDType
 from foammesh.rendering.vtk_loader import (hexPolyData, cylinderPolyData, spherePolyData, polyDataToActor,
                                            planePolyData, diskPolyData, openPlatePolyData)
+from foammesh.view.theming.metrics import size_stack_to_current_page
 from foammesh.view.theming.vtk_theme import rgb
 from .geometry import RESERVED_NAMES
 from .open_surface_page import OpenSurfacePage
@@ -45,10 +46,8 @@ def showStackPage(stack, page):
         widget = stack.widget(i)
         if widget.objectName() == page:
             stack.setCurrentIndex(i)
-        else:
-            widget.hide()
 
-    stack.adjustSize()
+    size_stack_to_current_page(stack)
 
 
 class VolumeDialog(QDialog):
@@ -103,7 +102,7 @@ class VolumeDialog(QDialog):
         return self._creationMode
 
     def setupForAdding(self, shape):
-        self.setWindowTitle(self.tr('Add Volume'))
+        self.setWindowTitle(self.tr('Add volume'))
 
         self._creationMode = True
         self._gId = None
@@ -121,7 +120,7 @@ class VolumeDialog(QDialog):
         self.adjustSize()
 
     def setupForEdit(self, gId, sources):
-        self.setWindowTitle(self.tr('Edit Volume'))
+        self.setWindowTitle(self.tr('Edit volume'))
 
         self._creationMode = False
         self._gId = gId
@@ -271,19 +270,19 @@ class VolumeDialog(QDialog):
         name = self._ui.name.text()
 
         if name in RESERVED_NAMES:
-            await AsyncMessageBox().information(
-                self, self.tr('Input Error'), self.tr('"{0}" is an invalid geometry name.').format(name))
+            await AsyncMessageBox().warning(
+                self, self.tr('Input error'), self.tr('"{0}" is an invalid geometry name.').format(name))
             return
 
         if name.find(' ') > -1:
-            await AsyncMessageBox().information(
-                self, self.tr('Input Error'), self.tr('Geometry name cannot contain spaces'))
+            await AsyncMessageBox().warning(
+                self, self.tr('Input error'), self.tr('Geometry name cannot contain spaces.'))
             return
 
         if app.facadeClient.checkout().getKeys(
                 'geometry', lambda i, e: e['name'] == name and i != self._gId):
-            await AsyncMessageBox().information(self, self.tr('Input Error'),
-                                                self.tr('geometry "{0}" already exists.').format(name))
+            await AsyncMessageBox().warning(self, self.tr('Input error'),
+                                                self.tr('Geometry "{0}" already exists.').format(name))
             return False
 
         self._dbElement.setValue('gType', GeometryType.VOLUME.value)
@@ -307,7 +306,7 @@ class VolumeDialog(QDialog):
 
     def _updateHexData(self):
         if not self._validateHex():
-            QMessageBox.information(self, self.tr('Add Geometry Failed'), self.tr('Invalid coordinates'))
+            QMessageBox.warning(self, self.tr('Add geometry failed'), self.tr('Invalid coordinates.'))
             return False
 
         self._dbElement.setValue('point1/x', self._ui.minX.text(), self.tr('Minimum X'))
@@ -320,12 +319,12 @@ class VolumeDialog(QDialog):
         return True
 
     def _updateCylinderData(self):
-        self._dbElement.setValue('point1/x', self._ui.axis1X.text(), self.tr('Axis Point1 X'))
-        self._dbElement.setValue('point1/y', self._ui.axis1Y.text(), self.tr('Axis Point1 Y'))
-        self._dbElement.setValue('point1/z', self._ui.axis1Z.text(), self.tr('Axis Point1 Z'))
-        self._dbElement.setValue('point2/x', self._ui.axis2X.text(), self.tr('Axis Point2 X'))
-        self._dbElement.setValue('point2/y', self._ui.axis2Y.text(), self.tr('Axis Point2 Y'))
-        self._dbElement.setValue('point2/z', self._ui.axis2Z.text(), self.tr('Axis Point2 Z'))
+        self._dbElement.setValue('point1/x', self._ui.axis1X.text(), self.tr('Axis point 1 X'))
+        self._dbElement.setValue('point1/y', self._ui.axis1Y.text(), self.tr('Axis point 1 Y'))
+        self._dbElement.setValue('point1/z', self._ui.axis1Z.text(), self.tr('Axis point 1 Z'))
+        self._dbElement.setValue('point2/x', self._ui.axis2X.text(), self.tr('Axis point 2 X'))
+        self._dbElement.setValue('point2/y', self._ui.axis2Y.text(), self.tr('Axis point 2 Y'))
+        self._dbElement.setValue('point2/z', self._ui.axis2Z.text(), self.tr('Axis point 2 Z'))
         self._dbElement.setValue('radius', self._ui.cylinderRadius.text(), self.tr('radius'))
 
         return True
@@ -339,28 +338,31 @@ class VolumeDialog(QDialog):
         from the shape, so nothing has to be stored twice.
         """
         page = self._openSurfacePage()
-        first, second, third = ('Point', 'Normal', None)
+        # Each noun is translated on its own and the axis letter appended
+        # afterwards. Translating the composed f-string made the lookup key
+        # change with the shape, so no key was ever the one in the catalogue.
+        first, second, third = (self.tr('Point'), self.tr('Normal'), None)
         if self._shape == Shape.DISK:
-            first, second, third = 'Origin', 'Normal', 'Radius'
+            first, second, third = self.tr('Origin'), self.tr('Normal'), self.tr('Radius')
         elif self._shape == Shape.PLATE:
-            first, second = 'Origin', 'Span'
+            first, second = self.tr('Origin'), self.tr('Span')
 
         for axis, value in zip('xyz', page.first()):
             self._dbElement.setValue(f'point1/{axis}', value,
-                                     self.tr(f'{first} {axis.upper()}'))
+                                     f'{first} {axis.upper()}')
         for axis, value in zip('xyz', page.second()):
             self._dbElement.setValue(f'point2/{axis}', value,
-                                     self.tr(f'{second} {axis.upper()}'))
+                                     f'{second} {axis.upper()}')
         if third is not None:
-            self._dbElement.setValue('radius', page.radius(), self.tr(third))
+            self._dbElement.setValue('radius', page.radius(), third)
 
         return True
 
     def _updateSphereData(self):
-        self._dbElement.setValue('point1/x', self._ui.centerX.text(), self.tr('Center X'))
-        self._dbElement.setValue('point1/y', self._ui.centerY.text(), self.tr('Center Y'))
-        self._dbElement.setValue('point1/z', self._ui.centerZ.text(), self.tr('Center Z'))
-        self._dbElement.setValue('radius', self._ui.sphereRadius.text(), self.tr('radius'))
+        self._dbElement.setValue('point1/x', self._ui.centerX.text(), self.tr('Centre X'))
+        self._dbElement.setValue('point1/y', self._ui.centerY.text(), self.tr('Centre Y'))
+        self._dbElement.setValue('point1/z', self._ui.centerZ.text(), self.tr('Centre Z'))
+        self._dbElement.setValue('radius', self._ui.sphereRadius.text(), self.tr('Radius'))
 
         return True
 
@@ -394,7 +396,7 @@ class VolumeDialog(QDialog):
             self._sources = {self._gId: polyData}
         else:
             self._sources.clear()
-            await AsyncMessageBox().information(self, self.tr('Preview Failed'), self.tr('Invalid coordinates'))
+            await AsyncMessageBox().warning(self, self.tr('Preview failed'), self.tr('Invalid coordinates.'))
 
         self._displayPreview()
 
@@ -444,10 +446,10 @@ class VolumeDialog(QDialog):
             except CONFLICT_ERRORS as error:
                 # Stay open: the user's entries are still here, and the only
                 # thing that changed is what the case looked like underneath.
-                await AsyncMessageBox().information(
-                    self, self.tr('Case Changed'), self.tr(conflict_message(error)))
+                await AsyncMessageBox().warning(
+                    self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                await AsyncMessageBox().information(self, self.tr("Input Error"), e.toMessage())
+                await AsyncMessageBox().warning(self, self.tr("Input error"), e.toMessage())
 
     def _openSurfacePolyData(self):
         """What the preview draws for a plane, a disk or a plate.

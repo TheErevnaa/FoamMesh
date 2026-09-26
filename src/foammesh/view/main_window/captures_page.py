@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QSizePolicy, QVBoxLayout, QWidget)
 
 from foammesh.core.capture import CaptureRecord
+from foammesh.view.theming.metrics import (
+    FORM_MARGIN, GAP_TIGHT, apply_prose_measure)
 
 
 THUMBNAIL = QSize(240, 150)
@@ -38,8 +40,8 @@ class CaptureCard(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(FORM_MARGIN, FORM_MARGIN, FORM_MARGIN, FORM_MARGIN)
+        layout.setSpacing(GAP_TIGHT)
 
         thumbnail = QLabel()
         pixmap = QPixmap(str(path))
@@ -101,7 +103,11 @@ class CapturesPage(QWidget):
             'No captures yet. Use Capture on the viewport toolbar to save a '
             'picture of the mesh into this case.'))
         self._empty.setWordWrap(True)
-        self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # DP-220. Running text is ranged left and held to a measure,
+        # so its lines all start at one edge instead of at three.
+        self._empty.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        apply_prose_measure(self._empty)
         layout.addWidget(self._empty)
 
         self._scroll = QScrollArea()
@@ -109,7 +115,7 @@ class CapturesPage(QWidget):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._grid_host = QWidget()
         self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(6, 6, 6, 6)
+        self._grid.setContentsMargins(FORM_MARGIN, FORM_MARGIN, FORM_MARGIN, FORM_MARGIN)
         self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._scroll.setWidget(self._grid_host)
         layout.addWidget(self._scroll, 1)

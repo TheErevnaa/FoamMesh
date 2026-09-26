@@ -47,7 +47,19 @@ class RegionCard(QWidget):
         x, y, z = db.getVector(path + 'point')
         self._point = float(x), float(y), float(z)
 
-        self._ui.name.setText(db.getValue(path + 'name'))
+        name = db.getValue(path + 'name')
+        self._ui.name.setText(name)
+        # DP-210. Both buttons in the card header paint an icon and no
+        # words, so the tooltip is the only place they say what they do,
+        # and it is their accessible name as well. That is the idiom the
+        # viewport overlay already uses for its icon-only controls.
+        # Naming them here rather than in the form means a renamed region
+        # renames them too, because load() runs again.
+        label = name or self.tr('this region')
+        self._ui.edit.setToolTip(self.tr('Edit {0}').format(label))
+        self._ui.edit.setAccessibleName(self._ui.edit.toolTip())
+        self._ui.remove.setToolTip(self.tr('Remove {0}').format(label))
+        self._ui.remove.setAccessibleName(self._ui.remove.toolTip())
         self._ui.type.setText(self._types[self._type])
         self._ui.point.setText(f'({x}, {y}, {z})')
 
@@ -59,14 +71,17 @@ class RegionCard(QWidget):
         self._ui.header.setEnabled(True)
         self._ui.card.layout().removeWidget(form)
 
-    def showWarning(self, message: str = ''):
+    def showWarning(self, message: str):
         # R164. The label said one thing -- "outside bounding box" -- and the
         # page now has a second reason to refuse a seed: a point inside the
         # box but outside the geometry, which is what happens on an annulus
         # and which used to surface several tasks later as a meshing error.
         # A warning has to name the reason it is complaining about.
-        if message:
-            self._ui.warning.setText(message)
+        # DP-183. The message is required now. The label used to ship a
+        # Designer placeholder carrying this same sentence indented by
+        # fifteen spaces, so calling this with nothing painted a duplicate of
+        # one live string, misaligned against every other line on the card.
+        self._ui.warning.setText(message)
         self._ui.warning.show()
 
     def hideWarning(self):

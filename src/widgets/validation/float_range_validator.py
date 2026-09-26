@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from foammesh.support import field_complaint
+
 from .validation import Validator
 
 
@@ -19,21 +21,26 @@ class FloatRangeValidator(Validator):
     def validate(self):
         text = self._edit.text().strip()
         if not text:
-            return False, self.tr('{} is required.'.format(self._name))
+            return False, field_complaint.sentence(
+                self._name, field_complaint.required_clause())
 
-        value = float(text)
-        if self._bottom is not None:
-            if self._bottomExclusive and value <= self._bottom:
-                return False, self.tr('{} must be greater than {}.'.format(self._name, self._bottom))
+        # ``float`` used to be called bare here, so a letter typed into the box
+        # left the dialog through an uncaught ValueError instead of a sentence.
+        try:
+            value = float(text)
+        except ValueError:
+            return False, field_complaint.sentence(
+                self._name, field_complaint.number_clause())
 
-            if not self._bottomExclusive and value < self._bottom:
-                return False, self.tr('{} cannot be less than {}.'.format(self._name, self._bottom))
-
-        if self._top is not None:
-            if self._topExclusive and value >= self._top:
-                return False, self.tr('{} must be less than {}.'.format(self._name, self._top))
-
-            if not self._topExclusive and value > self._top:
-                return False, self.tr('{} cannot be greator than {}.'.format(self._name, self._top))
+        low = self._bottom
+        high = self._top
+        if ((low is not None
+                and (value < low or (value == low and self._bottomExclusive)))
+                or (high is not None
+                    and (value > high or (value == high and self._topExclusive)))):
+            return False, field_complaint.sentence(self._name, field_complaint.range_clause(
+                low=low, high=high,
+                lowInclusive=not self._bottomExclusive,
+                highInclusive=not self._topExclusive))
 
         return True, None

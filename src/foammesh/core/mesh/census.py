@@ -44,6 +44,19 @@ from .poly_mesh_boundary import PolyMesh, PolyMeshReadError, read_poly_mesh
 #: engines; the two are asserted equal in the WP0 suite.
 SU2_CELL_FAMILIES = ('tetrahedron', 'hexahedron', 'prism', 'pyramid')
 
+#: The two destinations in this product that hold those four families and
+#: nothing else, as the sentence each refuses with and the way out each offers.
+#: DP-26. They are kept together because what follows the opening clause is
+#: identical: the counts are a property of the mesh, not of who is reading it.
+#: Every writer and the export page take their wording from here, so a user
+#: reads the same sentence before choosing a format that they would have read
+#: after being refused by it.
+SU2_READER = 'SU2 reads tetrahedra, hexahedra, prisms and pyramids only'
+SU2_ADVICE = 'Mesh with Gmsh to export this case for SU2.'
+MSH_READER = ('a Gmsh mesh holds tetrahedra, hexahedra, prisms and pyramids '
+              'only')
+MSH_ADVICE = 'Export this case as OpenFOAM or VTU, which keep polyhedra.'
+
 
 @dataclass(frozen=True)
 class MeshCensus:
@@ -80,6 +93,17 @@ class MeshCensus:
         tells them how much of the mesh is affected and therefore whether to
         re-mesh or to change engine.
         """
+        return self.reason_for(SU2_READER)
+
+    def reason_for(self, reader: str) -> str:
+        """The same measurement, opened with *reader*'s own sentence.
+
+        DP-26. MSH holds the same four families SU2 does, and the counts that
+        disqualify a mesh from one disqualify it from the other; only the
+        clause naming who cannot read it differs. Callers pass the sentence
+        their own refusal already uses, so nothing has to be reconciled by the
+        person reading two of them.
+        """
         if self.read_error:
             return self.read_error
         parts = []
@@ -95,8 +119,7 @@ class MeshCensus:
         parts.extend(self._extra_reasons)
         if not parts:
             return ''
-        return ('SU2 reads tetrahedra, hexahedra, prisms and pyramids only; '
-                + ', and '.join(parts))
+        return reader + '; ' + ', and '.join(parts)
 
     def to_dict(self) -> dict:
         return {
@@ -302,6 +325,12 @@ SU2_SECOND_ORDER_ELEMENT_TYPES = {
     27: ('pyramid', 13, True),
 }
 
+#: DP-674. The VTK line codes, linear and quadratic. Gmsh writes the boundary
+#: of a two-dimensional SU2 mesh (``NDIME= 2``) as lines under each marker, so
+#: they are boundary elements the file is meant to hold, not codes SU2 cannot
+#: read. Counting them as unknown made a planar mesh read as an unreadable one.
+SU2_LINE_TYPES = frozenset({3, 21})
+
 #: The VTK arbitrary-order Lagrange codes. Gmsh's SU2 writer emits these for
 #: any mesh above element order 2 -- one code per family, with the order left
 #: implicit in the node count -- so they are what an order-3, order-4 and
@@ -338,6 +367,9 @@ class ElementCensus:
     #: about a file with 256 tetrahedra in it.
     unreadable_codes: tuple = ()
     unreadable_count: int = 0
+    #: DP-674. ``2`` for a planar or axisymmetric section, whose cells are
+    #: triangles and quadrilaterals; ``3`` for a volume mesh.
+    dimension: int = 3
 
     @property
     def volume_count(self) -> int:
@@ -359,10 +391,31 @@ class ElementCensus:
         return self.volume_count > 0
 
     @property
+    def has_cells(self) -> bool:
+        """True when the file holds the cells a mesh of its dimension needs.
+
+        DP-674. A two-dimensional section is made of faces: its cells are the
+        triangles and quadrilaterals, which an MSH census files as surface
+        elements and the SU2 census (reading ``NDIME= 2``) as cells.
+        """
+        if self.dimension == 2:
+            return self.volume_count > 0 or self.surface_count > 0
+        return self.has_volume_elements
+
+    @property
     def summary(self) -> str:
         """One line, written to be shown to a user unchanged."""
         if self.read_error:
             return self.read_error
+        if self.dimension == 2 and self.has_cells:
+            # DP-674. A section's cells are faces; say so rather than call a
+            # planar mesh one with no volume elements.
+            cells = self.volume_by_family if self.volume_count else                 self.surface_by_family
+            count = int(sum(cells.values()))
+            shapes = ', '.join(
+                f'{number} {name}{"" if number == 1 else "s"}'
+                for name, number in sorted(cells.items()) if number)
+            return f'{count} two-dimensional cells ({shapes})'
         if not self.has_volume_elements:
             if self.unreadable_codes:
                 # Plan 31 FC-D. "No volume elements" is a statement about the
@@ -400,6 +453,7 @@ class ElementCensus:
             'warnings': list(self.warnings),
             'unreadable_codes': list(self.unreadable_codes),
             'unreadable_count': self.unreadable_count,
+            'dimension': self.dimension,
         }
 
 
@@ -779,6 +833,7 @@ def su2_element_census(path) -> ElementCensus:
 
     in_marker = False
     remaining = 0
+    dimension = 3
     unknown: set = set()
     unknown_rows = 0
     second_order: set = set()
@@ -788,6 +843,11 @@ def su2_element_census(path) -> ElementCensus:
             continue
         head = line.split('=')[0].strip().upper()
         if head == 'NDIME':
+            # DP-674. A planar SU2 mesh says so here, and its cells are faces.
+            try:
+                dimension = int(line.split('=')[1].split()[0])
+            except (IndexError, ValueError):
+                dimension = 3
             continue
         if head == 'NPOIN':
             try:
@@ -825,6 +885,10 @@ def su2_element_census(path) -> ElementCensus:
             code = int(line.split()[0])
         except (IndexError, ValueError):
             continue
+        if code in SU2_LINE_TYPES:
+            # DP-674. A line is the boundary of a planar section.
+            surface['line'] = surface.get('line', 0) + 1
+            continue
         entry = SU2_ELEMENT_TYPES.get(code)
         element_order = 1
         if entry is None:
@@ -838,7 +902,8 @@ def su2_element_census(path) -> ElementCensus:
             continue
         family, _size, is_volume = entry
         order = max(order, element_order)
-        if is_volume and not in_marker:
+        if (is_volume or dimension == 2) and not in_marker:
+            # DP-674: in a planar file the faces outside a marker are cells.
             volume[family] = volume.get(family, 0) + 1
         else:
             surface[family] = surface.get(family, 0) + 1
@@ -874,7 +939,8 @@ def su2_element_census(path) -> ElementCensus:
         path=path, file_format='su2', volume_by_family=volume,
         surface_by_family=surface, element_order=order,
         markers=tuple(markers), point_count=points, warnings=tuple(warnings),
-        unreadable_codes=tuple(sorted(unknown)), unreadable_count=unknown_rows)
+        unreadable_codes=tuple(sorted(unknown)), unreadable_count=unknown_rows,
+        dimension=2 if dimension == 2 else 3)
 
 
 def element_census(path) -> ElementCensus:

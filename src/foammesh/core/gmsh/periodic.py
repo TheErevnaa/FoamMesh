@@ -1,7 +1,11 @@
 """Periodic pair derivation.
 
-Gmsh's ``setPeriodic`` takes a 16-value row-major affine transform mapping the
-slave surface onto the master. Building that matrix here, rather than in the
+Gmsh's ``setPeriodic(dim, tags, tagsMaster, affine)`` takes a 16-value
+row-major affine transform mapping the master surface onto the slave: a point
+on the master, moved by the translation or turned through the angle, lands on
+the slave (DP-622; this said slave onto master, which is the inverse and
+would have a user enter every translation with the wrong sign). Building that
+matrix here, rather than in the
 runner, means a malformed pair is rejected while the user can still fix it,
 and the same numbers are reused to write the OpenFOAM ``cyclic`` patches.
 """

@@ -10,8 +10,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject
 
-from foammesh.settings.app_settings import appSettings
-from foammesh.settings.local_settings import LocalSettings, LocalSettingKey
+from foammesh.settings.local_settings import (
+    LocalSettings, carryLegacyCoreCount,
+)
 from foammesh.db.configurations import Configurations
 from foammesh.db.configurations_schema import schema
 from foammesh.core.project import Event, ProjectState
@@ -124,16 +125,6 @@ class Project(QObject):
     def setLocalSetting(self, key, value):
         self._settings.set(key, value)
 
-    def parallelEnvironment(self):
-        return self._settings.parallelEnvironment()
-
-    def setParallelEnvironment(self, environment):
-        self._settings.setParallelEnvironment(environment)
-        appSettings.updateParallelEnvironment(environment)
-
-    def parallelCores(self):
-        return self._settings.get(LocalSettingKey.PARALLEL_NP, 1)
-
     def save(self):
         self.assertUnchanged()
         self._db.save()
@@ -210,6 +201,13 @@ class Project(QObject):
     def open(self, create=False):
         self._settings.acquireLock(0.01)
         self._db.load(self._storagePath)
+        # DP-691. Meshing resources is the only core-count input; an old
+        # case's Parallel Environment count is carried onto it once.
+        try:
+            carryLegacyCoreCount(self._storagePath, self._db)
+        except Exception:  # noqa: BLE001 - never block opening a case
+            logger.warning('could not carry the legacy core count',
+                           exc_info=True)
         self._loadHistory(self._storagePath)
         self.acceptExternalChanges()
 

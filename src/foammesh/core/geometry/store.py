@@ -16,6 +16,8 @@ from foammesh.core.format_registry import geometry_suffix_formats
 from .cad.formats import detect_format
 from .diagnostics import assess
 from .diagnostics import is_watertight
+from .diagnostics.readiness import RULES_VERSION, explain_conjugate
+from .diagnostics.report import score_for
 from .importers import SUPPORTED_SUFFIXES, import_surface
 from .transform import TransformOp, TransformStack
 
@@ -25,6 +27,46 @@ _SOLID_WORD = re.compile(r'[^A-Za-z0-9_]+')
 
 
 CAD_SUFFIXES = frozenset(geometry_suffix_formats())
+
+#: The finest grid the wrap's acceptance preview is meshed on (DP-640).
+PREVIEW_RESOLUTION = 128
+
+
+def ordered_entries(entries) -> list[dict]:
+    """The geometry entries in a stable order, for every consumer of the set.
+
+    DP-379. This used to be ``sorted(entries, key=... ['geometry_id'])``, and
+    `geometry_id` is a fresh ``uuid4().hex`` minted by the store on every
+    import. So the same two files, imported the same way twice, were handed to
+    the mesher in whichever order the coin came down: the prepared `sources`
+    list, the `index` each source is addressed by, and therefore the order the
+    runner calls ``gmsh.merge`` in, all followed a random number.
+
+    That was not cosmetic. Growing a boundary layer on `cube_a` of
+    `two_cubes_two_files` refused with a node collision in every one of the
+    nine runs where `cube_a` was merged first, and meshed in every one of the
+    three where `cube_b` was, at one commit, one settings digest and one
+    resolved layer patch. Which is to say the product answered the same
+    question two different ways depending on a uuid.
+
+    It is public, and it lives here beside ``uuid4()``, because two
+    readers need the same answer: the prepared set the mesher is built
+    from, and the boundary list the user reads. If they use different
+    keys the panel says one thing and the mesher does another -- which
+    is what DP-380 was, once DP-379 re-keyed only the first of them.
+
+    The key is what a reader would name the sources by -- the display name --
+    with the content fingerprint and then the id behind it, so two sources
+    sharing a name still order stably and identically on every run. Import
+    order does not enter it: importing the same pair the other way round now
+    prepares the same set.
+    """
+    def key(entry):
+        return (str(entry.get('name') or ''),
+                str(entry.get('fingerprint') or ''),
+                str(entry.get('geometry_id') or ''))
+
+    return sorted(entries or (), key=key)
 
 
 def is_cad_entry(entry) -> bool:
@@ -36,6 +78,36 @@ def is_cad_entry(entry) -> bool:
     stopped having the same answer.
     """
     return bool(entry.get('cad_artifact')) and not entry.get('cad_superseded_by')
+
+
+def gmsh_mixed_sources_refusal(entries=(), new_sources=()) -> str | None:
+    """Why Gmsh cannot mesh these sources together, or ``None``.
+
+    DP-638 (field audit 0924 D-SH-04). The Gmsh job imports either solid
+    models or triangulated surfaces, never both (``runner_v1.py``: "CAD and
+    tessellated geometry cannot be mixed in one job"), and that was the first
+    place a STEP beside an STL was refused -- after the whole case had been
+    authored. ``entries`` are the store's records (a split or wrapped CAD
+    entry counts as the surface it is meshed as, see :func:`is_cad_entry`);
+    ``new_sources`` are files about to be imported.
+    """
+    cad, surfaces = [], []
+    for entry in entries or ():
+        name = str(entry.get('name') or entry.get('geometry_id') or '?')
+        (cad if is_cad_entry(entry) else surfaces).append(name)
+    for source in new_sources or ():
+        path = Path(source)
+        (cad if path.suffix.lower() in CAD_SUFFIXES else surfaces).append(
+            path.name)
+    if not cad or not surfaces:
+        return None
+    return ('Gmsh cannot mesh solid models (STEP/IGES/BREP) and surface '
+            'meshes (STL/OBJ) in one case: {} {} CAD and {} {}. '
+            'Import one kind only, split or wrap the CAD so it is meshed as '
+            'a surface, or use snappyHexMesh, which meshes both.').format(
+                ', '.join(cad), 'is' if len(cad) == 1 else 'are',
+                ', '.join(surfaces),
+                'is a surface' if len(surfaces) == 1 else 'are surfaces')
 
 
 def read_back_unit(entry) -> str:
@@ -78,6 +150,24 @@ def tessellation_params(values=None):
     return params
 
 
+def stored_tessellation(entry) -> dict:
+    """The deflection *entry* was faceted at, with the linear one in metres.
+
+    DP-520. ``TessellationParams.linear_deflection`` is in metres now. An
+    entry written before that carries no ``tessellation_unit``, and its
+    number was applied raw to the shape the reader handed back -- which for
+    a STEP or IGES is millimetres -- so it is converted from
+    :func:`read_back_unit` here, once, for every reader of the record.
+    """
+    values = dict((entry or {}).get('tessellation') or {})
+    if (not values or (entry or {}).get('tessellation_unit') == 'm'
+            or values.get('relative') or 'linear_deflection' not in values):
+        return values
+    factor = GeometryArtifactStore._unit_factor(read_back_unit(entry))
+    values['linear_deflection'] = float(values['linear_deflection']) * factor
+    return values
+
+
 def _scaled_shape(shape, factor: float):
     """*shape* scaled about the origin by *factor*. Requires OCCT."""
     from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
@@ -88,6 +178,23 @@ def _scaled_shape(shape, factor: float):
     return BRepBuilderAPI_Transform(shape, transform, True).Shape()
 
 
+
+
+def _surface_changed(before, after) -> bool:
+    """Whether two surfaces differ in points or triangles (DP-487)."""
+    import numpy as np
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    if (before.GetNumberOfPoints() != after.GetNumberOfPoints() or
+            before.GetNumberOfCells() != after.GetNumberOfCells()):
+        return True
+    if before.GetNumberOfPoints():
+        if not np.array_equal(vtk_to_numpy(before.GetPoints().GetData()),
+                              vtk_to_numpy(after.GetPoints().GetData())):
+            return True
+    return not np.array_equal(
+        vtk_to_numpy(before.GetPolys().GetConnectivityArray()),
+        vtk_to_numpy(after.GetPolys().GetConnectivityArray()))
 
 
 def _triangle_normal(a, b, c) -> tuple[float, float, float]:
@@ -127,6 +234,156 @@ def _split_patch_names(regions, region_solids: dict, base: str) -> list:
             used[name] = used.get(name, 0) + 1
             out.append(f'{name}_{used[name]}')
     return out
+
+
+#: A solid block the artifact writer named after a CAD face. The number is
+#: the ``cadFaceId`` its triangles carry (DP-396).
+_FACE_BLOCK = re.compile(r'face(\d+)$')
+
+
+def region_cell_ids(entry: dict, polydata) -> dict:
+    """Region name -> the ids of the surface cells that bound it.
+
+    DP-396. The store already knows a CAD assembly's structure -- one region
+    record per solid, each naming the patches that bound it, each patch naming
+    the ``face<N>`` solid block its triangles were written as -- and the
+    surface carries the matching ``cadFaceId`` on every cell. Following that
+    chain is all it takes to ask each region separately whether it closes,
+    which is the question a mesher is actually asking.
+
+    Cell *ids into the parent surface* are what is returned, not extracted
+    sub-surfaces: the triangles of one region have to keep the merged
+    surface's point numbering or the seams between its own faces read as
+    holes.
+
+    An empty dict when anything in the chain does not line up -- fewer than
+    two regions, a patch with no solid name, a name no block has, a region
+    with no cells, no ``cadFaceId`` at all. Nothing downstream may soften a
+    verdict on a mapping that was guessed, so a mapping that cannot be made
+    is reported as no mapping rather than as a partial one.
+    """
+    from collections import defaultdict
+
+    from .cad.surface_split import FACE_ID_ARRAY
+
+    regions = list(entry.get('regions') or ())
+    if len(regions) < 2:
+        return {}
+    array = polydata.GetCellData().GetArray(FACE_ID_ARRAY)
+    if array is None:
+        return {}
+
+    solids_of_patch: dict[str, list[str]] = {}
+    for patch in entry.get('patches') or ():
+        uuid = patch.get('patch_uuid')
+        if not uuid:
+            continue
+        refs = patch.get('source_refs') or (
+            [patch['source_ref']] if patch.get('source_ref') else [])
+        names = [str(ref.get('original_name') or ref.get('xde_name') or '')
+                 for ref in refs]
+        if not names or not all(names):
+            return {}
+        solids_of_patch[str(uuid)] = names
+
+    names_in_file = sorted(
+        {name for names in solids_of_patch.values() for name in names})
+    numbered = [_FACE_BLOCK.match(name) for name in names_in_file]
+    if not names_in_file or not all(numbered):
+        # The blocks were not written as ``face<N>``, so nothing ties a patch
+        # to a ``cadFaceId``; their order in the file would only be a guess.
+        return {}
+    id_of_solid = {name: int(match.group(1))
+                   for name, match in zip(names_in_file, numbered)}
+
+    cells_of_face: dict[int, list[int]] = defaultdict(list)
+    for cell_id in range(polydata.GetNumberOfCells()):
+        cells_of_face[int(array.GetTuple1(cell_id))].append(cell_id)
+
+    out: dict[str, list[int]] = {}
+    for region in regions:
+        cells: list[int] = []
+        for uuid in region.get('boundary_patch_uuids') or ():
+            for solid in solids_of_patch.get(str(uuid), ()):
+                face_id = id_of_solid.get(solid)
+                if face_id is None or face_id not in cells_of_face:
+                    return {}
+                cells.extend(cells_of_face[face_id])
+        if not cells:
+            return {}
+        out[str(region.get('name') or region.get('region_uuid'))] = cells
+    return out
+
+
+def _encloses(outer, inner) -> bool:
+    """True when box ``outer`` strictly contains box ``inner`` (xmin,xmax,...)."""
+    try:
+        return all(float(outer[2 * i]) < float(inner[2 * i])
+                   and float(inner[2 * i + 1]) < float(outer[2 * i + 1])
+                   for i in range(3))
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def _excuse_enclosed_seeds(reports, entries, carried, engine) -> list[dict]:
+    """DP-660. A closed body inside another closed geometry needs no seed.
+
+    The fluid of an external case lies between the body and the farfield
+    around it; the body's own inside is solid and is never meshed, so
+    finding no probe point inside thin fins is not a fault of the geometry.
+    The body is excused only while an enclosing *closed* geometry exists: a
+    body standing alone is its own domain and is still asked.
+    """
+    from .diagnostics.checks import Finding, Severity
+    from .diagnostics.readiness import classify
+
+    known = {item['geometry_id']: item for item in list(carried) + list(reports)}
+    closed = {}
+    for entry in entries:
+        seen = known.get(entry['geometry_id']) or entry
+        diagnostics = seen.get('diagnostics') or {}
+        if diagnostics.get('watertight') and entry.get('bbox'):
+            closed[entry['geometry_id']] = entry
+    result = []
+    for report in reports:
+        diagnostics = report.get('diagnostics') or {}
+        findings = diagnostics.get('findings') or []
+        seed = next((item for item in findings
+                     if item.get('kind') == 'fluid_seed'
+                     and item.get('severity') == Severity.ERROR.value
+                     and item.get('count')), None)
+        box = report.get('bbox')
+        outer = next((entry for key, entry in closed.items()
+                      if key != report['geometry_id'] and box
+                      and _encloses(entry['bbox'], box)), None)
+        if seed is None or outer is None:
+            result.append(report)
+            continue
+        name = outer.get('name') or Path(str(outer.get('artifact', ''))).stem
+        excused = dict(seed, count=0, severity=Severity.INFO.value,
+                       evaluated=False,
+                       message=('Interior seed not needed: this body sits '
+                                f'inside {name}, so the fluid is around it, '
+                                'not in it.'),
+                       details=dict(seed.get('details') or {},
+                                    enclosed_by=outer['geometry_id']))
+        graded = [excused if item is seed else item for item in findings]
+        objects = [Finding(
+            item['kind'], int(item.get('count') or 0),
+            Severity(item['severity']), item.get('message', ''),
+            tuple(tuple(point) for point in item.get('locations') or ()),
+            item.get('characteristic_size'), item.get('characteristic_unit'),
+            tuple(item.get('repairable_by') or ()),
+            item.get('engine_impact'), item.get('evaluated', True),
+            item.get('details')) for item in graded]
+        readiness = classify(objects, cell_count=int(report.get('cells') or 1),
+                             engine=engine)
+        result.append({**report, 'diagnostics': {
+            **diagnostics, 'findings': graded,
+            'readiness': readiness.to_dict(),
+            'score': score_for(objects,
+                               watertight=bool(diagnostics.get('watertight')))}})
+    return result
 
 
 class GeometryArtifactStore:
@@ -244,6 +501,15 @@ class GeometryArtifactStore:
         # is rewritten into the artifact rather than carried as-is.
         solids = self._solid_names(result.surfaces[0])
         names = list(result.surfaces[0].solid_names)
+        # DP-64. One `solid` block is one boundary, and its name is the key
+        # snappy writes its `regions` entry under -- resolved by OpenFOAM
+        # against the blocks in the staged triSurface, not against anything
+        # FoamMesh remembers. `_solid_names` answers nothing below two solids
+        # because what it answers is the per-solid *patch records*, and one
+        # solid has none to make. The name is still needed, and the file
+        # already carries it, so it is carried through to the conversion
+        # below rather than being rebuilt from the file name.
+        single = names[:1] if len(names) == 1 else []
         if scale == 1.0 and not derived and (len(names) < 2 or solids == names):
             # No conversion, so the artifact stays a byte-for-byte copy of what
             # the user handed over -- the strongest provenance there is.
@@ -255,18 +521,32 @@ class GeometryArtifactStore:
             # be in metres. The declared unit is recorded below, so the
             # conversion is traceable rather than a silently different file.
             self._write_converted(result, destination, unit,
-                                  names=dict(enumerate(solids)))
+                                  names=dict(enumerate(solids or single)))
             # Re-read what was actually written. The bounding box, cell counts
             # and diagnostics all go into the entry, and reporting the ones
             # measured before the conversion would describe a geometry that no
             # longer exists -- a bbox in millimetres beside an artifact in
             # metres is the kind of disagreement nothing downstream can detect.
             result = import_surface(destination)
-        health = assess(result.surfaces[0].polydata, budget=budget)
+        # DP-44. Against `destination`, not the polydata alone: in the copy
+        # branch above the artifact is the user's bytes and the polydata is
+        # what the reader kept, and the difference between them is what the
+        # mesher will be handed and nothing had ever counted.
+        health = assess(result.surfaces[0].polydata, budget=budget,
+                        source_file=destination)
         fingerprint = self.entry_fingerprint({'artifact': str(destination)})
         patch_uuid = str(uuid4())
         patches, regions = self._solid_records(
             result.surfaces[0], solids, source=source, name=source.stem)
+        # DP-64. Off the artifact that was written, not off the file that was
+        # picked. `result` is the re-read of `destination` wherever anything
+        # was rewritten, so this is the file's own answer rather than a second
+        # guess at it -- and a record that cannot drift from the block it
+        # names is the whole point. Two or more solids keep the stem: there
+        # the names live on the patch records, one each.
+        written = [str(name) for name in
+                   (getattr(result.surfaces[0], 'solid_names', None) or ())]
+        written_name = written[0] if len(written) == 1 else source.stem
         revision_record = {
             'revision': 1, 'kind': 'imported', 'parent_revision': None,
             'artifact': str(destination), 'fingerprint': fingerprint,
@@ -290,7 +570,8 @@ class GeometryArtifactStore:
             'fingerprint': fingerprint, 'revisions': [revision_record],
             'patch_uuid': patch_uuid,
             'source_ref': {'file': str(source), 'body_index': 0,
-                           'face_index': None, 'original_name': source.stem},
+                           'face_index': None,
+                           'original_name': written_name},
         }
         if patches:
             entry['patches'] = patches
@@ -323,7 +604,15 @@ class GeometryArtifactStore:
             if factor != 1.0:
                 shape = _scaled_shape(shape, factor)
                 cad_scale = factor
-        polydata = tessellate(shape, params)
+        # DP-520. The deflection is in metres and the shape is in whatever the
+        # reader handed back -- millimetres for STEP and IGES -- so it is
+        # converted into the shape's units rather than applied as a raw
+        # number. It was applied raw: the panel's `0.1 m` faceted a STEP at
+        # 0.1 mm, and the same panel's Re-tessellate, which goes through the
+        # repair route below on a shape already in metres, at 0.1 m.
+        shape_unit = 'm' if cad_scale != 1.0 else model.unit
+        polydata = tessellate(shape, params,
+                              unit_factor=self._unit_factor(shape_unit))
         if polydata.GetNumberOfCells() <= 0:
             raise ValueError('CAD geometry tessellation contains no surface cells')
         # The coordinates arrive in whatever unit the reader emits, which for
@@ -332,8 +621,7 @@ class GeometryArtifactStore:
         # the project a thousand times out of scale, and Gmsh -- which pins
         # metres when it imports the same file -- would then disagree with
         # every size the rest of the application computes.
-        polydata = self._to_metres(
-            polydata, 'm' if cad_scale != 1.0 else model.unit)
+        polydata = self._to_metres(polydata, shape_unit)
         geometry_id = uuid4().hex
         artifact_root = self.root / geometry_id
         artifact_root.mkdir(parents=True, exist_ok=True)
@@ -356,6 +644,11 @@ class GeometryArtifactStore:
         patches = []
         regions = []
         solid_position = 0
+        # DP-92. The CAD ids are per-body and the patch uuids are what every
+        # reader downstream has, so the face-level answers have to change
+        # address here, once, while both are in the same hand.
+        uuid_of = {face.id: face.patch_uuid
+                   for body in model.bodies for face in body.faces}
         for body_index, body in enumerate(model.bodies):
             body_patch_uuids = []
             for face_index, face in enumerate(body.faces):
@@ -369,6 +662,20 @@ class GeometryArtifactStore:
                 patches.append({
                     'patch_uuid': face.patch_uuid, 'name': face.patch,
                     'source_ref': source_ref,
+                    # DP-92. Advisory: absent where OCCT was not asked, and
+                    # every reader treats absence as "nobody measured".
+                    **({'planar': bool(face.planar)}
+                       if face.planar is not None else {}),
+                    **({'area': float(face.area)}
+                       if face.area is not None else {}),
+                    **({'face_order': int(face.face_order)}
+                       if face.face_order >= 0 else {}),
+                    **({'adjacent_patch_uuids': [
+                        uuid_of[other] for other in face.adjacent_ids
+                        if other in uuid_of]}
+                       if face.adjacent_ids else {}),
+                    **({'interface_patch_uuid': uuid_of[face.interface_id]}
+                       if face.interface_id in uuid_of else {}),
                 })
             regions.append({
                 'region_uuid': str(uuid4()),
@@ -419,6 +726,11 @@ class GeometryArtifactStore:
             'reader_unit': 'm' if cad_scale != 1.0 else model.unit,
             'cad_unit_factor': float(cad_scale),
             'tessellation': dataclasses.asdict(params),
+            # DP-520. Says the deflection above is in metres. An entry
+            # without it was written when the number was applied raw to the
+            # reader's shape, so it is in `reader_unit` (see
+            # `stored_tessellation`).
+            'tessellation_unit': 'm',
             'artifact': str(artifact), 'cad_artifact': str(cad_artifact),
             'cells': int(polydata.GetNumberOfCells()),
             'points': int(polydata.GetNumberOfPoints()),
@@ -467,42 +779,138 @@ class GeometryArtifactStore:
         return f'sha256:{digest.hexdigest()}'
 
     def diagnose(self, geometry_id: str | None = None, *,
-                 target_cell_size: float | None = None) -> list[dict]:
+                 target_cell_size: float | None = None,
+                 engine: str | None = None) -> list[dict]:
         selected = self.entries()
         if geometry_id:
             selected = [item for item in selected if item['geometry_id'] == geometry_id]
             if not selected:
                 raise KeyError(geometry_id)
+        # DP-409. Every one of these entries is re-imported from disk and
+        # re-assessed on the caller's thread, and on the owner loop that is
+        # the whole of the blocking this fault measured. The result was
+        # already being cached after every call and never read back: see
+        # `_persist_readiness`, which has written a fingerprinted document
+        # since the beginning. So read it. The key is the artifact's own
+        # content hash, so a geometry that has not changed is not diagnosed
+        # twice, and a geometry that has changed is not served from a stale
+        # answer.
+        cached = self._cached_readiness(target_cell_size, engine)
         reports = []
         for item in selected:
+            fingerprint = self.entry_fingerprint(item)
+            remembered = cached.get(item['geometry_id'])
+            if (remembered is not None
+                    and remembered.get('fingerprint') == fingerprint
+                    and isinstance(remembered.get('diagnostics'), dict)):
+                reports.append({**item, 'fingerprint': fingerprint,
+                                'diagnostics': remembered['diagnostics']})
+                continue
             imported = import_surface(item['artifact'])
-            health = assess(imported.surfaces[0].polydata,
-                            target_cell_size=target_cell_size)
+            polydata = imported.surfaces[0].polydata
+            health = assess(polydata, target_cell_size=target_cell_size,
+                            source_file=item['artifact'], engine=engine)
+            # DP-396. A conjugate assembly's merged surface cannot close where
+            # its bodies touch, so grading it as one surface refuses exactly
+            # the geometry a conjugate mesh is made of. Grade the regions.
+            region_cells = region_cell_ids(item, polydata)
+            if region_cells:
+                from .diagnostics.checks import region_shells
+                from .diagnostics.readiness import classify
+                health.findings.append(region_shells(polydata, region_cells))
+                health.readiness = classify(
+                    health.findings,
+                    cell_count=int(polydata.GetNumberOfCells()), engine=engine)
             if item.get('cad_artifact'):
                 try:
                     from .cad import read_cad
                     from .diagnostics.cad_checks import check_cad
                     from .diagnostics.readiness import classify
                     shape, _model = read_cad(item['cad_artifact'])
-                    health.findings.extend(check_cad(shape))
+                    # DP-530. The shape comes back in `reader_unit` --
+                    # millimetres for STEP and IGES -- and the census the
+                    # Repair plan suggests a tolerance from is in metres.
+                    health.findings.extend(check_cad(
+                        shape, unit_factor=self._unit_factor(
+                            read_back_unit(item))))
                     health.readiness = classify(
                         health.findings,
-                        cell_count=int(imported.surfaces[0].polydata.GetNumberOfCells()))
-                    health.score = max(0, health.score - sum(
-                        40 if finding.severity.value == 'error' and finding.count else
-                        10 if finding.severity.value == 'warning' and finding.count else 0
-                        for finding in health.findings if finding.kind.startswith('cad_')))
+                        cell_count=int(polydata.GetNumberOfCells()),
+                        engine=engine)
                 except RuntimeError:
                     # The tessellation remains diagnosable when CAD support is
                     # absent; capability status is exposed separately.
                     pass
+            # DP-434. Every finding is in hand here and not before, so this is
+            # where the conjugate proof can reach the three findings it
+            # accounts for. Until now it reached only the verdict: six STEP
+            # models came out of this method carrying `surface_not_closed`,
+            # `non_manifold_edges` and `duplicate_triangles` at severity
+            # `error` with `tess.fix_nonmanifold` and `tess.dedupe` offered as
+            # the cure -- repairs that would delete one copy of the shared
+            # surface -- beside a readiness badge that said `ready`. The score
+            # is taken once, afterwards, for the same reason.
+            health.findings = explain_conjugate(health.findings)
+            health.score = score_for(health.findings,
+                                     watertight=health.watertight)
             reports.append({
                 **item,
-                'fingerprint': self.entry_fingerprint(item),
+                'fingerprint': fingerprint,
                 'diagnostics': health.to_dict(),
             })
-        self._persist_readiness(reports)
-        return reports
+        carried = [entry for key, entry in cached.items()
+                   if key not in {item['geometry_id'] for item in selected}]
+        self._persist_readiness(reports, carried, target_cell_size, engine)
+        # DP-660. Graded after the cache, not stored in it: whether a body is
+        # enclosed depends on the other geometries, which the per-entry
+        # fingerprint cannot see.
+        return _excuse_enclosed_seeds(
+            reports, self.entries(), list(carried), engine)
+
+    def _cached_readiness(self, target_cell_size: float | None,
+                          engine: str | None) -> dict[str, dict]:
+        """The last diagnostics written for these same inputs, by id (DP-409).
+
+        The inputs are compared as a whole rather than ignored, because
+        `assess` is given the target cell size and the engine and grades
+        differently for each. A document written before this method existed
+        carries no record of what it was diagnosed with, so it reads as a
+        miss, which is the right answer for a document that cannot say.
+        """
+        try:
+            document = json.loads(self.readiness_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(document, dict) or document.get('schema_version') != 1:
+            return {}
+        if document.get('diagnosed_with') != self._diagnose_inputs(
+                target_cell_size, engine):
+            return {}
+        entries = document.get('geometries')
+        if not isinstance(entries, list):
+            return {}
+        return {entry['geometry_id']: entry for entry in entries
+                if isinstance(entry, dict) and entry.get('geometry_id')
+                and entry.get('fingerprint')}
+
+    @staticmethod
+    def _diagnose_inputs(target_cell_size: float | None,
+                         engine: str | None) -> dict:
+        """What `diagnose` was asked, in the form the cache compares (DP-409).
+
+        DP-530. ``cad_census_unit`` says the CAD census is in metres. A
+        document written before carries a census in whatever unit the reader
+        handed back -- millimetres for STEP -- and the Repair plan would
+        suggest a tolerance from it, so it is not trusted.
+        """
+        return {
+            'target_cell_size': (None if target_cell_size is None
+                                 else float(target_cell_size)),
+            'engine': None if engine is None else str(engine),
+            'cad_census_unit': 'm',
+            # DP-684. A verdict graded under older rules is graded again.
+            'rules_version': RULES_VERSION,
+        }
 
     def geometry_fingerprint(self) -> str:
         """Fingerprint the ordered active geometry set, independent of paths."""
@@ -526,8 +934,10 @@ class GeometryArtifactStore:
         return f'sha256:{digest.hexdigest()}'
 
     def readiness_report(self, geometry_id: str | None = None, *,
-                         target_cell_size: float | None = None) -> dict:
-        geometries = self.diagnose(geometry_id, target_cell_size=target_cell_size)
+                         target_cell_size: float | None = None,
+                         engine: str | None = None) -> dict:
+        geometries = self.diagnose(geometry_id, target_cell_size=target_cell_size,
+                                   engine=engine)
         return {
             'schema_version': 1,
             'geometry_fingerprint': self.geometry_fingerprint(),
@@ -535,13 +945,25 @@ class GeometryArtifactStore:
             'geometries': geometries,
         }
 
-    def _persist_readiness(self, reports: list[dict]) -> None:
-        """Atomically cache diagnostics; consumers detect stale data by fingerprint."""
+    def _persist_readiness(self, reports: list[dict],
+                          carried: list[dict] | None = None,
+                          target_cell_size: float | None = None,
+                          engine: str | None = None) -> None:
+        """Atomically cache diagnostics; consumers detect stale data by fingerprint.
+
+        DP-409 made this document readable as well as written, so it carries
+        two more things. `diagnosed_with` says what the diagnostics were taken
+        with, because the same geometry grades differently under a different
+        target cell size or engine. `carried` holds the entries a single-id
+        call did not look at, so diagnosing one geometry no longer erases the
+        cache for every other one.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
         document = {
             'schema_version': 1,
             'geometry_fingerprint': self.geometry_fingerprint(),
-            'geometries': reports,
+            'diagnosed_with': self._diagnose_inputs(target_cell_size, engine),
+            'geometries': list(reports) + list(carried or []),
         }
         temporary = self.readiness_path.with_suffix('.tmp')
         temporary.write_text(
@@ -704,6 +1126,115 @@ class GeometryArtifactStore:
         return self._replace_artifact_revision(
             entries, index, entry, result.polydata, metadata)
 
+    def split_interfaces(self, geometry_ids=None, *, preview: bool = False) -> dict:
+        """Cut an assembly's shared walls away from the walls it shares with nobody.
+
+        DP-421. OpenFOAM 13 writes a conjugate assembly as one surface per
+        interface plus one for the outer skin (``multiRegion/CHT/heatedDuct``),
+        and FoamMesh had no way to produce that shape: an imported body is one
+        closed surface, and one closed surface can be typed one thing. This is
+        the cut that makes the shape authorable.
+
+        The cut is exact and needs no tolerance. A conformal interface is drawn
+        twice, once by each body, from the *same* welded nodes -- the copies
+        differ only in winding -- so a node triple carried by two shells is a
+        shared face and nothing else is.
+
+        Each body keeps a new revision holding only the faces it shares with
+        nobody; each interface becomes a geometry of its own, named
+        ``<a>_to_<b>``, and carries the point inside the region it encloses
+        that ``mode insidePoint`` needs. A body that shares nothing is left
+        untouched, which is the answer for the single-region models that are
+        most of the catalogue. ``preview`` measures and writes nothing.
+        """
+        from .interface_split import split_assembly
+
+        entries = self.entries()
+        if geometry_ids:
+            chosen = [self._entry(entries, str(item)) for item in geometry_ids]
+        else:
+            chosen = list(enumerate(entries))
+        if len(chosen) < 2:
+            raise ValueError(
+                'an interface is a wall two bodies share, so the cut needs at '
+                'least two geometries; this case has '
+                f'{len(chosen)}')
+        labels = self._interface_labels([entry for _index, entry in chosen])
+        staging = None
+        if not preview:
+            staging = self.root / '_interface_split'
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+        paths = [entry['artifact'] for _index, entry in chosen]
+        record = split_assembly(
+            paths, labels=dict(zip(paths, labels)), directory=staging)
+        by_label = {label: (index, entry)
+                    for label, (index, entry) in zip(labels, chosen)}
+        result = {
+            'is_assembly': bool(record['is_assembly']),
+            'warnings': list(record['warnings']),
+            'bodies': [], 'interfaces': [],
+        }
+        for item in record['externals']:
+            index, entry = by_label[item['name']]
+            body = {'geometry_id': entry['geometry_id'], 'name': item['name'],
+                    'faces': int(item['triangles']),
+                    'removed': int(item['removed']),
+                    'revision': int(entry['revision'])}
+            if not preview and item['removed'] and item.get('path'):
+                # Only a body that lost faces gets a revision. Re-writing one
+                # that shares nothing would change its fingerprint, and every
+                # downstream record keyed on that fingerprint, to say the same
+                # thing it already said.
+                written = self._replace_artifact_revision(
+                    entries, index, entry,
+                    self._polydata({'artifact': item['path']}),
+                    {'kind': 'interface_split',
+                     'solid_names': {0: item['name']},
+                     'interface_split': {'removed': int(item['removed']),
+                                         'kept': int(item['triangles'])}})
+                body['revision'] = int(written['revision'])
+            result['bodies'].append(body)
+        for item in record['interfaces']:
+            joined = {'name': item['name'], 'between': list(item['between']),
+                      'faces': int(item['triangles']),
+                      'inside_shell': item['insideShell'],
+                      'inside_point': item['inside'],
+                      'geometry_id': None}
+            if not preview and item.get('path'):
+                imported = self.import_file(item['path'])
+                joined['geometry_id'] = imported['geometry_id']
+                joined['artifact'] = imported['artifact']
+                enclosed = by_label.get(item['insideShell'])
+                joined['inside_geometry_id'] = (
+                    enclosed[1]['geometry_id'] if enclosed else None)
+            result['interfaces'].append(joined)
+        return result
+
+    @staticmethod
+    def _interface_labels(entries: list[dict]) -> list[str]:
+        """One word per geometry, distinct, for the pieces to be named after.
+
+        The names end up in ``<a>_to_<b>``, in a solid block, in a face zone
+        and in a cell zone, so they have to be words OpenFOAM can read and
+        they have to tell two bodies apart. A name that is neither is
+        replaced rather than refused: the cut is worth more than the label,
+        and the entry keeps its own name whatever this says.
+        """
+        labels: list[str] = []
+        for position, entry in enumerate(entries, 1):
+            name = str(entry.get('name') or '').strip()
+            cleaned = ''.join(
+                character if character.isalnum() or character == '_' else '_'
+                for character in name).strip('_')
+            if not cleaned or not cleaned[0].isalpha():
+                cleaned = f'body{position}'
+            if cleaned in labels:
+                cleaned = f'{cleaned}{position}'
+            labels.append(cleaned)
+        return labels
+
     @staticmethod
     def _source_solid_names(entry: dict) -> dict:
         """Face id -> solid name, for the solids the FILE carried.
@@ -853,6 +1384,33 @@ class GeometryArtifactStore:
         return patches, regions
 
     @staticmethod
+    def _artifact_solid_names(entry: dict, polydata) -> dict[int, str]:
+        """Face id -> solid name, for the solids the entry's artifact carries.
+
+        DP-486. The fallback when the entry's patch records name nothing:
+        the names are read off the revision being replaced, keyed the way
+        the reader keyed them, so the revision written next carries the same
+        ``solid`` blocks. A single-solid surface is named by the entry's
+        ``source_ref`` -- the record the snappy ``regions`` key is generated
+        from -- and by its file's header only when that record is silent.
+        """
+        artifact = Path(str(entry.get('artifact') or ''))
+        if artifact.suffix.lower() != '.stl' or not artifact.is_file():
+            return {}
+        from .cad.surface_split import face_id_range
+        from .importers.stl_importer import face_ids_for, solid_names
+        names = solid_names(artifact)
+        if len(names) >= 2:
+            if face_id_range(polydata) is None:
+                # The solids were not kept apart, and no one of their names
+                # is the name of all of them.
+                return {}
+            return dict(zip(face_ids_for(names), names))
+        recorded = (entry.get('source_ref') or {}).get('original_name')
+        name = str(recorded) if recorded else (names[0] if names else None)
+        return {0: name} if name else {}
+
+    @staticmethod
     def _patch_solid_names(entry: dict) -> dict[int, str]:
         """Face id -> solid name, from the entry's patch records.
 
@@ -935,7 +1493,17 @@ class GeometryArtifactStore:
             self._write_polydata(result.polydata, temporary,
                                  names=self._patch_solid_names(entry))
         else:
-            write_surface(result.polydata, temporary)
+            # DP-362. A single-solid STL carries its patch identity in the
+            # one name the file already has, and `_patch_solid_names` cannot
+            # supply it -- that reads face indices, and a plain STL import
+            # has none. Read it off the surface that was repaired.
+            solid_names = [name for name in imported.surfaces[0].solid_names
+                           if name]
+            write_surface(
+                result.polydata, temporary,
+                solid_name=(solid_names[0] if len(solid_names) == 1
+                            and not imported.surfaces[0].derived_names
+                            else None))
         os.replace(temporary, destination)
         fingerprint = self.entry_fingerprint({'artifact': str(destination)})
         revision_record = {
@@ -1057,7 +1625,10 @@ class GeometryArtifactStore:
                 highlights[action_id] = cell_ids
             reports.append({
                 'action': action_id, 'params': dict(params),
-                'status': 'applied' if output.GetNumberOfCells() != polydata.GetNumberOfCells()
+                # DP-487. Judged on the surface, not the cell count: a weld
+                # that merges points keeps every triangle and still changed
+                # the surface, and one that merges nothing did not.
+                'status': 'applied' if _surface_changed(polydata, output)
                 or changes.get('cells_flipped') else 'no_effect',
                 'metrics_before': {
                     'points': polydata.GetNumberOfPoints(),
@@ -1097,8 +1668,42 @@ class GeometryArtifactStore:
             'highlights': highlights,
             '_polydata': polydata,
         }
+        result['effect'] = self._repair_effect(entry, reports)
         result['preview_digest'] = self._preview_digest(result, polydata)
         return result
+
+    def _repair_effect(self, entry: dict, reports: list[dict]) -> dict:
+        """What a tessellated repair plan would actually change, in one place.
+
+        DP-487. Audit 0923 MA-03, case S1: the only selected action, a weld,
+        merged 0 points, yet a new revision was written and shown as a
+        repair. Two separate things can make a revision differ from its
+        parent, and they are reported apart: what the actions did to the
+        surface, and ``normalization`` -- the file being re-written from the
+        surface as it was read, which drops facets the reader already
+        discarded (``dropped_facets``) whatever the actions did.
+
+        ``outcome`` is ``changed`` when an action changed the surface,
+        ``normalized`` when none did but the re-write still resolves a
+        finding, and ``none`` when a revision would be a copy of its parent.
+        """
+        applied = [item['action'] for item in reports if item['status'] == 'applied']
+        idle = [item['action'] for item in reports if item['status'] == 'no_effect']
+        normalization = None
+        artifact = Path(str(entry.get('artifact') or ''))
+        if artifact.suffix.lower() == '.stl' and artifact.is_file():
+            from .importers.stl_importer import facet_count
+            declared = facet_count(artifact)
+            kept = int(self._polydata(entry).GetNumberOfCells())
+            if declared is not None and declared > kept:
+                normalization = {'dropped_facets': declared - kept,
+                                 'declared': declared, 'read': kept}
+        return {
+            'outcome': ('changed' if applied else
+                        'normalized' if normalization else 'none'),
+            'applied': applied, 'no_effect': idle,
+            'normalization': normalization,
+        }
 
     def apply_repair_plan(self, plan: dict, *, progress=None, cancelled=None) -> dict:
         if plan.get('route') == 'cad':
@@ -1111,6 +1716,13 @@ class GeometryArtifactStore:
             raise ValueError('preview_stale')
         entries = self.entries()
         index, entry = self._entry(entries, preview['geometry_id'])
+        if (preview.get('effect') or {}).get('outcome') == 'none':
+            # DP-487. Every selected action left the surface as it was and
+            # the file needs no re-write, so a new revision would be a copy
+            # of its parent presented as a repair.
+            raise ValueError(
+                'repair_no_effect: no selected repair changed the surface, '
+                'so no revision was written')
         public_report = {key: value for key, value in preview.items()
                          if key != '_polydata'}
         output = preview['_polydata']
@@ -1161,7 +1773,17 @@ class GeometryArtifactStore:
         actions = [CadRepairAction(
             str(item.get('action')), dict(item.get('params') or {}),
             bool(item.get('enabled', True))) for item in plan.get('actions', ())]
-        backend = OcctHealingBackend()
+        # F-11. The healed solid comes back in the unit the artifact reads
+        # back in, while everything it is about to be compared and meshed
+        # against is in metres. DP-08: that is `reader_unit`, not `unit` --
+        # a metre-declaring STEP still hands OCCT millimetres.
+        unit_factor = self._unit_factor(read_back_unit(entry))
+        # DP-530. The plan's tolerances are in metres, as the Repair page
+        # labels them; the shape is in `reader_unit`. They were handed to
+        # OCCT raw, so the audit's G3 sew "at 0.0001 m" sewed its millimetre
+        # STEP at 0.0001 mm -- and the same number on the repaired revision,
+        # a BREP written in metres, would have meant metres.
+        backend = OcctHealingBackend(unit_factor)
         healed, healing = execute(
             shape, actions, backend=backend,
             progress=progress, cancelled=cancelled)
@@ -1182,12 +1804,7 @@ class GeometryArtifactStore:
         requested = {key: value for key, value in retessellate.items()
                      if key in {'linear_deflection', 'angular_deflection_deg',
                                 'relative', 'parallel'}}
-        params = tessellation_params({**(entry.get('tessellation') or {}), **requested})
-        # F-11. The healed solid comes back in the unit the artifact reads
-        # back in, while everything it is about to be compared and meshed
-        # against is in metres. DP-08: that is `reader_unit`, not `unit` --
-        # a metre-declaring STEP still hands OCCT millimetres.
-        unit_factor = self._unit_factor(read_back_unit(entry))
+        params = tessellation_params({**stored_tessellation(entry), **requested})
         healed_metres = (_scaled_shape(healed, unit_factor)
                          if unit_factor != 1.0 else healed)
         after_surface = tessellate(healed_metres, params)
@@ -1288,7 +1905,8 @@ class GeometryArtifactStore:
             'cad_unit_factor': float(entry.get('cad_unit_factor', 1.0)) * unit_factor,
             'tessellation': dataclasses.asdict(
                 tessellation_params(preview.get('_params')
-                                    or entry.get('tessellation'))),
+                                    or stored_tessellation(entry))),
+            'tessellation_unit': 'm',
             'artifact': str(surface_artifact), 'cad_artifact': str(cad_artifact),
             'fingerprint': fingerprint, 'cells': int(polydata.GetNumberOfCells()),
             'points': int(polydata.GetNumberOfPoints()),
@@ -1386,7 +2004,12 @@ class GeometryArtifactStore:
         coarse_parameters = dict(parameters)
         coarse_parameters.pop('expected_revision', None)
         coarse_parameters.pop('smallest_feature', None)
-        coarse_parameters['resolution'] = min(128, sizing.resolution)
+        # The acceptance preview is meshed on a grid of at most
+        # PREVIEW_RESOLUTION cells so that it stays quick; the smallest
+        # feature has already been turned into `sizing.resolution`. DP-640
+        # (field audit 0924 D-SH-10): the payload says which grid apply will
+        # use, so nobody reads a coarse triangle count as the applied one.
+        coarse_parameters['resolution'] = min(PREVIEW_RESOLUTION, sizing.resolution)
         coarse, report = wrap(source, cancelled=cancelled, **coarse_parameters)
         return {
             'geometry_id': geometry_id, 'base_revision': int(entry['revision']),
@@ -1394,6 +2017,9 @@ class GeometryArtifactStore:
             'experimental': True, **sizing.to_dict(),
             'coarse_preview': {
                 'resolution': coarse_parameters['resolution'],
+                'applied_resolution': int(sizing.resolution),
+                'same_as_apply': (int(coarse_parameters['resolution'])
+                                  == int(sizing.resolution)),
                 'points': int(coarse.GetNumberOfPoints()),
                 'cells': int(coarse.GetNumberOfCells()),
                 'watertight': bool(report['diagnostics_after']['watertight']),
@@ -1555,6 +2181,16 @@ class GeometryArtifactStore:
         writer = vtkSTLWriter() if destination.suffix.lower() == '.stl' else vtkOBJWriter()
         writer.SetFileName(str(destination))
         writer.SetInputData(polydata)
+        if names and len(names) == 1 and destination.suffix.lower() == '.stl':
+            # DP-64. One surface, one name and no face tags to group by: a
+            # single-solid STL being rewritten for its units. In an ASCII STL
+            # the header *is* the solid name, and left alone vtkSTLWriter puts
+            # its own there -- MEASURED, `solid Visualization Toolkit
+            # generated SLA File`, four words OpenFOAM cannot key a `regions`
+            # entry on and the user never chose. A unit conversion changes the
+            # coordinates and nothing else, so the block keeps the name it
+            # arrived with.
+            writer.SetHeader(str(next(iter(names.values()))))
         if writer.Write() != 1:
             raise OSError(f'could not write geometry artifact: {destination}')
 
@@ -1576,8 +2212,16 @@ class GeometryArtifactStore:
             grouped.setdefault(int(face_ids.GetTuple1(cell_id)), []).append(cell_id)
         temporary = destination.with_suffix(destination.suffix + '.solids')
         with temporary.open('w', encoding='utf-8') as stream:
-            for face_id in sorted(grouped):
-                name = (names or {}).get(face_id) or f'face{face_id}'
+            # DP-486. A negative id marks cells a repair created (a filled
+            # hole) and that no source solid owns. They are written last, so
+            # the solids the file already had keep their positions on the
+            # next read -- which is how a record without a ``face<N>`` name
+            # finds its solid again -- and they carry the patch name the
+            # repair report gives them rather than ``face-1``.
+            for face_id in sorted(grouped, key=lambda value: (value < 0, abs(value))):
+                name = ((names or {}).get(face_id) or
+                        (f'repair_fill_{-face_id}' if face_id < 0
+                         else f'face{face_id}'))
                 stream.write(f'solid {name}\n')
                 for cell_id in grouped[face_id]:
                     cell = polydata.GetCell(cell_id)
@@ -1608,6 +2252,31 @@ class GeometryArtifactStore:
         # entry's otherwise.
         names = self._patch_solid_names(
             {'patches': metadata['patches']} if metadata.get('patches') else entry)
+        if metadata.get('solid_names'):
+            # DP-421. An STL import's patch record carries no `face_index` --
+            # only a CAD face has one -- so `_patch_solid_names` answers with
+            # nothing for it and the block below writes vtkSTLWriter's own
+            # header instead: MEASURED, `solid Visualization Toolkit generated
+            # SLA File`, on the body revisions the interface cut produced.
+            # The manifest went on calling the same solid `left`, so nothing
+            # downstream could find the block the row named. An operation that
+            # knows the name says it here rather than inferring it.
+            names = dict(metadata['solid_names'])
+        if not names:
+            # DP-486. A plain STL's identity is not in a patch record with a
+            # face index -- a single-solid import has no patch records at
+            # all -- so the lookups above answer nothing for it and the
+            # revision went out under vtkSTLWriter's own header, MEASURED on
+            # the audit's repaired `box_with_cavity` and `open_box`:
+            # `Unknown region name box_with_cavity`, valid region
+            # `VisualizationToolkitgeneratedSLAFile`. A new revision is the
+            # same surface under the same names.
+            names = self._artifact_solid_names(entry, polydata)
+        elif not metadata.get('patches') and not metadata.get('solid_names'):
+            # The records describe the solids the file already has, so any
+            # solid they do not name -- a hole an earlier repair filled --
+            # keeps the name the file gave it rather than becoming face<N>.
+            names = {**self._artifact_solid_names(entry, polydata), **names}
         try:
             self._write_polydata(polydata, temporary, names=names)
             os.replace(temporary, destination)
@@ -1626,10 +2295,12 @@ class GeometryArtifactStore:
                               else 'geometry.wrap.apply' if revision_kind == 'wrapped'
                               else 'geometry.patches.split_by_angle'
                               if revision_kind == 'split'
+                              else 'geometry.split_interfaces'
+                              if revision_kind == 'interface_split'
                               else 'geometry.transform'),
                 **{key: value for key, value in metadata.items()
                    if key not in {'last_repair', 'repair_report', 'patches',
-                                  'regions', 'split_report'}},
+                                  'regions', 'split_report', 'solid_names'}},
             },
             **({'report': metadata['repair_report']}
                if 'repair_report' in metadata else {}),
@@ -1682,7 +2353,14 @@ class GeometryArtifactStore:
         temporary = artifact.with_suffix(f'.new{suffix}')
         self.root.mkdir(parents=True, exist_ok=True)
         try:
-            self._write_polydata(polydata, temporary)
+            # DP-486. The new entry is recorded under *name*, and a
+            # single-solid STL's header is the only place the file can say
+            # it; left out, vtkSTLWriter writes its own. A tagged surface
+            # keeps its per-face solids and their ``face<N>`` names.
+            from .cad.surface_split import face_id_range
+            self._write_polydata(
+                polydata, temporary,
+                names=None if face_id_range(polydata) is not None else {0: name})
             os.replace(temporary, artifact)
         finally:
             if temporary.exists():

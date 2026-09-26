@@ -134,7 +134,7 @@ def describe_cancellation(payload, allocation=None) -> str:
     what = 'job' if stopped == 1 else 'jobs'
     where = f' running {clause}' if clause else ''
     return (f'Cancelled: {stopped} {what}{where} stopped. '
-            'The case mesh is unchanged - a run only becomes the case mesh '
+            'The case mesh is unchanged — a run only becomes the case mesh '
             'when it finishes.')
 
 

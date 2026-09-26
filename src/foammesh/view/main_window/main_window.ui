@@ -155,7 +155,7 @@
               </size>
              </property>
              <property name="text">
-              <string>&amp;3. Base Grid</string>
+              <string>&amp;3. Base grid</string>
              </property>
              <property name="checkable">
               <bool>true</bool>
@@ -305,7 +305,7 @@
               </size>
              </property>
              <property name="text">
-              <string>&amp;6. Boundary Layer</string>
+              <string>&amp;6. Boundary layer</string>
              </property>
              <property name="checkable">
               <bool>true</bool>
@@ -423,7 +423,7 @@
                   </sizepolicy>
                  </property>
                  <property name="currentIndex">
-                  <number>4</number>
+                  <number>0</number>
                  </property>
                  <widget class="QWidget" name="geometryPage">
                   <layout class="QVBoxLayout" name="verticalLayout_4">
@@ -431,7 +431,6 @@
                     <widget class="QLabel" name="label">
                      <property name="font">
                       <font>
-                       <pointsize>10</pointsize>
                        <bold>true</bold>
                       </font>
                      </property>
@@ -562,7 +561,6 @@
                         </property>
                         <property name="font">
                          <font>
-                          <pointsize>10</pointsize>
                           <bold>true</bold>
                          </font>
                         </property>
@@ -639,12 +637,11 @@
                     <widget class="QLabel" name="label_2">
                      <property name="font">
                       <font>
-                       <pointsize>10</pointsize>
                        <bold>true</bold>
                       </font>
                      </property>
                      <property name="text">
-                      <string>Base Grid</string>
+                      <string>Base grid</string>
                      </property>
                     </widget>
                    </item>
@@ -658,7 +655,7 @@
                    <item>
                     <widget class="QGroupBox" name="groupBox_10">
                      <property name="title">
-                      <string>Grid Span</string>
+                      <string>Grid span</string>
                      </property>
                      <layout class="QVBoxLayout" name="verticalLayout_31">
                       <item>
@@ -828,7 +825,7 @@
                    <item>
                     <widget class="QGroupBox" name="groupBox_2">
                      <property name="title">
-                      <string>Number of Cells per Direction</string>
+                      <string>Number of cells per direction</string>
                      </property>
                      <layout class="QFormLayout" name="formLayout">
                       <item row="0" column="0">
@@ -945,7 +942,6 @@
                        <widget class="QLabel" name="label_18">
                         <property name="font">
                          <font>
-                          <pointsize>10</pointsize>
                           <bold>true</bold>
                          </font>
                         </property>
@@ -963,7 +959,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string>Load Default Settings</string>
+                         <string>Load the castellation defaults</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -1026,9 +1022,6 @@
                        <item>
                         <widget class="QWidget" name="widget_11" native="true">
                          <layout class="QVBoxLayout" name="verticalLayout_9">
-                          <property name="bottomMargin">
-                           <number>9</number>
-                          </property>
                           <item>
                            <widget class="FolderHeader" name="castellationConfigurationHeader">
                             <property name="sizePolicy">
@@ -1084,7 +1077,7 @@
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_15">
                                   <property name="text">
-                                   <string>Number of Cells between Levels</string>
+                                   <string>Number of cells between levels</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1094,7 +1087,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_16">
                                   <property name="text">
-                                   <string>Feature Angle Threshold</string>
+                                   <string>Feature angle threshold</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1119,14 +1112,14 @@
                                 <item>
                                  <widget class="QCheckBox" name="keepNonManifoldEdges">
                                   <property name="text">
-                                   <string>Keep Non-Manifold Edges</string>
+                                   <string>Keep non-manifold edges</string>
                                   </property>
                                  </widget>
                                 </item>
                                 <item>
                                  <widget class="QCheckBox" name="keepOpenEdges">
                                   <property name="text">
-                                   <string>Keep Open Edges</string>
+                                   <string>Keep open edges</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1142,9 +1135,6 @@
                        <item>
                         <widget class="QWidget" name="widget_22" native="true">
                          <layout class="QVBoxLayout" name="verticalLayout_13">
-                          <property name="bottomMargin">
-                           <number>9</number>
-                          </property>
                           <item>
                            <widget class="FolderHeader" name="castellationAdvancedHeader">
                             <property name="sizePolicy">
@@ -1194,7 +1184,7 @@
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_41">
                                   <property name="text">
-                                   <string>Max. Global Cell Count</string>
+                                   <string>Max. global cell count</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1204,7 +1194,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_42">
                                   <property name="text">
-                                   <string>Max. Local Cell Count</string>
+                                   <string>Max. local cell count</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1214,7 +1204,7 @@
                                 <item row="2" column="0">
                                  <widget class="QLabel" name="label_43">
                                   <property name="text">
-                                   <string>Min. Refinement Cell Count</string>
+                                   <string>Min. refinement cell count</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1224,7 +1214,7 @@
                                 <item row="3" column="0">
                                  <widget class="QLabel" name="label_44">
                                   <property name="text">
-                                   <string>Max. Load Unbalance</string>
+                                   <string>Max. load unbalance</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1237,7 +1227,7 @@
                              <item>
                               <widget class="QCheckBox" name="allowFreeStandingZoneFaces">
                                <property name="text">
-                                <string>Allow Free Standing Zone Faces</string>
+                                <string>Allow free standing zone faces</string>
                                </property>
                               </widget>
                              </item>
@@ -1279,7 +1269,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Surface/Feature Refinement</string>
+                                <string>Surface/feature refinement</string>
                                </property>
                                <property name="checked">
                                 <bool>true</bool>
@@ -1336,7 +1326,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Min. Level</string>
+                                <string>Min. level</string>
                                </property>
                               </widget>
                              </item>
@@ -1348,7 +1338,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Max. Level</string>
+                                <string>Max. level</string>
                                </property>
                               </widget>
                              </item>
@@ -1390,7 +1380,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Volume Refinement</string>
+                                <string>Volume refinement</string>
                                </property>
                                <property name="checked">
                                 <bool>true</bool>
@@ -1447,7 +1437,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Level / Split</string>
+                                <string>Level / split</string>
                                </property>
                               </widget>
                              </item>
@@ -1537,7 +1527,6 @@
                        <widget class="QLabel" name="label_68">
                         <property name="font">
                          <font>
-                          <pointsize>10</pointsize>
                           <bold>true</bold>
                          </font>
                         </property>
@@ -1555,7 +1544,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string>Load Default Settings</string>
+                         <string>Load the snap defaults</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -1621,7 +1610,7 @@
                           <item>
                            <widget class="QLabel" name="label_20">
                             <property name="text">
-                             <string>Global Configuration</string>
+                             <string>Global configuration</string>
                             </property>
                            </widget>
                           </item>
@@ -1635,13 +1624,13 @@
                           <item>
                            <widget class="QGroupBox" name="groupBox_3">
                             <property name="title">
-                             <string>Iteration Count</string>
+                             <string>Iteration count</string>
                             </property>
                             <layout class="QFormLayout" name="formLayout_4">
                              <item row="0" column="0">
                               <widget class="QLabel" name="label_21">
                                <property name="text">
-                                <string>Smoothing for Surface</string>
+                                <string>Smoothing for surface</string>
                                </property>
                               </widget>
                              </item>
@@ -1651,7 +1640,7 @@
                              <item row="1" column="0">
                               <widget class="QLabel" name="label_22">
                                <property name="text">
-                                <string>Smoothing for Internal</string>
+                                <string>Smoothing for internal</string>
                                </property>
                               </widget>
                              </item>
@@ -1661,7 +1650,7 @@
                              <item row="2" column="0">
                               <widget class="QLabel" name="label_23">
                                <property name="text">
-                                <string>Mesh Displacement Relaxation</string>
+                                <string>Mesh displacement relaxation</string>
                                </property>
                               </widget>
                              </item>
@@ -1671,7 +1660,7 @@
                              <item row="3" column="0">
                               <widget class="QLabel" name="label_24">
                                <property name="text">
-                                <string>Snapping Relaxation</string>
+                                <string>Global snapping relaxation</string>
                                </property>
                               </widget>
                              </item>
@@ -1684,7 +1673,7 @@
                           <item>
                            <widget class="QGroupBox" name="groupBox_4">
                             <property name="title">
-                             <string>Feature Snapping</string>
+                             <string>Feature snapping</string>
                             </property>
                             <layout class="QVBoxLayout" name="verticalLayout_15">
                              <item>
@@ -1705,7 +1694,7 @@
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_25">
                                   <property name="text">
-                                   <string>Snapping Relaxation</string>
+                                   <string>Feature snapping relaxation</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1715,7 +1704,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_35">
                                   <property name="text">
-                                   <string>Detect Features</string>
+                                   <string>Detect features</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1725,7 +1714,7 @@
                                    <string>Implicit</string>
                                   </property>
                                   <property name="toolTip">
-                                   <string>Snap to features detected from the surface mesh itself.</string>
+                                   <string>Snap to features detected from the surface mesh itself</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -1745,7 +1734,7 @@
                              <item>
                               <widget class="QCheckBox" name="multiSurfaceFeatureSnap">
                                <property name="text">
-                                <string>Multi-Surface Feature Snap</string>
+                                <string>Multi-surface feature snap</string>
                                </property>
                               </widget>
                              </item>
@@ -1768,7 +1757,7 @@
                              <item row="1" column="0">
                               <widget class="QLabel" name="label_27">
                                <property name="text">
-                                <string>Concave Angle (degree)</string>
+                                <string>Concave angle</string>
                                </property>
                               </widget>
                              </item>
@@ -1778,7 +1767,7 @@
                              <item row="2" column="0">
                               <widget class="QLabel" name="label_28">
                                <property name="text">
-                                <string>Min. Area Ratio</string>
+                                <string>Min. area ratio</string>
                                </property>
                               </widget>
                              </item>
@@ -1794,7 +1783,7 @@
                        <item>
                         <widget class="QGroupBox" name="bufferLayer">
                          <property name="title">
-                          <string>Buffer Layer</string>
+                          <string>Buffer layer</string>
                          </property>
                          <property name="checkable">
                           <bool>true</bool>
@@ -1806,7 +1795,7 @@
                           <item>
                            <widget class="QGroupBox" name="groupBox_11">
                             <property name="title">
-                             <string>Point Smoothing Method</string>
+                             <string>Point smoothing method</string>
                             </property>
                             <layout class="QVBoxLayout" name="verticalLayout_38">
                              <item>
@@ -1832,7 +1821,7 @@
                              <item row="0" column="0">
                               <widget class="QLabel" name="label_65">
                                <property name="text">
-                                <string>Number of Point Smoother Iterations per Timestep</string>
+                                <string>Number of point smoother iterations per timestep</string>
                                </property>
                               </widget>
                              </item>
@@ -1842,7 +1831,7 @@
                              <item row="1" column="0">
                               <widget class="QLabel" name="label_66">
                                <property name="text">
-                                <string>GETMe Transformation Parameter</string>
+                                <string>GETMe transformation parameter</string>
                                </property>
                               </widget>
                              </item>
@@ -1999,12 +1988,11 @@
                        <widget class="QLabel" name="label_19">
                         <property name="font">
                          <font>
-                          <pointsize>10</pointsize>
                           <bold>true</bold>
                          </font>
                         </property>
                         <property name="text">
-                         <string>Boundary Layer</string>
+                         <string>Boundary layer</string>
                         </property>
                        </widget>
                       </item>
@@ -2017,7 +2005,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string>Load Default Settings</string>
+                         <string>Load the boundary-layer defaults</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -2208,7 +2196,7 @@
                                 </font>
                                </property>
                                <property name="text">
-                                <string>Advanced Configuration</string>
+                                <string>Advanced configuration</string>
                                </property>
                                <property name="checked">
                                 <bool>true</bool>
@@ -2243,7 +2231,7 @@
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_14">
                                   <property name="text">
-                                   <string>Number of Grow</string>
+                                   <string>Number of grow</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2256,13 +2244,13 @@
                              <item>
                               <widget class="QGroupBox" name="groupBox_5">
                                <property name="title">
-                                <string>Static Analysis of Starting Mesh</string>
+                                <string>Static analysis of starting mesh</string>
                                </property>
                                <layout class="QFormLayout" name="formLayout_9">
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_17">
                                   <property name="text">
-                                   <string>Max. Thickness Ratio</string>
+                                   <string>Max. face thickness ratio</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2272,7 +2260,7 @@
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_60">
                                   <property name="text">
-                                   <string>Feature Angle Threshold</string>
+                                   <string>Feature angle threshold</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2285,13 +2273,13 @@
                              <item>
                               <widget class="QGroupBox" name="groupBox_6">
                                <property name="title">
-                                <string>Patch Displacement Smoothing</string>
+                                <string>Patch displacement smoothing</string>
                                </property>
                                <layout class="QFormLayout" name="formLayout_10">
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_30">
                                   <property name="text">
-                                   <string>Number of Iterations</string>
+                                   <string>Number of iterations</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2301,7 +2289,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_31">
                                   <property name="text">
-                                   <string>Smooth Layer Thickness</string>
+                                   <string>Smooth layer thickness</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2314,13 +2302,13 @@
                              <item>
                               <widget class="QGroupBox" name="groupBox_7">
                                <property name="title">
-                                <string>Medial Axis</string>
+                                <string>Medial axis</string>
                                </property>
                                <layout class="QFormLayout" name="formLayout_11">
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_32">
                                   <property name="text">
-                                   <string>Min. Axis Angle</string>
+                                   <string>Min. axis angle</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2330,7 +2318,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_33">
                                   <property name="text">
-                                   <string>max Thickness Ratio</string>
+                                   <string>Max. thickness to medial ratio</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2340,7 +2328,7 @@
                                 <item row="2" column="0">
                                  <widget class="QLabel" name="label_34">
                                   <property name="text">
-                                   <string>Number of Smoothing Iter.</string>
+                                   <string>Number of smoothing iter.</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2350,7 +2338,7 @@
                                 <item row="3" column="0">
                                  <widget class="QLabel" name="label_36">
                                   <property name="text">
-                                   <string>Max. Snapping Relaxation Iter.</string>
+                                   <string>Max. snapping relaxation iter.</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2363,13 +2351,13 @@
                              <item>
                               <widget class="QGroupBox" name="groupBox_8">
                                <property name="title">
-                                <string>Mesh Shrinking</string>
+                                <string>Mesh shrinking</string>
                                </property>
                                <layout class="QFormLayout" name="formLayout_12">
                                 <item row="0" column="0">
                                  <widget class="QLabel" name="label_51">
                                   <property name="text">
-                                   <string>Num. of Buffer Cells</string>
+                                   <string>Num. of buffer cells</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2379,7 +2367,7 @@
                                 <item row="1" column="0">
                                  <widget class="QLabel" name="label_52">
                                   <property name="text">
-                                   <string>Max. Layer Addition Iter.</string>
+                                   <string>Max. layer addition iter.</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2389,7 +2377,7 @@
                                 <item row="2" column="0">
                                  <widget class="QLabel" name="label_53">
                                   <property name="text">
-                                   <string>Max. Iter. Before Relax</string>
+                                   <string>Max. iter. before relax</string>
                                   </property>
                                  </widget>
                                 </item>
@@ -2467,13 +2455,12 @@
                  <widget class="QWidget" name="exportPage">
                   <layout class="QVBoxLayout" name="verticalLayout_22">
                    <property name="spacing">
-                    <number>9</number>
+                    <number>6</number>
                    </property>
                    <item>
                     <widget class="QLabel" name="label_37">
                      <property name="font">
                       <font>
-                       <pointsize>10</pointsize>
                        <bold>true</bold>
                       </font>
                      </property>
@@ -2502,21 +2489,9 @@
                    <item>
                     <widget class="QGroupBox" name="groupBox_20">
                      <property name="title">
-                      <string> 2D Exports</string>
+                      <string> 2D exports</string>
                      </property>
                      <layout class="QVBoxLayout" name="verticalLayout_37">
-                      <property name="leftMargin">
-                       <number>9</number>
-                      </property>
-                      <property name="topMargin">
-                       <number>9</number>
-                      </property>
-                      <property name="rightMargin">
-                       <number>9</number>
-                      </property>
-                      <property name="bottomMargin">
-                       <number>9</number>
-                      </property>
                       <item>
                        <widget class="QWidget" name="widget" native="true">
                         <layout class="QHBoxLayout" name="horizontalLayout_12">
@@ -2535,7 +2510,7 @@
                          <item>
                           <widget class="QPushButton" name="export2DPlane">
                            <property name="text">
-                            <string>2D Plane</string>
+                            <string>2D plane</string>
                            </property>
                           </widget>
                          </item>
@@ -2552,7 +2527,7 @@
                       <item>
                        <widget class="QLabel" name="label_13">
                         <property name="text">
-                         <string>&quot;2D exports&quot; exports the generated mesh in 2D. It is implemented using OpenFOAM &quot;extrudeMesh&quot; utility. &quot;2D Plane&quot; uses &quot;plane&quot; extrudeModel and &quot;Axi-Symmetry&quot; uses &quot;wedge&quot;. This is for the users who are familiar with the operation of &quot;extrudeMesh&quot;.</string>
+                         <string>&quot;2D exports&quot; exports the generated mesh in 2D. It is implemented using OpenFOAM &quot;extrudeMesh&quot; utility. &quot;2D plane&quot; uses &quot;plane&quot; extrudeModel and &quot;Axi-Symmetry&quot; uses &quot;wedge&quot;. This is for the users who are familiar with the operation of &quot;extrudeMesh&quot;.</string>
                         </property>
                         <property name="wordWrap">
                          <bool>true</bool>
@@ -2571,7 +2546,7 @@
                       </size>
                      </property>
                      <property name="text">
-                      <string>Export Mesh</string>
+                      <string>Export mesh</string>
                      </property>
                     </widget>
                    </item>
@@ -2634,7 +2609,7 @@
                   <item>
                    <widget class="QPushButton" name="finishSteps">
                     <property name="text">
-                     <string>Finish All Steps</string>
+                     <string>Finish all steps</string>
                     </property>
                    </widget>
                   </item>
@@ -2694,7 +2669,7 @@
                   </property>
                   <layout class="QVBoxLayout" name="verticalLayout_3">
                    <property name="topMargin">
-                    <number>2</number>
+                    <number>0</number>
                    </property>
                    <property name="bottomMargin">
                     <number>0</number>
@@ -2718,12 +2693,11 @@
                        <widget class="QLabel" name="label_61">
                         <property name="font">
                          <font>
-                          <pointsize>10</pointsize>
                           <bold>true</bold>
                          </font>
                         </property>
                         <property name="text">
-                         <string>Display Control</string>
+                         <string>Display control</string>
                         </property>
                        </widget>
                       </item>
@@ -2801,11 +2775,6 @@
                              <verstretch>0</verstretch>
                             </sizepolicy>
                            </property>
-                           <property name="font">
-                            <font>
-                             <bold>false</bold>
-                            </font>
-                           </property>
                            <property name="text">
                             <string>Cut</string>
                            </property>
@@ -2867,13 +2836,8 @@
                              <verstretch>0</verstretch>
                             </sizepolicy>
                            </property>
-                           <property name="font">
-                            <font>
-                             <bold>false</bold>
-                            </font>
-                           </property>
                            <property name="text">
-                            <string>Mesh Quality</string>
+                            <string>Mesh quality</string>
                            </property>
                            <property name="checked">
                             <bool>false</bool>
@@ -3101,7 +3065,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> Set the axis direction based on the origin</string>
+                         <string>Show or hide the origin axes</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3130,7 +3094,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> Display x,y and z axis coordinates</string>
+                         <string>Show or hide the viewport cube axes</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3156,7 +3120,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string>Ruler</string>
+                         <string>Show or hide the interactive measurement ruler</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3182,7 +3146,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> Toggle between Perspective and Orthogonal views</string>
+                         <string>Use parallel rather than perspective projection</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3208,7 +3172,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> Show the entire model in the windows to fit the view</string>
+                         <string>Fit all visible geometry and mesh objects in the viewport</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3231,7 +3195,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> View the model from cross-section of the closest-axis, aligning with current state</string>
+                         <string>Align the camera with a principal axis</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3254,7 +3218,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string> Rotate the model by 90 degrees</string>
+                         <string>Roll the current camera view by 90 degrees</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3277,7 +3241,7 @@
                          </size>
                         </property>
                         <property name="toolTip">
-                         <string>Rotation Center</string>
+                         <string>Show or hide the interactive camera rotation centre</string>
                         </property>
                         <property name="icon">
                          <iconset resource="../../../resource.qrc">
@@ -3298,7 +3262,7 @@
                        <widget class="QWidget" name="widget_17" native="true">
                         <layout class="QHBoxLayout" name="horizontalLayout_24">
                          <property name="spacing">
-                          <number>3</number>
+                          <number>4</number>
                          </property>
                          <property name="topMargin">
                           <number>0</number>
@@ -3316,7 +3280,6 @@
                            </property>
                            <property name="font">
                             <font>
-                             <pointsize>10</pointsize>
                              <bold>true</bold>
                             </font>
                            </property>
@@ -3324,14 +3287,7 @@
                             <enum>QFrame::Shape::NoFrame</enum>
                            </property>
                            <property name="text">
-                            <string>0</string>
-                           </property>
-                          </widget>
-                         </item>
-                         <item>
-                          <widget class="QLabel" name="label_62">
-                           <property name="text">
-                            <string>cells</string>
+                            <string/>
                            </property>
                           </widget>
                          </item>
@@ -3361,30 +3317,24 @@
                         </property>
                         <layout class="QHBoxLayout" name="horizontalLayout_27">
                          <property name="spacing">
-                          <number>2</number>
+                          <number>4</number>
                          </property>
                          <property name="leftMargin">
-                          <number>2</number>
+                          <number>0</number>
                          </property>
                          <property name="topMargin">
-                          <number>1</number>
+                          <number>0</number>
                          </property>
                          <property name="rightMargin">
-                          <number>1</number>
+                          <number>0</number>
                          </property>
                          <property name="bottomMargin">
-                          <number>1</number>
+                          <number>0</number>
                          </property>
                          <item>
                           <widget class="QLabel" name="label_64">
-                           <property name="font">
-                            <font>
-                             <pointsize>12</pointsize>
-                             <bold>true</bold>
-                            </font>
-                           </property>
                            <property name="text">
-                            <string>BG</string>
+                            <string>Background</string>
                            </property>
                           </widget>
                          </item>
@@ -3428,11 +3378,6 @@
                        <verstretch>0</verstretch>
                       </sizepolicy>
                      </property>
-                     <property name="font">
-                      <font>
-                       <family>휴먼옛체</family>
-                      </font>
-                     </property>
                      <property name="contextMenuPolicy">
                       <enum>Qt::ContextMenuPolicy::CustomContextMenu</enum>
                      </property>
@@ -3470,13 +3415,12 @@
     </property>
     <widget class="QMenu" name="menuOpen_Recent">
      <property name="title">
-      <string>Open Recent</string>
+      <string>Open &amp;recent</string>
      </property>
-     <addaction name="action"/>
     </widget>
     <widget class="QMenu" name="menuLoadModel">
      <property name="title">
-      <string>Load Model</string>
+      <string>&amp;Import</string>
      </property>
      <addaction name="actionLoadGeometry"/>
      <addaction name="actionLoadMesh"/>
@@ -3501,8 +3445,6 @@
     </property>
     <addaction name="actionUndo"/>
     <addaction name="actionRedo"/>
-    <addaction name="separator"/>
-    <addaction name="actionTransactionHistory"/>
    </widget>
    <widget class="QMenu" name="menuMesh">
     <property name="title">
@@ -3523,7 +3465,7 @@
     <property name="title">
      <string>&amp;Settings</string>
     </property>
-    <addaction name="actionTheme"/>
+    <addaction name="actionPreferences"/>
    </widget>
    <widget class="QMenu" name="menuHelp">
     <property name="title">
@@ -3533,47 +3475,41 @@
     <addaction name="actionTutorials"/>
     <addaction name="actionLicense"/>
     <addaction name="separator"/>
-    <addaction name="actionPrivacySettings"/>
+    <addaction name="actionRunDetails"/>
    </widget>
    <widget class="QMenu" name="menuView">
     <property name="title">
      <string>&amp;View</string>
     </property>
     <addaction name="actionViewFit"/>
+    <addaction name="actionViewZoomSelection"/>
     <addaction name="actionViewAlignAxis"/>
     <addaction name="actionViewRoll"/>
     <addaction name="separator"/>
     <addaction name="actionViewAxis"/>
     <addaction name="actionViewCubeAxis"/>
     <addaction name="actionViewRuler"/>
-    <addaction name="actionViewPerspective"/>
+    <addaction name="actionViewParallelProjection"/>
     <addaction name="actionViewRotationCenter"/>
     <addaction name="separator"/>
     <addaction name="actionTerminalHere"/>
-   </widget>
-   <widget class="QMenu" name="menuParallel">
-    <property name="title">
-     <string>&amp;Parallel</string>
-    </property>
-    <addaction name="actionParallelEnvironment"/>
    </widget>
    <addaction name="menuFile"/>
    <addaction name="menuEdit"/>
    <addaction name="menuMesh"/>
    <addaction name="menuView"/>
-   <addaction name="menuParallel"/>
    <addaction name="menuSettings"/>
    <addaction name="menuHelp"/>
   </widget>
   <widget class="QStatusBar" name="statusbar"/>
   <action name="actionNew">
    <property name="text">
-    <string>&amp;New Case in Folder…</string>
+    <string>&amp;New case in folder…</string>
    </property>
   </action>
   <action name="actionNewUntitled">
    <property name="text">
-    <string>New &amp;Untitled Case</string>
+    <string>New &amp;untitled case</string>
    </property>
    <property name="toolTip">
     <string>Start work straight away in a temporary folder, and choose where it lives later</string>
@@ -3591,23 +3527,23 @@
   </action>
   <action name="actionSaveAs">
    <property name="text">
-    <string>Save Settings As... (settings only)</string>
+    <string>Save se&amp;ttings to new case…</string>
    </property>
    <property name="toolTip">
-    <string>Create a new case containing FoamMesh state only; native geometry and mesh artifacts are not copied</string>
+    <string>Create a new case holding these FoamMesh settings only; geometry and mesh files are not copied</string>
    </property>
   </action>
   <action name="actionSaveProjectAs">
    <property name="text">
-    <string>Save Full Case Copy As... (settings, geometry and mesh)</string>
+    <string>Save case &amp;as…</string>
    </property>
    <property name="toolTip">
-    <string>Create and verify a full case-directory copy, excluding disposable cache and live lock files</string>
+    <string>Copy the whole case (settings, geometry and mesh) to a new folder and verify the copy; disposable cache and live lock files are left out</string>
    </property>
   </action>
   <action name="actionLoadGeometry">
    <property name="text">
-    <string>Geometry...</string>
+    <string>&amp;Geometry…</string>
    </property>
    <property name="toolTip">
     <string>Import geometry into the current case using the Geometry workflow</string>
@@ -3615,12 +3551,12 @@
   </action>
   <action name="actionLoadMesh">
    <property name="text">
-    <string>Mesh...</string>
+    <string>&amp;Mesh…</string>
    </property>
   </action>
   <action name="actionClose">
    <property name="text">
-    <string>Close Project</string>
+    <string>&amp;Close project</string>
    </property>
   </action>
   <action name="actionExit">
@@ -3638,29 +3574,24 @@
     <string>&amp;Redo</string>
    </property>
   </action>
-  <action name="actionTransactionHistory">
-   <property name="text">
-    <string>Transaction History</string>
-   </property>
-  </action>
   <action name="actionMeshInfo">
    <property name="text">
-    <string>Info...</string>
+    <string>&amp;Info…</string>
    </property>
   </action>
   <action name="actionMeshScale">
    <property name="text">
-    <string>Scale...</string>
+    <string>&amp;Scale…</string>
    </property>
   </action>
   <action name="actionMeshTranslate">
    <property name="text">
-    <string>Translate...</string>
+    <string>&amp;Translate…</string>
    </property>
   </action>
   <action name="actionMeshRotate">
    <property name="text">
-    <string>Rotate...</string>
+    <string>R&amp;otate…</string>
    </property>
    <property name="toolTip">
     <string>Rotate the current polyMesh around an axis and optional pivot, with recovery</string>
@@ -3668,17 +3599,17 @@
   </action>
   <action name="actionMeshCheck">
    <property name="text">
-    <string>Mesh Check...</string>
+    <string>Mesh &amp;check…</string>
    </property>
   </action>
   <action name="actionMeshRepair">
    <property name="text">
-    <string>Mesh Repair...</string>
+    <string>Mesh &amp;repair…</string>
    </property>
   </action>
   <action name="actionMeshRestore">
    <property name="text">
-    <string>Restore Previous Mesh...</string>
+    <string>Restore pre&amp;vious mesh…</string>
    </property>
    <property name="toolTip">
     <string>Replace the current mesh with the verified recovery copy saved before the last transform or repair</string>
@@ -3686,25 +3617,36 @@
   </action>
   <action name="actionParameters">
    <property name="text">
-    <string>&amp;Parameters</string>
+    <string>&amp;Quality thresholds…</string>
    </property>
   </action>
-  <action name="actionTheme">
+  <action name="actionPreferences">
    <property name="text">
-    <string>Theme...</string>
+    <string>&amp;Preferences…</string>
+   </property>
+   <property name="toolTip">
+    <string>Theme, OpenFOAM 13 runtime, diagnostics and geometry qualification</string>
    </property>
   </action>
   <action name="actionViewFit">
    <property name="text">
-    <string>Fit View</string>
+    <string>&amp;Fit view</string>
    </property>
    <property name="toolTip">
     <string>Fit all visible geometry and mesh objects in the viewport</string>
    </property>
   </action>
+  <action name="actionViewZoomSelection">
+   <property name="text">
+    <string>&amp;Zoom to selection</string>
+   </property>
+   <property name="toolTip">
+    <string>Fit the view to the parts selected in the outline or the viewport</string>
+   </property>
+  </action>
   <action name="actionViewAlignAxis">
    <property name="text">
-    <string>Align Camera...</string>
+    <string>&amp;Align camera…</string>
    </property>
    <property name="toolTip">
     <string>Align the camera with a principal axis</string>
@@ -3712,7 +3654,7 @@
   </action>
   <action name="actionViewRoll">
    <property name="text">
-    <string>Roll Camera 90 Degrees</string>
+    <string>&amp;Roll camera 90 degrees</string>
    </property>
    <property name="toolTip">
     <string>Roll the current camera view by 90 degrees</string>
@@ -3723,7 +3665,7 @@
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Origin Axes</string>
+    <string>&amp;Origin axes</string>
    </property>
    <property name="toolTip">
     <string>Show or hide the origin axes</string>
@@ -3734,7 +3676,7 @@
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Cube Axes</string>
+    <string>Cu&amp;be axes</string>
    </property>
    <property name="toolTip">
     <string>Show or hide the viewport cube axes</string>
@@ -3745,18 +3687,18 @@
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Measurement Ruler</string>
+    <string>&amp;Measurement ruler</string>
    </property>
    <property name="toolTip">
     <string>Show or hide the interactive measurement ruler</string>
    </property>
   </action>
-  <action name="actionViewPerspective">
+  <action name="actionViewParallelProjection">
    <property name="checkable">
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Parallel Projection</string>
+    <string>&amp;Parallel projection</string>
    </property>
    <property name="toolTip">
     <string>Use parallel rather than perspective projection</string>
@@ -3767,30 +3709,28 @@
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>Rotation Center</string>
+    <string>Ro&amp;tation centre</string>
    </property>
    <property name="toolTip">
-    <string>Show or hide the interactive camera rotation center</string>
+    <string>Show or hide the interactive camera rotation centre</string>
    </property>
   </action>
   <action name="actionAbout">
    <property name="text">
-    <string>About</string>
+    <string>&amp;About</string>
    </property>
   </action>
-  <action name="action">
+  <action name="actionRunDetails">
    <property name="text">
-    <string/>
+    <string>&amp;Run details</string>
    </property>
-  </action>
-  <action name="actionParallelEnvironment">
-   <property name="text">
-    <string>&amp;Environment</string>
+   <property name="toolTip">
+    <string>Read what the last run did, and open its log</string>
    </property>
   </action>
   <action name="actionTerminalHere">
    <property name="text">
-    <string>Terminal Here</string>
+    <string>Terminal &amp;here</string>
    </property>
    <property name="toolTip">
     <string>Open a terminal in the current case with the OpenFOAM environment</string>
@@ -3798,20 +3738,15 @@
   </action>
   <action name="actionTutorials">
    <property name="text">
-    <string>Tutorials</string>
+    <string>&amp;Tutorials</string>
    </property>
   </action>
   <action name="actionLicense">
    <property name="text">
-    <string>License and Notices</string>
+    <string>&amp;Licenses and notices</string>
    </property>
    <property name="toolTip">
     <string>View FoamMesh licensing and third-party notices</string>
-   </property>
-  </action>
-  <action name="actionPrivacySettings">
-   <property name="text">
-    <string>&amp;Privacy Settings...</string>
    </property>
   </action>
  </widget>

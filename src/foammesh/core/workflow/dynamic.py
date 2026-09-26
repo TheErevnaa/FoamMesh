@@ -61,9 +61,46 @@ class EngineWorkflowGraph:
         self.descriptor.task(task_id)
         return self._state[task_id]
 
+    def _blocking(self, task_id: str, seen: set | None = None) -> list:
+        """The prerequisites genuinely holding ``task_id``, in descriptor order.
+
+        Plan 31 DP-144. An untouched optional prerequisite is not one. The run
+        already agrees: `task_state_store._record` skips every OPTIONAL or
+        REPEATABLE task nobody configured (DP-35), so "Run to end" walks
+        straight past them. Only the manual walk disagreed, and because Gmsh
+        chains its five optional tasks in a line, that disagreement reached
+        every page after them -- Compute Mesh sat LOCKED behind Periodic
+        Pairs, and a user who wanted boundary layers and nothing else had to
+        press Save on three pages of settings they did not want, with no Skip
+        control anywhere in the interface to decline them.
+
+        An untouched optional parent is stepped *through*, not ignored: its
+        own blockers are this task's blockers, so `gmsh.compute` is still held
+        by Global Sizing until Global Sizing is accepted. LOCKED and READY are
+        the two untouched states; anything further along (CONFIGURED, RUNNING,
+        FAILED) is a task the user opted into, and those still hold.
+        """
+        seen = set() if seen is None else seen
+        found: list[str] = []
+        for parent in self.descriptor.task(task_id).depends_on:
+            if parent in seen:
+                continue
+            seen.add(parent)
+            state = self._state[parent]
+            if state in _ACCEPTED:
+                continue
+            untouched = state in {TaskState.LOCKED, TaskState.READY}
+            if untouched and (self.descriptor.task(parent).cardinality
+                              is not TaskCardinality.REQUIRED):
+                found.extend(self._blocking(parent, seen))
+                continue
+            found.append(parent)
+        order = {task.task_id: task.order
+                 for task in self.descriptor.ordered_tasks()}
+        return sorted(found, key=lambda item: order[item])
+
     def is_runnable(self, task_id: str) -> bool:
-        task = self.descriptor.task(task_id)
-        return all(self._state[parent] in _ACCEPTED for parent in task.depends_on)
+        return not self._blocking(task_id)
 
     def blocking_prerequisites(self, task_id: str) -> tuple[str, ...]:
         """The prerequisites of ``task_id`` that are not accepted yet.
@@ -76,10 +113,11 @@ class EngineWorkflowGraph:
         at, and nothing about what was holding it. Which of the seven manual
         Gmsh tasks is unaccepted is knowable here and nowhere else, so it is
         computed here and carried in the refusal.
+
+        DP-144 narrowed "not accepted" to "not accepted and not an optional
+        step the run would skip"; see :meth:`_blocking`.
         """
-        task = self.descriptor.task(task_id)
-        return tuple(parent for parent in task.depends_on
-                     if self._state[parent] not in _ACCEPTED)
+        return tuple(self._blocking(task_id))
 
     def _locked(self, task_id: str) -> ValueError:
         """The refusal a locked task raises, naming what it waits on.
@@ -292,12 +330,46 @@ class EngineWorkflowGraph:
             elif state is TaskState.READY and not runnable:
                 self._state[task.task_id] = TaskState.LOCKED
 
+    #: What a parent may be in while the task below it is SKIPPED (DP-241).
+    #:
+    #: A skip says nothing ran here, and nothing running does not require the
+    #: prerequisites to have run either. DP-144 made the optional chain
+    #: walkable -- an untouched optional parent does not hold the task behind
+    #: it shut -- so a user may legitimately decline `Curve controls` while
+    #: `Size fields` is still untouched, and the product writes that document
+    #: itself. Judged by the rule below, it could not read it back: the load
+    #: raised, the store reported `inconsistent_state`, and every accepted
+    #: stage on every row was replaced with a fresh document.
+    #:
+    #: LOCKED is deliberately not here. LOCKED means the workflow never
+    #: offered the row, so a skip recorded under one did not come from a press
+    #: the user made, and neither are EDITING, FAILED, RUNNING or STALE: each
+    #: of those is a parent mid-flight, which is not a state a considered
+    #: decision about the row behind it was taken in.
+    _SKIP_PARENTS = _ACCEPTED | {TaskState.READY, TaskState.CONFIGURED}
+
     def _validate_loaded_dependencies(self) -> None:
         for task in self.descriptor.ordered_tasks():
             state = self._state[task.task_id]
-            if state in _ACCEPTED | {TaskState.RUNNING, TaskState.CONFIGURED}:
-                missing = [parent for parent in task.depends_on
-                           if self._state[parent] not in _ACCEPTED]
-                if missing:
-                    raise ValueError(
-                        f'task {task.task_id!r} is {state.value} before {missing}')
+            if state is TaskState.SKIPPED:
+                allowed = self._SKIP_PARENTS
+            elif state in _ACCEPTED | {TaskState.RUNNING, TaskState.CONFIGURED}:
+                allowed = _ACCEPTED
+            else:
+                continue
+            missing = [parent for parent in task.depends_on
+                       if self._state[parent] not in allowed]
+            if missing:
+                # DP-241, left standing. This said `is skipped before
+                # ['gmsh.size_fields']`: it named the pair of ids and neither
+                # of the two states, and the store turns it into one reason
+                # code, so the sentence a user reads after their saved
+                # progress has been discarded said only that something was
+                # inconsistent. Both halves of the contradiction are named,
+                # with the state each is in, because that is the whole of
+                # what makes it a contradiction.
+                detail = ', '.join(
+                    f'{parent!r} is {self._state[parent].value}'
+                    for parent in missing)
+                raise ValueError(
+                    f'task {task.task_id!r} is {state.value} while {detail}')

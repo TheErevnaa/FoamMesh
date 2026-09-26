@@ -17,14 +17,17 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from foammesh.core.facade.errors import ValidationFailedError
+from foammesh.core.facade.fields import REGISTRY
 from foammesh.view.facade_client import query, submit
 
 from .conditional_fields import refresh_applicability
+from foammesh.view.theming.metrics import (align_unit_column,
+                                           apply_form_metrics)
 from .field_widgets import FieldEditor
 
 
@@ -56,21 +59,31 @@ class FieldGroupPage(QWidget):
         outer = QVBoxLayout(self)
         title = QLabel(self.heading or self.token, self)
         title.setObjectName('fieldGroupHeading')
+        # Plan 33 SETUP-01. Two paragraphs above the first control, on a page
+        # whose whole job is five spin boxes: MEASURED on Execution
+        # Preferences at a 520 px panel, the purpose and the caveat came to
+        # six wrapped lines and pushed the first setting below them. They are
+        # still the page's own words and still class attributes, so anything
+        # that reads `page.purpose` or `page.caveat` reads the same string --
+        # they are the heading's tooltip and the page's accessible
+        # description now, which is where an explanation belongs when the
+        # reader did not ask for one.
+        explained = ' '.join(part for part in (self.purpose, self.caveat)
+                             if part)
+        title.setToolTip(explained)
+        self.setAccessibleDescription(explained)
+        # W-O1. A heading over a group of controls belongs on the group, and
+        # this one had a group already: the box below was headed `Settings`,
+        # which names the column rather than the settings in it. The box now
+        # carries the heading and the label carries nothing but the words,
+        # for whatever reads `page.heading` off the widget tree.
+        title.setVisible(False)
+        self._heading = title
         outer.addWidget(title)
-        if self.purpose:
-            purpose = QLabel(self.purpose, self)
-            purpose.setWordWrap(True)
-            outer.addWidget(purpose)
-        if self.caveat:
-            caveat = QLabel(self.caveat, self)
-            caveat.setObjectName('fieldGroupCaveat')
-            caveat.setWordWrap(True)
-            caveat.setProperty('foammeshStatus', 'warning')
-            outer.addWidget(caveat)
 
         body = QWidget(self)
-        self._form = QGroupBox(self.tr('Settings'), body)
-        QFormLayout(self._form)
+        self._form = QGroupBox(self.heading or self.token, body)
+        apply_form_metrics(QFormLayout(self._form))
         body_layout = QVBoxLayout(body)
         body_layout.addWidget(self._form)
         body_layout.addStretch(1)
@@ -84,6 +97,10 @@ class FieldGroupPage(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+        self._outer = outer
+        self._body = body
+        self._scroll = scroll
+        self._embedded = False
 
         self._apply = QPushButton(self.tr('Apply'), self)
         self._revert = QPushButton(self.tr('Revert'), self)
@@ -124,13 +141,92 @@ class FieldGroupPage(QWidget):
             editor.valueChanged.connect(self._on_changed)
             row = QHBoxLayout()
             row.addWidget(editor.editor, 1)
-            if descriptor.unit:
-                row.addWidget(editor.unit_label)
+            # DP-156, as on the task page: the cell always ends with the unit
+            # label so the column can be given one width.
+            row.addWidget(editor.unit_label)
             container = QWidget(self._form)
             container.setLayout(row)
             layout.addRow(editor.label, container)
             self._editors[field_id] = editor
-        self.reload()
+        # DP-339. A rebuild replaces the editors; it is not a write, so an
+        # edit that has not reached the case yet is carried onto the new ones.
+        self.reload(discard_pending=False)
+
+    def form_layout(self) -> QFormLayout:
+        """The form this panel's editors are drawn into.
+
+        DP-154. A task page stacking two of these panels aligns their label
+        columns, which it can only do if it can reach the layouts.
+        """
+        return self._form.layout()
+
+    def setEmbedded(self, embedded: bool = True) -> None:
+        """Stop being a page in its own right and become a section of one.
+
+        DP-155. The class was written as a standalone page -- heading,
+        purpose, its own ``QScrollArea``, its own Apply -- and the snappy
+        workflow then mounted four of them as panels *inside* task pages that
+        already scroll. So the twenty-seven mesh quality limits were drawn
+        into 1477px of content inside a 360px window, itself inside the page's
+        own scroller: MEASURED, 1117px of the limits could only be reached by
+        landing the pointer on the inner panel and scrolling there, with two
+        vertical scrollbars a few pixels apart and no sign of which one the
+        wheel would move. The inner bar also took 12px off its panel's width,
+        so the panel with the bar put its editors 12px left of the panel
+        without one -- the same column split DP-154 had just closed, reopened
+        one level down.
+
+        Embedding lifts the body straight out of the scroll area and drops the
+        scroll area, so the panel is exactly as tall as its rows and the page
+        it sits on does all the scrolling. It is deliberately not the
+        default: a subclass reached as a page in its own right does need to
+        scroll. Plan 32 W1 made `ExecutionPreferencesPage` and
+        `GmshHealingPanel` sections of Mesh setup and Preparation rather than
+        rows of the outline, so both are embedded by their hosts.
+
+        DP-157. Embedding also takes the panel's own Apply and Revert
+        away. A panel is a section of a page, and the page already
+        carries Preview, Update and Revert for everything on it; leaving
+        the panel's pair in place put three commit controls on the QA
+        page, one of which committed the twenty-seven mesh quality limits
+        and two of which did not, with nothing on screen to say which was
+        which. The page adopts the panel -- `EngineTaskPage.adoptPanel`
+        -- and submits the panel's edits with its own.
+        """
+        embedded = bool(embedded)
+        if embedded == self._embedded or not embedded:
+            # Un-embedding is not supported: nothing needs it, and putting the
+            # body back would have to rebuild a scroll area to put it in.
+            return
+        self._embedded = True
+        body = self._scroll.takeWidget()
+        index = self._outer.indexOf(self._scroll)
+        self._outer.removeWidget(self._scroll)
+        self._scroll.setParent(None)
+        self._scroll.deleteLater()
+        self._scroll = None
+        self._outer.insertWidget(index, body)
+        body.setParent(self)
+        body.show()
+        # Plan 33 section 6 check 4, W-O2. A panel standing on its own needs
+        # its own left margin; a panel embedded in a page is inside the page's
+        # margin already, and these two default 9 px layout margins -- this
+        # one and the body's -- were adding 18 px on top of it. MEASURED on
+        # Surface features at a 635 px settings column: the page's own form
+        # put its labels at x=31 and the two embedded panels put theirs at
+        # x=44, one page, two label columns. The panel keeps its vertical
+        # margins, which separate it from what is above and below it.
+        for layout in (self._outer, body.layout()):
+            if layout is None:
+                continue
+            margins = layout.contentsMargins()
+            layout.setContentsMargins(0, margins.top(), 0, margins.bottom())
+        for button in (self._apply, self._revert):
+            button.hide()
+
+    def isEmbedded(self) -> bool:
+        """True when this panel is a section of a task page (DP-155)."""
+        return self._embedded
 
     def choices_for(self, field_id: str):
         """Runtime-narrowed rows for one field, or ``None`` for the schema's.
@@ -142,18 +238,49 @@ class FieldGroupPage(QWidget):
 
     # -- values ------------------------------------------------------------ #
 
-    def reload(self) -> None:
+    def reload(self, *, discard_pending: bool = True) -> None:
+        """Re-read every editor from the case.
+
+        DP-339. `discard_pending` says what to do with an edit nobody has
+        committed. After a patch the facade accepted, and after a revert,
+        the edit is spent and goes; that is what a reload always did. But a
+        reload is also how a page refreshes itself, and a refresh arrives
+        for reasons that have nothing to do with the person typing: the
+        method page reloads this band on every revisit, and the execution
+        band rebuilds itself when a cold runtime probe finally answers.
+        MEASURED on all three journeys of the settings-column campaign:
+        `serial` was typed into the execution band, the target solver and
+        the mesher were chosen next, each choice refreshed the method page,
+        the refresh reloaded the band -- and the press that followed found
+        `_pending` empty, sent no patch at all (the journal holds no
+        `mesh.execution.*` transaction) and left the case on `auto`. So a
+        refresh now keeps the typed value on screen and in the patch, and
+        only a write or a revert clears it.
+        """
+        kept = {} if discard_pending else dict(self._pending)
         self._pending.clear()
         if self._editors:
             values = self._client.field_values(tuple(self._editors))
             for field_id, editor in self._editors.items():
+                if field_id in kept:
+                    # The store has not been told about this one yet, so what
+                    # the person typed is the truer value of the two.
+                    editor.set_value(kept[field_id])
+                    continue
                 editor.set_value(
                     values.get(field_id, editor.descriptor.default))
+            self._pending.update(
+                (field_id, value) for field_id, value in kept.items()
+                if field_id in self._editors)
             # CP-09 item 4. A setting the configuration cannot reach stays on
             # the page, greyed and explained, and out of the patch.
             self._inactive = refresh_applicability(
                 self._client, self._editors, self._pending)
-        self._set_dirty(False)
+        # DP-156. A page reached on its own aligns its own unit column; a
+        # panel embedded on a task page has this done again, across both
+        # panels, after the page's refresh has reloaded them.
+        align_unit_column((self.form_layout(),))
+        self._set_dirty(bool(self._pending))
 
     @property
     def is_dirty(self) -> bool:
@@ -188,6 +315,38 @@ class FieldGroupPage(QWidget):
         # of the old body and still runs after the write lands.
         return submit(self._client, 'configuration.patch',
                       {'patch': self.pending_patch()}, then=applied)
+
+    async def save(self) -> bool:
+        """Write the pending edits and say whether they were accepted.
+
+        DP-227. `apply` is a button handler: it schedules the write and
+        reports a refusal in a modal of its own, and the task it returns
+        completes *before* its continuation runs, so awaiting it tells a
+        caller nothing about the outcome. A wizard needs an answer it can
+        branch on before it moves the outline, so this awaits the same
+        command and answers True only when the facade accepted it. The
+        message belongs to whoever asked, which is why there is no dialog
+        here.
+
+        Plan 30 WP-08. There is no synchronous fallback: a write from a view
+        module goes on the scheduler or it does not happen, and a client with
+        no awaitable `run` is answered False rather than served from the GUI
+        thread. Every caller already has to handle a refusal.
+        """
+        if not self._pending:
+            return True
+        parameters = {'patch': self.pending_patch()}
+        runner = getattr(self._client, 'run', None)
+        if runner is None:
+            return False
+        try:
+            result = await runner('configuration.patch', parameters)
+        except Exception:
+            return False
+        if getattr(result, 'status', 'accepted') != 'accepted':
+            return False
+        self.reload()
+        return True
 
     def revert(self) -> None:
         self.reload()
@@ -242,7 +401,253 @@ class ExecutionPreferencesPage(FieldGroupPage):
         'mesh.execution.preserve_refinement_history',
         'mesh.execution.decomposition_weight_field',
     )
-    heading = 'Execution'
+    heading = 'Meshing resources'
+
+    #: The route the band is filtering for: the engine id of the checked
+    #: meshing method, as the host page reports it.
+    _engine_id = ''
+
+    #: Which field each partitioner consumes, read off the writer
+    #: (`foammesh/openfoam/decomposition.py`): `NEEDS_COEFFICIENTS` takes the
+    #: cell vector for `hierarchical` and `simple`, and the order belongs to
+    #: `hierarchical` alone. A method the writer stops consuming a field for
+    #: is one edit here, beside the rest of the rule.
+    METHOD_FIELDS = {
+        'hierarchical': ('mesh.execution.decomposition_order',
+                         'mesh.execution.decomposition_cells'),
+        'simple': ('mesh.execution.decomposition_cells',),
+    }
+
+    #: Every field a parallel OpenFOAM run reads, whatever the partitioner.
+    DECOMPOSITION_FIELDS = (
+        'mesh.execution.max_cpu_cores',
+        'mesh.execution.decomposition_method',
+        'mesh.execution.preserve_face_zones',
+        'mesh.execution.preserve_baffles',
+        'mesh.execution.preserve_patches',
+        'mesh.execution.preserve_refinement_history',
+        'mesh.execution.decomposition_weight_field',
+    )
+
+    #: Why a setting no run reads is not on the page. Keyed by field id, and
+    #: carried on the editor that is still holding the stored value.
+    UNREAD_FIELDS = {
+        'mesh.execution.max_memory_bytes':
+            'No meshing runtime enforces a memory ceiling, so this number '
+            'bounds nothing that runs.',
+        'mesh.execution.allow_distributed':
+            'Meshing runs on this machine, so there is nothing to '
+            'distribute.',
+        'mesh.execution.preferred_backend':
+            'Each mesher has one runtime, and the run takes it from the '
+            'meshing method.',
+    }
+
+    def visible_field_ids(self, engine_id, mode, method) -> tuple[str, ...]:
+        """The fields the chosen mesher reads, in page order.
+
+        Plan 33 SETUP-02. This is the whole rule, in one readable place,
+        because "which fields does this mesher read" is the question the page
+        answered wrongly: it offered all thirteen on every route, so a Gmsh
+        case -- one process, threads, nothing decomposed -- was asked for a
+        decomposition method, an order, a cell vector, four partitioner
+        constraints and a weight field, none of which a Gmsh run reads.
+
+        A hidden field keeps its editor and its stored value: this narrows
+        what is asked, it does not clear what the case holds.
+        """
+        engine = str(engine_id or '').rsplit('.', 1)[-1].lower()
+        mode = str(mode or '').rsplit('.', 1)[-1].lower()
+        method = str(method or '').rsplit('.', 1)[-1].lower()
+        shown = {'mesh.execution.mode'}
+        if engine == 'gmsh':
+            # Gmsh meshes in one process; the count is threads, not ranks.
+            shown.add('mesh.execution.max_cpu_cores')
+        elif engine == 'snappy':
+            if mode == 'parallel':
+                shown.update(self.DECOMPOSITION_FIELDS)
+                shown.update(self.METHOD_FIELDS.get(method, ()))
+        else:
+            # No mesher is chosen yet: ask only what both of them read, and
+            # let the rest arrive with the answer to which mesher this is.
+            shown.add('mesh.execution.max_cpu_cores')
+        return tuple(field_id for field_id in self.field_ids
+                     if field_id in shown)
+
+    def setEngine(self, engine_id: str) -> None:
+        """Say which mesher the page is standing on, and ask the rule again."""
+        engine = str(engine_id or '').rsplit('.', 1)[-1].lower()
+        if engine == self._engine_id:
+            return
+        self._engine_id = engine
+        self._applyRoute()
+        self._refreshEffectiveCount()
+
+    def engineId(self) -> str:
+        return self._engine_id
+
+    def effectiveCountText(self) -> str:
+        """What the run will use, in the words beside the ceiling."""
+        label = getattr(self, '_effective', None)
+        return '' if label is None else label.text()
+
+    # -- construction ------------------------------------------------------ #
+
+    def build(self) -> None:
+        """Build the rows, then hand each one to its editor.
+
+        `FieldEditor.setApplicability` can only take a row off the form if it
+        knows which form the row is in -- otherwise the widgets hide and
+        `QFormLayout` keeps the empty line. The generic page does not hand the
+        layout over, so this does, for its own rows.
+        """
+        super().build()
+        self._registerRows()
+        self._mountEffectiveCount()
+        self._applyRoute()
+
+    def _registerRows(self) -> None:
+        layout = self.form_layout()
+        for editor in self._editors.values():
+            row, _role = layout.getWidgetPosition(editor.label)
+            if row < 0:
+                continue
+            item = layout.itemAt(row, QFormLayout.ItemRole.FieldRole)
+            editor.setRow(layout, item.widget() if item is not None else None)
+
+    def _cellFor(self, field_id: str):
+        editor = self._editors.get(field_id)
+        if editor is None:
+            return None
+        layout = self.form_layout()
+        row, _role = layout.getWidgetPosition(editor.label)
+        if row < 0:
+            return None
+        item = layout.itemAt(row, QFormLayout.ItemRole.FieldRole)
+        return item.widget() if item is not None else None
+
+    def _mountEffectiveCount(self) -> None:
+        """Put the count the run will use beside the ceiling that bounds it.
+
+        Plan 33 SETUP-03. Zero reads as `Automatic`, and a reader cannot be
+        left to guess what automatic came out as, so the number the run asks
+        for is the number on the page -- both from one function.
+        """
+        self._effective = None
+        cell = self._cellFor('mesh.execution.max_cpu_cores')
+        row = None if cell is None else cell.layout()
+        if row is None:
+            return
+        label = QLabel(cell)
+        label.setObjectName('executionEffectiveCores')
+        # DP-186 and the castellation estimate before it: a label whose text
+        # is rewritten on every edit must not carry a fixed accessible name,
+        # or an assistive reader is handed the heading in place of the
+        # number. The sentence belongs in the description.
+        label.setAccessibleDescription(
+            self.tr('The count the run asks for, after this limit and what '
+                    'the machine has.'))
+        label.setToolTip(label.accessibleDescription())
+        # DP-156: the cell still ends with the unit label.
+        row.insertWidget(max(row.count() - 1, 0), label)
+        self._effective = label
+        self._refreshEffectiveCount()
+
+    # -- the route --------------------------------------------------------- #
+
+    def _currentValue(self, field_id: str):
+        if field_id in self._pending:
+            return self._pending[field_id]
+        editor = self._editors.get(field_id)
+        return None if editor is None else editor.value()
+
+    def _applyRoute(self) -> None:
+        """Ask the rule again and take the rows it does not name away.
+
+        Run after `refresh_applicability`, never instead of it: a field the
+        configuration itself has ruled out stays ruled out with the reason its
+        clause gave, and this adds the route's own reasons on top.
+        """
+        if not self._editors or not hasattr(self, '_effective'):
+            return
+        shown = set(self.visible_field_ids(
+            self._engine_id,
+            self._currentValue('mesh.execution.mode'),
+            self._currentValue('mesh.execution.decomposition_method')))
+        inactive = getattr(self, '_inactive', None) or {}
+        for field_id, editor in self._editors.items():
+            if field_id in shown:
+                if field_id not in inactive:
+                    editor.setApplicability(True, '')
+                continue
+            editor.setApplicability(False, self._routeReason(field_id))
+
+    def _routeReason(self, field_id: str) -> str:
+        unread = self.UNREAD_FIELDS.get(field_id)
+        if unread:
+            return unread
+        if self._engine_id == 'gmsh':
+            return self.tr('Gmsh meshes in one process and decomposes '
+                           'nothing, so a Gmsh run never reads this.')
+        mode = str(self._currentValue('mesh.execution.mode') or '')
+        if mode.rsplit('.', 1)[-1].lower() == 'auto':
+            # DP-593. Automatic mode may still run on several ranks, so "a
+            # serial run" was the wrong excuse; what it does is decompose
+            # with the defaults and leave this setting unread.
+            return self.tr('Automatic mode picks the rank count and '
+                           'decomposes with scotch and no constraints, so '
+                           'this is read only in Parallel mode.')
+        if mode.rsplit('.', 1)[-1].lower() != 'parallel':
+            return self.tr('A serial run decomposes nothing, so nothing '
+                           'reads this.')
+        return self.tr('The chosen decomposition method does not read this.')
+
+    def _refreshEffectiveCount(self) -> None:
+        """Say what each mesher will really run on, in its own unit.
+
+        DP-691. This asked `effective_cpu_count` with the ceiling alone and
+        read `Automatic` for zero, while the snappy launcher also read the
+        Parallel Environment dialog and started one rank for an automatic
+        case, and Gmsh took every thread the machine had. The page and the
+        run now ask the same two rules: `_stage_ranks`'s for snappy (nothing
+        asked stays serial) and `resolve_parallel_threads` for Gmsh.
+        """
+        from foammesh.core.execution.resources import effective_cpu_count
+        from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
+
+        label = getattr(self, '_effective', None)
+        if label is None:
+            return
+        try:
+            ceiling = int(
+                self._currentValue('mesh.execution.max_cpu_cores') or 0)
+        except (TypeError, ValueError):
+            ceiling = 0
+        mode = str(self._currentValue('mesh.execution.mode') or 'auto')
+        policy = {'mode': mode.rsplit('.', 1)[-1].lower(),
+                  'max_cpu_cores': max(ceiling, 0) or None}
+        ranks = effective_cpu_count(policy, unasked=1)
+        threads = resolve_parallel_threads(policy)
+        rank_text = (self.tr('1 rank') if ranks == 1
+                     else self.tr('{0} ranks').format(ranks))
+        thread_text = (self.tr('1 thread') if threads == 1
+                       else self.tr('{0} threads').format(threads))
+        if self._engine_id == 'snappy':
+            label.setText(rank_text)
+        elif self._engine_id == 'gmsh':
+            label.setText(thread_text)
+        else:
+            label.setText(self.tr('snappy: {0} \u00b7 Gmsh: {1}').format(
+                rank_text, thread_text))
+
+    def _on_changed(self, field_id: str, value) -> None:
+        super()._on_changed(field_id, value)
+        if field_id in ('mesh.execution.mode',
+                        'mesh.execution.decomposition_method'):
+            self._applyRoute()
+        if field_id in ('mesh.execution.mode',
+                        'mesh.execution.max_cpu_cores'):
+            self._refreshEffectiveCount()
 
     def choices_for(self, field_id: str):
         """Offer only decomposition methods the selected runtime can run.
@@ -284,7 +689,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
              bool(item.get('available')))
             for item in methods)
 
-    def reload(self) -> None:
+    def reload(self, *, discard_pending: bool = True) -> None:
         """Re-read the values, and take the runtime's answer if it arrived.
 
         The first render happens before a cold runtime can answer, so the
@@ -292,7 +697,12 @@ class ExecutionPreferencesPage(FieldGroupPage):
         thread; the next time the page is shown the answer is in the cache and
         the rows are rebuilt against it.
         """
-        super().reload()
+        super().reload(discard_pending=discard_pending)
+        # `refresh_applicability` hands every clause-free field back its row,
+        # so the route has to be asked again after each reload rather than
+        # only when the mesher changes.
+        self._applyRoute()
+        self._refreshEffectiveCount()
         if self._runtime_answered or self._rebuilding or not self._editors:
             return
         self.choices_for('mesh.execution.decomposition_method')
@@ -307,7 +717,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
     purpose = (
         'How this case is allowed to use the machine. These bound every '
         'meshing run: the core ceiling here is what the run reads for its '
-        'rank count, so a Parallel Environment asking for more than this '
+        'rank count, so a Parallel environment asking for more than this '
         'gets this.')
     caveat = (
         'Changing the core count can change the mesh. Snappy\'s refinement '
@@ -317,140 +727,99 @@ class ExecutionPreferencesPage(FieldGroupPage):
         'of the core count.')
 
 
-class MeshIntentPage(FieldGroupPage):
-    """What this mesh is for: the target solver, and nothing else.
 
-    Plan 30 WP-09 (F-23). This page used to carry six ``mesh/intent`` sizing
-    fields -- target size, minimum size, cell ceiling, growth rate and two
-    policies -- that were validated, serialised and built into the engine
-    contract, and that neither shipped engine ever read: Gmsh sizes from its
-    own ``gmsh/globalSizing`` block and snappy from its base grid and
-    refinement levels. The page said so in a caveat, which made it a page
-    whose own text told the reader not to use it. The fields are gone from
-    the schema now, and a load-time migration drops them from cases that have
-    them, so there is nothing left to caveat.
+class GmshHealingPanel(FieldGroupPage):
+    """The import and healing questions Gmsh asks, hosted on Preparation.
 
-    What remains is the one genuinely engine-agnostic intent there is: which
-    solver will read the mesh. It decides which engines are offered and which
-    quality operation qualifies the result, so it is a statement of intent
-    rather than a setting, and it belongs here rather than only halfway down
-    the Meshing Method page.
+    Plan 32 §4.4. These nineteen settings were the `gmsh.describe_geometry`
+    task page: a child row of the engine branch, so they were reached only
+    after a solver was chosen, a method was chosen and the method was applied
+    -- which is to say after `1. Geometry` had already imported the file the
+    tolerances describe. They are statements about how to read the CAD, so
+    they belong beside the readiness report that says what is wrong with it.
 
-    It is not a ``FieldEditor`` row: ``mesh.target_solver`` is read-only in
-    the registry precisely because changing it invalidates published verdicts
-    and can strand the selected engine, so it is written through
-    ``mesh.target_solver.set`` -- the operation that does that work -- and not
-    through ``configuration.patch``.
+    The field list is read from the registry rather than typed here: the
+    fields are exactly those whose `ui_location` is
+    `workflow.gmsh.describe_geometry`, and a hand list is a second place for
+    that answer to be wrong.
     """
 
-    token = 'workflow.mesh.intent'
-    #: No schema fields. The solver is set through its own operation.
-    field_ids: tuple[str, ...] = ()
-    #: The two solvers a case can be meshed for. ``unselected`` is a state,
-    #: not an option, and is shown by leaving both unchecked.
-    SOLVER_LABELS = {
-        'openfoam': 'OpenFOAM',
-        'su2': 'SU2',
-    }
-    heading = 'Mesh Intent'
+    token = 'preparation.gmsh_healing'
+    heading = 'Import and healing'
+    # DP-630 (field audit 0924 D-SH-06). This said the settings "describe the
+    # geometry the rest of this page reports on". Nothing but the Gmsh job
+    # reads them: the readiness report above never changes with them, and
+    # nothing is re-imported when they do.
     purpose = (
-        'Which solver this mesh is for. It decides which meshing engines are '
-        'offered and which quality check qualifies the result, and it is '
-        'recorded with the case so the plan states what the mesh was made '
-        'for. Changing it after a mesh exists marks the published quality '
-        'verdict stale.')
+        'How Gmsh reads the geometry when it meshes it: the tolerances, the '
+        'sewing and the fixes its CAD importer applies, and the far-field box '
+        'it can build around the result. They take effect in the Gmsh run '
+        'only; the readiness report on this page is not re-run with them.')
     caveat = ''
+    field_ids: tuple[str, ...] = tuple(
+        field_id for field_id in REGISTRY.ids()
+        if REGISTRY.get(field_id).ui_location
+        == 'workflow.gmsh.describe_geometry')
 
-    def __init__(self, facade_client, parent=None):
-        self._solverButtons: dict[str, QRadioButton] = {}
-        self._solverGroup = None
-        self._solverReason = None
-        super().__init__(facade_client, parent)
+    #: DP-629 (field audit 0924 D-SH-02). Settings of Gmsh's CAD importer. A
+    #: surface (STL/OBJ) is read without it, so on a case whose every source
+    #: is a surface they change nothing, and the run records them so.
+    CAD_IMPORTER_FIELDS = tuple(
+        f'gmsh.describe_geometry.{name}' for name in (
+            'sew_faces', 'fix_degenerated', 'make_solids', 'fix_small_edges',
+            'fix_small_faces', 'auto_fix', 'union_unify', 'import_labels',
+            'occ_parallel', 'heal_shapes', 'import_tolerance',
+            'remove_duplicate_faces'))
+    SURFACE_ONLY_REASON = (
+        'Every geometry in this case is a surface (STL/OBJ), which Gmsh reads '
+        'without its CAD importer, so this setting would change nothing.')
+    #: DP-631 (field audit 0924 D-SH-01). A second unit knob: it multiplied
+    #: a CAD import already in metres and did nothing to a surface.
+    IMPORT_SCALING = 'gmsh.describe_geometry.import_scaling'
+    IMPORT_SCALING_REASON = (
+        'Held at 1. The unit is chosen when the file is imported; a second '
+        'factor here would put the Gmsh mesh at a different size from the '
+        'viewport and from every size on these pages.')
 
-    def build(self) -> None:
-        super().build()
-        # Nothing renders in "Settings" and an empty titled box reads as a
-        # section that failed to load.
-        self._form.setVisible(False)
-        self._apply.setVisible(False)
-        self._revert.setVisible(False)
-
-        box = QGroupBox(self.tr('Mesh for'), self)
-        box.setObjectName('meshIntentTargetSolverBox')
-        box_layout = QVBoxLayout(box)
-        self._solverGroup = QButtonGroup(self)
-        for solver_id, label in self.SOLVER_LABELS.items():
-            button = QRadioButton(label, self)
-            button.setObjectName(solver_id + 'IntentTargetSolver')
-            button.setProperty('targetSolver', solver_id)
-            button.clicked.connect(
-                lambda _checked=False, chosen=solver_id:
-                self.chooseTargetSolver(chosen))
-            self._solverGroup.addButton(button)
-            self._solverButtons[solver_id] = button
-            box_layout.addWidget(button)
-        self._solverReason = QLabel(self)
-        self._solverReason.setObjectName('meshIntentTargetSolverReason')
-        self._solverReason.setWordWrap(True)
-        self._solverReason.setProperty('foammeshTone', 'muted')
-        self._solverReason.setMinimumHeight(
-            2 * self._solverReason.fontMetrics().lineSpacing())
-        box_layout.addWidget(self._solverReason)
-        # Above the (hidden) settings box, where the scroll area is.
-        self.layout().insertWidget(self.layout().count() - 2, box)
-        self.reload()
-
-    # -- target solver ----------------------------------------------------- #
-
-    def targetSolver(self) -> str:
-        return self._targetSolver()
-
-    def _targetSolver(self) -> str:
+    def surfaceOnly(self) -> bool:
+        """True when the case has geometry and none of it is read as CAD."""
         try:
-            result = query(self._client, 'mesh.target_solver.get', {})
-        except Exception:
-            return 'unselected'
-        payload = getattr(result, 'payload', None) or {}
-        return str(payload.get('target_solver') or 'unselected')
+            from foammesh.app import app
+            from foammesh.core.geometry import GeometryArtifactStore
+            from foammesh.core.geometry.store import is_cad_entry
+            project = getattr(app, 'project', None)
+            path = getattr(project, 'path', None)
+            if path is None:
+                return False
+            entries = GeometryArtifactStore(path).entries()
+        except Exception:                                    # noqa: BLE001
+            # Unknown is not "surface": leave the switches offered.
+            return False
+        return bool(entries) and not any(is_cad_entry(item)
+                                         for item in entries)
 
-    def reload(self) -> None:
-        super().reload()
-        if self._solverGroup is None:
-            return
-        current = self._targetSolver()
-        self._solverGroup.setExclusive(False)
-        for solver_id, button in self._solverButtons.items():
-            button.setChecked(solver_id == current)
-        self._solverGroup.setExclusive(True)
-        self._solverReason.setText(self.tr(
-            'Choose the solver this mesh is for. Every meshing method is '
-            'offered until you do.') if current == 'unselected' else '')
+    def pinnedReasons(self) -> dict[str, str]:
+        """The fields this case cannot use, beyond their own conditions."""
+        pinned = {self.IMPORT_SCALING: self.IMPORT_SCALING_REASON}
+        if self.surfaceOnly():
+            pinned.update((field_id, self.SURFACE_ONLY_REASON)
+                          for field_id in self.CAD_IMPORTER_FIELDS)
+        return pinned
 
-    def chooseTargetSolver(self, solver: str) -> None:
-        # C31-12. Scheduled, not blocking: choosing a solver re-derives which
-        # meshing methods are offered, and the old synchronous call froze the
-        # radio group mid-click while the facade wrote and re-fingerprinted the
-        # case. Everything that used to follow the call is `chosen`, so the
-        # order (write, then reason text, then reload, then the warning) is
-        # unchanged; a refusal arrives as a FailedResult carrying its message.
-        def chosen(result) -> None:
-            if getattr(result, 'status', 'accepted') != 'accepted':
-                self._solverReason.setText(
-                    str(getattr(result, 'message', '')
-                        or self.tr('The target solver could not be set.')))
-                self.reload()
-                return
-            stranded = (getattr(result, 'payload', None) or {}).get(
-                'engine_incompatible_reason')
-            self.reload()
-            if stranded:
-                # Not repaired here: which engine to move to is the user's call.
-                QMessageBox.warning(
-                    self, self.tr('Mesh Intent'),
-                    self.tr('The selected meshing method cannot serve this '
-                            'solver.\n\n{0}\n\n'
-                            'Choose another method before meshing.'
-                            ).format(stranded))
-
-        submit(self._client, 'mesh.target_solver.set',
-               {'target_solver': str(solver)}, then=chosen)
+    def reload(self, *, discard_pending: bool = True) -> None:
+        super().reload(discard_pending=discard_pending)
+        inactive = getattr(self, '_inactive', None)
+        if inactive is None:
+            inactive = self._inactive = {}
+        changed = False
+        for field_id, reason in self.pinnedReasons().items():
+            editor = self._editors.get(field_id)
+            if editor is None or not editor.applies():
+                continue
+            editor.setApplicability(False, reason)
+            inactive[field_id] = reason
+            self._pending.pop(field_id, None)
+            changed = True
+        if changed:
+            align_unit_column((self.form_layout(),))
+            self._set_dirty(bool(self._pending))

@@ -15,12 +15,12 @@ from foammesh.support.simple_db.simple_schema import (
     BoolType, EnumType, FloatType, IntType, PrimitiveType, SchemaList, ValidationError)
 
 from .errors import ValidationFailedError
-from .field_metadata import FIELD_OVERRIDES
+from .field_metadata import FIELD_OVERRIDES, GROUP_METADATA
 from .fields import (CollectionSchema, FieldDescriptor, FieldType, _number, _snake, _title)
 
 _CAMEL = re.compile(r'(?<!^)(?=[A-Z])')
 
-# Curated element-leaf aliases (fidelity to storage, matching Â§6.2 vocabulary).
+# Curated element-leaf aliases (fidelity to storage, matching §6.2 vocabulary).
 ELEMENT_LEAF_ALIASES = {
     'gType': 'geometry_type', 'cfdType': 'cfd_type',
     'nSurfaceLayers': 'surface_layers', 'nonConformal': 'non_conformal',
@@ -73,25 +73,37 @@ def _element_leaf(name: str) -> str:
 
 
 def _walk_element(node: dict, prefix_id: str, prefix_path: str, collection_id: str,
-                  out: dict) -> None:
+                  out: dict, storage_path: str = '') -> None:
     for key, value in node.items():
         rel_path = f'{prefix_path}/{key}' if prefix_path else key
         semantic_leaf = _element_leaf(key)
         rel_id = f'{prefix_id}.{semantic_leaf}' if prefix_id else semantic_leaf
         if isinstance(value, PrimitiveType):
             full_id = f'{collection_id}/{{id}}/{rel_id}'
-            descriptor = _build_descriptor_for_element(full_id, rel_path, value, collection_id)
+            descriptor = _build_descriptor_for_element(full_id, rel_path, value, collection_id,
+                                                       storage_path)
             out[rel_id] = ElementField(rel_id, rel_path, descriptor)
         elif isinstance(value, SchemaList):
             # Nested repeated entities inside an element are not part of the AF2
             # collection surface; they get their own top-level collection.
             continue
         elif isinstance(value, dict):
-            _walk_element(value, rel_id, rel_path, collection_id, out)
+            _walk_element(value, rel_id, rel_path, collection_id, out, storage_path)
+
+
+def _element_unit(storage_path: str, rel_id: str):
+    """The collection's declared unit for one element field (DP-606).
+
+    ``GROUP_METADATA`` names units by snake leaf for each storage path, and a
+    vector's components (``axis.x``) share the unit of the vector itself.
+    """
+    units = GROUP_METADATA.get(storage_path, {}).get('units', {}) if storage_path else {}
+    return units.get(rel_id, units.get(rel_id.split('.', 1)[0]))
 
 
 def _build_descriptor_for_element(full_id: str, rel_path: str,
-                                  primitive: PrimitiveType, collection_id: str) -> FieldDescriptor:
+                                  primitive: PrimitiveType, collection_id: str,
+                                  storage_path: str = '') -> FieldDescriptor:
     value_type = (FieldType.ENUM if isinstance(primitive, EnumType) else
                   FieldType.BOOLEAN if isinstance(primitive, BoolType) else
                   FieldType.INTEGER if isinstance(primitive, IntType) else
@@ -118,14 +130,23 @@ def _build_descriptor_for_element(full_id: str, rel_path: str,
     # rendered with a generated label and an empty tooltip however obscure it
     # was. The override table is keyed by semantic id, and an element's id is
     # exactly the key used there, so the same entries now reach both.
+    #
+    # DP-606. The unit came from that table alone, so every length in the
+    # Gmsh row editors showed bare: the collection's own units, declared in
+    # ``GROUP_METADATA`` and already shown on the scalar fields, never reached
+    # a row. An override still wins; otherwise the storage path's units do.
     override = FIELD_OVERRIDES.get(full_id, {})
+    unit = override.get('unit', _element_unit(storage_path, full_id.split('/')[-1]))
     return FieldDescriptor(
         id=full_id, storage_path=f'{collection_id}/{{id}}/{rel_path}',
         title=override.get('title', _title(full_id.split('/')[-1])),
-        value_type=value_type, unit=override.get('unit'),
+        value_type=value_type, unit=unit,
         default=default, minimum=minimum, maximum=maximum,
         exclusive_minimum=exclusive_min, exclusive_maximum=exclusive_max,
         enum=enum_options, required=primitive.isRequired(),
+        # DP-609. A row setting the run cannot honour is greyed out rather
+        # than hidden, with its reason in the documentation.
+        read_only=bool(override.get('read_only', False)),
         ui_location=_collection_ui(collection_id),
         documentation=override.get('documentation', ''))
 
@@ -137,6 +158,7 @@ def _collection_ui(collection_id: str) -> str:
         'meshing.castellation.surface_refinements': 'workflow.castellation',
         'meshing.castellation.volume_refinements': 'workflow.castellation',
         'meshing.castellation.feature_bands': 'workflow.castellation',
+        'meshing.castellation.volume_bands': 'workflow.castellation',  # DP-586
         'meshing.layers.groups': 'workflow.layers',
         'geometry.interface_pairs': 'workflow.geometry.interfaces',
     }.get(collection_id, '')
@@ -148,7 +170,8 @@ class EntityAdapter:
     def __init__(self, collection: CollectionSchema):
         self.collection = collection
         self.fields: dict[str, ElementField] = {}
-        _walk_element(collection.element_schema, '', '', collection.collection_id, self.fields)
+        _walk_element(collection.element_schema, '', '', collection.collection_id, self.fields,
+                      collection.storage_path)
 
     @property
     def collection_id(self) -> str:

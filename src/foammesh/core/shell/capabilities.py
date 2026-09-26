@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from foammesh.core.openfoam_runtime import (
 OPENFOAM_UTILITIES = frozenset({
     'blockMesh', 'surfaceFeatures', 'snappyHexMesh', 'checkMesh',
     'decomposePar', 'reconstructPar', 'redistributePar',
-    'surfaceRedistributePar', 'splitMeshRegions', 'topoSet', 'createPatch',
+    'surfaceRedistributePar', 'splitMeshRegions', 'createZones', 'createPatch',
     'createNonConformalCouples',
     'extrudeMesh', 'collapseEdges', 'transformPoints', 'foamMeshToFluent',
     'foamFormatConvert', 'renumberMesh', 'subsetMesh', 'combinePatchFaces',
@@ -125,6 +126,17 @@ def parse_decomposition_probe(output: str) -> dict[str, str] | None:
     return found if saw_root else None
 
 
+def _run_cleanup(command) -> None:
+    """Best effort: stop a timed-out launch and remove its pid file."""
+    cleanup = getattr(command, 'cleanup_argv', ())
+    if not cleanup:
+        return
+    try:
+        subprocess.run(cleanup, capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class CapabilityRegistry:
     """Probe executables once per environment rather than failing after a click."""
 
@@ -154,11 +166,23 @@ class CapabilityRegistry:
         # R194. A probe that never reached the runtime is not an answer
         # about the runtime. Cached, one cold WSL start told the user for
         # the rest of the session that OpenFOAM was not installed, and only
-        # someone who guessed that `Re-probe Runtimes` meant them ever saw
+        # someone who guessed that `Re-probe runtimes` meant them ever saw
         # otherwise. Left uncached, the next question asks again.
         if not capability.transient:
             self._cache[name] = capability
         return capability
+
+    def utility_if_known(self, name: str) -> Capability | None:
+        """Answer from the cache alone: instantly, or not at all.
+
+        `utility()` always answers, and to do it may start a cold WSL runtime
+        and wait tens of seconds. A caller on the GUI thread pays that wait with
+        a frozen window -- the shell rebuilds its menus whenever a project
+        opens, and that rebuild asked. This is the same question in a form that
+        cannot block, so a view can draw a provisional state now and warm the
+        cache off-thread. A `None` here means unknown, never unavailable.
+        """
+        return self._cache.get(name)
 
     def refresh(self):
         self._cache.clear()
@@ -183,8 +207,13 @@ class CapabilityRegistry:
             self._state_callbacks.discard(callback)
         return unsubscribe
 
-    def help(self, name: str, *, timeout: float = 5.0) -> UtilityHelp:
-        """Probe the configured executable's own help without shell parsing."""
+    def help(self, name: str, *, timeout: float = 30.0) -> UtilityHelp:
+        """Probe the configured executable's own help without shell parsing.
+
+        DP-693. A cold WSL distribution outlasted a 5 s probe, and the cached failure
+        kept Mesh > Scale refusing until restart: the wait now covers a cold start and
+        only an answer is remembered, so a failed probe is asked again next time.
+        """
         if name in self._help_cache:
             return self._help_cache[name]
         capability = self.utility(name)
@@ -192,17 +221,25 @@ class CapabilityRegistry:
             result = UtilityHelp(name, False, reason=capability.reason)
         else:
             try:
-                command = self.command(name, ('-help',), cwd=Path.cwd())
-                completed = subprocess.run(
-                    command.argv, capture_output=True,
-                    text=True, errors='replace', timeout=timeout, check=False)
+                # DP-800. Run from the temporary folder, not wherever the app was
+                # started, and on a timeout run the cleanup that removes the launch's
+                # pid file -- killing the Windows side alone left one behind each time.
+                command = self.command(name, ('-help',), cwd=Path(tempfile.gettempdir()))
+                try:
+                    completed = subprocess.run(
+                        command.argv, capture_output=True,
+                        text=True, errors='replace', timeout=timeout, check=False)
+                except subprocess.TimeoutExpired:
+                    _run_cleanup(command)
+                    raise
                 output = '\n'.join(part for part in (completed.stdout, completed.stderr) if part).strip()
                 result = UtilityHelp(
                     name, bool(output), output,
                     '' if output else f'{name} -help returned no output')
             except (OSError, subprocess.SubprocessError) as error:
                 result = UtilityHelp(name, False, reason=f'could not inspect {name}: {error}')
-        self._help_cache[name] = result
+        if result.available:
+            self._help_cache[name] = result
         return result
 
     def command(self, name: str, arguments=(), *, cwd) -> LaunchCommand:

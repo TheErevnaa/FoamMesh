@@ -1,13 +1,6 @@
 """Safe argument builders and capability checks for external tools."""
 import platform
 import shutil
-from pathlib import Path
-
-
-def paraview_argv(executable: str, case_path: str | Path) -> tuple[str, ...]:
-    case = Path(case_path)
-    marker = case / 'case.foam'
-    return executable, str(marker if marker.exists() else case)
 
 
 def terminal_capability() -> tuple[bool, str]:

@@ -21,12 +21,14 @@ from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QMessageBox
 from foammesh.support.simple_db.simple_schema import ValidationError
 
 from foammesh.app import app
+from foammesh.core.facade.fields import REGISTRY
 from foammesh.core.quality.policy import (
     RELAXABLE_LIMITS,
     RELAXED_WITH_DEFAULT,
     STORAGE_ROOT,
     storage_paths,
 )
+from foammesh.view.theming.metrics import align_unit_column, place_unit
 from .mesh_quality_parameters_dialog_ui import Ui_MeshQualityParametersDialog
 
 
@@ -41,6 +43,10 @@ class MeshQualityParametersDialog(QDialog):
         super().__init__(parent)
         self._ui = Ui_MeshQualityParametersDialog()
         self._ui.setupUi(self)
+        # DP-213. Taken out of the form, and now said so here rather
+        # than only in the accountability generator: `minFaceFlatness`
+        # and `minTriangleTwist` are not consumed by Foundation 13
+        # snappy mesh quality, so neither row ever reaches a reader.
         self._ui.formLayout.removeRow(self._ui.minFaceFlatness)
         self._ui.formLayout.removeRow(self._ui.minTriangleTwist)
 
@@ -64,24 +70,61 @@ class MeshQualityParametersDialog(QDialog):
 
         A strict limit already has a box from Designer; a relaxed one has a
         box only for ``maxNonOrtho``, so the rest are inserted here -- beside
-        the strict row they loosen, borrowing the label it already carries
-        instead of inventing a second wording.
+        the strict row they loosen.
+
+        DP-170. The label is the registry's too, not a second wording typed
+        into Designer beside the same field. Plan 30 WP-04 made this dialog
+        and the QA page read one field list so they could not hold different
+        fields; they went on holding different *names* for them, thirteen of
+        the fifteen, because each had written its own. There is one name now,
+        and this is where the dialog reads it.
         """
         prefix = f'{STORAGE_ROOT}/'
+        units = []
         for full in storage_paths():
             path = full[len(prefix):]
             name = path.rsplit('/', 1)[-1]
             relaxed = path.startswith('relaxed/')
             attribute = f'{name}Relaxed' if relaxed else name
+            title = self._registryTitle(full) or self._rowTitle(
+                getattr(self._ui, attribute, None)) or name
             edit = getattr(self._ui, attribute, None)
             if edit is None and relaxed:
-                edit = self._insertRelaxedRow(name)
+                edit = self._insertRelaxedRow(name, title)
             if edit is None:
                 continue
+            self._setRowTitle(edit, title)
             self._editors[path] = edit
-            self._titles[path] = self._rowTitle(edit) or path
+            self._titles[path] = title
+            descriptor = REGISTRY.by_storage_path(full)
+            units.append((edit, descriptor.unit if descriptor else ''))
+        # DP-198. After the loop, not inside it: `place_unit` puts the box in
+        # a cell of its own, and from that moment the form knows the cell
+        # rather than the box -- which is what `_insertRelaxedRow` asks it
+        # about when it looks up the strict row to insert beneath.
+        for edit, unit in units:
+            place_unit(edit, unit)
+        align_unit_column((self._ui.formLayout,))
 
-    def _insertRelaxedRow(self, name):
+    def _registryTitle(self, storage_path):
+        """The one name this field has, with its unit if it has one.
+
+        The QA page puts the unit in a column of its own; this form is two
+        columns of label and box with nowhere to put one, so it goes in
+        brackets at the end of the name -- which is where the app's other
+        in-label units sit, and it is the same string either way because it
+        is the same descriptor.
+
+        DP-198. It used to end `Max face non-orthogonality (deg)`, because
+        this form is two columns of label and box and there was said to be
+        nowhere else to put a unit. There is: `place_unit` opens the column
+        beside the box that `unit_cell` opens for a row a page builds itself,
+        and the name is the name again.
+        """
+        descriptor = REGISTRY.by_storage_path(storage_path)
+        return '' if descriptor is None else descriptor.title
+
+    def _insertRelaxedRow(self, name, title):
         form = self._ui.formLayout
         strict = getattr(self._ui, name, None)
         if strict is None:
@@ -96,17 +139,31 @@ class MeshQualityParametersDialog(QDialog):
             'Limit used only in the phases snappyHexMesh is allowed to '
             'relax, layer addition above all. Leave empty and the strict '
             'limit governs there too.'))
-        title = self._rowTitle(strict) or name
-        form.insertRow(row + 1, self.tr('{0} (Relaxed)').format(title), edit)
+        form.insertRow(row + 1, title, edit)
         return edit
 
-    def _rowTitle(self, widget):
+    def _labelFor(self, widget):
         form = self._ui.formLayout
         row, _role = form.getWidgetPosition(widget)
+        if row < 0 and widget.parentWidget() is not None:
+            # DP-198. The box sits in a cell with its unit, so the row the
+            # form holds is the cell's.
+            row, _role = form.getWidgetPosition(widget.parentWidget())
         if row < 0:
-            return ''
+            return None
         item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
-        return item.widget().text() if item is not None else ''
+        return None if item is None else item.widget()
+
+    def _rowTitle(self, widget):
+        if widget is None:
+            return ''
+        label = self._labelFor(widget)
+        return label.text() if label is not None else ''
+
+    def _setRowTitle(self, widget, title):
+        label = self._labelFor(widget)
+        if label is not None:
+            label.setText(title)
 
     def accept(self):
         try:
@@ -130,4 +187,4 @@ class MeshQualityParametersDialog(QDialog):
 
             super().accept()
         except ValidationError as e:
-            QMessageBox.information(self, self.tr("Input Error"), e.toMessage())
+            QMessageBox.warning(self, self.tr("Input error"), e.toMessage())

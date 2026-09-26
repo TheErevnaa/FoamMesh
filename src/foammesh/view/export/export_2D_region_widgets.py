@@ -69,8 +69,8 @@ class Export2DWedgeRegionWidget(QGroupBox):
         self.setTitle(rname)
                 
         layout = QFormLayout(self)
-        layout.addRow(QLabel(self.tr('Source Boundary, P1')), self._p1)
-        layout.addRow(QLabel(self.tr('Exposed Boundary, P2')), self._p2)
+        layout.addRow(QLabel(self.tr('Source boundary, P1')), self._p1)
+        layout.addRow(QLabel(self.tr('Exposed boundary, P2')), self._p2)
         
         self._connectSignalsSlots()
         

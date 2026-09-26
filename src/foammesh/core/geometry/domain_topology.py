@@ -33,6 +33,8 @@ import struct
 import sys
 from pathlib import Path
 
+from foammesh.core.quantities import agreeing, count_text
+
 #: Version of the report this module writes, independent of the classifier's
 #: own ``calculation_version``.
 SCHEMA_VERSION = 1
@@ -116,7 +118,25 @@ def _read_binary_stl(data, welder, surfaces, triangles, sources, path):
     format carries no solid names at all, so every triangle lands on one
     surface and ``group_by_connectivity`` does the splitting -- which is the
     same answer an ASCII file with one ``solid`` block gets.
+
+    DP-421. An empty ASCII STL reaches here: a ``solid``/``endsolid`` pair
+    with no facets between them does not put the word ``facet`` in the first
+    2048 bytes, so the sniff above sends it down the binary branch, where it
+    is too short to hold the 80-byte header and the facet count and used to
+    raise ``struct.error`` out of the reader. An import holding no triangles
+    is a measurement the callers already state in words, so it returns empty.
+
+    Only for a file that says ``solid``, though. A short file that says
+    nothing of the kind is junk, and a reader that swallowed it would report
+    an empty tessellation where the callers need to hear `unreadable` -- the
+    difference between "this model has no faces" and "this is not a model".
     """
+    if len(data) < 84:
+        if data[:5].lower() == b'solid':
+            return
+        raise ValueError(
+            f'{path} is {len(data)} bytes, too short to be a binary STL and '
+            f'not an ASCII one either')
     count = struct.unpack('<I', data[80:84])[0]
     tag = len(surfaces) + 1
     surfaces.append(tag)
@@ -284,6 +304,11 @@ def classify_files(paths, *, roles=None, seed=None, labels=None) -> dict:
         'bodies': [],
         'voids': [],
         'volumes': 0,
+        # DP-53. Where the count came from, so a reader can tell "none"
+        # from "not measured". The seed is `unknown` because a report that
+        # returns early -- no triangles, or a shell topology that refuses --
+        # never counted anything.
+        'volumes_source': 'unknown',
         'void_count': 0,
         'bounds_domain': False,
         'refusal': None,
@@ -325,6 +350,7 @@ def classify_files(paths, *, roles=None, seed=None, labels=None) -> dict:
                   'void': 'voids'}[shell.role]
         report[bucket].append(shell.name)
     report['volumes'] = len(resolved.volumes)
+    report['volumes_source'] = 'shell_topology'
     report['void_count'] = sum(len(plan.voids) for plan in resolved.volumes)
     report['domain'] = resolved.domain or None
     report['warnings'] = list(resolved.warnings)
@@ -336,17 +362,32 @@ def summary_sentence(report: dict) -> str:
     """One line the user can read, whichever of the three cases they have."""
     if report.get('refusal'):
         return report['refusal']
+    if report.get('representation') == 'cad':
+        # DP-52. A CAD import has no surfaces and no shell roles, so the
+        # tessellated sentence rendered it as "0 surface(s) resolve to 0
+        # domain(s)" -- which reads as a measurement and is not one. What
+        # OCCT did find is the solids, so that is what gets said.
+        solids = [str(name) for name in (report.get('solids') or ())]
+        if report.get('volumes_source') != 'cad_regions':
+            return ('the CAD import has not been read for solids yet, so the '
+                    'number of volumes in it is not known')
+        named = ', '.join(solids[:4])
+        tail = f': {named}' if named else ''
+        return (count_text(report.get('volumes', 0), 'solid')
+                + ' imported from CAD' + tail)
     domains = report.get('domains') or []
     bodies = report.get('bodies') or []
     voids = report.get('voids') or []
-    parts = [f'{len(domains)} domain(s)']
+    parts = [count_text(len(domains), 'domain')]
     if bodies:
-        parts.append(f'{len(bodies)} declared body(ies)')
+        parts.append(count_text(len(bodies), 'declared body', 'declared bodies'))
     if voids:
-        parts.append(f'{len(voids)} void(s)')
+        parts.append(count_text(len(voids), 'void'))
     named = ', '.join(str(item) for item in domains[:4])
     tail = f': {named}' if named else ''
-    return (f'{report.get("surfaces", 0)} surface(s) resolve to '
+    surfaces = report.get('surfaces', 0)
+    return (count_text(surfaces, 'surface')
+            + agreeing(surfaces, ' resolves to ', ' resolve to ')
             + ', '.join(parts) + tail)
 
 
@@ -375,11 +416,27 @@ def classify_entries(entries) -> dict:
     here: OCCT already knows how many closed solids the file holds, and a
     tessellation of it would answer a question about the tessellation.
     """
-    paths, cad, labels = [], [], {}
+    paths, cad, labels, solids = [], [], {}, []
+    counted = False
     for entry in entries or ():
         path = entry_path(entry)
         if not path:
             continue
+        if Path(path).suffix.lower() not in TESSELLATED_SUFFIXES:
+            # DP-52. The CAD import already explored the solids and wrote one
+            # region per solid onto the entry; that is the answer, and reading
+            # it costs nothing. An entry with no `regions` key is an import
+            # that never recorded them, which is different from a file with
+            # no solids -- so it is not counted at all rather than counted
+            # as zero.
+            regions = entry.get('regions')
+            if isinstance(regions, list):
+                counted = True
+                for index, region in enumerate(regions):
+                    name = ''
+                    if isinstance(region, dict):
+                        name = str(region.get('name') or '').strip()
+                    solids.append(name or f'solid {index + 1}')
         if Path(path).suffix.lower() in TESSELLATED_SUFFIXES:
             paths.append(str(path))
             # Name the shell after the geometry the user imported, not after
@@ -395,17 +452,33 @@ def classify_entries(entries) -> dict:
             'sources': cad,
             'representation': 'cad' if cad else 'none',
             'shells': [], 'domains': [], 'bodies': [], 'voids': [],
-            'volumes': 0, 'void_count': 0,
-            # A CAD import states its own solids; the runner refuses an import
-            # with no volume before it meshes anything.
-            'bounds_domain': bool(cad),
-            'refusal': None,
+            'volumes': len(solids), 'void_count': 0,
+            'volumes_source': 'cad_regions' if counted else 'unknown',
+            'solids': list(solids),
+            # DP-73. A CAD import states its own solids, and this is that
+            # statement read back rather than the fact of the import. The
+            # line here was `bool(cad)` -- true whenever a CAD entry existed
+            # at all -- so a STEP whose import walked the file and recorded
+            # no solid passed the gate written to catch exactly that, and was
+            # refused later by the mesher in the mesher's words.
+            #
+            # An entry with no `regions` key at all is a different fact: that
+            # import never recorded them, which is not the same as a file
+            # with no solids, and refusing there would refuse on a question
+            # nobody asked. `counted` is what separates the two.
+            'bounds_domain': bool(solids) if counted else bool(cad),
+            'refusal': (None if solids or not counted else
+                        'the CAD import resolved no solid, so the file holds '
+                        'no volume to mesh'),
             'warnings': [],
         }
     report = classify_files(paths, labels=labels)
     report['sources'] = list(paths)
     if cad:
         report['representation'] = 'mixed'
+        # A mixed case is counted by both routes, so neither number is the
+        # whole answer; the solids are carried alongside rather than added.
+        report['solids'] = list(solids)
         report['warnings'] = list(report['warnings']) + [
             'the case mixes CAD and tessellated sources; only the '
             'tessellated sources are classified here']

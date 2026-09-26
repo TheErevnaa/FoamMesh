@@ -1,7 +1,7 @@
 """Snappy workflow page: ``snappy.qa`` -- the values snappy meshes against.
 
 Plan 26 WP5.1. This node resolved to the **Export** widget. Two consequences,
-and the second is worse than the first: a user clicking "Snappy QA" got the
+and the second is worse than the first: a user clicking the Quality row got the
 export page, and the strict-GUI harness recorded the node as a visited pass
 because it resolved to *a* widget, so an empty gap register was compatible with
 the defect.
@@ -50,6 +50,7 @@ def _mesh_quality_fields() -> tuple[str, ...]:
 
 
 MESH_QUALITY_FIELDS = _mesh_quality_fields()
+_MESH_QUALITY_IDS = frozenset(MESH_QUALITY_FIELDS)
 
 #: Plan 31 (``checkmesh.thresholds_and_region``, ``checkmesh.write_surfaces``).
 #: checkMesh's own command line. Every one of these was a key in the
@@ -74,6 +75,29 @@ class SnappyQaPage(EngineTaskPage):
     #: in the case root, and the only thing that advances the row.
     run_stage = 'checkMesh'
 
+    #: Plan 32 check 12. MEASURED on the page widget before this moved: 324
+    #: words over 47 labels, of which 187 were the two panels' purpose and
+    #: caveat paragraphs -- what the settings are for, which dictionary they
+    #: reach and what re-running the check does. The page now opens on the
+    #: verdict, the two headings and the thirty-two controls; the reasoning
+    #: is one press away, where §4.5 puts it.
+    HELP_DETAIL = (
+        'How the finished mesh is checked: these change the verdict and the '
+        'evidence, never the mesh. They are checkMesh\'s own command line, '
+        'so re-running the check with a lower threshold re-judges the mesh '
+        'you already have. Judging against the mesher\'s own limits writes '
+        'system/meshQualityDict from the mesher limits below and needs the '
+        'case dictionaries generated again before it takes effect. The '
+        'problem faces are always written as sets into '
+        'constant/polyMesh/sets, which is what the viewport highlights; the '
+        'surface is the extra copy, under postProcessing/checkMesh. '
+        'Every candidate cell is judged against the quality limits. '
+        'snappyHexMesh reverts a snap or a layer insertion that would breach '
+        'one, so they decide what the mesher is allowed to produce rather '
+        'than only what is reported afterwards. They are written into '
+        'snappyHexMeshDict/meshQualityControls and are not the checkMesh '
+        'reporting thresholds above.')
+
     def __init__(self, facade_client, parent=None, *, engine_id=None):
         super().__init__(facade_client, self.task_id_default, parent,
                          engine_id=engine_id or self.engine_id)
@@ -82,17 +106,61 @@ class SnappyQaPage(EngineTaskPage):
         """Mount what checkMesh found, then the limits snappy meshes against."""
         self._findings = CheckMeshFindings(self._client, self)
         layout.addWidget(self._findings)
-        self._check = _CheckMeshGroup(self._client, self)
+        self._check = self.adoptPanel(_CheckMeshGroup(self._client, self))
         layout.addWidget(self._check)
-        self._quality = _MeshQualityGroup(self._client, self)
+        self._quality = self.adoptPanel(
+            _MeshQualityGroup(self._client, self))
         layout.addWidget(self._quality)
+
+    def renders_field(self, field_id: str) -> bool:
+        """The limits belong to the panel, not to the page's own form.
+
+        DP-153. `snappy.qa` binds exactly ``MESH_QUALITY_FIELDS``, and
+        `_MeshQualityGroup` renders exactly ``MESH_QUALITY_FIELDS``, so the
+        page drew all twenty-seven twice -- once in Advanced, once in the
+        panel -- with no link between the two copies. The panel is the
+        surface that was designed for them: it carries the heading, the
+        purpose, the caveat that says these are the mesher's own limits and
+        not the checkMesh thresholds above, and the R102 widening that lets
+        `Min Vol -100000000000.0000000` be read to its last digit.
+        """
+        return field_id not in _MESH_QUALITY_IDS
+
+    def aligned_forms(self):
+        """The two panels are one column: checkMesh's settings over the
+        limits they may be compared against (DP-154)."""
+        return tuple(group.form_layout()
+                     for group in (getattr(self, '_check', None),
+                                   getattr(self, '_quality', None))
+                     if group is not None)
 
     def refresh(self) -> None:
         super().refresh()
+        self._moveProseBehindHelp()
         for name in ('_check', '_quality'):
             group = getattr(self, name, None)
             if group is not None:
-                group.reload()
+                # DP-339. A refresh keeps an uncommitted edit.
+                group.reload(discard_pending=False)
+        # The panels have just rewritten their own labels -- CP-09 adds and
+        # strips " (inactive)" on reload -- so the shared column is measured
+        # again here rather than in `super().refresh()`.
+        self._align_field_columns()
+
+    def _moveProseBehindHelp(self) -> None:
+        """Say the rest of it through the control DP-230 already built.
+
+        `_description` is where a task page authors what the step is for, and
+        `refresh()` rewrites it from the descriptor on every pass, so the two
+        panels' paragraphs are appended after that and the help is re-read
+        from the label rather than set beside it. The two therefore stay the
+        same two strings, which is what the DP-230 gate asserts.
+        """
+        described = self._description.text().strip()
+        if self.HELP_DETAIL not in described:
+            described = (described + ' ' + self.HELP_DETAIL).strip()
+            self._description.setText(described)
+        self._help.setDetail(described, self._prerequisites.text())
 
     def refresh_status(self) -> None:
         """Re-read the task's state *and* the report that produced it.
@@ -121,19 +189,21 @@ class _CheckMeshGroup(FieldGroupPage):
 
     token = 'workflow.quality'
     field_ids = CHECK_MESH_FIELDS
-    heading = 'Mesh check'
-    purpose = (
-        'How the finished mesh is checked. These change the verdict and the '
-        'evidence, never the mesh: they are checkMesh\'s own command line, '
-        'so re-running the check with a lower threshold re-judges the mesh '
-        'you already have.')
-    caveat = (
-        'Judging against the mesher\'s own limits writes '
-        'system/meshQualityDict from the values below and needs the case '
-        'dictionaries generated again before it takes effect. The problem '
-        'faces are always written as sets into constant/polyMesh/sets, which '
-        'is what the viewport highlights; the surface is the extra copy, '
-        'under postProcessing/checkMesh.')
+    #: DP-764. `Mesh check` over "Non-orthogonality reported above 70", and
+    #: `Mesh quality limits` under it over "Max face non-orthogonality 65":
+    #: two numbers for one quantity, and nothing on screen said the first is
+    #: where checkMesh starts reporting a face and the second is what the
+    #: mesher holds itself to (gui review 0925 workflow-pages #4).
+    heading = 'checkMesh report thresholds'
+    #: Plan 32 check 12. The paragraph that stood here and the caveat under
+    #: it are `SnappyQaPage.HELP_DETAIL` now: they say what the settings are
+    #: for and which dictionary they reach, which is reasoning rather than a
+    #: blocker, and §4.5 puts reasoning behind the help control. What stays
+    #: is one sentence, which SETUP-01 puts on the heading's tooltip and the
+    #: accessible description rather than on screen.
+    purpose = ('Where checkMesh starts reporting a face. Changing these '
+               're-judges the mesh you have; it does not change the mesh.')
+    caveat = ''
 
 
 class _MeshQualityGroup(FieldGroupPage):
@@ -141,19 +211,17 @@ class _MeshQualityGroup(FieldGroupPage):
 
     token = 'workflow.quality'
     field_ids = MESH_QUALITY_FIELDS
-    heading = 'Mesh quality limits'
-    purpose = (
-        'Every candidate cell is judged against these. snappyHexMesh reverts '
-        'a snap or a layer insertion that would breach one, so they decide '
-        'what the mesher is allowed to produce rather than only what is '
-        'reported afterwards.')
-    caveat = (
-        'These are the mesher\'s own limits, written into '
-        'snappyHexMeshDict/meshQualityControls. They are not the checkMesh '
-        'reporting thresholds above -- but "Judge against the mesher\'s own '
-        'limits" makes checkMesh read exactly these values, from a '
-        'meshQualityDict written beside the case, so the finished mesh is '
-        'held to what the mesher was asked for.')
+    #: DP-764. Named for the stages that read them (workflow-pages #4/#5):
+    #: snappyHexMesh reverts a snap or layer step that would breach one, so
+    #: they act before this page, not on it.
+    heading = 'Mesher limits (Snap and Layers)'
+    #: Plan 32 check 12, as above: the longer account is
+    #: `SnappyQaPage.HELP_DETAIL`. This sentence is the one a reader editing
+    #: a limit after the run needs, on the heading's tooltip (SETUP-01).
+    purpose = ('The limits snappyHexMesh holds every Snap and Layers step '
+               'to. A change takes effect when Snap and Layers run again; '
+               'the mesh you have was made with the values set when it ran.')
+    caveat = ''
 
     def build(self) -> None:
         super().build()

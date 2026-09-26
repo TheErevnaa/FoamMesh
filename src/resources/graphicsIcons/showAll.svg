@@ -1,14 +1,10 @@
-      <svg
-         id="icons"
-         viewBox="0 0 512 512"
-         xmlns="http://www.w3.org/2000/svg">
-        <path
-   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-   d="M 64,144 H 224 V 304 H 64 Z" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-   d="M 288,208 H 448 V 368 H 288 Z" />
-<path
-   style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-   d="M 176,368 H 272" />
-      </svg>
+<svg
+   id="icons"
+   viewBox="0 0 512 512"
+   xmlns="http://www.w3.org/2000/svg">
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 48,196 Q 256,20 464,196 Q 256,372 48,196 Z" />
+  <circle style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" cx="256" cy="196" r="52" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 72,336 H 168 V 432 H 72 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 208,336 H 304 V 432 H 208 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round" d="M 344,336 H 440 V 432 H 344 Z" />
+</svg>

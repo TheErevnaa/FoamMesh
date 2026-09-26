@@ -16,7 +16,7 @@ class MeshImportDialog(QDialog):
     def __init__(self, entries: tuple[MeshImportEntry, ...], parent=None):
         super().__init__(parent)
         self._entries = tuple(entries)
-        self.setWindowTitle(self.tr('Load Mesh'))
+        self.setWindowTitle(self.tr('Load mesh'))
         self.resize(480, 360)
         layout = QVBoxLayout(self)
         self._list = QListWidget()

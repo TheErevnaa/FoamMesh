@@ -79,6 +79,14 @@ class TaskStateLoadResult:
     reset_reason: str = ''
     prior: dict = field(default_factory=dict)
     current: dict = field(default_factory=dict)
+    #: What the document was refused for, in the loader's own words, when the
+    #: refusal was about something inside it. DP-241, left standing: the
+    #: reason code says a file was inconsistent and cannot say with what, so
+    #: the one contradiction that caused a reset was named in an exception
+    #: nobody catches and shown to nobody. Empty for the resets that are about
+    #: the file as a whole -- an older schema, a changed workflow -- which
+    #: have no task pair behind them.
+    detail: str = ''
 
     @property
     def was_reset(self) -> bool:
@@ -88,11 +96,15 @@ class TaskStateLoadResult:
         """What a surface shows the user, or ``None`` when nothing happened."""
         if not self.was_reset:
             return None
+        message = _RESET_MESSAGES.get(
+            self.reset_reason, 'Saved workflow progress could not be read '
+                               'and has been reset.')
+        if self.detail:
+            message = f'{message} ({self.detail})'
         return {
             'reason': self.reset_reason,
-            'message': _RESET_MESSAGES.get(
-                self.reset_reason, 'Saved workflow progress could not be read '
-                                   'and has been reset.'),
+            'message': message,
+            'detail': self.detail,
             'prior': dict(self.prior),
             'current': dict(self.current),
         }
@@ -170,10 +182,10 @@ class EngineTaskStateStore:
             return TaskStateLoadResult(fresh, 'workflow_digest', prior, current)
         try:
             fresh.load(document)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError) as error:
             return TaskStateLoadResult(
                 EngineWorkflowGraph(self.descriptor), 'inconsistent_state',
-                prior, current)
+                prior, current, str(error))
         return TaskStateLoadResult(fresh, prior=prior, current=current)
 
     def _contract(self) -> dict:
@@ -330,7 +342,7 @@ class EngineTaskStateStore:
 
     def record_atomic_run_success(self, task_ids, *,
                                   warning: bool = False,
-                                  waived=()) -> dict:
+                                  waived=(), configured=()) -> dict:
         """Advance the tasks one atomic engine run actually performed.
 
         Some engines do several tasks in one invocation -- ``mesh.gmsh.run``
@@ -344,9 +356,19 @@ class EngineTaskStateStore:
         just refused the mesh, so the outline painted the plain ``COMPLETED``
         tick over a recorded override and the ``WAIVED`` glyph the app already
         defines was never drawn for the one case it exists for.
+
+        ``configured`` names the optional tasks this run's configuration asked
+        for (DP-228). The graph cannot answer that question: a page save that
+        was refused as locked leaves its task READY, and DP-35 grades a READY
+        optional task as unused. The job the runner consumed can answer it, so
+        that is what the caller reads and hands here.
         """
         performed = set(task_ids)
         known = {task.task_id for task in self.descriptor.ordered_tasks()}
+        # A configuration naming a task this engine does not have is dropped
+        # rather than raised: it is derived from a job document, and a job that
+        # named one must not take down a run that produced a mesh.
+        configured = frozenset(configured) & known
         unknown = sorted(performed - known)
         if unknown:
             raise TaskStateError(
@@ -368,7 +390,7 @@ class EngineTaskStateStore:
         return self._record(
             ordered, warning=warning, warning_for=performed,
             performed=performed, evidence={'kind': 'atomic_run'},
-            waived=frozenset(waived))
+            configured=configured, waived=frozenset(waived))
 
     def record_check_result(self, task_id: str, *, evidence: dict,
                             warning: bool = False) -> dict:
@@ -392,7 +414,7 @@ class EngineTaskStateStore:
 
     def _record(self, task_ids, *, warning: bool, evidence: dict,
                 complete: bool = False, warning_for=None, performed=None,
-                waived=frozenset()) -> dict:
+                configured=frozenset(), waived=frozenset()) -> dict:
         """Advance the named tasks, stopping cleanly and keeping what advanced.
 
         The previous recorder raised into a caller that swallowed the exception
@@ -406,8 +428,17 @@ class EngineTaskStateStore:
         true of every caller but the chain recorder. Its only effect is on
         ``SKIPPED``: a skip says nothing ran, so a run that performed the task
         replaces it, while a run that only implies it leaves the skip standing.
+
+        ``configured`` names the optional tasks whose configuration this run
+        consumed, read back from the job the runner was given. An optional task
+        in it was used however the graph reads, so it is recorded as the pass
+        it was rather than as the skip DP-35 writes for a task nobody
+        configured. It is not the same claim as ``performed``: a warning still
+        belongs to the stage that raised it, so a task named here and nowhere
+        else is recorded PASSED and not WARNING.
         """
         performed = set(task_ids) if performed is None else set(performed)
+        configured = frozenset(configured)
         loaded = self.load_result()
         graph = loaded.graph
         advanced: list[str] = []
@@ -422,12 +453,22 @@ class EngineTaskStateStore:
             # Nor is a skipped task this run performed (R184): the skip is the
             # record that nothing ran, and something just did.
             ran_after_skip = (state is TaskState.SKIPPED
-                              and task_id in performed)
+                              and (task_id in performed
+                                   or task_id in configured))
             if state in _SETTLED and task_id not in waived and not ran_after_skip:
                 skipped.append({'task_id': task_id, 'reason': 'already recorded',
                                 'state': state.value})
                 continue
-            unused = state in {TaskState.READY, TaskState.LOCKED}
+            # DP-228. "Unused" is a fact about the configuration the run
+            # consumed, not about the graph. MEASURED on the
+            # `workflow-ux-20260915` audit: the Boundary layers page was saved
+            # with three layers, the save was refused as locked by
+            # prerequisites and reported as `Settings saved`, the run grew
+            # 7,914 prisms, and this graded the task SKIPPED because it was
+            # still READY. A task whose settings the run consumed was used,
+            # whatever the page save left behind.
+            unused = (state in {TaskState.READY, TaskState.LOCKED}
+                      and task_id not in configured)
             if task.cardinality is TaskCardinality.REPEATABLE and unused:
                 # An unconfigured repeatable task was explicitly not used.
                 graph.skip(task_id)
@@ -462,7 +503,7 @@ class EngineTaskStateStore:
                 elif complete:
                     # R180. `complete` refuses to run from EDITING, and a
                     # check task reaches EDITING the moment anyone presses
-                    # Revert and Edit on it. From there it is a dead end: a
+                    # Revert and edit on it. From there it is a dead end: a
                     # run-gated task refuses `accept`, and the run that should
                     # settle it rewrote its report and was then blocked here
                     # -- silently, because `_record` reports a block in its

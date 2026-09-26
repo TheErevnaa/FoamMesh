@@ -2,25 +2,11 @@
    id="icons"
    viewBox="0 0 512 512"
    xmlns="http://www.w3.org/2000/svg">
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 176,64 H 64 V 176" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 336,64 H 448 V 176" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 176,448 H 64 V 336" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 336,448 H 448 V 336" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round"
-     d="M 192,192 H 320 V 320 H 192 Z" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-     d="M 232,256 H 280" />
-  <path
-     style="fill:none;stroke:#000000;stroke-width:20;stroke-linecap:round;stroke-linejoin:round"
-     d="M 256,232 V 280" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 152,56 H 56 V 152" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 360,56 H 456 V 152" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 152,456 H 56 V 360" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 360,456 H 456 V 360" />
+  <path style="fill:#000000;fill-opacity:0.35;stroke:none" d="M 256,168 332,212 332,300 256,344 180,300 180,212 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 256,168 332,212 332,300 256,344 180,300 180,212 Z" />
+  <path style="fill:none;stroke:#000000;stroke-width:32;stroke-linecap:round;stroke-linejoin:round" d="M 180,212 256,256 332,212 M 256,256 V 344" />
 </svg>

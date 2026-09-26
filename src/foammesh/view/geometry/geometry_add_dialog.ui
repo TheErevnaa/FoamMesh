@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Add Geometry</string>
+   <string>Add geometry</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout_2">
    <item>
@@ -56,7 +56,7 @@
       <item>
        <widget class="QRadioButton" name="hex6">
         <property name="text">
-         <string>Hex6 (6 Sub-Surfaces)</string>
+         <string>Hex6 (6 sub-surfaces)</string>
         </property>
         <attribute name="buttonGroup">
          <string notr="true">shapeRadios</string>

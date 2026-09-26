@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
+from foammesh.core.quantities import agreeing
+
 
 CAD_ACTION_ORDER = (
     'cad.analyze', 'cad.fix_shape', 'cad.sew', 'cad.fix_wireframe',
@@ -56,7 +58,9 @@ def execute(shape, actions: list[CadRepairAction], *, backend: CadHealingBackend
     enabled = [item for item in actions if item.enabled]
     unknown = [item.action for item in enabled if item.action not in CAD_ACTION_ORDER]
     if unknown:
-        raise ValueError(f'unsupported CAD healing action(s): {", ".join(unknown)}')
+        raise ValueError(
+            f'unsupported CAD healing {agreeing(len(unknown), "action")}: '
+            + ', '.join(unknown))
     bodies = backend.split_bodies(backend.clone(shape))
     report = CadHealingReport(bodies_total=len(bodies))
     output = []
@@ -126,11 +130,41 @@ def execute(shape, actions: list[CadRepairAction], *, backend: CadHealingBackend
     return backend.combine_bodies(output), report
 
 
+#: DP-530. The tolerance a rung is run at when its plan states none, in the
+#: shape's own units: OCCT's confusion scale, not a length the user chose.
+_NATIVE_TOLERANCE = 1e-6
+
+
 class OcctHealingBackend:
     """Real pythonocc adapter. Imports remain lazy so non-CAD installs stay usable."""
 
-    def __init__(self):
+    def __init__(self, unit_factor: float = 1.0):
+        #: DP-530. Metres per unit of the shape's coordinates -- 0.001 for a
+        #: STEP or IGES read, which comes back in millimetres. A plan's
+        #: ``tolerance`` is in metres, the unit the Repair page labels it in
+        #: and suggests it in; OCCT takes the shape's own units, and
+        #: :meth:`run` converts at the one place the two meet. The census it
+        #: reports is converted back, so every length a report carries is in
+        #: metres too.
+        self.unit_factor = float(unit_factor or 1.0)
         self._history_steps = []
+
+    def applied_tolerance(self, params: dict) -> float:
+        """The OCCT tolerance, in the shape's units, for a rung's *params*.
+
+        A ``tolerance`` the plan states is in metres and is converted. With
+        none stated, the rung keeps OCCT's own confusion-scale default of
+        ``1e-6`` of the shape's units -- a resolution of the data, not a
+        length anybody typed.
+        """
+        if params.get('tolerance') is None:
+            return _NATIVE_TOLERANCE
+        return float(params['tolerance']) / self.unit_factor
+
+    def _delta(self, before_shape, after_shape, tolerance: float,
+               metrics: dict) -> dict:
+        return _census_delta(before_shape, after_shape, tolerance, metrics,
+                             unit_factor=self.unit_factor)
 
     def clone(self, shape):
         from .availability import require
@@ -182,9 +216,12 @@ class OcctHealingBackend:
         return compound
 
     def run(self, body, action: str, params: dict):
-        tolerance = float(params.get('tolerance', 1e-6))
+        # DP-530. In the shape's units from here on; `stated` is the metres
+        # the plan asked for, and is what the report records.
+        tolerance = self.applied_tolerance(params)
+        stated = tolerance * self.unit_factor
         if action == 'cad.analyze':
-            census = _analyze(body, tolerance)
+            census = _analyze(body, tolerance, self.unit_factor)
             return body, {'metrics_before': census, 'metrics_after': census,
                           'entities_touched': 0, **census}
         if action == 'cad.fix_shape':
@@ -196,7 +233,7 @@ class OcctHealingBackend:
             fixer.Perform()
             output = fixer.Shape()
             self._history_steps.append(('reshape', fixer.Context()))
-            return output, _census_delta(body, output, tolerance, {'precision': tolerance})
+            return output, self._delta(body, output, tolerance, {'precision': stated})
         if action == 'cad.sew':
             from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing
 
@@ -207,7 +244,7 @@ class OcctHealingBackend:
                 return sewing, sewing.SewedShape()
 
             sewing, output = _sew(tolerance)
-            delta = _census_delta(body, output, tolerance, {'tolerance': tolerance})
+            delta = self._delta(body, output, tolerance, {'tolerance': stated})
             after_free_edges = delta['metrics_after']['free_edges']
             escalated = False
             # Appendix A §3.2: one bounded, recorded escalation (×5) — only when
@@ -215,8 +252,9 @@ class OcctHealingBackend:
             if params.get('allow_escalation') and after_free_edges > 0:
                 escalated_tolerance = tolerance * 5
                 sewing2, output2 = _sew(escalated_tolerance)
-                delta2 = _census_delta(body, output2, escalated_tolerance, {
-                    'tolerance': escalated_tolerance, 'escalated_from': tolerance})
+                delta2 = self._delta(body, output2, escalated_tolerance, {
+                    'tolerance': escalated_tolerance * self.unit_factor,
+                    'escalated_from': stated})
                 if delta2['metrics_after']['free_edges'] < after_free_edges:
                     sewing, output, delta = sewing2, output2, delta2
                     escalated = True
@@ -233,7 +271,7 @@ class OcctHealingBackend:
             gaps = bool(fixer.FixWireGaps())
             output = fixer.Shape()
             self._history_steps.append(('reshape', fixer.Context()))
-            return output, _census_delta(body, output, tolerance, {
+            return output, self._delta(body, output, tolerance, {
                 'small_edges_fixed': small, 'wire_gaps_fixed': gaps})
         if action == 'cad.remove_small_faces':
             from OCC.Core.ShapeFix import ShapeFix_FixSmallFace
@@ -243,7 +281,7 @@ class OcctHealingBackend:
             fixer.Perform()
             output = fixer.FixShape()
             self._history_steps.append(('reshape', fixer.Context()))
-            return output, _census_delta(body, output, tolerance, {'tolerance': tolerance})
+            return output, self._delta(body, output, tolerance, {'tolerance': stated})
         if action == 'cad.unify_same_domain':
             from OCC.Core.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
             unify = ShapeUpgrade_UnifySameDomain(
@@ -252,7 +290,7 @@ class OcctHealingBackend:
             unify.Build()
             output = unify.Shape()
             self._history_steps.append(('history', unify.History()))
-            return output, _census_delta(body, output, tolerance, {'unified': True})
+            return output, self._delta(body, output, tolerance, {'unified': True})
         if action == 'cad.orient_and_solidify':
             from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
             from OCC.Core.TopAbs import TopAbs_IN, TopAbs_SHELL, TopAbs_SOLID
@@ -269,12 +307,12 @@ class OcctHealingBackend:
                 classifier.PerformInfinitePoint(tolerance)
                 if classifier.State() == TopAbs_IN:
                     current, reversed_body = current.Reversed(), True
-            return current, _census_delta(body, current, tolerance, {
+            return current, self._delta(body, current, tolerance, {
                 'solidified': solidified, 'reversed': reversed_body,
                 'open_shell': current.ShapeType() != TopAbs_SOLID})
         if action in {'cad.retessellate', 'cad.rediagnose'}:
             # These rungs are performed by the store's tessellation/diagnostic boundary.
-            census = _analyze(body, tolerance)
+            census = _analyze(body, tolerance, self.unit_factor)
             return body, {'delegated_to_artifact_store': True,
                           'metrics_before': census, 'metrics_after': census,
                           'entities_touched': 0}
@@ -285,8 +323,10 @@ class OcctHealingBackend:
         mapped = history_patch_map(
             before_shape, after_shape, patches,
             getattr(self, '_history_steps', ()))
+        # DP-530. The working tolerance is in metres; the shapes are not.
         return mapped or geometric_patch_map(
-            before_shape, after_shape, patches, working_tolerance)
+            before_shape, after_shape, patches,
+            float(working_tolerance) / self.unit_factor)
 
 
 def _count(shape, kind) -> int:
@@ -298,8 +338,16 @@ def _count(shape, kind) -> int:
     return count
 
 
-def _analyze(shape, tolerance: float) -> dict:
-    """Native validity, free-wire, tolerance and small-entity census."""
+def _analyze(shape, tolerance: float, unit_factor: float = 1.0) -> dict:
+    """Native validity, free-wire, tolerance and small-entity census.
+
+    *tolerance* is in the shape's units, as OCCT takes it. *unit_factor* is
+    metres per unit of the shape (DP-530): the tolerances, lengths and areas
+    the census reports are converted by it, so a STEP read in millimetres
+    reports metres like everything else -- its 1 mm edge had been reported as
+    an edge of ``1.0`` under a finding that says it speaks in metres.
+    """
+    factor = float(unit_factor or 1.0)
     from OCC.Core.BRepCheck import BRepCheck_Analyzer
     from OCC.Core.BRepGProp import brepgprop
     from OCC.Core.GProp import GProp_GProps
@@ -334,19 +382,23 @@ def _analyze(shape, tolerance: float) -> dict:
         'free_edges': free_edges,
         'nonmanifold_edges': nonmanifold_edges,
         'tolerance_census': {
-            'min': float(census.GlobalTolerance(-1)),
-            'avg': float(census.GlobalTolerance(0)),
-            'max': float(census.GlobalTolerance(1))},
+            'min': float(census.GlobalTolerance(-1)) * factor,
+            'avg': float(census.GlobalTolerance(0)) * factor,
+            'max': float(census.GlobalTolerance(1)) * factor},
         'faces': len(face_areas), 'edges': len(edge_lengths),
         'small_faces': sum(area < (4 * tolerance) ** 2 for area in face_areas),
         'small_edges': sum(length < 2 * tolerance for length in edge_lengths),
-        'face_area_min': min(face_areas, default=None),
-        'edge_length_min': min(edge_lengths, default=None),
+        'face_area_min': (min(face_areas) * factor * factor
+                          if face_areas else None),
+        'edge_length_min': (min(edge_lengths) * factor
+                            if edge_lengths else None),
     }
 
 
-def _census_delta(before_shape, after_shape, tolerance: float, metrics: dict) -> dict:
-    before, after = _analyze(before_shape, tolerance), _analyze(after_shape, tolerance)
+def _census_delta(before_shape, after_shape, tolerance: float, metrics: dict,
+                  *, unit_factor: float = 1.0) -> dict:
+    before = _analyze(before_shape, tolerance, unit_factor)
+    after = _analyze(after_shape, tolerance, unit_factor)
     touched = (abs(after['faces'] - before['faces']) +
                abs(after['edges'] - before['edges']) +
                abs(after['free_edges'] - before['free_edges']) +

@@ -3,7 +3,7 @@
 R208. This panel was written for R100 -- the run finished `warning`, and the
 1,451 concave cells behind it appeared on no surface at all -- and it was built
 inside the snappy workflow package, where only the snappy QA page could reach
-it. MEASURED on tee_gmsh_r2: Gmsh's Mesh QA page read "Accepted." above an
+it. MEASURED on tee_gmsh_r2: the Gmsh Quality page read "Accepted." above an
 empty grey rectangle, while `foammesh/quality/latest.json` held the whole
 checkMesh report and the dock at the bottom of the window was showing it. Both
 engines run the same checkMesh on the same published mesh and write the same
@@ -71,8 +71,16 @@ class CheckMeshFindings(QGroupBox):
     def refresh(self) -> None:
         from foammesh.core.quality.readout import checkmesh_readout
 
-        readout = checkmesh_readout(self.report())
+        report = self.report()
+        readout = checkmesh_readout(report)
         self._headline.setText(readout.headline)
+        # W-O1. A verdict is a measured result and stays; the sentence that
+        # says there is no verdict yet is the state of the case, and it is
+        # said by the panel itself rather than by a label standing in the
+        # settings column where a reading will later be.
+        self._headline.setVisible(bool(report))
+        self.setToolTip(readout.headline)
+        self.setAccessibleDescription(readout.headline)
         self._caveat.setText(readout.caveat)
         self._caveat.setVisible(bool(readout.caveat))
         self._table.setRowCount(len(readout.rows))

@@ -45,6 +45,7 @@ import time
 
 from foammesh.core.quality.checkmesh_service import (
     NATIVE_CHECK, report_path as quality_report_path)
+from foammesh.core.quantities import agreeing, count_text
 
 #: The version of the adoption report itself.
 ADOPTION_SCHEMA_VERSION = 1
@@ -227,7 +228,7 @@ def _adopt_sidecar(case_path: Path) -> RecordAdoption:
         findings['stale_evidence'] = True
         reasons.append(
             'a mesh exists beside a sidecar that records no workflow and no '
-            'mesh fingerprint, so the case opens as External Mesh: the mesh '
+            'mesh fingerprint, so the case opens as External mesh: the mesh '
             'is kept and used, and the steps that made it are not claimed')
     return RecordAdoption('case-metadata', str(path), disposition, reasons,
                           findings)
@@ -593,9 +594,10 @@ def _adopt_gmsh_run(case_path: Path, run_path: Path) -> list:
         disposition = max(disposition, MIGRATED, key=_SEVERITY.get)
         document['artifacts'] = artifacts
         reasons.append(
-            f'{len(artifacts)} output file(s) exist in the run directory and '
-            'were not recorded; the rows are rebuilt from the files, hashed '
-            'as found')
+            f'{count_text(len(artifacts), "output file")} '
+            f'{agreeing(len(artifacts), "exists", "exist")} in the run '
+            f'directory and {agreeing(len(artifacts), "was", "were")} not '
+            'recorded; the rows are rebuilt from the files, hashed as found')
     if 'result_handle' not in manifest and artifacts:
         document['result_handle'] = _result_handle(
             run_path, manifest, case_path, artifacts)
@@ -684,7 +686,7 @@ def _adopt_snappy_evidence(case_path: Path) -> list:
                 reasons.append(
                     'the recorded mesh check names neither a run nor a mesh '
                     'fingerprint, so it cannot be shown to describe any mesh '
-                    'in the case; run Mesh Check again to attach current '
+                    'in the case; run Mesh check again to attach current '
                     'evidence')
             elif not measured:
                 reasons.append(

@@ -27,7 +27,7 @@ class ExternalMeshPage(QWidget):
         self._summary = None
 
         layout = QVBoxLayout(self)
-        title = QLabel(self.tr('External Mesh'))
+        title = QLabel(self.tr('External mesh'))
         title.setObjectName('externalMeshTitle')
         layout.addWidget(title)
 
@@ -50,11 +50,11 @@ class ExternalMeshPage(QWidget):
         form.addRow(self.tr('Why this mode'), self._reason)
         layout.addLayout(form)
 
-        self._showMesh = QPushButton(self.tr('Display Mesh'))
-        self._meshInfo = QPushButton(self.tr('Mesh Info'))
-        self._copyCasePath = QPushButton(self.tr('Copy Case Path'))
-        self._startWorkflow = QPushButton(self.tr('Start Meshing Workflow'))
-        self._returnExternal = QPushButton(self.tr('Return to External Mesh'))
+        self._showMesh = QPushButton(self.tr('Display mesh'))
+        self._meshInfo = QPushButton(self.tr('Mesh info'))
+        self._copyCasePath = QPushButton(self.tr('Copy case path'))
+        self._startWorkflow = QPushButton(self.tr('Start meshing workflow'))
+        self._returnExternal = QPushButton(self.tr('Return to external mesh'))
         self._showMesh.clicked.connect(self.showMeshRequested)
         self._meshInfo.clicked.connect(self.meshInfoRequested)
         self._copyCasePath.clicked.connect(self._copyPath)

@@ -131,7 +131,7 @@ class FileSystem:
         makeDir(self._casePath, Directory.BOUNDARY_CONDITIONS_DIRECTORY_NAME)
 
     def ensureFoamFile(self):
-        """Create the empty ParaView/OpenFOAM marker file when it is absent."""
+        """Create the empty OpenFOAM case marker file when it is absent."""
         self.foamFilePath().touch(exist_ok=True)
         
     async def createRegionSystemDirectory(self, rname):

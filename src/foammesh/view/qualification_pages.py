@@ -25,14 +25,26 @@ from PySide6.QtWidgets import (
 
 from widgets.fit_to_text import FlowLayout, fit_to_text
 
+from foammesh.core.quality.layer_report import coverage_rows
+from foammesh.core.quality.readout import absent
 from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.facade_client import query, submit
+from foammesh.view.theming.metrics import UnitLabel
+from foammesh.view.widgets.folder_header import FolderHeader
 
 
 #: Task states that mean a prerequisite is settled. Same set the task page uses
 #: for "still accepted"; a prerequisite in any other state is one the user has
 #: to go back to.
 _SETTLED = frozenset({'passed', 'warning', 'completed', 'waived', 'skipped'})
+
+#: W-O1. What the fidelity tolerance is, on the field that takes it. A module
+#: constant rather than a literal at the call site because the state of the
+#: store is appended to it at runtime and the two halves are written in
+#: different places.
+TOLERANCE_HELP = (
+    'How far the mesh may sit from the prepared surface before a section '
+    'counts as lost. Nothing is rated until one is set.')
 
 
 class QualificationTaskPage(EngineTaskPage):
@@ -69,6 +81,10 @@ class QualificationTaskPage(EngineTaskPage):
     #: What the panel calls itself, so four consecutive pages are no longer
     #: distinguishable only by their titles (R123).
     evidence_title = 'Measured evidence'
+    #: W-O1. Anything else this page's panel has to explain about itself.
+    #: Appended to the gate sentence and rendered with it, on the panel and
+    #: in the step help -- never as a paragraph over the controls.
+    PANEL_HELP = ''
 
     def __init__(self, facade_client, parent=None, *, engine_id=None):
         super().__init__(facade_client, self.task_id_default, parent,
@@ -85,7 +101,13 @@ class QualificationTaskPage(EngineTaskPage):
         self._gateNote = QLabel(self)
         self._gateNote.setObjectName('qualificationGateNote')
         self._gateNote.setWordWrap(True)
-        self.refreshGateNote()
+        # W-O1. What a non-pass does is reasoning about the panel, not a
+        # setting, so the sentence is carried rather than drawn:
+        # `refreshGateNote` renders it on the panel it describes, as that
+        # panel's tooltip and accessible description, and appends it to the
+        # step help. Same arrangement as the hidden `_description` label that
+        # feeds the Help menu.
+        self._gateNote.setVisible(False)
         inner.addWidget(self._gateNote)
 
         self._evidenceHeadline = QLabel(self)
@@ -93,6 +115,11 @@ class QualificationTaskPage(EngineTaskPage):
         self._evidenceHeadline.setWordWrap(True)
         self._evidenceHeadline.setAccessibleName(
             self.tr('Verdict recorded for this task'))
+        # W-O1. A verdict is a measured result and stays. "No report has been
+        # read for this task." is the state of the case before there is one,
+        # and the outline row beside this page already paints exactly that,
+        # so the line appears when there is a verdict to put on it.
+        self._evidenceHeadline.setVisible(False)
         inner.addWidget(self._evidenceHeadline)
 
         self._evidenceCaveat = QLabel(self)
@@ -133,6 +160,9 @@ class QualificationTaskPage(EngineTaskPage):
         inner.addWidget(self._evidenceTable, 1)
         layout.addWidget(box)
         self._evidenceBox = box
+        # W-O1. After the box exists, because that is what the note is drawn
+        # on now.
+        self.refreshGateNote()
         # R187. Claimed at construction only so the first paint of a page that
         # does have rows is right; refreshEvidence() hands it back when the
         # report turns out to be empty.
@@ -167,6 +197,10 @@ class QualificationTaskPage(EngineTaskPage):
         shipping default, report-only, and the opposite of what the page had
         just promised. A gate that overstates itself is worse than one that
         does not gate, because the next non-pass reads as safe to ignore.
+
+        W-O1. The label is hidden and the sentence is drawn on the panel it
+        is about, as its tooltip and its accessible description, and on the
+        step help beside them. The words are unchanged; only the surface is.
         """
         label = getattr(self, '_gateNote', None)
         if label is None:
@@ -181,6 +215,51 @@ class QualificationTaskPage(EngineTaskPage):
                 'This is a blocking gate, but qualification is in report-only '
                 'mode: a non-pass is recorded and does not stop the pipeline '
                 'until thresholds are promoted.'))
+        self.showGateNote(label.text())
+
+    def showGateNote(self, said: str) -> None:
+        """Draw the gate sentence on the panel and on the step help.
+
+        W-O1. Two surfaces, neither of them a paragraph in the settings
+        column: the box that holds the verdict carries the sentence for
+        anyone who asks it, and the step help carries it for anyone reading
+        the step. Composed at runtime from whichever branch above applied,
+        so neither surface can hold a stale copy of the other branch.
+        """
+        if self.PANEL_HELP:
+            said = (said + ' ' + self.tr(self.PANEL_HELP)).strip()
+        for name in ('_evidenceBox', '_checkBox'):
+            box = getattr(self, name, None)
+            if box is not None:
+                box.setToolTip(said)
+                box.setAccessibleDescription(said)
+        described = getattr(self, '_description', None)
+        help_control = getattr(self, '_help', None)
+        # `build_sections` runs from inside the base page's constructor, so
+        # the first call arrives before the rest of the page exists and the
+        # help control has nothing to read yet. The spacer index is the last
+        # thing the constructor sets after the sections are built; until it
+        # is there, only the panel is painted, and the first `refresh_status`
+        # a moment later brings the help along.
+        if (described is None or help_control is None
+                or getattr(self, '_bodySpacerIndex', -1) < 0):
+            return
+        text = described.text().strip()
+        # The branch can change under the page -- a promoted threshold moves
+        # a gate from report-only to enforcing -- so the sentence that was
+        # appended last time comes out before this one goes in. Otherwise the
+        # help would end up holding both readings of the same gate.
+        previous = getattr(self, '_gateSaid', '')
+        if previous and previous != said:
+            text = ' '.join(text.replace(previous, '').split())
+        if said and said not in text:
+            text = (text + ' ' + said).strip()
+        self._gateSaid = said
+        if text != described.text().strip():
+            described.setText(text)
+        prerequisites = getattr(self, '_prerequisites', None)
+        help_control.setDetail(
+            text, prerequisites.text() if prerequisites is not None else '')
 
     #: R190. Whether a row re-size is already queued for the next turn of
     #: the event loop.
@@ -214,9 +293,13 @@ class QualificationTaskPage(EngineTaskPage):
         readout = self.evidence_document()
         self.refreshGateNote()
         rows = list(readout.get('rows') or ())
+        verdict = str(readout.get('headline') or '')
         self._evidenceHeadline.setText(
-            str(readout.get('headline')
-                or self.tr('No report has been read for this task.')))
+            verdict or self.tr('No report has been read for this task.'))
+        # W-O1. The verdict when there is one; nothing when there is not.
+        # The absent case is the state of the case and the outline row is
+        # already drawing it, two columns to the left of this one.
+        self._evidenceHeadline.setVisible(bool(verdict))
         caveat = str(readout.get('caveat') or '')
         self._evidenceCaveat.setText(caveat)
         self._evidenceCaveat.setVisible(bool(caveat))
@@ -256,13 +339,19 @@ class QualificationTaskPage(EngineTaskPage):
         which one is unfinished.
         """
         label = getattr(self, '_prerequisites', None)
-        depends = tuple((self._task or {}).get('depends_on') or ())
-        if label is None or not depends:
+        if label is None:
             return
         titles = self._task_titles()
         try:
             page = self.page_model()
         except Exception:                                    # noqa: BLE001
+            return
+        # DP-144. On snappy this page depended on Boundary Layers, which is
+        # optional and which the run skips, so a mesh made without layers was
+        # told its Geometry Fidelity was waiting on them.
+        depends = tuple(page.get('requires')
+                        or (self._task or {}).get('depends_on') or ())
+        if not depends:
             return
         states = (page.get('state') or {}).get('tasks') or {}
         outstanding = [item for item in depends
@@ -329,6 +418,12 @@ class ReferenceReadinessPage(QualificationTaskPage):
         self._gateState.setWordWrap(True)
         self._gateState.setAccessibleName(
             self.tr('Whether this readiness task has been confirmed'))
+        # W-O1. Carried, not drawn. Half of this sentence explains what the
+        # press does, which belongs on the press; the other half reports
+        # whether it has happened, which the outline row already shows.
+        # `refreshReadinessGate` puts the whole of it on the box and on the
+        # button, and the label stays off the column.
+        self._gateState.setVisible(False)
         inner.addWidget(self._gateState)
 
         self._confirm = QPushButton(self.tr('Confirm readiness'), self)
@@ -351,6 +446,7 @@ class ReferenceReadinessPage(QualificationTaskPage):
         row.addWidget(self._confirm)
         inner.addLayout(row)
         self._confirm.clicked.connect(self.confirmReadiness)
+        self._gateBox = box
         return box
 
     def dependentTaskTitles(self) -> tuple:
@@ -366,7 +462,14 @@ class ReferenceReadinessPage(QualificationTaskPage):
             return ()
 
     def refreshReadinessGate(self) -> None:
-        """Say whether the confirmation has been given, and what waits on it."""
+        """Say whether the confirmation has been given, and what waits on it.
+
+        W-O1. On the press and on the box around it rather than in a
+        paragraph above them. The sentence names the button by its label and
+        names the rows that stay locked, so the control it is about is the
+        one place it can be read without standing between the reader and
+        anything.
+        """
         note = getattr(self, '_gateState', None)
         if note is None:
             return
@@ -377,8 +480,9 @@ class ReferenceReadinessPage(QualificationTaskPage):
                 'Confirmed. The tasks that wait on this one are unlocked. '
                 'This records your confirmation; it does not verify the '
                 'reference. If a fidelity task reports that no section was '
-                'measured, the reference was not built - set a tolerance '
+                'measured, the reference was not built — set a tolerance '
                 'below and prepare the geometry again.'))
+            self.showReadinessGate(note.text())
             return
         waiting = self.dependentTaskTitles()
         text = self.tr(
@@ -389,6 +493,23 @@ class ReferenceReadinessPage(QualificationTaskPage):
             text += ' ' + self.tr('Until you do, {0} stays locked.').format(
                 ', '.join(waiting))
         note.setText(text)
+        self.showReadinessGate(text)
+
+    def showReadinessGate(self, said: str) -> None:
+        """Put the readiness sentence where the press is.
+
+        The button is disabled once the task is settled, and a disabled
+        control is not reliably asked for its tooltip, so the box carries the
+        sentence as well. Composed at runtime because it names the rows this
+        engine's workflow actually unlocks.
+        """
+        button = getattr(self, '_confirm', None)
+        if button is not None:
+            button.setToolTip(said)
+        box = getattr(self, '_gateBox', None)
+        if box is not None:
+            box.setToolTip(said)
+            box.setAccessibleDescription(said)
 
     def confirmReadiness(self) -> None:
         """Settle the task. The branch turns this into the accept transition."""
@@ -400,12 +521,9 @@ class ReferenceReadinessPage(QualificationTaskPage):
     def _buildToleranceBox(self) -> QGroupBox:
         box = QGroupBox(self.tr('Fidelity tolerance'), self)
         inner = QVBoxLayout(box)
-        note = QLabel(self.tr(
-            'How far the mesh may sit from the prepared surface before a '
-            'section counts as lost. Nothing is rated until one is set.'),
-            self)
-        note.setWordWrap(True)
-        inner.addWidget(note)
+        # W-O1. This was a wrapped paragraph standing above the field it
+        # describes. It explains one setting, so it is that setting's
+        # tooltip; `refreshTolerance` adds the state of the store to it.
 
         # B8/B9. Field and two buttons on one line left none of them room:
         # the placeholder read `met...` and the button `Set toleranc`. The
@@ -416,16 +534,26 @@ class ReferenceReadinessPage(QualificationTaskPage):
         self._tolerance.setObjectName('qualificationTolerance')
         self._tolerance.setAccessibleName(
             self.tr('Project fidelity tolerance in metres'))
-        self._tolerance.setPlaceholderText(self.tr('metres'))
+        # DP-164. This one row named its unit three times and spelled it
+        # three ways: `Tolerance (m)` on the label, `metres` as the
+        # placeholder inside the box, `in metres` in the accessible name.
+        # The unit is said once, beside the box, as `m`.
+        self._tolerance.setPlaceholderText(self.tr('0.001'))
         self._tolerance.setMinimumWidth(
             self._tolerance.fontMetrics().horizontalAdvance(
-                self.tr('metres')) + 32)
+                '0.0000001') + 32)
         self._suggest = QPushButton(self.tr('Use suggestion'), self)
         self._suggest.setObjectName('qualificationToleranceSuggest')
         self._apply = QPushButton(self.tr('Set tolerance'), self)
         self._apply.setObjectName('qualificationToleranceApply')
-        row.addWidget(QLabel(self.tr('Tolerance (m)'), self))
+        name = QLabel(self.tr('Tolerance'), self)
+        # W-O1. Hand-built rows are laid out by hand, so nothing had told Qt
+        # which control this word names. It is a field label and now says so,
+        # to a screen reader and to the census alike.
+        name.setBuddy(self._tolerance)
+        row.addWidget(name)
         row.addWidget(self._tolerance, 1)
+        row.addWidget(UnitLabel('m'))
         inner.addLayout(row)
 
         buttons = FlowLayout()
@@ -437,6 +565,12 @@ class ReferenceReadinessPage(QualificationTaskPage):
         self._toleranceNote = QLabel(self)
         self._toleranceNote.setObjectName('qualificationToleranceNote')
         self._toleranceNote.setWordWrap(True)
+        # W-O1. Plan 33 section 1 keeps a specific validation error beside
+        # the input it concerns, and takes the routine readout out. This
+        # label is the refusal now: `showToleranceNote` shows it when the
+        # entry was rejected or the store refused, and keeps it off the form
+        # for "set" and "not set", which are the state of the case.
+        self._toleranceNote.setVisible(False)
         inner.addWidget(self._toleranceNote)
 
         self._suggest.clicked.connect(self.useSuggestedTolerance)
@@ -473,12 +607,29 @@ class ReferenceReadinessPage(QualificationTaskPage):
                 'No geometry is prepared yet, so there is nothing to base a '
                 'suggestion on.')
         if stored:
-            self._toleranceNote.setText(
-                self.tr('Set for this project. ') + offer)
+            said = self.tr('Set for this project. ') + offer
         else:
-            self._toleranceNote.setText(
-                self.tr('Not set, so fidelity and resolution stay unrated. ')
-                + offer)
+            said = (self.tr('Not set, so fidelity and resolution stay '
+                            'unrated. ') + offer)
+        self._toleranceNote.setText(said)
+        # W-O1. Not on the form. The field it is about carries what the
+        # setting is and where the store stands; the suggestion button
+        # carries the offer, because pressing it is what takes the offer up.
+        self._toleranceNote.setVisible(False)
+        self._tolerance.setToolTip(self.tr(TOLERANCE_HELP) + ' ' + said)
+        self._suggest.setToolTip(offer)
+
+    def showToleranceNote(self, said: str) -> None:
+        """Draw a refusal beside the entry that earned it.
+
+        W-O1. The only thing this label says on the form now: a number that
+        was not a number, or a store that would not take one. Both are the
+        specific validation errors Plan 33 section 1 keeps beside the input,
+        and both go away on the next successful pass through
+        `refreshTolerance`.
+        """
+        self._toleranceNote.setText(said)
+        self._toleranceNote.setVisible(True)
 
     def useSuggestedTolerance(self) -> None:
         suggested = float(self.toleranceState().get('suggested_m') or 0.0)
@@ -491,8 +642,7 @@ class ReferenceReadinessPage(QualificationTaskPage):
         try:
             value = 0.0 if not text else float(text)
         except ValueError:
-            self._toleranceNote.setText(
-                self.tr('That is not a number of metres.'))
+            self.showToleranceNote(self.tr('That is not a number of metres.'))
             return
 
         # C31-12. Scheduled rather than blocking. Everything the press used to
@@ -500,7 +650,7 @@ class ReferenceReadinessPage(QualificationTaskPage):
         # panel, then emit the lifecycle signal, then refresh the status.
         def stored(result) -> None:
             if getattr(result, 'status', 'accepted') != 'accepted':
-                self._toleranceNote.setText(
+                self.showToleranceNote(
                     str(getattr(result, 'message', '')
                         or self.tr('The tolerance was not stored.')))
                 return
@@ -601,10 +751,310 @@ class QualificationSummaryPage(QualificationTaskPage):
     account — it reports what the blocks earned. A waiver shows here as
     `waived`, never as a pass, because §8.6's whole point is that the two
     remain distinguishable to whoever reads the case next.
+
+    DP-245. Plan 32 §4.4 asks for the automatic quality substeps to be read
+    together. `common.fidelity`, `common.resolution` and `common.summary` are
+    three rows of the outline, three pages and three separate visits, and
+    nothing on any of them is an engineering setting: the only thing a reader
+    does there is look. MEASURED before this change, this class was
+    `task_id_default` and `evidence_title` and nothing else, so the composed
+    disposition sat beside no fidelity number and no resolution number, and a
+    reader who wanted the three had to walk the outline. Every check, every
+    page and every gate stays where it was; this is a second reading of
+    reports the facade already wrote, and it decides nothing.
+
+    It is also where the layer question is answered (Plan 32 check 5). The
+    achieved counts have been parsed, persisted and served for two plans --
+    `core/quality/layer_report.py`, `foammesh/quality/layer-coverage.json`,
+    `mesh.layer_coverage` -- and MEASURED before this change the only
+    consumers in the whole view were a viewport colouring mode. Asking for
+    three layers and being handed a coloured mesh is not an answer.
     """
 
     task_id_default = 'common.summary'
     evidence_title = 'Composed disposition'
+    #: W-O1. The paragraph that used to stand above the three panels, said
+    #: where a reader asks for it instead of before they have asked.
+    PANEL_HELP = (
+        'Every automatic check of this mesh, read together. Each one is '
+        'still its own task with its own page and its own gate; this is '
+        'where they can be compared.')
+    #: The three reports below include this task's own, so the base
+    #: single-box evidence panel would render the summary twice on one page.
+    has_evidence = False
+
+    #: The automatic checks Plan 32 §4.4 names, in the order the pipeline
+    #: produces them. Fixed here rather than derived from the workflow: these
+    #: three are the ones the plan consolidates, and a page that guessed from
+    #: the graph would quietly pick up or drop one.
+    CONSOLIDATED_TASKS = ('common.fidelity', 'common.resolution',
+                          'common.summary')
+
+    #: One check's detail grid, with the same three columns the per-task
+    #: pages use, so a row means the same thing in both places.
+    _DETAIL_COLUMNS = ('Section', 'Verdict', 'Measured')
+
+    #: The layer grid. Two of these columns carry numbers of different kinds
+    #: -- one is a length, one is a share of a request -- and each names its
+    #: own unit rather than leaving the heading to carry it.
+    _LAYER_COLUMNS = ('Patch', 'Faces', 'Requested', 'Achieved',
+                      'Overall thickness', 'Of requested thickness',
+                      'Verdict')
+
+    # -- construction ------------------------------------------------------ #
+
+    def build_sections(self, layout) -> None:
+        self._gateNote = QLabel(self)
+        self._gateNote.setObjectName('qualificationGateNote')
+        self._gateNote.setWordWrap(True)
+        # W-O1. As on every other qualification page: carried, and drawn on
+        # the panel it is about. See `QualificationTaskPage.showGateNote`.
+        self._gateNote.setVisible(False)
+        layout.addWidget(self._gateNote)
+
+        box = QGroupBox(self.tr('Automatic checks'), self)
+        inner = QVBoxLayout(box)
+        self._checkPanels = {
+            task_id: self._buildCheckPanel(inner, task_id)
+            for task_id in self.CONSOLIDATED_TASKS}
+        layout.addWidget(box)
+        self._checkBox = box
+        # W-O1. The paragraph that used to head this box said what the box
+        # is, which is what a title and a help entry are for. The title is
+        # above it and `PANEL_HELP` reaches the step help through the same
+        # route the gate sentence takes.
+        self.refreshGateNote()
+        self.claimBodyStretch(box)
+
+        layout.addWidget(self._buildLayerBox())
+
+    def _buildCheckPanel(self, inner, task_id: str) -> dict:
+        """One check: its verdict, its caveat, and its rows behind a folder."""
+        name = task_id.rsplit('.', 1)[-1]
+        headline = QLabel(self)
+        headline.setObjectName('qualificationHeadline_' + name)
+        headline.setWordWrap(True)
+        headline.setAccessibleName(
+            self.tr('Verdict recorded for this check'))
+        # W-O1. Shown once the check has a verdict. Before that the folder
+        # below says "nothing measured to show" in the row's own name, which
+        # is the same fact without a paragraph of it.
+        headline.setVisible(False)
+        inner.addWidget(headline)
+
+        caveat = QLabel(self)
+        caveat.setObjectName('qualificationCaveat_' + name)
+        caveat.setWordWrap(True)
+        # Same rendering as the per-task page: this is the sentence that says
+        # a verdict does not mean what it looks like.
+        caveat.setProperty('foammeshStatus', 'warning')
+        caveat.setVisible(False)
+        inner.addWidget(caveat)
+
+        folder = FolderHeader(self.tr('Details'), self)
+        folder.setObjectName('qualificationDetails_' + name)
+        # Not a settings fold: what is behind it is the measured evidence
+        # table, which section 1.1 puts in an on-demand view. A fold opens
+        # open where it holds editors (W-O2, `FolderHeader`); this one holds
+        # none, and the evidence is the reason for the press.
+        folder.setChecked(False)
+        inner.addWidget(folder)
+
+        table = QTableWidget(0, len(self._DETAIL_COLUMNS), self)
+        table.setObjectName('qualificationEvidence_' + name)
+        table.setHorizontalHeaderLabels(
+            tuple(self.tr(column) for column in self._DETAIL_COLUMNS))
+        table.setAccessibleName(self.tr('Measured evidence for this check'))
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.setWordWrap(True)
+        header = table.horizontalHeader()
+        for column in (0, 1):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        inner.addWidget(table)
+        # The disclosure owns the grid's visibility from here on: details on
+        # request (§4.4). A refresh fills the rows and never opens the folder
+        # over the reader.
+        folder.setContents(table)
+        return {'headline': headline, 'caveat': caveat, 'folder': folder,
+                'table': table}
+
+    def _buildLayerBox(self) -> QGroupBox:
+        box = QGroupBox(self.tr('Boundary layers'), self)
+        inner = QVBoxLayout(box)
+        self._layerNote = QLabel(self)
+        self._layerNote.setObjectName('qualificationLayerNote')
+        self._layerNote.setWordWrap(True)
+        inner.addWidget(self._layerNote)
+
+        self._layerTable = QTableWidget(0, len(self._LAYER_COLUMNS), self)
+        self._layerTable.setObjectName('qualificationLayers')
+        self._layerTable.setHorizontalHeaderLabels(
+            tuple(self.tr(column) for column in self._LAYER_COLUMNS))
+        self._layerTable.setAccessibleName(
+            self.tr('Layers requested against layers achieved, per patch'))
+        self._layerTable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._layerTable.verticalHeader().setVisible(False)
+        self._layerTable.setWordWrap(True)
+        header = self._layerTable.horizontalHeader()
+        last = len(self._LAYER_COLUMNS) - 1
+        for column in range(last):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(last, QHeaderView.ResizeMode.Stretch)
+        inner.addWidget(self._layerTable)
+        self._layerBox = box
+        return box
+
+    # -- the three checks, read together ----------------------------------- #
+
+    def checkReadouts(self) -> dict:
+        """The stored report for each consolidated check, by task id.
+
+        One read per check, through the same operation each check's own page
+        uses, so the panel and the page cannot disagree about one report. A
+        read that fails is an empty mapping: the caller renders that as "not
+        run", which is what an unreadable report means for the question.
+        """
+        stored = {}
+        for task_id in self.CONSOLIDATED_TASKS:
+            try:
+                payload = query(self._client, 'quality.evidence.read',
+                                {'task_id': task_id}).payload or {}
+            except Exception:                                # noqa: BLE001
+                payload = {}
+            stored[task_id] = dict(payload.get('readout') or {})
+        return stored
+
+    def refreshChecks(self) -> None:
+        """Paint the three verdicts side by side, details left shut.
+
+        The panel is a reader and nothing else: it emits no signal, sends no
+        command and settles nothing. Where a non-pass stops the pipeline is
+        the facade's rule, and it stays there.
+        """
+        panels = getattr(self, '_checkPanels', None)
+        if not panels:
+            return
+        titles = self._task_titles()
+        stored = self.checkReadouts()
+        for task_id, panel in panels.items():
+            title = str(titles.get(task_id) or task_id)
+            readout = stored.get(task_id) or {}
+            reported = bool(readout)
+            rows = tuple(readout.get('rows') or ())
+            if not reported:
+                # Not a pass. A check with no report has measured nothing,
+                # and silence in this row would read as agreement.
+                readout = absent(task_id.rsplit('.', 1)[-1], title).to_dict()
+                rows = ()
+            panel['headline'].setText(str(readout.get('headline') or ''))
+            # W-O1. The verdict when one has been recorded. The composed
+            # "not run" sentence goes on the folder header below, which is a
+            # control and names its own row.
+            panel['headline'].setVisible(reported)
+            panel['headline'].setToolTip(str(readout.get('headline') or ''))
+            caveat = str(readout.get('caveat') or '')
+            panel['caveat'].setText(caveat)
+            panel['caveat'].setVisible(bool(caveat))
+            folder = panel['folder']
+            # DP-573 (0924 rerun2). A fold header is a check box and cannot
+            # wrap, and "Qualification summary -- nothing measured to show"
+            # asked 329 px in the 326 px the compact settings column leaves
+            # it, so its last word was cut. The whole sentence is the
+            # tooltip below; the header only has to say which row is empty.
+            folder.setText(
+                self.tr('{0} — details').format(title) if rows
+                else self.tr('{0} — not measured').format(title))
+            folder.setEnabled(bool(rows))
+            # W-O1. Where the absent sentence lands: on the row it is about,
+            # for a reader who wants the whole of it.
+            folder.setToolTip(str(readout.get('headline') or ''))
+            table = panel['table']
+            table.setRowCount(len(rows))
+            for index, row in enumerate(rows):
+                for column, value in enumerate(
+                        (row.get('name'), row.get('verdict'),
+                         row.get('detail'))):
+                    item = QTableWidgetItem(str(value or ''))
+                    item.setToolTip(str(value or ''))
+                    table.setItem(index, column, item)
+            table.resizeRowsToContents()
+
+    # -- layers ------------------------------------------------------------ #
+
+    def layerCoverage(self) -> dict:
+        """What the run recorded per patch, out of the run artifact."""
+        try:
+            payload = query(self._client, 'mesh.layer_coverage').payload or {}
+        except Exception:                                    # noqa: BLE001
+            return {}
+        return dict(payload)
+
+    def refreshLayers(self) -> None:
+        """Requested against achieved, per patch, with both units named.
+
+        The projection is :func:`core.quality.layer_report.coverage_rows`,
+        which the HTML mesh report reads as well. Two surfaces describing one
+        run in two ways is the shape of defect this page exists to close, so
+        neither of them keeps a second opinion about what the numbers mean.
+        """
+        table = getattr(self, '_layerTable', None)
+        note = getattr(self, '_layerNote', None)
+        if table is None or note is None:
+            return
+        document = self.layerCoverage()
+        rows = coverage_rows(document)
+        if not rows:
+            table.setRowCount(0)
+            table.setVisible(False)
+            note.setText(self.tr(
+                'This run recorded no per-patch layer measurement, so there '
+                'is nothing to hold a request against. Either no boundary '
+                'layers were asked for, or the run that produced this mesh '
+                'wrote no layer coverage.'))
+            # W-O1. Off the form. There is no measurement to annotate, so
+            # this is the state of the case; it goes on the box, which still
+            # names itself Boundary layers, and the empty grid beside it.
+            note.setVisible(False)
+            box = getattr(self, '_layerBox', None)
+            if box is not None:
+                box.setToolTip(note.text())
+                box.setAccessibleDescription(note.text())
+            return
+        table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = (row['patch'], str(row['faces']), row['requested_text'],
+                      row['achieved_text'], row['thickness_text'],
+                      row['coverage_text'], row['verdict'])
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                table.setItem(index, column, item)
+        table.resizeRowsToContents()
+        table.setVisible(True)
+        warnings = [str(line) for line in (document.get('warnings') or ())]
+        measured = self.tr(
+            'Read from the layer coverage this run wrote. Overall thickness '
+            'is a length in metres; the share beside it is a percentage of '
+            'the thickness that was asked for.')
+        # W-O1. The sentence about where the numbers come from and what
+        # their units are describes the grid, so it goes on the grid's box.
+        # What is left on the form is what the run itself recorded -- a
+        # warning is a measured finding, and Plan 33 keeps those.
+        box = getattr(self, '_layerBox', None)
+        if box is not None:
+            box.setToolTip(measured)
+            box.setAccessibleDescription(measured)
+        note.setText(' '.join(warnings) if warnings else measured)
+        note.setVisible(bool(warnings))
+
+    def refresh_status(self) -> None:
+        super().refresh_status()
+        self.refreshChecks()
+        self.refreshLayers()
 
 
 #: The `common.*` pages, shared by every engine.

@@ -39,7 +39,20 @@ region.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# DP-199. The rules for writing a count live next door, so that the runner and
+# this module spell a plural the same way. This module is also loaded straight
+# from its file by the host (``core.geometry.domain_topology``), and a loader
+# that names a file does not put its directory on the path, so the import is
+# guarded the way the runner guards its own.
+try:
+    from quantities import agreeing, count_text
+except ImportError:  # pragma: no cover - exercised only by the module loader
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from quantities import agreeing, count_text
 
 CALCULATION_VERSION = 'gmsh.shellTopology.v1'
 
@@ -96,11 +109,11 @@ def _dot(left, right):
 # Triangulation facts
 # --------------------------------------------------------------------------- #
 
-def free_edges(triangles):
-    """Edges used by other than exactly two triangles.
+def edge_use_census(triangles):
+    """How many triangles use each edge.
 
-    An empty result is the definition of a closed shell used throughout this
-    module: every edge shared by two faces, no boundary and no fin.
+    DP-368. Split out of :func:`free_edges` so a refusal can say which way an
+    edge failed instead of naming the one it did not measure.
     """
     counts: dict = {}
     for triangle in triangles:
@@ -108,7 +121,68 @@ def free_edges(triangles):
             first, second = triangle[index], triangle[(index + 1) % 3]
             key = (first, second) if first <= second else (second, first)
             counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def free_edges(triangles):
+    """Edges used by other than exactly two triangles.
+
+    An empty result is the definition of a closed shell used throughout this
+    module: every edge shared by two faces, no boundary and no fin.
+    """
+    counts = edge_use_census(triangles)
     return tuple(sorted(edge for edge, used in counts.items() if used != 2))
+
+
+def closure_census(triangles) -> tuple:
+    """``(with_one_triangle, with_more_than_two)`` for this triangulation.
+
+    DP-368. The two ways an edge stops bounding a volume, counted apart. The
+    first is a hole and fills; the second is a fin or a doubled sheet and is
+    removed. Naming one when the other is what is there sends the reader to a
+    repair that cannot change the number.
+    """
+    counts = edge_use_census(triangles)
+    boundary = sum(1 for used in counts.values() if used < 2)
+    shared = sum(1 for used in counts.values() if used > 2)
+    return boundary, shared
+
+
+def winding_disagreements(triangles):
+    """Shared edges that both their triangles traverse the same way.
+
+    Two triangles that agree on which side is out traverse the edge between
+    them in opposite directions; when they traverse it the same way, one of
+    them is wound inside-out relative to the other. The count is zero for a
+    consistently wound triangulation whichever way round it is wound, so it
+    is independent of :func:`signed_volume`, which reads the global sign.
+
+    DP-400. This was measured nowhere, and a shell that failed it was read as
+    though it had passed. The runner records one winding per shell -- ``1`` if
+    :func:`signed_volume` is positive and ``-1`` if it is not -- and the
+    boundary layer grows along the surface normals that sign describes. A
+    shell whose facets disagree has no single answer for that sign, so some of
+    its layers grow into the fluid and the rest into the solid.
+
+    MEASURED on ``heated_duct.stl``: 44 triangles, every edge shared by
+    exactly two, enclosing +0.0004275 m3 -- closed and outward by every
+    reading the module took. Eight of its 66 edges are traversed the same way
+    twice, and the 14 triangles of its z = 0 cap are wound inside-out, so the
+    shell has no downward-facing area at all. Its three layers grew up into
+    the solid instead of down into the fluid, which put 342 faces into the
+    published mesh with both their cells on the same side, and checkMesh read
+    those as 342 open cells. The enclosed volume is blind to it because the
+    inverted cap lies in z = 0, where its contribution to the divergence
+    integral is zero whichever way it faces.
+    """
+    directions: dict = {}
+    for triangle in triangles:
+        for index in range(3):
+            first, second = triangle[index], triangle[(index + 1) % 3]
+            key = (first, second) if first <= second else (second, first)
+            directions.setdefault(key, []).append(first == key[0])
+    return sum(1 for used in directions.values()
+               if len(used) == 2 and used[0] == used[1])
 
 
 def bounding_box(triangles, coordinates):
@@ -169,6 +243,117 @@ def group_by_connectivity(surfaces, triangles):
     for tag in surfaces:
         groups.setdefault(find(tag), []).append(tag)
     return [tuple(sorted(members)) for members in groups.values()]
+
+
+def _every_part_closes(split, triangles):
+    """The proof that a candidate split is bodies rather than damage."""
+    if len(split) < 2:
+        return False
+    for part in split:
+        owned = [triangle for tag in part
+                 for triangle in triangles.get(tag, ())]
+        if not owned or free_edges(owned):
+            return False
+    return True
+
+
+def _split_by_source(members, triangles, sources):
+    """One file, one body: the reading the fixtures were authored in."""
+    if not sources:
+        return None
+    parts: dict = {}
+    for tag in members:
+        origin = sources.get(tag)
+        if not origin:
+            return None
+        parts.setdefault(str(origin), []).append(tag)
+    return tuple(sorted(tuple(sorted(group)) for group in parts.values()))
+
+
+def _split_by_welds(members, triangles):
+    """Walk the group again, crossing only edges used by exactly two."""
+    counts = edge_use_census(
+        [triangle for tag in members for triangle in triangles.get(tag, ())])
+    parent = {tag: tag for tag in members}
+
+    def find(tag):
+        while parent[tag] != tag:
+            parent[tag] = parent[parent[tag]]
+            tag = parent[tag]
+        return tag
+
+    welds: dict = {}
+    for tag in members:
+        for triangle in triangles.get(tag, ()):
+            for index in range(3):
+                first, second = triangle[index], triangle[(index + 1) % 3]
+                key = (first, second) if first <= second else (second, first)
+                if counts[key] != 2:
+                    continue
+                welds.setdefault(key, set()).add(tag)
+    for shared in welds.values():
+        ordered = sorted(shared)
+        for other in ordered[1:]:
+            parent[find(other)] = find(ordered[0])
+
+    parts: dict = {}
+    for tag in members:
+        parts.setdefault(find(tag), []).append(tag)
+    return tuple(sorted(tuple(sorted(group)) for group in parts.values()))
+
+
+def split_conjugate_assembly(members, triangles, sources=None):
+    """Bodies meeting face to face, told apart from one damaged shell.
+
+    DP-456. :func:`group_by_connectivity` unions two surfaces that share an
+    edge, which is right for a skin arriving in several files and wrong for a
+    conformal assembly: the two bodies of `baffled_chamber` each carry their
+    own copy of the 0.09 m interface rectangle, so its four boundary edges and
+    its diagonal are each used by four triangles -- two from the upstream
+    body, two from the downstream one. The union made the pair a single
+    "shell", :func:`_not_closed` measured five edges belonging to more than
+    two triangles, and the run was refused by name with a repair that cannot
+    change the number: nothing is duplicated within either body, and removing
+    the interface would remove the thing the fixture exists to carry.
+
+    MEASURED on that fixture: upstream is 180 triangles and closed on its own,
+    downstream is 12 and closed on its own, and appended they are exactly the
+    192 of `baffled_chamber.stl` with a census of ``{4: 5}``.
+
+    Two readings are offered, and neither is trusted on its own. The first is
+    the one the fixtures are authored in: one file, one body. The second walks
+    the group's own triangulation again, crossing only edges used by *exactly*
+    two triangles -- the welds -- and never the edges where sheets meet; it is
+    what answers for two bodies that arrived in a single file.
+
+    Both are held to the same proof: two or more parts, every one of them
+    closed on its own. That is what separates an assembly from damage, and
+    anything failing it falls through to the refusal unchanged, so a fin, a
+    doubled sheet and a hole are still refused in the terms they were measured
+    in.
+
+    MEASURED, and the reason the weld walk is not enough by itself: by the
+    time the runner asks, `classifySurfaces` has already cut each body into
+    many surfaces, and the interface patch is one of them. Every edge on that
+    patch's rim is used by four triangles -- its own two bodies' copies and
+    the two walls they meet -- so the weld walk cannot reach it from the body
+    it belongs to, strands it as a part of its own, and the proof fails on a
+    correct assembly. The source reading places it, because the patch came out
+    of the same file as the body.
+
+    Returns the parts, or ``None`` when this group is not an assembly.
+    """
+    if len(members) < 2:
+        return None
+    owned = [triangle for tag in members for triangle in triangles.get(tag, ())]
+    if not owned or not free_edges(owned):
+        return None
+
+    for candidate in (_split_by_source(members, triangles, sources),
+                      _split_by_welds(members, triangles)):
+        if candidate and _every_part_closes(candidate, triangles):
+            return candidate
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -271,6 +456,14 @@ class Shell:
     volume: float
     triangle_count: int
     reference_point: tuple
+    #: DP-368. :attr:`free_edge_count` split by which way the edge failed:
+    #: used by one triangle, and used by more than two. They sum to it.
+    open_edge_count: int = 0
+    shared_edge_count: int = 0
+    #: DP-400. Shared edges both of whose triangles traverse them the same
+    #: way. Nonzero means the shell is wound two ways at once, and the one
+    #: winding the runner records for it is a fiction for some of its faces.
+    disagreeing_edge_count: int = 0
     parent: str = ''
     depth: int = 0
     role: str = FLUID
@@ -293,6 +486,7 @@ class Shell:
             'depth': self.depth,
             'surfaces': list(self.surfaces),
             'orientation': self.orientation,
+            'windingDisagreements': self.disagreeing_edge_count,
             'enclosedVolume': self.volume,
             'triangles': self.triangle_count,
             'boundingBox': list(self.box),
@@ -360,6 +554,11 @@ def build_shells(surfaces, triangles, coordinates, sources=None):
     sources = dict(sources or {})
     surfaces = [tag for tag in surfaces]
     groups = group_by_connectivity(surfaces, triangles)
+    # DP-456. A conformal assembly arrives here as one group; put it back.
+    groups = [part for members in groups
+              for part in (split_conjugate_assembly(members, triangles,
+                                                    sources)
+                           or (tuple(members),))]
 
     measured = []
     for members in groups:
@@ -369,6 +568,7 @@ def build_shells(surfaces, triangles, coordinates, sources=None):
         box = bounding_box(owned, coordinates)
         span = max(box[axis + 3] - box[axis] for axis in range(3)) or 1.0
         loose = free_edges(owned)
+        census = closure_census(owned)
         first = owned[0]
         centre = tuple(
             sum(coordinates[node][axis] for node in first) / 3.0
@@ -376,7 +576,8 @@ def build_shells(surfaces, triangles, coordinates, sources=None):
         measured.append({
             'surfaces': members, 'triangles': owned, 'box': box, 'span': span,
             'free': loose, 'volume': signed_volume(owned, coordinates),
-            'reference': centre,
+            'reference': centre, 'census': census,
+            'disagreements': winding_disagreements(owned),
         })
 
     # Largest first, then by corner, so the numbering does not depend on the
@@ -391,20 +592,88 @@ def build_shells(surfaces, triangles, coordinates, sources=None):
             surfaces=item['surfaces'], closed=not item['free'],
             free_edge_count=len(item['free']), box=item['box'],
             volume=item['volume'], triangle_count=len(item['triangles']),
-            reference_point=item['reference']))
+            reference_point=item['reference'],
+            open_edge_count=item['census'][0],
+            shared_edge_count=item['census'][1],
+            disagreeing_edge_count=item['disagreements']))
     return shells, {name: item['triangles']
                     for name, item in zip(names, measured)}
+
+
+def _not_closed(shell) -> str:
+    """Why this shell bounds no volume, in the terms it was measured in.
+
+    DP-368. The sentence this replaces said every one of the edges belonged
+    to one triangle instead of two. On `annulus_shell` -- 512 triangles, the
+    inner r=0.06 wall drawn once for each of the two volumes that share it --
+    all 168 of them belong to *four*, and none to one, so the count was right
+    and the cause was the opposite of what was measured. The repair it then
+    asked for, filling the surface, cannot change a number that no hole
+    contributes to; what removes those 168 is dropping the 84 duplicated
+    triangles, which is a different button on a different tab.
+
+    This is DP-366's finding in the second place it is spelled: the readiness
+    page graded the same geometry on boundary edges alone and called its
+    surface closed. That one is now a census, and so is this one.
+    """
+    holes, shared = shell.open_edge_count, shell.shared_edge_count
+    if holes and shared:
+        census = (f'{count_text(holes, "edge")} '
+                  f'{agreeing(holes, "belongs", "belong")} to one triangle '
+                  f'and {count_text(shared, "edge")} to more than two, '
+                  'instead of two each')
+    elif shared:
+        census = (f'{count_text(shared, "edge")} '
+                  f'{agreeing(shared, "belongs", "belong")} to more than two '
+                  'triangles instead of two')
+    elif holes:
+        census = (f'{count_text(holes, "edge")} '
+                  f'{agreeing(holes, "belongs", "belong")} to one triangle '
+                  'instead of two')
+    else:  # A closed shell never reaches here; say so rather than nothing.
+        census = (f'{count_text(shell.free_edge_count, "edge")} '
+                  f'{agreeing(shell.free_edge_count, "is", "are")} not shared '
+                  'by exactly two triangles')
+    repair = ('Fill the holes' if holes and not shared else
+              'Remove the duplicated and folded triangles'
+              if shared and not holes else 'Repair the surface')
+    return (f'shell {shell.name!r} from {shell.source or "the import"} is not '
+            f'closed: {census}, so it cannot bound a volume. {repair} on the '
+            'Repair tab, or remove the surface from the geometry.')
+
+
+def _not_wound(shell) -> str:
+    """Why this shell has no single winding, and which button repairs it.
+
+    DP-400. The refusal is here rather than at the boundary layer because the
+    reading the layer needs is taken here: the runner records one winding for
+    the whole shell from the sign of its enclosed volume, and every later
+    answer that names a normal -- the manifest's ``orientation``, the void
+    side of a hole, the direction ``extrudeBoundaryLayer`` follows -- is built
+    on it. A shell wound two ways at once makes that one answer wrong for some
+    of its faces, and the run cannot say which without asking the question
+    that has just been asked.
+    """
+    disagreements = shell.disagreeing_edge_count
+    return (f'shell {shell.name!r} from {shell.source or "the import"} is '
+            f'closed but wound two ways at once: '
+            f'{count_text(disagreements, "edge")} shared by two triangles '
+            f'{agreeing(disagreements, "is", "are")} traversed the same way '
+            'by both of them, so some of its faces point out of the solid and '
+            'the rest point into it. One winding is recorded for the whole '
+            'shell and the boundary layer follows it, so the layer would grow '
+            'into the solid wherever the two disagree. Run "Point every '
+            'triangle the same way" on the Repair tab, which settles this '
+            'without changing the geometry, or remove the surface.')
 
 
 def nest_shells(shells, owned_triangles, coordinates):
     """Set ``parent`` and ``depth`` from containment, refusing what it cannot read."""
     for shell in shells:
         if not shell.closed:
-            raise ShellTopologyError(
-                f'shell {shell.name!r} from {shell.source or "the import"} is '
-                f'not closed: {shell.free_edge_count} edge(s) belong to one '
-                'triangle instead of two, so it cannot bound a volume. Repair '
-                'the surface, or remove it from the geometry.')
+            raise ShellTopologyError(_not_closed(shell))
+        if shell.disagreeing_edge_count:
+            raise ShellTopologyError(_not_wound(shell))
 
     containers: dict = {shell.name: [] for shell in shells}
     for inner in shells:

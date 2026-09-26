@@ -27,8 +27,11 @@ def apply_scalar_bar_theme(scalar_bar, tokens) -> None:
 
 def apply_vtk_theme(renderer, tokens, *, cube_axes=None, origin_axes=None, logo=None):
     """Apply background, annotation contrast, and watermark weight at runtime."""
-    renderer.SetBackground(*rgb(tokens.value('viewport.top')))
-    renderer.SetBackground2(*rgb(tokens.value('viewport.bottom')))
+    # DP-190. With GradientBackgroundOn, VTK paints Background at the BOTTOM
+    # of the viewport and Background2 at the top. The token named for an end
+    # of the gradient therefore goes into the slot that paints that end.
+    renderer.SetBackground(*rgb(tokens.value('viewport.bottom')))
+    renderer.SetBackground2(*rgb(tokens.value('viewport.top')))
     annotation = rgb(tokens.value('foreground.secondary'))
     if cube_axes is not None:
         axis_colours = [tokens.value(name) for name in
@@ -52,4 +55,6 @@ def apply_vtk_theme(renderer, tokens, *, cube_axes=None, origin_axes=None, logo=
             tip.SetColor(*rgb(colour))
     if logo is not None:
         logo.GetImageProperty().SetOpacity(
-            0.20 if luminance(tokens.value('viewport.top')) > 0.55 else 0.34)
+            # The watermark sits bottom-right, so it is the bottom of the
+            # gradient it has to stay legible against.
+            0.20 if luminance(tokens.value('viewport.bottom')) > 0.55 else 0.34)

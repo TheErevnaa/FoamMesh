@@ -7,6 +7,7 @@ from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 
 from foammesh.support.pfloat import PFloat
+from foammesh.view.theming.metrics import place_unit
 from widgets.async_message_box import AsyncMessageBox
 
 from .transform_widget_ui import Ui_TransformWidget
@@ -50,6 +51,18 @@ class TransformWidget(QWidget):
         self._ui = Ui_TransformWidget()
         self._ui.setupUi(self)
 
+        # DP-198. The three rows of this form that carry a length said so
+        # in their own labels -- `X (m)`, `Y (m)`, `Z (m)` above the origin
+        # boxes and again above the translation boxes, six brackets for one
+        # fact. The unit stands beside the number now, in the column after
+        # the box, which is where every row the app builds itself puts it.
+        # The rotation axis takes no unit: it is a direction, not a length.
+        for box in (self._ui.originX, self._ui.originY, self._ui.originZ,
+                    self._ui.translateX, self._ui.translateY,
+                    self._ui.translateZ):
+            place_unit(box, 'm')
+        place_unit(self._ui.rotationAngle, 'deg')
+
         self._meshes = None
         #: What was applied, in order, as the artifact store's transform
         #: operations, so the same transform can reach the mesher's copy.
@@ -83,11 +96,11 @@ class TransformWidget(QWidget):
         self._ui.scale.setEnabled(False)
 
         try:
-            x = float(PFloat(self._ui.scaleX.text(), self.tr('Scale Factor')))
-            y = float(PFloat(self._ui.scaleY.text(), self.tr('Scale Factor')))
-            z = float(PFloat(self._ui.scaleZ.text(), self.tr('Scale Factor')))
+            x = float(PFloat(self._ui.scaleX.text(), self.tr('Scaling factor X')))
+            y = float(PFloat(self._ui.scaleY.text(), self.tr('Scaling factor Y')))
+            z = float(PFloat(self._ui.scaleZ.text(), self.tr('Scaling factor Z')))
         except ValueError as e:
-            await AsyncMessageBox().information(self, self.tr('Input Error'), str(e))
+            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
             self._ui.scale.setEnabled(True)
             return
 
@@ -111,15 +124,15 @@ class TransformWidget(QWidget):
         self._ui.rotate.setEnabled(False)
 
         try:
-            angle = float(PFloat(self._ui.rotationAngle.text(), self.tr('Rotation Angle')))
-            originX = float(PFloat(self._ui.originX.text(), self.tr('Rotation Origin')))
-            originY = float(PFloat(self._ui.originY.text(), self.tr('Rotation Origin')))
-            originZ = float(PFloat(self._ui.originZ.text(), self.tr('Rotation Origin')))
-            axisX = float(PFloat(self._ui.axisX.text(), self.tr('Rotation Axis')))
-            axisY = float(PFloat(self._ui.axisY.text(), self.tr('Rotation Axis')))
-            axisZ = float(PFloat(self._ui.axisZ.text(), self.tr('Rotation Axis')))
+            angle = float(PFloat(self._ui.rotationAngle.text(), self.tr('Rotation angle')))
+            originX = float(PFloat(self._ui.originX.text(), self.tr('Rotation origin X')))
+            originY = float(PFloat(self._ui.originY.text(), self.tr('Rotation origin Y')))
+            originZ = float(PFloat(self._ui.originZ.text(), self.tr('Rotation origin Z')))
+            axisX = float(PFloat(self._ui.axisX.text(), self.tr('Rotation axis X')))
+            axisY = float(PFloat(self._ui.axisY.text(), self.tr('Rotation axis Y')))
+            axisZ = float(PFloat(self._ui.axisZ.text(), self.tr('Rotation axis Z')))
         except ValueError as e:
-            await AsyncMessageBox().information(self, self.tr('Input Error'), str(e))
+            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
             self._ui.rotate.setEnabled(True)
             return
 
@@ -156,11 +169,11 @@ class TransformWidget(QWidget):
         self._ui.translate.setEnabled(False)
 
         try:
-            x = float(PFloat(self._ui.translateX.text(), self.tr('Translate Offset')))
-            y = float(PFloat(self._ui.translateY.text(), self.tr('Translate Offset')))
-            z = float(PFloat(self._ui.translateZ.text(), self.tr('Translate Offset')))
+            x = float(PFloat(self._ui.translateX.text(), self.tr('Translation offset X')))
+            y = float(PFloat(self._ui.translateY.text(), self.tr('Translation offset Y')))
+            z = float(PFloat(self._ui.translateZ.text(), self.tr('Translation offset Z')))
         except ValueError as e:
-            await AsyncMessageBox().information(self, self.tr('Input Error'), str(e))
+            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
             self._ui.translate.setEnabled(True)
             return
 

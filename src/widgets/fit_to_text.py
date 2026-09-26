@@ -2,7 +2,7 @@
 
 Across the shell, buttons and table headers were clipped on *both* sides --
 ``uggest pla`` for "Suggest plan", ``meters (JS`` for "Parameters (JSON)",
-``!evert and Ed`` for "Revert and Edit". That is worse than an elide: an elide
+``!evert and Ed`` for "Revert and edit". That is worse than an elide: an elide
 keeps the beginning and marks what it dropped, whereas a clip removes the first
 characters too, and the word cannot be recovered from what is left.
 

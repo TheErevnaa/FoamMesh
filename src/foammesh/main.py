@@ -31,6 +31,7 @@ from analytics.events import EVENT_LOOP_ERROR
 
 from foammesh.app import app
 from foammesh.core.case import startup_case_path
+from foammesh.support import lifecycle
 from foammesh.view.main_window.main_window import MainWindow
 
 logger = logging.getLogger()
@@ -111,6 +112,22 @@ def _claim_windows_taskbar_identity():
             'could not set the Windows taskbar identity', exc_info=True)
 
 
+# DP-694. The help texts a menu dialog or the mesh check waits on before it can
+# open. A cold WSL start held Mesh > Scale for seconds; fetched here, in the
+# background, the dialog reads the cache instead.
+STARTUP_HELP_UTILITIES = ('transformPoints', 'checkMesh')
+
+
+async def warm_utility_help(capabilities, names=STARTUP_HELP_UTILITIES):
+    """Fetch and cache each utility's help off the GUI thread; failures are retried on use."""
+    for name in names:
+        try:
+            await asyncio.to_thread(capabilities.help, name)
+        except Exception:                                   # noqa: BLE001
+            # The dialog asks again when it opens (DP-693 caches only answers).
+            continue
+
+
 def main():
     self_test_path = _package_self_test_path(sys.argv[1:])
     if self_test_path is not None:
@@ -119,10 +136,23 @@ def main():
 
     initial_case = startup_case_path(sys.argv[1:])
     app.setupApplication(meshAppProperties)
+    # DP-550/551. Before anything native can fail: a fatal fault, a VTK
+    # warning and the way this process ends are all written under the
+    # application's log directory, and a session that died last time is named.
+    for dead in lifecycle.install(app.settings.settingsPath()):
+        logger.warning(
+            'A previous FoamMesh session (pid %s) ended without a clean exit; '
+            'last operations: %s. See %s.', dead.get('pid'),
+            ' | '.join((dead.get('recent_operations') or [])[-5:]) or 'none',
+            lifecycle.log_directory())
     os.environ['LC_NUMERIC'] = 'C'
     _claim_windows_taskbar_identity()
     application = QApplication(sys.argv)
     application.setWindowIcon(meshAppProperties.icon())
+    application.lastWindowClosed.connect(
+        lambda: lifecycle.record('Qt lastWindowClosed'))
+    application.aboutToQuit.connect(
+        lambda: lifecycle.record('Qt aboutToQuit'))
 
     Analytics().configure(
         app_name=meshAppProperties.name,
@@ -159,6 +189,12 @@ def main():
                 'OpenFOAM 13 WSL MPI is unavailable; parallel actions are '
                 f'disabled. {mpi.reason}')
             app.window.statusBar().showMessage(message, 10000)
+        else:
+            # The runtime just answered, so it is warm: fetch the help texts now,
+            # alongside consent, instead of on the user's first transform click.
+            warm = loop.create_task(warm_utility_help(app.capabilities))
+            background_tasks.add(warm)
+            warm.add_done_callback(background_tasks.discard)
         if await Analytics().ensureConsent(parent=app.window):
             Analytics().init()
 
@@ -170,6 +206,7 @@ def main():
     with loop:
         loop.run_forever()
 
+    lifecycle.record('event loop returned; exiting with code 0')
     loop.close()
     Analytics().shutdown(final=True)
     return 0

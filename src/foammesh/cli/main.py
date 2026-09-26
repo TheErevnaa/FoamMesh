@@ -80,11 +80,24 @@ def _cmd_generate(args) -> int:
     if not bbox or len(bbox) != 6:
         print('error: imported geometry has no finite bounding box', file=sys.stderr)
         return 1
-    diagonal = sum((bbox[i + 1] - bbox[i]) ** 2 for i in (0, 2, 4)) ** 0.5
-    pad = (diagonal or 1.0) * 0.5
-    domain = [bbox[0] - pad, bbox[1] + pad, bbox[2] - pad,
-              bbox[3] + pad, bbox[4] - pad, bbox[5] + pad]
-    generated = _execute(args.out, 'workflow.generate_dictionaries', {'bbox': domain})
+    # DP-576. The margin round the geometry is the project's standoff, saved
+    # in the case, not a pad only this command knows about: the same case
+    # then writes the same blockMeshDict from the desktop, the facade and
+    # here. Half the diagonal on every face, as this command always padded,
+    # expressed as the standoff's fraction of the largest span.
+    spans = [bbox[i + 1] - bbox[i] for i in (0, 2, 4)]
+    if max(spans) <= 0 or min(spans) < 0:
+        print('error: imported geometry has no extent to build a domain round',
+              file=sys.stderr)
+        return 1
+    diagonal = sum(span ** 2 for span in spans) ** 0.5
+    standoff = 0.5 * diagonal / max(spans)
+    configured = _execute(args.out, 'configuration.patch', {
+        'patch': {'meshing.base_grid.standoff': standoff}})
+    if configured is None:
+        return 1
+    generated = _execute(args.out, 'workflow.generate_dictionaries',
+                         {'bbox': list(bbox)})
     if generated is None or generated.status != 'accepted':
         return 1
     print(json.dumps({'import': imported.payload, 'dictionaries': generated.payload},

@@ -13,6 +13,32 @@ def derive_background_counts(bounds, target_cell_size: float) -> tuple[int, int,
     return tuple(max(2, math.ceil(length / target_cell_size)) for length in lengths)
 
 
+#: DP-669. The divisor an unset ("Auto") snappy base cell is derived with:
+#: the same bounding-box diagonal / 40 the Gmsh global size uses (DP-614).
+AUTO_CELL_DIAGONAL_DIVISOR = 40.0
+
+
+def auto_target_cell_size(bounds) -> float | None:
+    """The base cell an unset ("Auto") target cell size stands for, in metres.
+
+    DP-669 (DP-587 left it). The diagonal of *bounds* -- the six-number
+    extent the background block divides -- over
+    :data:`AUTO_CELL_DIAGONAL_DIVISOR`. ``None`` when the extent is unusable,
+    so a caller says why rather than meshing at an invented scale.
+    """
+    try:
+        values = [float(value) for value in bounds]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 6:
+        return None
+    diagonal = math.sqrt(sum((values[i * 2 + 1] - values[i * 2]) ** 2
+                             for i in range(3)))
+    if not math.isfinite(diagonal) or diagonal <= 0:
+        return None
+    return diagonal / AUTO_CELL_DIAGONAL_DIVISOR
+
+
 def stand_off_bounds(bounds, standoff: float):
     """The block the base grid derives from a geometry extent (R167/R175).
 

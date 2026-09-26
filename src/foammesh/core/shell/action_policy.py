@@ -35,7 +35,6 @@ class ActionId(str, Enum):
     EXIT = 'exit'
     UNDO = 'undo'
     REDO = 'redo'
-    TRANSACTION_HISTORY = 'transaction_history'
     MESH_INFO = 'mesh_info'
     MESH_SCALE = 'mesh_scale'
     MESH_TRANSLATE = 'mesh_translate'
@@ -45,20 +44,20 @@ class ActionId(str, Enum):
     MESH_REPAIR = 'mesh_repair'
     MESH_RESTORE = 'mesh_restore'
     VIEW_FIT = 'view_fit'
+    VIEW_ZOOM_SELECTION = 'view_zoom_selection'
     VIEW_AXIS = 'view_axis'
     VIEW_CUBE_AXIS = 'view_cube_axis'
     VIEW_RULER = 'view_ruler'
-    VIEW_PERSPECTIVE = 'view_perspective'
+    VIEW_PARALLEL_PROJECTION = 'view_parallel_projection'
     VIEW_ALIGN_AXIS = 'view_align_axis'
     VIEW_ROLL = 'view_roll'
     VIEW_ROTATION_CENTER = 'view_rotation_center'
-    PARALLEL_ENVIRONMENT = 'parallel_environment'
-    THEME = 'theme'
+    PREFERENCES = 'preferences'
     TERMINAL_HERE = 'terminal_here'
     TUTORIALS = 'tutorials'
     LICENSE = 'license'
-    PRIVACY = 'privacy'
     ABOUT = 'about'
+    RUN_DETAILS = 'run_details'
 
 
 # Stable IDs are deliberately separate from translated labels.  Keeping the
@@ -77,7 +76,6 @@ ACTION_OBJECT_NAMES: Mapping[ActionId, str] = {
     ActionId.EXIT: 'actionExit',
     ActionId.UNDO: 'actionUndo',
     ActionId.REDO: 'actionRedo',
-    ActionId.TRANSACTION_HISTORY: 'actionTransactionHistory',
     ActionId.MESH_INFO: 'actionMeshInfo',
     ActionId.MESH_SCALE: 'actionMeshScale',
     ActionId.MESH_TRANSLATE: 'actionMeshTranslate',
@@ -87,20 +85,20 @@ ACTION_OBJECT_NAMES: Mapping[ActionId, str] = {
     ActionId.MESH_REPAIR: 'actionMeshRepair',
     ActionId.MESH_RESTORE: 'actionMeshRestore',
     ActionId.VIEW_FIT: 'actionViewFit',
+    ActionId.VIEW_ZOOM_SELECTION: 'actionViewZoomSelection',
     ActionId.VIEW_AXIS: 'actionViewAxis',
     ActionId.VIEW_CUBE_AXIS: 'actionViewCubeAxis',
     ActionId.VIEW_RULER: 'actionViewRuler',
-    ActionId.VIEW_PERSPECTIVE: 'actionViewPerspective',
+    ActionId.VIEW_PARALLEL_PROJECTION: 'actionViewParallelProjection',
     ActionId.VIEW_ALIGN_AXIS: 'actionViewAlignAxis',
     ActionId.VIEW_ROLL: 'actionViewRoll',
     ActionId.VIEW_ROTATION_CENTER: 'actionViewRotationCenter',
-    ActionId.PARALLEL_ENVIRONMENT: 'actionParallelEnvironment',
-    ActionId.THEME: 'actionTheme',
+    ActionId.PREFERENCES: 'actionPreferences',
     ActionId.TERMINAL_HERE: 'actionTerminalHere',
     ActionId.TUTORIALS: 'actionTutorials',
     ActionId.LICENSE: 'actionLicense',
-    ActionId.PRIVACY: 'actionPrivacySettings',
     ActionId.ABOUT: 'actionAbout',
+    ActionId.RUN_DETAILS: 'actionRunDetails',
 }
 
 
@@ -157,16 +155,12 @@ class ActionPolicy:
         result[ActionId.LOAD_GEOMETRY] = ActionPresentation(
             snapshot.job_idle, reason=self._job_reason(snapshot))
         # Close/Exit stay reachable so their lifecycle handler can offer
-        # Cancel Operation / Keep Running / Return instead of trapping users.
+        # Cancel operation / Keep running / Return instead of trapping users.
         result[ActionId.EXIT] = ActionPresentation(True)
-        for action in (ActionId.THEME, ActionId.TUTORIALS,
-                       ActionId.LICENSE, ActionId.ABOUT):
+        for action in (ActionId.PREFERENCES, ActionId.TUTORIALS,
+                       ActionId.LICENSE, ActionId.ABOUT,
+                       ActionId.RUN_DETAILS):
             result[action] = ActionPresentation(True)
-        result[ActionId.PRIVACY] = ActionPresentation(
-            ActionId.PRIVACY.value in snapshot.capabilities,
-            visible=ActionId.PRIVACY.value in snapshot.capabilities,
-            reason=snapshot.capability_reasons.get(
-                ActionId.PRIVACY.value, 'Analytics is not configured in this build'))
 
         if not snapshot.project_ready:
             return result
@@ -175,8 +169,8 @@ class ActionPolicy:
         project_reason = self._job_reason(snapshot)
         for action in (
                 ActionId.SAVE_AS, ActionId.SAVE_PROJECT_AS, ActionId.LOAD_GEOMETRY,
-                ActionId.LOAD_MESH, ActionId.CLOSE_PROJECT, ActionId.TRANSACTION_HISTORY,
-                ActionId.MESH_QUALITY, ActionId.PARALLEL_ENVIRONMENT):
+                ActionId.LOAD_MESH, ActionId.CLOSE_PROJECT,
+                ActionId.MESH_QUALITY):
             result[action] = self._capability_action(snapshot, action, project_idle, project_reason)
         result[ActionId.CLOSE_PROJECT] = self._capability_action(
             snapshot, ActionId.CLOSE_PROJECT, True)
@@ -197,8 +191,9 @@ class ActionPolicy:
         rendering_reason = ('Open a case to use viewport controls'
                             if not snapshot.rendering_available else project_reason)
         for action in (
-                ActionId.VIEW_FIT, ActionId.VIEW_AXIS, ActionId.VIEW_CUBE_AXIS,
-                ActionId.VIEW_RULER, ActionId.VIEW_PERSPECTIVE,
+                ActionId.VIEW_FIT, ActionId.VIEW_ZOOM_SELECTION,
+                ActionId.VIEW_AXIS, ActionId.VIEW_CUBE_AXIS,
+                ActionId.VIEW_RULER, ActionId.VIEW_PARALLEL_PROJECTION,
                 ActionId.VIEW_ALIGN_AXIS, ActionId.VIEW_ROLL,
                 ActionId.VIEW_ROTATION_CENTER):
             result[action] = ActionPresentation(
@@ -234,6 +229,22 @@ class ActionPolicy:
         if snapshot.job is JobState.CANCELLING:
             return 'The active operation is being cancelled'
         return 'Wait for the active operation to finish'
+
+
+def mesh_quality_capability(engine_id: str) -> tuple[bool, str]:
+    """Whether Mesh > Quality thresholds has anything to edit on this case.
+
+    DP-752. The dialog edits the meshQualityDict limits snappyHexMesh applies
+    while it snaps and adds layers. Nothing else reads them, so on a Gmsh case
+    the entry was a form whose every value was ignored.
+    """
+    if str(engine_id) == 'snappy':
+        return True, ''
+    if str(engine_id) == 'gmsh':
+        return False, ('These thresholds drive snappyHexMesh only. A Gmsh mesh '
+                       'is judged by the quality gate on Generate mesh')
+    return False, ('These thresholds drive snappyHexMesh. Choose it on Mesh '
+                   'setup to set them')
 
 
 def job_state_from_manager(manager) -> JobState:

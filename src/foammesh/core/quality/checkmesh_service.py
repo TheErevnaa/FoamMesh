@@ -542,11 +542,11 @@ class MeshCheckService:
         if job.status is JobStatus.CANCELLED:
             result.incomplete = True
             result.severity = 'incomplete'
-            result.recommendations.insert(0, 'Mesh Check was cancelled; run it again for a current verdict.')
+            result.recommendations.insert(0, 'Mesh check was cancelled; run it again for a current verdict.')
         elif job.status is JobStatus.TIMED_OUT:
             result.incomplete = True
             result.severity = 'incomplete'
-            result.recommendations.insert(0, 'Mesh Check timed out; review the log and retry with a longer timeout.')
+            result.recommendations.insert(0, 'Mesh check timed out; review the log and retry with a longer timeout.')
         sets = tuple(discover_set_details(case))
         for item in sets:
             if item['name'] not in result.reported_sets:

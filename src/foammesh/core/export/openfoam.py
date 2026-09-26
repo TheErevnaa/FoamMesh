@@ -14,6 +14,49 @@ from pathlib import Path
 from .base import ExportFormat, ExportReport
 
 
+#: The files an OpenFOAM mesh is made of.  Every reader -- ``checkMesh``, the
+#: solvers, ParaView's ``.foam`` reader -- opens all five, so a directory
+#: holding four of them is not a mesh that is mostly there, it is a mesh
+#: nothing will read.
+#:
+#: DP-266 wrote this list in ``core/import_export/service.py``, which is one
+#: of the two callers of :func:`validate_case`; the verdict itself did not
+#: know it, so the other caller and every reader of the report were still
+#: told a four-file directory was a mesh. It lives here, beside the verdict,
+#: because ``service.py`` already imports this module and the reverse import
+#: would be a cycle.
+POLY_MESH_FILES = ('points', 'faces', 'owner', 'neighbour', 'boundary')
+
+
+def missing_poly_mesh_files(case_path) -> list[str]:
+    """Which of :data:`POLY_MESH_FILES` a case's mesh directory is without.
+
+    Empty when the case has no ``constant/polyMesh`` at all: a case that is
+    dictionaries and no mesh yet is a different matter, and
+    :func:`validate_case` already warns about it. ``.gz`` counts, because
+    OpenFOAM writes compressed meshes under the same names and reads them
+    back the same way.
+    """
+    mesh = Path(case_path) / 'constant' / 'polyMesh'
+    if not mesh.is_dir():
+        return []
+    return [name for name in POLY_MESH_FILES
+            if not (mesh / name).is_file()
+            and not (mesh / f'{name}.gz').is_file()]
+
+
+def incomplete_mesh_message(absent) -> str:
+    """The one sentence every route says about a mesh written halfway.
+
+    One wording, because the service and the native writer both refuse on
+    this and a reader who met two spellings of the same refusal would have to
+    work out whether they were the same complaint.
+    """
+    return ('constant/polyMesh is incomplete, so this case is not a mesh any '
+            'OpenFOAM reader will open: missing ' + ', '.join(absent)
+            + '. Re-run the mesh before exporting it.')
+
+
 def validate_case(case_dir) -> ExportReport:
     case = Path(case_dir)
     report = ExportReport(format=ExportFormat.OPENFOAM)
@@ -29,6 +72,16 @@ def validate_case(case_dir) -> ExportReport:
     if has_system and not has_mesh:
         report.warnings.append('case has dictionaries but no polyMesh yet '
                                '(run blockMesh/snappyHexMesh first).')
+    # DP-266 left this standing: the presence of the mesh directory stood in
+    # for the presence of a mesh, so a run killed between `owner` and
+    # `neighbour` passed the verdict and every caller of it.  A case with no
+    # mesh directory at all is not taken here -- that is the warning above,
+    # and a mesh not built yet is a different matter from one written
+    # halfway.
+    absent = missing_poly_mesh_files(case)
+    if absent:
+        report.ok = False
+        report.errors.append(incomplete_mesh_message(absent))
     return report
 
 

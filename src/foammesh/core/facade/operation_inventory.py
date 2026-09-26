@@ -35,7 +35,6 @@ ACTION_TO_OPERATION: dict[str, str] = {
     'clean_case': 'case.clean',
     'undo': 'history.undo',
     'redo': 'history.redo',
-    'transaction_history': 'history.query',
     # Geometry / mesh input
     'load_geometry': 'geometry.import',
     'load_mesh': 'mesh.import.native',
@@ -53,10 +52,14 @@ ACTION_TO_OPERATION: dict[str, str] = {
     'export': 'case.export.native',
     # Presentation (view controls)
     'view_fit': 'presentation.view.fit',
+    # DP-755. A camera fit bounded by the selection rather than the scene.
+    'view_zoom_selection': 'presentation.view.fit',
     'view_axis': 'presentation.view.axis',
     'view_cube_axis': 'presentation.view.cube_axis',
     'view_ruler': 'presentation.view.ruler',
-    'view_perspective': 'presentation.view.perspective',
+    # DP-757. The operation keeps its public name; the action is named for
+    # what it does.
+    'view_parallel_projection': 'presentation.view.perspective',
     'view_align_axis': 'presentation.view.align_axis',
     'view_roll': 'presentation.view.roll',
     'view_rotation_center': 'presentation.view.rotation_center',
@@ -64,15 +67,14 @@ ACTION_TO_OPERATION: dict[str, str] = {
     'parallel_environment': APPLICATION_SETTING,
     'ui_scale': APPLICATION_SETTING,
     'language': APPLICATION_SETTING,
-    'theme': APPLICATION_SETTING,
+    'preferences': APPLICATION_SETTING,  # DP-759: the Preferences dialog
     # Reviewed client-only shell controls (no domain handler by design)
     'exit': CLIENT_SHELL,               # quits the client process
     'terminal_here': CLIENT_SHELL,      # opens an OS terminal
-    'paraview': CLIENT_SHELL,           # launches the external ParaView app
     'tutorials': CLIENT_SHELL,          # opens documentation in a browser
     'license': CLIENT_SHELL,            # shows an about/license dialog
-    'privacy': CLIENT_SHELL,            # opens the consent dialog
     'about': CLIENT_SHELL,              # shows the about dialog
+    'run_details': CLIENT_SHELL,        # shows the last run sentence and its log
 }
 
 
@@ -109,7 +111,8 @@ SERVICE_TO_OPERATIONS: dict[str, tuple[str, ...]] = {
                               'geometry.split', 'geometry.combine', 'geometry.transform',
                               'geometry.readiness', 'geometry.repair.rollback',
                               'geometry.wrap.estimate',
-                              'geometry.patches.split_by_angle'),
+                              'geometry.patches.split_by_angle',
+                              'geometry.split_interfaces'),
     'MeshTransformService': ('mesh.transform.rotate', 'mesh.transform.translate',
                              'mesh.transform.scale'),
     'MeshCheckService': ('mesh.check', 'quality.su2_readiness',
@@ -128,7 +131,19 @@ SUPPLEMENTAL_TO_OPERATION: dict[str, str] = {
     'capture': CLIENT_SHELL,                    # viewport-only image capture
     'cheatSheet': CLIENT_SHELL,                 # viewport shortcut overlay
     'zoomSelection': CLIENT_SHELL,              # viewport-only camera fit
+    'fitSelectionOrAll': CLIENT_SHELL,          # DP-697: the viewport's F key
     'action': CLIENT_SHELL,                     # recent-files / menu container control
+    # DP-292 (W-B): the boundary actions on the geometry page are the four
+    # patch routes; the host supplies the selection and the angle.
+    '_renameAction': 'geometry.patches.rename',
+    '_mergeAction': 'geometry.patches.merge',
+    '_splitAction': 'geometry.patches.split',
+    '_angleAction': 'geometry.patches.split_by_angle',
+    # DP-290 (W-E): the Help menu step entries open the help and details
+    # panes of the step on screen; the separator between them is a menu line.
+    '_stepHelpAction': CLIENT_SHELL,
+    '_stepDetailsAction': CLIENT_SHELL,
+    'separator': CLIENT_SHELL,
 }
 
 

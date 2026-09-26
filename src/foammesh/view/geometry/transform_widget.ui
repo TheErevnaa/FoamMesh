@@ -39,7 +39,7 @@
        <item>
         <widget class="QGroupBox" name="groupBox">
          <property name="title">
-          <string>Scaling Factors</string>
+          <string>Scaling factors</string>
          </property>
          <layout class="QGridLayout" name="gridLayout">
           <item row="0" column="0">
@@ -139,7 +139,7 @@
           <item row="0" column="0">
            <widget class="QLabel" name="label_10">
             <property name="text">
-             <string>Rotation Angle (deg)</string>
+             <string>Rotation angle</string>
             </property>
            </widget>
           </item>
@@ -171,20 +171,20 @@
           <item>
            <widget class="QGroupBox" name="groupBox_2">
             <property name="title">
-             <string>Rotation Origin</string>
+             <string>Rotation origin</string>
             </property>
             <layout class="QGridLayout" name="gridLayout_2">
              <item row="0" column="0">
               <widget class="QLabel" name="label_4">
                <property name="text">
-                <string>X (m)</string>
+                <string>X</string>
                </property>
               </widget>
              </item>
              <item row="1" column="0">
               <widget class="QLabel" name="label_5">
                <property name="text">
-                <string>Y (m)</string>
+                <string>Y</string>
                </property>
               </widget>
              </item>
@@ -198,7 +198,7 @@
              <item row="2" column="0">
               <widget class="QLabel" name="label_6">
                <property name="text">
-                <string>Z (m)</string>
+                <string>Z</string>
                </property>
               </widget>
              </item>
@@ -222,7 +222,7 @@
           <item>
            <widget class="QGroupBox" name="groupBox_3">
             <property name="title">
-             <string>Rotation Axis</string>
+             <string>Rotation axis</string>
             </property>
             <layout class="QGridLayout" name="gridLayout_3">
              <item row="0" column="0">
@@ -309,13 +309,13 @@
        <item>
         <widget class="QGroupBox" name="groupBox_4">
          <property name="title">
-          <string>Translation Offsets</string>
+          <string>Translation offsets</string>
          </property>
          <layout class="QGridLayout" name="gridLayout_4">
           <item row="0" column="0">
            <widget class="QLabel" name="label_11">
             <property name="text">
-             <string>X (m)</string>
+             <string>X</string>
             </property>
            </widget>
           </item>
@@ -329,7 +329,7 @@
           <item row="1" column="0">
            <widget class="QLabel" name="label_12">
             <property name="text">
-             <string>Y (m)</string>
+             <string>Y</string>
             </property>
            </widget>
           </item>
@@ -343,7 +343,7 @@
           <item row="2" column="0">
            <widget class="QLabel" name="label_13">
             <property name="text">
-             <string>Z (m)</string>
+             <string>Z</string>
             </property>
            </widget>
           </item>

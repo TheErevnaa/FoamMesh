@@ -6,6 +6,8 @@ from io import StringIO
 import sys
 from typing import Optional
 
+from foammesh.core.quantities import count_text
+
 from PySide6.QtCore import Qt, QTimer, QRect, Signal
 from PySide6.QtGui import QKeySequence, QShortcut, QPainter, QPen, QPalette
 from PySide6.QtWidgets import (
@@ -359,11 +361,18 @@ class SimpleExcelSheet(QTableWidget):
 
             menu.addSeparator()
 
-            action = menu.addAction("Insert Row(s)")
-            action.triggered.connect(self._insertRows)
-
-            action = menu.addAction("Remove Row(s)")
-            action.triggered.connect(self._removeRows)
+            # DP-199. The menu knew how many rows it was about to act on
+            # and asked the reader to assemble the ending anyway; and it
+            # offered both of these with nothing selected, where the handler
+            # walks an empty list and the click does nothing at all.
+            rows = len(self._selectedRows())
+            for verb, slot in (('Insert', self._insertRows),
+                               ('Remove', self._removeRows)):
+                action = menu.addAction(
+                    verb + ' ' + (count_text(rows, 'row') if rows > 1
+                                  else 'row'))
+                action.triggered.connect(slot)
+                action.setEnabled(rows > 0)
 
         menu.exec(self.viewport().mapToGlobal(pos))
 

@@ -49,6 +49,20 @@ def parse_vector(text: str) -> Vector:
         raise ValueError('enter exactly three numeric values') from error
 
 
+def parse_scale(text: str) -> Vector:
+    """DP-693. One factor scales every direction; three scale X, Y and Z apart."""
+    values = text.replace(',', ' ').split()
+    if len(values) == 1:
+        try:
+            factor = float(values[0])
+        except ValueError as error:
+            raise ValueError('enter one factor or three numeric values') from error
+        return (factor, factor, factor)
+    if len(values) != 3:
+        raise ValueError('enter one factor or three numeric values')
+    return parse_vector(text)
+
+
 @dataclass(frozen=True)
 class MeshTransformRequest:
     operation: str

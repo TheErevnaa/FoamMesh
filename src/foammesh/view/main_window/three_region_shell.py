@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
-    QBoxLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSplitter,
-    QTabWidget, QVBoxLayout, QWidget,
+    QBoxLayout, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
+
+from foammesh.view.theming.metrics import GAP, apply_bar_metrics
 
 from .verdict_strip import VerdictStrip
 
@@ -36,6 +38,16 @@ REGION_C_BAND_PREFERRED = 260
 REGION_A_PREFERRED = 220
 REGION_B_PREFERRED = 420
 REGION_B_COMPACT_PREFERRED = 360
+#: DP-569. A window narrower than this gets the compact settings column. It
+#: is named so the table-width gates measure at the width the shell decides
+#: rather than at a number copied out of it.
+REGION_B_COMPACT_BELOW = 1600
+#: DP-A1. How little of the settings column has to be on screen for the
+#: column to be worth showing at all -- about four rows of a form. It is a
+#: fact about the shell, not about any page, which is the whole point: the
+#: page stack is inside a scroller now, so the window's minimum height stops
+#: following whichever page in the stack happens to be tallest.
+REGION_B_PAGE_MINIMUM = 160
 LAYOUT_VERSION = 1
 
 
@@ -56,7 +68,7 @@ def preferred_band_sizes(total_height: int) -> tuple[int, int]:
 def reveal_output_band(splitter, *, minimum: int | None = None) -> bool:
     """Grow Region C's output band to fit what it holds. True when it moved.
 
-    R114. `Details` beside the verdict line raised the Mesh Quality tab into a
+    R114. `Details` beside the verdict line raised the Mesh quality tab into a
     band about 40 px tall, so the button that promises the report delivered a
     cropped sentence and the only remedy was to find a splitter handle and drag
     it up 270 px. The viewport keeps its own minimum, so revealing the report
@@ -89,16 +101,24 @@ def reveal_output_band(splitter, *, minimum: int | None = None) -> bool:
     return True
 
 
-def preferred_region_sizes(total_width: int) -> tuple[int, int, int]:
-    """Return the FOAMFlow-aligned A/B/C allocation for ``total_width``."""
+def preferred_region_sizes(
+        total_width: int, a_preferred: int | None = None
+) -> tuple[int, int, int]:
+    """Return the FOAMFlow-aligned A/B/C allocation for ``total_width``.
+
+    DP-134. ``a_preferred`` is what the outline says it needs to show its rows
+    without eliding them; ``REGION_A_PREFERRED`` is the floor, and B and C keep
+    their own minimums ahead of it, so a long task name can widen the pane but
+    never starve the page or the viewport.
+    """
     total_width = max(
         int(total_width),
         REGION_A_MINIMUM + REGION_B_MINIMUM + REGION_C_MINIMUM,
     )
-    a_width = REGION_A_PREFERRED
+    a_width = max(REGION_A_PREFERRED, int(a_preferred or 0))
     b_width = (
         REGION_B_COMPACT_PREFERRED
-        if total_width < 1600 else REGION_B_PREFERRED
+        if total_width < REGION_B_COMPACT_BELOW else REGION_B_PREFERRED
     )
     c_width = total_width - a_width - b_width
     if c_width < REGION_C_MINIMUM:
@@ -111,15 +131,30 @@ def preferred_region_sizes(total_width: int) -> tuple[int, int, int]:
     return a_width, b_width, c_width
 
 
+def layout_worth_recording(user_moved: bool, restored_sizes) -> bool:
+    """Whether the splitter's current sizes are a preference or an accident.
+
+    DP-134.  They are a preference in exactly two cases: somebody dragged the
+    handle this session, or somebody dragged it in an earlier one and we are
+    looking at what we restored.  Otherwise the sizes are whatever
+    :func:`clamp_region_sizes` computed for the last window width, and writing
+    them down turns one narrow session into a permanent setting -- which is how
+    Region A came to sit at its 190 px minimum, eliding half the outline, with
+    no way back short of deleting the settings file.
+    """
+    return bool(user_moved) or restored_sizes is not None
+
+
 def clamp_region_sizes(
-        total_width: int, sizes) -> tuple[int, int, int]:
+        total_width: int, sizes, a_preferred: int | None = None
+) -> tuple[int, int, int]:
     """Validate a saved allocation and return a safe current-schema layout."""
     try:
         values = tuple(int(value) for value in sizes)
     except (TypeError, ValueError):
-        return preferred_region_sizes(total_width)
+        return preferred_region_sizes(total_width, a_preferred)
     if len(values) != 3 or any(value < 0 for value in values):
-        return preferred_region_sizes(total_width)
+        return preferred_region_sizes(total_width, a_preferred)
 
     total_width = max(
         int(total_width),
@@ -129,8 +164,129 @@ def clamp_region_sizes(
     b_width = max(REGION_B_MINIMUM, values[1])
     # A and B own their requested widths; every remaining pixel belongs to C.
     if a_width + b_width + REGION_C_MINIMUM > total_width:
-        return preferred_region_sizes(total_width)
+        return preferred_region_sizes(total_width, a_preferred)
     return a_width, b_width, total_width - a_width - b_width
+
+
+class PageColumn(QScrollArea):
+    """The settings column: one page at a time, scrolled, footer outside it.
+
+    DP-A1. Region B used to hold the page stack directly, so the stack's
+    minimum size hint -- which `QStackedLayout` computes as the *largest* of
+    every page it holds, shown or not -- was a term in the window's own
+    minimum height. MEASURED on the real window built offscreen at
+    `4ed5fcb8`: 892 px of minimum height, of which Region B asked for 823 and
+    the page stack for 736, and the 736 belonged to `baseGridPage`, a page
+    the user may never open. The elbow campaign of 16 September measured the
+    same thing on a real display: 1,428 px of minimum height against 1,032 px
+    of screen, with the one forward button 359 px below the bottom of the
+    screen and no resize able to recover it.
+
+    So the column scrolls and the footer does not. Two things make that true
+    and both are needed:
+
+    * The stack's *vertical* size policy is `Ignored`, which is what makes
+      `qSmartMinSize` -- the function every Qt layout and this scroll area
+      ask for a child's floor -- stop reading the stack's own hint. Nothing
+      about the width changes: a page too wide for the column is as wide as
+      it was.
+    * The floor is then written back, per page, as an explicit minimum
+      height taken from *the page being shown*. An explicit minimum survives
+      `Ignored`, so the scroller still grows a bar for a page that needs one
+      -- a Designer page with no scroller of its own, Preparation with its
+      findings table -- and a hidden page contributes nothing.
+
+    The height is re-read on every layout request as well as on every page
+    change, because a page grows after it is opened: a fold opens, a table
+    fills, a validation line appears.
+
+    The same per-page height is also the stack's *maximum*, which is what
+    keeps the two scrollers from both drawing a bar. Several pages carry a
+    `QScrollArea` of their own -- every engine task page does, and so do the
+    Snappy Designer pages -- and Qt, left alone, sizes the widget inside a
+    resizable scroll area to its height-for-width, which MEASURED at 916 px
+    for every one of those pages in a 700 px window whose column viewport was
+    544 px. That put a 372 px bar on the column *and* left the page's own bar
+    where it was: two bars, a few pixels apart, one of which moved the page
+    heading away from the row the other had just revealed. Capping the stack
+    at the viewport height unless the page itself asks for more means the
+    outer bar appears only for a page with no scroller of its own, and a page
+    that scrolls itself is given exactly the room it is shown in.
+    """
+
+    def __init__(self, stack, parent=None) -> None:
+        super().__init__(parent)
+        self._stack = stack
+        self.setObjectName('regionBPageColumn')
+        self.setAccessibleName('Settings for the current step')
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        # One column, one direction. A settings form that scrolled sideways
+        # as well would put the value of a row off screen from its label.
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(REGION_B_PAGE_MINIMUM)
+        policy = stack.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Ignored)
+        # DP-534 (audit 0924, S5/S6). The width had the same fault as the
+        # height: the stack was as wide as its widest page, shown or not.
+        # The Preparation page's revision row outgrew the column on a case
+        # with a long geometry name, and every snappy stage page was then
+        # laid out that wide inside a column with no sideways bar -- and
+        # when focus reached a control on the right, the scroller moved the
+        # page left to show it, so the heading read `main & regions` and
+        # `stellation`. Width now follows the page being shown too.
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        stack.setSizePolicy(policy)
+        self.setWidget(stack)
+        # With no sideways bar there is no way back from a sideways scroll,
+        # so the column never takes one: a page that is still too wide is
+        # cut on its right, where its own scroller or elision can answer,
+        # and never loses its heading off the left.
+        self.horizontalScrollBar().valueChanged.connect(
+            self._keepLeftEdge)
+        stack.currentChanged.connect(self._followPage)
+        stack.installEventFilter(self)
+        self._followPage()
+
+    @property
+    def stack(self):
+        return self._stack
+
+    def eventFilter(self, watched, event):
+        if watched is self._stack and event.type() in (
+                QEvent.Type.LayoutRequest, QEvent.Type.ChildAdded,
+                QEvent.Type.ChildRemoved):
+            self._followPage()
+        return False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The cap below is measured against the viewport, so it is re-read
+        # whenever the viewport changes size.
+        self._followPage()
+
+    def _followPage(self, *_args) -> None:
+        page = self._stack.currentWidget()
+        wanted = 0 if page is None else page.minimumSizeHint().height()
+        capped = max(wanted, self.viewport().height())
+        # DP-534. The shown page's own floor, not the widest page's.
+        width = 0 if page is None else max(0, page.minimumSizeHint().width())
+        # Guarded, because writing either bound posts a layout request back to
+        # the stack and this is the handler for those.
+        if self._stack.minimumHeight() != wanted:
+            self._stack.setMinimumHeight(wanted)
+        if self._stack.maximumHeight() != capped:
+            self._stack.setMaximumHeight(capped)
+        if self._stack.minimumWidth() != width:
+            self._stack.setMinimumWidth(width)
+
+    def _keepLeftEdge(self, value: int) -> None:
+        if value:
+            self.horizontalScrollBar().setValue(0)
 
 
 @dataclass(frozen=True)
@@ -149,6 +305,10 @@ class ThreeRegionShell:
     region_c_splitter: object = None
     verdict_strip: QWidget = None                            # type: ignore[assignment]
     output_band: QWidget = None                              # type: ignore[assignment]
+    #: DP-A1. The bounded scroller the page stack lives in.
+    page_column: QWidget = None                              # type: ignore[assignment]
+    #: DP-A1. The footer, outside that scroller and never inside it.
+    action_bar: QWidget = None                               # type: ignore[assignment]
 
     @property
     def minimum_window_width(self) -> int:
@@ -157,10 +317,12 @@ class ThreeRegionShell:
             + 2 * self.splitter.handleWidth()
         )
 
-    def apply_sizes(self, total_width: int, saved=None) -> tuple[int, int, int]:
+    def apply_sizes(self, total_width: int, saved=None,
+                    a_preferred: int | None = None) -> tuple[int, int, int]:
         sizes = (
-            preferred_region_sizes(total_width)
-            if saved is None else clamp_region_sizes(total_width, saved)
+            preferred_region_sizes(total_width, a_preferred)
+            if saved is None
+            else clamp_region_sizes(total_width, saved, a_preferred)
         )
         self.splitter.setSizes(list(sizes))
         return sizes
@@ -181,6 +343,11 @@ class ThreeRegionShell:
         assert self.region_c.indexOf(self.mesh_page) < 0
         assert self.mesh_page.parent() is not self.region_c
         assert self.verdict_strip is not None
+        # DP-A1. The settings column scrolls and the footer does not, so the
+        # footer is never a descendant of the scroller: if it were, a tall
+        # page would carry the one forward action off the bottom of the view.
+        assert self.page_column is not None and self.action_bar is not None
+        assert not self.page_column.isAncestorOf(self.action_bar)
 
 
 def install_three_region_shell(ui) -> ThreeRegionShell:
@@ -200,7 +367,7 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
 
     region_a = QWidget(splitter)
     region_a.setObjectName('regionAHost')
-    region_a.setAccessibleName('Region A - guided meshing workflow')
+    region_a.setAccessibleName('Outline of the meshing workflow')
     region_a.setMinimumWidth(REGION_A_MINIMUM)
     region_a.setSizePolicy(
         QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -209,7 +376,9 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     ui.navigation.setParent(region_a)
     ui.navigation.setTitle('Outline')
     ui.horizontalLayout_2.setDirection(QBoxLayout.Direction.TopToBottom)
-    ui.horizontalLayout_2.setSpacing(2)
+    # DP-194. The form says GAP for this layout too; the two agree by
+    # arithmetic rather than by two authors typing the same number.
+    ui.horizontalLayout_2.setSpacing(GAP)
     for label in ui.navigation.findChildren(QLabel):
         pixmap = label.pixmap()
         if pixmap is not None and not pixmap.isNull():
@@ -218,7 +387,7 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
 
     region_b = QWidget(splitter)
     region_b.setObjectName('regionBHost')
-    region_b.setAccessibleName('Region B - current meshing page and settings')
+    region_b.setAccessibleName('Current meshing page and its settings')
     region_b.setMinimumWidth(REGION_B_MINIMUM)
     region_b.setSizePolicy(
         QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -227,13 +396,23 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     workflow.setParent(region_b)
     workflow.setTitle('')
     workflow.setMinimumWidth(0)
-    b_layout.addWidget(workflow)
+    # DP-A1. The page stack goes into a bounded scroller, in the place in the
+    # workflow box's own layout that it already occupied -- so the validation
+    # line, the run strip and the legacy button row that follow it stay where
+    # they are, outside the scroller, and so does the footer below them.
+    workflow_layout = workflow.layout()
+    # Read before the scroller adopts the stack: adopting it reparents it,
+    # and a reparented widget is dropped from the layout it was in.
+    page_slot = max(workflow_layout.indexOf(ui.content), 0)
+    page_column = PageColumn(ui.content, workflow)
+    workflow_layout.insertWidget(page_slot, page_column, 1)
+    b_layout.addWidget(workflow, 1)
 
     # Scene / Display is a Region B page.  Moving the existing widget leaves
     # renderingSplitter with the one and only viewport widget.
     scene = QWidget(ui.content)
     scene.setObjectName('sceneRegionBPage')
-    scene.setAccessibleName('Scene and display settings')
+    scene.setAccessibleName('Display settings')
     scene_layout = QVBoxLayout(scene)
     scene_layout.setContentsMargins(0, 0, 0, 0)
     ui.widget_37.setParent(scene)
@@ -245,20 +424,26 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # controllers, but the human always has one Back/Proceed location.
     action_bar = QWidget(region_b)
     action_bar.setObjectName('wizardActionBar')
-    action_bar.setAccessibleName('Wizard page actions')
+    action_bar.setAccessibleName('Workflow page actions')
     action_layout = QHBoxLayout(action_bar)
-    action_layout.setContentsMargins(8, 4, 8, 8)
     # G3. The two buttons were drawn edge to edge and read as one control
-    # with a seam down it.
-    action_layout.setSpacing(8)
+    # with a seam down it, so the bar's gap separates them.
+    # DP-191. The row used to sit its buttons two pixels above its own
+    # centre, and its inset now matches the shell's other bars.
+    apply_bar_metrics(action_bar, action_layout)
+    action_layout.setSpacing(GAP)
     action_layout.addStretch(1)
     back = QPushButton('Back', action_bar)
     back.setObjectName('wizardBackButton')
-    back.setAccessibleName('Go to previous available meshing page')
+    # DP-186. `Back` and `Proceed` are the two words on screen; a name
+    # that replaces them leaves voice control with nothing to match.
+    # The explanation belongs in the description slot.
+    back.setAccessibleDescription(
+        'Go to the previous available meshing page.')
     proceed = QPushButton('Proceed', action_bar)
     proceed.setObjectName('wizardProceedButton')
-    proceed.setAccessibleName(
-        'Validate and apply the current page, then proceed')
+    proceed.setAccessibleDescription(
+        'Validate and apply the current page, then move on.')
     # A6. Once a branch expands this is the only control that moves the
     # workflow forward, while each task page carries its own Update/Revert
     # buttons of the same weight. Drawing this one as the primary says which
@@ -266,7 +451,16 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     proceed.setProperty('foammeshRole', 'primary')
     action_layout.addWidget(back)
     action_layout.addWidget(proceed)
-    b_layout.addWidget(action_bar)
+    # DP-A2. The footer keeps its own height whatever else region B is
+    # asked to fit. MEASURED at 4ed5fcb8: a run completion posted a
+    # status strip into this column and the window minimum rose from
+    # 892 px to 926 px, carrying the one forward button 34 px further
+    # down -- off a 1,032 px screen entirely on the real display. With
+    # the page column bounded above, the only way the footer can still
+    # be pushed out is by being asked to shrink, so it is not askable.
+    action_bar.setSizePolicy(
+        QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    b_layout.addWidget(action_bar, 0)
 
     # Region C is split vertically rather than tabbed. Before Plan 26 WP3 the
     # viewport and the console were peer tabs in one QTabWidget, so only one
@@ -276,7 +470,7 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # output band and no tab selection can displace it.
     region_c_host = QWidget(splitter)
     region_c_host.setObjectName('regionCHost')
-    region_c_host.setAccessibleName('Region C - mesh viewport and outputs')
+    region_c_host.setAccessibleName('Mesh viewport and outputs')
     region_c_host.setMinimumWidth(REGION_C_MINIMUM)
     region_c_host.setSizePolicy(
         QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -307,7 +501,7 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
 
     region_c = QTabWidget(output_band)
     region_c.setObjectName('regionCTabHost')
-    region_c.setAccessibleName('Region C - mesh outputs')
+    region_c.setAccessibleName('Mesh outputs')
     region_c.setTabsClosable(False)
     region_c.setMovable(False)
     region_c.setSizePolicy(
@@ -370,6 +564,10 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     ui.meshRegionPage = viewport
     ui.sceneSidebarPage = scene  # controller compatibility; host is Region B
     ui.sceneRegionBPage = scene
+    # DP-A1. The bounded scroller the page stack lives in, published so
+    # that a page controller can ask what is on screen and so that a
+    # gate can measure the one widget the fix is about.
+    ui.regionBPageColumn = page_column
     ui.wizardActionBar = action_bar
     ui.wizardBackButton = back
     ui.wizardProceedButton = proceed
@@ -377,7 +575,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     shell = ThreeRegionShell(
         splitter, region_a, region_b, region_c, viewport,
         region_c_host=region_c_host, region_c_splitter=region_c_splitter,
-        verdict_strip=verdict_strip, output_band=output_band)
+        verdict_strip=verdict_strip, output_band=output_band,
+        page_column=page_column, action_bar=action_bar)
     shell.apply_sizes(1280)
     shell.assert_invariants()
     return shell

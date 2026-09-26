@@ -8,6 +8,8 @@ import importlib.util
 
 from .base import ExportFormat, ExportCapability, ExportReport
 from foammesh.core.format_registry import format_spec
+from foammesh.core.mesh.census import (
+    MSH_ADVICE, MSH_READER, SU2_ADVICE, SU2_READER)
 
 
 _FORMAT_SPECS = {
@@ -127,11 +129,24 @@ def _format_available(cap: ExportCapability) -> bool:
     return not unavailable_reason(cap)
 
 
-#: Formats whose reader knows only the four SU2 cell families. Plan 28: this
-#: is a property of the destination, not of a lossy writer, which is why
-#: `lossless` could never express it -- the SU2 writer is perfectly lossless
-#: for a mesh SU2 can read, and cannot write one it cannot.
-_SOLVER_FORMATS = (ExportFormat.SU2,)
+#: Formats whose reader knows only four cell families, each with the sentence
+#: it refuses with and the way out it offers. Plan 28: this is a property of
+#: the destination, not of a lossy writer, which is why `lossless` could never
+#: express it -- the SU2 writer is perfectly lossless for a mesh SU2 can read,
+#: and cannot write one it cannot.
+#:
+#: DP-26. MSH was missing from here, and `lossless=False` was carrying the
+#: whole weight of it: the row came back available with a warning that
+#: polyhedra "may drop or split", and then `msh_interchange` refused the file
+#: and wrote nothing. MEASURED on the 60 published snappyHexMesh cases in
+#: `test_cases/`: 59 carry polyhedral cells and every one was offered that
+#: row. The 60th -- `pipe_step`, 4374 cells, pure hexahedra, no refinement
+#: transition -- exports MSH correctly, which is why the answer is decided per
+#: case here rather than per engine anywhere.
+_FOUR_FAMILY_FORMATS = {
+    ExportFormat.SU2: (SU2_READER, SU2_ADVICE),
+    ExportFormat.GMSH: (MSH_READER, MSH_ADVICE),
+}
 
 
 def readiness(fmt: ExportFormat, *, has_polyhedra: bool = False,
@@ -155,22 +170,25 @@ def readiness(fmt: ExportFormat, *, has_polyhedra: bool = False,
         report.ok = False
         report.errors.append(reason)
 
-    if cap.format in _SOLVER_FORMATS:
-        if census is not None and not census.su2_readable:
+    four_family = _FOUR_FAMILY_FORMATS.get(cap.format)
+    if four_family is not None:
+        reader, advice = four_family
+        refusal = census.reason_for(reader) if census is not None else ''
+        if refusal:
             report.ok = False
-            report.errors.append(census.reason)
+            report.errors.append(f'{refusal}. {advice}')
         elif census is None and has_polyhedra:
             report.ok = False
             report.errors.append(
-                'the mesh contains polyhedral cells; SU2 reads tetrahedra, '
-                'hexahedra, prisms and pyramids only')
+                f'{reader}, and the mesh contains polyhedral cells. {advice}')
         for warning in getattr(census, 'warnings', ()):
             report.warnings.append(warning)
 
     if not cap.lossless:
         report.warnings.append(cap.notes)
-        if has_polyhedra or (census is not None and census.polyhedral_cells):
-            report.warnings.append(
-                'Mesh contains polyhedral cells — this format may drop or split them.')
+        # No polyhedra warning follows it. MSH is the one format that is not
+        # lossless, and a mesh carrying polyhedra is now refused above, so a
+        # warning that they "may drop or split" would sit underneath an error
+        # saying nothing will be written at all (DP-26).
 
     return report

@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton)
 
 from foammesh.support.simple_db.simple_schema import ValidationError
+from foammesh.view.facade_client import submit
 from foammesh.view.widgets.commit_guard import CONFLICT_ERRORS, conflict_message
 
 from widgets.async_message_box import AsyncMessageBox
@@ -44,7 +45,7 @@ def layerCountLabel(policy, count) -> str:
 STAGED_MESH_ADVISORY = (
     'This mesh was built stage by stage, which is intended for tuning '
     'settings. For the mesh you hand to a solver, finish with the full '
-    'pipeline on the Base Grid step so every phase runs in one qualified '
+    'pipeline on the Base grid step so every phase runs in one qualified '
     'snappyHexMesh pass.')
 
 
@@ -104,7 +105,10 @@ class BoundaryLayerPage(StepPage):
 
         self._yPlusHelper = QPushButton(self.tr('Calculate first-layer height from y+…'),
                                        ui.boundaryLayerPage)
-        self._yPlusHelper.setAccessibleName(self.tr('Y plus first-layer height calculator'))
+        # DP-186. The button already paints the whole sentence; a name
+        # that rewrites it is a second label nobody can say out loud.
+        self._yPlusHelper.setAccessibleDescription(
+            self.tr('Calculate the first-layer height from a target y+.'))
         ui.verticalLayout_18.insertWidget(
             max(0, ui.verticalLayout_18.count() - 1), self._yPlusHelper)
         self._yPlusHelper.clicked.connect(self._showYPlusHelper)
@@ -130,7 +134,7 @@ class BoundaryLayerPage(StepPage):
         self._nSmoothDisplacement.setPlaceholderText(self.tr('OpenFOAM default'))
         self._nSmoothDisplacement.setToolTip(self.tr(
             'Smoothing sweeps applied to the computed layer displacement '
-            'before the mesh is moved.'))
+            'before the mesh is moved'))
 
         self._detectExtrusionIsland = self._layerToggle(parent, self.tr(
             'Drop patches of layer that are extruded on their own, cut off '
@@ -162,8 +166,8 @@ class BoundaryLayerPage(StepPage):
     def _showYPlusHelper(self):
         prompts = (
             (self.tr('Target y+'), 1.0), (self.tr('Velocity (m/s)'), 10.0),
-            (self.tr('Density (kg/mÂ³)'), 1.225),
-            (self.tr('Dynamic viscosity (PaÂ·s)'), 1.81e-5),
+            (self.tr('Density (kg/m³)'), 1.225),
+            (self.tr('Dynamic viscosity (Pa·s)'), 1.81e-5),
             (self.tr('Reference length (m)'), 1.0))
         values = []
         for label, default in prompts:
@@ -194,36 +198,40 @@ class BoundaryLayerPage(StepPage):
             # subtree, so it is taken and committed as one subtree.
             addLayer = app.facadeClient.checkout('addLayers')
 
-            addLayer.setValue('nGrow', self._ui.nGrow.text(), self.tr('Number of Grow'))
-            addLayer.setValue('featureAngle', self._ui.featureAngleThreshold.text(), self.tr('Feature Angle Threshold'))
+            addLayer.setValue('nGrow', self._ui.nGrow.text(), self.tr('Number of grow'))
+            addLayer.setValue('featureAngle', self._ui.featureAngleThreshold.text(), self.tr('Feature angle threshold'))
             addLayer.setValue('slipFeatureAngle', self._slipFeatureAngle.text(),
-                              self.tr('Slip Feature Angle'))
+                              self.tr('Slip feature angle'))
+            # DP-212. Both ratios used to be called 'Max. thickness ratio',
+            # on the screen and here, so a refused value could not say which
+            # box the reader had to go back to. The names are the ones the
+            # two boxes now wear.
             addLayer.setValue('maxFaceThicknessRatio', self._ui.maxFaceThicknessRatio.text(),
-                              self.tr('Max. Thickness Ratio'))
+                              self.tr('Max. face thickness ratio'))
             addLayer.setValue('nSmoothSurfaceNormals', self._ui.nSmoothSurfaceNormals.text(),
-                              self.tr('Number of Iterations'))
-            addLayer.setValue('nSmoothThickness', self._ui.nSmoothThickness.text(), self.tr('Smooth Layer Thickness'))
-            addLayer.setValue('minMedialAxisAngle', self._ui.minMedialAxisAngle.text(), self.tr('Min. Axis Angle'))
+                              self.tr('Number of iterations'))
+            addLayer.setValue('nSmoothThickness', self._ui.nSmoothThickness.text(), self.tr('Smooth layer thickness'))
+            addLayer.setValue('minMedialAxisAngle', self._ui.minMedialAxisAngle.text(), self.tr('Min. axis angle'))
             addLayer.setValue('maxThicknessToMedialRatio', self._ui.maxThicknessToMedialRatio.text(),
-                              self.tr('Max. Thickness Ratio'))
-            addLayer.setValue('nSmoothNormals', self._ui.nSmoothNormals.text(), self.tr('Number of Smoothing Iter.'))
-            addLayer.setValue('nRelaxIter', self._ui.nRelaxIter.text(), self.tr('Max. Snapping Relaxation Iter.'))
+                              self.tr('Max. thickness to medial ratio'))
+            addLayer.setValue('nSmoothNormals', self._ui.nSmoothNormals.text(), self.tr('Number of smoothing iter.'))
+            addLayer.setValue('nRelaxIter', self._ui.nRelaxIter.text(), self.tr('Max. snapping relaxation iter.'))
             addLayer.setValue('nBufferCellsNoExtrude', self._ui.nBufferCellsNoExtrude.text(),
-                              self.tr('Num. of Buffer Cells'))
-            addLayer.setValue('nLayerIter', self._ui.nLayerIter.text(), self.tr('Max. Layer Addition Iter.'))
-            addLayer.setValue('nRelaxedIter', self._ui.nRelaxedIter.text(), self.tr('Max. Iter. Before Relax'))
+                              self.tr('Num. of buffer cells'))
+            addLayer.setValue('nLayerIter', self._ui.nLayerIter.text(), self.tr('Max. layer addition iter.'))
+            addLayer.setValue('nRelaxedIter', self._ui.nRelaxedIter.text(), self.tr('Max. iter. before relax'))
             addLayer.setValue(
                 'meshShrinker', self._meshShrinker.currentData(),
-                self.tr('Layer Mesh Shrinker'))
+                self.tr('Layer mesh shrinker'))
             # An empty box is "no opinion": the key is left out entirely so
             # snappyHexMesh's own default still governs.
             addLayer.setValue(
                 'nMedialAxisIter', self._nMedialAxisIter.text().strip() or None,
-                self.tr('Max. Medial Axis Iter.'))
+                self.tr('Max. medial axis iter.'))
             addLayer.setValue(
                 'nSmoothDisplacement',
                 self._nSmoothDisplacement.text().strip() or None,
-                self.tr('Smooth Displacement'))
+                self.tr('Smooth displacement'))
             addLayer.setValue('detectExtrusionIsland',
                               self._detectExtrusionIsland.currentData())
             addLayer.setValue('additionalReporting',
@@ -234,12 +242,12 @@ class BoundaryLayerPage(StepPage):
 
             return True
         except CONFLICT_ERRORS as error:
-            await AsyncMessageBox().information(
-                self._widget, self.tr('Case Changed'), self.tr(conflict_message(error)))
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Case changed'), self.tr(conflict_message(error)))
 
             return False
         except ValidationError as e:
-            await AsyncMessageBox().information(self._widget, self.tr("Input Error"), e.toMessage())
+            await AsyncMessageBox().warning(self._widget, self.tr("Input error"), e.toMessage())
 
             return False
 
@@ -289,8 +297,8 @@ class BoundaryLayerPage(StepPage):
     @qasync.asyncSlot()
     async def _loadDefaults(self):
         if await AsyncMessageBox().confirm(
-                self._widget, self.tr('Reset Settings'),
-                self.tr('Would you like to reset all Boundary Layer settings to default,excluding the Layer Groups?')):
+                self._widget, self.tr('Reset settings'),
+                self.tr('Would you like to reset all Boundary layer settings to default, excluding the Layer groups?')):
             self._setConfigurastions(defaultsDB.getElement('addLayers'))
 
     def _setConfigurastions(self, addLayer):
@@ -380,6 +388,12 @@ class BoundaryLayerPage(StepPage):
             self._ui.boundaryLayerConfigurations.item(self._dialog.groupId()).update(
                 [element.getValue('groupName'), label])
 
+        # DP-119. The dialog commits its own write now, so the copy this page
+        # reads geometry and group names from is one revision behind the
+        # moment it closes -- and the next dialog opened from it would edit
+        # an element that no longer matches the case.
+        self._db = app.facadeClient.checkout()
+
     def _addConfigurationItem(self, groupId, name, layers):
         item = ListItemWithButtons(groupId, [name, layers])
         item.editClicked.connect(lambda: self._openLayerEditDialog(groupId))
@@ -387,12 +401,32 @@ class BoundaryLayerPage(StepPage):
         self._ui.boundaryLayerConfigurations.addItem(item)
 
     def _removeLayerConfiguration(self, groupId):
-        self._db.removeElement('addLayers/layers', groupId)
+        # DP-119. Same defect as the edit dialog had: these three writes went
+        # into a working copy nothing ever committed, so a group removed here
+        # came back the next time the page loaded, still owning its patches.
+        def dropRow(_result=None):
+            self._db = app.facadeClient.checkout()
+            self._ui.boundaryLayerConfigurations.removeItem(groupId)
 
-        self._db.updateElements('geometry', 'layerGroup', None, lambda i, e: e['layerGroup'] == groupId)
-        self._db.updateElements('geometry', 'slaveLayerGroup', None, lambda i, e: e['slaveLayerGroup'] == groupId)
+        db = app.facadeClient.checkout()
+        try:
+            db.removeElement('addLayers/layers', groupId)
+        except KeyError:
+            # The row outlived the group it stood for. Drop the row rather
+            # than raising out of a click handler.
+            dropRow()
+            return
 
-        self._ui.boundaryLayerConfigurations.removeItem(groupId)
+        db.updateElements('geometry', 'layerGroup', None, lambda i, e: e['layerGroup'] == groupId)
+        db.updateElements('geometry', 'slaveLayerGroup', None, lambda i, e: e['slaveLayerGroup'] == groupId)
+
+        # Scheduled, not blocking: this is a `clicked` slot, and the row is
+        # dropped when the removal has landed, which is the order the
+        # uncommitted version appeared to have.
+        submit(app.facadeClient, 'configuration.commit_working_copy',
+               {'working_copy': db, 'action': 'update boundary layers',
+                'reason': None, 'target': None},
+               then=dropRow)
 
     def _updateControlButtons(self):
         if self.isNextStepAvailable():
@@ -446,13 +480,14 @@ class BoundaryLayerPage(StepPage):
                 self._layerWarnings = list(
                     (execution.payload or {}).get('layer_warnings') or ())
         except Exception as e:
-            await AsyncMessageBox().information(self._widget, self.tr('Error'),
-                                                self.tr('Failed to apply boundary layers:') + str(e))
+            await AsyncMessageBox().warning(
+                self._widget,
+                self.tr('Boundary layers not applied'), str(e))
 
         if not result:
             self.clearResult()
         else:
-            await self._reloadResultMesh()
+            await self._reloadResultMesh(self.tr('Boundary layers'))
 
         return result
 

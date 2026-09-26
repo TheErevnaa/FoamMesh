@@ -1,6 +1,6 @@
 """Single compact progress surface for long-running case jobs (§7.2).
 
-Shows operation name, elapsed time, Cancel, and Show Log for every job the
+Shows operation name, elapsed time, Cancel, and Show log for every job the
 :class:`JobManager` publishes on the event bus.  Cancel kills the original
 process tree through the manager; the widget itself never touches processes.
 """
@@ -14,6 +14,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from foammesh.core.project import Event
+from foammesh.view.theming.metrics import FORM_MARGIN
 
 
 @dataclass
@@ -104,11 +105,11 @@ class JobProgressWidget(QWidget):
         self._jobManager = job_manager
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setContentsMargins(FORM_MARGIN, 0, FORM_MARGIN, 0)
         self._label = QLabel()
         self._elapsed = QLabel()
         self._cancel = QPushButton(self.tr('Cancel'))
-        self._showLog = QPushButton(self.tr('Show Log'))
+        self._showLog = QPushButton(self.tr('Show log'))
         for widget in (self._label, self._elapsed, self._cancel, self._showLog):
             layout.addWidget(widget)
 

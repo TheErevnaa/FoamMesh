@@ -39,8 +39,48 @@ Two consequences are worth knowing before you look for a file:
 | Fluent `.msh` | `.msh` | `foamMeshToFluent` output, with that utility's documented zone limitations | first | `foamMeshToFluent` |
 | Case archive | `.zip` | the case, with a manifest and checksums | — | — |
 
-Arbitrary polyhedral cells may not survive a `.msh` or `.cgns` round trip;
-hexes and tets are the safe shapes. The export warns before writing when that
+### Polyhedral cells, and the two formats that cannot hold them
+
+MSH and SU2 carry exactly four cell families — tetrahedra, hexahedra, prisms
+and pyramids. Neither has a polyhedron element, so a mesh containing one
+cannot be written in either format. This is a property of the formats, not a
+limitation of this application.
+
+snappyHexMesh produces polyhedra as a matter of course: they appear at every
+2:1 refinement transition, which is what a castellated mesh is made of. Of the
+sixty snappyHexMesh cases published with FoamMesh, **fifty-nine contain
+polyhedral cells**. The sixtieth, `pipe_step`, is 4,374 pure hexahedra with no
+refinement transition, and it exports to MSH perfectly well.
+
+So the two pipelines reach different destinations, by design:
+
+| Made by | Can be exported as |
+|---|---|
+| **Gmsh** | OpenFOAM, MSH, SU2, VTU, CGNS, Fluent |
+| **snappyHexMesh** | OpenFOAM, VTU, Fluent — and MSH or SU2 only for a mesh that happens to hold no polyhedra |
+
+Fluent's format is on the snappy row because it *does* have a polyhedron:
+`foamMeshToFluent` writes element type 7 for any cell that is not a tet, hex,
+pyramid or prism, warning that the result needs a polyhedral-capable Fluent
+reader. OpenFOAM and VTU carry polyhedra natively.
+
+The export dialog decides this **per case, by counting the mesh in front of
+it**, not by asking which mesher ran. A snappy mesh with no polyhedra is
+offered MSH and writes it. A mesh that holds them is refused before anything
+is written, with the count and the formats that do keep polyhedra:
+
+> a Gmsh mesh holds tetrahedra, hexahedra, prisms and pyramids only; 12246 of
+> 70744 cells are polyhedral, and 17176 faces have five or more vertices.
+> Export this case as OpenFOAM or VTU, which keep polyhedra.
+
+FoamMesh does **not** decompose polyhedra on the way out. Decomposing them
+would hand another solver a different mesh from the one `checkMesh` graded — a
+different cell count, and in the dual-mesh case different points — and an
+export is not the place to silently change what was meshed. If you need a
+Gmsh-pipeline mesh for SU2, mesh it with Gmsh.
+
+Arbitrary polyhedral cells may also not survive a `.cgns` round trip; hexes
+and tets are the safe shapes. That export warns before writing when it
 applies.
 
 ### Why the SU2 export copies rather than rebuilds
@@ -77,9 +117,11 @@ order is separate work — see the follow-on packages in
 
 ## Readiness
 
-Unavailable dependencies are reported as capability errors. Lossy formats
-produce warnings, including an additional warning when polyhedral cells may be
-dropped or split.
+Unavailable dependencies are reported as capability errors, and so is a mesh
+a format cannot hold: MSH and SU2 come back unavailable, with the polyhedron
+count, for a mesh that carries any. Lossy formats produce warnings — but a
+format that will refuse to write at all reports an error, never a warning,
+because "may drop or split" describes a lossy export and no export happens.
 
 ## GUI, API, and CLI
 

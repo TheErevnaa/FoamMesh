@@ -6,8 +6,25 @@ from typing import Optional
 
 from PySide6.QtCore import QObject
 
+from foammesh.rendering.actor_info import RegionMarkerActor
 from foammesh.support.mesh import Bounds
 from foammesh.app import app
+
+
+def _union(boundsList) -> Optional[Bounds]:
+    """Merge bounds, skipping any that enclose nothing (min above max)."""
+    merged = None
+    for bounds in boundsList:
+        if bounds is None:
+            continue
+        values = bounds.toTuple()
+        if any(values[2 * axis] > values[2 * axis + 1] for axis in range(3)):
+            continue
+        if merged is None:
+            merged = Bounds(*values)
+        else:
+            merged.merge(bounds)
+    return merged
 
 
 class ActorGroup(Enum):
@@ -62,15 +79,38 @@ class ActorManager(QObject):
             self._displayControl.remove(actorInfo)
 
     def getBounds(self) -> Optional[Bounds]:
+        """Union of every actor this manager holds, drawn or not.
+
+        DP-813. An actor over an empty data set -- a patch with no faces, a
+        face zone with none -- reports VTK's uninitialised ``(1, -1, ...)``,
+        and merging it dragged the union's minimum down to 1 and its maximum
+        up to -1 on every axis the model does not straddle: a part at x = 1000
+        mm measured from x = 1. Empty actors have no place and are skipped;
+        a manager holding nothing but empty actors still answers with what
+        it has, as it always did, because callers take ``.toTuple()`` of it.
+        """
         if self.isEmpty():
             return None
+        merged = _union(info.bounds() for info in self._actorInfos.values())
+        if merged is None:
+            merged = next(iter(self._actorInfos.values())).bounds()
+        return merged
 
-        it = iter(self._actorInfos.values())
-        bounds = next(it).bounds()
-        while actorInfo := next(it, None):
-            bounds.merge(actorInfo.bounds())
+    def getDisplayedBounds(self) -> Optional[Bounds]:
+        """Union of the actors actually on screen, or ``None`` if none are.
 
-        return bounds
+        DP-813. What a section plane is placed against. ``hide()`` takes the
+        props out of the renderer and keeps the actors, so ``getBounds``
+        still counts a mesh the user has left or geometry a volume mesh
+        hid. A part the user switched off is not on screen either, and a
+        region seed is a landmark rather than part of the model (DP-679).
+        """
+        isShown = getattr(self._displayControl, 'isShown', None)
+        return _union(
+            info.bounds() for info in self._actorInfos.values()
+            if info.isVisible()
+            and not isinstance(info, RegionMarkerActor)
+            and (isShown is None or isShown(info)))
 
     def assignPatchPalette(self, types, family='patch', keys=None):
         """Give each actor of ``types`` a distinct slot in a categorical palette.

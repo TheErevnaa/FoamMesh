@@ -29,6 +29,10 @@ class PolyMeshWriteReport:
     patches: tuple[dict, ...]
     checksums: dict
     regions: tuple[dict, ...] = ()
+    # DP-420. One row per interface between two cell zones, so a caller that
+    # wants to know whether the conformal interface was labelled can read it
+    # here instead of parsing the mesh back.
+    face_zones: tuple[dict, ...] = ()
     schema_version: int = 1
 
     def to_dict(self):
@@ -39,6 +43,7 @@ class PolyMeshWriteReport:
             'boundary_faces': self.boundary_faces,
             'patches': list(self.patches), 'checksums': self.checksums,
             'regions': list(self.regions),
+            'face_zones': list(self.face_zones),
         }
 
 
@@ -77,6 +82,12 @@ class FoamPolyMeshWriter:
                 topology.internal_count, mesh.patches)
             regions = _write_cell_zones(
                 temporary / 'cellZones', mesh)
+            # DP-420. The interface, where there is one. Written after the
+            # cell zones because a face zone is only meaningful between two of
+            # them, and skipped entirely when the mesh has one region -- there
+            # is nothing for an interface to be between.
+            zones = _write_face_zones(
+                temporary / 'faceZones', topology, mesh) if regions else []
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(temporary, destination)
         except Exception:
@@ -86,13 +97,13 @@ class FoamPolyMeshWriter:
         checksums = {
             name: _sha256(destination / name)
             for name in ('points', 'faces', 'owner', 'neighbour', 'boundary',
-                         'cellZones')
+                         'cellZones', 'faceZones')
             if (destination / name).is_file()}
         return PolyMeshWriteReport(
             str(destination), mesh.point_count, mesh.cell_count,
             len(topology.owner), topology.internal_count,
             len(topology.owner) - topology.internal_count,
-            tuple(patches), checksums, tuple(regions))
+            tuple(patches), checksums, tuple(regions), tuple(zones))
 
 
 def _foam_topology(mesh: CanonicalMesh) -> _FoamTopology:
@@ -355,6 +366,87 @@ def _write_cell_zones(path, mesh):
                 'region_id': region_id, 'name': name,
                 'cell_count': int(len(labels)),
                 'region_type': item.get('region_type', item.get('category')),
+            })
+        stream.write(')\n')
+    return rows
+
+
+def _cell_regions(mesh):
+    """The region of every cell, in the global cell order the writer uses."""
+    return np.concatenate([block.region_ids for block in mesh.cell_blocks])
+
+
+def _write_face_zones(path, topology, mesh):
+    """Label the faces where one cell zone meets another.
+
+    DP-420. MEASURED on all four models this campaign meshed on both engines:
+    every Gmsh multiregion mesh had a `cellZones` file and no `faceZones` file
+    at all, where every snappy one had both. The interface was there and
+    unlabelled -- 9,152 internal faces of refined `coaxial_ducts` have their
+    owner in one zone and their neighbour in the other, out of 1,181,006
+    internal faces -- so the conformal interface these eighty meshes exist to
+    test was built by both engines and named by one. Nothing that reaches for
+    it by name found it on a Gmsh mesh, the viewport included.
+
+    It never had to be inferred: a face is on the interface exactly when its
+    two cells belong to different zones, which is the same definition the
+    audit counted with.
+    """
+    internal = int(topology.internal_count)
+    if internal <= 0:
+        return []
+    regions = _cell_regions(mesh)
+    owner = regions[topology.owner[:internal]]
+    neighbour = regions[topology.neighbour[:internal]]
+    crossing = np.flatnonzero(owner != neighbour)
+    if not len(crossing):
+        return []
+
+    order = sorted({int(value) for value in regions},
+                   key=lambda value: _patch_sort_key(value, mesh.regions))
+    names = {}
+    for region_id in order:
+        item = mesh.regions[int(region_id)]
+        names[int(region_id)] = _foam_name(
+            item.get('solver_name') or item.get('name')
+            or f'region_{region_id}')
+    rank = {value: index for index, value in enumerate(order)}
+
+    low = np.minimum(owner[crossing], neighbour[crossing])
+    high = np.maximum(owner[crossing], neighbour[crossing])
+    # The zone's normal points out of the region written first, so a face
+    # whose owner is the other one is flipped. `flipMap` is what says so, and
+    # a faceZone without it is not readable by OpenFOAM.
+    pairs = sorted(
+        {(int(a), int(b)) for a, b in zip(low, high)},
+        key=lambda pair: sorted((rank[pair[0]], rank[pair[1]])))
+
+    rows = []
+    with path.open('w', encoding='ascii', newline='\n') as stream:
+        stream.write(_header('faceZoneList', 'faceZones'))
+        stream.write(f'{len(pairs)}\n(\n')
+        for pair in pairs:
+            first, second = sorted(pair, key=lambda value: rank[value])
+            selected = np.flatnonzero((low == pair[0]) & (high == pair[1]))
+            labels = crossing[selected]
+            flipped = owner[labels] != first
+            name = _foam_name(f'{names[first]}_to_{names[second]}')
+            stream.write(
+                f'{name}\n{{\n    type faceZone;\n'
+                f'    faceLabels List<label>\n    {len(labels)}\n    (\n')
+            for label in labels:
+                stream.write(f'        {int(label)}\n')
+            stream.write('    );\n    flipMap List<bool>\n'
+                         f'    {len(labels)}\n    (\n')
+            # DP-565: 0 and 1, not the words. OpenFOAM reads a bool either
+            # way, but vtkOpenFOAMReader wants a number and drops the whole
+            # faceZones block on the word `false`.
+            for value in flipped:
+                stream.write('        %d\n' % (1 if value else 0))
+            stream.write('    );\n}\n')
+            rows.append({
+                'name': name, 'face_count': int(len(labels)),
+                'regions': [names[int(first)], names[int(second)]],
             })
         stream.write(')\n')
     return rows

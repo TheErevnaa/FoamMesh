@@ -16,6 +16,7 @@ from .errors import (AuthorizationRequiredError, CaseNotFoundError, OperationNot
                      PlanStaleError, RevisionConflictError, UndoNotAllowedError,
                      ValidationFailedError)
 from .field_adapters import build_entity_adapters, coerce_for_apply, read_value, values_equal
+from .field_metadata import MESH_FINGERPRINT, expand_fingerprints, stales
 from .fields import REGISTRY as FIELD_REGISTRY
 from .operations import OperationKind, build_operation_registry
 from .presentation import PresentationOperations, PresentationState
@@ -40,6 +41,19 @@ _SCOPED_COLLECTIONS = frozenset({
 _REGION_SCOPED_COLLECTIONS = frozenset({'gmsh.volume_controls.controls'})
 
 
+def _scope_is_unused(collection_id: str, normalized: dict) -> bool:
+    """True for a row whose kind takes no geometric scope (DP-665).
+
+    Only an analytic size field -- Box, Ball, Cylinder, Frustum, MathEval --
+    is placed by its own numbers rather than by a surface group, the same
+    rule `SizeFieldControl.needs_scope` applies at plan time.
+    """
+    if collection_id != 'gmsh.size_fields.controls':
+        return False
+    from foammesh.core.gmsh.size_fields import ANALYTIC_KINDS
+    return str(normalized.get('fieldType') or '') in ANALYTIC_KINDS
+
+
 # The full AF2 semantic-ID -> storage-path map, generated from the schema.
 FIELD_STORAGE = FIELD_REGISTRY.storage_map()
 
@@ -55,13 +69,28 @@ AF1V_FIELDS = {
 }
 
 
+#: What a commit that names no fields has to be assumed to have changed.
+#: Staling from the first stage onwards is the whole mesh plus the reports,
+#: which is what this call site said before the stages existed.
+_WHOLE_WORKING_COPY_STALES = stales('mesh.base_grid', 'quality')
+
+
 def _invalidation_for(field_ids) -> tuple[str, ...]:
-    """Union of the artifact fingerprints the changed fields stale (§6.7)."""
+    """Union of the artifact fingerprints the changed fields stale (§6.7).
+
+    Plan 32 W4 (DP-242). The union is resolved through
+    ``expand_fingerprints``, so a field naming a snappyHexMesh stage stales
+    that stage, every stage after it, and the delivered mesh -- and nothing
+    before it. The resolution is idempotent and the registry rows already
+    carry their closure, so this is a guarantee rather than a second
+    derivation: a caller that hands in a bare stage name gets the same answer
+    the registry would have given.
+    """
     invalidated: set[str] = set()
     for field_id in field_ids:
         if field_id in FIELD_REGISTRY:
             invalidated.update(FIELD_REGISTRY.get(field_id).invalidates)
-    return tuple(sorted(invalidated))
+    return expand_fingerprints(invalidated)
 
 
 def _publish_verdict_staleness(session, invalidated, changed) -> None:
@@ -76,13 +105,21 @@ def _publish_verdict_staleness(session, invalidated, changed) -> None:
     Only fired when the change actually invalidates the mesh: an edit to a
     field that cannot alter the mesh must not grey out a verdict that is still
     perfectly current.
+
+    Plan 32 W4 (DP-242). The test is still membership of the delivered mesh,
+    because the verdict on screen is a verdict about the delivered mesh: a
+    stale stage means a stale verdict whichever stage it is. Resolving the
+    closure first is what keeps that true -- every stage closure contains
+    ``mesh``, so a caller handing in a bare stage name is answered the same
+    way the registry would have answered it.
     """
-    if 'mesh' not in set(invalidated or ()):
+    resolved = set(expand_fingerprints(invalidated))
+    if MESH_FINGERPRINT not in resolved:
         return
     try:
         session.state.bus.publish(
             Event.MESH_VERDICT_STALE, fields=tuple(changed or ()),
-            invalidated=tuple(invalidated or ()))
+            invalidated=expand_fingerprints(invalidated))
     except Exception:                                        # noqa: BLE001
         # A staleness notice that can break the edit it reports on would be a
         # worse defect than the stale verdict it exists to prevent.
@@ -173,7 +210,23 @@ class FoamMeshFacade:
 
     def attach(self, session: CaseSession) -> CaseSession:
         self._cases[session.case_id] = session
+        self._publish_prepared_catalogue(session)
         return session
+
+    @staticmethod
+    def _publish_prepared_catalogue(session: CaseSession) -> None:
+        """Tell the scope catalogue which case is in front now.
+
+        Plan 33 CURVE-01/FIELD-02. The catalogue is application-lived and the
+        case is not, so attaching a case is the moment the prepared scopes of
+        the last one stop being true. Advisory: a case that cannot be read for
+        scopes is still a case that opened.
+        """
+        from foammesh.core.selection.service import notify_prepared_case
+        try:
+            notify_prepared_case(session.case_path, session.state.db)
+        except (AttributeError, FileNotFoundError, OSError, ValueError):
+            pass
 
     def detach(self, case_id: str, *, save: bool = True) -> None:
         session = self._cases.pop(case_id, None)
@@ -419,7 +472,8 @@ class FoamMeshFacade:
                 # licence to sit on the event loop: a query that blocks for
                 # 40 ms freezes every dialog just as thoroughly from here, and
                 # the owner-loop budget is the only thing that says so.
-                with session.monitor.measure('owner_loop_slice'):
+                with session.monitor.measure(
+                        'owner_loop_slice', context=command.operation):
                     value = handler(session, command)
                 if inspect.isawaitable(value):
                     value = await value
@@ -432,11 +486,14 @@ class FoamMeshFacade:
             session.assert_revision(command.expected_revision)
             session.set_event_context(command)
             try:
-                with session.monitor.measure('owner_loop_slice'):
+                with session.monitor.measure(
+                        'owner_loop_slice', context=command.operation):
                     value = handler(session, command)
                 if inspect.isawaitable(value):
                     value = await value
-                with session.monitor.measure('owner_loop_slice'):
+                with session.monitor.measure(
+                        'owner_loop_slice',
+                        context=f'{command.operation} (bookkeeping)'):
                     if command.is_human_gui_command and value.changed_fields:
                         self.plans.supersede_for_human_edit(
                             session, actor_id=command.actor.id, command_id=command.command_id)
@@ -518,6 +575,7 @@ class FoamMeshFacade:
             raise ValidationFailedError('patch did not satisfy field validation', details={
                 'error': str(error),
             }) from error
+        self._validate_configuration_patch(changed, data)
         transaction = session.state.commit(
             data, action='facade configuration patch', source=_source(command.source),
             target=','.join(sorted(changed)), reason=f'actor={command.actor.id}')
@@ -560,13 +618,18 @@ class FoamMeshFacade:
                 'another change landed while this working copy was open',
                 details={'paths': list(error.paths)}) from error
         latest = session.latest_change_set()
-        _publish_verdict_staleness(session, ('mesh', 'quality'), ())
+        # Plan 32 W4 (DP-242). A working copy handed in whole says nothing
+        # about which fields moved, so there is no stage to scope to and the
+        # honest answer is the widest one: from the first stage onwards, which
+        # is every stage. A dialog that wants the narrow answer patches fields
+        # through `configuration.patch`, where the registry supplies it.
+        _publish_verdict_staleness(session, _WHOLE_WORKING_COPY_STALES, ())
         # DP-16. The merge renumbers an element when another copy had already
         # taken the key this one allocated. The caller is still holding the key
         # it was handed, so the move has to come back with the result rather
         # than only living on the working copy.
         return OperationResult('accepted', command.operation, session.revisions,
-                               invalidated_outputs=('mesh', 'quality'),
+                               invalidated_outputs=_WHOLE_WORKING_COPY_STALES,
                                payload={'transaction_id': transaction.tx_id,
                                         'remapped_keys': getattr(
                                             data, 'remappedKeys', dict)(),
@@ -604,10 +667,17 @@ class FoamMeshFacade:
             normalized = adapter.normalize_patch(fields) if fields else {}
             self._validate_collection_scope(
                 session, collection_id, normalized)
+            self._stamp_surface_reference(session, collection_id, normalized)
             data = session.state.checkout()
             key, _element = data.addNewElement(adapter.storage_path)
             for relative_path, value in normalized.items():
                 data.setValue(f'{adapter.storage_path}/{key}/{relative_path}', value, relative_path)
+            self._share_layer_relative_sizes(  # DP-595
+                collection_id, data, adapter.storage_path, key, normalized,
+                created=True)
+            self._validate_collection_row(
+                collection_id, data, f'{adapter.storage_path}/{key}',
+                normalized)
             transaction = session.state.commit(
                 data, action=f'create {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
@@ -630,13 +700,204 @@ class FoamMeshFacade:
             normalized = adapter.normalize_patch(command.parameters.get('fields') or {})
             self._validate_collection_scope(
                 session, collection_id, normalized)
+            self._stamp_surface_reference(session, collection_id, normalized)
             for relative_path, value in normalized.items():
                 data.setValue(f'{adapter.storage_path}/{key}/{relative_path}', value, relative_path)
+            self._share_layer_relative_sizes(  # DP-595
+                collection_id, data, adapter.storage_path, key, normalized)
+            self._validate_collection_row(
+                collection_id, data, f'{adapter.storage_path}/{key}',
+                normalized)
             transaction = session.state.commit(
                 data, action=f'edit {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
             return self._collection_result(session, command, collection_id, key, transaction)
         return handler
+
+    @staticmethod
+    def _validate_configuration_patch(changed: dict, data) -> None:
+        """Rules a scalar field is judged by against the rest of the case.
+
+        DP-577 (field audit 0924 snappy-front D4). The bounding Hex6 was a
+        raw integer: an id naming no geometry row was saved and changed
+        nothing, and the id of a plain ``hex`` refinement box was saved and
+        dropped that box's refinement. Only a ``hex6`` volume can be the
+        background block, so any other id is refused here, by name.
+        """
+        field_id = 'meshing.base_grid.bounding_hex6'
+        if field_id not in changed:
+            return
+        selected = changed[field_id].get('after')
+        if selected is None:
+            return
+
+        def shape_of(row):
+            try:
+                value = row.value('shape')
+            except Exception:  # noqa: BLE001 - a row without a shape
+                return None
+            return getattr(value, 'value', value)
+
+        try:
+            rows = {str(key): row
+                    for key, row in dict(data.getElements('geometry')).items()}
+        except Exception:  # noqa: BLE001 - no geometry: nothing can match
+            rows = {}
+        row = rows.get(str(selected))
+        shape = shape_of(row) if row is not None else None
+        if shape == 'hex6':
+            return
+        hex6 = sorted(key for key, candidate in rows.items()
+                      if shape_of(candidate) == 'hex6')
+        found = ('names no geometry row' if row is None
+                 else f'names a {shape} volume, not a hex6')
+        offered = (', '.join(hex6) if hex6 else
+                   'none; model a Hex6 volume first, or leave it empty for '
+                   'the block derived from the geometry')
+        raise ValidationFailedError(
+            f'Bounding hex6 {selected} {found}. It must be the id of a Hex6 '
+            f'volume in this case ({offered}).',
+            details={'field': field_id, 'error': 'not_a_hex6',
+                     'value': selected, 'hex6_ids': hex6})
+
+    @staticmethod
+    def _share_layer_relative_sizes(collection_id: str, data, storage_path: str,
+                                    key: str, normalized,
+                                    created: bool = False) -> None:
+        """Keep ``relativeSizes`` one value across every layer group.
+
+        DP-595 (field audit 0924 snappy-back D3). OpenFOAM 13 reads
+        ``relativeSizes`` once, for the whole ``addLayersControls`` block, and
+        the writer refuses to guess between groups that disagree. The box sat
+        on each group, so two groups set differently were saved without a word
+        and the dictionary build then failed. It is one setting shown on every
+        group: changing it on one changes it on all, and a new group takes the
+        value the others already share.
+        """
+        if collection_id != 'meshing.layers.groups':
+            return
+        try:
+            others = [other for other in data.getKeys(storage_path)
+                      if str(other) != str(key)]
+        except Exception:  # noqa: BLE001 - no groups: nothing to share
+            return
+        if 'relativeSizes' in (normalized or {}):
+            value = data.getValue(f'{storage_path}/{key}/relativeSizes')
+            for other in others:
+                data.setValue(f'{storage_path}/{other}/relativeSizes', value,
+                              'relativeSizes')
+        elif created and others:
+            value = data.getValue(f'{storage_path}/{others[0]}/relativeSizes')
+            data.setValue(f'{storage_path}/{key}/relativeSizes', value,
+                          'relativeSizes')
+
+    @staticmethod
+    def _validate_collection_row(collection_id: str, data, row_path: str,
+                                 normalized=None) -> None:
+        """Rules that join two fields of one row, checked on the merged row.
+
+        DP-575 (field audit 0924 snappy-front D2). Each surface level was
+        validated alone, so a minimum above the maximum was saved and written
+        as ``level (4 2)``, and OF13 then died at launch on it
+        (``refinementSurfaces.C``: "Illegal level specification").
+        """
+        if collection_id == 'geometry.items':
+            # DP-578: judged only when the binding is what this edit sets, so
+            # a row bound before the rule can still be renamed or unbound.
+            if 'castellationGroup' in (normalized or {}):
+                FoamMeshFacade._validate_surface_group_binding(data, row_path)
+            return
+        if collection_id != 'meshing.castellation.surface_refinements':
+            return
+        try:
+            minimum = data.getValue(f'{row_path}/surfaceRefinement/minimumLevel')
+            maximum = data.getValue(f'{row_path}/surfaceRefinement/maximumLevel')
+        except Exception:  # noqa: BLE001 - a row without levels has no rule
+            return
+        if minimum is None or maximum is None:
+            return
+        if int(minimum) > int(maximum):
+            raise ValidationFailedError(
+                f'Minimum level ({int(minimum)}) cannot be above Maximum level '
+                f'({int(maximum)}): snappyHexMesh refines a surface between the '
+                'two, so the minimum must be 0 to the maximum',
+                details={'collection': collection_id,
+                         'field': 'surface_refinement.minimum_level',
+                         'error': 'minimum_above_maximum',
+                         'minimum_level': int(minimum),
+                         'maximum_level': int(maximum)})
+
+    #: DP-578. The surface shapes the snappy writer can refine as a surface:
+    #: a tessellated import and, since DP-668, the closed surface of a box,
+    #: sphere or cylinder. The surface of a plane, disk or plate, or a Hex6
+    #: face, has no such writer.
+    _SURFACE_GROUP_SHAPES = ('triSurfaceMesh', '', None,
+                             'hex', 'sphere', 'cylinder')
+
+    @staticmethod
+    def _validate_surface_group_binding(data, row_path: str) -> None:
+        """Refuse binding a primitive's surface to a surface refinement group.
+
+        DP-578 (field audit 0924 snappy-front D5). The picker offered every
+        surface row, including the ``<name>_surface`` row the volume dialog
+        makes for a box, sphere or cylinder; the writer only refines imported
+        surfaces, so a group bound to one wrote nothing and said nothing.
+        """
+        def read(name):
+            try:
+                value = data.getValue(f'{row_path}/{name}')
+            except Exception:  # noqa: BLE001 - the row has no such field
+                return None
+            return getattr(value, 'value', value)
+
+        if read('gType') != 'surface' or read('castellationGroup') in (None, ''):
+            return
+        shape = read('shape')
+        if shape in FoamMeshFacade._SURFACE_GROUP_SHAPES:
+            return
+        raise ValidationFailedError(
+            f'Surface {read("name")} is the {shape} surface of a modelled '
+            'shape, and a surface refinement group refines imported surfaces '
+            'and the surface of a box, sphere or cylinder only; this binding '
+            'would write nothing. Refine the shape through '
+            'a volume refinement group instead.',
+            details={'field': 'castellation_group', 'error': 'primitive_surface',
+                     'shape': shape})
+
+    @staticmethod
+    def _stamp_surface_reference(session: CaseSession, collection_id: str,
+                                 normalized: dict) -> None:
+        """Record which prepared boundary a per-surface size row refines.
+
+        Plan 33 W-G1 (FIELD-03). The row asks for a Gmsh surface tag, and a
+        tag is a position in import order: renaming, merging or re-importing
+        a boundary renumbers them, so every saved row moved onto a different
+        face without saying anything. The boundary the tag stands for *now*
+        is stamped beside it here, at the one place every authored row goes
+        through, and the run resolves the tag from that instead.
+
+        A tag no prepared boundary claims -- or one two of them claim, which
+        is not an identity -- leaves the reference empty; such a row is read
+        by its number, as it was before, and refused by name if that number
+        reaches nothing when the run starts.
+        """
+        if collection_id != 'gmsh.surface_sizes.controls':
+            return
+        if 'surfaceId' not in normalized or normalized.get('surfaceRef'):
+            return
+        from foammesh.core.geometry import PreparedGeometryStore
+        from foammesh.core.gmsh.size_fields import surface_reference_for_tag
+
+        try:
+            prepared = PreparedGeometryStore(session.case_path).current()
+        except (OSError, ValueError):
+            return
+        if prepared is None:
+            return
+        reference = surface_reference_for_tag(
+            prepared, normalized.get('surfaceId'))
+        if reference:
+            normalized['surfaceRef'] = reference
 
     @staticmethod
     def _validate_collection_scope(
@@ -675,6 +936,10 @@ class FoamMeshFacade:
             else face_scopes)
         for field in scope_fields:
             scope_id = str(normalized.get(field) or '').strip()
+            if not scope_id and _scope_is_unused(collection_id, normalized):
+                # DP-665. A Box, Ball, Cylinder, Frustum or MathEval size
+                # field has no geometric scope; its dialog sends a blank one.
+                continue
             if not scope_id:
                 raise ValidationFailedError(
                     'a stable prepared geometry scope is required', details={

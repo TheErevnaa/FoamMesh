@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Import STL</string>
+   <string>Import geometry</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
@@ -111,7 +111,7 @@
    <item>
     <widget class="QGroupBox" name="splitSurface">
      <property name="title">
-      <string>Split Surface</string>
+      <string>Split surface</string>
      </property>
      <property name="checkable">
       <bool>true</bool>
@@ -123,7 +123,7 @@
       <item row="0" column="0">
        <widget class="QLabel" name="label_2">
         <property name="text">
-         <string>Feature Angle</string>
+         <string>Feature angle</string>
         </property>
        </widget>
       </item>

@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Boundary Setting</string>
+   <string>Boundary setting</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout_3">
    <item>
@@ -32,7 +32,7 @@
          <item row="0" column="0">
           <widget class="QLabel" name="label_2">
            <property name="text">
-            <string>Group Name</string>
+            <string>Group name</string>
            </property>
           </widget>
          </item>
@@ -42,21 +42,21 @@
          <item row="1" column="0">
           <widget class="QLabel" name="label_3">
            <property name="text">
-            <string>Layer Policy</string>
+            <string>Layer policy</string>
            </property>
           </widget>
          </item>
          <item row="1" column="1">
           <widget class="EnumComboBox" name="layerPolicy">
            <property name="toolTip">
-            <string>Grow adds layers; Freeze writes nSurfaceLayers 0 so the patch neither slides nor gains layers; Inherit leaves the patch out of the dictionary so it slides with its neighbours.</string>
+            <string>Grow adds layers; Freeze writes nSurfaceLayers 0 so the patch neither slides nor gains layers; Inherit leaves the patch out of the dictionary so it slides with its neighbours</string>
            </property>
           </widget>
          </item>
          <item row="2" column="0">
           <widget class="QLabel" name="label">
            <property name="text">
-            <string>Number of Layers</string>
+            <string>Number of layers</string>
            </property>
           </widget>
          </item>
@@ -69,13 +69,13 @@
       <item>
        <widget class="QGroupBox" name="groupBox">
         <property name="title">
-         <string>Thickness Model Specification</string>
+         <string>Thickness model specification</string>
         </property>
         <layout class="QVBoxLayout" name="verticalLayout_21">
          <item>
           <widget class="QRadioButton" name="finalAndExpansion">
            <property name="text">
-            <string>Final and Expansion</string>
+            <string>Final and expansion</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -85,7 +85,7 @@
          <item>
           <widget class="QRadioButton" name="finalAndOverall">
            <property name="text">
-            <string>Final and Total</string>
+            <string>Final and total</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -95,7 +95,7 @@
          <item>
           <widget class="QRadioButton" name="firstAndExpansion">
            <property name="text">
-            <string>First and Expansion</string>
+            <string>First and expansion</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -105,7 +105,7 @@
          <item>
           <widget class="QRadioButton" name="firstAndOverall">
            <property name="text">
-            <string>First and Total</string>
+            <string>First and total</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -115,7 +115,7 @@
          <item>
           <widget class="QRadioButton" name="overallAndExpansion">
            <property name="text">
-            <string>Total and Expansion</string>
+            <string>Total and expansion</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -125,7 +125,7 @@
          <item>
           <widget class="QRadioButton" name="firstAndRelativeFinal">
            <property name="text">
-            <string>First and Relative Final</string>
+            <string>First and relative final</string>
            </property>
            <attribute name="buttonGroup">
             <string notr="true">thicknessModelSpecificationRadios</string>
@@ -141,7 +141,7 @@
          <item row="0" column="0">
           <widget class="QLabel" name="label_31">
            <property name="text">
-            <string>Size Specification</string>
+            <string>Size specification</string>
            </property>
           </widget>
          </item>
@@ -155,7 +155,7 @@
          <item row="1" column="0">
           <widget class="QLabel" name="label_32">
            <property name="text">
-            <string>First Layer Thickness</string>
+            <string>First layer thickness</string>
            </property>
           </widget>
          </item>
@@ -168,14 +168,14 @@
          <item row="2" column="0">
           <widget class="QLabel" name="label_33">
            <property name="text">
-            <string>Final Layer Thickness</string>
+            <string>Final layer thickness</string>
            </property>
           </widget>
          </item>
          <item row="3" column="0">
           <widget class="QLabel" name="label_34">
            <property name="text">
-            <string>Total Thickness</string>
+            <string>Total thickness</string>
            </property>
           </widget>
          </item>
@@ -185,7 +185,7 @@
          <item row="4" column="0">
           <widget class="QLabel" name="label_35">
            <property name="text">
-            <string>Expansion Ratio</string>
+            <string>Expansion ratio</string>
            </property>
           </widget>
          </item>
@@ -195,7 +195,7 @@
          <item row="5" column="0">
           <widget class="QLabel" name="label_36">
            <property name="text">
-            <string>Min. Total Thickness</string>
+            <string>Min. total thickness</string>
            </property>
           </widget>
          </item>

@@ -14,7 +14,9 @@ from typing import Iterable, Mapping
 from foammesh.core.engine.contracts import PreparedGeometryRef
 
 from . import domain_topology
-from .store import GeometryArtifactStore, is_cad_entry, read_back_unit
+from .store import (GeometryArtifactStore, is_cad_entry,
+                    ordered_entries as _ordered_sources,
+                    read_back_unit, stored_tessellation)
 
 
 PREPARED_SCHEMA_VERSION = 1
@@ -99,6 +101,8 @@ def domain_topology_report(entries) -> dict:
                         for item in (entries or ())],
             'shells': [], 'domains': [], 'bodies': [], 'voids': [],
             'volumes': 0, 'void_count': 0,
+            # Nothing was measured, so nothing is claimed.
+            'volumes_source': 'unknown',
             'bounds_domain': True,
             'refusal': None,
             'warnings': [f'the geometry could not be classified: {error}'],
@@ -141,10 +145,53 @@ def prepare_readiness(store, *, engine_id: str | None = None) -> dict:
         'can_prepare': bool(entries),
         'blocked': blocked,
         'bounds_domain': bounds,
+        # DP-52/DP-53. One volume count, published under one key whichever
+        # route imported the geometry, so no caller has to know there are
+        # two. `volumes_source` is what lets a reader tell a measured zero
+        # from an import that never counted.
+        'volumes': (topology or {}).get('volumes', 0),
+        'volumes_source': (topology or {}).get('volumes_source', 'unknown'),
         'topology': topology,
         'topology_sentence': (domain_topology.summary_sentence(topology)
                               if topology else None),
     }
+
+
+def preparation_with_topology(readiness: dict, preparation) -> dict:
+    """*preparation* with the classifier's topology recorded on it.
+
+    DP-122. Plan 31 CP-04 put the topology block on the revision so the run
+    seams and the Boundary Layers page could read the volume count instead of
+    recomputing it, and DP-52/DP-53/DP-115 are all built on that read. It was
+    written by :func:`ensure_prepared` only -- the automatic route -- and the
+    explicit one, `geometry.prepared.create`, passed the caller's dict through
+    untouched. The GUI's Prepare step sends `{'decision': 'as_is'}`.
+
+    MEASURED on the `9f6abca1` sweep: **0 of 40 prepared revisions**, twenty
+    models across both engines, carry a topology block. Every one of those
+    pre-flights therefore read `volumes_source: unknown`, and an unknown count
+    refuses nothing, so the whole chain was inert on the route users take.
+
+    A caller that supplies its own topology keeps it; nothing else is
+    rewritten.
+    """
+    preparation = dict(preparation or DEFAULT_PREPARATION)
+    if preparation.get('topology'):
+        return preparation
+    topology = readiness.get('topology') or {}
+    preparation['topology'] = {
+        'bounds_domain': topology.get('bounds_domain'),
+        'domains': list(topology.get('domains') or ()),
+        'bodies': list(topology.get('bodies') or ()),
+        'voids': list(topology.get('voids') or ()),
+        'volumes': topology.get('volumes', 0),
+        'volumes_source': topology.get('volumes_source', 'unknown'),
+        'solids': list(topology.get('solids') or ()),
+        'refusal': topology.get('refusal'),
+        'representation': topology.get('representation'),
+        'calculation_version': topology.get('calculation_version'),
+    }
+    return preparation
 
 
 def ensure_prepared(store, *, producer: str, boundary_categories=None,
@@ -165,20 +212,8 @@ def ensure_prepared(store, *, producer: str, boundary_categories=None,
     # was. It records the classification now -- and deliberately does not
     # refuse on it, because refusing here would put repair and wrapping out
     # of reach of the very cases that need them. The run seams refuse.
-    topology = readiness.get('topology') or {}
-    preparation = {
-        **DEFAULT_PREPARATION,
-        'producer': producer,
-        'topology': {
-            'bounds_domain': topology.get('bounds_domain'),
-            'domains': list(topology.get('domains') or ()),
-            'bodies': list(topology.get('bodies') or ()),
-            'voids': list(topology.get('voids') or ()),
-            'refusal': topology.get('refusal'),
-            'representation': topology.get('representation'),
-            'calculation_version': topology.get('calculation_version'),
-        },
-    }
+    preparation = preparation_with_topology(
+        readiness, {**DEFAULT_PREPARATION, 'producer': producer})
     return store.materialize(
         preparation=preparation,
         boundary_categories=boundary_categories, fluid_seed=fluid_seed)
@@ -218,8 +253,31 @@ class PreparedGroup:
     source_refs: tuple[dict, ...]
     mapping_confidence: float
     confirmation_required: bool
+    # DP-92. The face answers the boundary-layer page needs and had no way to
+    # get: whether an uncovered patch is flat (DP-90), which patches share an
+    # edge and so may not grow layers in opposite directions (DP-91), and
+    # which two patches are one interface written twice, healed into the one
+    # the walk saw first. Omitted from the manifest where nobody measured --
+    # the STL route does not, and neither did any revision written before
+    # this -- so the schema is unchanged and absence still reads as absence.
+    planar: bool | None = None
+    area: float | None = None
+    face_order: int | None = None
+    adjacent_patch_uuids: tuple[str, ...] = ()
+    interface_patch_uuid: str = ''
 
     def to_dict(self) -> dict:
+        measured = {}
+        if self.planar is not None:
+            measured['planar'] = bool(self.planar)
+        if self.area is not None:
+            measured['area'] = float(self.area)
+        if self.face_order is not None:
+            measured['face_order'] = int(self.face_order)
+        if self.adjacent_patch_uuids:
+            measured['adjacent_patch_uuids'] = list(self.adjacent_patch_uuids)
+        if self.interface_patch_uuid:
+            measured['interface_patch_uuid'] = self.interface_patch_uuid
         return {
             'patch_uuid': self.patch_uuid,
             'native_token': self.native_token,
@@ -230,6 +288,7 @@ class PreparedGroup:
             'source_refs': list(self.source_refs),
             'mapping_confidence': self.mapping_confidence,
             'confirmation_required': self.confirmation_required,
+            **measured,
         }
 
 
@@ -291,7 +350,12 @@ class PreparedGeometryStore:
             raise PreparedGeometryError('no imported geometry is available to prepare')
         categories = dict(boundary_categories or {})
         groups = self._groups(entries, categories)
-        regions = self._regions(entries)
+        # DP-419. The groups first, because a region publishes beside them:
+        # a Gmsh model names its physical volumes and its physical surfaces in
+        # one model, so a region that would take a name a patch already has
+        # keeps the disambiguated form.
+        regions = self._regions(
+            entries, reserved={item.solver_name for item in groups})
         self._validate_groups(groups)
         self._validate_regions(regions)
         sources = self._source_records(entries)
@@ -460,7 +524,7 @@ class PreparedGeometryStore:
     def _source_records(entries: list[dict]) -> list[dict]:
         records = []
         used_names = set()
-        for entry in sorted(entries, key=lambda item: item['geometry_id']):
+        for entry in _ordered_sources(entries):
             surface = Path(entry['artifact']).resolve()
             # A wrapped or feature-split CAD entry keeps its `cad_artifact`
             # as provenance, but the surface beside it is what it now means.
@@ -515,7 +579,9 @@ class PreparedGeometryStore:
                     # until the two facts were recorded apart.
                     'geometry_unit': str(entry.get('unit') or 'm'),
                     'cad_declared_unit': str(entry.get('declared_unit') or ''),
-                    'tessellation': dict(entry.get('tessellation') or {}),
+                    # DP-520. The linear deflection in metres, whenever
+                    # the entry was written.
+                    'tessellation': stored_tessellation(entry),
                 })
             role = _declared_shell_role(entry)
             if role:
@@ -556,7 +622,7 @@ class PreparedGeometryStore:
     @staticmethod
     def _groups(entries: list[dict], categories: Mapping[str, str]) -> tuple[PreparedGroup, ...]:
         groups = []
-        for entry in sorted(entries, key=lambda item: item['geometry_id']):
+        for entry in _ordered_sources(entries):
             patches = entry.get('patches') or ({
                 'patch_uuid': entry.get('patch_uuid'),
                 'name': entry.get('name') or entry['geometry_id'],
@@ -587,13 +653,25 @@ class PreparedGeometryStore:
                     else (dict(patch.get('source_ref') or {}),),
                     mapping_confidence=float(patch.get('mapping_confidence', 1.0)),
                     confirmation_required=bool(patch.get('confirmation_required', False)),
+                    planar=(None if patch.get('planar') is None
+                            else bool(patch['planar'])),
+                    area=(None if patch.get('area') is None
+                          else float(patch['area'])),
+                    face_order=(None if patch.get('face_order') is None
+                                else int(patch['face_order'])),
+                    adjacent_patch_uuids=tuple(
+                        str(value) for value in
+                        patch.get('adjacent_patch_uuids') or ()),
+                    interface_patch_uuid=str(
+                        patch.get('interface_patch_uuid') or ''),
                 ))
         return _with_solver_names(groups)
 
     @staticmethod
-    def _regions(entries: list[dict]) -> tuple[PreparedRegion, ...]:
+    def _regions(entries: list[dict], *,
+                 reserved: set | None = None) -> tuple[PreparedRegion, ...]:
         regions = []
-        for entry in sorted(entries, key=lambda item: item['geometry_id']):
+        for entry in _ordered_sources(entries):
             source_regions = entry.get('regions') or ({
                 'region_uuid': (
                     'region-' + hashlib.sha256(
@@ -627,7 +705,7 @@ class PreparedGeometryStore:
                         item.get('boundary_patch_uuids', ())),
                     included=bool(item.get('included', True)),
                 ))
-        return tuple(regions)
+        return _with_region_solver_names(regions, reserved or set())
 
     @staticmethod
     def _validate_groups(groups: Iterable[PreparedGroup]) -> None:
@@ -671,7 +749,18 @@ class PreparedGeometryStore:
             category=item['category'], geometry_id=item['geometry_id'],
             source_refs=tuple(item.get('source_refs', ())),
             mapping_confidence=float(item['mapping_confidence']),
-            confirmation_required=bool(item['confirmation_required']))
+            confirmation_required=bool(item['confirmation_required']),
+            # DP-92. The digest is taken over `to_dict()`, so a field the
+            # writer emits and the reader drops makes every revision fail
+            # validation the next time it is loaded.
+            planar=(None if item.get('planar') is None
+                    else bool(item['planar'])),
+            area=(None if item.get('area') is None else float(item['area'])),
+            face_order=(None if item.get('face_order') is None
+                        else int(item['face_order'])),
+            adjacent_patch_uuids=tuple(
+                str(value) for value in item.get('adjacent_patch_uuids') or ()),
+            interface_patch_uuid=str(item.get('interface_patch_uuid') or ''))
 
     @staticmethod
     def _region_from_dict(item: dict) -> PreparedRegion:
@@ -771,6 +860,41 @@ def _with_solver_names(groups: Iterable[PreparedGroup]) -> tuple[PreparedGroup, 
             _solver_name(item.display_name, item.patch_uuid)
             if name in clashing else name))
         for item, name in zip(groups, names))
+
+
+def _with_region_solver_names(
+        regions: Iterable[PreparedRegion],
+        reserved: set) -> tuple[PreparedRegion, ...]:
+    """Name every prepared region, disambiguating only where names clash.
+
+    DP-419. The same rule R97 gave the patches, one field along. A region is
+    what becomes a cell zone -- ``Part_1_solid_1`` in the tree, in the Gmsh
+    physical group and in ``constant/polyMesh/cellZones`` -- and it was minted
+    ``<display name>_<sha256(uuid)[:8]>`` unconditionally, so all four
+    multiregion models this campaign meshed on Gmsh published zones called
+    `Part_1_solid_1_11ff99c5` and `Part_1_solid_2_aaa75d09`. A user who runs
+    ``splitMeshRegions -cellZones`` on that mesh gets directories by those
+    names. Nothing was disambiguated: the two names differ in their own words.
+
+    ``reserved`` is what the patches of the same revision publish under, so a
+    region cannot take a name a boundary already has -- they share one Gmsh
+    model and would be two physical groups with one name.
+    """
+    from .patches.ops import RESERVED_NAMES
+
+    regions = list(regions)
+    stems = [solver_stem(item.display_name) for item in regions]
+    names = [stem if (stems.count(stem) == 1
+                      and stem not in RESERVED_NAMES
+                      and stem not in reserved)
+             else _solver_name(item.display_name, item.region_uuid)
+             for stem, item in zip(stems, regions)]
+    clashing = {name for name in names if names.count(name) > 1}
+    return tuple(
+        replace(item, solver_name=(
+            _solver_name(item.display_name, item.region_uuid)
+            if name in clashing else name))
+        for item, name in zip(regions, names))
 
 
 def _file_sha256(path: Path) -> str:

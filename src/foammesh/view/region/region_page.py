@@ -59,7 +59,7 @@ class RegionPage(StepPage):
                 card.hideWarning()
             elif not self._bounds.includes(card.point()):
                 card.showWarning(self.tr(
-                    'Invalid point - outside bounding box.'))
+                    'Invalid point — outside bounding box.'))
                 available = False
             elif reason := self._seedWarning(card.point()):
                 card.showWarning(reason)
@@ -74,15 +74,44 @@ class RegionPage(StepPage):
             self._ui.regionValidationMessage.hide()
             return available
 
+        if multiRegion and self._regionsSeparated():
+            # DP-543. Regions that never meet have no interface to couple.
+            self._ui.regionValidationMessage.hide()
+            return available
+
         if multiRegion:
             self._ui.regionValidationMessage.setText(self.tr(
-                'No Inter-Region Interface is configured while Region points are configured.'))
+                'No inter-region interface is configured, and these regions may '
+                'share a boundary. Add one on the Geometry step to couple them.'))
         else:
             self._ui.regionValidationMessage.setText(self.tr(
-                'Only one Region Point is configured while Inter-Region Interface is configured in Geometry Step.'))
+                'Only one region point is configured while an inter-region interface is configured on the Geometry step.'))
         self._ui.regionValidationMessage.show()
 
         return False
+
+    def _regionsSeparated(self) -> bool:
+        """Do the seeds sit in closed volumes that provably never touch?
+
+        DP-543. MEASURED on the 24 Sep 2026 audit case S6: two closed cubes
+        1 m apart, a Fluid seed in each. This page said no interface was
+        configured, the sentence stood through Quality and Export, and
+        checkMesh read back two fully disconnected regions with no shared
+        face -- there was nothing to couple. The warning is for regions that
+        touch; ``regions_separated`` answers True only when that is ruled
+        out, so anything it cannot judge keeps the warning.
+        """
+        project = getattr(app, 'project', None)
+        if project is None or getattr(project, 'path', None) is None:
+            return False
+        try:
+            from foammesh.core.geometry import GeometryArtifactStore
+            from foammesh.core.geometry.region_contact import regions_separated
+            entries = GeometryArtifactStore(project.path).entries()
+            return regions_separated(
+                entries, [card.point() for card in self._regions.values()])
+        except Exception:                                   # noqa: BLE001
+            return False
 
     def _seedWarning(self, point) -> str:
         """Why this seed is not a material point, or '' (R164).
@@ -106,11 +135,14 @@ class RegionPage(StepPage):
         except Exception:                                   # noqa: BLE001
             # A point that cannot be judged is not a point known to be wrong.
             return ''
-        if not payload.get('known') or payload.get('inside'):
+        if (not payload.get('known') or payload.get('inside')
+                or payload.get('external')):
+            # DP-574: an external-flow seed (outside the body, inside the
+            # background box) is a valid material point.
             return ''
         if payload.get('on_surface'):
-            return self.tr('Invalid point - on the geometry surface.')
-        return self.tr('Invalid point - outside the geometry.')
+            return self.tr('Invalid point — on the geometry surface.')
+        return self.tr('Invalid point — outside the geometry.')
 
     def open(self):
         if self._loaded:

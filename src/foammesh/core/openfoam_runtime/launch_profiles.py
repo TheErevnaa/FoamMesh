@@ -22,6 +22,20 @@ class LaunchProfileError(ValueError):
     pass
 
 
+# DP-45. Settings handed to `source <bashrc>` as arguments, which OpenFOAM
+# evaluates in `_foamParams "$@"` after its own exports have run -- the
+# upstream-sanctioned way to override a shipped default without editing the
+# distribution.
+#
+# `ParaView_TYPE=none` is here because the block the shipped `system` value
+# enables runs `pvserver --version` on every source of the environment. On a
+# loaded machine that call does not return, and a probe asking whether
+# `snappyHexMesh` exists then times out and reports a working OpenFOAM as
+# absent. Nothing FoamMesh runs needs ParaView; the product does not offer it
+# at all.
+SOURCE_SETTINGS: tuple[str, ...] = ('ParaView_TYPE=none',)
+
+
 @dataclass(frozen=True)
 class LaunchCommand:
     argv: tuple[str, ...]
@@ -54,6 +68,45 @@ class OpenFoamLaunchProfile:
                 'OpenFOAM profile requires an expected project and version')
         object.__setattr__(self, 'environment', dict(self.environment))
 
+    def export_clause(self) -> str:
+        """The profile's declared environment, as shell exports.
+
+        DP-48. `environment` was a declared field that `__post_init__`
+        normalised and `fingerprint` recorded and no builder ever read, so
+        setting it moved a profile's identity without changing a single
+        command -- a change that looks applied and is not. It is applied
+        here, ahead of the source, and the empty case adds nothing.
+
+        The form is copied from the Gmsh backend, which has applied its own
+        `environment` this way in `runner_argv` since it was written. The two
+        profiles were meant to be built alike; only one of them was.
+        """
+        if not self.environment:
+            return ''
+        return ''.join(
+            f'export {shlex.quote(name)}={shlex.quote(str(value))}; '
+            for name, value in sorted(self.environment.items()))
+
+    def source_clause(self, *, quiet: bool = False) -> str:
+        """Build the `source <bashrc>` clause every runtime command opens with.
+
+        One place, so a setting added for detection is also carried by the
+        script that actually runs the mesher -- a probe and a run that source
+        different environments are two different runtimes.
+
+        Order is deliberate and the two halves are not interchangeable. The
+        profile's own environment goes first as exports; then the bashrc,
+        with SOURCE_SETTINGS passed as *arguments* to `source`, because an
+        exported value would not survive it -- line 112 of OpenFOAM 13's
+        bashrc exports ParaView_TYPE unconditionally, and the parameter form
+        is the override its own `_foamParams` provides.
+        """
+        clause = ' '.join(
+            ('source', shlex.quote(self.bashrc), *SOURCE_SETTINGS))
+        if quiet:
+            clause = f'{clause} >/dev/null 2>&1'
+        return f'{self.export_clause()}{clause}'
+
     def translate_host_path(self, path: str | Path) -> str:
         if self.kind == 'native':
             return str(Path(path).resolve())
@@ -79,7 +132,8 @@ class OpenFoamLaunchProfile:
             'bashrc': self.bashrc,
             'expected_project': self.expected_project,
             'expected_version': self.expected_version,
-            'environment_keys': sorted(self.environment),
+            'environment': {name: str(value) for name, value in sorted(self.environment.items())},
+            'source_settings': list(SOURCE_SETTINGS),
         }
         encoded = json.dumps(
             document, sort_keys=True, separators=(',', ':')).encode()
@@ -106,7 +160,7 @@ class OpenFoamLaunchProfile:
         run = shlex.join((utility, *suffix))
         grouped = 'setsid bash -c ' + shlex.quote('exec stdbuf -oL -eL ' + run)
         script = (
-            f'source {shlex.quote(self.bashrc)} && '
+            f'{self.source_clause()} && '
             f'cd {shlex.quote(runtime_cwd)} && '
             f'rm -f {shlex.quote(pid_name)} {shlex.quote(exit_name)}; '
             f'{grouped} & child=$!; '
@@ -136,7 +190,7 @@ class OpenFoamLaunchProfile:
             executable = shutil.which(utility)
             return (executable or utility, '-help')
         script = (
-            f'source {shlex.quote(self.bashrc)} >/dev/null 2>&1 && '
+            f'{self.source_clause(quiet=True)} && '
             f'command -v {shlex.quote(utility)}'
         )
         return (*self._wsl_prefix(), 'bash', '-c', script)
@@ -149,7 +203,7 @@ class OpenFoamLaunchProfile:
         lines = [
             f'test -r {shlex.quote(self.bashrc)} || '
             f'{{ echo "__FOAMMESH_ERROR__=missing bashrc {self.bashrc}"; exit 40; }}',
-            f'source {shlex.quote(self.bashrc)} >/dev/null 2>&1 || '
+            f'{self.source_clause(quiet=True)} || '
             f'{{ echo "__FOAMMESH_ERROR__=could not source {self.bashrc}"; exit 41; }}',
             'echo "__FOAMMESH_PROJECT__=$WM_PROJECT"',
             'echo "__FOAMMESH_VERSION__=$WM_PROJECT_VERSION"',
@@ -189,7 +243,7 @@ class OpenFoamLaunchProfile:
         the caller decides.
         """
         script = '; '.join([
-            f'source {shlex.quote(self.bashrc)} >/dev/null 2>&1 || '
+            f'{self.source_clause(quiet=True)} || '
             '{ echo "__FOAMMESH_ERROR__=could not source the runtime"; exit 41; }',
             'root="$FOAM_LIBBIN"',
             'test -n "$root" || '

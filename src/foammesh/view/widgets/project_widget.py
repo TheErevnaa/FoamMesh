@@ -23,6 +23,14 @@ class ProjectWidget(QWidget):
             self._ui.path.setDisabled(True)
             self._ui.name.setDisabled(True)
 
+        # DP-210. The button paints a cross and no words. It drops the
+        # project from the recent list rather than from disk, which is
+        # the distinction the confirmation goes on to draw, so the
+        # tooltip draws it here too.
+        self._ui.remove.setToolTip(
+            self.tr('Remove {0} from the list').format(path.name))
+        self._ui.remove.setAccessibleName(self._ui.remove.toolTip())
+
         self._ui.remove.clicked.connect(self._remove)
 
     def getProjectPath(self):

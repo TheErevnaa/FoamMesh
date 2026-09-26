@@ -36,6 +36,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 
+from foammesh.core.quantities import agreeing
+
 #: The six faces of one hexahedral block, as *local* vertex indices, in
 #: ``blockMeshDict`` vertex order. Same tuple the single-block writer has
 #: always used; it now names block-local corners rather than the only block.
@@ -366,7 +368,8 @@ class BackgroundTopology:
             bad = [i for i, value in enumerate(jacobians) if value <= 0]
             if bad:
                 found.append(
-                    f'block {number} is inside out at corner(s) '
+                    f'block {number} is inside out at '
+                    f'{agreeing(len(bad), "corner")} '
                     f'{", ".join(str(i) for i in bad)}: the hex vertex order '
                     'gives a non-positive Jacobian, so blockMesh would build '
                     'cells with negative volume')

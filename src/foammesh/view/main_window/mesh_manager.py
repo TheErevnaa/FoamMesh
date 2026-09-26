@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import functools
 import logging
 from pathlib import Path
 
+import numpy as np
 import qasync
 from PySide6.QtCore import Signal
 
@@ -12,16 +14,27 @@ from widgets.progress_dialog import ProgressDialog
 
 from foammesh.app import app
 from foammesh.core.mesh.msh_scene import MshSceneError, read_msh_scene
+from foammesh.core.mesh.presentation import (
+    ENCLOSURE_OPACITY, VOLUME_DEPTH_BIAS, artifact_kind, display_mode_name,
+    enclosing_part_ids, hides_geometry, summary_text)
 from foammesh.core.mesh.poly_mesh_reader import PolyMeshLoader
-from foammesh.core.run_result import GMSH_MSH, POLY_MESH
+from foammesh.core.run_result import GMSH_MSH, GMSH_SURFACE_MSH, POLY_MESH
 from foammesh.rendering.actor_info import ActorInfo, BoundaryActor, DisplayMode, MeshActor, MeshQualityIndex
+from foammesh.rendering.actor_info import ActorType
 from foammesh.view.main_window.actor_manager import ActorManager
 from foammesh.core.quality import extract_selected_cells
 from PySide6.QtGui import QColor
 from foammesh.view.facade_client import query
+from foammesh.core.quality.geometry_fidelity import live_distance
+from foammesh.support.colormap import deviationLut
 
 
 logger = logging.getLogger(__name__)
+
+
+#: DP-714. How opaque the surfaces are while the poor cells are coloured:
+#: enough to keep the model's shape, little enough to see the cells inside.
+QUALITY_SEE_THROUGH_OPACITY = 0.3
 
 
 class MeshManager(ActorManager):
@@ -29,6 +42,10 @@ class MeshManager(ActorManager):
     #: way to tell a clipped mesh from a smaller one, so both numbers travel
     #: together and the label says which is which.
     cellCountChanged = Signal(int, int)
+    #: The one sentence that says what is on screen and how big it is.
+    #: DP-96: emitted on every load and on every unload, so the line
+    #: cannot outlive the mesh it describes the way the cell count did.
+    meshSummaryChanged = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -59,9 +76,26 @@ class MeshManager(ActorManager):
         self._runId = ''
         self._resultLabel = ''
         self._load_generation = 0
+        # DP-485. polyMesh reads in flight, and the event a writer waits on
+        # until there are none. See `readsFinished` and `_waitForWriters`.
+        self._reads = 0
+        self._readsIdle = asyncio.Event()
+        self._readsIdle.set()
         self._regionIds: dict[str, list[str]] = {}
         self._patchIds: list[str] = []
         self._zoneIds: list[str] = []
+        self._regionPartIds: list[str] = []
+
+        # DP-96. What the user pressed to make this mesh, when a stage
+        # page made it. A result loaded from a run has no stage and
+        # names itself by what it is instead.
+        self._stage = ''
+        # DP-133. Whether the file named by `_nativePath` is to be read as a
+        # surface pass. Part of what identifies the mesh on screen, not a
+        # property of the file: the same file read the other way is the
+        # refusal `read_msh_scene` exists to make.
+        self._surfaceOnly = False
+        self._summary = ''
 
         self._name = 'Mesh'
 
@@ -97,6 +131,16 @@ class MeshManager(ActorManager):
 
     def zoneIds(self) -> list[str]:
         return list(self._zoneIds)
+
+    def regionPartIds(self) -> list[str]:
+        """The volume parts named after a region point (DP-711)."""
+        return list(self._regionPartIds)
+
+    def volumePartIds(self) -> list[str]:
+        """What the Region picker offers under each region: cell zones and
+        the region-point parts, each a piece of volume that can be shown on
+        its own."""
+        return list(self._zoneIds) + list(self._regionPartIds)
 
     def patchIds(self) -> list[str]:
         return list(self._patchIds)
@@ -201,7 +245,8 @@ class MeshManager(ActorManager):
                 BoundaryActor, 'patch', keys=set(self._patchIds))
 
         self.assignPatchPalette(
-            (MeshActor, BoundaryActor), 'zone', keys=set(self._zoneIds))
+            (MeshActor, BoundaryActor), 'zone',
+            keys=set(self._zoneIds) | set(self._regionPartIds))
 
     async def loadResult(self, handle) -> str:
         """Draw the artifact ``handle`` names, whichever format it is in.
@@ -235,11 +280,22 @@ class MeshManager(ActorManager):
         if fmt == GMSH_MSH:
             return await self.loadNative(
                 getattr(handle, 'artifact_path', ''), artifact_id=artifact_id)
+        if fmt == GMSH_SURFACE_MSH:
+            # DP-133. The same file format, read the other way, and the
+            # reader is told so rather than left to work it out: a surface
+            # mesh arriving where a volume was expected is the failure it
+            # refuses by default. The stage is what the sentence beside the
+            # picture calls it, so the user can tell this mesh from the
+            # volume one at a glance instead of by counting cells.
+            return await self.loadNative(
+                getattr(handle, 'artifact_path', ''), artifact_id=artifact_id,
+                stage=self.tr('Surface pass'), surface_only=True)
         if not fmt:
             return 'this run left no artifact to read'
         return f'no reader for {fmt}'
 
-    async def loadNative(self, path, artifact_id: str = '') -> str:
+    async def loadNative(self, path, artifact_id: str = '', stage: str = '',
+                         *, surface_only: bool = False) -> str:
         """Draw a native Gmsh ``.msh`` directly, publishing nothing.
 
         The scene is built from the mesher's own file, so a refused candidate
@@ -259,16 +315,24 @@ class MeshManager(ActorManager):
         generation = self._load_generation
         hidden = {key for key, info in self._actorInfos.items()
                   if not info.isVisible()}
-        self.clear()
-        self._visibility = True
+        # DP-128. The scene on screen is not cleared here. Reading a mesh
+        # takes seconds, and clearing first means the viewport is empty for
+        # every one of them -- a reload blanked the mesh a user was looking
+        # at and brought it back unchanged. The old scene stands in until the
+        # new one is in hand, and the two swap in `_buildScene` below.
         self._time = None
         self._root = None
         self._loader = None
         self._nativePath = Path(path)
         self._artifactId = str(artifact_id or '')
+        self._stage = str(stage or '')
+        # DP-133. Kept so `reload` re-reads the file the same way. A surface
+        # pass re-read as a volume would refuse, and the mesh a user was
+        # looking at would come off the screen on a reload.
+        self._surfaceOnly = bool(surface_only)
 
-        progressDialog = ProgressDialog(app.window, self.tr('Loading Mesh'))
-        progressDialog.setLabelText(self.tr('Loading Mesh'))
+        progressDialog = ProgressDialog(app.window, self.tr('Loading mesh'))
+        progressDialog.setLabelText(self.tr('Loading mesh…'))
         progressDialog.open()
         try:
             # Off the event loop: the parse plus the VTK conversion is
@@ -276,14 +340,19 @@ class MeshManager(ActorManager):
             # (measured 0.98 s for the 141,486-cell finned_tube candidate),
             # and freezing the window for it is the R95 complaint again.
             scene = await asyncio.get_running_loop().run_in_executor(
-                None, read_msh_scene, self._nativePath)
+                None, functools.partial(read_msh_scene, self._nativePath,
+                                        surface_only=self._surfaceOnly))
         except MshSceneError as error:
+            # DP-128. The old scene stood in while the read ran; it cannot
+            # stand in for a read that failed, so it comes down here instead.
+            self.clear()
             self._nativePath = None
             self._artifactId = ''
             self.cellCountChanged.emit(0, 0)
             return str(error)
         except Exception as error:                                 # noqa: BLE001
             logger.debug('native mesh read failed', exc_info=True)
+            self.clear()
             self._nativePath = None
             self._artifactId = ''
             self.cellCountChanged.emit(0, 0)
@@ -293,10 +362,13 @@ class MeshManager(ActorManager):
 
         if generation != self._load_generation:
             return ''
+        self.clear()
+        self._visibility = True
         self._buildScene(scene.vtk_mesh, hidden)
         return ''
 
-    async def load(self, time: int, root=None, artifact_id: str = ''):
+    async def load(self, time: int, root=None, artifact_id: str = '',
+                   stage: str = ''):
         """Draw time ``time`` of the case at ``root`` (the project by default).
 
         ``root`` is a case directory -- the thing that holds ``constant/
@@ -313,40 +385,118 @@ class MeshManager(ActorManager):
             logger.info('mesh load skipped: rendering is disabled')
             return
 
-        # Deliberately no gather here. The reader selects DECOMPOSED_CASE when
-        # `processor0` exists, so a decomposed mesh draws directly from the
-        # processor cases. Reconstructing to display was costing a full gather
-        # after every stage for a picture the viewer could already read.
+        # Deliberately no gather here. The reader picks whichever of the two
+        # meshes on disk is the newer, so a run that has not been
+        # reconstructed yet still draws straight from the processor cases.
+        # Reconstructing to display would cost a full gather after every
+        # stage for a mesh `reconstructPar` has usually already written.
+        # DP-140: what it must not do is read the decomposition *instead* of
+        # a reconstruction that is sitting right there -- that draws the
+        # subdomain cuts as if they were mesh.
         self._load_generation += 1
         generation = self._load_generation
+        # DP-485. A job that is rewriting the polyMesh is not read under.
+        # The job's own stage reload follows it, and supersedes this one.
+        await self._waitForWriters()
+        if generation != self._load_generation:
+            return
         # R27. Carry the user's per-part visibility across the reload. Only
         # actors that come back are restored, so a mesh with different patches
         # starts from its own defaults rather than inheriting a hidden row
         # that no longer means anything.
         hidden = {key for key, info in self._actorInfos.items()
                   if not info.isVisible()}
-        self.clear()
-        self._visibility = True
-
+        # DP-128. Not cleared here -- see `loadNative`. Reading a polyMesh is
+        # seconds of work, and this method is what a stage reload calls, so
+        # clearing first emptied the viewport for the whole of every reload.
         self._time = time
         self._root = Path(root) if root else Path(app.facadeClient.case_root)
         self._nativePath = None
+        self._surfaceOnly = False
         self._artifactId = str(artifact_id or '')
+        self._stage = str(stage or '')
 
-        progressDialog = ProgressDialog(app.window, self.tr('Loading Mesh'))
-        progressDialog.setLabelText(self.tr('Loading Mesh'))
+        progressDialog = ProgressDialog(app.window, self.tr('Loading mesh'))
+        progressDialog.setLabelText(self.tr('Loading mesh…'))
         progressDialog.open()
 
-        self._loader = PolyMeshLoader(self._root / 'case.foam')
+        # DP-711. Region points reach the loader only when there are any.
+        # Asked of the class: it needs no state of this manager.
+        seeds = MeshManager._regionSeeds()
+        options = {'regionSeeds': seeds} if seeds else {}
+        self._loader = PolyMeshLoader(self._root / 'case.foam', **options)
         self._loader.progress.connect(progressDialog.setLabelText)
 
+        self._readStarted()
         try:
             vtkMesh = await self._loader.loadMesh(self._time)
-            if generation != self._load_generation:
-                return
-            self._buildScene(vtkMesh, hidden)
+        except Exception:
+            # DP-128. A read that failed leaves nothing to swap in, so the
+            # scene that was standing in for it comes down.
+            self.clear()
+            raise
         finally:
+            self._readFinished()
             progressDialog.close()
+        if generation != self._load_generation:
+            # Superseded mid-read. Leave the scene alone: the load that
+            # overtook this one owns what is on screen now.
+            return
+        self.clear()
+        self._visibility = True
+        self._buildScene(vtkMesh, hidden)
+
+    @staticmethod
+    def _regionSeeds() -> list:
+        """``[(name, point), ...]`` from the Regions page (DP-711).
+
+        The reader uses them to name the regions of a mesh that holds several
+        without saying which cells are which. No case, or a region without a
+        point, simply gives nothing to split by.
+        """
+        try:
+            regions = app.db.getElements('region')
+        except Exception:                           # noqa: BLE001 - no case
+            return []
+        seeds = []
+        for region in regions.values():
+            try:
+                seeds.append((region.value('name'), region.vector('point')))
+            except Exception:                       # noqa: BLE001
+                continue
+        return seeds
+
+    @staticmethod
+    def _writerActive() -> bool:
+        try:
+            return bool(app.facadeClient.session().jobs.mesh_write_pending)
+        except Exception:       # noqa: BLE001 - no case open writes nothing
+            return False
+
+    async def _waitForWriters(self):
+        """Return once no job is rewriting the case (DP-485).
+
+        MEASURED on `centrifugal_impeller`, 12 processors: pressing layers
+        commits the page's settings, the commit schedules a scene refresh,
+        and the refresh reloaded the snap mesh out of `processor*/constant/
+        polyMesh` while addLayers was writing those same files. VTK read a
+        truncated `faces` ("Unexpected EOF") and the GUI died rc=139.
+        """
+        while self._writerActive():
+            await asyncio.sleep(0.25)
+
+    def _readStarted(self):
+        self._reads += 1
+        self._readsIdle.clear()
+
+    def _readFinished(self):
+        self._reads = max(0, self._reads - 1)
+        if not self._reads:
+            self._readsIdle.set()
+
+    async def readsFinished(self):
+        """The read barrier a mutating job awaits before it starts."""
+        await self._readsIdle.wait()
 
     def _buildScene(self, vtkMesh, hidden=frozenset()):
         """Turn one loaded mesh into actors, whichever reader produced it.
@@ -358,9 +508,17 @@ class MeshManager(ActorManager):
         entries here, which is what makes its patches pickable and hideable
         independently of the volume.
         """
+        # DP-713. A new scene carries no deviation colouring, so neither
+        # does what describes it.
+        self._deviation = None
+        # DP-714. Nor any surface faded for a colouring it no longer has.
+        self._qualityFaded = {}
         patch_ids: list[str] = []
         zone_ids: list[str] = []
+        region_part_ids: list[str] = []
         region_ids: dict[str, list[str]] = {}
+        patch_bounds: dict[str, tuple] = {}
+        volume_of: dict[str, str] = {}
         if vtkMesh:
             multi_region = len(vtkMesh) > 1
             for rname, region in vtkMesh.items():
@@ -371,17 +529,49 @@ class MeshManager(ActorManager):
                     display = f'{rname}/{bname}' if rname else bname
                     self.add(BoundaryActor(polyData, actor_id, display))
                     patch_ids.append(actor_id)
+                    # Not every reader hands over a vtkPolyData; one
+                    # that cannot say where it is simply does not
+                    # take part in the enclosure question.
+                    reportBounds = getattr(polyData, 'GetBounds', None)
+                    if reportBounds is not None:
+                        patch_bounds[actor_id] = reportBounds()
                     region_ids[rname].append(actor_id)
                 internal_id = (
                     f'{prefix}internalMesh' if multi_region
                     else 'internalMesh')
                 display = (
                     f'{rname}/internalMesh' if rname else 'internalMesh')
-                self.add(MeshActor(
-                    region['internalMesh'], internal_id, display))
-                region_ids[rname].append(internal_id)
+                # DP-133. A surface mesh has no volume, and the surface pass
+                # of a 3D run is now something a user can ask to see. The
+                # reader says so by handing over `internalMesh: None` rather
+                # than an empty grid, because an empty grid is a row in the
+                # tree that can be picked and hidden and shows nothing when
+                # it is. Every use of `internal_id` below is inside this
+                # guard: with no volume there is nothing for a patch to fade
+                # behind and nothing to bias away from it.
+                internal = region['internalMesh']
+                if internal is not None:
+                    internal_actor = MeshActor(internal, internal_id, display)
+                    # DP-141. That same coincidence is also a depth fight: the
+                    # volume's exterior surface and the patches are the same
+                    # faces, reaching the renderer through two different
+                    # triangulations, so neither wins cleanly and the model
+                    # renders as speckle. The patches carry the case's
+                    # meaning, so the volume is the one that steps back.
+                    internal_actor.setDepthBias(VOLUME_DEPTH_BIAS)
+                    self.add(internal_actor)
+                    # The volume's own exterior surface is the same box its
+                    # boundary patches describe, so a patch that fades without
+                    # it fades behind an opaque copy of itself.
+                    for member in region_ids[rname]:
+                        volume_of[member] = internal_id
+                    region_ids[rname].append(internal_id)
                 zones = region.get('zones', region)
-                for category in ('cellZones', 'faceZones'):
+                # DP-711. `regions` is the reader naming the pieces of a mesh
+                # that holds several regions without cell zones (S5's fluid
+                # and solid). Each is a volume part like a cell zone, filed
+                # apart from the zones so nothing counts it as one.
+                for category in ('cellZones', 'faceZones', 'regions'):
                     collection = zones.get(category, {})
                     if not isinstance(collection, dict):
                         continue
@@ -391,23 +581,138 @@ class MeshManager(ActorManager):
                             f'{rname}/{category}/{zone_name}' if rname
                             else f'{category}/{zone_name}')
                         actor_type = (
-                            MeshActor if category == 'cellZones'
-                            else BoundaryActor)
+                            BoundaryActor if category == 'faceZones'
+                            else MeshActor)
                         self.add(actor_type(data_set, actor_id, display))
-                        zone_ids.append(actor_id)
+                        (region_part_ids if category == 'regions'
+                         else zone_ids).append(actor_id)
                         region_ids[rname].append(actor_id)
         self._regionIds = region_ids
         self._patchIds = patch_ids
         self._zoneIds = zone_ids
+        self._regionPartIds = region_part_ids
         self._assignPalettes()
+        self._fadeEnclosures(patch_bounds, volume_of)
         for key in set(hidden) & set(self._actorInfos):
             self._actorInfos[key].setVisible(False)
+        self._presentArtifact()
         self.applyToDisplay()
         self.fitDisplay()
         self._notifyCellCountChange()
         rebuild = getattr(app.window, 'rebuildOverlayParts', None)
         if rebuild is not None:
             rebuild()
+
+    def _fadeEnclosures(self, patch_bounds: dict, volume_of: dict):
+        """Draw an outer boundary that holds a body so the body reads through it.
+
+        DP-136. The geometry view already does this -- every surface is drawn
+        at less than full opacity, which is why an imported cyclone in its
+        tunnel shows the cyclone. The mesh view draws every patch solid, so the
+        moment blockMesh finishes the same case becomes a grey box and stays
+        one for every remaining stage of the run: castellation, snap, layers,
+        all identical from outside.
+
+        :func:`enclosing_part_ids` decides which patch that is, from geometry
+        rather than from a name or a group -- see its docstring for why those
+        do not separate the two cases. It answers with nothing at all for an
+        ordinary internal-flow mesh, which is most of them, and that is the
+        path that leaves the scene exactly as it was.
+
+        MEASURED: fading the patch alone changed not one pixel. The region's
+        ``internalMesh`` actor sends the volume's *exterior* surface to the
+        renderer, which for an enclosure case is that same outer box, drawn
+        solid on top. So the volume behind an enclosure fades with it, while
+        the body's own patch keeps full opacity and reads through both.
+        """
+        for actor_id in enclosing_part_ids(patch_bounds):
+            for target in (actor_id, volume_of.get(actor_id)):
+                actor_info = (self._actorInfos.get(target)
+                              if target is not None else None)
+                if actor_info is not None:
+                    actor_info.setOpacity(ENCLOSURE_OPACITY)
+
+    def meshSummary(self) -> str:
+        """What the viewport is showing and how big it is (DP-96)."""
+        return self._summary
+
+    def boundaryFaceCount(self) -> int:
+        """Faces on the named patches, which is the mesh's skin.
+
+        DP-529 (MA G1-P2, G1 ``jacketed_pipe``): a faceZone is drawn with a
+        ``BoundaryActor`` too, and counting every one of those said 1,838
+        boundary faces for a mesh whose patches hold 1,216 -- the other 622
+        are the interface between the two volumes, which is interior. Only
+        the patches are counted.
+        """
+        total = 0
+        for actor_id in self._patchIds:
+            actorInfo = self._actorInfos.get(actor_id)
+            if not isinstance(actorInfo, BoundaryActor):
+                continue
+            dataSet = getattr(actorInfo, 'dataSet', None)
+            count = getattr(dataSet() if dataSet else None,
+                            'GetNumberOfCells', None)
+            if count is not None:
+                total += int(count())
+        return total
+
+    def pointCount(self) -> int:
+        """Points in the volume, counted once.
+
+        Only the volume is asked. Each patch carries its own copy of the
+        points it shares with its neighbours, so adding the patches up
+        reports a mesh as larger than it is -- and a number that is wrong in
+        the user's favour is worse than no number.
+        """
+        for actorInfo in self._actorInfos.values():
+            if isinstance(actorInfo, MeshActor):
+                dataSet = getattr(actorInfo, 'dataSet', None)
+                count = getattr(dataSet() if dataSet else None,
+                                'GetNumberOfPoints', None)
+                return int(count()) if count is not None else 0
+        return 0
+
+    def _presentArtifact(self):
+        """Put the mesh a load just built in front of the user (DP-95/DP-96).
+
+        Three things, none of which the user should have to ask for: the
+        edges are drawn, so the picture is of a mesh and not of a skin; the
+        geometry it was built from steps out of the way, because it occupies
+        the same space and wins the depth test as often as not; and the
+        sentence beside it says which stage made it, how many cells, faces
+        and points it has, and how big it is in model units.
+
+        Called before ``applyToDisplay`` so the modes reach the renderer in
+        the same repaint as the actors do -- a mesh that appears smooth and
+        then re-draws with edges is the same flicker in a slower form.
+        """
+        cells = self.getNumberOfCells()
+        faces = self.boundaryFaceCount()
+        kind = artifact_kind(cells, faces)
+        member = getattr(DisplayMode, display_mode_name(kind), None)
+        if member is not None:
+            for actorInfo in self._actorInfos.values():
+                setMode = getattr(actorInfo, 'setDisplayMode', None)
+                if setMode is not None:
+                    setMode(member)
+        # An actor that cannot say where it is is not a reason to refuse to
+        # draw the mesh. The size sentence loses its extent and keeps its
+        # counts, which is the part that cannot be got anywhere else.
+        try:
+            bounds = self.getBounds()
+            size = bounds.size() if bounds is not None else None
+        except Exception:                                    # noqa: BLE001
+            logger.debug('mesh extent unavailable', exc_info=True)
+            size = None
+        self._summary = summary_text(
+            self._stage, kind, cells, faces, self.pointCount(), size)
+        self.meshSummaryChanged.emit(self._summary)
+        if hides_geometry(kind):
+            geometry = getattr(app.window, 'geometryManager', None)
+            hide = getattr(geometry, 'hide', None)
+            if hide is not None:
+                hide()
 
     def unload(self):
         # A failed-cell overlay belongs to a specific mesh/result pair; never
@@ -421,6 +726,10 @@ class MeshManager(ActorManager):
         self._artifactId = ''
         self._runId = ''
         self._resultLabel = ''
+        self._stage = ''
+        self._surfaceOnly = False
+        self._summary = ''
+        self.meshSummaryChanged.emit('')
         # R87. The toolbar kept the last number it was handed: `36,533 cells`
         # was still on screen after a Base Grid reset had deleted
         # `constant/polyMesh` outright. It is the only always-visible
@@ -433,13 +742,15 @@ class MeshManager(ActorManager):
             # A native result has no time directory and no case root to go
             # back to; it reloads from the file it was drawn from.
             await self.loadNative(self._nativePath,
-                                  artifact_id=self._artifactId)
+                                  artifact_id=self._artifactId,
+                                  stage=self._stage,
+                                  surface_only=self._surfaceOnly)
             return
         if self._time is None:
             return
 
         await self.load(self._time, root=self._root,
-                        artifact_id=self._artifactId)
+                        artifact_id=self._artifactId, stage=self._stage)
 
     @qasync.asyncSlot()
     async def show(self, time: int):
@@ -513,8 +824,42 @@ class MeshManager(ActorManager):
     def clearCellFilter(self):
         for actorInfo in self._actorInfos.values():
             actorInfo.clearCellFilter()
+        self._restoreSurfaces()
 
         self._notifyCellCountChange()
+
+    def _seeThroughSurfaces(self):
+        """DP-714. Fade every surface while the poor cells are coloured.
+
+        Viewport audit 0925 F10. The poor cells are volume cells, and most of
+        them are inside: the boundary patches drawn over them are opaque, so
+        rotated to the far side the highlight vanished behind the model.
+        Each surface keeps its own opacity to come back to.
+        """
+        faded = getattr(self, '_qualityFaded', None) or {}
+        for id_, actorInfo in self._actorInfos.items():
+            kind = getattr(actorInfo, 'type', None)
+            if kind is None or kind() is ActorType.MESH or id_ in faded:
+                continue
+            opacity = actorInfo.properties().opacity
+            opacity = 1.0 if opacity is None else float(opacity)
+            if opacity <= QUALITY_SEE_THROUGH_OPACITY:
+                continue
+            faded[id_] = opacity
+            actorInfo.setOpacity(QUALITY_SEE_THROUGH_OPACITY)
+        self._qualityFaded = faded
+
+    def _restoreSurfaces(self):
+        """Give the faded surfaces their opacity back -- unless the user set
+        a new one while they were faded, which then stands."""
+        faded = getattr(self, '_qualityFaded', None) or {}
+        self._qualityFaded = {}
+        for id_, opacity in faded.items():
+            actorInfo = self._actorInfos.get(id_)
+            if actorInfo is None:
+                continue
+            if actorInfo.properties().opacity == QUALITY_SEE_THROUGH_OPACITY:
+                actorInfo.setOpacity(opacity)
 
     def showFailedCells(self, ids: list[int], set_name: str = 'Failed cells',
                         artifact_id: str = '') -> bool:
@@ -615,26 +960,112 @@ class MeshManager(ActorManager):
                         'the viewport is showing %s',
                         artifact_id, self._artifactId or '(nothing)')
             return 0
-        coloured = 0
+        # DP-713. Model units in the file, millimetres on screen, and the
+        # faces put where their labels say rather than where they fell.
+        measured = {}
         for name, field in (fields or {}).items():
-            actorInfo = self._actorInfos.get(name)
-            if actorInfo is None:
+            if self._actorInfos.get(name) is None:
                 continue
             try:
                 face_ids, deviations = field
             except (TypeError, ValueError):
                 continue
-            if actorInfo.setFaceScalars('deviation', face_ids, deviations):
-                coloured += 1
+            measured[name] = (
+                np.asarray(face_ids, dtype=np.int64).ravel(),
+                np.asarray(deviations, dtype=np.float64).ravel()
+                * live_distance.MODEL_TO_MM)
+        return self._paintDeviation(measured, self.patchStartFaces(), 'run')
 
+    def showLiveDeviation(self, reference) -> int:
+        """DP-713. Colour each patch by its signed distance to ``reference``.
+
+        Viewport audit 0925 F8. With no stored fidelity run the colouring had
+        nothing to show, on a case whose reference geometry was loaded in
+        the same window. This measures every patch face centre against that
+        geometry now -- blue short of it, red past it -- on one shared range.
+        """
+        if reference is None:
+            return 0
+        surfaces = {}
+        for actor_id in self._patchIds:
+            actorInfo = self._actorInfos.get(actor_id)
+            if (isinstance(actorInfo, BoundaryActor)
+                    and actorInfo.dataSet() is not None):
+                surfaces[actor_id] = actorInfo.dataSet()
+        distances = live_distance.face_distances_mm(reference, surfaces)
+        fields = {name: (np.arange(values.size, dtype=np.int64), values)
+                  for name, values in distances.items()}
+        return self._paintDeviation(
+            fields, {name: 0 for name in fields}, 'live')
+
+    def _paintDeviation(self, fields, starts, source) -> int:
+        """Paint ``name -> (face labels, mm)`` on one symmetric range."""
+        valueRange = live_distance.symmetric_range(
+            values for _ids, values in fields.values())
+        self._deviation = None
+        if valueRange is None:
+            self.applyToDisplay()
+            return 0
+        lut = deviationLut(valueRange)
+        painted = {}
+        for name, (face_ids, values) in fields.items():
+            actorInfo = self._actorInfos[name]
+            if actorInfo.setFaceScalars(
+                    'deviation', face_ids, values,
+                    start_face=starts.get(name), value_range=valueRange,
+                    lookup_table=lut):
+                painted[name] = actorInfo.faceScalars('deviation')
+        if painted:
+            self._deviation = live_distance.DeviationReadout(
+                fields=painted, value_range=valueRange, lookup_table=lut,
+                source=source)
         self.applyToDisplay()
-        return coloured
+        return len(painted)
+
+    def deviationReadout(self):
+        """DP-713. What the deviation colouring on screen shows, or None."""
+        return getattr(self, '_deviation', None)
+
+    def patchStartFaces(self) -> dict[str, int]:
+        """DP-713. ``actor id -> startFace`` of every patch on screen.
+
+        A face label is only a cell of its patch's actor once the patch's
+        first label is known. Read from the boundary file of the mesh the
+        viewport drew -- the time's own polyMesh when it has one -- and empty
+        for a native mesh or one that cannot be read, which leaves only a
+        field with one value per face to paint.
+        """
+        from foammesh.core.mesh.poly_mesh_boundary import _read_boundary
+
+        if self._root is None:
+            return {}
+        starts: dict[str, int] = {}
+        bases = [self._root / str(self._time)] if self._time else []
+        bases.append(self._root / 'constant')
+        for rname in (self._regionIds or {'': []}):
+            prefix = f'{rname}:' if rname else ''
+            for base in bases:
+                mesh = (base / rname / 'polyMesh') if rname else (
+                    base / 'polyMesh')
+                if not mesh.is_dir():
+                    continue
+                try:
+                    patches = _read_boundary(mesh)
+                except Exception:                             # noqa: BLE001
+                    logger.debug('no readable boundary in %s', mesh,
+                                 exc_info=True)
+                    continue
+                for patch in patches:
+                    starts[f'{prefix}{patch.name}'] = int(patch.start_face)
+                break
+        return starts
 
     def clearFidelityColouring(self):
         """Put every patch back on its palette colour and drop the field."""
         for actorInfo in self._actorInfos.values():
             actorInfo.clearFaceScalars()
             actorInfo.resetColor()
+        self._deviation = None
         self.applyToDisplay()
 
     def clearFailedCells(self):
@@ -654,6 +1085,7 @@ class MeshManager(ActorManager):
     def applyCellFilter(self):
         for actorInfo in self._actorInfos.values():
             actorInfo.applyCellFilter()
+        self._seeThroughSurfaces()
 
         self._notifyCellCountChange()
 

@@ -28,11 +28,15 @@ a runner that reports the request is a runner that certifies work it never did.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import json
 import math
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -43,10 +47,16 @@ from pathlib import Path
 try:
     from shell_topology import ShellTopologyError, resolve_topology
     from field_graph import FieldGraphError, build_graph
+    from layer_targets import (
+        MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
+    from quantities import agreeing, count_text
 except ImportError:  # pragma: no cover - exercised only by the module loader
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from shell_topology import ShellTopologyError, resolve_topology
     from field_graph import FieldGraphError, build_graph
+    from layer_targets import (
+        MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
+    from quantities import agreeing, count_text
 
 SCHEMA_VERSION = 1
 RUNNER_VERSION = 'gmsh-runner-v1'
@@ -54,6 +64,26 @@ RUNNER_VERSION = 'gmsh-runner-v1'
 
 class ContractFailure(RuntimeError):
     """The job does not satisfy the contract this runner implements."""
+
+
+def _cavities(count) -> str:
+    """``1 sealed cavity`` or ``3 sealed cavities``, said in four places."""
+    return count_text(count, 'sealed cavity', 'sealed cavities')
+
+
+def oriented_key(triple):
+    """A triangle's node triple, rotated to its smallest node.
+
+    DP-456. Winding-preserving, so a coincident pair -- the same three nodes
+    walked the other way round, which is what a conformal interface is --
+    reads as two triangles rather than one.
+    """
+    first, second, third = (int(value) for value in triple)
+    if second < first and second <= third:
+        return (second, third, first)
+    if third < first and third <= second:
+        return (third, first, second)
+    return (first, second, third)
 
 
 def regroup_classified(before: dict, after: dict) -> dict:
@@ -69,12 +99,26 @@ def regroup_classified(before: dict, after: dict) -> dict:
     for source, triangles in before.items():
         for key in triangles:
             index[key] = source
+    # DP-456. Keys are oriented now, so a classified piece whose winding the
+    # classifier flipped would match nothing. The unwound key is kept as a
+    # second reading for exactly that piece, and only for it: it is the old
+    # behaviour, so nothing that used to be placed stops being placed.
+    unwound = {}
+    for source, triangles in before.items():
+        for key in triangles:
+            unwound.setdefault(tuple(sorted(key)), set()).add(source)
     for tag, triangles in after.items():
         votes: dict = {}
         for key in triangles:
             source = index.get(key)
             if source is not None:
                 votes[source] = votes.get(source, 0) + 1
+        if not votes:
+            for key in triangles:
+                sources = unwound.get(tuple(sorted(key)))
+                if sources and len(sources) == 1:
+                    source = next(iter(sources))
+                    votes[source] = votes.get(source, 0) + 1
         if votes:
             origin[tag] = max(votes, key=lambda item: (votes[item], -item))
     return origin
@@ -99,6 +143,197 @@ class MeshFailure(RuntimeError):
     """Gmsh could not produce a usable mesh."""
 
 
+class LayerFold(MeshFailure):
+    """The boundary layer folded back through itself.
+
+    DP-74. Raised between the surface pass and the volume pass, and it
+    carries what the fold measured so the run can be refitted rather than
+    only refused: ``carries`` is the thickness the geometry holds, ``asked``
+    the thickness this attempt grew.
+    """
+
+    def __init__(self, message, carries=0.0, asked=0.0, folded=0,
+                 patch='', at=()):
+        super().__init__(message)
+        self.carries = float(carries)
+        self.asked = float(asked)
+        self.folded = int(folded)
+        self.patch = str(patch)
+        self.at = tuple(at)
+
+
+class LayerLanding(MeshFailure):
+    """The boundary layer fitted, and then the mesh above it degenerated.
+
+    DP-76. A stack thin enough not to fold is not thereby a stack the volume
+    mesher can build on: where the fitted thickness is a small fraction of
+    the surface elements around it, the cells resting on the inner surface
+    come out as pancakes -- wide in the plane of the layer top and flat
+    across it. Carries the measurement so the refusal can quote it: ``cells``
+    how many landed degenerate, ``worst`` the worst of them, ``thickness``
+    what the layer grew, ``asked`` what was asked for.
+    """
+
+    def __init__(self, message, cells=0, worst=0.0, thickness=0.0,
+                 asked=0.0, at=()):
+        super().__init__(message)
+        self.cells = int(cells)
+        self.worst = float(worst)
+        self.thickness = float(thickness)
+        self.asked = float(asked)
+        self.at = tuple(at)
+
+class LayerCollision(MeshFailure):
+    """Two boundary layer stacks grew into the same space.
+
+    DP-121. ``extrudeBoundaryLayer`` gives the stack its own nodes, and on a
+    layer that fits, none of them land on top of another: MEASURED across the
+    `9f6abca1` corpus, **16 of the 17 layered meshes have zero coincident
+    nodes anywhere**, and the seventeenth -- `turbine_cascade` -- has 896, all
+    of them on the layer. So a coincidence on the layer is not the separate
+    body the merge guard was written to protect; it is two stacks meeting.
+
+    The mesh that comes out of one cannot even be written down. On that run
+    the exporter reported `40557 nodes written, 40109 read back`: the reader
+    welds the 448 coincident pairs the writer emitted, and 896 is exactly
+    twice 448. checkMesh then called the result not runnable, and the runner
+    called it ``succeeded``.
+
+    Carries the measurement so the refusal can quote it: ``nodes`` how many
+    coincide, ``coincident`` how many the scan found in the whole mesh,
+    ``patches`` where they sit, ``at`` one of them.
+    """
+
+    def __init__(self, message, nodes=0, coincident=0, patches=(), at=(),
+                 stalled=False):
+        super().__init__(message)
+        self.nodes = int(nodes)
+        self.coincident = int(coincident)
+        self.patches = tuple(patches)
+        self.at = tuple(at)
+        # DP-484. True when the stacks did not meet anything: a column Gmsh
+        # extruded by zero. That one is cleared by a different surface mesh,
+        # which is what :func:`execute_with_another_surface_algorithm` tries.
+        self.stalled = bool(stalled)
+
+
+class SurfaceCrossing(MeshFailure):
+    """The surface mesh passes through itself.
+
+    DP-75. Raised from the volume pass, carrying what the scan found so the
+    run can be redone on the imported facets rather than only refused.
+    ``remeshed`` is False when those facets were already what was meshed, and
+    then there is nothing left to fall back to.
+    """
+
+    def __init__(self, message, patch='', at=(), pairs=0, remeshed=True):
+        super().__init__(message)
+        self.patch = str(patch)
+        self.at = tuple(at)
+        self.pairs = int(pairs)
+        self.remeshed = bool(remeshed)
+
+
+def _cross(first, second):
+    return (first[1] * second[2] - first[2] * second[1],
+            first[2] * second[0] - first[0] * second[2],
+            first[0] * second[1] - first[1] * second[0])
+
+
+def _dot(first, second):
+    return first[0] * second[0] + first[1] * second[1] + first[2] * second[2]
+
+
+def _minus(first, second):
+    return (first[0] - second[0], first[1] - second[1], first[2] - second[2])
+
+
+def _share_a_corner(one, other, tolerance=1e-12):
+    """True when two faces meet at a corner, which is not a crossing."""
+    for first in one:
+        for second in other:
+            if all(abs(first[axis] - second[axis]) <= tolerance
+                   for axis in range(3)):
+                return True
+    return False
+
+
+def _segment_hits_face(start, finish, face):
+    """Moller-Trumbore, with both ends and all three edges held open.
+
+    DP-75. Faces that share an edge touch along it, and faces of one surface
+    meet at their edges everywhere; only a segment that passes through the
+    inside of a face and strictly between its own ends is a crossing.
+    """
+    edge_one = _minus(face[1], face[0])
+    edge_two = _minus(face[2], face[0])
+    direction = _minus(finish, start)
+    sideways = _cross(direction, edge_two)
+    determinant = _dot(edge_one, sideways)
+    if abs(determinant) < 1e-16:
+        return False
+    inverse = 1.0 / determinant
+    offset = _minus(start, face[0])
+    along = _dot(offset, sideways) * inverse
+    if along < 1e-9 or along > 1.0 - 1e-9:
+        return False
+    across = _cross(offset, edge_one)
+    sideward = _dot(direction, across) * inverse
+    if sideward < 1e-9 or along + sideward > 1.0 - 1e-9:
+        return False
+    depth = _dot(edge_two, across) * inverse
+    return 1e-9 < depth < 1.0 - 1e-9
+
+
+def _faces_cross(one, other):
+    """True when either face has an edge through the inside of the other."""
+    for index in range(3):
+        if _segment_hits_face(one[index], one[(index + 1) % 3], other):
+            return True
+    for index in range(3):
+        if _segment_hits_face(other[index], other[(index + 1) % 3], one):
+            return True
+    return False
+
+
+def layer_fold_parameter(base, top):
+    """The fraction of the layer at which a facet turns inside out.
+
+    DP-74. Every node of a boundary layer travels the same distance along its
+    own normal -- MEASURED on ``centrifugal_impeller``, where the extrusion
+    moved all 34026 wall nodes by exactly the 0.00133750785 m asked for, with
+    no 1/cos relief where two walls meet. So the facet at fraction ``s`` of
+    the requested thickness has vertices ``P + s * (P' - P)``, its normal
+    dotted into the base normal is a quadratic in ``s`` that starts at the
+    base area squared, and the first positive root is where the facet has
+    folded flat. ``None`` where the facet never folds, however far it is
+    grown.
+    """
+    edge = _minus(base[1], base[0])
+    other = _minus(base[2], base[0])
+    first = _minus(_minus(top[1], base[1]), _minus(top[0], base[0]))
+    second = _minus(_minus(top[2], base[2]), _minus(top[0], base[0]))
+    normal = _cross(edge, other)
+    constant = _dot(normal, normal)
+    if constant <= 0.0:
+        return None
+    linear = (_dot(_cross(edge, second), normal)
+              + _dot(_cross(first, other), normal))
+    square = _dot(_cross(first, second), normal)
+    roots = []
+    if abs(square) < 1e-30:
+        if abs(linear) > 1e-30:
+            roots.append(-constant / linear)
+    else:
+        discriminant = linear * linear - 4.0 * square * constant
+        if discriminant >= 0.0:
+            span = math.sqrt(discriminant)
+            roots.append((-linear + span) / (2.0 * square))
+            roots.append((-linear - span) / (2.0 * square))
+    positive = [value for value in roots if value > 1e-12]
+    return min(positive) if positive else None
+
+
 # --------------------------------------------------------------------------- #
 # Progress
 # --------------------------------------------------------------------------- #
@@ -115,21 +350,30 @@ class Reporter:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.sequence = 0
+        #: DP-446. The mesh step beats from a second thread while the main
+        #: one is inside Gmsh, and two writers sharing a sequence number
+        #: and a file handle is how a log loses a line.
+        self.lock = threading.Lock()
 
     def emit(self, kind, stage_id, fraction, message='', details=None):
-        event = {
-            'schema_version': 1, 'sequence': self.sequence, 'kind': kind,
-            'stage_id': stage_id, 'fraction': float(fraction),
-            'message': str(message)[:4096], 'timestamp': utc_now(),
-            'details': details or {},
-        }
-        line = json.dumps(event, sort_keys=True, separators=(',', ':'))
-        if self.path is not None:
-            with self.path.open('a', encoding='utf-8') as stream:
-                stream.write(line + '\n')
-                stream.flush()
-        print('FOAMMESH_PROGRESS ' + line, flush=True)
-        self.sequence += 1
+        # DP-446. Held across the whole record, not only the counter: two
+        # threads interleaving inside one `print` is a broken JSON line,
+        # and a line the console cannot parse is a line the operator does
+        # not see.
+        with self.lock:
+          event = {
+              'schema_version': 1, 'sequence': self.sequence, 'kind': kind,
+              'stage_id': stage_id, 'fraction': float(fraction),
+              'message': str(message)[:4096], 'timestamp': utc_now(),
+              'details': details or {},
+          }
+          line = json.dumps(event, sort_keys=True, separators=(',', ':'))
+          if self.path is not None:
+              with self.path.open('a', encoding='utf-8') as stream:
+                  stream.write(line + '\n')
+                  stream.flush()
+          print('FOAMMESH_PROGRESS ' + line, flush=True)
+          self.sequence += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -146,9 +390,19 @@ class Ledger:
     def __init__(self):
         self.entries: list[dict] = []
 
-    def record(self, control, requested, effective, *, applied=True, note=''):
-        matched = None
-        if isinstance(requested, (int, float)) and isinstance(effective, (int, float)):
+    def record(self, control, requested, effective, *, applied=True, note='',
+               matched=None):
+        """``matched`` is compared from the two values unless it is given.
+
+        DP-503. A read-back option compares like with like, and equality is
+        the right test. A census does not: ``Triangle`` against
+        ``Triangle=1838`` is the family that was asked for, produced, and
+        string equality called it a mismatch. A caller whose effective side
+        is a description rather than a value says whether it matched.
+        """
+        if matched is not None:
+            matched = bool(matched)
+        elif isinstance(requested, (int, float)) and isinstance(effective, (int, float)):
             matched = math.isclose(float(requested), float(effective),
                                    rel_tol=1e-9, abs_tol=1e-12)
         elif requested is not None and effective is not None:
@@ -245,6 +499,9 @@ ALGORITHM_RETRIES = 10
 #: (6008/0, 4596/0, 8216/0 quads/triangles), which is exactly what was asked
 #: for, so calling it a fallback would have been a false alarm on every run.
 PIPELINE_ALGORITHMS = frozenset({11})
+#: DP-505. What Gmsh logs for a surface an extrusion made and meshed: the
+#: sides and tops of a boundary layer. It is not an algorithm anyone chooses.
+EXTRUDED_ALGORITHM = 'Extruded'
 #: ``Mesh.SubdivisionAlgorithm`` values that change the element family.
 #: MEASURED: 1 ("all quadrangles") left 682 triangles and 1044 tetrahedra --
 #: the numbers no subdivision at all gives -- and 3 (barycentric) split each
@@ -283,6 +540,19 @@ QUALITY_SUBSTITUTE = 'sicn'
 #: where every element is bad cannot produce a gigabyte of manifest.
 OFFENDER_CAP = 1000
 
+#: DP-76. Below this a cell resting on the layer top is not a poor cell, it
+#: is not a cell. MEASURED on ``drone_quadcopter``: with the fitted layer the
+#: worst tetrahedron is 3.363e-07 gamma, and with the layer off, on the same
+#: tessellation, it is 3.504e-04. Three orders of magnitude separate the two
+#: populations and this floor sits between them, so it catches the layer's
+#: pancakes without touching the slivers the geometry brings of its own.
+LAYER_LANDING_FLOOR = 1e-5
+
+#: DP-121. The reason ``protected_surfaces`` gives for a layer surface, named
+#: once so the merge can tell a layer apart from a periodic pair without
+#: matching prose.
+LAYER_PROTECTION = 'the boundary layer'
+
 
 class _Classification:
     """Which surface-classification settings a triangulation survived."""
@@ -309,6 +579,11 @@ class GmshRun:
         self.planar = bool(self.dimensionality.get('planar'))
         self.generate_dimension = int(
             self.dimensionality.get('generateDimension') or 3)
+        #: DP-133. Where to leave the surface pass of a three-dimensional
+        #: run, or `''` for a job that did not ask for one. Absent in a job
+        #: written before this existed, which is why it is read with a
+        #: default rather than indexed.
+        self.surface_output = str(job.get('surfaceOutput') or '')
         #: FC-E. Curves bounding the section, for a planar job. The
         #: three-dimensional equivalent is `boundary_surfaces`.
         self.boundary_curves: list[int] = []
@@ -373,6 +648,24 @@ class GmshRun:
         #: carries no entity names, which leaves the version-1 lookup by tag.
         self.entity_surface_names: dict[int, str] = {}
         self.entity_volume_names: dict[int, str] = {}
+        #: DP-399. Prepared surface names that no surface in the model
+        #: carries, filled by `describe_surfaces` once the model has stopped
+        #: changing. A control scoped to one of these reaches nothing.
+        self.names_without_surface: set[str] = set()
+        #: How many faces the duplicate fusion took away, which is the one
+        #: cause of the above this runner can name.
+        self.duplicate_faces_fused = 0
+        #: DP-410. ``{dropped tag: surviving tag}`` for every coincident face
+        #: the fusion consumed, matched by centre of mass and area. The pair
+        #: is one face now and the identity that pointed at the dropped tag
+        #: has to point at the one that replaced it.
+        self.duplicate_face_successors: dict[int, int] = {}
+        self.duplicate_volume_successors: dict[int, int] = {}
+        #: DP-410. ``{tag: [name, ...]}`` -- the further prepared names a
+        #: fused surface carries beyond the one it publishes under. A face
+        #: can belong to one patch, so the extras name the same faces rather
+        #: than naming nothing.
+        self.merged_surface_names: dict[int, list[str]] = {}
         #: C31-04. One record per topology change that moved entities:
         #: ``{'stage', 'entities': {entity_id: {'from': [...], 'to': [...]}}}``.
         #: Published as ``statistics['import']['topologyChanges']``.
@@ -381,10 +674,20 @@ class GmshRun:
         #: from the extrusion's inner rim, so this maps the original tag onto
         #: the faces that took its place and must inherit its patch name.
         self.layer_replacements: dict[int, list[int]] = {}
+        #: R118. The same, one dimension up. The volume a layer is carved
+        #: out of is deleted and replaced by the layer volumes and a rebuilt
+        #: core, and all of them are still the region the user named. Maps
+        #: the original tag onto the tags that took its place.
+        self.volume_replacements: dict[int, list[int]] = {}
         #: Size fields awaiting combination into one background field. Size
         #: fields and per-volume sizes must share it, or whichever was set
         #: last would silently replace the other.
         self.background_fields: list[int] = []
+        #: DP-504. ``(row name, local size)`` for each background source, so
+        #: the combination can tell whether anything asked for a size the
+        #: boundary could outvote. ``None`` is a size the runner cannot read
+        #: off the row (a MathEval expression).
+        self.background_sizes: list[tuple[str, float | None]] = []
         #: Every curve a transfinite control put a node count on, and what it
         #: asked for. Read back after meshing, because Gmsh answers a
         #: structured request it cannot honour by meshing unstructured
@@ -412,6 +715,24 @@ class GmshRun:
         self.layer_bases: list[int] = []
         self.layer_volumes: list[int] = []
         self.layer_laterals: list[int] = []
+        #: DP-74. Each wall surface paired with the inner surface its stack
+        #: reaches, which is what the fit check reads once both are meshed.
+        self.layer_columns: list[tuple[int, int]] = []
+        #: DP-75. True when this run meshed the imported facets instead of a
+        #: parametrised remesh of them. Set by :meth:`import_tessellated`.
+        self.kept_tessellation = False
+        #: DP-55. Surfaces that bound a void inside the volume being meshed.
+        #: Their triangles are wound out of the void, which points into the
+        #: fluid - the opposite of an outer shell - so a layer grown with the
+        #: outer shell's sign lands in the hole instead of in the flow.
+        self.void_surfaces: set[int] = set()
+        #: DP-55. Surface tag -> +1 when its shell is wound outward, -1 when
+        #: the shell is inverted, read off the signed enclosed volume the
+        #: shell topology already computes.
+        self.surface_winding: dict[int, int] = {}
+        # DP-457. Which closed body each surface bounds, kept so that a
+        # coincidence can be asked whether it spans two of them.
+        self.surface_shell: dict[int, str] = {}
 
     # -- option helpers ---------------------------------------------------- #
 
@@ -481,6 +802,188 @@ class GmshRun:
         # `reproducible-one-thread.json`. Setting it would have left a comment
         # in this runner promising a guarantee the runner does not have.
 
+    #: DP-60. Suffixes whose OCCT reader Gmsh constructs only after it has
+    #: applied ``Geometry.OCCTargetUnit``, so at that moment there is nothing
+    #: for the unit to be applied to. STEP is not one of them, which is how
+    #: this was isolated.
+    UNIT_PRIME_SUFFIXES = ('.iges', '.igs')
+
+    def _prime_occ_target_unit(self, sources):
+        """Read one empty file, so the next one can carry a unit.
+
+        DP-60. MEASURED on Gmsh 4.15.2 in the ``wsl-openfoam13-gmsh``
+        runtime, one scenario per fresh process:
+
+        * with ``Geometry.OCCTargetUnit`` set to ``M``, every IGES import
+          raises ``Could not set OpenCASCADE target unit 'M'`` and imports
+          nothing -- ``pipe.iges``, ``pipe_mm.iges``, ``pipe_inch.iges`` and
+          ``elbow.iges`` alike -- and a second attempt in the same process
+          fails identically, so it is not a warm-up;
+        * the same files import with the option unset, at the file's own
+          unit: ``pipe.iges`` spans 100 x 100 x 600 where the STEP and the
+          BREP of that same pipe both give 0.1 x 0.1 x 0.6;
+        * a STEP import first, in the same process, makes the IGES import
+          succeed and land at 0.1 x 0.1 x 0.6;
+        * and so does a **zero-byte file**, which holds no geometry and is
+          never parsed. Named ``.step`` it primes, but OCCT prints
+          ``**** ERR StepFile : Undefined Parsing ... ****`` to the run's
+          stderr and then raises. Named ``.iges`` it primes without raising,
+          and the only thing it adds to the log is a second
+          ``Total number of loaded entities 0.`` beside the one the real
+          IGES import prints anyway. The IGES name is the one that ships:
+          the STEP one puts an error in front of a user whose run is fine.
+
+        The unit lives in an OCCT static that exists only once a STEP or IGES
+        reader has been constructed in the process. Gmsh's STEP path
+        constructs its reader before applying the unit; its IGES path does
+        not. Priming on an empty file costs one open and no parse, which is
+        why it is preferred over re-reading the real geometry -- that works
+        too, and doubles the import of a large assembly.
+
+        Only paid for when a source needs it, and never allowed to fail a
+        run.
+        """
+        if not any(Path(str(item)).suffix.lower() in self.UNIT_PRIME_SUFFIXES
+                   for item in sources):
+            return
+        gmsh = self.gmsh
+        current = gmsh.model.getCurrent()
+        gmsh.model.add('__foammesh_occ_unit_prime__')
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                empty = Path(directory) / 'prime.iges'
+                empty.touch()
+                try:
+                    gmsh.model.occ.importShapes(str(empty))
+                except Exception:
+                    # MEASURED not to happen for an empty IGES, and caught
+                    # anyway: constructing the reader is the whole effect,
+                    # and there is nothing in the file to read.
+                    pass
+        finally:
+            gmsh.model.remove()
+            gmsh.model.setCurrent(current)
+
+    def set_import_tolerance(self, healing, tessellated):
+        """Apply the healing page's import tolerance on the route it means.
+
+        DP-401. `Geometry.Tolerance` configures Gmsh's OCC importer, and a
+        tessellated import runs no OCC importer. What the value reaches
+        instead is `removeDuplicateNodes`, whose welding distance it is, and
+        through the surface that welding leaves, the parametrisation
+        `createGeometry` solves.
+
+        MEASURED on `naca0012` -- two STLs, Gmsh 4.15.2, 24,000 edges every
+        one of which is shared by exactly two triangles before Gmsh touches
+        it. At the page default of 1e-6 the weld takes 8,004 nodes to 7,982
+        and leaves 15 edges shared by more than two; the run reads that as a
+        non-manifold surface, turns reparametrisation off on that reading,
+        and `createGeometry` then fails with `The linear system of equations
+        did not converge (PETSc reason : -11)`. At Gmsh's own 1e-8 nothing is
+        welded away, nothing is non-manifold, and the configured 40 degrees
+        classifies into 9 surfaces. A NACA0012 is the ordinary case for this
+        and not a pathological one: the two sides of a sharp trailing edge
+        run within a micron of each other over the last of the chord.
+
+        So on a tessellated import the tolerance is left where Gmsh has it,
+        and the run says so -- as it already does for `healShapes`, which is
+        the same sentence about the same absent kernel.
+        """
+        value = float(healing.get('importTolerance', 1e-6) or 1e-6)
+        if not tessellated:
+            self.set_number('Geometry.Tolerance', value,
+                            control='gmsh/healing/importTolerance')
+            return
+        default = float(self.gmsh.option.getNumber('Geometry.Tolerance'))
+        self.ledger.record(
+            'gmsh/healing/importTolerance', value, default, applied=False,
+            note='tessellated import: this tolerance configures the OCC '
+                 'importer, and there is no CAD here for it to import')
+        if value > default:
+            self.warnings.append(
+                f'the import tolerance of {value:g} m was not applied: it '
+                f'configures the CAD importer and this import is '
+                f'tessellated. On a surface import the same number is the '
+                f'distance within which two nodes are welded into one, so a '
+                f'sharp edge whose two sides run nearer than that is sewn '
+                f'shut by it — which makes the surface non-manifold where it '
+                f'was not, and can leave its patches with no parametrisation '
+                f'to mesh on. Gmsh welds at {default:g} m here instead.')
+
+    #: DP-629 (field audit 0924 D-SH-02). Options that configure Gmsh's CAD
+    #: importer, ``occ.importShapes``. A tessellated source is read by
+    #: ``gmsh.merge`` and never reaches it, so on that route these were set,
+    #: read back and logged as honoured while changing nothing.
+    OCC_IMPORT_OPTIONS = (
+        ('Geometry.OCCSewFaces', 'sewFaces', False),
+        ('Geometry.OCCFixDegenerated', 'fixDegenerated', False),
+        # Rebuilds a solid from a closed shell. Measured: with sewing on and
+        # this off, the import has zero volumes and meshes to a bare surface.
+        ('Geometry.OCCMakeSolids', 'makeSolids', False),
+        ('Geometry.OCCFixSmallEdges', 'fixSmallEdges', False),
+        ('Geometry.OCCFixSmallFaces', 'fixSmallFaces', False),
+        ('Geometry.OCCAutoFix', 'autoFix', True),
+        ('Geometry.OCCUnionUnify', 'unionUnify', True),
+        ('Geometry.OCCImportLabels', 'importLabels', True),
+        ('Geometry.OCCParallel', 'occParallel', False),
+    )
+
+    def set_occ_import_options(self, healing, tessellated):
+        """Configure the CAD importer, or say it is not being used."""
+        skipped = []
+        for option, key, default in self.OCC_IMPORT_OPTIONS:
+            requested = bool(healing.get(key, default))
+            control = f'gmsh/healing/{key}'
+            if not tessellated:
+                self.set_number(option, int(requested), control=control)
+                continue
+            self.ledger.record(
+                control, requested, None, applied=False,
+                note='tessellated import: this configures the CAD importer, '
+                     'and a surface is read without it')
+            if requested != default:
+                skipped.append(key)
+        if skipped:
+            self.warnings.append(
+                'these import settings were not applied because they '
+                'configure the CAD importer and this import is a surface '
+                f'(STL/OBJ/PLY): {", ".join(skipped)}. The classification '
+                'angle and the duplicate-node weld are what act on a surface.')
+        self.set_import_scaling(healing, tessellated)
+
+    def set_import_scaling(self, healing, tessellated):
+        """DP-631 (field audit 0924 D-SH-01). Geometry.OCCScaling is pinned.
+
+        The store has already put the part in metres and the importer is told
+        to read in metres, so a second factor here made the Gmsh mesh a
+        different size from the viewport, the prepared geometry and every
+        metre-valued size on the Gmsh pages. MEASURED (Gmsh 4.15.2): at 1000
+        elbow.step went from 0.3247 m to 324.7 m, and elbow.stl stayed at
+        0.2999 m because a surface is not read by the CAD importer at all.
+        The unit is chosen once, at import; this option stays at 1.
+        """
+        requested = float(healing.get('importScaling', 1.0) or 1.0)
+        if not tessellated:
+            self.set_number('Geometry.OCCScaling', 1.0,
+                            control='gmsh/healing/importScaling')
+        if requested == 1.0:
+            if tessellated:
+                self.ledger.record(
+                    'gmsh/healing/importScaling', requested, None,
+                    applied=False,
+                    note='tessellated import: read without the CAD importer')
+            return
+        self.ledger.record(
+            'gmsh/healing/importScaling', requested, 1.0, applied=False,
+            note='pinned at 1: the unit is set at import, and a second '
+                 'factor would size this mesh apart from everything else')
+        self.warnings.append(
+            f'the import scaling of {requested:g} was not applied: the '
+            'geometry is already in metres from its import unit, and a '
+            'second factor would put this mesh at a different size from the '
+            'viewport and every size on these pages. Re-import with the '
+            'right unit instead.')
+
     def import_geometry(self):
         gmsh = self.gmsh
         healing = self.intent.get('healing') or {}
@@ -502,22 +1005,19 @@ class GmshRun:
                     f'{reason}')
 
         # MEASURED: without this, a 0.4 m pipe imports as 400.
+        # DP-60: and for an IGES, without the prime, it does not import at all.
+        # DP-401. Which route this import takes has to be settled before the
+        # importer is configured, because one of the options below must not
+        # be set on the tessellated route at all.
+        tessellated = [item for item in sources
+                       if str(item).lower().endswith(('.stl', '.obj', '.ply'))]
+
+        self._prime_occ_target_unit(sources)
         self.set_string('Geometry.OCCTargetUnit', 'M',
                         control='geometry.unit')
-        self.set_number('Geometry.Tolerance',
-                        healing.get('importTolerance', 1e-6),
-                        control='gmsh/healing/importTolerance')
-        self.set_number('Geometry.OCCSewFaces',
-                        int(bool(healing.get('sewFaces', False))),
-                        control='gmsh/healing/sewFaces')
-        self.set_number('Geometry.OCCFixDegenerated',
-                        int(bool(healing.get('fixDegenerated', False))),
-                        control='gmsh/healing/fixDegenerated')
-        # Rebuilds a solid from a closed shell. Measured: with sewing on and
-        # this off, the import has zero volumes and meshes to a bare surface.
-        self.set_number('Geometry.OCCMakeSolids',
-                        int(bool(healing.get('makeSolids', False))),
-                        control='gmsh/healing/makeSolids')
+        self.set_import_tolerance(healing, bool(tessellated))
+        # DP-629. The importer switches, the scaling beside them (DP-631).
+        self.set_occ_import_options(healing, bool(tessellated))
 
         # -- Plan 31: the rest of the Geometry.* family ------------------- #
         # Kept as its own block, in one place, so this file stays mergeable
@@ -527,27 +1027,7 @@ class GmshRun:
         #
         # All of these have to be established before importShapes: they
         # configure the importer, not the model.
-        self.set_number('Geometry.OCCFixSmallEdges',
-                        int(bool(healing.get('fixSmallEdges', False))),
-                        control='gmsh/healing/fixSmallEdges')
-        self.set_number('Geometry.OCCFixSmallFaces',
-                        int(bool(healing.get('fixSmallFaces', False))),
-                        control='gmsh/healing/fixSmallFaces')
-        self.set_number('Geometry.OCCAutoFix',
-                        int(bool(healing.get('autoFix', True))),
-                        control='gmsh/healing/autoFix')
-        self.set_number('Geometry.OCCUnionUnify',
-                        int(bool(healing.get('unionUnify', True))),
-                        control='gmsh/healing/unionUnify')
-        self.set_number('Geometry.OCCImportLabels',
-                        int(bool(healing.get('importLabels', True))),
-                        control='gmsh/healing/importLabels')
-        self.set_number('Geometry.OCCScaling',
-                        float(healing.get('importScaling', 1.0) or 1.0),
-                        control='gmsh/healing/importScaling')
-        self.set_number('Geometry.OCCParallel',
-                        int(bool(healing.get('occParallel', False))),
-                        control='gmsh/healing/occParallel')
+        # The OCC importer switches moved to set_occ_import_options (DP-629).
         # Read by the farfield cut and by removeAllDuplicates, both of which
         # are booleans, so it is set before either runs.
         self.set_number('Geometry.ToleranceBoolean',
@@ -556,8 +1036,6 @@ class GmshRun:
         # -- end Geometry.* block ----------------------------------------- #
 
         self.reporter.emit('progress', 'import', 0.05, 'importing geometry')
-        tessellated = [item for item in sources
-                       if str(item).lower().endswith(('.stl', '.obj', '.ply'))]
         if tessellated:
             if len(tessellated) != len(sources):
                 raise MeshFailure(
@@ -614,14 +1092,29 @@ class GmshRun:
             # mesh". Fusing the duplicates makes the interface conformal, which
             # is what a multi-region assembly needs.
             if healing.get('removeDuplicateFaces', True):
+                signatures = self._entity_signatures((2, 3))
                 before = len(gmsh.model.getEntities(2))
                 gmsh.model.occ.removeAllDuplicates()
                 gmsh.model.occ.synchronize()
                 after = len(gmsh.model.getEntities(2))
+                self._follow_duplicate_fusion(signatures)
                 if after != before:
+                    self.duplicate_faces_fused = before - after
                     self.ledger.record(
                         'gmsh/healing/removeDuplicateFaces', True, True,
-                        note=f'{before - after} duplicate face(s) fused')
+                        note=f'{count_text(before - after, "duplicate face")}'
+                             ' fused')
+            # DP-399. Both steps above can take a face away, and neither said
+            # so to the identity map. MEASURED on two boxes sharing a face:
+            # the fusion drops one tag of each duplicate pair and renumbers
+            # nothing, so the identity whose face was the dropped one still
+            # points at a tag the model no longer has -- and a prepared name
+            # is then carried forward onto a dead tag, where the census, the
+            # receipt and the boundary-layer scope all read over the surfaces
+            # that remain, agree with each other, and are wrong. This is the
+            # first point at which both are done, so it is where they are
+            # followed. It costs nothing when nothing moved.
+            self.revalidate_scopes('healing')
 
         volumes = gmsh.model.getEntities(3)
         surfaces = gmsh.model.getEntities(2)
@@ -636,9 +1129,10 @@ class GmshRun:
             mode = self.dimensionality.get('mode') or 'two_d'
             if volumes:
                 raise MeshFailure(
-                    f'the job asked for a {mode} mesh and the import produced '
-                    f'{len(volumes)} volume(s). This route meshes a planar '
-                    'section and extrudes it into exactly one cell of '
+                    f'the job asked for a {mode} mesh and the import '
+                    f'produced {count_text(len(volumes), "volume")}. This '
+                    'route meshes a planar section and extrudes it into '
+                    'exactly one cell of '
                     'thickness, so a solid cannot be its input: supply the '
                     'section face, or mesh in three dimensions.')
             if not surfaces:
@@ -688,8 +1182,8 @@ class GmshRun:
         self.statistics['import'].update(census['statistics'])
         self.reporter.emit(
             'progress', 'import', 0.15,
-            f'imported {len(volumes)} volume(s), {len(surfaces)} surface(s)'
-            f'{census["message"]}',
+            f'imported {count_text(len(volumes), "volume")}, '
+            f'{count_text(len(surfaces), "surface")}{census["message"]}',
             {'diagonal_m': round(diagonal, 6), **census['details']})
 
     def surface_patch_name(self, tag):
@@ -711,6 +1205,21 @@ class GmshRun:
             # look up, and `face_41` would publish as a wall.
             named = self.generated_names.get(tag)
         return (str(named) if named else f'face_{source}'), bool(named)
+
+    def declared_surface_names(self) -> set[str]:
+        """Every patch name the prepared geometry declared, alive or not.
+
+        The counterpart to :meth:`surface_patch_name`, which asks a surface
+        what it is called. DP-399: a name with no surface is not a surface
+        with no name, and the census only ever counted the second kind.
+        """
+        names = (self.job.get('entityNames') or {}).get('surfaces') or {}
+        if not names:
+            # The version-1 form, keyed by a source-local tag. Its keys
+            # collide across sources; its values do not, and the values are
+            # the whole of the question here.
+            names = self.job.get('surfaceNames') or {}
+        return {str(label) for label in names.values() if label}
 
     @staticmethod
     def _tag_ranges(tags):
@@ -742,6 +1251,12 @@ class GmshRun:
                 named.setdefault(name, []).append(tag)
             else:
                 unnamed.append(tag)
+            # DP-410. A name the fusion merged into this one names these
+            # faces too. It publishes under the other name -- a face belongs
+            # to one patch -- but it is not a name without a surface, and
+            # counting it as one is what refused the run.
+            for alias in self.merged_surface_names.get(int(tag), ()):
+                named.setdefault(alias, []).append(tag)
         parts = [f'{name} = {self._tag_ranges(owned)}'
                  for name, owned in sorted(named.items())]
         message = f': {"; ".join(parts)}' if parts else ''
@@ -752,9 +1267,27 @@ class GmshRun:
                 'prepared geometry and will publish as '
                 + ', '.join(f'face_{self.surface_origin.get(tag, tag)}'
                             for tag in unnamed))
+        lost = sorted(self.declared_surface_names() - set(named))
+        self.names_without_surface = set(lost)
+        if lost:
+            message += (
+                f'{";" if parts or unnamed else ":"} '
+                + ', '.join(lost)
+                + (' is a prepared patch name' if len(lost) == 1
+                   else ' are prepared patch names')
+                + ' that no surface in this model carries')
+            self.warnings.append(
+                'the prepared geometry names ' + ', '.join(lost)
+                + ', which no imported surface carries, so any control '
+                'scoped to ' + ('it' if len(lost) == 1 else 'them')
+                + ' reaches nothing')
         census = {'surfacesByPatch': {name: sorted(owned)
                                       for name, owned in named.items()},
-                  'unnamedSurfaces': sorted(unnamed)}
+                  'unnamedSurfaces': sorted(unnamed),
+                  # DP-399. The count this is measured against is the
+                  # receipt's own: 14 declared against 13 surfaces read as
+                  # healthy because nobody subtracted them.
+                  'namesWithoutSurface': lost}
         return {'message': message, 'details': census, 'statistics': census}
 
     #: Repairs `occ.healShapes` can perform, in the order its signature takes
@@ -878,7 +1411,11 @@ class GmshRun:
         'gmsh.option.setNumber("General.Terminal", 0)\n'
         'angle = float(sys.argv[1])\n'
         'reparametrize = int(sys.argv[2])\n'
-        'for item in sys.argv[4:]:\n'
+        # DP-401. The run's options stand when the run makes this call, so
+        # they have to stand when the probe makes it: a probe that clears a
+        # call under settings the run does not use has cleared nothing.
+        'gmsh.option.setNumber("Geometry.Tolerance", float(sys.argv[4]))\n'
+        'for item in sys.argv[5:]:\n'
         '    gmsh.merge(item)\n'
         '    gmsh.model.mesh.removeDuplicateNodes()\n'
         'verdict = {"ok": True, "error": ""}\n'
@@ -955,7 +1492,10 @@ class GmshRun:
                 'with')
         argv = [sys.executable, '-c', self.CLASSIFY_PROBE,
                 repr(float(angle)), '1' if reparametrize else '0',
-                str(self.CLASSIFY_PROBE_BYTES)]
+                str(self.CLASSIFY_PROBE_BYTES),
+                # DP-401: whatever tolerance is standing here, not Gmsh's
+                # default, because it is what the run will classify under.
+                repr(float(self.gmsh.option.getNumber('Geometry.Tolerance')))]
         argv.extend(str(item) for item in sources)
         try:
             completed = subprocess.run(
@@ -1017,7 +1557,7 @@ class GmshRun:
                 return _Classification(candidate, bool(reparametrize))
             attempts.append(
                 f'{self._classification_words(candidate, reparametrize)} '
-                f'-- {detail}')
+                f'— {detail}')
         raise MeshFailure(
             'this triangulation cannot be classified into patches Gmsh can '
             'mesh. Every setting was tried:\n  '
@@ -1076,22 +1616,7 @@ class GmshRun:
         gmsh = self.gmsh
         angle = float(healing.get('classificationAngle', 40.0))
 
-        source_of_import = {}
-        for index, item in enumerate(sources):
-            before = {tag for _dim, tag in gmsh.model.getEntities(2)}
-            gmsh.merge(str(item))
-            gmsh.model.mesh.removeDuplicateNodes()
-            added = [tag for _dim, tag in gmsh.model.getEntities(2)
-                     if tag not in before]
-            for tag in added:
-                source_of_import[tag] = str(item)
-            # WP-01 F-35. Each `solid` block of an STL arrives as its own
-            # discrete surface, so the surfaces this file added are the shells
-            # it contributed. Volumes come later, from the shells together.
-            self.import_receipts.append(self._source_receipt(
-                index, item, stage='tessellated', surfaces=len(added),
-                volumes=0, shells=len(added),
-                added={'surface': sorted(added), 'volume': []}))
+        source_of_import = self.merge_tessellated(sources, healing)
 
         # Plan 28 WP7. Each `solid` of an STL arrives as its own discrete
         # surface, in file order, and those are the surfaces the job names
@@ -1123,9 +1648,10 @@ class GmshRun:
         reparametrize = not shared
         if shared:
             self.warnings.append(
-                f'this surface is not manifold: {shared} edge(s) are shared '
-                'by more than two triangles, so it pinches or doubles back '
-                'on itself along them. Gmsh was therefore asked to classify '
+                f'this surface is not manifold: {count_text(shared, "edge")} '
+                f'{agreeing(shared, "is", "are")} shared by more than two '
+                'triangles, so it pinches or doubles back on itself along '
+                'them. Gmsh was therefore asked to classify '
                 'it without reparametrisation, which is the only form of '
                 'that call measured to finish on a surface like this; with '
                 'reparametrisation it does not stop, and the run is killed '
@@ -1145,7 +1671,26 @@ class GmshRun:
         gmsh.model.mesh.classifySurfaces(
             settled.angle * math.pi / 180.0, True, settled.reparametrize,
             math.pi / 2)
-        gmsh.model.mesh.createGeometry()
+        # DP-75. ``createGeometry`` throws the imported facets away and
+        # rebuilds every patch on a parametrisation Gmsh invents for it. A
+        # patch that wraps -- a boss, a collar, anything whose facets face
+        # more than one way round -- has no parametrisation that is one to
+        # one, and the remesh built on it crosses itself. Classification is
+        # still wanted, because the patches, the names and the shells are
+        # read off it; only the remesh is not. So it is skipped, and the
+        # discrete patches keep the triangles they were classified from.
+        keep = bool(healing.get('keepTessellation'))
+        self.ledger.record('gmsh/healing/keepTessellation', False, keep,
+                           applied=keep,
+                           note='mesh the imported facets rather than a '
+                                'parametrised remesh of them')
+        if keep:
+            self.kept_tessellation = True
+        else:
+            gmsh.model.mesh.createGeometry()
+        record = self.statistics.get('classification')
+        if isinstance(record, dict):
+            record['keptTessellation'] = keep
         angle = settled.angle
 
         surfaces = [tag for _dim, tag in gmsh.model.getEntities(2)]
@@ -1163,8 +1708,9 @@ class GmshRun:
         unplaced = [tag for tag in surfaces if tag not in self.surface_origin]
         if unplaced:
             self.warnings.append(
-                f'{len(unplaced)} classified surface(s) could not be traced to '
-                'an imported solid and keep a generated name')
+                f'{count_text(len(unplaced), "classified surface")} could '
+                'not be traced to an imported solid and kept '
+                f'{agreeing(len(unplaced), "a generated name", "generated names")}')
 
         # Classification renumbers, so the shells are re-derived from the
         # triangulation that survived it rather than from the import order.
@@ -1189,9 +1735,26 @@ class GmshRun:
             # meshes as itself, so two volumes never claim the same region.
             loops.extend(gmsh.model.geo.addSurfaceLoop(list(void))
                          for void in plan.voids)
+            # DP-55. A hole's boundary faces the fluid from the other side,
+            # and the boundary layer has to know that before it is extruded.
+            for void in plan.voids:
+                self.void_surfaces.update(int(tag) for tag in void)
             topology.shell(plan.name).volume_tag = int(
                 gmsh.model.geo.addVolume(loops))
+        for shell in topology.shells:
+            winding = 1 if shell.volume >= 0.0 else -1
+            for tag in shell.surfaces:
+                self.surface_winding[int(tag)] = winding
+                self.surface_shell[int(tag)] = str(shell.name)
         gmsh.model.geo.synchronize()
+
+        # DP-59. The volumes exist now, and until this call none of them
+        # belonged to anything: the receipts above declare `volume: []`,
+        # truthfully, because the import did not make them. Registering them
+        # here is the other half of that sentence, and without it every region
+        # control scoped to a tessellated source refuses the run naming a
+        # volume the run does contain.
+        volume_identities = self._attribute_volumes(topology, sources)
 
         self.warnings.extend(topology.warnings)
         voids = sum(len(plan.voids) for plan in topology.volumes)
@@ -1204,12 +1767,74 @@ class GmshRun:
             'surfaces': len(surfaces), 'classificationAngle': angle,
             'importedSolids': len(self.import_surface_tags),
             'tracedSurfaces': len(self.surface_origin),
+            'volumeIdentities': dict(volume_identities),
         }
         self.reporter.emit(
             'progress', 'import', 0.12,
-            f'{len(topology.shells)} closed shell(s) -> '
-            f'{len(topology.volumes)} volume(s), {voids} void(s)',
+            f'{count_text(len(topology.shells), "closed shell")} -> '
+            f'{count_text(len(topology.volumes), "volume")}, '
+            f'{count_text(voids, "void")}',
             {'shells': topology.to_list()})
+
+    def _attribute_volumes(self, topology, sources) -> dict:
+        """Register ``<source_id>:volume:<n>`` for the volumes a file bounds.
+
+        DP-59. An identity is registered by the import that adds the entity,
+        and a tessellated import adds no volume: the volumes are made from the
+        shells together, once every file has been read. Nothing attributed
+        them back to the file whose shell bounds them, so no volume identity
+        existed for any tessellated source. MEASURED across every Gmsh result
+        on disk: 14 runs report scopes that matched nothing, 19 scopes in all,
+        and every one of them is a volume scope.
+
+        The join the CAD path gets for free is available here too. A shell
+        records the file it came from, and ``surface_origin`` maps each
+        classified piece back to the imported solid it was cut from. Imported
+        solids arrive in file order, one per ``solid`` block, so ordering a
+        source's volumes by the lowest imported solid their shell traces to
+        numbers them the way the prepared side numbers a region: by body index
+        within the file, and not by size, which is how the shells themselves
+        are ordered. MEASURED across every published shell census: 27 of 28
+        sources bound exactly one volume, where no ordering can disagree with
+        another; the exception is ``two_cubes_one_file.stl``, whose two cubes
+        are two bodies of one file and where the ordering is the question.
+        """
+        placed = {str(item): index for index, item in enumerate(sources)}
+        ordered: dict[str, list] = {}
+        for plan in topology.volumes:
+            shell = topology.shell(plan.name)
+            tag = int(getattr(shell, 'volume_tag', 0) or 0)
+            if not tag:
+                continue
+            imported = sorted(
+                self.surface_origin[surface] for surface in shell.surfaces
+                if surface in self.surface_origin)
+            if not imported:
+                # A shell no piece of which traces to an imported solid
+                # belongs to no file, and an identity that cannot be checked
+                # is what these identities exist to stop being invented.
+                continue
+            ordered.setdefault(str(shell.source or ''), []).append(
+                (imported[0], tag))
+
+        identities: dict[str, int] = {}
+        for path, entries in sorted(ordered.items()):
+            index = placed.get(path)
+            if index is None:
+                # A shell spanning two files records both of them, joined.
+                # It is one volume belonging to neither, and it keeps no
+                # identity rather than an arbitrary one of the two.
+                continue
+            record = self._source_record(index, path)
+            source_id = str(record.get('source_id') or '')
+            if not source_id:
+                continue
+            for local, (_solid, tag) in enumerate(sorted(entries)):
+                identity = f'{source_id}:volume:{local}'
+                self.entity_tags[identity] = {
+                    'kind': 'volume', 'dim': 3, 'tags': [tag]}
+                identities[identity] = tag
+        return identities
 
     def _node_coordinates(self):
         """Every mesh node as ``tag -> (x, y, z)``, for the shell geometry."""
@@ -1263,6 +1888,51 @@ class GmshRun:
             return {}
         return record
 
+    def merge_tessellated(self, sources, healing) -> dict:
+        """Merge each STL/OBJ file; return which file each surface came from.
+
+        DP-613 (field audit 0924 gmsh-sizing D10). ``removeDuplicateNodes``
+        ran after every merge whatever "Remove duplicate nodes" said. MEASURED
+        on Gmsh 4.15.2 (field_fix_scratch/sizing/probe613): the STL reader
+        already joins the points of one file -- a cube split into two solids
+        in one file is 8 nodes with or without the call -- and the call only
+        joins points *between* files: the same cube over two files is 16
+        nodes without it and 8 with it. So the checkbox now decides that, and
+        a multi-file import left unjoined says what it risks.
+        """
+        gmsh = self.gmsh
+        weld = bool(healing.get('removeDuplicateNodes', True))
+        source_of_import = {}
+        for index, item in enumerate(sources):
+            before = {tag for _dim, tag in gmsh.model.getEntities(2)}
+            gmsh.merge(str(item))
+            if weld:
+                gmsh.model.mesh.removeDuplicateNodes()
+            added = [tag for _dim, tag in gmsh.model.getEntities(2)
+                     if tag not in before]
+            for tag in added:
+                source_of_import[tag] = str(item)
+            # WP-01 F-35. Each `solid` block of an STL arrives as its own
+            # discrete surface, so the surfaces this file added are the shells
+            # it contributed. Volumes come later, from the shells together.
+            self.import_receipts.append(self._source_receipt(
+                index, item, stage='tessellated', surfaces=len(added),
+                volumes=0, shells=len(added),
+                added={'surface': sorted(added), 'volume': []}))
+        self.ledger.record(
+            'gmsh/healing/removeDuplicateNodes.betweenFiles', weld, weld,
+            applied=weld,
+            note=('coincident points joined between the imported files'
+                  if weld else 'unticked: points shared between the imported '
+                  'files were left apart (points within one file are always '
+                  'joined by the STL reader)'))
+        if not weld and len(sources) > 1:
+            self.warnings.append(
+                '"Remove duplicate nodes" is off, so the '
+                f'{len(sources)} imported files were not joined where they '
+                'meet; a body split across files will read as open shells')
+        return source_of_import
+
     def _source_receipt(self, index, path, *, stage, surfaces, volumes,
                         shells, added) -> dict:
         """One import receipt, with the entity mapping this source produced.
@@ -1274,21 +1944,31 @@ class GmshRun:
         """
         record = self._source_record(index, path)
         source_id = str(record.get('source_id') or '')
+        declared = int(record.get('declared_surfaces') or 0)
+        found = len(added.get('surface') or ())
+        shared = self._shared_listings(record, declared, found)
         entities = []
         if source_id:
             for kind, tags in added.items():
                 dimension = 2 if kind == 'surface' else 3
-                for local, tag in enumerate(tags):
+                listings = self._listing_tags(
+                    tags, shared if kind == 'surface' else {})
+                for local, owned in enumerate(listings):
                     identity = f'{source_id}:{kind}:{local}'
                     self.entity_tags[identity] = {
-                        'kind': kind, 'dim': dimension, 'tags': [int(tag)]}
+                        'kind': kind, 'dim': dimension, 'tags': list(owned)}
                     entities.append({'entity_id': identity, 'kind': kind,
-                                     'dim': dimension, 'tags': [int(tag)]})
-        declared = int(record.get('declared_surfaces') or 0)
-        found = len(added.get('surface') or ())
+                                     'dim': dimension, 'tags': list(owned)})
+        if shared:
+            self.ledger.record(
+                f'sharedFaces:{source_id}', len(shared), len(shared),
+                note=(f'{count_text(len(shared), "face")} two solids share '
+                      'imported once and answer to both listings: '
+                      + ', '.join(f'{alias} = {first}' for alias, first
+                                  in sorted(shared.items()))))
         if not source_id:
             status = 'unmapped'
-        elif declared and declared != found:
+        elif declared and declared - len(shared) != found:
             # The prepared revision named a different number of faces than
             # Gmsh made. Saying so is the difference between a scope that is
             # known to be approximate and one that quietly points elsewhere.
@@ -1302,10 +1982,53 @@ class GmshRun:
             'import_stage': stage,
             'surfaces': surfaces, 'volumes': volumes, 'shells': shells,
             'entities': entities,
+            # DP-399. Kept so the status can be decided again later, against
+            # the tags the model holds rather than the ones import made.
+            'declared_surfaces': declared,
             'mapping_confidence': float(record.get('mapping_confidence', 1.0)
                                         if record else 0.0),
             'mapping_status': status,
         }
+
+    @staticmethod
+    def _shared_listings(record, declared, found) -> dict:
+        """``{second listing: first listing}`` for this source's shared faces.
+
+        DP-546. Used only when the import agrees with it: the file listed
+        *declared* faces, the job says ``len(shared)`` of those are a face two
+        solids share, and Gmsh added exactly the rest. Any other count means
+        the import did something the prepared walk did not foresee, and the
+        plain positional join -- with its ``partial`` status -- says so.
+        """
+        shared = {}
+        for alias, first in ((record or {}).get('shared_surfaces')
+                             or {}).items():
+            try:
+                shared[int(alias)] = int(first)
+            except (TypeError, ValueError):
+                return {}
+        if not shared or declared - len(shared) != found:
+            return {}
+        return shared
+
+    @staticmethod
+    def _listing_tags(tags, shared) -> list:
+        """The tags each listing of one source owns, listing by listing.
+
+        DP-546. Gmsh binds a face two solids share at its first listing and
+        numbers every later face from there, so the second listing takes the
+        first one's tag and spends none of its own.
+        """
+        if not shared:
+            return [[int(tag)] for tag in tags]
+        listings: list[list[int]] = []
+        remaining = iter(tags)
+        for local in range(len(tags) + len(shared)):
+            if local in shared:
+                listings.append(list(listings[shared[local]]))
+            else:
+                listings.append([int(next(remaining))])
+        return listings
 
     def retarget_entities(self, stage, successors, *, dimensions=(2,)):
         """Follow every entity identity through one topology change.
@@ -1351,9 +2074,13 @@ class GmshRun:
         alive = {dimension: {int(tag) for _dim, tag
                              in self.gmsh.model.getEntities(dimension)}
                  for dimension in dimensions}
-        successors = {tag: [tag] for tags in alive.values() for tag in tags}
-        moved = self.retarget_entities(stage, successors,
-                                       dimensions=dimensions)
+        # DP-527. Per dimension: one tag-keyed map over both let a surviving
+        # volume 7 keep a consumed surface 7 alive.
+        moved: dict[str, dict] = {}
+        for dimension in dimensions:
+            moved.update(self.retarget_entities(
+                stage, {tag: [tag] for tag in alive[dimension]},
+                dimensions=(dimension,)))
         if not moved:
             return moved
         scoped = self.job.get('scopeEntities') or {}
@@ -1378,6 +2105,167 @@ class GmshRun:
                 current = self.entity_tags.get(entry['entity_id'])
                 if current is not None:
                     entry['tags'] = list(current['tags'])
+            # DP-399. The status used to be settled during import, before
+            # healing and before the duplicate fusion, so a source that lost
+            # a face to either still reported `exact` -- the one field a
+            # reader would consult to ask whether the mapping held. It is the
+            # same question; this is the first point at which it can be
+            # answered.
+            if receipt.get('mapping_status') == 'unmapped':
+                continue
+            declared = int(receipt.get('declared_surfaces') or 0)
+            alive = sum(1 for entry in receipt.get('entities') or ()
+                        if entry['kind'] == 'surface' and entry['tags'])
+            receipt['mapping_status'] = (
+                'exact' if not declared or declared == alive else 'partial')
+
+    def _entity_signatures(self, dimensions=(2, 3)) -> dict:
+        """Where each entity is and how big it is, keyed by tag.
+
+        DP-410. The one thing that survives ``removeAllDuplicates``: the tag
+        numbering does not, but two coincident faces have one centre of mass
+        and one area between them, and that is still true of the single face
+        the fusion leaves behind. Rounded, because the fused face is rebuilt
+        rather than kept and the arithmetic is not bit-identical.
+
+        DP-527. Keyed by ``(dim, tag)``, not by the tag alone. Gmsh numbers
+        each dimension from 1, so surface 1 and volume 1 are two entities with
+        one number, and a tag-keyed map let the volume's signature overwrite
+        the surface's. MEASURED on G1 `jacketed_pipe.step`: tag 7, the jacket's
+        copy of the core's cylinder, has exactly the centre and area of the
+        surviving tag 1 -- but surface 1's signature had been replaced by
+        volume 1's, so the fusion found "no survivor", face6 was reported as a
+        name no surface carried and its scope as unresolved.
+        """
+        signatures: dict[tuple, tuple] = {}
+        occ = self.gmsh.model.occ
+        for dimension in dimensions:
+            for _dim, tag in occ.getEntities(dimension):
+                try:
+                    centre = occ.getCenterOfMass(dimension, tag)
+                    mass = occ.getMass(dimension, tag)
+                except Exception:  # noqa: BLE001 - OCC raises many ways
+                    continue
+                signatures[(int(dimension), int(tag))] = (
+                    dimension,
+                    tuple(round(float(value), 9) for value in centre),
+                    # Nine significant figures, not nine decimal places: the
+                    # area of a large face carries its magnitude with it and
+                    # an absolute rounding would compare the noise.
+                    float('%.8e' % float(mass)))
+        return signatures
+
+    def _follow_duplicate_fusion(self, before: dict) -> dict:
+        """Point each identity the fusion consumed at the face that replaced it.
+
+        DP-410. ``removeAllDuplicates`` fuses two coincident faces into one,
+        which is what makes a shared interface conformal and is why it is on
+        by default. It also drops one tag of the pair. ``revalidate_scopes``
+        maps every *surviving* tag to itself, so the dropped one had no
+        successor at all: it was recorded as consumed, the prepared name it
+        carried became a name no surface held, and DP-399 refused the run.
+
+        MEASURED on `baffled_chamber.step` in the campaign runtime: 14
+        surfaces in, tag 14 out, and the survivor -- tag 13, same centre of
+        mass, same area, adjacent to the same single volume -- is an external
+        face that can carry exactly the boundary layer the run was refused
+        for. The two tags were one face all along. So the successor is found
+        by that signature and the identity follows it.
+
+        A dropped tag that matches no survivor, or more than one, is left
+        consumed: that is the case this cannot read, and guessing it would
+        put a user's patch name on a face chosen by arithmetic.
+        """
+        dimensions = tuple(sorted({dimension for dimension, _tag in before}))
+        after = self._entity_signatures(dimensions)
+        if not before:
+            return {}
+        by_signature: dict[tuple, list[tuple]] = {}
+        for key, signature in after.items():
+            by_signature.setdefault(signature, []).append(key)
+        # One successor map per dimension, for the reason the signatures are
+        # keyed by dimension: a surviving surface 3 is no successor for a
+        # consumed volume 3.
+        successors = {dimension: {tag: [tag] for dim, tag in after
+                                  if dim == dimension}
+                      for dimension in dimensions}
+        for dimension, tag in sorted(set(before) - set(after)):
+            candidates = by_signature.get(before[(dimension, tag)]) or []
+            if len(candidates) != 1:
+                self.ledger.record(
+                    f'duplicateFusion:{tag}', tag, None, applied=False,
+                    note=('the fusion consumed this entity and '
+                          + ('no survivor' if not candidates
+                             else f'{len(candidates)} survivors')
+                          + ' share its centre of mass and size, so anything '
+                            'scoped to it is refused rather than moved'))
+                continue
+            survivor = candidates[0][1]
+            successors[dimension][tag] = [survivor]
+            if dimension == 2:
+                self.duplicate_face_successors[int(tag)] = int(survivor)
+            else:
+                self.duplicate_volume_successors[int(tag)] = int(survivor)
+        if self.duplicate_face_successors or self.duplicate_volume_successors:
+            for dimension in dimensions:
+                self.retarget_entities('duplicate-fusion',
+                                       successors[dimension],
+                                       dimensions=(dimension,))
+        return self.duplicate_face_successors
+
+    def _announce_merged_names(self) -> None:
+        """Say which prepared names the fusion made into one face.
+
+        DP-410. Two names on one face is not an error -- the faces really are
+        one face now -- but it is a thing the user did that the run quietly
+        changed, and a patch they named that will not appear in the mesh
+        under its own name. It is said once, with both names in it.
+        """
+        for tag in sorted(self.merged_surface_names):
+            published = self.entity_surface_names.get(int(tag))
+            extras = self.merged_surface_names[tag]
+            if not published:
+                continue
+            if self._bounds_two_volumes(tag):
+                # DP-527. The two sides of an interface between two solids
+                # are the one pair the fusion exists for: each solid brings
+                # its own copy, and fusing them is what makes the interface
+                # conformal. Neither name publishes as a patch -- the face is
+                # interior -- so "publishes under" was false and "turn off
+                # remove duplicate faces" was advice that breaks the volume
+                # mesh. MEASURED on G1 `jacketed_pipe`: face0/face6 is the
+                # core-to-jacket interface, and the prepared group manifest
+                # already declares it as an interface pair.
+                # DP-557. The requested side is the list of names that fused
+                # and the effective side the one surface they became, so the
+                # ledger's string equality compared a list with a name and
+                # filed every conformal interface under `controlMismatches`.
+                # The fusion is what an interface between two volumes asks
+                # for: it matched.
+                self.ledger.record(
+                    f'mergedInterface:{published}', sorted(extras), published,
+                    note='the two sides of an interface between two volumes '
+                         'fused into one conformal surface',
+                    matched=True)
+                continue
+            self.warnings.append(
+                'the import fused coincident faces, so '
+                + ', '.join(sorted(extras))
+                + (' names' if len(extras) == 1 else ' name')
+                + f' the same surface as {published} and the patch publishes '
+                  f'under {published}. Turn off "remove duplicate faces" if '
+                  'these were meant to stay separate patches.')
+            self.ledger.record(
+                f'mergedPatch:{published}', sorted(extras), published,
+                note='coincident faces fused into one surface')
+
+    def _bounds_two_volumes(self, tag) -> bool:
+        """Whether surface *tag* lies between two volumes, i.e. is interior."""
+        try:
+            upward, _down = self.gmsh.model.getAdjacencies(2, int(tag))
+        except Exception:  # noqa: BLE001 - an unanswerable model is not one
+            return False
+        return len(upward) >= 2
 
     def _entity_counts(self) -> dict:
         """How many entities of each dimension the model holds right now.
@@ -1389,10 +2277,21 @@ class GmshRun:
                 for dimension in (2, 3)}
 
     def _surface_triangles(self, tag):
-        """The triangles of one discrete surface, as sorted node triples.
+        """The triangles of one discrete surface, as oriented node triples.
 
         Node tags survive classification; element tags do not. A triple is
         therefore the one key that identifies a triangle on both sides.
+
+        DP-456. The triple used to be sorted, and on a conformal assembly
+        that made two triangles one key: the interface is drawn once by each
+        body, from the same welded nodes, and the two copies differ only in
+        winding. MEASURED on `baffled_chamber`, whose two bodies are 180 and
+        12 triangles: both copies of the interface voted for the same file,
+        so :func:`regroup_classified` handed the downstream body's cap to the
+        upstream one and the split came out 182 and 10 -- one body with five
+        crowded edges and one with a hole, neither of them closed, and the
+        run refused. Rotating to the smallest node instead of sorting keeps
+        the cycle, so the two copies are two keys and each goes home.
         """
         triples = set()
         types, _elements, nodes = self.gmsh.model.mesh.getElements(2, tag)
@@ -1401,7 +2300,7 @@ class GmshRun:
                 continue
             flat = [int(value) for value in node_tags]
             for start in range(0, len(flat) - 2, 3):
-                triples.add(tuple(sorted(flat[start:start + 3])))
+                triples.add(oriented_key(flat[start:start + 3]))
         return triples
 
     def census_triangulation(self):
@@ -1505,23 +2404,26 @@ class GmshRun:
         volumes = gmsh.model.getEntities(3)
         if not volumes:
             raise MeshFailure(
-                f'cutting the farfield box against {len(bodies)} solid(s) '
-                'left no volume at all; the box was consumed by the cut, '
+                'cutting the farfield box against '
+                f'{count_text(len(bodies), "solid")} left no volume at all; '
+                'the box was consumed by the cut, '
                 'which happens when a solid is larger than the padding '
                 'allows for')
         domain, sealed = self.classify_cut_volumes(volumes, origin, span,
                                                    diagonal)
         if not domain:
             raise MeshFailure(
-                f'cutting the farfield box against {len(bodies)} solid(s) '
-                f'left {len(volumes)} volume(s), none of them bounded by a '
-                'side of the generated box, so none of them is the external '
+                'cutting the farfield box against '
+                f'{count_text(len(bodies), "solid")} left '
+                f'{count_text(len(volumes), "volume")}, none of them bounded '
+                'by a side of the generated box, so none of them is the external '
                 'domain. A solid reaching outside the padding is the usual '
                 'cause; increase the padding or supply the domain as its '
                 'own surface.')
         if len(domain) > 1:
             raise MeshFailure(
-                f'cutting the farfield box against {len(bodies)} solid(s) '
+                'cutting the farfield box against '
+                f'{count_text(len(bodies), "solid")} '
                 f'split the external domain into {len(domain)} separate '
                 'volumes, each touching the generated box. Meshing one of '
                 'them would silently drop the rest of the flow region, so '
@@ -1554,8 +2456,10 @@ class GmshRun:
         self.name_farfield_faces(box_faces, origin, span, diagonal)
 
         self.ledger.record('gmsh/farfield/enabled', True, True,
-                           note=f'{len(bodies)} solid(s) cut out of a box '
-                                f'{padding:g} diagonal(s) larger on each side')
+                           note=f'{count_text(len(bodies), "solid")} cut out '
+                                f'of a box {padding:g} '
+                                f'{agreeing(padding, "diagonal")} larger on '
+                                'each side')
         self.ledger.record('gmsh/farfield/padding', padding, padding,
                            note=f'{standoff:.6g} m on each side')
         self.statistics['farfield'] = {
@@ -1575,7 +2479,7 @@ class GmshRun:
         }
         self.reporter.emit(
             'progress', 'import', 0.12,
-            f'built a farfield box around {len(bodies)} solid(s)',
+            f'built a farfield box around {count_text(len(bodies), "solid")}',
             {'standoff_m': round(standoff, 6)})
         return True
 
@@ -1639,20 +2543,22 @@ class GmshRun:
         with an alternative, not the only thing the product can do.
         """
         self.ledger.record('gmsh/farfield/sealedCavities', policy, policy,
-                           note=f'{len(sealed)} sealed cavity(ies) found')
+                           note=f'{_cavities(len(sealed))} found')
         if not sealed:
             return self.gmsh.model.getEntities(3)
         sizes = ', '.join(f'{mass:.3g} m^3' for mass, _tag in sealed)
         if policy == 'refuse':
             raise MeshFailure(
-                f'{len(sealed)} sealed cavity(ies) inside the geometry were '
+                f'{_cavities(len(sealed))} inside the geometry '
+                f'{agreeing(len(sealed), "was", "were")} '
                 f'left by the farfield cut ({sizes}), and this case asks to '
                 'be told rather than have them decided. External flow does '
                 'not reach them. Choose to discard them to mesh the outside '
                 'only, or to keep them to mesh them as separate regions.')
         if policy == 'keep':
             self.warnings.append(
-                f'{len(sealed)} sealed cavity(ies) inside the geometry were '
+                f'{_cavities(len(sealed))} inside the geometry '
+                f'{agreeing(len(sealed), "was", "were")} '
                 'left by the farfield cut and kept, as this case asks: they '
                 'mesh as regions disconnected from the external domain, so '
                 f'the mesh has {len(domain) + len(sealed)} volumes. Their '
@@ -1665,7 +2571,8 @@ class GmshRun:
             self.gmsh.model.occ.remove([(3, tag)], recursive=True)
         self.gmsh.model.occ.synchronize()
         self.warnings.append(
-            f'{len(sealed)} sealed cavity(ies) inside the geometry were '
+            f'{_cavities(len(sealed))} inside the geometry '
+            f'{agreeing(len(sealed), "was", "were")} '
             'left by the farfield cut and discarded: external flow does not '
             'reach them, and meshing them would produce a second, '
             f'disconnected region. Their volumes were {sizes}')
@@ -1753,7 +2660,6 @@ class GmshRun:
             self.scope_volumes, absent = self._scopes_by_identity(
                 scoped.get('volumes') or {}, 'volume')
             self.unresolved_scopes.extend(missing + absent)
-            self._name_entities()
         else:
             mapping = self.job.get('scopeSurfaces') or {}
             # Plan 28 WP7. After a tessellated import the indices name the
@@ -1792,10 +2698,15 @@ class GmshRun:
                     self.scope_volumes[token] = resolved
                 else:
                     self.unresolved_scopes.append(token)
+        # DP-58. This was inside the identity branch above, which is
+        # reached only when the job carries a scope. A case with no scoped
+        # control -- 19 of the 33 tessellated runs this repository has
+        # published -- therefore threw away names the job was carrying for it.
+        # Naming an entity and scoping a control to it are two different
+        # questions about the same map.
+        self._name_entities()
         if self.unresolved_scopes:
-            self.warnings.append(
-                'these scopes matched no imported entity and were skipped: '
-                + ', '.join(sorted(set(self.unresolved_scopes))))
+            self.warnings.append(self._unresolved_scope_sentence())
         self.refuse_unresolved_scopes()
 
     def _scopes_by_identity(self, mapping, kind):
@@ -1830,12 +2741,63 @@ class GmshRun:
                             ('volume', names.get('volumes') or {})):
             target = (self.entity_surface_names if kind == 'surface'
                       else self.entity_volume_names)
-            for identity, label in table.items():
+            for identity, label in sorted(table.items()):
                 record = self.entity_tags.get(str(identity))
                 if record is None or record['kind'] != kind or not label:
                     continue
                 for tag in record['tags']:
-                    target[int(tag)] = str(label)
+                    # DP-410. Two identities can share a tag: the duplicate
+                    # fusion makes one face out of two, and both prepared
+                    # names then belong to it. `target[tag] = label` alone
+                    # let whichever came last win, which is a patch name
+                    # decided by dictionary order. The first in sorted order
+                    # publishes and the rest are kept as names of the same
+                    # faces.
+                    held = target.get(int(tag))
+                    if held is None:
+                        target[int(tag)] = str(label)
+                    elif held != str(label) and kind == 'surface':
+                        merged = self.merged_surface_names.setdefault(
+                            int(tag), [])
+                        if str(label) not in merged:
+                            merged.append(str(label))
+        self._announce_merged_names()
+        self._name_unclaimed_volumes()
+
+    def _name_unclaimed_volumes(self) -> None:
+        """The volumes a source made beyond the one its region claimed.
+
+        DP-423. A surface that closes into more than one volume still gets a
+        single region record, so only ``{source}:volume:0`` is ever named and
+        every other volume of that file fell through to ``volume_<tag>`` --
+        134 of 140 zones across six meshes, each called after a Gmsh tag
+        number with no relation to the model.
+
+        Nothing about those volumes is unknown here. The import recorded
+        which file produced each one and in what order, and the job carries
+        what that file's single region is called, so the name is that name
+        with the volume's own position after it. Volume ``0`` is skipped: the
+        region already named it, and renaming it would move a zone name that
+        meshes already carry.
+        """
+        fallback = self.job.get('volumeFallback') or {}
+        if not fallback:
+            return
+        for identity, record in self.entity_tags.items():
+            if record.get('kind') != 'volume':
+                continue
+            source, _, local = str(identity).rpartition(':volume:')
+            if not source or not local.isdigit() or int(local) == 0:
+                continue
+            label = str(fallback.get(source) or '').strip()
+            if not label:
+                continue
+            for tag in record['tags']:
+                # Only where nothing else named it. An explicit name from
+                # `entityNames` is a name the user's own tree gave this
+                # volume and outranks a position.
+                self.entity_volume_names.setdefault(
+                    int(tag), f'{label}_{int(local) + 1}')
 
     def authored_scopes(self) -> dict:
         """Scope token -> ``[(what named it, the entity kind it needs)]``.
@@ -1874,6 +2836,90 @@ class GmshRun:
             claim(pair.get('slaveScope'),
                   f'periodic pair {name!r} (slave)', 'surface')
         return authored
+
+    def _unresolved_scope_sentence(self) -> str:
+        """Why each scope reached nothing, where the geometry says why.
+
+        DP-84. "matched no imported entity and were skipped" reads as a
+        wiring fault, and on a domain with a body standing in it the most
+        common cause is not a fault at all: the scope names a shell the
+        nesting made a void, and a void is a hole, so it never becomes a
+        volume for a scope to reach. MEASURED on gmsh `drone_quadcopter`,
+        where `region-bdfdd4053357f840b89899c8` names the drone body -- five
+        shells, every one of them `void` -- and the run meshed correctly
+        while reporting a sentence that says something went wrong.
+
+        Saying which is which matters because the two want opposite actions.
+        A void wants the control moved to the fluid; a genuinely missing
+        entity wants the geometry looked at.
+        """
+        roles = {}
+        record = self.statistics.get('tessellatedImport')
+        for shell in (record or {}).get('shells') or ():
+            name = str(shell.get('name') or '')
+            key = name.split('#', 1)[0]
+            roles.setdefault(key, set()).add(str(shell.get('role') or ''))
+        scoped = (self.job.get('scopeEntities') or {}).get('volumes') or {}
+        voided, plain = [], []
+        for token in sorted(set(self.unresolved_scopes)):
+            keys = {str(item).split(':', 1)[0]
+                    for item in scoped.get(token) or ()}
+            seen = set()
+            for key in keys:
+                seen |= roles.get(key, set())
+            if seen and seen <= {'void'}:
+                voided.append(token)
+            else:
+                plain.append(token)
+        parts = []
+        if plain:
+            parts.append('these scopes matched no imported entity and were '
+                         'skipped: ' + ', '.join(self._scope_holder(token)
+                                                 for token in plain))
+        if voided:
+            parts.append(
+                'these scopes name a shell this domain treats as a void, so '
+                'there is no volume for them to reach and nothing scoped to '
+                'them was applied — move the control to the fluid volume if '
+                'it was meant for the space around the body: '
+                + ', '.join(voided))
+        return '; '.join(parts)
+
+    def _scope_holder(self, token) -> str:
+        """What a user can find a scope token under: its control, its patch.
+
+        DP-547. G6 (audit 0924) warned ``...were skipped:
+        640cae55-a49b-4f43-98f5-51a8d5fade54``. That token was the prepared
+        patch ``body1_face4``, which no control scoped at all -- the job's
+        scope maps name every prepared group -- and nothing on screen let the
+        user find that out. The bare token is kept only when the job has no
+        word for it.
+        """
+        token = str(token)
+        holders = [label for label, _kind
+                   in self.authored_scopes().get(token, ())]
+        # DP-548. A pair's scope is not a control the run can apply, so it
+        # never stops the run -- but it is what the user authored the token
+        # on, and the name they can look for.
+        for pair in self.job.get('interfacePairs') or ():
+            for side in ('master', 'slave'):
+                if str(pair.get(f'{side}Scope') or '') == token:
+                    holders.append(
+                        f'interface pair {pair.get("name")!r} ({side})')
+        scoped = self.job.get('scopeEntities') or {}
+        names = self.job.get('entityNames') or {}
+        labels = []
+        for kind in ('surfaces', 'volumes'):
+            for identity in (scoped.get(kind) or {}).get(token) or ():
+                label = (names.get(kind) or {}).get(identity)
+                if label and label not in labels:
+                    labels.append(str(label))
+        patch = ', '.join(labels)
+        if holders:
+            return f'{", ".join(holders)} on {patch or token}'
+        if patch:
+            return f'{patch} (a prepared patch no enabled control uses)'
+        return token
 
     def refuse_unresolved_scopes(self) -> None:
         """Stop the run when an enabled control's scope reached no entity.
@@ -2033,15 +3079,32 @@ class GmshRun:
                 self.barycentric_refinement = True
 
         quality = self.intent.get('quality') or {}
-        self.set_number('Mesh.Optimize', int(bool(quality.get('optimize', True))),
+        optimize = bool(quality.get('optimize', True))
+        self.set_number('Mesh.Optimize', int(optimize),
                         control='gmsh/optimization/optimize')
         # Plan 30 WP12. `Mesh.OptimizeNetgen` is a boolean. The pass count
         # used to be written into it, so "three passes" and "one pass" set the
         # same flag to different truthy numbers and the explicit loop in
         # generate() then ran on top of whatever that did.
-        self.set_number('Mesh.OptimizeNetgen',
-                        int(bool(quality.get('netgen', True))),
-                        control='gmsh/optimization/netgen')
+        #
+        # DP-620 (field audit 0924 gmsh-generate-export D3). "Optimize" is the
+        # switch the page offers for optimisation as a whole, and it only ever
+        # reached `Mesh.Optimize`: the Netgen flag, on by default, still ran
+        # Netgen after the volume pass. MEASURED on a box minus a sphere
+        # through this runner: Optimize off still logged "Optimizing mesh
+        # (Netgen)" and three explicit passes. Off now means off, and the
+        # ledger says the Netgen request was not applied and why.
+        netgen = bool(quality.get('netgen', True))
+        if netgen and not optimize:
+            self.gmsh.option.setNumber('Mesh.OptimizeNetgen', 0.0)
+            self.ledger.record(
+                'gmsh/optimization/netgen', 1,
+                self.gmsh.option.getNumber('Mesh.OptimizeNetgen'),
+                applied=False,
+                note='Optimize is off, so the Netgen optimiser was not run')
+        else:
+            self.set_number('Mesh.OptimizeNetgen', int(netgen),
+                            control='gmsh/optimization/netgen')
         self.set_number('Mesh.Smoothing', int(quality.get('smoothing', 1) or 0),
                         control='gmsh/optimization/smoothing')
         self.set_number('Mesh.OptimizeThreshold',
@@ -2050,6 +3113,15 @@ class GmshRun:
         self.set_number('Mesh.QualityType',
                         QUALITY_MEASURE.get(quality.get('qualityType', 'sicn'), 0),
                         control='gmsh/optimization/qualityType')
+        # DP-623 (field audit 0924 gmsh-generate-export D7). The point
+        # perturbation Delaunay uses on large near-flat faces decides whether
+        # such a face meshes at all, and nothing in the product set it or
+        # said what it was. It is not a FoamMesh setting; the value Gmsh used
+        # is read back and recorded so a run that failed there can be read.
+        self.ledger.record(
+            'gmsh/default/randomFactor', None,
+            self.gmsh.option.getNumber('Mesh.RandomFactor'),
+            note='Gmsh default (Mesh.RandomFactor), not set by FoamMesh')
 
     def apply_recombination(self):
         """Quads on the surfaces, and the cell family that follows from them.
@@ -2106,7 +3178,8 @@ class GmshRun:
         self.ledger.record('gmsh/algorithms/recombine.surfaces',
                            len(surfaces), touched,
                            applied=bool(touched),
-                           note=f'{touched} of {len(surfaces)} surface(s) '
+                           note=f'{touched:,} of '
+                                f'{count_text(len(surfaces), "surface")} '
                                 'marked for recombination')
         self.statistics['recombination'] = {
             'surfaces': len(surfaces), 'recombined': touched,
@@ -2213,8 +3286,9 @@ class GmshRun:
             # Reporting this mesh as structured is the failure the control was
             # written to avoid.
             self.warnings.append(
-                f'automatic structuring took {len(structured)} of {total} '
-                'volume(s); volume(s) '
+                f'automatic structuring took {len(structured):,} of '
+                f'{count_text(total, "volume")}; '
+                f'{agreeing(len(unstructured), "volume")} '
                 + ', '.join(str(tag) for tag in sorted(unstructured))
                 + ' came back as tetrahedra, so the mesh is partly structured '
                   'and is not reported as a structured mesh')
@@ -2269,12 +3343,26 @@ class GmshRun:
             if node.requires_scope and not found:
                 dropped[node.row] = token
 
-        for row_name, token in sorted(dropped.items()):
-            self.warnings.append(
-                f'size field {row_name!r} has no resolvable geometry scope '
-                'and was skipped')
-            self.ledger.record(f'sizeField:{row_name}', token, None,
-                               applied=False, note='scope did not resolve')
+        if dropped:
+            # Plan 33 W-G1 (FIELD-06). This used to warn once and mesh
+            # anyway: the row was dropped whole, the ledger recorded it as
+            # not applied, and the run published a mesh that looked like the
+            # one the user asked for. Nothing downstream could tell the
+            # difference, which is what made it worse than no mesh at all.
+            # The refusal the enabled-scope check already makes for a control
+            # the job knows about (C31-05), made here for the one shape that
+            # reaches Gmsh without passing through it.
+            for row_name, token in sorted(dropped.items()):
+                self.ledger.record(f'sizeField:{row_name}', token, None,
+                                   applied=False,
+                                   note='scope did not resolve')
+            raise MeshFailure(
+                'these size fields name geometry this run does not contain, '
+                'so the mesh would silently be missing them:\n  '
+                + '\n  '.join(f'{row_name!r} is scoped to {token!r}'
+                              for row_name, token in sorted(dropped.items()))
+                + '\nRe-prepare the geometry, or turn the field off, and run '
+                  'again.')
 
         # -- build in dependency order ------------------------------------- #
         index = graph.by_id()
@@ -2312,13 +3400,28 @@ class GmshRun:
                 continue
             self.ledger.record(f'sizeField:{name}', row.get('fieldType'),
                                row.get('fieldType'), note='field created')
+            self.background_sizes.append(
+                (name, None if row.get('fieldType') == 'math_eval'
+                 else float(row.get('sizeInside') or 0.0)))
 
         self.background_fields.extend(created)
+        # DP-501. The graph's `scopes` carry the tags a row named itself and
+        # the prepared token it was scoped to; a row scoped by token names no
+        # tags of its own, so its entry read `SurfacesList: []` while Gmsh was
+        # handed the resolved surface. MEASURED on G4: the face0 Distance was
+        # given native tag 1 and the result said []. `entities` is what each
+        # node was actually given, keyed by the Gmsh option.
+        report = graph.to_dict()
+        for entry in report['nodes']:
+            entry['entities'] = {
+                option: [int(item) for item in entities]
+                for option, entities
+                in (resolved.get(entry['nodeId']) or {}).items()}
         self.statistics['sizeFields'] = {
             'created': len(created),
             'gmshFields': len(tags),
             'skipped': len(dropped),
-            'graph': graph.to_dict(),
+            'graph': report,
         }
 
     def assemble_background_field(self):
@@ -2344,7 +3447,8 @@ class GmshRun:
         field.setAsBackgroundMesh(combined)
         self.ledger.record(
             'gmsh/globalSizing/fieldCombiner', combiner, combiner,
-            note=f'{native} of {len(self.background_fields)} field(s)')
+            note=f'{native} of '
+                 f'{count_text(len(self.background_fields), "field")}')
         # Plan 29 WP8. This used to force MeshSizeExtendFromBoundary and
         # MeshSizeFromPoints to 0 here, behind the ledger: both had already
         # been recorded as applied, so the run certified a value the mesher did
@@ -2356,15 +3460,58 @@ class GmshRun:
                      (('extend from boundary', 'extendFromBoundary'),
                       ('sizes from points', 'fromPoints'))
                      if bool(sizing.get(key, True))]
-        if outvoting:
+        # DP-504. Those sources can only outvote a row asking for a larger
+        # size than the smallest they can give. Without curvature sizing or a
+        # sized curve that is the global target, so a row at or below it is
+        # honoured whatever they say; with them it is the finest of those.
+        # The warning used to fire on every run with any size source and
+        # name none of them -- G1 had two volume controls and no size field,
+        # and was told a "size field" might look ignored.
+        target = float(sizing.get('targetSize') or 0.0)
+        floor, finer = self.competing_size_floor(target)
+        outvotable = [name for name, size in self.background_sizes
+                      if size is None or floor <= 0
+                      or size > floor * (1.0 + 1e-9)]
+        if outvoting and outvotable:
+            reason = (f' ({"; ".join(finer)})' if finer else '')
             self.warnings.append(
                 'the background size field shares the mesh with '
                 + ' and '.join(outvoting)
-                + '; where those give a smaller size they win, so turn them '
-                  'off on Global Sizing if a size field looks ignored')
+                + f'; where those give a smaller size they win{reason}, so '
+                + ', '.join(repr(name) for name in outvotable)
+                + ' may come out finer than asked — turn them off on Global '
+                  'sizing if that row looks ignored')
         self.statistics['backgroundField'] = {
             'sources': len(self.background_fields),
-            'competingSizeSources': outvoting}
+            'competingSizeSources': outvoting,
+            'competingSizeFloor': floor,
+            'outvotable': outvotable}
+
+    def competing_size_floor(self, target):
+        """The smallest size boundary and point sizes can give, and why.
+
+        DP-504. `(floor, reasons)`: the global target, lowered to the minimum
+        size when curvature sizing is on and to a sized curve's local size.
+        """
+        sizing = self.intent.get('sizing') or {}
+        floor, reasons = target, []
+        if float(sizing.get('fromCurvature', 12) or 0) > 0:
+            minimum = float(sizing.get('minimumSize') or 0.0)
+            if target <= 0 or minimum < floor:
+                floor = minimum
+                reasons.append(f'curvature sizing can go down to {minimum:g} m')
+        for row in self.intent.get('curveControls') or ():
+            if row.get('mode') == 'transfinite':
+                continue
+            try:
+                local = float(row.get('localSize'))
+            except (TypeError, ValueError):
+                continue
+            if local > 0 and (floor <= 0 or local < floor):
+                floor = local
+                reasons.append(f'curve control {row.get("name")!r} sets '
+                               f'{local:g} m')
+        return floor, reasons
 
     def apply_curve_controls(self):
         """Put node counts on curves, then make the asked-for surfaces structured.
@@ -2382,7 +3529,34 @@ class GmshRun:
             return
         applied = structured = 0
         pending: list[tuple] = []
+        # DP-611 (field audit 0924 gmsh-sizing D2). Rows arrive highest
+        # priority first, and each setTransfiniteCurve / setSize overwrote the
+        # one before, so on a curve two rows share -- every edge between two
+        # adjacent faces -- the LOWEST priority won. MEASURED (audit probe,
+        # Gmsh 4.15.2): 21 nodes at priority 100 then 6 at priority 0 left 6.
+        # A curve (and, in size mode, an end point) now belongs to the first
+        # row that reaches it in priority order; a lower row skips it and
+        # says so. Sorted here too, so an older job's row order cannot matter.
+        rows = sorted(rows, key=lambda item: -int(item.get('order') or 0))
+        claimed_curves: dict[int, str] = {}
+        claimed_points: dict[int, str] = {}
+        # DP-612 (field audit 0924 gmsh-sizing D4). A local size is a size on
+        # the curve's end points, and Gmsh reads point sizes only while
+        # Mesh.MeshSizeFromPoints is on. With "From points" off the setSize
+        # call changed nothing and the row was still logged as applied.
+        from_points = bool((self.intent.get('sizing') or {}).get(
+            'fromPoints', True))
         for row in rows:
+            if row['mode'] == 'size' and not from_points:
+                self.warnings.append(
+                    f'curve control {row["name"]!r} sets a local size, which '
+                    'Gmsh reads only while "From points" is ticked on the '
+                    'Global sizing page; it is off, so the row was skipped')
+                self.ledger.record(f'curveControl:{row["name"]}', 'size',
+                                   None, applied=False,
+                                   note='"From points" is off, so Gmsh '
+                                        'ignores point sizes')
+                continue
             surfaces = self.scope_surfaces.get(row['scopeToken'])
             if not surfaces:
                 self.warnings.append(
@@ -2402,7 +3576,12 @@ class GmshRun:
             # the one; older jobs without the key are corrected here.
             nodes = int(row.get('nodes') or int(row['segments']) + 1)
             coefficient = self.grading_coefficient(row)
-            for curve in sorted(curves):
+            kept_by: dict[int, str] = {curve: claimed_curves[curve]
+                                       for curve in curves
+                                       if curve in claimed_curves}
+            mine = sorted(curves - set(kept_by))
+            for curve in mine:
+                claimed_curves[curve] = row['name']
                 if row['mode'] == 'transfinite':
                     self.gmsh.model.mesh.setTransfiniteCurve(
                         curve, nodes, row['law'], coefficient)
@@ -2410,16 +3589,33 @@ class GmshRun:
                         'control': row['name'], 'nodes': nodes,
                         'law': row['law'], 'coefficient': coefficient}
                 else:
-                    self.gmsh.model.mesh.setSize(
-                        [(0, point) for _d, point in
-                         self.gmsh.model.getBoundary([(1, curve)],
-                                                     oriented=False)],
-                        float(row['localSize']))
+                    points = []
+                    for _d, point in self.gmsh.model.getBoundary(
+                            [(1, curve)], oriented=False):
+                        point = int(point)
+                        owner = claimed_points.setdefault(point, row['name'])
+                        if owner == row['name']:
+                            points.append((0, point))
+                    if points:
+                        self.gmsh.model.mesh.setSize(
+                            points, float(row['localSize']))
                 applied += 1
+            note = (f'{count_text(len(mine), "curve")}, '
+                    f'{count_text(nodes, "node")} each'
+                    if row['mode'] == 'transfinite'
+                    else count_text(len(mine), 'curve'))
+            if kept_by:
+                owners = ', '.join(repr(name)
+                                   for name in sorted(set(kept_by.values())))
+                skipped = count_text(len(kept_by), 'shared curve')
+                note += (f'; {skipped} left to higher-priority {owners}')
+                self.warnings.append(
+                    f'curve control {row["name"]!r} left {skipped} to '
+                    f'{owners}, which ranks higher (priority, then name)')
             self.ledger.record(
-                f'curveControl:{row["name"]}', row['mode'], row['mode'],
-                note=f'{len(curves)} curve(s), {nodes} node(s) each'
-                     if row['mode'] == 'transfinite' else f'{len(curves)} curve(s)')
+                f'curveControl:{row["name"]}', row['mode'],
+                row['mode'] if mine else None, applied=bool(mine),
+                note=note)
             if row.get('transfiniteSurface'):
                 pending.append((row, surfaces))
         for row, surfaces in pending:
@@ -2728,7 +3924,9 @@ class GmshRun:
                                        dimensions=(3,))
                 applied['excluded'] += len(volumes)
                 self.ledger.record(f'volumeControl:{name}.included', False,
-                                   False, note=f'{len(volumes)} volume(s) removed')
+                                   False,
+                                   note=f'{count_text(len(volumes), "volume")}'
+                                        ' removed')
                 continue
 
             size = row.get('targetSize')
@@ -2738,9 +3936,11 @@ class GmshRun:
                 field.setNumbers(constant, 'VolumesList',
                                  [float(tag) for tag in volumes])
                 self.background_fields.append(constant)
+                self.background_sizes.append((str(name), float(size)))
                 applied['sized'] += 1
                 self.ledger.record(f'volumeControl:{name}.targetSize', size,
-                                   size, note=f'{len(volumes)} volume(s)')
+                                   size,
+                                   note=count_text(len(volumes), 'volume'))
 
             if row.get('transfinite'):
                 accepted = 0
@@ -2806,24 +4006,79 @@ class GmshRun:
         if not selected:
             # Growing on nothing is not the same as growing on everything, and
             # quietly doing the latter is how a user gets prisms on an inlet.
-            self.warnings.append(
-                'no boundary layer was grown: the selected patches matched no '
-                'imported surface')
+            #
+            # DP-57. This warned and returned, and the run then published as
+            # `succeeded` with `statistics.layers: null`. MEASURED across the
+            # 66 Gmsh runs this repository has published: 23 asked for layers
+            # and grew none, and 20 of those reported success. The page
+            # pre-ticks the wall patches, so a selection is nearly always
+            # present; where the import carries no patch names of its own,
+            # every offered name misses and the whole selection empties. A
+            # mesh with no near-wall resolution is not the mesh that was asked
+            # for, and a warning on a run marked successful did not stop one
+            # of those twenty from being used.
             self.ledger.record('gmsh/boundaryLayers/layerCount', count, 0,
                                applied=False,
                                note='no selected patch matched a surface')
-            return
-        # MEASURED: the carve below removes every volume and rebuilds one core
-        # from the layer's inner surfaces. With two volumes sharing an
-        # interface that rebuild cannot close either of them, and the run ends
-        # as a hollow shell of prisms several stages later. Refusing here
-        # names the cause instead of leaving a confusing post-hoc symptom.
-        if len(volumes) > 1:
+            asked = ', '.join(
+                str(item).strip() for item in (layers.get('patches') or ())
+                if str(item).strip())
+            offer = ', '.join(sorted({self.surface_patch_name(tag)[0]
+                                      for tag in surfaces})) or 'none'
+            if not asked:
+                # Plan 33 section 1.1. This case used to mesh, growing layers
+                # on every boundary surface including the inlet and the
+                # outlet. Silence is not consent to that.
+                raise MeshFailure(
+                    'boundary layers are switched on and no surface was '
+                    'chosen to grow them, so no layer could be grown and the '
+                    'mesh would have had no near-wall resolution at all. The '
+                    f'surfaces this run imported are: {offer}. Choose one of '
+                    'those, ask for every eligible wall, or turn boundary '
+                    'layers off.')
             raise MeshFailure(
-                f'boundary layers are not supported on a {len(volumes)}-volume '
-                'assembly: the layer is carved out of a single core volume, '
-                'and a shared interface leaves neither side closed. Mesh this '
-                'geometry without layers, or split it into one job per volume.')
+                f'boundary layers were asked for on {asked}, which matched no '
+                'imported surface, so no layer could be grown and the mesh '
+                'would have had no near-wall resolution at all. The surfaces '
+                f'this run imported are: {offer}. Name one of those, or turn '
+                'boundary layers off.')
+        # R118. The carve removes the volume the layer grows into and rebuilds
+        # it from the layer's inner surfaces. That can be done on an assembly
+        # as long as every base bounds the same volume: the others are left
+        # exactly as they were imported, and the interface is the very surface
+        # the prisms grew from, so the two sides stay conformal. MEASURED on
+        # `annulus_shell.step`, three layers, the two cylindrical walls only
+        # and the end caps rebuilt -- solid 21769 tets, interface layer 10716
+        # prisms, outer layer 17754 prisms, fluid core 34065 tets, 0 inverted,
+        # and 12550829 mm3 against an analytic 12566371, 0.12% low, which is
+        # the faceting of the two cylinders. What cannot be done is a
+        # selection that spans volumes: only one core is rebuilt.
+        carved = list(volumes)
+        if len(volumes) > 1:
+            core, candidates = self.volume_the_layer_grows_into(volumes,
+                                                                selected)
+            if core is None and candidates:
+                raise MeshFailure(
+                    'the boundary layer was asked for on surfaces that bound '
+                    f'{len(candidates)} volumes and on nothing else, so there '
+                    'is no way to tell which side of the interface it belongs '
+                    'on. Name a patch that bounds only the volume the layer '
+                    'is for as well.')
+            if core is None:
+                raise MeshFailure(
+                    f'boundary layers are not supported on a {len(volumes)}'
+                    '-volume assembly unless every patch they grow on bounds '
+                    'one and the same volume: the layer is carved out of a '
+                    'single core, and a selection spanning more than one '
+                    'leaves neither side closed. Name the patches of one '
+                    'volume, mesh this geometry without layers, or split it '
+                    'into one job per volume.')
+            carved = [core]
+            surfaces = self.volume_surfaces(core)
+            chosen = set(int(tag) for tag in selected)
+            skipped = [tag for tag in surfaces if int(tag) not in chosen]
+            selected, skipped = self.keep_shared_surfaces(volumes, selected,
+                                                          skipped)
         # The bounding curves have to be read while the surface still exists;
         # they are what ties the faces that replace it back to its patch name.
         # The boxes are read here for the same reason, and check that what the
@@ -2831,16 +4086,102 @@ class GmshRun:
         skipped_curves = {tag: self.surface_curves(tag) for tag in skipped}
         skipped_boxes = {tag: gmsh.model.getBoundingBox(2, tag)
                          for tag in skipped}
-        self.remove_entities([(3, tag) for tag in volumes])
+        # DP-55. The sign of `heights` is a direction along the surface
+        # normal, and one sign cannot serve two shells. Each shell's normals
+        # face away from its own interior, so on the outermost one the fluid
+        # lies at -n and on an obstacle inside it the fluid lies at +n. Grown
+        # with a single sign the obstacle's layer goes into the solid: MEASURED
+        # on `box_with_obstacle_two_files`, 2082 open cells, 2082 wrongly
+        # oriented face pyramids, 2082 concave cells, four failed checkMesh
+        # checks -- and a volume of 63.156 where the fluid is 63.000, because
+        # the shell around the obstacle was covered twice.
+        #
+        # `void_surfaces` and `surface_winding` answer this where the shell
+        # topology ran. It does not run on the CAD route, which arrives here
+        # with nothing meshed at all, so the boundary is split into shells and
+        # the enclosed ones handed to `layer_height_groups` as well.
+        shells = self.boundary_shells(surfaces)
+        internal = self.internal_shells(shells)
+        # DP-124. A shell of the core the layer never touches needs no
+        # rebuild at all. MEASURED on `two_solid_block.stl`, a box inside a
+        # box: the farfield is one volume bounded by two disjoint shells, the
+        # layer covers the outer one entirely, and so there is no rim
+        # anywhere -- every curve of every layer top is shared with another
+        # top. The inner shell was handed to the rebuild regardless, which
+        # found no rim to stand in for it and refused the run. It is already
+        # closed, already meshed and already named; it just has to be handed
+        # to `addVolume` as the hole it is.
+        kept_shells = self.shells_kept_whole(shells, selected, internal)
+        # DP-127. The mirror of the same reading. On `turbine_cascade` the
+        # layer is on the blades and the farfield around them carries none,
+        # so the shell the layer never reached is the enclosing one. It needs
+        # no rim either; it is the exterior the fluid is bounded by, and the
+        # layer tops are the holes in it.
+        outer_shell = self.shell_kept_as_exterior(shells, selected, internal)
+        retained = {tag for group in kept_shells for tag in group}
+        retained.update(int(tag) for tag in outer_shell)
+        if retained:
+            skipped = [tag for tag in skipped if int(tag) not in retained]
+            skipped_curves = {tag: curves for tag, curves
+                              in skipped_curves.items()
+                              if int(tag) not in retained}
+            skipped_boxes = {tag: box for tag, box in skipped_boxes.items()
+                             if int(tag) not in retained}
+        # DP-71. Nesting says a surface bounds a hole; it does not say which
+        # way that surface faces, and the flip needs both. `outward_normals`
+        # asks the solid directly, while it is still in the model.
+        outward = ({} if self.surface_winding
+                   else self.outward_normals(selected, carved))
+        self.remove_entities([(3, tag) for tag in carved])
 
+        groups = self.layer_height_groups(selected, heights, internal=internal,
+                                          outward=outward)
+        # DP-91. Two directions that meet on a shared edge extrude that edge
+        # twice, and Gmsh says so only part-way through the 3D pass, in a
+        # sentence with no patch name in it. Asked here, while the patches
+        # still have names and before anything has been built.
+        meetings = self.directions_that_meet(groups)
+        inward = [tag for _signed, tags, flipped in groups if flipped
+                  for tag in tags]
+        # DP-404. The refusal below used to stand here, in front of the
+        # extrusion. It stands behind it now, because the premise it was
+        # written on is only half true: the *height* is signed once per call,
+        # the *call* is not limited to one direction. A dim-tag carries a sign
+        # of its own and `extrudeBoundaryLayer` reads it.
+        refusal = ''
+        if meetings:
+            refusal = self.opposed_directions_refusal(selected, groups,
+                                                      meetings, skipped)
+            groups = self.one_call_for_both_directions(groups)
         try:
-            extruded = gmsh.model.geo.extrudeBoundaryLayer(
-                [(2, tag) for tag in selected], [1] * count, heights,
-                bool(layers.get('quads', True)))
+            extruded = []
+            columns = []
+            for signed, tags, _flipped in groups:
+                produced = list(gmsh.model.geo.extrudeBoundaryLayer(
+                    [(2, tag) for tag in tags], [1] * count, signed,
+                    bool(layers.get('quads', True))))
+                extruded.extend(produced)
+                # DP-74. The inner face of each stack, paired with the wall it
+                # grew from. The pairing only holds within one call: the two
+                # directions are extruded separately and the returned list
+                # runs in the order of the surfaces handed to that call.
+                # DP-404. A tag in this list may be negative, which is how
+                # the direction is carried when both senses go in one call.
+                # What is paired with the stack is the surface, not the sense.
+                columns.extend(zip([abs(int(tag)) for tag in tags], [
+                    produced[index - 1][1]
+                    for index in range(1, len(produced))
+                    if produced[index][0] == 3
+                    and produced[index - 1][0] == 2]))
             gmsh.model.geo.synchronize()
         except Exception as error:
+            # DP-404. Where the two senses were put in one call and the call
+            # still would not run, the contact is the thing to say: it is the
+            # reading that names patches and offers a selection, and `error`
+            # names neither.
             raise MeshFailure(
-                f'the boundary layer could not be extruded: {error}') from error
+                refusal or f'the boundary layer could not be extruded: {error}'
+            ) from error
 
         tops = [extruded[index - 1] for index in range(1, len(extruded))
                 if extruded[index][0] == 3 and extruded[index - 1][0] == 2]
@@ -2853,18 +4194,45 @@ class GmshRun:
             tag for dim, tag in extruded
             if dim == 2 and tag not in set(top_tags)))
         rebuilt_loops = (self.rebuild_unextruded(skipped, top_tags,
-                                                 skipped_boxes)
+                                                 skipped_boxes, columns)
                          if skipped else {})
         rebuilt = list(rebuilt_loops)
-        loop = gmsh.model.geo.addSurfaceLoop(top_tags + rebuilt)
-        gmsh.model.geo.addVolume([loop])
+        if outer_shell:
+            # DP-127. The layer is inside, on bodies the kept shell encloses.
+            # The exterior is that shell, whole, and each body's layer tops
+            # close around it to make one hole -- so they are grouped by the
+            # shell their bases stood on rather than poured into one loop.
+            loops = [gmsh.model.geo.addSurfaceLoop(list(outer_shell))]
+            loops.extend(gmsh.model.geo.addSurfaceLoop(group)
+                         for group in self.layer_tops_by_shell(shells,
+                                                               columns))
+        else:
+            loops = [gmsh.model.geo.addSurfaceLoop(top_tags + rebuilt)]
+        # DP-124. Every kept shell is enclosed by the one the layer grew on --
+        # `shells_kept_whole` will not keep one that is not -- so it is a hole
+        # in the core, and the geo kernel spells a hole as a surface loop
+        # after the first. Same shape the tessellated import builds its voids
+        # with, above.
+        loops.extend(gmsh.model.geo.addSurfaceLoop(list(group))
+                     for group in kept_shells)
+        core_volume = gmsh.model.geo.addVolume(loops)
         gmsh.model.geo.synchronize()
         if skipped:
             self.name_layer_replacements(skipped_curves, rebuilt_loops,
                                          laterals)
 
         self.layer_bases = [int(tag) for tag in selected]
+        self.layer_columns = [(int(base), int(top)) for base, top in columns]
         self.layer_volumes = [int(tag) for dim, tag in extruded if dim == 3]
+        # R118. The carved volume is gone; these are what it became. A
+        # region is not renamed by having a layer grown in it -- MEASURED on
+        # `annulus_shell` before this: the fluid's own name landed on one of
+        # its two layer volumes by tag reuse and its core published as
+        # `volume_4`, and on the wrapped single-solid route 17 of the 18
+        # volumes published as `volume_N`.
+        self.volume_replacements = {
+            int(tag): [int(core_volume)] + list(self.layer_volumes)
+            for tag in carved}
         self.layer_laterals = [int(tag) for tag in laterals]
         self.statistics['layers'] = {
             'requestedLayers': count,
@@ -2873,12 +4241,834 @@ class GmshRun:
             'extrudedSurfaces': len(selected),
             'skippedSurfaces': len(skipped),
             'rebuiltSurfaces': len(rebuilt),
+            # DP-55. How the boundary divided, and how many bases had to be
+            # grown the other way because they bound a hole rather than the
+            # outside of the fluid, so a finished mesh can be read back
+            # against the decision.
+            'shells': len(shells),
+            'reversedSurfaces': len(inward),
+            # DP-71. How many of the bases had their direction measured
+            # against the solid rather than inferred from nesting.
+            'measuredSurfaces': len(outward),
             'patches': sorted({self.surface_patch_name(tag)[0]
                                for tag in selected}),
             'scope': layers.get('scope', 'all_boundary_surfaces'),
+            # R118. Which volume was carved and rebuilt, and which ones were
+            # left as they were imported. On a single-solid case this is the
+            # only volume there was; on an assembly it says which side of the
+            # interface the layer was grown into.
+            'coreVolume': int(carved[0]) if len(carved) == 1 else None,
+            'volumesLeftInPlace': sorted(
+                int(tag) for tag in volumes if int(tag) not in
+                {int(item) for item in carved}),
         }
+        note = f'extruded off {count_text(len(selected), "surface")}'
+        if inward:
+            note += (f', {len(inward)} of them bounding a hole and grown the '
+                     'other way, into the fluid')
         self.ledger.record('gmsh/boundaryLayers/layerCount', count, count,
-                           note=f'extruded off {len(selected)} surface(s)')
+                           note=note)
+
+    def surface_facets(self, tag, points):
+        """One surface's faces as corner triangles, in element order.
+
+        DP-74. A recombined layer bounds its stacks with quadrilaterals and an
+        unrecombined one with triangles, and the fold reading has to compare
+        like with like, so both are fanned from their first corner. Midside
+        nodes are dropped: a second-order face carries them and the fold is a
+        property of the corners.
+        """
+        kinds, _tags, nodes = self.gmsh.model.mesh.getElements(2, tag)
+        facets = []
+        for kind, block in zip(kinds, nodes):
+            facts = self.gmsh.model.mesh.getElementProperties(kind)
+            shape, _dim, _order, per = facts[:4]
+            corners = 3 if shape.startswith('Triangle') else (
+                4 if shape.startswith('Quadrilateral') else 0)
+            if not corners:
+                continue
+            block = [int(item) for item in block]
+            for index in range(0, len(block), per):
+                face = [points[item]
+                        for item in block[index:index + corners]]
+                for step in range(1, corners - 1):
+                    facets.append((face[0], face[step], face[step + 1]))
+        return facets
+
+    def read_surface_crossings(self, error, tags=None):
+        """Name the patches whose own faces cross, or return None.
+
+        DP-75. Only a refusal that reads like a crossing boundary is worth
+        the scan, and only the surface mesh is scanned: every face of every
+        2D entity against every other face near it, in a grid whose cell is
+        the model diagonal over 96, which is what bounds the work.
+
+        MEASURED on ``drone_quadcopter``, Gmsh 4.15.2. Handed the classified
+        patches alone (``tags`` from :meth:`classified_surfaces`) it reads
+        32543 faces in 1.9 s and reports 85 crossing pairs. Handed the whole
+        model (``tags`` None, which is the path :meth:`generate` takes) it
+        reads 389 entities and 21148 faces in 37 s and reports 1131 pairs.
+        Fewer faces and twenty times the cost, because the whole model adds
+        the boundary-layer laterals, and a lateral is a long thin face that
+        lands in many cells at once; the grid bounds the comparison but does
+        not make it linear. That is the reason the fold oracle passes the
+        classified patches rather than letting the scan see everything.
+        """
+        if error is not None and not crossing_like(error):
+            return None
+        wanted = set(tags) if tags is not None else None
+        points = self._node_coordinates()
+        facets = []
+        for _dim, tag in self.gmsh.model.getEntities(2):
+            if wanted is not None and int(tag) not in wanted:
+                continue
+            for face in self.surface_facets(tag, points):
+                facets.append((int(tag), face))
+        if not facets:
+            return None
+        low = [min(corner[axis] for _t, face in facets for corner in face)
+               for axis in range(3)]
+        high = [max(corner[axis] for _t, face in facets for corner in face)
+                for axis in range(3)]
+        step = max(high[axis] - low[axis] for axis in range(3)) / 96.0
+        if step <= 0.0:
+            return None
+        grid: dict = {}
+        for number, (_tag, face) in enumerate(facets):
+            span = [(int((min(c[axis] for c in face) - low[axis]) / step),
+                     int((max(c[axis] for c in face) - low[axis]) / step))
+                    for axis in range(3)]
+            for i in range(span[0][0], span[0][1] + 1):
+                for j in range(span[1][0], span[1][1] + 1):
+                    for k in range(span[2][0], span[2][1] + 1):
+                        grid.setdefault((i, j, k), []).append(number)
+        return self._crossing_verdict(facets, grid, error)
+
+    def _crossing_verdict(self, facets, grid, error):
+        """Turn the crossing pairs found into a refusal that names them."""
+        pairs = set()
+        for members in grid.values():
+            for first in range(len(members)):
+                for second in range(first + 1, len(members)):
+                    one, other = members[first], members[second]
+                    if (one, other) in pairs:
+                        continue
+                    if _share_a_corner(facets[one][1], facets[other][1]):
+                        continue
+                    if _faces_cross(facets[one][1], facets[other][1]):
+                        pairs.add((one, other))
+        if not pairs:
+            return None
+        tally: dict = {}
+        for one, other in pairs:
+            for number in (one, other):
+                tag = facets[number][0]
+                tally[tag] = tally.get(tag, 0) + 1
+        worst = max(tally, key=lambda tag: tally[tag])
+        where = next(facets[one][1][0] for one, other in pairs
+                     if facets[one][0] == worst or facets[other][0] == worst)
+        name = self.surface_patch_name(worst)[0]
+        tail = f' The volume mesher refused it: {error}' if error else ''
+        return SurfaceCrossing(
+            f'the surface mesh crosses itself: {count_text(len(pairs), "pair")} '
+            f'of faces {agreeing(len(pairs), "passes", "pass")} through each '
+            f'other, most of them on {name} near '
+            f'({where[0]:.6g}, {where[1]:.6g}, {where[2]:.6g}).' + tail,
+            patch=name, at=tuple(where), pairs=len(pairs),
+            remeshed=not self.kept_tessellation)
+
+    def classified_surfaces(self):
+        """The patches the import left, without anything the layer added.
+
+        DP-75. A layer that folds puts crossing faces on its own tops and
+        sides, and those say nothing about the geometry underneath. Only the
+        patches that were there before the extrusion answer the question the
+        fallback turns on: did the remesh of the *imported* surface cross
+        itself, whatever the layer did.
+        """
+        grown = {int(top) for _base, top in self.layer_columns}
+        grown.update(int(tag) for tag in self.layer_laterals)
+        return [int(tag) for _dim, tag in self.gmsh.model.getEntities(2)
+                if int(tag) not in grown]
+
+    def measure_layer_fit(self):
+        """Read the grown layer back and refuse one that folded over itself.
+
+        DP-74. MEASURED on ``centrifugal_impeller``, reproduced on
+        ``drone_quadcopter``: the run died in the volume mesher with
+        ``PLC Error:  A segment and a facet intersect at point`` and nothing
+        more -- tetgen prints the point in a second call that Gmsh's logger
+        drops, so the message names neither the place nor the cause, and the
+        name it invites is the wrong one. The geometry is not at fault. The
+        impeller's STL carries 616 triangles with no self-intersecting pair,
+        no degenerate triangle, no open edge and no non-manifold edge, and the
+        same job meshes on both volume algorithms once ``layers.enabled`` is
+        turned off. What crosses is the layer: of the 34026 facets the
+        extrusion grew, 8 turn inside out before they reach the
+        0.00133750785 m of stack that was asked for, the first at
+        0.000438 m -- a third of the way up. Bisecting the same job agrees:
+        it meshes at 0.000334 m and refuses at 0.000669 m.
+
+        So the fold is measured here, between the surface pass that creates
+        the inner surface and the volume pass that chokes on it, and what it
+        measures is the thickness this geometry carries.
+        ``execute_with_layer_fit`` regrows the stack at that thickness rather
+        than refusing outright, which is what snappyHexMesh does with a layer
+        that will not fit.
+        """
+        stack = (self.intent.get('layers') or {}).get('cumulativeHeights')
+        if not stack or not self.layer_columns:
+            return
+        asked = abs(float(stack[-1]))
+        if asked <= 0.0:
+            return
+        tags, flat, _ = self.gmsh.model.mesh.getNodes()
+        points = {int(tag): (flat[3 * index], flat[3 * index + 1],
+                             flat[3 * index + 2])
+                  for index, tag in enumerate(tags)}
+        worst = None
+        folded = 0
+        total = 0
+        for base, top in self.layer_columns:
+            low = self.surface_facets(base, points)
+            high = self.surface_facets(top, points)
+            if len(low) != len(high):
+                # Nothing to compare against, and guessing a correspondence
+                # would invent a fold or hide one.
+                continue
+            for one, other in zip(low, high):
+                total += 1
+                value = layer_fold_parameter(one, other)
+                if value is None:
+                    continue
+                if value <= 1.0:
+                    folded += 1
+                if worst is None or value < worst[0]:
+                    worst = (value, base, tuple(
+                        sum(point[axis] for point in one) / 3.0
+                        for axis in range(3)))
+        self.record_layer_fit(asked, total, folded, worst)
+
+    def record_layer_fit(self, asked, total, folded, worst):
+        """Publish what the fit reading found, and refuse if it folded."""
+        if worst is None:
+            return
+        carries = worst[0] * asked
+        patch = self.surface_patch_name(worst[1])[0]
+        place = tuple(round(value, 9) for value in worst[2])
+        record = self.statistics.get('layers')
+        if isinstance(record, dict):
+            record['fit'] = {
+                'askedTotalThickness': asked,
+                'carriesTotalThickness': carries,
+                'facets': total,
+                'foldedFacets': folded,
+                'limitPatch': patch,
+                'limitAt': list(place),
+            }
+        if not folded:
+            return
+        # DP-75. A fold reading this bad is usually a layer too thick for the
+        # wall, and refitting it is what DP-74 does. It is sometimes a patch
+        # whose remesh already crossed itself, on which no layer of any
+        # thickness can stand, and the two are told apart by looking at the
+        # patches alone -- so the scan is paid for only here, where the run
+        # is about to be refused either way.
+        crossing = self.read_surface_crossings(None,
+                                               self.classified_surfaces())
+        if crossing is not None:
+            raise crossing
+        raise LayerFold(
+            f'the boundary layer does not fit this geometry: {folded} of the '
+            f'{total} faces it grew turn inside out before they reach the '
+            f'{asked:.6g} m of stack that was asked for. The first fold is on '
+            f'{patch} at ({place[0]:.6g}, {place[1]:.6g}, {place[2]:.6g}), '
+            f'where the wall carries {carries:.6g} m.',
+            carries=carries, asked=asked, folded=folded, patch=patch,
+            at=place)
+
+    def layer_cell_tags(self):
+        """The cells the boundary-layer extrusion made, by element tag.
+
+        DP-76. Read from the volume entities the extrusion returned rather
+        than from the element shape, because a shape is not provenance: a
+        recombined volume is full of prisms nobody grew, and a layer over a
+        quadrilateral wall is full of hexahedra. Empty when no layer was
+        grown, which is the case the callers treat as 'judge everything'.
+        """
+        if not self.layer_volumes:
+            return frozenset()
+        found = set()
+        for tag in self.layer_volumes:
+            try:
+                _types, groups, _nodes = self.gmsh.model.mesh.getElements(
+                    3, int(tag))
+            except Exception:                                # noqa: BLE001
+                continue
+            for group in groups:
+                found.update(int(item) for item in group)
+        return frozenset(found)
+
+    def layer_top_nodes(self):
+        """The nodes on the inner surface of the layer.
+
+        DP-76. This is the sheet the volume mesh has to start from, and a
+        cell all of whose corners lie on it is a cell with no height.
+        """
+        found = set()
+        for _base, top in self.layer_columns:
+            try:
+                nodes, _coords, _params = self.gmsh.model.mesh.getNodes(
+                    2, int(top), includeBoundary=True)
+            except Exception:                                # noqa: BLE001
+                continue
+            found.update(int(item) for item in nodes)
+        return frozenset(found)
+
+    def cells_resting_on_the_layer(self):
+        """Volume cells every corner of which lies on the layer top.
+
+        DP-76. A cell like this spans the inner surface without leaving it,
+        so it has the plan of a surface element and none of its height. Read
+        from the flat node block ``getElements`` returns rather than element
+        by element: on ``drone_quadcopter`` that is 276574 cells, and asking
+        Gmsh for each one's nodes separately costs more than the mesh did.
+        """
+        tops = self.layer_top_nodes()
+        if not tops:
+            return []
+        skip = self.layer_cell_tags()
+        resting = []
+        types, groups, nodes = self.gmsh.model.mesh.getElements(3)
+        for _etype, tags, block in zip(types, groups, nodes):
+            if not len(tags):
+                continue
+            width = len(block) // len(tags)
+            if width <= 0:
+                continue
+            for index in range(len(tags)):
+                tag = int(tags[index])
+                if tag in skip:
+                    continue
+                corners = block[index * width:(index + 1) * width]
+                if all(int(node) in tops for node in corners):
+                    resting.append(tag)
+        return resting
+
+    def measure_layer_landing(self):
+        """Read the volume mesh back against the layer it was built on.
+
+        DP-76. :meth:`measure_layer_fit` asks whether the stack folds, which
+        is a question about the layer alone and is answered before the volume
+        pass. It is not the whole question. MEASURED on ``drone_quadcopter``:
+        a stack refitted to 0.00015995 m -- 9.4% of the 0.0016950 m asked for
+        -- grows without folding a single facet, and the volume mesh above it
+        then comes out with cells 22 mm across and 13 um thick. Gmsh calls
+        none of them inverted; ``checkMesh`` reads 40 of them as negative
+        volume and 64 cells as open, and fails five checks on a mesh that,
+        with the layer off and nothing else changed, fails one.
+
+        So a layer thin enough to fit is not thereby a layer the volume
+        mesher can build on, and this is the check that says which it was.
+        """
+        record = self.statistics.get('layers')
+        if not record or not self.layer_columns:
+            return
+        resting = self.cells_resting_on_the_layer()
+        if not resting:
+            record['landing'] = {'restingCells': 0, 'degenerateCells': 0,
+                                 'floor': LAYER_LANDING_FLOOR}
+            return
+        values = self.gmsh.model.mesh.getElementQualities(resting, 'gamma')
+        flat = sorted((float(value), int(tag))
+                      for value, tag in zip(values, resting)
+                      if value < LAYER_LANDING_FLOOR)
+        record['landing'] = {
+            'restingCells': len(resting),
+            'degenerateCells': len(flat),
+            'worst': float(min(values)),
+            'floor': LAYER_LANDING_FLOOR,
+            'measure': 'gamma',
+        }
+        if not flat:
+            return
+        worst, tag = flat[0]
+        place = self._element_centroid(tag)
+        record['landing']['worstAt'] = list(place)
+        grew = float(record.get('requestedTotalThickness') or 0.0)
+        # DP-76. Not ``requestedTotalThickness``: inside a refitted run that
+        # is what the refit asked for, not what the user did. DP-74 scales
+        # the intent and leaves the untouched ask beside it, so the two
+        # numbers in the sentence below are a real comparison and not the
+        # same number written twice.
+        layers = self.intent.get('layers') or {}
+        asked = float(layers.get('originalTotalThickness')
+                      or layers.get('totalThickness') or grew)
+        against = ''
+        if asked > grew * 1.001:
+            against = f' against the {asked:.6g} m asked for'
+        raise LayerLanding(
+            f'the boundary layer fitted and then did not land: {len(flat)} of '
+            f'the {len(resting)} cells resting on the inner surface of the '
+            f'layer have no height. The worst measures {worst:.3e} gamma at '
+            f'({place[0]:.6g}, {place[1]:.6g}, {place[2]:.6g}) — flat enough '
+            f'that OpenFOAM reads cells like it as negative volume. The '
+            f'stack grew {grew:.6g} m{against}, and a layer that thin under '
+            f'the surface mesh around it leaves the volume mesher a gap it '
+            f'can fill only with flat cells. A thinner layer will not clear '
+            f'this, because the gap only gets thinner with it: refine the '
+            f'surface mesh at the wall so its elements come nearer the layer '
+            f'in size, or grow no layer on this geometry.',
+            cells=len(flat), worst=worst, thickness=grew, asked=asked,
+            at=place)
+
+    def layer_height_groups(self, selected, heights, internal=(),
+                            outward=None):
+        """Split the layer bases by the direction that grows into the fluid.
+
+        DP-55. MEASURED on ``box_with_obstacle.stl``, a 4x4x4 box holed by a
+        1x1x1 cube, three layers, every boundary surface selected. All 12
+        facets of the inner shell are wound out of the cube, so their normals
+        point into the fluid; the outer box's 12 are wound out of the fluid.
+        One sign for both put 6258 of 500430 cells inside the obstacle - three
+        layers off its 2082 wall faces, plus the twelve tetrahedra that closed
+        the corner - 1040 of them at negative volume, and checkMesh named
+        every cell that held the inner cap non-closed at an openness of
+        exactly 1. A prism's two triangular caps carry all the area in the cap
+        direction and cancel; reverse one and the sum equals the sum of the
+        magnitudes, which is what openness 1 means. Measured again on the
+        two-file form of the same geometry in leg t6-r2 of the Plan 31
+        campaign: 2082 open cells, 2082 wrongly oriented face pyramids, 2082
+        concave cells, four failed checkMesh checks, and 63.156 m3 of fluid
+        where the analytic answer is 63.000.
+
+        *internal* is the CAD route's answer to the same question. The shell
+        topology runs on the tessellated route only, so an OCC import arrives
+        here with no voids and no windings recorded; the surfaces of every
+        shell the outermost one encloses are passed in instead. A nested shell
+        can only be a hole by this point, because a multi-volume assembly was
+        already refused above.
+
+        DP-71. *internal* alone was never that answer, and reading it as one
+        reversed the surfaces it should have left alone. `hole != inverted` is
+        two readings and the tessellated route supplies both: a void shell is
+        wound out of the solid it cuts, so its normals already point into the
+        fluid, and the two readings cancel. `surface_winding` is written by
+        the tessellated import and by nothing else, so on the CAD route
+        `inverted` was False for every surface in the run and every enclosed
+        shell was reversed on the strength of half a test. MEASURED on
+        `box_with_cavity.step`: three layers of prisms grown into a spherical
+        cavity, 5974 open cells, and 0.0712 m3 of fluid where the analytic
+        answer is 0.0568.
+
+        *outward* is the reading that was missing, and it is a measurement
+        rather than an inference: for each base, whether the surface's own
+        normal -- the direction ``extrudeBoundaryLayer`` follows -- leaves the
+        fluid. Where it answers it decides, because it answers the question
+        the other two only approach. Probed across the 22 CAD files of the
+        catalogue, one of them holed: every surface of every single-solid file
+        answers, and every one of them faces out of the fluid.
+
+        The sign the intent carries is kept as the outer shell's direction, so
+        a geometry with no holes extrudes exactly as it did before.
+        """
+        base = list(heights)
+        opposite = [-value for value in heights]
+        enclosed = {int(tag) for tag in internal}
+        measured = dict(outward or {})
+        keep, flip = [], []
+        for tag in selected:
+            if int(tag) in measured:
+                (keep if measured[int(tag)] else flip).append(tag)
+                continue
+            inverted = self.surface_winding.get(int(tag), 1) < 0
+            hole = int(tag) in self.void_surfaces or int(tag) in enclosed
+            # A void shell and an inverted shell each reverse the normal; both
+            # together cancel back to the outer shell's direction.
+            (flip if hole != inverted else keep).append(tag)
+        groups = []
+        if keep:
+            groups.append((base, keep, False))
+        if flip:
+            groups.append((opposite, flip, True))
+            self.warnings.append(
+                f'{count_text(len(flip), "boundary layer base")} '
+                f'{agreeing(len(flip), "bounds", "bound")} a hole in the '
+                f'volume and {agreeing(len(flip), "was", "were")} grown '
+                'inwards from it, away from the void')
+        return groups
+
+    def directions_that_meet(self, groups):
+        """Which layer bases grow opposite ways and share an edge.
+
+        DP-91. ``extrudeBoundaryLayer`` takes one signed height per call, so
+        bases that grow towards each other are extruded in two calls -- and a
+        curve on the boundary between them is then extruded twice, once in
+        each direction. Gmsh does not notice while the geometry is built; it
+        notices during the 3D pass, when the second call looks for a node the
+        first one moved somewhere else.
+
+        MEASURED on `annulus_shell.step` with layers on every wall of the
+        fluid annulus. The interface with the bore is wound out of the bore,
+        so its normal points into the fluid and it is grown the other way;
+        the outer cylinder and the two end caps are grown along -n. The
+        interface shares curve 3 with one cap and curve 2 with the other, and
+        the run failed 12 s in with `Could not find extruded node
+        (0.06016981, 1.1304e-08, -0.00017653) in surface 63` -- a point on the
+        bore radius, one layer height off the cap. Nothing in that names a
+        patch, and the same selection is what the Boundary Layers page
+        proposes for this geometry.
+
+        Returns the pairs that touch, as ``(tag, other tag)``.
+        """
+        if len(groups) < 2:
+            return []
+        curves = {}
+        for _signed, tags, _flipped in groups:
+            for tag in tags:
+                curves[int(tag)] = set(self.surface_curves(tag))
+        meetings = set()
+        for index in range(len(groups)):
+            for other in range(index + 1, len(groups)):
+                for tag in groups[index][1]:
+                    for mate in groups[other][1]:
+                        if curves[int(tag)] & curves[int(mate)]:
+                            meetings.add((int(tag), int(mate)))
+        return sorted(meetings)
+
+    def one_call_for_both_directions(self, groups):
+        """Both senses in one group, the sense carried on each tag.
+
+        DP-404. `directions_that_meet` finds bases that grow opposite ways
+        along their own normals and share a curve, and DP-91 refused them,
+        because two senses meant two calls to `extrudeBoundaryLayer` and a
+        curve handed to both is extruded twice. The height is indeed signed
+        once per call. The call is not: a dim-tag carries a sign of its own.
+
+        MEASURED on Gmsh 4.15.2, one unit square, one layer, reading back
+        where the nodes landed:
+
+            tag +1  height +0.1  ->  nodes span z 0.0 .. 0.1
+            tag +1  height -0.1  ->  nodes span z -0.1 .. 0.0
+            tag -1  height +0.1  ->  nodes span z -0.1 .. 0.0
+            tag -1  height -0.1  ->  nodes span z 0.0 .. 0.1
+
+        Negating the tag is exactly negating the height, so `(2, -tag)` at the
+        base heights grows where `(2, tag)` at the opposite heights grows, and
+        one call can hold both.
+
+        MEASURED again on the contact itself -- two unit boxes fragmented into
+        a shared face, the core taken as the volume that face_s normal enters,
+        layers of 3 on its five outer walls and on its half of the partition,
+        which share the partition_s whole rim:
+
+            two calls, one signed height each
+                FAILED  Could not find extruded node
+                        (1.051477373670381, 0.2, 1.051477373670381)
+                        in surface 152
+            one call, the sense carried on each tag
+                MESHED  1,200 prisms
+
+        The first line is DP-91_s failure, in DP-91_s words. The second is the
+        same geometry, the same heights and the same selection.
+
+        This is reached only where the two-call arrangement is measured not to
+        work -- a contact was found -- so every selection that extrudes today
+        extrudes exactly as it did.
+        """
+        base = next((list(signed) for signed, _tags, flipped in groups
+                     if not flipped), None)
+        if base is None:
+            # Every group flipped: there is no contact to resolve, but the
+            # sense the tags will carry has to be read against something.
+            base = [-value for value in groups[0][0]] if groups else []
+        tags = []
+        for _signed, group, flipped in groups:
+            tags.extend((-abs(int(tag)) if flipped else abs(int(tag)))
+                        for tag in group)
+        return [(base, tags, False)]
+
+    def opposed_directions_refusal(self, selected, groups, meetings, skipped):
+        """What to say when the contact cannot be extruded at all.
+
+        DP-91 wrote this, and DP-404 moved it: it is the sentence the run
+        makes when a contact was found *and* the one call that holds both
+        senses would not run either. Every fact in it is read before anything
+        is built, which is why it can still name patches -- the Gmsh failure
+        it stands in for arrives part-way through the 3D pass and names a
+        coordinate.
+        """
+        gmsh = self.gmsh
+        boxes = {int(tag): gmsh.model.getBoundingBox(2, int(tag))
+                 for tag in list(selected) + list(skipped)}
+        touching = sorted({self.surface_patch_name(tag)[0]
+                           for pair in meetings for tag in pair})
+        workable = self.selection_that_would_mesh(
+            selected, groups, meetings, skipped, boxes)
+        advice = ('Grow layers on a set of patches that all face the same '
+                  'way, mesh one volume per job, or turn boundary layers '
+                  'off.')
+        if workable:
+            names = sorted({self.surface_patch_name(tag)[0]
+                            for tag in workable})
+            advice = ('Layers on ' + ', '.join(names) + ' would mesh: '
+                      'what is left over is flat, and a flat opening is '
+                      'one the rebuild can close. Or mesh one volume per '
+                      'job, or turn boundary layers off.')
+        return ('boundary layers were asked for on both sides of an edge '
+                f'shared by {", ".join(touching)}, and those patches are '
+                'wound opposite ways: one layer grows along its surface '
+                'normal and the other against it. A shared edge cannot be '
+                'extruded in two directions at once. ' + advice)
+
+    def selection_that_would_mesh(self, selected, groups, meetings,
+                                  skipped, boxes):
+        """A subset of this selection whose bases no longer meet head-on.
+
+        DP-91. The refusal above is a dead end unless it says what to do
+        instead, and the run holds every fact the answer needs. Dropping the
+        patches on one side of the contact removes it; which side to drop is
+        decided by :meth:`patch_lies_in_a_plane`, because whatever is dropped
+        joins what :meth:`rebuild_unextruded` has to close with a flat face,
+        and DP-90 refuses a curved opening.
+
+        MEASURED on `annulus_shell.step` with layers on the whole fluid
+        annulus: dropping the interface leaves the outer cylinder uncovered
+        and curved, which DP-90 refuses; dropping the two end caps leaves the
+        interface and the outer cylinder, which meshes -- 302474 cells and
+        0.01256056 m3 against an analytic 0.01256637. Returns the surviving
+        tags, the largest surviving selection first, or an empty list where
+        neither side can be dropped.
+        """
+        chosen = {int(tag) for tag in selected}
+        touching = {int(tag) for pair in meetings for tag in pair}
+        left_out = [int(tag) for tag in skipped]
+        curves = {tag: set(self.surface_curves(tag)) for tag in chosen}
+        candidates = []
+        for index, (_signed, tags, _flipped) in enumerate(groups):
+            dropped = sorted(touching & {int(tag) for tag in tags})
+            kept = sorted(chosen - set(dropped))
+            if not dropped or not kept:
+                continue
+            # Dropping one side has to leave the other side clear of every
+            # contact, not only of the ones this side was in.
+            if any(curves[one] & curves[other] for one in kept
+                   for other in kept if one < other
+                   and self.grow_the_same_way(groups, one, other) is False):
+                continue
+            if all(self.patch_lies_in_a_plane(tag, boxes[tag])
+                   for tag in dropped + left_out if tag in boxes):
+                candidates.append((len(kept), index, kept))
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][2]
+
+    @staticmethod
+    def grow_the_same_way(groups, one, other):
+        """Are these two bases extruded in the same call, and so the same way?"""
+        homes = {}
+        for index, (_signed, tags, _flipped) in enumerate(groups):
+            for tag in tags:
+                homes[int(tag)] = index
+        if one not in homes or other not in homes:
+            return None
+        return homes[one] == homes[other]
+
+    #: Where on a surface to sample it, as fractions of its parametric range.
+    NORMAL_SAMPLES = (0.25, 0.5, 0.75)
+
+    def outward_normals(self, selected, volumes):
+        """Which of these surfaces have their own normal leaving the fluid.
+
+        DP-71. ``extrudeBoundaryLayer`` walks each stack along the surface's
+        own normal, so the only thing the direction decision needs to know is
+        where that normal points -- and on the CAD route the solid it points
+        out of, or into, is still in the model when the layers are grown.
+        Nothing is meshed yet, which is why the nesting reading was reached
+        for; a solid can be asked about a point without meshing it.
+
+        Returns the surfaces it could answer for and leaves the rest to the
+        readings that were here before.
+        """
+        gmsh = self.gmsh
+        if not volumes:
+            return {}
+        try:
+            box = gmsh.model.getBoundingBox(-1, -1)
+            span = max(box[axis + 3] - box[axis] for axis in range(3))
+        except Exception:
+            return {}
+        if not span:
+            return {}
+        answers = {}
+        for tag in selected:
+            verdict = self.normal_leaves_the_fluid(
+                int(tag), volumes, span * 1e-4, span * 1e-6)
+            if verdict is not None:
+                answers[int(tag)] = verdict
+        return answers
+
+    def normal_leaves_the_fluid(self, tag, volumes, step, slack):
+        """True, False, or None where the samples do not agree on one.
+
+        DP-71. Sample the surface, step off the point along its normal by
+        *step*, and ask the solid which side each step landed on. Leaving the
+        fluid forwards and entering it backwards is a normal that faces out;
+        the reverse is a normal that faces in; anything else is not an answer.
+
+        Parametric bounds are a rectangle and a trimmed face is not, so a
+        sample is dropped on its coordinates rather than trusted: a point
+        outside the surface's own bounding box is not on the surface. MEASURED
+        across the CAD catalogue -- every surface of every single-solid file
+        answers, and the two that do not belong to the one file holding two
+        solids, which cannot grow layers at all.
+
+        ``getBoundary(..., oriented=True)`` was tried for this first and
+        cannot serve: probed live on Gmsh 4.15.2 its signs are mixed within a
+        single shell, and on ``box_with_cavity.step`` three of the box's six
+        faces carry the sign opposite to the other three while all six face
+        the same way.
+        """
+        gmsh = self.gmsh
+        try:
+            low, high = gmsh.model.getParametrizationBounds(2, tag)
+            corners = gmsh.model.getBoundingBox(2, tag)
+        except Exception:
+            return None
+        votes = []
+        for first in self.NORMAL_SAMPLES:
+            for second in self.NORMAL_SAMPLES:
+                params = [low[0] + (high[0] - low[0]) * first,
+                          low[1] + (high[1] - low[1]) * second]
+                try:
+                    point = gmsh.model.getValue(2, tag, params)
+                    normal = gmsh.model.getNormal(tag, params)
+                    if any(not corners[axis] - slack <= point[axis]
+                           <= corners[axis + 3] + slack for axis in range(3)):
+                        continue
+                    ahead = [point[axis] + normal[axis] * step
+                             for axis in range(3)]
+                    behind = [point[axis] - normal[axis] * step
+                              for axis in range(3)]
+                    forward = any(gmsh.model.isInside(3, volume, ahead)
+                                  for volume in volumes)
+                    backward = any(gmsh.model.isInside(3, volume, behind)
+                                   for volume in volumes)
+                except Exception:
+                    return None
+                if bool(forward) == bool(backward):
+                    continue
+                votes.append(not forward)
+        if not votes or len(set(votes)) != 1:
+            return None
+        return votes[0]
+
+    def volume_surfaces(self, volume):
+        """The surfaces bounding one volume, unsigned.
+
+        The sign `getBoundary` returns is not read anywhere: probed live on
+        Gmsh 4.15.2 it is mixed within a single shell, which is why
+        `normal_leaves_the_fluid` exists.
+        """
+        return [abs(int(tag)) for _dim, tag in
+                self.gmsh.model.getBoundary([(3, int(volume))],
+                                            oriented=False)]
+
+    def surface_owners(self, volumes):
+        """Which volumes each surface bounds, as ``{surface: {volume, ...}}``.
+
+        One notion of adjacency for the two questions that need it: which
+        single volume every layer base bounds, and which surfaces bound more
+        than one. `getBoundary` is the source for both, so the second cannot
+        answer differently from the first.
+        """
+        owners: dict[int, set] = {}
+        for volume in volumes:
+            for tag in self.volume_surfaces(volume):
+                owners.setdefault(int(tag), set()).add(int(volume))
+        return owners
+
+    def volume_the_layer_grows_into(self, volumes, selected):
+        """Which volume every selected base bounds, if there is just one.
+
+        R118. A face shared by two volumes bounds both, so the answer is the
+        intersection and not the union: on `annulus_shell.step` the fluid
+        annulus is named by its outer wall alone, while the interface it
+        shares with the solid bore names both and settles nothing.
+
+        Returns ``(volume, None)`` when one volume carries every base,
+        ``(None, candidates)`` when more than one still could -- a selection
+        made entirely of shared faces -- and ``(None, [])`` when the bases
+        span volumes and no single core can be rebuilt.
+        """
+        owners = self.surface_owners(volumes)
+        common = {int(volume) for volume in volumes}
+        for tag in selected:
+            common &= owners.get(int(tag), set())
+        if len(common) == 1:
+            return next(iter(common)), None
+        return None, sorted(common)
+
+    def keep_shared_surfaces(self, volumes, selected, skipped):
+        """Move a surface two volumes share out of ``skipped`` and into it.
+
+        DP-398. `rebuild_unextruded` deletes every skipped surface and builds
+        a plane across the rim in its place, because the layer's laterals lie
+        in the neighbouring patch's plane and reusing the patch would cover it
+        twice. On the outside of a volume that is right. On a surface two
+        volumes share it is not: only the volume the layer is carved out of is
+        rebuilt, so the carved side gets the new plane and the other side
+        keeps the original, and an interface that was one face becomes two
+        triangulations that meet nowhere.
+
+        MEASURED on the four multiregion STEP fixtures. `shell_and_tube` and
+        `coaxial_ducts` name their interface as a layer base -- `wall1` in
+        both -- and publish, with the interface internal and every boundary
+        face named. `tee_with_plug` names `wall4`..`wall7` and not its
+        interface `wall3`; `baffled_chamber` names `wall7`..`wall12` and
+        `wall14`, the copy the fusion had already deleted. Both refuse, with
+        884 and 4,200 unnamed boundary faces covering 0.0020289 m2 and
+        0.0159999 m2 -- twice 0.0010179 and twice 0.008, their two interface
+        areas, present once from each side.
+
+        A base survives the carve: the prisms stand on it and it goes on
+        bounding both volumes. So a shared surface is made a base. The cost is
+        a layer grown on the interface, which is what the two fixtures that
+        already work already do, and what a conjugate interface wants.
+
+        This is called once the core volume is known and `skipped` has been
+        recomputed from that core's surfaces, so every tag it can reach bounds
+        the core already; what it tests is whether the tag bounds something
+        else as well.
+        """
+        # DP-57's refusal stands: growing on nothing is an answer, and this
+        # is not the place to turn it into something. The caller has returned
+        # on an empty selection long before here; the guard is kept so that
+        # staying true of this method does not depend on the caller.
+        if not selected:
+            return selected, skipped
+        owners = self.surface_owners(volumes)
+        shared = [tag for tag in skipped if len(owners.get(int(tag), ())) > 1]
+        if not shared:
+            return selected, skipped
+        names = sorted({self.surface_patch_name(tag)[0] for tag in shared})
+        self.warnings.append(
+            'boundary layers were not asked for on ' + ', '.join(names)
+            + ', and each of those is shared by two regions. A patch left out '
+            'of the layer is rebuilt for the region the layer is carved out '
+            'of alone, which would leave the two regions meeting across two '
+            'separate surfaces instead of one, so the layer was grown on '
+            'them as well to keep the interface conformal.')
+        for tag in shared:
+            self.ledger.record(
+                f'layerPatch:{self.surface_patch_name(tag)[0]}',
+                False, True,
+                note='shared by two regions: not asked for, grown anyway to '
+                     'keep the interface one surface')
+        keep = {int(tag) for tag in shared}
+        return (list(selected) + list(shared),
+                [tag for tag in skipped if int(tag) not in keep])
 
     def layer_surfaces(self, surfaces, layers):
         """Split the boundary into the surfaces that grow layers and the rest.
@@ -2888,13 +5078,39 @@ class GmshRun:
         inlet plane (z=0.004999) and the outlet plane (z=0.5937 / 0.5967) --
         the very stack that failed the quality gate of R113. Prism layers on an
         inlet and an outlet are wrong for every flow case, so the plan may name
-        the patches that get them. An empty selection keeps the shipped
-        behaviour: every boundary surface.
+        the patches that get them.
+
+        Plan 33 section 1.1 retired the rest of that rule. An empty selection
+        used to mean every boundary surface, which is the defect above with
+        the user's own silence for a cause, and no reader of the page could
+        tell the two apart. The plan now carries the choice as well as the
+        list: ``selected`` is the list and nothing else, empty included, and
+        ``all_eligible_walls`` reads the walls off the surfaces this run
+        actually imported, through the same rule the page ticks its rows
+        with.
         """
+        mode = normalise_mode(layers.get('patchMode'))
         wanted = {str(item).strip() for item in (layers.get('patches') or ())
                   if str(item).strip()}
-        if not wanted:
-            return list(surfaces), []
+        if not mode:
+            # A job written before the choice existed. Read it the way the
+            # saved case it came from is read, so one plan cannot mean two
+            # things depending on which side of the seam is looking.
+            mode = MODE_ALL_WALLS if not wanted else 'selected'
+        if mode == MODE_ALL_WALLS:
+            wanted = set(eligible_wall_names(
+                self.surface_patch_name(tag)[0] for tag in surfaces))
+            if not wanted:
+                self.warnings.append(
+                    'every eligible wall was asked for and this import names '
+                    'no boundary as a wall, so no layer could be grown. Name '
+                    'the surfaces that are walls, or choose them here by '
+                    'hand.')
+                return [], list(surfaces)
+        elif not wanted:
+            # Growing on nothing is an answer. It is refused above this, in
+            # `apply_boundary_layers`, rather than turned into everything.
+            return [], list(surfaces)
         # Plan 30 WP12, F-26. The comparison was exact, and on a tessellated
         # import the surfaces are called `face_3` while the page offers the
         # prepared patch names, so a selection matched nothing and the run
@@ -2903,12 +5119,29 @@ class GmshRun:
         # separator-insensitive, the generated `face_N` spelling is accepted
         # as well as the prepared name, and a miss says what was on offer.
         folded = {self._fold_patch_name(item): item for item in wanted}
+        # DP-500. The generated spelling is a Gmsh tag, numbered from 1, and
+        # a prepared CAD import names its faces `face0`, `face1`, ... from 0.
+        # Folded, `face_2` (the tag of prepared `face1`) *is* `face2`, so a
+        # selection of face2-face5 also grew prisms off the unselected outlet
+        # face1. MEASURED on G4 `duct.step`: five surfaces extruded for four
+        # selected, 37 prism columns standing on the outlet plane. A generated
+        # alias that spells a name the prepared geometry declared belongs to
+        # that name's surface, never to this one.
+        declared = {self._fold_patch_name(item)
+                    for item in self.declared_surface_names()}
         selected, skipped, present, matched = [], [], {}, set()
         for tag in surfaces:
             name, known = self.surface_patch_name(tag)
             present[name] = present.get(name, 0) + 1
-            keys = {self._fold_patch_name(name), self._fold_patch_name(
-                f'face_{self.surface_origin.get(tag, tag)}')}
+            own = self._fold_patch_name(name)
+            alias = self._fold_patch_name(
+                f'face_{self.surface_origin.get(tag, tag)}')
+            keys = {own}
+            if alias == own or alias not in declared:
+                keys.add(alias)
+            # DP-410. Ditto: the face the fusion kept answers to both names.
+            keys.update(self._fold_patch_name(alias) for alias
+                        in self.merged_surface_names.get(int(tag), ()))
             hit = keys & set(folded)
             if hit:
                 matched.update(folded[key] for key in hit)
@@ -2924,7 +5157,32 @@ class GmshRun:
                          'patch name')
         missing = sorted(wanted - matched)
         if missing:
+            # DP-399. Two unlike things arrive here. A name the prepared
+            # geometry never declared is a selection pointing at nothing, and
+            # the list of what was imported answers it. A name the prepared
+            # geometry *did* declare, whose surface this import no longer
+            # has, is the run losing work the user did: the wall publishes
+            # bare, and the layer summary -- which counts the patches it grew
+            # on against the patches it found -- reports full coverage over
+            # the ones that remain. Nothing in the finished case records that
+            # a wall was ever asked for, which is why this one is a refusal.
+            lost = [name for name in missing
+                    if name in self.names_without_surface]
             offer = ', '.join(sorted(present)) or 'none'
+            if lost:
+                fused = (
+                    f' Import fused '
+                    f'{count_text(self.duplicate_faces_fused, "face")} as '
+                    'duplicates, which is what takes a prepared name away; '
+                    'turn off "remove duplicate faces" if these surfaces are '
+                    'meant to stay separate.'
+                    if self.duplicate_faces_fused else '')
+                raise MeshFailure(
+                    'boundary layers were asked for on ' + ', '.join(lost)
+                    + ', which the prepared geometry names but no surface in '
+                    'this model carries, so the layers cannot be grown and '
+                    f'the patch would publish bare.{fused} The surfaces this '
+                    f'run imported are: {offer}.')
             reason = (
                 'boundary layers were asked for on ' + ', '.join(missing)
                 + f', which matched no imported surface. The surfaces this '
@@ -2974,6 +5232,188 @@ class GmshRun:
         return {abs(curve) for _dim, curve in self.gmsh.model.getBoundary(
             [(2, tag)], oriented=False, recursive=False)}
 
+    def boundary_shells(self, surfaces):
+        """The boundary split into connected shells, by shared curves.
+
+        DP-55. Two surfaces that share a bounding curve are two faces of the
+        same closed surface, so the transitive closure of that relation is a
+        shell. A box with an obstacle inside it is two of them, and they want
+        their layers grown in opposite directions.
+        """
+        parent = {tag: tag for tag in surfaces}
+
+        def find(tag):
+            while parent[tag] != tag:
+                parent[tag] = parent[parent[tag]]
+                tag = parent[tag]
+            return tag
+
+        owners: dict[int, int] = {}
+        for tag in surfaces:
+            for curve in self.surface_curves(tag):
+                other = owners.setdefault(curve, tag)
+                left, right = find(tag), find(other)
+                if left != right:
+                    parent[left] = right
+        shells: dict[int, list[int]] = {}
+        for tag in surfaces:
+            shells.setdefault(find(tag), []).append(tag)
+        return [sorted(group) for group in shells.values()]
+
+    def internal_shells(self, shells):
+        """The surfaces of every shell the outermost one encloses.
+
+        DP-55. Bounding-box containment, because it answers from geometry the
+        model already has. Where the tessellated route ran, the shell topology
+        has already said which shells are voids and which way each is wound,
+        and that reading is the better one; this is the CAD route's answer,
+        where nothing is meshed until after the layers are grown. The sign of
+        each shell's own volume read off its surface mesh would also serve
+        (+64 for a 4 m box, +1.0 for the 1 m cube cut out of it, measured
+        live), and there is no surface mesh here to read it from.
+
+        A nested shell can only be a hole, because a multi-volume assembly is
+        refused before this point.
+
+        Empty where there is one shell, or where no single shell encloses all
+        the others: then every surface keeps the direction the plan asked for,
+        which is what this did before it could tell them apart.
+        """
+        if len(shells) < 2:
+            return set()
+        boxes = []
+        for group in shells:
+            corners = [self.gmsh.model.getBoundingBox(2, tag) for tag in group]
+            boxes.append(tuple(
+                [min(corner[axis] for corner in corners) for axis in range(3)]
+                + [max(corner[axis] for corner in corners)
+                   for axis in range(3, 6)]))
+        slack = max(box[axis + 3] - box[axis]
+                    for box in boxes for axis in range(3)) * 1e-9
+
+        def encloses(outer, inner):
+            return (all(outer[axis] <= inner[axis] + slack
+                        for axis in range(3))
+                    and all(outer[axis] >= inner[axis] - slack
+                            for axis in range(3, 6)))
+
+        enclosing = [index for index, box in enumerate(boxes)
+                     if all(encloses(box, other)
+                            for position, other in enumerate(boxes)
+                            if position != index)]
+        if len(enclosing) != 1:
+            return set()
+        return {tag for index, group in enumerate(shells)
+                if index != enclosing[0] for tag in group}
+
+    def shells_kept_whole(self, shells, selected, internal):
+        """The core's shells that close it without being rebuilt.
+
+        DP-124. :meth:`rebuild_unextruded` replaces every un-layered surface
+        with a flat face stitched into the rim the layer stopped at, because
+        the layer's own lateral faces lie in the plane of the surface it grew
+        beside and the two would overlap. That reasoning is about a surface
+        the layer *reaches*. A shell it never touches is not in the way of
+        anything: it is still closed, still meshed and still named, and
+        rebuilding it is neither possible nor wanted.
+
+        MEASURED on `two_solid_block.stl`, one wrapped file holding a box
+        inside a box. The farfield is a single volume bounded by two disjoint
+        shells; with layers on the outer one every curve of every layer top is
+        shared with another top, so `rim_loops` returns nothing at all and the
+        rebuild refused with "the boundary layer left no rim to rebuild the
+        un-layered patches from". Kept whole instead, the inner shell goes to
+        `addVolume` as the hole it always was.
+
+        Only a shell the layered one encloses is kept. The geo kernel reads
+        the first surface loop of a volume as its exterior and the rest as
+        holes, so an un-layered shell *outside* the layer -- an obstacle given
+        layers inside a box that was not -- cannot be a loop after the first.
+        That one is left in `skipped` and refused by the rebuild as before,
+        rather than built into a volume turned inside out.
+        """
+        chosen = {int(tag) for tag in selected}
+        inside = {int(tag) for tag in internal}
+        kept = []
+        for group in shells:
+            tags = sorted(int(tag) for tag in group)
+            if any(tag in chosen for tag in tags):
+                continue
+            if tags and all(tag in inside for tag in tags):
+                kept.append(tags)
+        return kept
+
+    def shell_kept_as_exterior(self, shells, selected, internal):
+        """The un-layered shell the core is bounded by from outside.
+
+        DP-127. :meth:`shells_kept_whole` reads the same fact -- a shell the
+        layer never reached needs no rebuild -- and only acts on it where the
+        shell is a hole. MEASURED on `turbine_cascade`, two files and one
+        fluid volume: the layer is on the blades (`99 boundary layer base(s)
+        bound a hole in the volume and were grown inwards from it`) and the
+        farfield around them carries none. So the untouched shell is the
+        enclosing one, DP-124 declined it, the rebuild was handed it, and a
+        layer that wraps a blade leaves no rim for a flat face to stitch into:
+        the run died on "the boundary layer left no rim to rebuild the
+        un-layered patches from".
+
+        That volume is not ill-defined. It is bounded outside by the farfield
+        and inside by the layer tops, and `addVolume` spells exactly that --
+        the kept shell first, one loop of tops per body after it.
+
+        Kept only where the split is clean: one shell that encloses all the
+        others and carries no layer, and every enclosed shell layered whole.
+        A shell the layer reached in part has its own faces in the way of the
+        layer's laterals, which is what the rebuild exists for, so a mixture
+        goes there as before rather than into a volume that covers a plane
+        twice.
+        """
+        if len(shells) < 2 or not internal:
+            return []
+        chosen = {int(tag) for tag in selected}
+        inside = {int(tag) for tag in internal}
+        outside, enclosed = [], []
+        for group in shells:
+            tags = sorted(int(tag) for tag in group)
+            (enclosed if tags and all(tag in inside for tag in tags)
+             else outside).append(tags)
+        if len(outside) != 1 or not enclosed:
+            return []
+        if any(tag in chosen for tag in outside[0]):
+            return []
+        if not all(all(tag in chosen for tag in group) for group in enclosed):
+            return []
+        return outside[0]
+
+    def layer_tops_by_shell(self, shells, columns):
+        """Each shell's layer tops, grouped so they can close one hole.
+
+        DP-127. `addVolume` takes one surface loop per hole, and a cascade
+        has a hole per blade. The grouping is read off the columns rather
+        than the model: the top of a column stands on its base, so the tops
+        of a shell's bases close around that shell and nothing else.
+        """
+        top_of = {int(base): int(top) for base, top in columns}
+        groups = []
+        for group in shells:
+            tops = [top_of[int(tag)] for tag in group if int(tag) in top_of]
+            if tops:
+                groups.append(tops)
+        return groups
+
+    def rim_owners(self, tops):
+        """Which layer top each rim curve belongs to.
+
+        Where two extruded surfaces meet, their tops share a curve. A curve
+        owned by a single top is on the rim where the layer stops.
+        """
+        seen: dict[int, list] = {}
+        for tag in tops:
+            for curve in self.surface_curves(tag):
+                seen.setdefault(curve, []).append(int(tag))
+        return {curve: tags[0] for curve, tags in seen.items()
+                if len(tags) == 1}
+
     def rim_loops(self, tops):
         """Closed loops of the curves that bound exactly one layer top.
 
@@ -2981,11 +5421,7 @@ class GmshRun:
         owned by a single top is therefore on the rim where the layer stops --
         the outline of the hole the un-extruded surface has to fill.
         """
-        owners: dict[int, int] = {}
-        for tag in tops:
-            for curve in self.surface_curves(tag):
-                owners[curve] = owners.get(curve, 0) + 1
-        rim = [curve for curve, count in owners.items() if count == 1]
+        rim = list(self.rim_owners(tops))
         parent = {curve: curve for curve in rim}
 
         def find(curve):
@@ -3007,7 +5443,69 @@ class GmshRun:
             loops.setdefault(find(curve), []).append(curve)
         return list(loops.values())
 
-    def rebuild_unextruded(self, skipped, tops, boxes):
+    def patch_lies_in_a_plane(self, tag, box):
+        """Is this patch flat enough to be stood in for by a plane face?
+
+        DP-90. :meth:`rebuild_unextruded` closes the opening a layer leaves
+        with ``addPlaneSurface``, and every guard it had reads the *rim*
+        rather than the patch. MEASURED on `annulus_shell.step`, layers on
+        `wall4`, `wall5` and `wall6` -- the three faces of the fluid annulus
+        that are not its interface with the bore. Each rim of that interface
+        is a single closed circle, so it bounds exactly one point:
+        `_box_holding` attributes it freely and `_out_of_plane` reports 0.0
+        over fewer than four points. Both guards passed vacuously and the two
+        rims, 0.4 m apart, were welded into one plane surface as outline and
+        hole. The core came out open on 124 edges and the 3D pass spun on it
+        for over 45 minutes emitting nothing -- `generate` has no heartbeat,
+        so the GUI showed a run at 35% that never moved and had to be killed.
+
+        The same blindness is worse where it finishes. With layers on `wall4`
+        alone the interface is left with no rim at all, dropped, and the core
+        closed as though the bore were not there: 0.01707852 m3 of cells
+        against an analytic 0.01256637, the bore's 0.00452 m3 meshed twice
+        and the two regions overlapping -- and the run published `succeeded`.
+
+        The normal of a plane is the same everywhere on it. Sampled the way
+        :meth:`normal_leaves_the_fluid` samples, that answers for a slanted
+        face as well as an axis-aligned one, which a bounding box does not.
+        A patch that cannot be asked is called flat: an unanswerable one
+        keeps the shipped behaviour rather than refusing a run that worked.
+        """
+        gmsh = self.gmsh
+        try:
+            low, high = gmsh.model.getParametrizationBounds(2, tag)
+        except Exception:                    # noqa: BLE001 - discrete surface
+            return True
+        span = max(box[axis + 3] - box[axis] for axis in range(3))
+        slack = max(span * 1e-6, 1e-9)
+        normals = []
+        for first in self.NORMAL_SAMPLES:
+            for second in self.NORMAL_SAMPLES:
+                params = [low[0] + (high[0] - low[0]) * first,
+                          low[1] + (high[1] - low[1]) * second]
+                try:
+                    point = gmsh.model.getValue(2, tag, params)
+                    normal = gmsh.model.getNormal(tag, params)
+                except Exception:            # noqa: BLE001 - not parametrised
+                    return True
+                # Parametric bounds are a rectangle and a trimmed face is
+                # not, so a sample off the patch says nothing about it.
+                if any(not box[axis] - slack <= point[axis]
+                       <= box[axis + 3] + slack for axis in range(3)):
+                    continue
+                length = math.sqrt(sum(value * value for value in normal))
+                if length <= 0.0:
+                    continue
+                normals.append([value / length for value in normal])
+        if len(normals) < 2:
+            return True
+        first = normals[0]
+        # Unsigned: a parametrisation may flip the normal across the patch
+        # without the patch bending at all.
+        return all(abs(sum(first[axis] * other[axis] for axis in range(3)))
+                   >= 1.0 - 1e-4 for other in normals[1:])
+
+    def rebuild_unextruded(self, skipped, tops, boxes, columns):
         """Close the core volume across the surfaces that grew no layer.
 
         R118. The core is rebuilt from the extrusion's *top* surfaces, and with
@@ -3025,7 +5523,37 @@ class GmshRun:
         """
         gmsh = self.gmsh
         rebuilt = {}
+        # R118. Every geometric read below -- the rim's points,
+        # its plane, its span -- goes through `gmsh.model`, and
+        # the extrusion built its rims in the `geo` kernel.
+        # MEASURED on `annulus_shell` without this call: all four
+        # rim curves answer `Empty bounding box`, parametrise as
+        # (0, 1) with `getValue` returning the origin, and bound
+        # no points at all -- so every guard here passed
+        # vacuously, all four rims were attributed to one cap and
+        # the plane surface built across them held two concentric
+        # circles in one loop. Gmsh then spun on `8 intersections
+        # in the 1D mesh (curves 10 10 12 12 33 33 35 35)` for
+        # over thirty minutes without growing by a byte.
+        gmsh.model.geo.synchronize()
+        owners = self.rim_owners(tops)
+        bases = {int(top): int(base) for base, top in columns}
         names = sorted({self.surface_patch_name(tag)[0] for tag in skipped})
+        # DP-90. The closure built below is a plane, so a patch that is not
+        # one cannot be stood in for. Refused here, where the patch still has
+        # a name, rather than left to a 3D pass that does not return.
+        curved = [tag for tag in skipped
+                  if not self.patch_lies_in_a_plane(tag, boxes[tag])]
+        if curved:
+            bent = sorted({self.surface_patch_name(tag)[0] for tag in curved})
+            raise MeshFailure(
+                'the patches left without a boundary layer — '
+                + ', '.join(bent) + ' — are not flat, and the opening a '
+                'layer leaves can only be closed with a flat face. A curved '
+                'patch cannot be left uncovered: the core would be rebuilt as '
+                'though the curve were not there. Name a set of patches that '
+                'leaves only flat ones uncovered, or turn layers off.')
+        rings = []
         for curves in self.rim_loops(tops):
             # MEASURED: the rim only outlines the un-layered patch when the
             # layer surrounds it. Asking for layers on the inlet of the duct
@@ -3036,7 +5564,8 @@ class GmshRun:
             # does not sit inside the patch it is standing in for, or that is
             # not flat, is refused here where the cause can still be named.
             points = self._loop_points(curves)
-            if not self._within_any(boxes, points):
+            owner = self._box_holding(boxes, points)
+            if owner is None:
                 raise MeshFailure(
                     'the boundary layer leaves an opening that does not lie '
                     'on any of the patches without one (' + ', '.join(names)
@@ -3046,19 +5575,35 @@ class GmshRun:
             deviation, extent = self._out_of_plane(points)
             if deviation > max(extent * 1e-4, 1e-12):
                 raise MeshFailure(
-                    'the patches left without a boundary layer -- '
-                    + ', '.join(names) + f' -- span {deviation:.4g} m out of '
+                    'the patches left without a boundary layer — '
+                    + ', '.join(names) + f' — span {deviation:.4g} m out of '
                     'any one plane, and the opening the layer leaves can only '
                     'be closed with a flat face. Grow the layer on them too, '
                     'or turn layers off.')
+            rings.append((owner, curves))
+        grouped: dict[int, list[list[int]]] = {}
+        for owner, curves in rings:
+            grouped.setdefault(owner, []).append(curves)
+        for owner, members in grouped.items():
+            # An annular opening leaves two rims in one plane, and one plane
+            # surface per rim lays a disc across the bore. MEASURED on
+            # `annulus_shell`: the fluid is the space between two cylinders,
+            # so each end cap is bounded by the inner layer's rim and the
+            # outer layer's rim together. The widest rim is the outline and
+            # every other one is a hole in it.
+            flat = self._flat_axis(boxes[owner])
+            members.sort(reverse=True, key=lambda ring: self._rim_rank(
+                ring, owners, bases, flat))
             try:
-                loop = gmsh.model.geo.addCurveLoop(curves, reorient=True)
-                rebuilt[gmsh.model.geo.addPlaneSurface([loop])] = curves
+                loops = [gmsh.model.geo.addCurveLoop(ring, reorient=True)
+                         for ring in members]
+                surface = gmsh.model.geo.addPlaneSurface(loops)
             except Exception as error:
                 raise MeshFailure(
                     'the patches left without a boundary layer could not be '
                     f'rebuilt to close the core volume: {error}. Grow the '
                     'layer on every patch, or turn layers off.') from error
+            rebuilt[surface] = [curve for ring in members for curve in ring]
         if not rebuilt:
             raise MeshFailure(
                 'the boundary layer left no rim to rebuild the un-layered '
@@ -3073,16 +5618,83 @@ class GmshRun:
         return rebuilt
 
     def _loop_points(self, curves):
-        """Coordinates of the points bounding a set of curves."""
+        """Coordinates of the points bounding a set of curves.
+
+        R118. `combined` defaults to true, and a closed curve begins and
+        ends at one point: combining cancels the two occurrences against
+        each other and the curve is reported as bounding nothing at all.
+        MEASURED on `annulus_shell`, whose four rims are full circles --
+        every one of them returned no points, `_box_holding` then held
+        them all to be inside the first cap it looked at, and the plane
+        surface built across them carried two concentric circles in one
+        loop. Gmsh spun on `8 intersections in the 1D mesh` for over
+        thirty minutes.
+        """
         seen, points = set(), []
         for curve in curves:
             for _dim, point in self.gmsh.model.getBoundary(
-                    [(1, curve)], oriented=False, recursive=False):
+                    [(1, curve)], oriented=False, combined=False,
+                    recursive=False):
                 tag = abs(point)
                 if tag not in seen:
                     seen.add(tag)
                     points.append(list(self.gmsh.model.getValue(0, tag, [])))
         return points
+
+    def _flat_axis(self, box):
+        """The axis an un-layered patch has no thickness in."""
+        extents = [box[axis + 3] - box[axis] for axis in range(3)]
+        return extents.index(min(extents))
+
+    def _rim_rank(self, curves, owners, bases, flat):
+        """How wide the layer this rim belongs to started out, in the cap.
+
+        R118. The rim itself cannot be measured: it is a `geo` curve the
+        extrusion made, and MEASURED on `annulus_shell` those answer `Empty
+        bounding box`, parametrise as (0, 1) and evaluate to the origin. The
+        surface the layer grew from is the imported one, and that has real
+        coordinates -- so the rims of one cap are ranked by the bases behind
+        them, measured across the cap rather than along it.
+
+        This is exact for the shape that needs it, nested shells, where the
+        rim is its base offset by the layer thickness. It would not be for a
+        base that narrows away from the cap, and no such case is meshed here:
+        a cap with a single rim never asks the question.
+        """
+        spans = []
+        for curve in curves:
+            base = bases.get(owners.get(int(curve)))
+            if base is None:
+                continue
+            try:
+                box = self.gmsh.model.getBoundingBox(2, int(base))
+            except Exception:                                # noqa: BLE001
+                continue
+            spans.append(max(box[axis + 3] - box[axis]
+                             for axis in range(3) if axis != flat))
+        return max(spans) if spans else 0.0
+
+    @staticmethod
+    def _box_holding(boxes, points):
+        """Which un-layered surface's box holds all of these points.
+
+        `_within_any` answered whether any of them did. The rebuild now has
+        to group the rims by the patch each one stands in, because a patch
+        can be left with more than one -- so the answer has to say which.
+        """
+        # An empty set of points is held by every box: `all` over nothing
+        # is true. MEASURED, that is not a hypothetical -- a rim made of
+        # full circles bounds no points at all, and the first box in the
+        # dictionary then claimed all four of them.
+        if not points:
+            return None
+        for tag, box in boxes.items():
+            span = max(box[index + 3] - box[index] for index in range(3))
+            slack = max(span * 1e-6, 1e-9)
+            if all(box[index] - slack <= point[index] <= box[index + 3] + slack
+                   for point in points for index in range(3)):
+                return tag
+        return None
 
     @staticmethod
     def _within_any(boxes, points):
@@ -3093,6 +5705,12 @@ class GmshRun:
         that has not been meshed yet answers +-DBL_MAX -- but the points of
         its rim have real coordinates.
         """
+        # An empty set of points is held by every box: `all` over nothing
+        # is true. MEASURED, that is not a hypothetical -- a rim made of
+        # full circles bounds no points at all, and the first box in the
+        # dictionary then claimed all four of them.
+        if not points:
+            return False
         for box in boxes.values():
             span = max(box[index + 3] - box[index] for index in range(3))
             slack = max(span * 1e-6, 1e-9)
@@ -3302,20 +5920,51 @@ class GmshRun:
             members = self.layer_replacements.get(tag)
             grouped.setdefault(name, []).extend(
                 members if members is not None else [tag])
+        named = []
         for name, tags in grouped.items():
             if not tags:
                 continue
             gmsh.model.addPhysicalGroup(2, tags, name=name)
+            named.append(name)
         volumes = [tag for _dim, tag in gmsh.model.getEntities(3)]
         volume_names = self.job.get('volumeNames') or {}
-        for tag in volumes:
+
+        def volume_name(tag):
             # C31-04. As for the surfaces: the identity map names this tag,
             # the version-1 map names a position two sources both claim.
-            name = (self.entity_volume_names.get(int(tag))
+            return (self.entity_volume_names.get(int(tag))
                     or volume_names.get(str(tag)) or f'volume_{tag}')
-            gmsh.model.addPhysicalGroup(3, [tag], name=name)
+
+        # R118. A volume a layer was carved out of no longer exists, and the
+        # layer volumes and the rebuilt core that replaced it are all still
+        # the region the user named -- so they publish as one physical group
+        # under that name, and none of them is named after a tag the model
+        # reused underneath it.
+        present = {int(tag) for tag in volumes}
+        claimed = set()
+        for original, members in self.volume_replacements.items():
+            members = [int(tag) for tag in members if int(tag) in present]
+            if not members:
+                continue
+            gmsh.model.addPhysicalGroup(3, members, name=volume_name(original))
+            claimed.update(members)
+        for tag in volumes:
+            if int(tag) in claimed:
+                continue
+            gmsh.model.addPhysicalGroup(3, [tag], name=volume_name(tag))
+        # DP-63. Two different numbers, and a reader downstream needs the
+        # second one. `boundarySurfaces` is how many surface entities the
+        # model has; `boundaryGroups` is how many patches they were grouped
+        # into three lines above, which is what becomes a physical group and
+        # therefore what a `.msh` or a `.su2` carries as a marker. They are
+        # equal only when every surface has its own name. The SU2 export held
+        # its marker count against the first and refused every mesh made from
+        # a single-solid STL.
         self.statistics['groups'] = {
-            'boundarySurfaces': len(boundary), 'volumes': len(volumes)}
+            'boundarySurfaces': len(boundary),
+            'boundaryGroups': len(named),
+            'boundaryGroupNames': sorted(named),
+            'volumes': len(volumes)}
 
     def tag_planar_groups(self):
         """Name a section's boundary curves and its faces.
@@ -3333,21 +5982,88 @@ class GmshRun:
         curves = self.boundary_curves
         # Named by tag, in import order. The prepared-geometry store names
         # surfaces and volumes, because a group in it is a set of faces; it
-        # has nothing to say about a curve, so there is no job key to read
-        # here and inventing one would be a key nobody writes. A section's
-        # boundary therefore publishes as `edge_<tag>` walls, and naming them
-        # inlet and outlet is a separate piece of work.
+        # has nothing to say about a curve. DP-675 (field audit 0924
+        # gmsh-generate-export D11): the user names them instead, by the tag
+        # a first run published as `edge_<tag>`; a curve not named keeps it.
+        names = self.planar_curve_names(curves)
+        grouped = {}
         for tag in curves:
-            gmsh.model.addPhysicalGroup(1, [tag], name=f'edge_{tag}')
+            grouped.setdefault(names.get(int(tag), f'edge_{tag}'),
+                               []).append(tag)
+        for name, tags in grouped.items():
+            gmsh.model.addPhysicalGroup(1, tags, name=name)
         sections = [tag for _dim, tag in gmsh.model.getEntities(2)]
         region_names = self.job.get('volumeNames') or {}
         for tag in sections:
             name = (self.entity_surface_names.get(int(tag))
                     or region_names.get(str(tag)) or f'region_{tag}')
             gmsh.model.addPhysicalGroup(2, [tag], name=name)
+        # DP-63. One group per curve on this route, so the two counts agree
+        # here -- they are recorded separately anyway, because a reader that
+        # has to know which of them it is holding is the fault being fixed.
         self.statistics['groups'] = {
             'boundarySurfaces': 0, 'volumes': 0,
-            'boundaryCurves': len(curves), 'sections': len(sections)}
+            'boundaryGroups': len(grouped),
+            'boundaryGroupNames': sorted(grouped),
+            'boundaryCurves': len(curves), 'sections': len(sections),
+            'curves': self.describe_curves(curves, names)}
+
+    def planar_curve_names(self, curves):
+        """``{curve tag: patch name}`` from the job, checked against the model.
+
+        DP-675. A tag that is not a boundary curve of this section names
+        nothing; that is said in the ledger and the warnings rather than
+        dropped, and every name that did land is recorded as applied.
+        """
+        wanted = self.dimensionality.get('edgeNames') or {}
+        present = {int(tag) for tag in curves}
+        names, missing = {}, []
+        for name, tags in wanted.items():
+            for tag in tags:
+                if int(tag) in present:
+                    names[int(tag)] = str(name)
+                else:
+                    missing.append(f'{name}: {tag}')
+        if wanted:
+            self.ledger.record(
+                'gmsh/dimensionality/edgeNames',
+                {str(name): list(tags) for name, tags in wanted.items()},
+                {name: sorted(tag for tag, other in names.items()
+                              if other == name)
+                 for name in wanted},
+                applied=bool(names), matched=not missing,
+                note=('' if not missing else
+                      'no boundary curve of this section has tag '
+                      + ', '.join(missing) + '; the boundary curves are '
+                      + ', '.join(str(tag) for tag in sorted(present))))
+        if missing:
+            self.warnings.append(
+                'edge names: ' + ', '.join(missing) + ' named no boundary '
+                'curve of this section; its boundary curves are '
+                + ', '.join(f'edge_{tag}' for tag in sorted(present)))
+        return names
+
+    def describe_curves(self, curves, names):
+        """Each boundary curve's tag, patch, length and midpoint.
+
+        DP-675. The tag is what the edge-name field is keyed by, so the run
+        says where each one is.
+        """
+        described = []
+        for tag in curves:
+            item = {'tag': int(tag),
+                    'patch': names.get(int(tag), f'edge_{tag}')}
+            try:
+                low, high = self.gmsh.model.getParametrizationBounds(1, tag)
+                mid = self.gmsh.model.getValue(
+                    1, tag, [0.5 * (low[0] + high[0])])
+                item['midpoint'] = [round(float(value), 9) for value in mid]
+                item['length'] = round(float(self.gmsh.model.occ.getMass(
+                    1, tag)), 9)
+            except Exception:
+                pass
+            described.append(item)
+        return described
 
     def measure_quality(self, all_tags, limit):
         """Measure one metric across the volume and name the elements that fail.
@@ -3371,8 +6087,10 @@ class GmshRun:
             all_tags, QUALITY_QUERY_NAME[measure])
 
         threshold = float(limit.get('minQuality', limit.get('minimum', 0.0)) or 0.0)
-        below = [index for index, item in enumerate(values) if item < threshold]
         inverted = sum(1 for item in values if item <= 0)
+        judged, layer_block = self.split_off_the_layer(values, all_tags,
+                                                       threshold)
+        below = [index for index in judged if values[index] < threshold]
         # Worst first, so the cap keeps the elements a user most wants to see.
         below.sort(key=lambda index: values[index])
         offending = []
@@ -3382,16 +6100,124 @@ class GmshRun:
                 'tag': tag, 'value': float(values[index]), 'measure': measure,
                 'centroid': self._element_centroid(tag),
             })
+        kept = [values[index] for index in judged]
         block = {
             'measure': measure,
-            'minimum': min(values), 'mean': sum(values) / len(values),
-            'below_threshold': len(below), 'total': len(values),
+            'minimum': min(kept), 'mean': sum(kept) / len(kept),
+            'below_threshold': len(below), 'total': len(kept),
             'inverted': inverted, 'offending': offending,
             'offendingTruncated': len(below) > OFFENDER_CAP,
         }
+        surface = self.measure_the_surface_it_was_built_on(measure,
+                                                          threshold)
+        if surface is not None:
+            block['surface'] = surface
+        if layer_block is not None:
+            block['layerCells'] = layer_block
         if substituted_for:
             block['substituted_for'] = substituted_for
         return block
+
+    def measure_the_surface_it_was_built_on(self, measure, threshold):
+        """The boundary mesh, judged by the reading the volume is judged by.
+
+        DP-82. A tetrahedron resting on a sliver triangle is a sliver: its
+        inscribed radius cannot exceed the face it sits on. So a volume mesh
+        refused on quality may be carrying nothing worse than the surface it
+        was given, and the remedy the gate would otherwise advise -- the
+        repair pass, which moves nodes -- cannot lift it, because those nodes
+        are where the surface put them. MEASURED on gmsh drone_quadcopter
+        with the recommended preparation applied: 1405 of the 5228 imported
+        facets (26.9%) read below gamma 0.1 themselves, worst 0.00889, and
+        the volume built on them came out 5097 of 259863 (1.96%) below the
+        same limit. Turning the repair pass on moved the untangler not at
+        all and left 5741 cells below the limit instead of 5097.
+
+        Recorded beside the volume block rather than instead of it: the gate
+        still judges the mesh it was asked to judge, and now it can say where
+        the fault came from.
+        """
+        gmsh = self.gmsh
+        if measure not in QUALITY_QUERY_NAME:
+            return None
+        tags = []
+        _types, groups, _nodes = gmsh.model.mesh.getElements(2)
+        for group in groups:
+            tags.extend(int(item) for item in group)
+        if not tags:
+            return None
+        values = list(gmsh.model.mesh.getElementQualities(
+            tags, QUALITY_QUERY_NAME[measure]))
+        if not values:
+            return None
+        record = getattr(self, 'statistics', {}).get('classification')
+        kept = bool(isinstance(record, dict)
+                    and record.get('keptTessellation'))
+        return {
+            'measure': measure,
+            'total': len(values),
+            'minimum': float(min(values)),
+            'mean': float(sum(values) / len(values)),
+            'below_threshold': sum(1 for item in values if item < threshold),
+            # True when the surface is the imported triangulation itself, in
+            # which case repairing it means repairing the geometry.
+            'keptTessellation': kept,
+        }
+
+    def split_off_the_layer(self, values, all_tags, threshold):
+        """Which elements the limit is judged against, and what the rest were.
+
+        DP-76. ``gamma`` is the ratio of a cell's inscribed radius to its
+        circumscribed one: it measures how far a cell is from equilateral,
+        and it condemns anisotropy as such. A boundary-layer cell is
+        anisotropic on purpose -- that is the whole of what a boundary layer
+        is -- so judging one by gamma is asking it to stop being a layer.
+        MEASURED on ``drone_quadcopter``: of the 12062 cells the gate refused
+        at gamma 0.1, 7143 were the layer prisms the user had asked for, and
+        the best-formed prism in a stack 0.04 mm thick on a 5 mm wall reads
+        0.00426. So the limit is judged against the cells it means something
+        for, and the layer is counted beside it, not inside it.
+
+        The layer keeps two tests it cannot argue with: it must not invert,
+        which is counted across every cell whatever its family, and it must
+        not fold, which :meth:`measure_layer_fit` measured before the volume
+        pass ever ran.
+
+        Returns the indices to judge and the layer's own block, or every
+        index and ``None`` when there is no layer to set aside -- including
+        the hollow-shell case where the layer is all there is, which
+        :meth:`generate` refuses a few lines later for that reason.
+        """
+        every = list(range(len(values)))
+        layer_cells = self.layer_cell_tags()
+        if not layer_cells:
+            return every, None
+        judged, mine = [], []
+        for index in every:
+            if int(all_tags[index]) in layer_cells:
+                mine.append(values[index])
+            else:
+                judged.append(index)
+        if not mine or not judged:
+            return every, None
+        block = {
+            'total': len(mine),
+            'below_threshold': sum(1 for item in mine if item < threshold),
+            'minimum': min(mine), 'mean': sum(mine) / len(mine),
+            'inverted': sum(1 for item in mine if item <= 0),
+        }
+        if block['below_threshold']:
+            inverted = block['inverted']
+            stood = (f'{inverted} of them inverted' if inverted
+                     else 'none of them inverted')
+            note = (f"{block['below_threshold']} of the {len(mine)} "
+                    f'boundary-layer cells fall below the limit, and are '
+                    f'counted separately rather than judged by it: the '
+                    f'measure reads a deliberately thin cell as a bad one. '
+                    f'They are still required not to invert, and {stood}.')
+            if note not in self.warnings:
+                self.warnings.append(note)
+        return judged, block
 
     def _element_centroid(self, tag):
         """Where to point a camera. Never fatal: a missing node loses a marker,
@@ -3673,6 +6499,72 @@ class GmshRun:
                 used.update(int(item) for item in group)
         return used
 
+    def _coincident_buckets(self, tolerance):
+        """``{place: [node tags]}`` for every place holding more than one.
+
+        DP-457. :meth:`coincident_nodes` used to build this and throw the
+        grouping away, and the grouping is the whole question: a node is not
+        interesting because it is coincident, it is interesting because of
+        what the node it is coincident *with* belongs to.
+        """
+        try:
+            tags, coords, _p = self.gmsh.model.mesh.getNodes()
+        except Exception:                                    # noqa: BLE001
+            return {}
+        tags = [int(item) for item in tags]
+        if len(coords) < 3 * len(tags):
+            return {}
+        used = self.meshed_nodes()
+        places: dict = {}
+        for index, tag in enumerate(tags):
+            if used and tag not in used:
+                continue
+            key = tuple(round(float(coords[3 * index + axis]) / tolerance)
+                        for axis in range(3))
+            places.setdefault(key, []).append(tag)
+        return {key: group for key, group in places.items() if len(group) > 1}
+
+    def interface_coincidences(self, tolerance):
+        """The coincident nodes that are a conformal interface.
+
+        DP-457. Two nodes in the same place are a doubled import when they
+        belong to the same body and an interface when they belong to two --
+        and an interface is the one coincidence in a mesh that exists to be
+        welded, because welding it is what conformal means.
+
+        MEASURED on `refined baffled_chamber/gmsh`, the fixture built to
+        carry one. Its two bodies meet on the rectangle at x = 0.09; each
+        grows its own copy of that face, so 1102 nodes stand in 551 places,
+        two to a place, one node from each body. The guard read them as a
+        boundary layer that had grown into itself and refused the run -- with
+        arithmetic in the same sentence saying no wall faced any of them
+        within four times the asked thickness, which is to say there was no
+        collision to find.
+
+        The reading is the shells, not the distance: a place holding nodes
+        from two different closed bodies is where those bodies meet. A layer
+        that really has grown into itself collides inside one body, so it
+        spans one shell and is still refused, in its own words.
+        """
+        if not getattr(self, 'surface_shell', None):
+            return set()
+        buckets = self._coincident_buckets(tolerance)
+        if not buckets:
+            return set()
+        duplicates = {tag for group in buckets.values() for tag in group}
+        owner: dict = {}
+        for tag, shell in self.surface_shell.items():
+            for node in self.surface_node_set(tag) & duplicates:
+                owner.setdefault(node, set()).add(shell)
+        interface = set()
+        for group in buckets.values():
+            shells = set()
+            for node in group:
+                shells |= owner.get(node, set())
+            if len(shells) > 1:
+                interface.update(group)
+        return interface
+
     def coincident_nodes(self, tolerance):
         """The mesh node tags that sit on top of another, within *tolerance*.
 
@@ -3685,26 +6577,9 @@ class GmshRun:
 
         Only nodes an element uses are scanned; see ``meshed_nodes``.
         """
-        try:
-            tags, coords, _p = self.gmsh.model.mesh.getNodes()
-        except Exception:                                    # noqa: BLE001
-            return set()
-        tags = [int(item) for item in tags]
-        if len(coords) < 3 * len(tags):
-            return set()
-        used = self.meshed_nodes()
-        seen, duplicates = {}, set()
-        for index, tag in enumerate(tags):
-            if used and tag not in used:
-                continue
-            key = tuple(round(float(coords[3 * index + axis]) / tolerance)
-                        for axis in range(3))
-            if key in seen:
-                duplicates.add(tag)
-                duplicates.add(seen[key])
-            else:
-                seen[key] = tag
-        return duplicates
+        return {tag for group in self._coincident_buckets(tolerance).values()
+                for tag in group}
+
 
     def merge_tolerance(self):
         """The distance Gmsh itself treats as "the same place".
@@ -3736,7 +6611,7 @@ class GmshRun:
                 reasons.setdefault(int(tag), f'periodic pair {pair["name"]!r}')
         if self.statistics.get('layers'):
             for tag in list(self.layer_bases) + list(self.layer_laterals):
-                reasons.setdefault(int(tag), 'the boundary layer')
+                reasons.setdefault(int(tag), LAYER_PROTECTION)
         return reasons
 
     def surface_node_set(self, tag):
@@ -3769,6 +6644,13 @@ class GmshRun:
         it stands in -- and the reading this replaces refused the merge
         whenever a pair or a layer existed *at all*.
 
+        DP-457. There is a third kind, and it is the opposite case: two
+        bodies that share a face each draw it, so the interface stands two
+        nodes to a place, and welding those is exactly what makes the mesh
+        conformal across it. Those are taken out before the protected
+        surfaces are asked -- see :meth:`interface_coincidences` -- so what
+        the refusals below judge is only coincidence inside one body.
+
         MEASURED, on the meshes this runner produces, that guard fires on
         meshes it cannot help. A duct with three layers on four walls comes
         out with 846 nodes and no two of them in the same place; the 0.8 m
@@ -3793,16 +6675,32 @@ class GmshRun:
         if not healing.get('removeDuplicateNodes', True):
             return
         gmsh = self.gmsh
-        duplicates = self.coincident_nodes(self.merge_tolerance())
+        tolerance = self.merge_tolerance()
+        duplicates = self.coincident_nodes(tolerance)
         if not duplicates:
             self.ledger.record(
                 'gmsh/healing/removeDuplicateNodes', True, True,
                 note='no coincident nodes to merge')
             return
 
+        # DP-457. The coincidence an assembly is built to have. Two bodies
+        # that meet on a face each draw it, so its nodes stand two to a place
+        # -- and welding them is not damage to be refused, it is the step
+        # that makes the interface conformal. Taken out of the reckoning
+        # before the protected surfaces are asked, so what remains is only
+        # the coincidence inside a single body, which is what the refusals
+        # below are about.
+        interface = self.interface_coincidences(tolerance) & duplicates
+        if interface:
+            self.statistics.setdefault('interface', {})['weldedNodes'] =                 len(interface)
+            self.warnings.append(
+                f'{count_text(len(interface), "coincident node")} on the '
+                'interface between two bodies were welded, which is what '
+                'makes it conformal')
+
         at_risk, where = {}, {}
         for tag, reason in self.protected_surfaces().items():
-            hit = duplicates & self.surface_node_set(tag)
+            hit = (duplicates - interface) & self.surface_node_set(tag)
             if hit:
                 # A corner node lies on several of these surfaces at once, so
                 # the tally is a union of nodes rather than a sum of surface
@@ -3813,13 +6711,16 @@ class GmshRun:
                     self.surface_patch_name(int(tag))[0])
         if at_risk:
             reason = '; '.join(
-                f'{len(nodes)} of {len(duplicates)} coincident node(s) lie on '
+                f'{len(nodes):,} of '
+                f'{count_text(len(duplicates - interface), "coincident node")} '
+                f'{agreeing(len(nodes), "lies", "lie")} on '
                 f'{name} ({", ".join(sorted(where[name]))}), which merging '
                 'would collapse'
                 for name, nodes in sorted(at_risk.items()))
             self.ledger.record('gmsh/healing/removeDuplicateNodes',
                                True, False, applied=False, note=reason)
             self.warnings.append('duplicate nodes were not merged: ' + reason)
+            self.refuse_collided_layer(at_risk, where, duplicates)
             return
 
         # An API call, not an option: Gmsh has no Mesh.RemoveDuplicateNodes
@@ -3834,8 +6735,8 @@ class GmshRun:
         prisms_after = self.prism_count()
         self.ledger.record(
             'gmsh/healing/removeDuplicateNodes', True, True,
-            note=f'{before - after} of {len(duplicates)} coincident node(s) '
-                 'merged')
+            note=f'{before - after:,} of '
+                 f'{count_text(len(duplicates), "coincident node")} merged')
         # The check the refusal above cannot make for itself: the surfaces
         # were clear of duplicates, so the merge should not have touched them.
         if pairs_before != pairs_after:
@@ -3846,7 +6747,386 @@ class GmshRun:
         if prisms_before != prisms_after:
             self.warnings.append(
                 f'merging coincident nodes changed the boundary layer from '
-                f'{prisms_before} to {prisms_after} prism(s)')
+                f'{prisms_before:,} to {count_text(prisms_after, "prism")}')
+
+    def stalled_columns(self, collided):
+        """``{base surface: [node, ...]}`` for stacks that grew by nothing.
+
+        DP-381. A base node coincident with a node on its own column's
+        top is not two stacks meeting across a gap. It is one column that
+        Gmsh extruded by zero: the top node was written at the base node's
+        own coordinates, to the last bit.
+
+        MEASURED on ``two_cubes_two_files`` at ``targetSize`` 0.04145781 --
+        two cubes a whole unit apart, so there is no gap for a stack to
+        meet another across, and :meth:`measure_layer_fit` reports 0.0327 m
+        of room against the 0.0066166 asked. Of the 4,400 top nodes the
+        eight columns produced, **4,398 travelled 0.00661666488 m -- the
+        entire ask, to every digit -- and 2 travelled 0.0**. Those 2 are
+        the whole collision, and both are interior to their surface: no
+        curve and no point owns them, so no seam explains them either.
+        """
+        columns = getattr(self, 'layer_columns', ())
+        if not columns:
+            return {}
+        gmsh = self.gmsh
+        tolerance = self.merge_tolerance()
+
+        def key(tag):
+            try:
+                point = gmsh.model.mesh.getNode(int(tag))[0]
+            except Exception:                                # noqa: BLE001
+                return None
+            return tuple(round(float(value) / tolerance) for value in point)
+
+        stalled = {}
+        for base, top in columns:
+            standing = collided & self.surface_node_set(int(base))
+            if not standing:
+                continue
+            # This column's own top and no other. A base node that landed
+            # on some *other* stack is the fault DP-121 filed, and it
+            # keeps that name and that advice.
+            places = {key(tag) for tag in self.surface_node_set(int(top))}
+            places.discard(None)
+            landed = [int(tag) for tag in sorted(standing)
+                      if key(tag) in places]
+            if landed:
+                stalled[int(base)] = landed
+        return stalled
+
+    #: How square-on two walls must be to count as facing each other across a
+    #: gap: the cosine between each wall's normal and the line joining them.
+    #: 0.5 admits anything within 60 degrees of square, which is generous --
+    #: the question being asked is whether a wall stands *across* from the
+    #: node, not whether it is parallel to it.
+    FACING_COSINE = 0.5
+
+    def walls_within_reach(self, collided, reach):
+        """How many colliding nodes have a wall *facing* them within ``reach``.
+
+        DP-403. The fall-through arm of :meth:`refuse_collided_layer` advised
+        on the assumption that two stacks had met across a narrow gap, without
+        ever asking whether the model had one. On ``flange`` it does not, and
+        the refusal sent the user to change a thing that is not there.
+
+        Facing is the whole reading, and a nearness test alone will not do it.
+        MEASURED on ``flange`` at the asked size: every one of the 894
+        colliding nodes has a node of *some other* layer base surface within
+        0.00114621 m, the nearest 7.18e-05 m away -- and none of those is a
+        wall across a gap. They are the neighbouring faces of the same wall.
+        A STEP solid arrives split into hundreds of faces, so on any CAD model
+        "another surface is nearby" is true everywhere and discriminates
+        nothing.
+
+        So a candidate counts only when the line joining the two nodes runs
+        square-on to *both* walls -- :attr:`FACING_COSINE` against each node's
+        surface normal, taken as the area-weighted sum of its facets'. That
+        rejects the two cases a nearness test confuses with a gap: a
+        neighbouring face continuing the same wall, where the join lies in the
+        surface and the cosine is near zero, and a corner, where it is small
+        against at least one of the two. Sign is not read, so an inconsistently
+        oriented surface cannot flip the answer.
+
+        The node's own surfaces are excluded outright: its neighbours on them
+        are one mesh spacing away by construction. A surface that folded into
+        itself therefore reads as alone, which is the right answer for it too
+        -- what clears a fold is the resolution that stops meshing it there.
+
+        Returns ``None`` when there is nothing to measure -- no columns, no
+        reach, a mesh that will not hand over its nodes -- so the caller can
+        tell "no wall facing" from "not asked". `nearby` is the weaker count
+        the facing test discards, kept because it is what makes the reading
+        legible: on `flange` it is 894 against 0.
+        """
+        columns = getattr(self, 'layer_columns', ())
+        if not columns or not collided or reach <= 0.0:
+            return None
+        try:
+            tags, flat, _params = self.gmsh.model.mesh.getNodes()
+            points = {int(tag): (float(flat[3 * index]),
+                                 float(flat[3 * index + 1]),
+                                 float(flat[3 * index + 2]))
+                      for index, tag in enumerate(tags)}
+        except Exception:                                    # noqa: BLE001
+            return None
+        if not points:
+            return None
+
+        on = {}
+        normals = {}
+        for base, _top in columns:
+            base = int(base)
+            for node in self.surface_node_set(base):
+                on.setdefault(int(node), set()).add(base)
+            try:
+                kinds, _etags, blocks = self.gmsh.model.mesh.getElements(
+                    2, base)
+            except Exception:                                # noqa: BLE001
+                continue
+            for kind, block in zip(kinds, blocks):
+                facts = self.gmsh.model.mesh.getElementProperties(kind)
+                shape, _dim, _order, per = facts[:4]
+                if not (shape.startswith('Triangle')
+                        or shape.startswith('Quadrilateral')):
+                    continue
+                block = [int(item) for item in block]
+                for index in range(0, len(block), per):
+                    corners = block[index:index + 3]
+                    try:
+                        one, two, three = (points[tag] for tag in corners)
+                    except KeyError:
+                        continue
+                    a = [two[axis] - one[axis] for axis in range(3)]
+                    b = [three[axis] - one[axis] for axis in range(3)]
+                    # Area-weighted, so a sliver counts for what it is.
+                    cross = (a[1] * b[2] - a[2] * b[1],
+                             a[2] * b[0] - a[0] * b[2],
+                             a[0] * b[1] - a[1] * b[0])
+                    for tag in block[index:index + per]:
+                        running = normals.setdefault(tag, [0.0, 0.0, 0.0])
+                        for axis in range(3):
+                            running[axis] += cross[axis]
+        if not on:
+            return None
+
+        def unit(vector):
+            length = math.sqrt(sum(value * value for value in vector))
+            if length <= 0.0:
+                return None
+            return tuple(value / length for value in vector)
+
+        facing = {node: unit(vector) for node, vector in normals.items()}
+        if not any(facing.values()):
+            # No facets handed over, so which way the walls point cannot be
+            # read. Say "not asked" rather than "nothing faces them".
+            return None
+
+        cell = float(reach)
+
+        def box(point):
+            return tuple(int(math.floor(value / cell)) for value in point)
+
+        grid = {}
+        for node in on:
+            point = points.get(node)
+            if point is not None:
+                grid.setdefault(box(point), []).append(node)
+
+        within = 0
+        nearby = 0
+        nearest = None
+        for node in collided:
+            node = int(node)
+            point = points.get(node)
+            if point is None:
+                continue
+            mine = on.get(node) or set()
+            normal = facing.get(node)
+            home = box(point)
+            best = None
+            saw = False
+            for x in (-1, 0, 1):
+                for y in (-1, 0, 1):
+                    for z in (-1, 0, 1):
+                        neighbours = grid.get(
+                            (home[0] + x, home[1] + y, home[2] + z), ())
+                        for other in neighbours:
+                            if other == node or (on.get(other) or set()) & mine:
+                                continue
+                            gap = math.dist(point, points[other])
+                            if gap > cell:
+                                continue
+                            saw = True
+                            if normal is None:
+                                continue
+                            across = facing.get(other)
+                            if across is None:
+                                continue
+                            line = unit([points[other][axis] - point[axis]
+                                         for axis in range(3)])
+                            if line is None:
+                                continue
+                            here = abs(sum(normal[axis] * line[axis]
+                                           for axis in range(3)))
+                            there = abs(sum(across[axis] * line[axis]
+                                            for axis in range(3)))
+                            if (here < self.FACING_COSINE
+                                    or there < self.FACING_COSINE):
+                                continue
+                            if best is None or gap < best:
+                                best = gap
+            nearby += int(saw)
+            if best is not None:
+                within += 1
+                if nearest is None or best < nearest:
+                    nearest = best
+        return {'measured': len(collided), 'within': within, 'nearby': nearby,
+                'reach': cell, 'nearest': nearest}
+
+    def refuse_collided_layer(self, at_risk, where, duplicates):
+        """Refuse a mesh whose layer stacks have grown into one another.
+
+        DP-121. The merge above declines on two readings and only one of them
+        describes a mesh a user can have. A periodic pair with coincident
+        nodes is the part imported twice that the merge's own docstring
+        names -- the mesh is whole, the merge would weld it, so declining is
+        the right answer and a warning is the right weight.
+
+        A *layer* with coincident nodes is not that. The extruded stack gets
+        its own nodes and, on a layer that fits, no two of them share a place:
+        MEASURED across the `9f6abca1` corpus, 16 of the 17 layered meshes
+        have no coincident nodes at all. Two others -- `annulus_shell` and
+        `centrifugal_impeller` -- grew their bases inwards from a hole and
+        still came out clean, which is why the direction is not the reading
+        and this is. The one mesh that collides is the one checkMesh then
+        called not runnable, and the one whose msh export lost 448 nodes on
+        the way back in.
+
+        So the layer arm refuses. Immediately, and without a refit: DP-374
+        measured what a thinner layer does here, and the answer is nothing,
+        and DP-76 is the standing example of a layer fault that a halving
+        walks further into rather than out of. The message says what to
+        change instead.
+
+        DP-381. *Which* message depends on a reading this refusal used to
+        skip. Coincident nodes on a layer are two faults wearing one name:
+        two stacks that met, and one column that never grew.
+        :meth:`stalled_columns` tells them apart, and the second is refused
+        in its own words -- because the advice this arm gives (thinner,
+        fewer, mind the gap) is measurably inert against it. MEASURED on
+        ``two_cubes_two_files``: at half the asked thickness and at a tenth
+        of it the refusal is identical, the same 2 nodes at the same point;
+        at one layer instead of three Gmsh fails elsewhere in the extrusion;
+        and the two cubes are a unit apart, so there is no gap to mind. What
+        does clear it is the surface resolution -- 0.030 and 0.055 both mesh
+        where 0.04145781 does not.
+        """
+        collided = at_risk.get(LAYER_PROTECTION)
+        if not collided:
+            return
+        patches = sorted(where.get(LAYER_PROTECTION) or ())
+
+        def place_of(nodes):
+            try:
+                return tuple(float(value) for value in
+                             self.gmsh.model.mesh.getNode(min(nodes))[0])
+            except Exception:                                # noqa: BLE001
+                return ()
+
+        def first(point):
+            return (f' first at ({point[0]:.6g}, {point[1]:.6g}, '
+                    f'{point[2]:.6g}),' if len(point) == 3 else '')
+
+        # DP-381. Which of the two faults this is, measured rather than
+        # assumed. Both leave coincident nodes on a protected surface and
+        # the old arm read every one of them as the first.
+        stalled = self.stalled_columns(collided)
+        if stalled:
+            standing = sorted({node for nodes in stalled.values()
+                               for node in nodes})
+            grown = sorted({self.surface_patch_name(base)[0]
+                            for base in stalled})
+            named = ', '.join(grown)
+            asked = float((self.statistics.get('layers') or {}).get(
+                'requestedTotalThickness') or 0.0)
+            beside = (f'the columns beside them grew the whole '
+                      f'{asked:.6g} m that was asked for, and ' if asked else '')
+            point = place_of(standing)
+            # DP-375. The second half of the same lever, and the cheaper
+            # half. MEASURED on `two_cubes_one_file`, the same job run five
+            # times with nothing changed but this setting: frontal_delaunay
+            # refuses at (0.6, 0.445744, 0); mesh_adapt, delaunay and
+            # frontal_delaunay_quads all mesh it, at full coverage, and in
+            # none of their surface meshes does a node stand within 3.8 mm of
+            # that point. The node that cannot grow is one this algorithm
+            # put there.
+            algorithm = str((self.intent.get('algorithms') or {}).get(
+                'surface') or '')
+            ran = f' (this ran {algorithm})' if algorithm else ''
+            raise LayerCollision(
+                f'the boundary layer grew by nothing at {len(standing)} of '
+                f'its nodes: the top of the stack was written at the '
+                f'coordinates of the base node it grew from,{first(point)} '
+                f'on {count_text(len(stalled), "surface")} it was grown '
+                f'from ({named}). A column of no height is not a cell, and '
+                f'the mesh cannot be written down either — the exporter '
+                f'emits both nodes of every pair and any reader welds them '
+                f'back. This is not a layer that ran out of room: '
+                f'{beside}the nodes that did not move have nothing standing '
+                f'within reach of them. Scaling the ask scales these '
+                f'columns by nothing, so a thinner layer lands in the same '
+                f'place. What moves them is where the surface mesh puts '
+                f'them: change the surface resolution, or the surface '
+                f'algorithm{ran}, so these nodes are not meshed where they '
+                f'are — or take the layer off {named}.',
+                nodes=len(standing), coincident=len(duplicates),
+                patches=tuple(patches), at=point, stalled=True)
+
+        place = place_of(collided)
+        at = first(place)
+        named = ', '.join(patches[:6]) + ('...' if len(patches) > 6 else '')
+
+        # DP-403. Measure before advising, as the stalled arm above does.
+        # Two stacks growing `asked` each can only meet across a gap narrower
+        # than twice it; the reach below is twice that again, so a wall this
+        # does not find could not have been the wall the stacks met.
+        asked = float((self.statistics.get('layers') or {}).get(
+            'requestedTotalThickness') or 0.0)
+        census = self.walls_within_reach(collided, 4.0 * asked)
+        record = self.statistics.get('layers')
+        if isinstance(record, dict) and census is not None:
+            record['collision'] = dict(census)
+
+        if census is not None and not census['within']:
+            # The count a nearness test would have returned, quoted so the
+            # claim is checkable rather than asserted: on `flange` it is 894
+            # against 0, and it is the whole reason the nearness test alone
+            # could not be trusted.
+            crowd = (f' {census["nearby"]} of them do have another layer '
+                     f'surface that close, but not one of those stands across '
+                     f'from the node — they are the neighbouring faces of the '
+                     f'same wall, which a CAD solid arrives split into.'
+                     if census['nearby'] else '')
+            raise LayerCollision(
+                f'the boundary layer grew into itself: {len(collided)} of its '
+                f'nodes stand on top of another node,{at} across '
+                f'{len(patches)} of the surfaces it was grown from ({named}). '
+                f'Stacks that meet leave cells with no volume between them, '
+                f'and the mesh cannot be written down either — the exporter '
+                f'emits both nodes of every pair and any reader welds them '
+                f'back. This is not a layer that ran out of room between two '
+                f'walls: not one of those {census["measured"]} nodes has a '
+                f'wall facing it within {census["reach"]:.6g} m, which is '
+                f'four times the {asked:.6g} m the layer asked for, and two '
+                f'stacks can only meet across a gap narrower than twice the '
+                f'ask.{crowd} They met with nothing across from them, so a '
+                f'thinner layer meets in the same place — change the surface '
+                f'resolution so these nodes are not meshed where they are, or '
+                f'take the layer off {named}.',
+                nodes=len(collided), coincident=len(duplicates),
+                patches=tuple(patches), at=place)
+
+        measured = ''
+        if census is not None:
+            near = (f', the nearest {census["nearest"]:.6g} m away'
+                    if census['nearest'] is not None else '')
+            measured = (f' {census["within"]} of {census["measured"]} of '
+                        f'these nodes have a wall facing them within '
+                        f'{census["reach"]:.6g} m{near}, so there is a gap '
+                        f'here to mind.')
+        raise LayerCollision(
+            f'the boundary layer grew into itself: {len(collided)} of its '
+            f'nodes stand on top of another node,{at} across '
+            f'{len(patches)} of the surfaces it was grown from ({named}). '
+            f'Stacks that meet leave cells with no volume between them, and '
+            f'the mesh cannot be written down either — the exporter emits '
+            f'both nodes of every pair and any reader welds them back.'
+            f'{measured} Grow a '
+            f'thinner layer, grow fewer of them, or take the layer off the '
+            f'surfaces that face each other across a narrow gap.',
+            nodes=len(collided), coincident=len(duplicates),
+            patches=tuple(patches), at=place)
 
     def prism_count(self):
         try:
@@ -3923,15 +7203,142 @@ class GmshRun:
             'gmsh/algorithms/splitQuadrangles',
             f'Quadrilateral={quads}', census, applied=not after.get(
                 'Quadrilateral', 0),
-            note=f'{quads} quadrangle(s) became {after.get("Triangle", 0)} '
-                 'triangle(s) before the volume pass')
+            note=f'{count_text(quads, "quadrangle")} became '
+                 f'{count_text(after.get("Triangle", 0), "triangle")} '
+                 'before the volume pass')
         self.statistics['splitQuadrangles'] = {
             'before': before, 'after': after,
             'quadranglesLeft': after.get('Quadrilateral', 0)}
         if after.get('Quadrilateral', 0):
             self.warnings.append(
-                f'{after["Quadrilateral"]} quadrangle(s) survived the split; '
-                'the volume pass will build pyramids against them')
+                f'{count_text(after["Quadrilateral"], "quadrangle")} '
+                'survived the split; the volume pass will build pyramids '
+                'against them')
+
+    def write_surface_pass(self):
+        """DP-133. Leave the surface pass on disk so it can be looked at.
+
+        The instruction was that the mesh be visible as it is built, and that
+        a surface mesh and a volume mesh be distinguishable. MEASURED on the
+        `45db9031` sweep, a Gmsh leg captured two stages against snappy's
+        five, and the reason was not the drawing: this mesh already existed,
+        in memory, for the length of the volume pass, and was then discarded
+        unshown.
+
+        Written here and not in :meth:`write_outputs` because by the time that
+        runs the volume pass has replaced these elements. Failure is recorded
+        and never raised -- a run that meshed correctly does not fail because
+        a convenience file could not be written.
+
+        Written without the :meth:`refuse_unsafe_write` guard that stands in
+        front of every export, and deliberately: that guard reads the volume
+        census, which does not exist yet here, so calling it would always
+        return `''` and read as protection that was not protecting anything.
+        It has nothing to do either way -- the trap it contains is a Medit
+        `.mesh` write, and this path is named by :attr:`RunLayout.surface`
+        rather than by the user, so it is always `.msh`.
+        """
+        path = Path(self.surface_output)
+        try:
+            # The same three writer options `write_outputs` pins, for the same
+            # reasons, and pinned again here because that method has not run
+            # yet: MSH 2.2 is the one version every reader in this product
+            # opens, `SaveAll=0` keeps the physical groups that make the
+            # patches pickable, and a binary file is one this application
+            # cannot read.
+            self.set_number('Mesh.MshFileVersion', 2.2)
+            self.set_number('Mesh.SaveAll', 0)
+            self.set_number('Mesh.Binary', 0)
+            self.gmsh.option.setNumber('Mesh.Format', AUTO_FORMAT_CODE)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.gmsh.write(str(path))
+        except Exception as error:                        # noqa: BLE001
+            self.warnings.append(f'surface pass not kept: {error}')
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self.warnings.append('surface pass not kept: it was not written')
+            return
+        self.statistics['surface'] = {'path': str(path), 'bytes': int(size)}
+
+    #: DP-446. How often the mesh step says it is still there, in seconds.
+    #: Long enough that an ordinary two-minute mesh writes four lines rather
+    #: than a page, short enough that the two legs this row was written from
+    #: -- 2,700 s of silence apiece -- would have written ninety.
+    HEARTBEAT_SECONDS = 30.0
+
+    @contextlib.contextmanager
+    def meshing_heartbeat(self, dimension):
+        """Say the mesher is still there, and let it say where it has got to.
+
+        DP-446. `naca0012/gmsh/refined` and `sphere/gmsh/refined` both ran
+        exactly 2700.5 s against the harness ceiling, and both got to the
+        same place first: sixteen authored steps, the last of them
+        `gmsh threads :: threads=12`, and then nothing at all for the
+        remaining thirty-nine minutes. The reading the evidence supports is
+        narrow -- authoring finished and is timestamped, so the stop is in
+        the mesh execution -- and what it cannot say is whether the mesher
+        was working or hung. Neither could the operator, who sees exactly
+        what the log sees.
+
+        Two signals, because one of them alone answers the wrong question.
+        A timer says the process is alive, which a hung mesher also is. So
+        Gmsh's own terminal output is turned on for the duration: it writes
+        `Meshing 1D...`, `Meshing 2D...`, `Meshing 3D...` and a line per
+        entity, flushed as it goes, and those lines reach the console
+        verbatim because the console passes through anything that is not a
+        progress record. Between them the two answer it -- Gmsh lines still
+        arriving is work, the heartbeat alone is a stop, and the last Gmsh
+        line says where.
+
+        The timer runs in a thread and touches nothing of Gmsh's: the option
+        is set from this thread before the mesher starts and restored after
+        it ends, and the beat itself only reads a clock and reports. The
+        reporter takes a lock for the same reason.
+        """
+        stop = threading.Event()
+        started = time.perf_counter()
+        beats = [0]
+
+        def beat():
+            while not stop.wait(self.HEARTBEAT_SECONDS):
+                beats[0] += 1
+                elapsed = time.perf_counter() - started
+                # The fraction does not move. A number that climbed on a
+                # clock rather than on work would be a picture of progress
+                # rather than progress, which is the thing this row is about.
+                self.reporter.emit(
+                    'progress', 'mesh', 0.35,
+                    f'still meshing {dimension}D, {elapsed:,.0f}s elapsed',
+                    details={'heartbeat': beats[0],
+                             'elapsedSeconds': round(elapsed, 1)})
+
+        terminal = None
+        if self.gmsh is not None:
+            try:
+                terminal = self.gmsh.option.getNumber('General.Terminal')
+                self.gmsh.option.setNumber('General.Terminal', 1)
+            except Exception:                                # noqa: BLE001
+                terminal = None
+        worker = threading.Thread(target=beat, name='gmsh-heartbeat',
+                                  daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(timeout=5.0)
+            if terminal is not None:
+                try:
+                    self.gmsh.option.setNumber('General.Terminal', terminal)
+                except Exception:                            # noqa: BLE001
+                    pass
+            self.statistics.setdefault('heartbeat', {})['mesh'] = {
+                'beats': beats[0],
+                'everySeconds': self.HEARTBEAT_SECONDS,
+                'seconds': round(time.perf_counter() - started, 1),
+            }
 
     def generate(self):
         gmsh = self.gmsh
@@ -3946,21 +7353,54 @@ class GmshRun:
         self.reporter.emit('progress', 'mesh', 0.35,
                            f'meshing {dimension}D')
         started = time.perf_counter()
+        split = bool(dimension >= 2 and algorithms.get('splitQuadrangles'))
+        # DP-74. The inner surface of a boundary layer only exists once the
+        # walls are meshed, and whether it folded back through itself can only
+        # be read there -- before the volume pass, which is what a fold
+        # breaks, and which says nothing about the layer when it does.
+        fit = bool(dimension > 2 and self.layer_columns)
+        # DP-133. A 3D run now always takes the two-pass route, because the
+        # surface mesh is written between the passes and this is the only
+        # place it exists. It was always two passes inside Gmsh; what changed
+        # is that the boundary between them is now ours to stand on. The
+        # extra `generate(2)` costs nothing that was not already being spent
+        # -- `generate(3)` meshes the surfaces first regardless, and calling
+        # it explicitly does not mesh them twice.
+        keep_surface = bool(dimension > 2 and self.surface_output)
         try:
-            if dimension >= 2 and algorithms.get('splitQuadrangles'):
-                # Two passes rather than one, because the split has to happen
-                # between them; see :meth:`split_quadrangles`. A section has no
-                # second pass, so for it the split is simply the last thing
-                # done to the surfaces -- the same call in the same place.
-                gmsh.model.mesh.generate(2)
-                self.split_quadrangles()
-                if dimension > 2:
-                    gmsh.model.mesh.generate(dimension)
+          # DP-446. Everything the mesher does is inside this block, which is
+          # exactly the span that used to be silent.
+          with self.meshing_heartbeat(dimension):
+            if split or fit or keep_surface:
+                  # Two passes rather than one, because the split has to happen
+                  # between them; see :meth:`split_quadrangles`. A section has no
+                  # second pass, so for it the split is simply the last thing
+                  # done to the surfaces -- the same call in the same place.
+                  gmsh.model.mesh.generate(2)
+                  if split:
+                      self.split_quadrangles()
+                  if fit:
+                      self.measure_layer_fit()
+                  if keep_surface:
+                      # After the split, because the split is what the volume
+                      # pass will see, and a surface mesh a user is shown that
+                      # is not the one the volume was built on would be a
+                      # picture of a mesh that never existed.
+                      self.write_surface_pass()
+                  if dimension > 2:
+                      gmsh.model.mesh.generate(dimension)
             else:
-                gmsh.model.mesh.generate(dimension)
+                  gmsh.model.mesh.generate(dimension)
         except MeshFailure:
             raise
         except Exception as error:
+            # DP-75. tetgen says only that a segment and a facet intersect,
+            # at a point in space with no name on it. The surfaces are still
+            # in memory here and nowhere else, so this is the one place the
+            # question 'which patch crosses itself' can be answered.
+            crossing = self.read_surface_crossings(error)
+            if crossing is not None:
+                raise crossing from error
             raise MeshFailure(
                 f'Gmsh could not mesh the {subject}: {error}') from error
         passes = int(quality.get('netgenPasses', 0) or 0)
@@ -3971,11 +7411,23 @@ class GmshRun:
                 note='the Netgen optimiser acts on a volume mesh; this job '
                      'meshes a section')
             passes = 0
+        if passes and not bool(quality.get('optimize', True)):
+            # DP-620. The explicit Netgen passes are optimisation too, and a
+            # user who switched optimisation off did not ask for them.
+            self.ledger.record(
+                'gmsh/optimization/netgenPasses', passes, 0, applied=False,
+                note='Optimize is off, so no optimisation pass was run')
+            passes = 0
         for index in range(passes):
             self.reporter.emit(
                 'progress', 'optimize', 0.6 + 0.1 * index / max(passes, 1),
                 f'optimising, pass {index + 1} of {passes}')
             gmsh.model.mesh.optimize('Netgen')
+        # DP-76. After the optimiser, because the optimiser is the last thing
+        # that can rescue a cell, and before the order is raised, because a
+        # curved cell is measured against a different quality altogether.
+        if fit:
+            self.measure_layer_landing()
         self.raise_element_order()
         elapsed = time.perf_counter() - started
 
@@ -4039,7 +7491,9 @@ class GmshRun:
         self.statistics['achievedQuality'] = dict(primary_block, metrics=metrics)
         if inverted:
             self.warnings.append(
-                f'{inverted} element(s) are inverted; the mesh is not usable')
+                f'{count_text(inverted, "element")} '
+                f'{agreeing(inverted, "is", "are")} inverted; the mesh is '
+                'not usable')
         # A layered run whose census is prisms alone is a hollow shell: the
         # layer meshed and the core did not. Measured when a boundary layer is
         # grown off a subset of the boundary, which leaves the core volume
@@ -4116,11 +7570,33 @@ class GmshRun:
             return False
         if not enabled:
             # The refusal names its own remedy. Without this the user is told
-            # the mesh is too poor and left to find the control alone.
-            self.warnings.append(
-                'elements fall below the requested quality; the repair pass '
-                '(Repair poor elements) is off, and it is what runs Gmsh\'s '
-                'untangling and relocation optimisers on exactly this mesh')
+            # the mesh is too poor and left to find the control alone -- but
+            # DP-76: only where the remedy can act. On a mesh with a boundary
+            # layer it cannot, and naming it there is worse than naming
+            # nothing, because the user spends a whole second run finding out.
+            if not quality.get('optimize', True) and not self.layer_volumes:
+                # DP-780. Measured on mesh campaign 0925 G9A: with Optimize
+                # off the repair pass left 3 inverted elements, and turning
+                # Optimize back on passed the same mesh.
+                self.warnings.append(
+                    'elements fall below the requested quality with Optimize '
+                    'off, so no optimisation pass ran; turn Optimize back on '
+                    '(its default) before anything else')
+            elif self.layer_volumes:
+                self.warnings.append(
+                    'elements fall below the requested quality. The repair '
+                    'pass (Repair poor elements) is off, and on this mesh it '
+                    'would not help: MEASURED on a layered mesh, '
+                    'UntangleMeshGeometry refuses outright — "prism not '
+                    'supported yet, abort" — and Relocate3D ran without '
+                    'moving a node. Change the layer or the surface sizing '
+                    'instead')
+            else:
+                self.warnings.append(
+                    'elements fall below the requested quality; the repair '
+                    'pass (Repair poor elements) is off, and it is what runs '
+                    'Gmsh\'s untangling and relocation optimisers on exactly '
+                    'this mesh')
             return False
         order = int(export.get('elementOrder', 1) or 1)
         if order > 1:
@@ -4254,6 +7730,7 @@ class GmshRun:
             self.ledger.record(
                 f'gmsh/algorithms/family.{where}',
                 ' + '.join(wanted), note, applied=not missing,
+                matched=not missing,
                 note='the element families counted out of the finished mesh')
             if missing:
                 self.warnings.append(
@@ -4306,24 +7783,45 @@ class GmshRun:
             record['bySurface'][match.group(1)] = algorithm
         record['used'] = sorted(set(record['bySurface'].values()))
         record['pipeline'] = requested in PIPELINE_ALGORITHMS
+        # DP-505. A surface an extrusion made is meshed by that extrusion --
+        # the prism tops and sides of a boundary layer, the far face of a
+        # planar section -- and Gmsh logs it as `Extruded`. No 2D algorithm
+        # is ever chosen for it, so it is not one the fallback switched to.
+        # MEASURED on G4 `duct.step`: all 17 surfaces reported as "retried
+        # with Extruded" were the 5 layer tops and 12 layer sides; every
+        # surface the chosen algorithm was asked to mesh used it.
+        record['extruded'] = sorted(
+            tag for tag, name in record['bySurface'].items()
+            if name == EXTRUDED_ALGORITHM)
+        meshed = {tag: name for tag, name in record['bySurface'].items()
+                  if name != EXTRUDED_ALGORITHM}
         if wanted and not record['pipeline']:
             record['switched'] = sorted(
-                tag for tag, name in record['bySurface'].items()
-                if name != wanted)
+                tag for tag, name in meshed.items() if name != wanted)
         self.statistics['algorithms'] = record
         if record['switched']:
             self.warnings.append(
-                f'{len(record["switched"])} of {len(record["bySurface"])} '
+                f'{len(record["switched"])} of {len(meshed)} '
                 f'surfaces were not meshed by the {wanted} algorithm that was '
                 'chosen: Gmsh retried them with '
-                + ' and '.join(name for name in record['used']
-                               if name != wanted)
+                + ' and '.join(sorted({meshed[tag]
+                                       for tag in record['switched']}))
                 + '. The mesh is sound; it is not the mesh that was asked for.')
+        note = 'the algorithm Gmsh logged for each surface it meshed'
+        if record['extruded']:
+            note += (f'; {count_text(len(record["extruded"]), "surface")} '
+                     'made by an extrusion took its mesh from it and are not '
+                     'counted')
+        observed = sorted(set(meshed.values()))
         self.ledger.record(
             'gmsh/algorithms/surface.used', wanted or requested,
-            ', '.join(record['used']) or 'not observed',
+            ', '.join(observed) or (
+                'extruded only' if record['extruded'] else 'not observed'),
             applied=not record['switched'],
-            note='the algorithm Gmsh logged for each surface it meshed')
+            matched=(None if record['pipeline']
+                     or not (observed or record['extruded'])
+                     else not record['switched']),
+            note=note)
 
     def measure_structure(self):
         """Read back what the structured controls actually produced.
@@ -4477,6 +7975,7 @@ class GmshRun:
             'gmsh/boundaryLayers/quads', quads,
             ', '.join(sorted(lateral)) or None,
             applied=bool(lateral) and recombined == quads,
+            matched=bool(lateral) and recombined == quads,
             note='the family the sides of the layer came out as')
 
         owner, faces = {}, {}
@@ -4563,7 +8062,8 @@ class GmshRun:
             reach_all += entry['reach']
             depths |= entry['layers']
             if name not in wanted:
-                unasked.append(f'{name} ({entry["columns"]} column(s))')
+                unasked.append(
+                    f'{name} ({count_text(entry["columns"], "column")})')
             elif coverage is not None and coverage < 1 - 1e-9:
                 short.append(f'{name} ({entry["columns"]} of {total} faces)')
         for name in sorted(wanted - set(by_patch)):
@@ -4715,6 +8215,152 @@ class GmshRun:
                 + affine[row * 4 + 2] * point[2] + affine[row * 4 + 3]
                 for row in range(3)]
 
+    #: DP-548. What the Gmsh route does with an interface pair, said once.
+    INTERFACE_PAIR_ACTION = (
+        'the Gmsh runner builds no coupling from a pair: two solids are '
+        'conformal where they share one CAD face or where duplicate-face '
+        'fusion merged their copies, and nowhere else; a translated or '
+        'rotated cyclic pair is built by setPeriodic (DP-641)')
+
+    def trace_interface_pairs(self):
+        """Say, pair by pair, what the finished mesh holds where it points.
+
+        DP-548. The job never carried the pairs, so a run could not tell a
+        pair that took effect from one that did nothing. MEASURED on G6
+        ``tee_with_plug.brep`` (audit 0924): the mesh held a 36-face interface
+        and the saved pair ``tee_plug_contact``, and nothing said which caused
+        which. Neither did: nothing in this runner reads a pair. The interface
+        is the plug face the two solids share (DP-546), and the pair's slave
+        ``body1_face2`` is the tee's outer end cap -- a boundary face of one
+        volume, not the contact.
+
+        So each pair is resolved and graded, not applied. A conformal,
+        coincident pair whose two sides are one surface between two volumes is
+        ``conformal``, with the faces meshed there counted; any other pair is
+        ``not applied`` or ``skipped``, with the reason, and warned about --
+        the user asked for a coupling this mesh does not have.
+        """
+        pairs = [pair for pair in self.job.get('interfacePairs') or ()
+                 if isinstance(pair, dict)]
+        if not pairs:
+            return
+        traced = []
+        for pair in pairs:
+            row = self._trace_interface_pair(pair)
+            traced.append(row)
+            applied = row['state'] in ('conformal', 'periodic')
+            self.ledger.record(
+                f'interfacePair:{row["name"]}', row['coupling'],
+                row['state'], applied=applied, matched=applied,
+                note=row['reason'])
+            if not applied:
+                self.warnings.append(
+                    f'interface pair {row["name"]!r} {row["state"]}: '
+                    f'{row["reason"]}')
+        self.statistics['interfacePairs'] = {
+            'action': self.INTERFACE_PAIR_ACTION, 'pairs': traced}
+
+    def _trace_interface_pair(self, pair) -> dict:
+        name = str(pair.get('name') or pair.get('pairId') or '')
+        coupling = str(pair.get('coupling') or 'conformal')
+        transform = str(pair.get('transform') or 'coincident')
+        sides = {}
+        for side in ('master', 'slave'):
+            token = str(pair.get(f'{side}Scope') or '')
+            tags = sorted({int(tag) for tag
+                           in self.scope_surfaces.get(token) or ()})
+            sides[side] = {
+                'scope': token, 'dim': 2, 'tags': tags,
+                'names': [self.entity_surface_names.get(tag, f'surface {tag}')
+                          for tag in tags],
+                # DP-566. What the user picked, before duplicate-face fusion
+                # renamed it: G6's slave body1_face4 is meshed as body0_face2,
+                # and naming it by the survivor reads as a pair of one face.
+                'authored': self._authored_surface_names(token)}
+        row = {'name': name, 'coupling': coupling, 'transform': transform,
+               'master': sides['master'], 'slave': sides['slave'],
+               'state': 'skipped', 'matchedFaces': 0, 'reason': ''}
+        missing = [side for side in ('master', 'slave')
+                   if not sides[side]['tags']]
+        if missing:
+            row['reason'] = (
+                f'the {" and ".join(missing)} side reached no imported '
+                'surface, so there is nothing to grade')
+            return row
+        master, slave = sides['master']['tags'], sides['slave']['tags']
+
+        def described(side):
+            return ', '.join(
+                f'{label} (surface {tag}, '
+                f'{"between two volumes" if self._bounds_two_volumes(tag) else "a boundary"})'
+                for tag, label in zip(sides[side]['tags'],
+                                      sides[side]['names']))
+
+        row['state'] = 'not applied'
+        if coupling == 'cyclic':
+            # DP-641. A transformed cyclic pair is joined to the job's
+            # periodic pairs (execution.py) and built by setPeriodic.
+            for applied in getattr(self, 'periodic_applied', ()) or ():
+                if (str(applied.get('name') or '') == name
+                        and sorted(int(tag) for tag
+                                   in applied.get('master') or ()) == master
+                        and sorted(int(tag) for tag
+                                   in applied.get('slave') or ()) == slave):
+                    row['state'] = 'periodic'
+                    row['reason'] = (
+                        f'built by setPeriodic as a {applied.get("transform")}'
+                        f' periodic pair; master is {described("master")}, '
+                        f'slave is {described("slave")}')
+                    return row
+        if coupling == 'non_conformal':
+            row['reason'] = (
+                'Gmsh builds no non-conformal (NCC) coupling, so this pair '
+                'is not built on the Gmsh route; master '
+                f'is {described("master")}, slave is {described("slave")}')
+            return row
+        if coupling != 'conformal' or transform != 'coincident':
+            row['reason'] = (
+                f'a {coupling} {transform} coupling is not built on the Gmsh '
+                'route (a transformed match is authored on the Periodic '
+                'page); master '
+                f'is {described("master")}, slave is {described("slave")}')
+            return row
+        if set(master) == set(slave) and all(
+                self._bounds_two_volumes(tag) for tag in master):
+            row['state'] = 'conformal'
+            row['matchedFaces'] = sum(self._surface_face_count(tag)
+                                      for tag in master)
+            row['reason'] = (
+                'the two bodies share this face, so the mesh is conformal '
+                'there')
+            return row
+        row['reason'] = (
+            f'master is {described("master")} and slave is '
+            f'{described("slave")}; they are not one face between two '
+            'volumes, and the Gmsh runner does not merge faces for a pair')
+        return row
+
+    def _authored_surface_names(self, token) -> list:
+        """The names the user's tree gave the surfaces behind *token*."""
+        identities = ((self.job.get('scopeEntities') or {}).get('surfaces')
+                      or {}).get(str(token)) or ()
+        names = (self.job.get('entityNames') or {}).get('surfaces') or {}
+        labels = []
+        for identity in identities:
+            label = names.get(identity)
+            if label and str(label) not in labels:
+                labels.append(str(label))
+        return labels
+
+    def _surface_face_count(self, tag) -> int:
+        """How many 2D elements the finished mesh holds on surface *tag*."""
+        try:
+            _types, elements, _nodes = self.gmsh.model.mesh.getElements(
+                2, int(tag))
+        except Exception:  # noqa: BLE001 - an unanswerable model counts none
+            return 0
+        return sum(len(group) for group in elements)
+
     def measure_periodic(self):
         """Read each periodic pair back out of the finished mesh.
 
@@ -4827,7 +8473,8 @@ class GmshRun:
             self.ledger.record(
                 f'periodicPair:{name}',
                 f'{pair["transform"]} correspondence',
-                (f'{paired}/{total} node(s), {matched}/{slave_faces} face(s), '
+                (f'{paired}/{total} {agreeing(total, "node")}, '
+                 f'{matched}/{slave_faces} {agreeing(slave_faces, "face")}, '
                  f'residual {residual:.3g}'),
                 applied=bool(paired) and matched == slave_faces
                 and (not total or paired == total),
@@ -4932,9 +8579,16 @@ class GmshRun:
         order = int(export.get('elementOrder', 1) or 1)
         requested_high_order = int(quality.get('highOrderOptimize', 0) or 0)
         if order < 2:
+            # DP-666. The note names the export this run is on, if any: an
+            # SU2 run used to be told order 1 was all "the OpenFOAM route"
+            # could read.
+            route = {'openfoam': 'OpenFOAM', 'su2': 'SU2'}.get(
+                str(export.get('targetSolver') or '').lower())
+            note = ('first order; the default' + (
+                f' and the only order the {route} export can read'
+                if route else ''))
             self.ledger.record('gmsh/output/elementOrder', order, 1,
-                               note='first order; the default and the only '
-                                    'order the OpenFOAM route can read')
+                               note=note)
             # Plan 30 WP12. The high-order optimiser has nothing to curve on a
             # first-order mesh. Recorded as requested-but-not-effective rather
             # than set and ignored.
@@ -5082,7 +8736,10 @@ class GmshRun:
         'gmsh.option.setNumber("General.Terminal", 0)\n'
         'gmsh.merge(sys.argv[1])\n'
         'tags, _c, _p = gmsh.model.mesh.getNodes()\n'
-        '_t, cells, _n = gmsh.model.mesh.getElements(3)\n'
+        # DP-674. A planar run's cells are its two-dimensional elements; the
+        # dimension to count arrives as the second argument.
+        'dim = int(sys.argv[2]) if len(sys.argv) > 2 else 3\n'
+        '_t, cells, _n = gmsh.model.mesh.getElements(dim)\n'
         'names = []\n'
         'for dim, tag in gmsh.model.getPhysicalGroups():\n'
         '    label = str(gmsh.model.getPhysicalName(dim, tag)).strip()\n'
@@ -5111,7 +8768,29 @@ class GmshRun:
                 names.add((int(dim), label))
         return sorted(names)
 
-    def read_back_census(self, path):
+    def named_node_count(self):
+        """How many nodes an element of a named group uses, or None.
+
+        That is what a file written with `Mesh.SaveAll=0` carries: MEASURED on
+        the G4 `duct_fields_layers` MSH, 2,903 nodes and every one of them
+        used by an element, from a model of 2,911. None when this Gmsh cannot
+        be asked which entities a group holds.
+        """
+        model = self.gmsh.model
+        if not hasattr(model, 'getEntitiesForPhysicalGroup'):
+            return None
+        used = set()
+        try:
+            for dim, tag in model.getPhysicalGroups():
+                for entity in model.getEntitiesForPhysicalGroup(dim, tag):
+                    _types, _tags, nodes = model.mesh.getElements(dim, entity)
+                    for group in nodes:
+                        used.update(int(node) for node in group)
+        except Exception:
+            return None
+        return len(used)
+
+    def read_back_census(self, path, dimension=3):
         """Open *path* in a second interpreter and return what is inside it.
 
         `{'nodes': int, 'cells': int, 'groups': [str]}`, raising when the file
@@ -5123,7 +8802,8 @@ class GmshRun:
         if not sys.executable:
             raise RuntimeError('there is no interpreter to read the file with')
         completed = subprocess.run(
-            [sys.executable, '-c', self.VERIFY_READER, str(path)],
+            [sys.executable, '-c', self.VERIFY_READER, str(path),
+             str(int(dimension))],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=self.VERIFY_TIMEOUT_SECONDS)
         output = completed.stdout.decode('utf-8', 'replace')
@@ -5170,7 +8850,13 @@ class GmshRun:
                     'cells': int(mesh.get('cells') or 0),
                     'groups': [name for _dim, name in self.model_group_names()]}
         try:
-            found = self.read_back_census(path)
+            # DP-674. `statistics['mesh']['cells']` counts the elements of the
+            # dimension the run meshed, so a planar section is read back as
+            # its triangles and quads. Counting volumes instead called every
+            # 2D export "486 cells written, 0 read back".
+            found = (self.read_back_census(path, dimension=2)
+                     if getattr(self, 'planar', False)
+                     else self.read_back_census(path))
         except subprocess.TimeoutExpired:
             return {'checked': False,
                     'reason': 'reopening the file took longer than '
@@ -5180,9 +8866,21 @@ class GmshRun:
                     'expected': expected,
                     'difference': 'the file could not be reopened: '
                                   f'{str(failure)[:300]}'}
+        # DP-505 (G4-P3, `duct_fields_layers`). `Mesh.SaveAll=0` writes the
+        # nodes a named element uses and no others, so a model holding nodes
+        # no named element touches -- 8 of 2,911 on G4, left on unnamed
+        # entities by the layer extrusion -- is written as 2,903 and read back
+        # as 2,903, every one of them used, every cell and name intact. The
+        # model total was the wrong thing to hold the file to: it called a
+        # faithful export a different mesh. A writer that keeps them is still
+        # right, so either count is the mesh that was made.
+        named = self.named_node_count()
+        if named is not None and named != expected['nodes']:
+            expected['namedNodes'] = named
         differences = []
-        if found['nodes'] != expected['nodes']:
-            differences.append(f'{expected["nodes"]} nodes written, '
+        if found['nodes'] not in {expected['nodes'], named}:
+            written_nodes = named if named is not None else expected['nodes']
+            differences.append(f'{written_nodes} nodes written, '
                                f'{found["nodes"]} read back')
         if found['cells'] != expected['cells']:
             differences.append(f'{expected["cells"]} cells written, '
@@ -5231,7 +8929,7 @@ class GmshRun:
     UNSUPPORTED_GEOMETRY = {
         '.xao': ('Gmsh imports XAO as geometry and keeps its group names, but '
                  'FoamMesh stages CAD through Open CASCADE, which has no XAO '
-                 'reader -- so there is no path that could hand this file to '
+                 'reader — so there is no path that could hand this file to '
                  'the mesher. Convert it to STEP or BREP.'),
         '.med': ('a MED file is a finished mesh, not geometry: it imports with '
                  'no CAD kernel behind it, so element size, refinement and '
@@ -5319,6 +9017,7 @@ class GmshRun:
             self.measure_structure()
             self.measure_layers()
             self.measure_periodic()
+            self.trace_interface_pairs()
             self.measure_volume()
             self.write_outputs()
         finally:
@@ -5354,6 +9053,436 @@ class GmshRun:
         }
 
 
+#: DP-74. How much of the fold limit a refitted layer actually grows. The
+#: limit is the thickness at which the facet turns flat, and a facet meshed
+#: at exactly that thickness has no area left. Bisecting the impeller put the
+#: largest stack that meshes at 0.763 of its limit, so the refit stays under
+#: it.
+LAYER_FIT_MARGIN = 0.7
+
+#: One measured refit, one halving after it, and then the run is refused.
+LAYER_FIT_ATTEMPTS = 3
+
+
+def folded_like_a_layer(error) -> bool:
+    """A volume-mesher refusal that a thinner boundary layer could clear.
+
+    DP-74. The fit reading catches a layer that crosses itself. A layer can
+    also reach a wall it did not grow from, which leaves the same tetgen
+    refusal with no fold in it at all, so the text is read as well.
+    """
+    text = str(error).lower()
+    return 'plc error' in text and 'intersect' in text
+
+
+def crossing_like(error) -> bool:
+    """A refusal that says the boundary handed to the mesher crosses itself.
+
+    DP-75. tetgen's wording and Gmsh's own wording for the same complaint.
+    """
+    text = str(error).lower()
+    if 'plc error' in text and 'intersect' in text:
+        return True
+    return 'overlapping facets' in text or 'invalid boundary mesh' in text
+
+
+def a_remesh_of_imported_facets(job):
+    """True when this job builds a remesh of a triangulation it imported.
+
+    DP-93. The fallback below meshes the facets the user supplied, so it can
+    only be reached by a job that has facets and chose not to mesh them. A
+    CAD job has none, and a job already keeping its tessellation has nothing
+    left to fall back to.
+    """
+    healing = (job.get('intent') or {}).get('healing') or {}
+    if healing.get('keepTessellation'):
+        return False
+    sources = job.get('geometry') or ()
+    return bool(sources) and all(
+        str(item).lower().endswith(('.stl', '.obj', '.ply'))
+        for item in sources)
+
+
+def kept_tessellation_job(job):
+    """A copy of the job that meshes the imported facets as they are."""
+    document = copy.deepcopy(job)
+    intent = document.setdefault('intent', {})
+    healing = intent.get('healing')
+    if not isinstance(healing, dict):
+        healing = {}
+        intent['healing'] = healing
+    healing['keepTessellation'] = True
+    return document
+
+
+def layerless_job(job):
+    """A copy of the job that meshes this geometry without a boundary layer.
+
+    DP-81. Not the same as a job that never asked for one: the ask is kept
+    beside the switch so the run can say what it dropped and what the user
+    had wanted, and the receipt is not left claiming the user never asked.
+    """
+    document = copy.deepcopy(job)
+    intent = document.setdefault('intent', {})
+    layers = intent.get('layers')
+    if not isinstance(layers, dict):
+        layers = {}
+        intent['layers'] = layers
+    layers['requestedEnabled'] = bool(layers.get('enabled'))
+    layers['enabled'] = False
+    return document
+
+
+def refitted_job(job, factor):
+    """A copy of the job whose layer stack is scaled to what will fit."""
+    document = copy.deepcopy(job)
+    layers = (document.get('intent') or {}).get('layers') or {}
+    # DP-76. Keep what the user asked for beside what is about to replace it.
+    # A refitted run cannot otherwise tell the two apart -- every number it
+    # can see has already been scaled -- and a refusal raised inside it has
+    # to be able to say how far the layer had been cut back to get there.
+    stack = layers.get('cumulativeHeights') or ()
+    original = layers.get('totalThickness')
+    if original is None and stack:
+        original = abs(float(stack[-1]))
+    if original is not None:
+        layers.setdefault('originalTotalThickness', abs(float(original)))
+    layers['cumulativeHeights'] = [
+        float(value) * factor
+        for value in layers.get('cumulativeHeights') or ()]
+    for key in ('firstHeight', 'totalThickness'):
+        if layers.get(key) is not None:
+            layers[key] = float(layers[key]) * factor
+    return document
+
+
+def record_layer_refit(document, asked, first, factor, note):
+    """Say in the receipt what was asked for and what was grown instead."""
+    record = (document.get('statistics') or {}).get('layers')
+    if isinstance(record, dict):
+        record['fittedTotalThickness'] = record.get('requestedTotalThickness')
+        record['fittedFirstHeight'] = record.get('requestedFirstHeight')
+        record['requestedTotalThickness'] = asked
+        record['requestedFirstHeight'] = first
+        record['fitScale'] = factor
+    document.setdefault('warnings', []).insert(0, note)
+
+
+def execute_with_layer_fit(job, reporter, attempts=None):
+    """Run the job, regrowing a boundary layer the geometry cannot carry.
+
+    DP-74. A layer thicker than the wall it grows on can only be discovered
+    by growing it, so the fit is a property of a run rather than of a job,
+    and the repair is another run. The first refit is measured -- the fold
+    reading says what the geometry carries -- and a refusal with no fold in
+    it is halved once, because a layer that reaches a wall it did not grow
+    from leaves the same message and no fold. Three runs at the outside, and
+    every one of them says in the receipt what it grew.
+    """
+    layers = (job.get('intent') or {}).get('layers') or {}
+    stack = list(layers.get('cumulativeHeights') or ())
+    carried = bool(layers.get('enabled')) and bool(stack)
+    asked = abs(float(stack[-1])) if carried else 0.0
+    first = abs(float(stack[0])) if carried else 0.0
+    factor = 1.0
+    tried = []
+    note = ''
+    crossing = None
+    current = job
+    for attempt in range(LAYER_FIT_ATTEMPTS):
+        run = GmshRun(current, reporter)
+        if attempts is not None:
+            attempts.append(run)
+        tried.append(asked * factor)
+        try:
+            document = run.execute()
+        except LayerFold as fold:
+            following = fold.carries * LAYER_FIT_MARGIN / asked
+            note = (
+                f'the boundary layer asked for reaches {asked:.6g} m, which '
+                f'this geometry cannot carry: {fold.folded} of the faces it '
+                f'grew fold back through themselves, first on {fold.patch} '
+                f'at ({fold.at[0]:.6g}, {fold.at[1]:.6g}, {fold.at[2]:.6g}), '
+                f'where the wall carries {fold.carries:.6g} m.')
+        except LayerLanding:
+            # DP-76. A layer that did not land is already too thin for the
+            # mesh above it; halving it again walks further into the fault
+            # the reading just named, so this one leaves immediately and
+            # the message it carries is the message the user gets.
+            raise
+        except SurfaceCrossing as error:
+            crossing = error
+            if not carried:
+                raise
+            following = factor * 0.5
+            note = (
+                f'the volume mesher refused the boundary layer grown at '
+                f'{asked * factor:.6g} m as a crossing surface, with no fold '
+                f'in the layer itself to measure.')
+        except MeshFailure as error:
+            if not carried or not folded_like_a_layer(error):
+                raise
+            following = factor * 0.5
+            note = (
+                f'the volume mesher refused the boundary layer grown at '
+                f'{asked * factor:.6g} m as a crossing surface, with no fold '
+                f'in the layer itself to measure.')
+        else:
+            if factor < 1.0:
+                record_layer_refit(document, asked, first, factor, note)
+            return document
+        if following < 0.05 or attempt + 1 >= LAYER_FIT_ATTEMPTS:
+            break
+        factor = following
+        note += (f' The layer was regrown at {asked * factor:.6g} m, '
+                 f'{factor:.1%} of what was asked, keeping the layer count '
+                 f'and the growth ratio.')
+        reporter.emit('progress', 'mesh', 0.3,
+                      'refitting the boundary layer to '
+                      f'{asked * factor:.4g} m')
+        current = refitted_job(job, factor)
+    detail = note.strip()
+    if len(tried) > 1:
+        detail += (' Thicknesses of '
+                   + ', '.join(f'{value:.6g}' for value in tried)
+                   + ' m were tried and every one was refused.')
+    refusal = MeshFailure(
+        'the boundary layer could not be fitted to this geometry: ' + detail
+        + ' Mesh this geometry with a thinner layer, or with layers turned '
+          'off.')
+    # DP-75. A layer refit cannot clear a boundary that crossed itself before
+    # the layer was grown, so what the scan found is carried out of here for
+    # the caller to act on rather than being spent on another thinner layer.
+    refusal.surface_crossing = crossing
+    raise refusal
+
+
+def execute_with_surface_fallback(job, reporter, attempts=None):
+    """Run the job, and mesh the imported facets if the remesh will not mesh.
+
+    DP-75. MEASURED on ``drone_quadcopter``, Gmsh 4.15.2: classification at
+    40 deg leaves a patch with three boundary loops -- a motor boss, wrapped
+    all the way round -- and ``createGeometry`` parametrises it anyway. 85 of
+    that patch's own faces then cross each other, 356 more cross the layer
+    grown from it, and the volume mesher refuses with `PLC Error: A segment
+    and a facet intersect at point`, which names nothing. The imported STL is
+    manifold, closed and carries no crossing facets of its own, so the
+    boundary the user supplied was never the problem; meshing it as supplied
+    gives 276574 cells with no inverted element and full layer coverage on
+    both patches.
+
+    DP-93. A crossing was the only failure this fallback listened for, so
+    the rung was reachable only when the scan happened to name one. MEASURED
+    on the same model with the preparation the product recommends applied:
+    the recommended weld drops nine exactly-degenerate facets and rewrites
+    the file, the classified remesh built on the result dies with `Some NULL
+    points exist in 2D mesh`, and the run was reported failed -- while this
+    rung, which had already been written, tested and measured, meshed the
+    same job as 262197 cells with no inverted element in 72.9s. What the
+    weld does to the surface does not explain that: connectivity is five
+    components before and after -- [4581, 164, 164, 164, 164] becomes
+    [4572, 164, 164, 164, 164], the four motor bosses being separate shells
+    in the supplied file already -- and both files carry 0 boundary edges
+    and 0 non-manifold edges. Why the remesh fails is still open. This rung
+    does not rest on knowing that; it rests on the rung below meshing the
+    job the rung above could not.
+    """
+    crossing = None
+    unmeshable = None
+    try:
+        return execute_with_layer_fit(job, reporter, attempts)
+    except SurfaceCrossing as error:
+        crossing = error
+    except LayerCollision:
+        # DP-374. A collision is not a remesh that could not be meshed, and
+        # this rung answers only that question. MEASURED on
+        # `two_cubes_one_file`, the same job three ways: with layers off the
+        # remesh meshes 127961 cells and never reaches this rung; with one
+        # layer the remesh refuses a 2-node collision on one surface and this
+        # rung meshed the raw 24 authored triangles instead, reporting
+        # `succeeded` with 36 cells, `coverage 1.0` and every quality reading
+        # met; with three layers the same fall lands on a collision of 32
+        # nodes across 14 surfaces, because the facets are coarser than the
+        # remesh and the stacks are relatively thicker. So the rung cannot
+        # cure a collision, it discards the surface sizing that was asked for
+        # -- 127961 cells becomes 36 -- and the warning it writes says the
+        # remesh `could not be meshed`, which on a collision is not true.
+        # The refusal below it already names the measurement and what to do
+        # about it, so it is left to travel.
+        raise
+    except MeshFailure as error:
+        crossing = getattr(error, 'surface_crossing', None)
+        if crossing is None:
+            # DP-93. A crossing is one way the remesh fails and not the only
+            # one, and the rung below is the same rung either way. MEASURED
+            # on drone_quadcopter with the preparation the product itself
+            # recommends applied: the classified remesh dies with `Some NULL
+            # points exist in 2D mesh` and the run was reported failed, while
+            # the same job with the tessellation kept meshes 262197 cells
+            # with no inverted element in 72.9s. Gated on the job actually
+            # having built a remesh of imported facets, because a CAD job has
+            # no tessellation to fall back to and would only pay twice.
+            if not a_remesh_of_imported_facets(job):
+                raise
+            unmeshable = error
+    if crossing is not None and not crossing.remeshed:
+        raise crossing
+    reporter.emit('progress', 'mesh', 0.3,
+                  'meshing the imported facets rather than a remesh of them')
+    document = execute_with_layer_fit(
+        kept_tessellation_job(job), reporter, attempts)
+    document.setdefault('warnings', []).insert(0, (
+        f'the remesh Gmsh built from its own parametrisation of this '
+        f'geometry could not be meshed — {unmeshable} — so the imported '
+        f'triangulation was meshed as it was supplied instead. The mesh '
+        f'follows the imported facets exactly and the surface sizing asked '
+        f'for did not shape it.'
+        if crossing is None else
+        f'the remesh Gmsh built from its own parametrisation of this '
+        f'geometry crossed itself — {count_text(crossing.pairs, "pair")} '
+        f'of faces passed through each other, most of them on '
+        f'{crossing.patch} — so '
+        f'the imported triangulation was meshed as it was supplied instead. '
+        f'The mesh follows the imported facets exactly and the surface '
+        f'sizing asked for did not shape it.'))
+    return document
+
+
+#: DP-484. The surface algorithms tried, in order, when a layer column was
+#: extruded by nothing. MEASURED on `two_cubes_one_file` (DP-375): Delaunay,
+#: MeshAdapt and Frontal-Delaunay for Quads all mesh the job that
+#: Frontal-Delaunay refuses.
+STALL_ALGORITHMS = (('delaunay', 5), ('mesh_adapt', 1))
+
+
+def another_surface_algorithm_job(job, name, code):
+    """A copy of the job that meshes its surfaces with another algorithm."""
+    document = copy.deepcopy(job)
+    algorithms = document.setdefault('intent', {}).setdefault('algorithms', {})
+    algorithms.setdefault('requestedSurface', algorithms.get('surface'))
+    algorithms.setdefault('requestedSurfaceCode', algorithms.get('surfaceCode'))
+    algorithms['surface'] = name
+    algorithms['surfaceCode'] = code
+    return document
+
+
+def execute_with_another_surface_algorithm(job, reporter, attempts=None):
+    """Run the job, and re-mesh the surface if a layer column did not grow.
+
+    DP-484. MEASURED on the representative sweep, `two_cubes_one_file`, Gmsh
+    4.15.2, targetSize 0.04145781, three layers: two nodes interior to
+    `two_cubes_one_file_wall1` were extruded by exactly zero while the 4,398
+    beside them grew the whole ask. DP-381 made the refusal say so and DP-375
+    measured the remedy -- the nodes are where Frontal-Delaunay put them, and
+    every other surface algorithm tried meshes the job. The refusal then told
+    the user to change the algorithm; the run can do that itself and say it
+    did. Only a stalled column is retried: two stacks that met across a gap
+    are not moved by a different surface mesh.
+    """
+    try:
+        return execute_with_surface_fallback(job, reporter, attempts)
+    except LayerCollision as collision:
+        if not collision.stalled:
+            raise
+        first = collision
+    algorithms = (job.get('intent') or {}).get('algorithms') or {}
+    asked = int(algorithms.get('surfaceCode', 6) or 6)
+    asked_name = ALGORITHM_NAMES.get(asked, str(asked))
+    tried = [asked_name]
+    for name, code in STALL_ALGORITHMS:
+        if code == asked:
+            continue
+        label = ALGORITHM_NAMES.get(code, name)
+        tried.append(label)
+        reporter.emit('progress', 'mesh', 0.3,
+                      f're-meshing the surface with {label}: a boundary-layer '
+                      f'column did not grow on the {asked_name} surface mesh')
+        try:
+            document = execute_with_surface_fallback(
+                another_surface_algorithm_job(job, name, code), reporter,
+                attempts)
+        except LayerCollision as collision:
+            if not collision.stalled:
+                raise
+            continue
+        document.setdefault('warnings', []).insert(0, (
+            f'the surface was meshed with {label}, not the {asked_name} that '
+            f'was asked for. On the {asked_name} surface mesh the boundary '
+            f'layer grew by nothing at {first.nodes} of its nodes '
+            f'({", ".join(first.patches)}), and a column of no height is '
+            f'not a cell. The {label} surface mesh grew every column.'))
+        return document
+    raise LayerCollision(
+        f'{first} Surface algorithms {", ".join(tried)} were each tried and '
+        f'every one left a column that did not grow.',
+        nodes=first.nodes, coincident=first.coincident,
+        patches=first.patches, at=first.at, stalled=True) from first
+
+
+def execute_without_a_layer_that_will_not_land(job, reporter, attempts=None):
+    """Run the job, and mesh without a layer that cannot be landed.
+
+    DP-81. MEASURED on ``drone_quadcopter``, Gmsh 4.15.2, with the
+    preparation the product recommends applied. The wall carries about
+    0.00023 m of layer before it folds, so :func:`execute_with_layer_fit`
+    refits the 0.001695 m asked for down to 0.00016 m -- and the surface
+    elements resting on that stack are 22.7 mm across, so 32 of the 961
+    cells sitting on the layer top come out flat and the landing reading
+    refuses. Thinning again only widens that ratio, which is why the
+    landing handler in the fit loop leaves immediately rather than halving;
+    and the one move that would close it, refining the wall to the layer's
+    own size, is a million surface elements on a 150 mm body for a layer
+    9% as thick as the one asked for. No thickness both fits and lands
+    here.
+
+    Spending that on the whole mesh is the fault. The same geometry meshes
+    to 276574 cells with no inverted element once the layer is off, so a
+    refusal here throws away everything the user asked for to avoid
+    delivering one optional part of it short. What the run owes them is the
+    mesh and a receipt that says, in the reading's own numbers, that the
+    layer was dropped and why -- which is what :func:`execute_with_surface_fallback`
+    already does for a remesh that crosses itself.
+    """
+    try:
+        return execute_with_another_surface_algorithm(job, reporter, attempts)
+    except LayerLanding as landing:
+        asked = landing.asked or landing.thickness
+        share = (f'{landing.thickness / asked:.1%} of the {asked:.6g} m '
+                 f'asked for' if asked else 'all this wall would carry')
+        reporter.emit('progress', 'mesh', 0.3,
+                      'meshing without the boundary layer, which this '
+                      'geometry cannot carry at a thickness the mesh above '
+                      'it can rest on')
+        document = execute_with_surface_fallback(
+            layerless_job(job), reporter, attempts)
+        # MEASURED: a run that grew no layer publishes no `layers` block at
+        # all, so writing into the one that is there would have dropped this
+        # reading on exactly the runs it describes.
+        statistics = document.setdefault('statistics', {})
+        record = statistics.get('layers')
+        if not isinstance(record, dict):
+            record = {'enabled': False}
+            statistics['layers'] = record
+        record['droppedAfterLanding'] = {
+            'requestedTotalThickness': asked,
+            'grownTotalThickness': landing.thickness,
+            'degenerateCells': landing.cells,
+            'worst': landing.worst,
+            'measure': 'gamma',
+        }
+        document.setdefault('warnings', []).insert(0, (
+            f'the boundary layer asked for was not grown: this wall carries '
+            f'a stack only {landing.thickness:.6g} m thick before it folds '
+            f'— {share} — and a stack that thin under the surface mesh '
+            f'around it leaves the volume mesher a gap it can fill only with '
+            f'flat cells: {landing.cells} of the cells resting on it came out '
+            f'with no height, the worst at {landing.worst:.3e} gamma. The '
+            f'mesh below was built without a layer. To grow one here, refine '
+            f'the surface mesh at the wall so its elements come nearer the '
+            f'layer in size, or ask for a layer this wall can carry.'))
+        return document
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='FoamMesh Gmsh runner')
     parser.add_argument('job')
@@ -5362,17 +9491,21 @@ def main(argv=None) -> int:
     arguments = parser.parse_args(argv)
 
     reporter = Reporter(arguments.progress)
-    run = None
+    attempts: list = []
     try:
         job = load_job(Path(arguments.job))
         result_path = Path(arguments.result or job.get('resultPath')
                            or Path(arguments.job).with_name('result.json'))
-        run = GmshRun(job, reporter)
-        document = run.execute()
+        # DP-74. One call, one or more runs: a boundary layer the geometry
+        # cannot carry is refitted and the job re-run, and it is the last of
+        # those runs that has to report if the refit does not land either.
+        document = execute_without_a_layer_that_will_not_land(
+            job, reporter, attempts)
         status = 0
     except Exception as error:  # noqa: BLE001 - the runner reports, never crashes
         detail = f'{type(error).__name__}: {error}'
         reporter.emit('failed', 'gmsh', 1.0, detail)
+        run = attempts[-1] if attempts else None
         document = (run.result('failed', detail) if run is not None else {
             'schema_version': SCHEMA_VERSION, 'runner': RUNNER_VERSION,
             'status': 'failed', 'error': detail, 'statistics': {},

@@ -13,7 +13,17 @@ from foammesh.core.case import record_artifact_event
 from foammesh.core.export import ExportFormat, capability, list_formats, readiness
 from foammesh.core.export import gmsh_export as _gmsh
 from foammesh.core.export import cgns_export as _cgns
-from foammesh.core.export.openfoam import validate_case
+# ``POLY_MESH_FILES`` is re-exported under its own name on purpose: DP-266
+# wrote the list here, and the fault its Left standing named was that
+# ``validate_case`` did not know it.  The list moved next to that verdict in
+# ``core/export/openfoam.py`` -- this module already imports that one, so the
+# reverse import would have been a cycle -- and every reader that learned the
+# name here still reads the one list rather than a second copy that can drift.
+from foammesh.core.export.openfoam import (
+    POLY_MESH_FILES as POLY_MESH_FILES,
+    missing_poly_mesh_files as missing_poly_mesh_files,
+    validate_case,
+)
 from foammesh.core.export.msh_interchange import write_msh_interchange
 from foammesh.core.export.vtk_export import (
     load_case_blocks, load_case_dataset, read_vtu_counts, write_vtu,
@@ -105,6 +115,21 @@ class NativeExportResult:
     warnings: tuple[str, ...]
 
 
+def _classified(error: RuntimeError) -> ValueError:
+    """Carry the converter's classification onto the refusal it becomes.
+
+    EXPORT-01. :mod:`foammesh.core.export.gmsh_export` decides whether a
+    conversion was interrupted, wrote something it could not read back, or
+    never ran; the callers of this service raise on ValueError, so the word
+    would be lost at the boundary unless it is carried across. Reading
+    ``error.kind`` tells a caller which of the three it was without parsing
+    the sentence.
+    """
+    refusal = ValueError(str(error))
+    refusal.kind = getattr(error, 'kind', 'failed')
+    return refusal
+
+
 def path_bytes(path: Path) -> int:
     if path.is_file():
         return path.stat().st_size
@@ -121,6 +146,41 @@ def record_export_event(case_path, *, entry_id: str, destination, total_bytes: i
     payload.update(details or {})
     return record_artifact_event(
         case_path, operation=f'export:{entry_id}', status=status, details=payload)
+
+
+def _dataset_count(dataset, method: str) -> int:
+    """A census read off the dataset that was actually written.
+
+    The VTK reader hands back a dataset, not a document, so the only honest
+    count an export can file is the one the object it wrote reports. A build
+    whose reader answers neither call files no number rather than a zero that
+    would read as an empty mesh.
+    """
+    call = getattr(dataset, method, None)
+    if call is None:
+        return 0
+    try:
+        return int(call())
+    except Exception:
+        return 0
+
+
+def _kept_run_id(case_path) -> str:
+    """The newest run this case kept, or ``''`` when it kept none.
+
+    ``accepted_run_layout`` answers the same question but returns ``None`` for
+    a kept run that recorded no processor layout, which is exactly the case a
+    serial mesh leaves behind. The run id is still a fact then, and it is the
+    one thing that lets a reader trace an export back to the mesh it came
+    from, so it is read on its own here.
+    """
+    from foammesh.core.gmsh.manifest import (
+        EXPORTABLE, run_disposition, run_documents)
+
+    for root, document in run_documents(case_path):
+        if run_disposition(document) in EXPORTABLE:
+            return str(document.get('run_id') or root.name)
+    return ''
 
 
 def _su2_identity_problems(census, document: dict) -> tuple[list, list]:
@@ -160,13 +220,39 @@ def _su2_identity_problems(census, document: dict) -> tuple[list, list]:
         problems.append('the copied file names the boundary '
                         + ', '.join(duplicated) + ' more than once')
 
-    expected_markers = groups.get('boundarySurfaces')
-    if isinstance(expected_markers, int) and expected_markers > 0 and markers:
-        if len(markers) != expected_markers:
+    # DP-63. The names the run grouped its boundary into, which is what a
+    # marker is. This used to read `boundarySurfaces`, the count of surface
+    # *entities*, and a named STL surface is deliberately one patch however
+    # many faces it became -- so a pipe from one solid meshed as six surfaces
+    # under one name, and every SU2 export of it was refused for carrying one
+    # marker instead of six. MEASURED on `test_cases/gmsh/pipe_stl_su2`.
+    expected_names = [str(name) for name in (groups.get('boundaryGroupNames') or ())
+                      if str(name).strip()]
+    if expected_names and markers:
+        missing = sorted(set(expected_names) - set(str(name) for name in markers))
+        extra = sorted(set(str(name) for name in markers) - set(expected_names))
+        if missing:
+            problems.append(
+                'the run named the boundary ' + ', '.join(missing)
+                + ' and the copied file does not carry '
+                + ('them' if len(missing) > 1 else 'it'))
+        if extra:
+            problems.append(
+                'the copied file names the boundary ' + ', '.join(extra)
+                + ' and the run recorded no such patch')
+    else:
+        # A manifest from before the names were recorded. A group is one or
+        # more surfaces and never none, so more markers than surfaces is
+        # impossible and fewer is ordinary; that inequality is the part of
+        # the old equality check that was ever true.
+        expected_markers = groups.get('boundarySurfaces')
+        if (isinstance(expected_markers, int) and expected_markers > 0
+                and markers and len(markers) > expected_markers):
             problems.append(
                 f'the run meshed {expected_markers} boundary surfaces but the '
                 f'copied file carries {len(markers)} markers '
-                f'({", ".join(str(name) for name in markers)})')
+                f'({", ".join(str(name) for name in markers)}), which is more '
+                f'boundary than the run had to give it')
 
     expected_cells = mesh.get('cells')
     if isinstance(expected_cells, int) and expected_cells > 0:
@@ -373,6 +459,14 @@ class ImportExportService:
             raise ValueError('export destination must not be the source or a child of it')
         if destination_path.exists():
             raise FileExistsError(f'export destination already exists: {destination_path}')
+        # A mesh that was written halfway -- a run killed between `owner` and
+        # `neighbour`, a copy that ran out of disk -- used to export without a
+        # word, and the reader met it as an unreadable case in whatever solver
+        # they took it to.  DP-266 named it here, in one of the two callers;
+        # the verdict itself now names it, so this route and the native writer
+        # and everything else that reads an ``ExportReport`` refuse on the one
+        # sentence.  The explicit check that stood here is gone rather than
+        # left unreachable behind ``validate_case``.
         report = validate_case(source_path)
         if not report.ok:
             raise ValueError('; '.join(report.errors))
@@ -510,20 +604,34 @@ class ImportExportService:
             except RuntimeError as error:
                 # The caller's contract is OSError/ValueError; a runtime that
                 # would not start is a refusal with a reason, not a traceback.
-                raise ValueError(str(error)) from error
+                # EXPORT-01: the word the converter classified this failure
+                # with travels with the refusal, so the reader is told the
+                # conversion was interrupted rather than that the mesh is bad.
+                raise _classified(error) from error
             problems, warnings = self._conversion_identity_problems(census, artifact)
             if problems:
                 raise ValueError(
                     f'{entry_id} validation failed: ' + '; '.join(problems))
         outcome = ExportOutcome(entry_id, source, target, path_bytes(target),
                                 tuple(warnings))
+        # DP-244. The same four layout details DP-229 gave the authored
+        # OpenFOAM export and the SU2 copy now files, through the same helper.
+        # This is every MED and UNV export and the CGNS exports that take the
+        # Gmsh route, so leaving it out made the history answer for the layout
+        # on some formats and not others, for no reason a reader can see.
+        from foammesh.core.gmsh.manifest import recorded_mesh_layout
+        from foammesh.core.import_export.authored import export_layout_details
+        layout = recorded_mesh_layout(artifact.get('run_manifest') or {}) or {}
         record_export_event(
             case, entry_id=entry_id, destination=target,
             total_bytes=outcome.total_bytes, warnings=outcome.warnings,
             details={'points': census.get('nodes'), 'cells': census.get('cells'),
                      'groups': list(census.get('groups') or ()),
                      'format': registry_id, 'source': 'native',
-                     'run_id': artifact.get('run_id', '')})
+                     'run_id': artifact.get('run_id', ''),
+                     **export_layout_details(
+                         'accepted-run', artifact.get('run_id', ''),
+                         layout.get('cores') or 1, layout.get('decomposed'))})
         return outcome
 
     def export_med(self, case_path: str | Path, destination: str | Path) -> ExportOutcome:
@@ -561,8 +669,31 @@ class ImportExportService:
                 raise ValueError('CGNS writer produced an empty file')
         warnings = tuple(report.warnings)
         outcome = ExportOutcome(ExportFormat.CGNS.value, case, target, path_bytes(target), warnings)
-        record_export_event(case, entry_id=outcome.entry_id, destination=target,
-                            total_bytes=outcome.total_bytes, warnings=warnings)
+        # DP-264 left this standing.  The three other export writers -- the
+        # authored OpenFOAM step, the native SU2 copy and the Gmsh conversion
+        # -- file the four layout details through
+        # :func:`export_layout_details`; this one filed no ``details`` at all,
+        # so the one page reading the one history answered for the layout on a
+        # MED, a UNV or an SU2 export and answered "not recorded" on a CGNS
+        # export written from the same case.
+        #
+        # What this route reproduces is the case's own ``constant/polyMesh``,
+        # read through the VTK OpenFOAM reader.  That mesh is one piece by the
+        # time it is read, whatever the run that wrote it did, so the layout
+        # filed is one core and undecomposed, and the source is named with the
+        # vocabulary ``_exportLayout`` already uses for pieces taken off disk.
+        # The run named is the newest one the case kept, so a reader can still
+        # trace the file back; a case adopted from outside FoamMesh kept none
+        # and names none, which is a fact rather than a gap.
+        from foammesh.core.import_export.authored import export_layout_details
+        record_export_event(
+            case, entry_id=outcome.entry_id, destination=target,
+            total_bytes=outcome.total_bytes, warnings=warnings,
+            details={'points': _dataset_count(dataset, 'GetNumberOfPoints'),
+                     'cells': _dataset_count(dataset, 'GetNumberOfCells'),
+                     'format': 'mesh.cgns.export',
+                     **export_layout_details(
+                         'mesh-on-disk', _kept_run_id(case), 1, False)})
         return outcome
 
     def _copy_native_su2(self, case: Path, artifact: dict,
@@ -577,7 +708,9 @@ class ImportExportService:
         elements and a nonzero size; what it does not have is the run's
         marker set.
         """
-        from foammesh.core.gmsh.manifest import artifact_provenance_error
+        from foammesh.core.gmsh.manifest import (
+            artifact_provenance_error, recorded_mesh_layout)
+        from foammesh.core.import_export.authored import export_layout_details
         from foammesh.core.mesh.census import su2_element_census
 
         source = Path(artifact.get('path') or '')
@@ -602,6 +735,14 @@ class ImportExportService:
         outcome = ExportOutcome(ExportFormat.SU2.value, source, target,
                                 path_bytes(target),
                                 tuple(census.warnings) + tuple(warnings))
+        # DP-244. The layout details DP-229 gave the authored OpenFOAM export,
+        # filed here too and through the same helper. This writer recorded the
+        # run under its own spelling and nothing else, so an SU2 export reached
+        # the history with three fewer facts than an OpenFOAM one and the page
+        # that reads them had to know two vocabularies. The layout is the one
+        # the accepted run recorded; a run that recorded none meshed in one
+        # process, which is every Gmsh run.
+        layout = recorded_mesh_layout(artifact.get('run_manifest') or {}) or {}
         record_export_event(
             case, entry_id=outcome.entry_id, destination=target,
             total_bytes=outcome.total_bytes, warnings=outcome.warnings,
@@ -609,7 +750,10 @@ class ImportExportService:
                      'elements': census.volume_count,
                      'markers': list(census.markers),
                      'source': 'native',
-                     'run_id': artifact.get('run_id', '')})
+                     'run_id': artifact.get('run_id', ''),
+                     **export_layout_details(
+                         'accepted-run', artifact.get('run_id', ''),
+                         layout.get('cores') or 1, layout.get('decomposed'))})
         return outcome
 
     def export_su2(self, case_path: str | Path, destination: str | Path) -> ExportOutcome:
@@ -675,6 +819,9 @@ class ImportExportService:
         if not report.ok:
             raise ValueError('; '.join(report.errors))
         target = self._prepare_file_destination(destination, '.msh')
+        artifact, _reason = self.gmsh_conversion_source(case)
+        if artifact is not None:
+            return self._copy_native_msh(case, artifact, target, report)
         interior, patches = load_case_blocks(case)
         with self._staged(target) as staged_target:
             with tempfile.TemporaryDirectory(prefix='foammesh-gmsh-') as work:
@@ -686,7 +833,7 @@ class ImportExportService:
                 except RuntimeError as error:
                     # The caller's contract is OSError/ValueError; a runtime
                     # that would not start is a refusal with a reason.
-                    raise ValueError(str(error)) from error
+                    raise _classified(error) from error
             if path_bytes(staged_target) == 0:
                 raise ValueError('Gmsh writer produced an empty file')
             problems, identity_warnings = self._identity_problems(
@@ -703,6 +850,54 @@ class ImportExportService:
                                      'cells': census.get('cells'),
                                      'groups': list(census.get('groups') or ()),
                                      'boundary_faces': written.boundary_faces})
+        return outcome
+
+    def _copy_native_msh(self, case: Path, artifact: dict, target: Path,
+                         report) -> ExportOutcome:
+        """Hand over the accepted run's own ``mesh.msh`` rather than rebuild it.
+
+        EXPORT-01. The run wrote this file, read it back in a fresh session
+        and recorded its hash and its byte count;
+        :meth:`gmsh_conversion_source` has just held the file on disk against
+        both, so the mesh being asked for is the mesh that is already there.
+        Rebuilding it -- polyMesh to interchange to a Gmsh process and back --
+        is a second chance to fail at something a copy cannot get wrong, and
+        the measured export that died at exit 3221225786 died in exactly that
+        process. What is filed says ``reused`` so that a reader can tell a
+        copy from a conversion without measuring the file.
+
+        The same shape :meth:`_copy_native_su2` files for the SU2 mesh, for
+        the same reason: one history, one vocabulary.
+        """
+        source = Path(artifact.get('path') or '')
+        with self._staged(target) as staging:
+            shutil.copy2(source, staging)
+            if path_bytes(staging) == 0:
+                raise ValueError(
+                    f'the mesh of the accepted Gmsh run is empty: {source}')
+        statistics = dict(
+            (artifact.get('run_manifest') or {}).get('statistics') or {})
+        mesh = dict(statistics.get('mesh') or {})
+        identity = dict((dict(statistics.get('outputs') or {}).get('msh')
+                         or {}).get('identity') or {})
+        groups = [str(name).strip()
+                  for name in (dict(identity.get('expected') or {}).get('groups')
+                               or identity.get('groups') or ())
+                  if str(name).strip()]
+        outcome = ExportOutcome(ExportFormat.GMSH.value, source, target,
+                                path_bytes(target), tuple(report.warnings))
+        from foammesh.core.gmsh.manifest import recorded_mesh_layout
+        from foammesh.core.import_export.authored import export_layout_details
+        layout = recorded_mesh_layout(artifact.get('run_manifest') or {}) or {}
+        record_export_event(
+            case, entry_id=outcome.entry_id, destination=target,
+            total_bytes=outcome.total_bytes, warnings=outcome.warnings,
+            details={'points': mesh.get('nodes'), 'cells': mesh.get('cells'),
+                     'groups': groups, 'source': 'reused',
+                     'run_id': artifact.get('run_id', ''),
+                     **export_layout_details(
+                         'accepted-run', artifact.get('run_id', ''),
+                         layout.get('cores') or 1, layout.get('decomposed'))})
         return outcome
 
     @staticmethod

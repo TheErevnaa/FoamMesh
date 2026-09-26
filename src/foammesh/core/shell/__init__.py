@@ -9,9 +9,10 @@ from .action_policy import (
     ContentState,
     JobState,
     job_state_from_manager,
+    mesh_quality_capability,
 )
 from .capabilities import Capability, CapabilityRegistry, UtilityHelp
-from .external_tools import paraview_argv, terminal_capability
+from .external_tools import terminal_capability
 
 __all__ = [
     'ActionId',
@@ -22,9 +23,9 @@ __all__ = [
     'ContentState',
     'JobState',
     'job_state_from_manager',
+    'mesh_quality_capability',
     'Capability',
     'CapabilityRegistry',
     'UtilityHelp',
-    'paraview_argv',
     'terminal_capability',
 ]

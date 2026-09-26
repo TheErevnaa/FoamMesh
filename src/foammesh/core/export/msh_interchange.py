@@ -52,7 +52,9 @@ from pathlib import Path
 
 import numpy as np
 
+from foammesh.core.mesh.census import MSH_ADVICE, MSH_READER
 from foammesh.core.mesh.msh_scene import SURFACE_TYPES, VOLUME_TYPES
+from foammesh.core.quantities import count_text
 
 #: VTK cell type -> MSH element type, inverted from the one table this
 #: application already keeps for reading MSH files back. The node orders agree
@@ -124,9 +126,7 @@ def _refuse_unwritable(interior, patches) -> None:
             f'{"face has" if surface_offenders == 1 else "faces have"} '
             'five or more vertices')
     raise MshInterchangeError(
-        'a Gmsh mesh holds tetrahedra, hexahedra, prisms and pyramids only; '
-        + ', and '.join(parts)
-        + '. Export this case as OpenFOAM or VTU, which keep polyhedra.')
+        MSH_READER + '; ' + ', and '.join(parts) + '. ' + MSH_ADVICE)
 
 
 def _group_label(name: str, used: set) -> str:
@@ -196,8 +196,8 @@ def write_msh_interchange(interior, patches, path) -> InterchangeReport:
             boundary_faces += 1
     if unmatched:
         raise MshInterchangeError(
-            f'{unmatched} boundary face(s) could not be matched to an interior '
-            'point; the exported patches would be incomplete')
+            f'{count_text(unmatched, "boundary face")} could not be matched '
+            'to an interior point; the exported patches would be incomplete')
 
     lines = ['$MeshFormat', '2.2 0 8', '$EndMeshFormat',
              '$PhysicalNames', str(len(labels))]

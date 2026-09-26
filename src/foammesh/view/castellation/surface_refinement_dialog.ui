@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Surface Refinement</string>
+   <string>Surface refinement</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
@@ -32,7 +32,7 @@
          <item row="0" column="0">
           <widget class="QLabel" name="label">
            <property name="text">
-            <string>Group Name</string>
+            <string>Group name</string>
            </property>
           </widget>
          </item>
@@ -45,13 +45,13 @@
       <item>
        <widget class="QGroupBox" name="groupBox">
         <property name="title">
-         <string>Surface Refinement</string>
+         <string>Surface refinement</string>
         </property>
         <layout class="QFormLayout" name="formLayout_2">
          <item row="0" column="0">
           <widget class="QLabel" name="label_2">
            <property name="text">
-            <string>Minimum Level</string>
+            <string>Minimum level</string>
            </property>
           </widget>
          </item>
@@ -61,7 +61,7 @@
          <item row="2" column="0">
           <widget class="QLabel" name="label_5">
            <property name="text">
-            <string>Maximum Level</string>
+            <string>Maximum level</string>
            </property>
           </widget>
          </item>
@@ -97,7 +97,7 @@
          <item row="1" column="0">
           <widget class="QLabel" name="label_3">
            <property name="text">
-            <string>Feature Edge Refinement Level</string>
+            <string>Feature edge refinement level</string>
            </property>
           </widget>
          </item>
@@ -114,7 +114,7 @@
       <item>
        <widget class="QGroupBox" name="curvatureRefinement">
         <property name="title">
-         <string>Curvature Refinement</string>
+         <string>Curvature refinement</string>
         </property>
         <property name="checkable">
          <bool>true</bool>
@@ -126,7 +126,7 @@
          <item>
           <widget class="QLabel" name="label_6">
            <property name="text">
-            <string>Number(N) of Cells per Radius(R) of Curvature</string>
+            <string>Number(N) of cells per radius(R) of curvature</string>
            </property>
           </widget>
          </item>
@@ -154,7 +154,7 @@
          <item>
           <widget class="QLabel" name="label_7">
            <property name="text">
-            <string>Maximum Cell Level</string>
+            <string>Maximum cell level</string>
            </property>
           </widget>
          </item>
@@ -200,7 +200,7 @@
                <item row="1" column="0">
                 <widget class="QLabel" name="label_9">
                  <property name="text">
-                  <string>Minimum Radius of Curvature</string>
+                  <string>Minimum radius of curvature</string>
                  </property>
                 </widget>
                </item>

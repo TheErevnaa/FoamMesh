@@ -83,13 +83,13 @@ class ThicknessForm(QObject):
         return self._thicknessModelRadios.value()
 
     def save(self, db):
-        db.setValue('thicknessModel', self._thicknessModelRadios.value(), self.tr('Thickness Model Specification'))
+        db.setValue('thicknessModel', self._thicknessModelRadios.value(), self.tr('Thickness model specification'))
         db.setValue('relativeSizes', self._ui.sizeSpecificationRelative.isChecked())
-        db.setValue('firstLayerThickness', self._ui.firstLayerThickness.text(), self.tr('First Layer Thickness'))
-        db.setValue('finalLayerThickness', self._ui.finalLayerThickness.text(), self.tr('Final Layer Thickness'))
-        db.setValue('thickness', self._ui.totalThickness.text(), self.tr('Total Thickness'))
-        db.setValue('expansionRatio', self._ui.expansionRatio.text(), self.tr('Expansion Ratio'))
-        db.setValue('minThickness', self._ui.minTotalThickness.text(), self.tr('Min. Total Thickness'))
+        db.setValue('firstLayerThickness', self._ui.firstLayerThickness.text(), self.tr('First layer thickness'))
+        db.setValue('finalLayerThickness', self._ui.finalLayerThickness.text(), self.tr('Final layer thickness'))
+        db.setValue('thickness', self._ui.totalThickness.text(), self.tr('Total thickness'))
+        db.setValue('expansionRatio', self._ui.expansionRatio.text(), self.tr('Expansion ratio'))
+        db.setValue('minThickness', self._ui.minTotalThickness.text(), self.tr('Min. total thickness'))
 
     def _connectSignalsSlots(self):
         self._thicknessModelRadios.valueChanged.connect(self._thicknessModelChanged)

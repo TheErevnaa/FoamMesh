@@ -200,3 +200,130 @@ def allocate_resources(policy: ResourcePolicy, request: ResourceRequest,
     return ResourceAllocation(
         ranks, threads, request.backend_id, request.profile_id, memory,
         warnings=tuple(warnings))
+
+
+def machine_cpu_limit(facts: 'ResourceFacts | None' = None) -> int:
+    """How many CPU slots this machine offers meshing.
+
+    Kept here so that the answer to "what does automatic mean" is a policy
+    function with a name, rather than a call to ``os.cpu_count`` copied into
+    whichever surface needed it next.
+    """
+    return int((facts or ResourceFacts.local()).effective_cpu_limit)
+
+
+def requested_cpu_count(policy, *, requested: int = 0,
+                        configured: int = 0) -> int:
+    """What this case asks meshing to run on, before the machine is asked.
+
+    Plan 33 SETUP-03. The precedence lives here, in one function, because it
+    used to live in three: the launcher read the parallel environment alone,
+    the plan preview read the environment and then the ceiling, and the page
+    showed the ceiling and called it the count. MEASURED: a case whose page
+    said three cores and whose parallel environment had never been opened
+    meshed on one, because an unopened environment answers 1 and 1 outranked
+    the ceiling.
+
+    An environment of 1 is the value a case that nobody configured carries,
+    so it is not read as a request. ``0`` is returned when nothing asked at
+    all, which is the caller's cue to apply its own idea of automatic.
+    """
+    mode, ceiling = _policy_reading(policy)
+    if mode == 'serial':
+        return 1
+    if requested and int(requested) > 0:
+        return int(requested)
+    if configured and int(configured) > 1:
+        return int(configured)
+    if ceiling:
+        return int(ceiling)
+    return 0
+
+
+def effective_cpu_count(policy, *, requested: int = 0, configured: int = 0,
+                        unasked: int = 0, facts=None) -> int:
+    """The count a run will really use: what was asked for, clamped.
+
+    ``unasked`` is what to do when nothing asked for anything: threads on one
+    machine cost nothing, so Gmsh leaves it at 0 and takes the machine; ranks
+    change a snappy mesh, so the launcher passes 1 and stays serial until
+    someone says otherwise.
+    """
+    mode, ceiling = _policy_reading(policy)
+    if mode == 'serial':
+        return 1
+    limit = machine_cpu_limit(facts)
+    if ceiling:
+        limit = min(limit, int(ceiling))
+    count = requested_cpu_count(policy, requested=requested,
+                                configured=configured)
+    if count <= 0:
+        count = int(unasked) if unasked else limit
+    return max(1, min(int(count), limit))
+
+
+def _policy_reading(policy) -> tuple[str, int | None]:
+    """The two things the precedence needs, from a policy or a plain mapping.
+
+    The facade carries the policy as a mapping and the engines carry it as a
+    ``ResourcePolicy``; asking both the same question here keeps the callers
+    from each doing their own conversion.
+    """
+    if isinstance(policy, ResourcePolicy):
+        return policy.mode.value, policy.max_cpu_cores
+    values = policy or {}
+    mode = str(values.get('mode') or 'auto').split('.')[-1].lower()
+    ceiling = values.get('max_cpu_cores')
+    try:
+        ceiling = int(ceiling or 0)
+    except (TypeError, ValueError):
+        ceiling = 0
+    return mode, (ceiling or None)
+
+
+def execution_record(policy, *, effective: int, unit: str,
+                     facts=None) -> dict:
+    """The CPU cap a run was given and the count it really used, for a file.
+
+    DP-678. ``max_cpu_cores`` is a ceiling, and the rank or thread count a run
+    uses is derived from it, the mode and the machine. None of the three
+    reached any file, so a written case could not say what it was capped at:
+    a ``numberOfSubdomains 12`` read the same whether the cap was 12 or none.
+    ``maxCpuCores`` is ``None`` when no cap was set; ``unit`` is ``ranks``
+    for OpenFOAM MPI and ``threads`` for Gmsh.
+    """
+    mode, ceiling = _policy_reading(policy)
+    return {
+        'mode': mode,
+        'maxCpuCores': int(ceiling) if ceiling else None,
+        'machineCpus': machine_cpu_limit(facts),
+        'unit': str(unit),
+        'effective': max(1, int(effective or 1)),
+    }
+
+
+#: Where the snappy stage route records each stage's :func:`execution_record`,
+#: beside ``stage-runs.json``. The whole-pipeline route carries the same record
+#: in its run's ``job.json``.
+STAGE_EXECUTION_FILE = ('foammesh', 'dictionaries', 'stage-execution.json')
+
+
+def record_stage_execution(case_path, stage: str, record: dict):
+    """Keep ``record`` as the execution of ``stage``; returns the file path."""
+    from pathlib import Path
+
+    target = Path(case_path).joinpath(*STAGE_EXECUTION_FILE)
+    document = {'schema_version': 1, 'stages': {}}
+    try:
+        loaded = json.loads(target.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict) and isinstance(loaded.get('stages'), dict):
+            document = loaded
+    except (OSError, ValueError):
+        pass
+    document['stages'][str(stage)] = dict(record)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix('.tmp')
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n',
+                         encoding='utf-8')
+    os.replace(temporary, target)
+    return target

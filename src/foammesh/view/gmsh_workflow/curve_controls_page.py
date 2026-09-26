@@ -1,31 +1,32 @@
 """Gmsh workflow page: gmsh.curve_controls."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel
-
-from foammesh.view.workflow_controls.child_controls import ChildControlPanel
-
 from .base import GmshTaskPage
 
 
 class GmshCurveControlsPage(GmshTaskPage):
-    """Structured or locally sized curves, scoped to a prepared face group."""
+    """The curve task, whose controls are edited on the sizing step.
+
+    Plan 33 CURVE-06. The task is still a task: the runner reads
+    `gmsh/curveControls`, the engine declares it, and the one press on
+    `Size fields` settles it after the size-field task. What it no longer
+    has is a row and a page of its own, because the question it answers --
+    where is the mesh finer than the global size -- is the question the
+    sizing step asks, and the table was empty on almost every case.
+
+    The class stays because every engine task has a page (`GMSH_TASK_PAGES`
+    is keyed by task id and gate 1 asserts the two sets are equal), and
+    because the outline still walks the task as a substep. The page draws
+    nothing, the way `gmsh.describe_geometry` does: what it would have
+    drawn is drawn where the reader is.
+    """
 
     task_id_default = 'gmsh.curve_controls'
 
+    #: What the sizing step shows of a row. Left here rather than moved so
+    #: that the columns are named beside the task that owns the collection.
     COLUMNS = ('name', 'enabled', 'scope_token', 'mode', 'segments', 'law',
                'coefficient', 'priority')
 
     def build_sections(self, layout) -> None:
-        note = QLabel(self.tr(
-            'A control applies to the boundary curves of the selected face '
-            'group. Transfinite mode fixes the node count along each curve; '
-            'size mode sets a local element size instead.'), self)
-        note.setWordWrap(True)
-        layout.addWidget(note)
-
-        self.panel = ChildControlPanel(
-            self._client, 'gmsh.curve_controls.controls',
-            self.tr('Curve controls'), columns=self.COLUMNS, parent=self)
-        self.panel.childrenChanged.connect(self.refresh)
-        layout.addWidget(self.panel)
+        return None

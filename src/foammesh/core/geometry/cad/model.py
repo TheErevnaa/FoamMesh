@@ -22,6 +22,24 @@ class CadFace:
     # patch name to assign to triangles originating from this face (defaults to name/id)
     patch: str = ''
     color: str = ''          # '#rrggbb' from the CAD file, if present (XDE)
+    # DP-92. What the OCCT face answers about itself. The boundary-layer page
+    # authors a layer selection, and whether a selection meshes turns on two
+    # things nothing downstream of here used to carry: whether a patch left
+    # uncovered is flat, because the rebuild closes that opening with a plane
+    # (DP-90), and whether two patches that share an edge grow their layers in
+    # opposite directions, because a shared edge cannot be extruded twice
+    # (DP-91). `None` means nobody measured -- the STL route does not.
+    planar: bool | None = None
+    area: float | None = None
+    #: Ids of the faces this one shares an edge with, anywhere in the model.
+    adjacent_ids: tuple[str, ...] = ()
+    #: The id of this face's twin in another solid, where the file carries an
+    #: interface as two coincident faces. Healing merges the pair and keeps
+    #: the one the walk saw first, so a selection has to name that one.
+    interface_id: str = ''
+    #: Position in the importer's flat face walk, which is the order the
+    #: mesher reads the file in and so which twin survives the merge.
+    face_order: int = -1
 
     def __post_init__(self):
         if not self.patch:

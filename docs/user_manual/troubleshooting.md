@@ -12,31 +12,31 @@ Hover the menu item — the tooltip/status tip always states the reason:
 no case, no complete `constant/polyMesh`, a running operation, or a missing
 utility. FoamMesh never shows a dead action without an explanation.
 
-## Mesh Check says "stale"
+## Mesh check says "stale"
 
 The mesh changed after the report was produced (transform, repair, import,
-format conversion, restore). Run Mesh Check again; the report is keyed to the
+format conversion, restore). Run Mesh check again; the report is keyed to the
 mesh fingerprint, so staleness is detected even across sessions.
 
 ## An operation failed — where is my mesh?
 
 Mesh-changing operations snapshot `constant/polyMesh` first and restore it
-automatically on failure or cancel. Check **Edit → Transaction History** for
+automatically on failure or cancel. Check **Edit → Transaction history** for
 the event and its recovery status, and `foammesh/logs/` for the raw log.
 A successful-but-unwanted result can be reverted with
-**Mesh → Restore Previous Mesh...**.
+**Mesh → Restore previous mesh...**.
 
 ## The case will not open in the authored workflow
 
 Sidecar provenance and the on-disk mesh no longer agree (for example the mesh
 was replaced outside FoamMesh). The case opens safely in external-mesh mode
-and states why; **Start Meshing Workflow** re-enters authored navigation.
+and states why; **Start meshing workflow** re-enters authored navigation.
 
 ## Export destination errors
 
 Exports refuse to overwrite existing files/directories and refuse a
 destination inside the source case. Choose a fresh path; the completion
-dialog's **Open Folder** shows exactly what was written.
+dialog's **Open folder** shows exactly what was written.
 
 ## GUI does not start
 

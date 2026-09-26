@@ -1,6 +1,6 @@
 # Meshing with Gmsh
 
-Gmsh is FoamMesh's second meshing method, beside Snappy Hex Mesh. It meshes
+Gmsh is FoamMesh's second meshing method, beside snappyHexMesh. It meshes
 your geometry directly rather than carving a background grid, which suits
 internal flow — pipes, manifolds, ducts, anything where the fluid volume is
 already a closed solid or a closed surface.
@@ -9,7 +9,7 @@ It takes CAD (STEP, IGES, BREP) and tessellated surfaces (STL, OBJ) alike; the
 two arrive by different routes and behave differently, which the
 [Import](#import-stl-and-step) section sets out.
 
-Choose it on the **Meshing Method** step. The workflow that appears is Gmsh's
+Choose it on the **Mesh setup** step. The workflow that appears is Gmsh's
 own; Snappy's settings are kept untouched in case you switch back.
 
 ## Before you start
@@ -22,25 +22,26 @@ beyond Gmsh itself:
 wsl -d OpenFOAM13Runtime -u root -- pip3 install gmsh
 ```
 
-The Meshing Method step probes the runtime and reports what it found — the
+The Mesh setup step probes the runtime and reports what it found — the
 Gmsh version and the distribution — or why it could not use it. The reasons are
 specific: a missing distribution, a missing package, or a version below the
 qualified minimum are each reported differently, because the fix differs.
 
-## Prepare the geometry first
+## Preparation is a shared row
 
-Gmsh imports the prepared geometry, so the **Prepare Geometry** step must have
-run — for CAD and for STL alike. Planning without it is refused rather than
-quietly producing an empty case. Snappy prepares itself with defaults; Gmsh
-waits for you to say so. That asymmetry is the single most common reason a Gmsh
-run will not start.
+Gmsh imports the prepared geometry, and preparing it is **3. Preparation**,
+the third shared row — for CAD and for STL alike. Every case walks that row
+before any Gmsh row opens, and the press on it prepares the geometry and
+grades it, so planning can no longer happen without it. Snappy takes the
+healing defaults; on the Gmsh route you say which healing you want, in the
+Advanced section of that row.
 
 **Your CAD must declare its unit.** Gmsh honours the unit in the STEP file. A
 part authored in millimetres but declared in metres imports a thousand times
 too large, and every size you then set is meaningless. FoamMesh converts the
 declared unit to metres on import and records the bounding box it actually
-read; check it on the Describe Geometry page if a mesh comes out absurdly
-coarse or fine.
+read; check it in the Advanced section of **3. Preparation** if a mesh comes
+out absurdly coarse or fine.
 
 An STL carries no unit at all, so the unit you declare in FoamMesh is the only
 one there is.
@@ -100,7 +101,40 @@ grouping. None of those three has been tested end to end here.
 
 ## The workflow
 
-### Describe Geometry
+The outline lists twelve rows. Rows 1 to 3 — **Geometry**, **Mesh setup** and
+**Preparation** — are shared with Snappy, and the questions Gmsh asks about
+how your CAD is read are in the Advanced section of **3. Preparation**. Rows 4
+to 12 are the engine rows, and are the sections below. The forward button at
+the bottom of the window carries the label of the row you are standing on:
+
+| Row | Forward button says |
+| --- | --- |
+| 4. Global sizing | Proceed |
+| 5. Size fields | Proceed |
+| 6. Curve controls | Proceed |
+| 7. Volume controls | Proceed |
+| 8. Boundary layers | Proceed |
+| 9. Periodic pairs | Proceed |
+| 10. Generate mesh | Generate & Proceed |
+| 11. Quality | Check & Proceed |
+| 12. Export | Export mesh |
+
+**Generate & Proceed** runs Gmsh, measures native fidelity and publishes the
+mesh — three tasks, one press. **Check & Proceed** runs `checkMesh`, geometry
+fidelity, resolution and the summary. When one of those sub-steps fails, the
+row stops there and the status line names the sub-step that failed.
+
+**Size Fields**, **Curve Controls**, **Volume Controls**, **Boundary Layers**
+and **Periodic Pairs** are optional. Proceed on one you left empty records a
+skip and says so, rather than running nothing and reporting success.
+
+Running every remaining stage in one press is **Run to end**, on the Gmsh
+heading row, and only there.
+
+### Preparation: how your CAD is read
+
+These settings are in the Advanced section of **3. Preparation**, the third
+shared row, rather than on a row of their own.
 
 Import healing. Both healing options are **off by default**, and that is
 deliberate:
@@ -213,12 +247,16 @@ Two further limits:
 - **Single volume only.** On a multi-volume assembly the core rebuild cannot
   close either side of a shared interface, so layers are refused outright with
   that as the reason. Mesh it without layers, or one volume per job.
-- **A name that matches nothing is reported.** Patch names that match no
-  imported surface produce a warning naming them; if *none* of them match, no
-  layer is grown at all and the run says so rather than quietly falling back to
-  growing them everywhere.
+- **A name that matches nothing is refused.** Patch names that match no
+  imported surface produce a warning naming them, and the layer still grows on
+  the ones that did match. If *none* of them match there is nothing left to
+  grow on, and the run is refused rather than published as a mesh with no
+  near-wall resolution anywhere. The message names both the patches that were
+  asked for and the surfaces this run imported, which is where the mismatch
+  usually shows: a tessellated file carrying no patch names of its own arrives
+  as `face_1`, `face_2`, … , and no name taken from the model will match those.
 
-If a rebuild is refused and you cannot restructure the geometry, Snappy Hex Mesh
+If a rebuild is refused and you cannot restructure the geometry, snappyHexMesh
 grows layers on any selection of patches without this constraint.
 
 ### Periodic Pairs
@@ -230,11 +268,11 @@ The transform maps the **master** surface onto the **slave**. Pointing it the
 wrong way is the usual cause of *"no corresponding point"* from Gmsh; the error
 message says so.
 
-### Compute, Publish and QA
+### Generate mesh, Publish and QA
 
-**Compute** runs Gmsh in the qualified runtime as a separate process — Gmsh
-aborts on some malformed geometry, and an abort must not take the application
-with it. Progress streams while it runs.
+**Generate mesh** runs Gmsh in the qualified runtime as a separate
+process — Gmsh aborts on some malformed geometry, and an abort must not take
+the application with it. Progress streams while it runs.
 
 Every control is recorded as requested-against-achieved. Options are read back
 from Gmsh after being set, so a value the mesher declined shows as a mismatch
@@ -249,7 +287,7 @@ recorded on the run.
 boundary categories on your prepared geometry, so a Gmsh mesh and a Snappy mesh
 of the same part type their patches identically.
 
-**Mesh QA** runs OpenFOAM 13 `checkMesh` — the same OpenFOAM that produced the
+**Quality** runs OpenFOAM 13 `checkMesh` — the same OpenFOAM that produced the
 mesh judging it.
 
 ## Exporting
@@ -267,10 +305,10 @@ is refused with the reason rather than quietly downgraded. See
 
 ## When to use which method
 
-| | Gmsh | Snappy Hex Mesh |
+| | Gmsh | snappyHexMesh |
 |---|---|---|
 | geometry | closed CAD solids or closed STL/OBJ | CAD or dirty surface data |
-| input preparation | explicit Prepare step, always | automatic |
+| input preparation | the healing is yours to choose on **3. Preparation** | the defaults are taken for you |
 | cells | tetrahedra, prisms | hex-dominant |
 | refinement | composable size fields | surface and volume levels |
 | boundary layers | per patch, if the layer surrounds the rest and those are flat | per patch, unconditionally |
@@ -308,6 +346,12 @@ closed flat. Grow the layer on it too.
 rebuild cannot close a shared interface. Mesh without layers, or split the
 geometry into one job per volume.
 
+**"… matched no imported surface"** — none of the patches picked for boundary
+layers exists in this geometry, so there was nothing to grow a layer on. The
+message lists the surfaces the run did import; pick from those on the Boundary
+Layers page, or turn layers off. A tessellated import with no patch names of
+its own arrives as `face_1`, `face_2`, … , which is the usual cause.
+
 **"CAD and tessellated geometry cannot be mixed in one job"** — a job is all
 STEP/IGES/BREP or all STL/OBJ. Convert the odd one out.
 
@@ -315,9 +359,9 @@ STEP/IGES/BREP or all STL/OBJ. Convert the odd one out.
 classify into patches. Check the classification angle, and check the file is a
 surface rather than an empty or malformed one.
 
-**A mesh far coarser or finer than expected** — check the bounding box on the
-Describe Geometry page. It is almost always a CAD file whose declared unit does
-not match its numbers.
+**A mesh far coarser or finer than expected** — check the bounding box
+reported in the Advanced section of **3. Preparation**. It is almost always a
+CAD file whose declared unit does not match its numbers.
 
 **"no corresponding point" on a periodic pair** — the transform is mapping
 slave onto master. Reverse it.

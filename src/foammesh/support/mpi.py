@@ -4,7 +4,6 @@
 import platform
 import re
 from enum import IntEnum, auto
-from pathlib import Path
 
 import asyncio
 from foammesh.support.process import runExternalCommand
@@ -22,17 +21,14 @@ class MPIStatus(IntEnum):
     LOW_VERSION = auto()
 
 
-HOST_FILE_NAME = 'hostfile'
 if platform.system() == 'Windows':
     MPICMD = 'mpiexec'
-    HOST_FILE_OPTION = '-machinefile'
     VERSION_CHECK_OPTION = '-help'
     MAJOR_VERSION = 10
     MINOR_VERSION = 1
     MPI_PREFIX = None
 else:
     MPICMD = 'mpirun'
-    HOST_FILE_OPTION = '-hostfile'
     VERSION_CHECK_OPTION = '--version'
     MAJOR_VERSION = 4
     MINOR_VERSION = 1
@@ -72,45 +68,3 @@ class ParallelEnvironment:
 
     def isParallelOn(self):
         return self._np > 1
-
-    def setNP(self, np: int):
-        self._np = np
-
-    def setType(self, type_: ParallelType):
-        self._type = type_
-
-    def setHosts(self, hosts):
-        self._hosts = hosts
-
-    def makeCommand(self, *command, cwd: Path, options):
-        # windows: mpiexec
-        # others: mpirun
-        cmdline = [MPICMD]
-
-        if self._type == ParallelType.CLUSTER:
-            # windows: -env <name_1> <value_1> ... -env <name_n> <value_n>
-            # others: -x <name_1> ... -x <name_n>
-            cmdline.extend(options)
-
-            if self._hosts:
-                path = cwd / HOST_FILE_NAME
-                with path.open(mode='w') as f:
-                    f.write(self._hosts)
-
-                # windows: -machinefile $cwd/hostfile
-                # others: -hostfile $cwd/hostfile
-                cmdline.append(HOST_FILE_OPTION)
-                cmdline.append(str(path))
-
-        # -np <N>
-        cmdline.append('-np')
-        cmdline.append(str(self._np))
-
-        # <program command to run>
-        cmdline.extend(command)
-
-        if self._np > 1:
-            # -parallel
-            cmdline.append('-parallel')
-
-        return cmdline

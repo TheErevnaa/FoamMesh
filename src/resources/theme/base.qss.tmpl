@@ -34,9 +34,14 @@ QPushButton, QToolButton {
     border-radius: 6px;
     padding: 5px 14px;
     color: {{foreground.primary}};
+    /* DP-189. 16 + 2 border + 10 padding = 28, the one control height. */
+    min-height: 16px;
 }
 QToolButton {
     padding: 4px 6px;
+    /* The windows11 style adds 3px of its own to a tool button, so
+     * 15 + 3 + 2 border + 8 padding = 28. */
+    min-height: 15px;
 }
 QPushButton:hover, QToolButton:hover {
     background: {{background.elevated}};
@@ -54,13 +59,16 @@ QPushButton:disabled, QToolButton:disabled {
     background: {{disabled.background}};
     border-color: {{border.default}};
 }
+/* DP-193. The accent's two jobs want opposite lightnesses: the border is
+   the bright line colour so the button's edge stands off the page, and
+   the fill is dark enough to carry white words. */
 QPushButton:default {
-    background: {{accent.default}};
+    background: {{accent.fill}};
     color: {{accent.text}};
     border: 1px solid {{accent.default}};
 }
 QPushButton:default:hover {
-    background: {{accent.hover}};
+    background: {{accent.fill.hover}};
     border-color: {{accent.hover}};
 }
 /* R4. A disabled default button read as enabled: `:default` and `:disabled`
@@ -92,14 +100,30 @@ QComboBox::drop-down {
     border: none;
     width: 18px;
 }
-QComboBox::down-arrow { width: 10px; height: 10px; }
+/* DP-203. The chevron has to be named. Sizing `::drop-down` above already
+ * moved this box onto the style-sheet paint path, and on that path an arrow
+ * with no `image` is drawn as nothing at all -- so every combo box in the
+ * application was a text field with a dead 18px margin, and the one thing
+ * that says "there are other answers than this one" was missing from all of
+ * them. `icon.ink` picks the set the theme can be read in. */
+QComboBox::down-arrow {
+    image: url(:/{{icon.ink}}/chevron-down.svg);
+    width: 12px;
+    height: 12px;
+}
+/* A closed list has no other answer to offer, so it offers no chevron. */
+QComboBox::down-arrow:disabled { image: none; }
 
 /* Styling QAbstractSpinBox at all switches Qt to the style-sheet box model,
  * and the step buttons then come out at a default size that has room for
  * neither the arrow nor a mouse: they rendered as two dots in a 12px column
  * on every spin box in the application. Sizing the sub-controls explicitly
- * restores both. No `image` is set, so the arrow stays the base style's own
- * and follows the palette into dark mode. */
+ * restores the room. DP-203: it does not restore the arrow. Naming any
+ * property of a sub-control is what hands that whole complex control to the
+ * style-sheet painter, and the style-sheet painter draws exactly the `image`
+ * it is given -- so for as long as this block set a width and no picture,
+ * every number box in both pipelines showed two empty cells where its steps
+ * should be. */
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
     subcontrol-origin: border;
     width: 20px;
@@ -129,6 +153,15 @@ QAbstractSpinBox::up-button:disabled, QAbstractSpinBox::down-button:disabled {
 QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow {
     width: 9px;
     height: 9px;
+}
+QAbstractSpinBox::up-arrow { image: url(:/{{icon.ink}}/caret-up.svg); }
+QAbstractSpinBox::down-arrow { image: url(:/{{icon.ink}}/caret-down.svg); }
+/* A box that cannot be stepped shows no step. The cell stays, because the
+   row beside it has one and a box that changed width when it was disabled
+   would move every number on the page. */
+QAbstractSpinBox::up-arrow:disabled, QAbstractSpinBox::down-arrow:disabled,
+QAbstractSpinBox::up-arrow:off, QAbstractSpinBox::down-arrow:off {
+    image: none;
 }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
 QPlainTextEdit:disabled, QTextEdit:disabled, QAbstractSpinBox:disabled {
@@ -168,7 +201,9 @@ QHeaderView::section {
     color: {{foreground.primary}};
     border: none;
     border-bottom: 1px solid {{border.default}};
-    padding: 5px 8px;
+    /* 23 + 1 border + 4 padding = 28. */
+    padding: 2px 8px;
+    min-height: 23px;
 }
 
 /* -- tabs ---------------------------------------------------------------- */
@@ -185,6 +220,8 @@ QTabBar::tab {
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     padding: 6px 14px;
+    /* 15 + 1 border + 12 padding = 28. */
+    min-height: 15px;
 }
 QTabBar::tab:hover { background: {{background.elevated}}; }
 QTabBar::tab:selected {
@@ -301,7 +338,14 @@ QGroupBox::indicator:disabled {
    for the chosen solver, carried a greyed dot and full-strength text, and read
    as merely unselected -- clicking it did nothing and said nothing. Buttons
    already restate this at line 52 for the same reason. */
-QCheckBox:disabled, QRadioButton:disabled {
+/* DP-148. The rule above names three widgets and R110 restated two of them,
+   so every disabled QLabel in the application kept full-strength text.
+   MEASURED on a collapsed Advanced group: the field label held `#e6e6e6` at
+   13.2:1 while the value beside it dropped to `#6f747b` at 3.14:1 -- half a
+   row dimmed and half did not, on the same line. A label carrying its own
+   colour (a status message, a heading) still sets it, by source order and by
+   specificity. */
+QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled {
     color: {{disabled.foreground}};
 }
 
@@ -313,6 +357,15 @@ QLabel[foammeshStatus="error"] { color: {{status.error}}; }
 QLabel[foammeshStatus="info"] { color: {{status.info}}; }
 QLabel[foammeshTone="muted"] { color: {{foreground.muted}}; }
 QLabel[foammeshTone="secondary"] { color: {{foreground.secondary}}; }
+/* DP-109. The sentence that says what a run produced -- "gmsh-dead217bb1 ·
+   accepted · 91,220 cells · polyMesh" -- is the most important thing the page
+   has to offer once a mesh finishes, and it was drawn in the panel's ordinary
+   body grey under the action button row, reading as a footnote to the
+   buttons. The weight makes it the page's answer. The colour is applied only
+   where the strip has no status role of its own, so a failed run keeps the
+   error shade the rule above gives it. */
+QLabel#runStatusText { font-weight: 600; }
+QLabel#runStatusText[foammeshStatus=""] { color: {{foreground.primary}}; }
 QLabel[foammeshAccentSurface="true"] { background: {{selection.background}}; margin: 2px; }
 ListTable[foammeshSurface="true"] { background: {{background.surface}}; }
 QLabel#regionEmptyMessage, QLabel#regionValidationMessage {
@@ -331,15 +384,15 @@ QPlainTextEdit[foammeshConsole="true"] {
     selection-background-color: {{selection.background}};
 }
 /* G2. A page whose four stacked buttons all look alike hides which one is
-   the action: `Apply Method` read exactly like `Re-probe Runtimes`. The one
+   the action: `Apply method` read exactly like `Re-probe runtimes`. The one
    button that advances the workflow is drawn in the accent. */
 QPushButton[foammeshRole="primary"] {
-    background: {{accent.default}};
+    background: {{accent.fill}};
     color: {{accent.text}};
     border: 1px solid {{accent.default}};
 }
 QPushButton[foammeshRole="primary"]:hover {
-    background: {{accent.hover}};
+    background: {{accent.fill.hover}};
     border-color: {{accent.hover}};
 }
 QPushButton[foammeshRole="primary"]:disabled {
@@ -372,13 +425,39 @@ QCheckBox#rendering::indicator {
 }
 QCheckBox#rendering::indicator:unchecked { image: url(:/images/toggle_off); padding: 0; }
 QCheckBox#rendering::indicator:checked { image: url(:/images/toggle_on); padding: 0; }
-FolderHeader { spacing: 5px; }
-FolderHeader::indicator {
-    width: 14px; height: 14px;
-    border: none; background: transparent; border-radius: 0;
+/* DP-230. The '?' beside a step's heading, and the panel it opens. The
+   button takes the QToolButton rule above for its height, its hover, its
+   checked fill and its focus ring -- it is a tool button and should look
+   like the others -- and asks only for even padding, because a one-character
+   label under the shared 4px/6px inset sits off-centre in its own box. */
+QToolButton#taskHelp { padding: 4px 7px; }
+QFrame#taskHelpPopup {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
 }
-FolderHeader::indicator:unchecked { image: url(:/icons/chevron-forward.svg); }
-FolderHeader::indicator:checked { image: url(:/icons/chevron-down.svg); }
+QFrame#taskHelpPopup QLabel {
+    background: transparent;
+    color: {{foreground.primary}};
+}
+/* The prerequisite line is the quieter of the two sentences: it says what
+   has to be true, not what the step is for. */
+QFrame#taskHelpPopup QLabel#taskHelpRequires { color: {{foreground.secondary}}; }
+
+FolderHeader { spacing: 5px; }
+/* DP-150. The chevron is now painted as the button own icon, through
+   `load_themed_icon`, so that it follows the palette instead of arriving as
+   raw `stroke:#000` straight out of the resource file.  On this canvas that
+   was black ink on `#1e1f22` and no chevron was visible at all.  The
+   indicator is retired rather than restyled: left with a box of its own it
+   drew an empty 14px square, and `QCheckBox::indicator:checked` above filled
+   that square with `accent.default`, so opening a section turned its chevron
+   slot into a blue chip. */
+FolderHeader::indicator {
+    width: 0; height: 0; margin: 0; border: none;
+    background: transparent; border-radius: 0; image: none;
+}
 
 /* Body text, like FoamFlow's outline. It used to be 12pt DemiBold -- declared
  * both here and in navigation code -- which made the one tree a user reads
@@ -390,9 +469,11 @@ QTreeView#workflowStepTree {
     outline: none;
 }
 QTreeView#workflowStepTree::item {
-    padding: 6px 6px;
+    padding: 4px 6px;
     border-radius: 6px;
     margin: 1px 4px;
+    /* 18 + 8 padding + 2 margin = 28. */
+    min-height: 18px;
 }
 QTreeView#workflowStepTree::item:selected {
     background: {{selection.background}};
@@ -404,17 +485,35 @@ QTreeView#workflowStepTree::item:hover:!selected {
 QTreeView#workflowStepTree::item:disabled {
     color: {{disabled.foreground}};
 }
-QWidget#sidebarShell, QGroupBox#groupBox_9 {
+/* The native Windows 11 style washes the indentation strip of the current
+   row with a subtle light fill.  That fill is square, full-height and sits
+   outside the rounded pill the ::item rule draws, so it reads as a second
+   grey chip parked beside the selected row.  With no renderable ::branch
+   rule the stylesheet defers PE_IndicatorBranch to the base style, which is
+   how the fill got in.  Giving the selected state a real background takes
+   the cell back -- but only for the cells that carry no expand mark, since
+   a background makes the stylesheet own the whole cell and the mark would
+   go with the wash.  `transparent` is not a renderable background and
+   changes nothing. */
+QTreeView#workflowStepTree::branch:selected:!has-children {
+    background: {{background.canvas}};
+}
+QGroupBox#groupBox_9 {
     background: {{background.surface}};
     border: none;
 }
-QLabel#engineBranchHeading, QLabel#meshingMethodTitle {
+/* One place decides how a page heading is set, so that every heading
+ * on every page is set the same way and no page has to pin a size of
+ * its own.  A label named as a page heading belongs in this list. */
+QLabel#emptyCaseTitle,
+QLabel#engineBranchHeading,
+QLabel#engineTaskTitle,
+QLabel#externalMeshTitle,
+QLabel#fieldGroupHeading,
+QLabel#meshingMethodTitle,
+QLabel#preparationTitle {
     font-size: 12pt;
     font-weight: 600;
-}
-QLabel#salomeTaskTitle {
-    font-size: 13pt;
-    font-weight: 700;
 }
 
 /* The parts/section overlay floats over the viewport, so it needs a surface

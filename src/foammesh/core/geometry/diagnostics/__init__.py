@@ -10,7 +10,8 @@ in-place repairs (clean/dedup, fill holes, consistent normals).
 
 from .checks import (
     Finding, Severity,
-    open_edges, non_manifold_edges, duplicate_points, is_watertight, check_all,
+    open_edges, surface_not_closed, non_manifold_edges, duplicate_points, dropped_facets,
+    is_watertight, check_all,
 )
 from .report import GeometryHealth, assess
 from .readiness import RULES_VERSION, ReadinessReport, ReadinessState, classify
@@ -18,7 +19,8 @@ from . import repair
 
 __all__ = [
     'Finding', 'Severity',
-    'open_edges', 'non_manifold_edges', 'duplicate_points', 'is_watertight',
+    'open_edges', 'surface_not_closed', 'non_manifold_edges', 'duplicate_points', 'dropped_facets',
+    'is_watertight',
     'check_all', 'GeometryHealth', 'assess', 'repair',
     'RULES_VERSION', 'ReadinessReport', 'ReadinessState', 'classify',
 ]

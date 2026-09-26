@@ -51,7 +51,7 @@ class SimpleSheetDialog(QDialog):
     async def _okClicked(self):
         if not self._future.done():
             if not self._ui.sheet.isDataComplete():
-                await AsyncMessageBox().information(self, self.tr('Input Error'),
+                await AsyncMessageBox().warning(self, self.tr('Input error'),
                                                     self.tr('Empty cells are not allowed within the data range.'))
                 return
 

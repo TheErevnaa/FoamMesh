@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+UNATTRIBUTED = 'an unnamed slice'
+
 OWNER_LOOP_MAX_MS = 20.0
 OWNER_LOOP_P95_MS = 8.0
 P95_MIN_SAMPLES = 20
@@ -67,18 +69,26 @@ class OwnerLoopMonitor:
         self._journal_queue_depth = 0
         self._budget_violations: list[dict] = []
 
-    def measure(self, name: str):
-        """Context manager timing one owner-loop slice."""
-        return _Measurement(self, name)
+    def measure(self, name: str, *, context: str | None = None):
+        """Context manager timing one owner-loop slice.
 
-    def record(self, name: str, duration_ms: float) -> None:
+        ``context`` names what was running. DP-409: without it a violation
+        says only how long the loop was held, which is the one thing that is
+        already obvious to whoever is watching the frozen window.
+        """
+        return _Measurement(self, name, context)
+
+    def record(self, name: str, duration_ms: float, *,
+               context: str | None = None) -> None:
         self._series.setdefault(name, _Series()).record(duration_ms)
         if name == 'owner_loop_slice' and duration_ms > self.budget_max_ms:
             violation = {'metric': name, 'duration_ms': round(duration_ms, 3),
-                         'budget_ms': self.budget_max_ms}
+                         'budget_ms': self.budget_max_ms,
+                         'context': context or UNATTRIBUTED}
             self._budget_violations.append(violation)
-            logger.warning('owner-loop slice exceeded budget: %.1f ms > %.1f ms',
-                           duration_ms, self.budget_max_ms)
+            logger.warning('owner-loop slice exceeded budget: %.1f ms > %.1f ms '
+                           'in %s', duration_ms, self.budget_max_ms,
+                           context or UNATTRIBUTED)
 
     def record_journal_queue_depth(self, depth: int) -> None:
         self._journal_queue_depth = depth
@@ -109,9 +119,11 @@ class OwnerLoopMonitor:
 
 
 class _Measurement:
-    def __init__(self, monitor: OwnerLoopMonitor, name: str):
+    def __init__(self, monitor: OwnerLoopMonitor, name: str,
+                 context: str | None = None):
         self._monitor = monitor
         self._name = name
+        self._context = context
         self._started = 0.0
 
     def __enter__(self):
@@ -120,5 +132,5 @@ class _Measurement:
 
     def __exit__(self, *_exc_info):
         duration = (self._monitor._clock() - self._started) * 1000.0
-        self._monitor.record(self._name, duration)
+        self._monitor.record(self._name, duration, context=self._context)
         return False

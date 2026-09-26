@@ -30,7 +30,7 @@ LEGACY_DB_MUTATORS = {
 }
 LEGACY_PROJECT_MUTATORS = {
     'save', 'saveAs', 'saveStateAsCase', 'saveStateCopy',
-    'markArtifactChanged', 'markGeometryChanged', 'setParallelEnvironment',
+    'markArtifactChanged', 'markGeometryChanged',
 }
 LEGACY_JOB_MUTATORS = {'start', 'cancel', 'cancel_all', 'submit'}
 

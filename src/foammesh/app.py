@@ -156,6 +156,15 @@ class App(QObject):
     def setupApplication(self, properties):
         appSettings.load(properties.name)
         self._settings = appSettings
+        self.applyOpenFoamRuntime()
+
+    def applyOpenFoamRuntime(self):
+        """Point the capability probes at the stored OpenFOAM 13 runtime.
+
+        Called at start-up, and again by Settings > Preferences when the
+        runtime changes (DP-759), so a new distribution or bashrc is probed
+        without a restart.
+        """
         from foammesh.core.openfoam_runtime import OpenFoamLaunchProfile
         try:
             runtime = self._settings.getOpenFoamRuntime()

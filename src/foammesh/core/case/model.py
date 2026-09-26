@@ -367,7 +367,7 @@ def fingerprint_poly_mesh(poly_mesh_path: Path) -> MeshFingerprint:
 #: See `docs/user_manual/legacy_case_migration.md`.
 LEGACY_SIDECAR_REASON = (
     'legacy sidecar: valid FoamMesh metadata with no workflow mode beside an '
-    'existing mesh; the case opens as External Mesh with no workflow state')
+    'existing mesh; the case opens as External mesh with no workflow state')
 
 
 def classify_case(path: str | Path) -> CaseClassification:
@@ -533,7 +533,7 @@ def record_generated_mesh(case_path: str | Path, *,
 
     :func:`resolve_workflow` reads the sidecar, and a sidecar carrying
     ``workflow=none`` falls through to `mesh exists but metadata has no
-    workflow mode` -- External Mesh.  ``workflow=authored`` was written in
+    workflow mode` -- External mesh.  ``workflow=authored`` was written in
     exactly one place, the explicit external-to-authored transition, so a case
     that had only ever meshed with Gmsh or snappyHexMesh had no record of it.
     The first re-resolution after that -- a save, a re-open -- read our own

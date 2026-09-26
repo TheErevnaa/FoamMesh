@@ -4,27 +4,29 @@
 import asyncio
 import logging
 import platform
+from functools import partial
 
 import qasync
 from filelock import Timeout
+from foammesh.core.quantities import aligned
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
-from PySide6.QtWidgets import (QDialog, QMainWindow, QFileDialog, QMessageBox,
-                               QInputDialog)
+from PySide6.QtWidgets import (QDialog, QLabel, QMainWindow, QFileDialog,
+                               QMessageBox, QInputDialog, QVBoxLayout,
+                               QTabWidget, QPlainTextEdit, QWidget)
 from PySide6.QtCore import Signal, QEvent, Qt, QTimer
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence
 
 from analytics import Analytics
 from app_properties import meshAppProperties
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.support.utils import getFit
-from foammesh.db.configurations_schema import Shape
+from foammesh.db.configurations_schema import Shape, Step
 from widgets.async_dialog import asyncExec
 from widgets.async_message_box import AsyncMessageBox
 from widgets.new_project_dialog import NewProjectDialog
-from widgets.parallel.parallel_environment_dialog import ParallelEnvironmentDialog
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.app import app
@@ -32,8 +34,9 @@ from foammesh.core.facade import FacadeError
 from foammesh.core.documentation import tutorial_url
 from foammesh.core.case import CaseConflictError, WorkflowMode
 from foammesh.core.shell import (
-    ACTION_OBJECT_NAMES, ActionId, ActionPolicy, AppSnapshot, ContentState,
-    job_state_from_manager, terminal_capability,
+    ACTION_OBJECT_NAMES, ActionId, ActionPolicy, AppSnapshot, Capability,
+    ContentState, job_state_from_manager, mesh_quality_capability,
+    terminal_capability,
 )
 from foammesh.core.mesh import (
     MeshInfoService, MeshRecoveryService, MeshRepairService,
@@ -41,14 +44,15 @@ from foammesh.core.mesh import (
 )
 from foammesh.core.quality import MeshCheckService
 from foammesh.core.quality import discover_cell_set_files
-from foammesh.core.quality import (QualityReport, apply_waivers,
+from foammesh.core.quality import (QualityReport, apply_layer_coverage,
+                                   apply_waivers,
                                    verdict_from_report)
 from foammesh.core.project import Event
 from foammesh.core.import_export import (
     ConverterFormat, ConverterImportService, extract_converter_warnings,
 )
-from foammesh.view.theming import ThemeMode
-from foammesh.view.display_control.display_control import DisplayControl
+from foammesh.view.display_control.display_control import (
+    DisplayControl, countedPartIds)
 from foammesh.view.display_control import view_modes
 from foammesh.view.widgets.job_progress import JobProgressWidget
 from foammesh.view.widgets.justification_dialog import JustificationDialog
@@ -56,6 +60,8 @@ from foammesh.view.widgets.mesh_import_dialog import MeshImportDialog
 from foammesh.view.menu.mesh_quality.mesh_quality_parameters_dialog import MeshQualityParametersDialog
 from foammesh.view.menu.help.about_dialog import AboutDialog
 from foammesh.view.menu.help.license_dialog import LicenseDialog
+from foammesh.view.menu.settings.preferences_dialog import PreferencesDialog
+from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.menu.mesh import MeshInfoDialog, QualityDashboardDialog, TransformDialog
 from foammesh.view.geometry.geometry_manager import GeometryManager
 from widgets.themed_icon import load_themed_icon
@@ -63,11 +69,14 @@ from .recent_files_menu import RecentFilesMenu
 from .naviagtion_view import NavigationView
 from .rendering_tool import RenderingTool
 from .console_view import Console
+from foammesh.core.mesh.presentation import count_text
 from .mesh_composition import cell_count_text, composition_text
 from .mesh_manager import MeshManager
 from .step_manager import StepManager
 from .main_window_ui import Ui_MainWindow
-from .three_region_shell import install_three_region_shell, reveal_output_band
+from .three_region_shell import (
+    install_three_region_shell, layout_worth_recording, reveal_output_band,
+)
 from .output_tabs import OutputTabRegistry
 from .capture_manager import CaptureManager
 from .captures_page import CapturesPage
@@ -77,7 +86,12 @@ from foammesh.rendering import feature_overlay
 from foammesh.core.quality.geometry_fidelity import report as fidelity_report
 from foammesh.core.viewport_state import (
     ViewStateError, delete_view, load_views, save_view)
+from foammesh.view.display_control.region_picker import (
+    RegionFilter, picker_entries)
 from foammesh.view.display_control.viewport_overlay import ViewportOverlay
+from foammesh.view.display_control.deviation_panel import (
+    DeviationPanel, deviationScalarBar)
+from foammesh.core.quality.geometry_fidelity import live_distance
 from .mesh_quality_tab import MeshQualityTab
 from foammesh.core.geometry.diagnostics.repair import (
     REPAIR_BANDS, TESSELLATED_ACTIONS, apply_action, write_surface,
@@ -94,6 +108,35 @@ logger = logging.getLogger(__name__)
 #: settles for "not checked". Reading a persisted report is a filesystem
 #: operation; anything slower than this is a fault, not a slow disk.
 QUALITY_READ_TIMEOUT = 5.0
+
+
+def with_layer_coverage(verdict: dict) -> dict:
+        """DP-664. The verdict, with any requested layers that were not grown.
+
+        checkMesh grades the cells that exist, so a layer stage that grew
+        nothing left the strip and Export reading `Every metric grades good`
+        while the layer record said `no prism layers were added`. A stale
+        verdict describes a different mesh and is left as it is.
+        """
+        if not verdict or verdict.get('stale'):
+            return verdict
+        try:
+            result = query(app.facadeClient, 'mesh.layer_coverage')
+        except (FacadeError, RuntimeError, OSError, ValueError, KeyError,
+                AttributeError):
+            logger.debug('no readable layer coverage', exc_info=True)
+            return verdict
+        payload = getattr(result, 'payload', result)
+        return apply_layer_coverage(
+            verdict, payload if isinstance(payload, dict) else {})
+
+
+def holdBatchLock(ui, locked: bool) -> None:
+    """DP-756. While a batch runs, Undo and Redo stay off whatever else
+    refreshes the menus, so neither the menu nor Ctrl+Z can reach them."""
+    if locked:
+        ui.actionUndo.setEnabled(False)
+        ui.actionRedo.setEnabled(False)
 
 
 class MainWindow(QMainWindow):
@@ -117,9 +160,7 @@ class MainWindow(QMainWindow):
         self._ui.regionSplitter.splitterMoved.connect(
             lambda *_args: setattr(
                 self, '_regionSplitterUserMoved', True))
-        QTimer.singleShot(
-            0, lambda: self._threeRegionShell.apply_sizes(
-                max(self.width(), 1280), self._savedRegionSizes))
+        QTimer.singleShot(0, self._applyRegionSizes)
         self.setMinimumWidth(self._threeRegionShell.minimum_window_width)
 
         self._applyThemedIcons()
@@ -139,6 +180,11 @@ class MainWindow(QMainWindow):
         self._recentFilesMenu.setRecents(app.settings.getRecentCases())
 
         self._navigationView = NavigationView(self._ui)
+        # DP-134. The outline learns how wide it needs to be only once it has
+        # rows -- the engine branch installs thirteen of them when a meshing
+        # method is chosen -- so the pane has to be able to follow it.
+        self._navigationView.paneWidthChanged.connect(
+            lambda _width: self._applyRegionSizes())
         self._displayControl = DisplayControl(self._ui)
         self._renderingTool = RenderingTool(self._ui)
         self._outputTabs = OutputTabRegistry(self._ui.regionCTabHost)
@@ -153,7 +199,7 @@ class MainWindow(QMainWindow):
             'console', self._consoleView, self.tr('Console'))
         self._meshQualityTab = MeshQualityTab()
         self._outputTabs.register_permanent(
-            'quality', self._meshQualityTab, self.tr('Mesh Quality'))
+            'quality', self._meshQualityTab, self.tr('Mesh quality'))
         self._verdictStrip = self._ui.meshVerdictStrip
         self._verdictStrip.activated.connect(self.showQualityReport)
         self._meshQualityTab.acceptRequested.connect(self._acceptMeshQuality)
@@ -190,10 +236,25 @@ class MainWindow(QMainWindow):
         self._policyActions = {}
         self._menuRefreshPending = False
         self._projectRefreshPending = False
+        # DP-363. Set when a pending refresh is a history move, which has
+        # to repaint the forms; cleared when it is flushed.
+        self._projectRefreshRepaintsForms = False
+        # DP-397. What the pending refresh is *for*. `_projectRefreshWide` is
+        # set by anything this window cannot read as a rename, and a wide
+        # refresh rebuilds the scene as it always did; the list holds the
+        # (id, name) pairs of the renames seen since the last flush.
+        self._projectRefreshWide = False
+        self._projectRefreshRenames = []
+        self._capabilityWarmPending = False
+        self._capabilityProbeFailure = None
+        self._capabilityWanted = set()
         self._jobStateUnsubscribe = app.jobManager.subscribe_state(
             self._scheduleMenuRefresh)
+        # DP-464. The menu is not the only thing a finished job frees.
+        self._stepLockUnsubscribe = app.jobManager.subscribe_state(
+            self._stepManager.refreshStepLock)
         self._capabilityStateUnsubscribe = app.capabilities.subscribe_state(
-            self._scheduleMenuRefresh)
+            self._capabilitiesReprobed)
         # C3. The designed window is 1065 px tall; on a 1080 px screen the
         # status bar -- the only progress surface a task-page run has, and the
         # only place its Cancel lives -- was drawn below the bottom edge.
@@ -204,11 +265,19 @@ class MainWindow(QMainWindow):
 
         #: Feature-line actors while the overlay is shown.
         self._featureActors = []
+        #: True while the fidelity colouring sits on the patches.
+        self._fidelityPainted = False
         self._captureManager = CaptureManager(
             self._ui.renderingView, self._displayControl)
         self._viewportOverlay = ViewportOverlay(self._ui.renderingView)
         self._viewportOverlay.move(12, 12)
         self._viewportOverlay.show()
+        # DP-713. The deviation colouring's histogram, figures and legend.
+        self._deviationPanel = DeviationPanel(self._ui.renderingView)
+        self._deviationPanel.toleranceChanged.connect(
+            self._deviationToleranceEdited)
+        self._deviationLegend = None
+        self._deviationToleranceMm = None
         self._displayControl.cutTool().addMirror(
             self._viewportOverlay.sectionPanel())
         self._connectViewportControls()
@@ -222,9 +291,11 @@ class MainWindow(QMainWindow):
 
         self.setWindowIcon(meshAppProperties.icon())
 
-        # OEM variants with analytics disabled don't need this entry.
+        # OEM variants with analytics disabled get no Privacy page in
+        # Preferences (DP-760: it is no longer a Help entry as well).
         self._privacyConfigured = Analytics().configured
-        self._ui.actionPrivacySettings.setVisible(self._privacyConfigured)
+
+        self._installStepHelpActions()
 
         self._setupShortcuts()
 
@@ -232,11 +303,17 @@ class MainWindow(QMainWindow):
 
         self._ui.regionValidationMessage.hide()
 
-        # Plan 30 WP-08 (F-09). What a run did is said here, in the bottom bar
-        # under the step page, instead of in a modal raised over the viewport
-        # that is drawing the mesh the sentence is about. Inserted rather than
-        # designed into the .ui so the bar's own layout stays where it is: it
-        # goes directly above the Unlock / Finish / Next row.
+        # Plan 30 WP-08 (F-09). What a run did is said in one line, without
+        # taking the window away, instead of in a modal raised over the
+        # viewport that is drawing the mesh the sentence is about.
+        #
+        # QA-04. That line used to sit in the page footer, directly above the
+        # Unlock / Finish / Next row, where it competed with the control that
+        # moves the job forward and pushed the page up every time a run ended.
+        # The footer is for walking the workflow. The sentence and its Cancel,
+        # its offer and its log button are kept exactly as they are and moved
+        # into a view of their own, reached from Help and from the quality
+        # page, so a run can be read about deliberately rather than read over.
         #: The allocation of the run currently on the strip, so cancelling it
         #: can name the workers it stopped rather than only the job count.
         self._lastRunAllocation = None
@@ -248,11 +325,36 @@ class MainWindow(QMainWindow):
         #: set when a run ends with no mesh of its own. Never drawn until the
         #: user takes the offer.
         self._offeredResult = None
-        bar = self._ui.regionValidationMessage.parentWidget().layout()
-        if bar is not None:
-            bar.insertWidget(
-                bar.indexOf(self._ui.regionValidationMessage) + 1,
-                self._runStatusStrip)
+        #: The run details view. Not modal, and never raised by the product:
+        #: it opens when the user asks for it, from Help > Run details or
+        #: from the Details control on the quality page.
+        self._runDetailsView = QDialog(self)
+        self._runDetailsView.setObjectName('runDetailsView')
+        self._runDetailsView.setWindowTitle(self.tr('Run details'))
+        self._runDetailsView.setModal(False)
+        # DP-753. What the case has recorded is read here too, on a History
+        # tab, instead of in a message box off the Edit menu.
+        runDetailsOuter = QVBoxLayout(self._runDetailsView)
+        self._runDetailsTabs = QTabWidget(self._runDetailsView)
+        self._runDetailsTabs.setObjectName('runDetailsTabs')
+        runDetailsOuter.addWidget(self._runDetailsTabs)
+        runDetailsPage = QWidget(self._runDetailsTabs)
+        self._runDetailsTabs.addTab(runDetailsPage, self.tr('Last run'))
+        self._runHistoryText = QPlainTextEdit(self._runDetailsTabs)
+        self._runHistoryText.setObjectName('runHistoryText')
+        self._runHistoryText.setReadOnly(True)
+        self._runDetailsTabs.addTab(self._runHistoryText, self.tr('History'))
+        runDetailsLayout = QVBoxLayout(runDetailsPage)
+        # The strip hides itself when there is nothing to say, so the view
+        # says that in words rather than opening on an empty rectangle.
+        self._runDetailsEmpty = QLabel(
+            self.tr('No run has been made in this case yet.'),
+            self._runDetailsView)
+        self._runDetailsEmpty.setObjectName('runDetailsEmpty')
+        self._runDetailsEmpty.setWordWrap(True)
+        runDetailsLayout.addWidget(self._runDetailsEmpty)
+        runDetailsLayout.addWidget(self._runStatusStrip)
+        runDetailsLayout.addStretch(1)
 
         # C3. `availableVirtualGeometry()` is the union of every attached
         # monitor, so a window opening on a 1080 px screen was clamped against
@@ -284,13 +386,14 @@ class MainWindow(QMainWindow):
         tool = self._renderingTool
         tool.sectionRequested.connect(self._quickSection)
         tool.captureRequested.connect(self.captureViewport)
-        tool.galleryRequested.connect(self.showCaptures)
-        tool.isolateRequested.connect(lambda: self._displayControl.isolate())
+        tool.galleryRequested.connect(self._showCaptureGallery)
+        tool.isolateRequested.connect(self._isolateSelection)
         tool.zoomSelectionRequested.connect(self._zoomToSelection)
-        tool.showAllRequested.connect(self._displayControl.showAll)
+        tool.fitSelectionOrAllRequested.connect(self._fitSelectionOrAll)
+        tool.showAllRequested.connect(self._showEveryPart)
         tool.poorCellsRequested.connect(self._highlightPoorCells)
         tool.failedCellsRequested.connect(self._showFailedCellsFromViewport)
-        tool.fidelityRequested.connect(self.showGeometryFidelity)
+        tool.fidelityRequested.connect(self.toggleGeometryFidelity)
         tool.featuresRequested.connect(self.toggleFeatureCapture)
         tool.viewModeRequested.connect(self.applyViewMode)
         tool.layerCoverageRequested.connect(self.showLayerCoverage)
@@ -309,8 +412,19 @@ class MainWindow(QMainWindow):
             self._setPartVisible)
         self._viewportOverlay.soloRequested.connect(
             lambda key: self._displayControl.isolate([key]))
-        self._viewportOverlay.showAllRequested.connect(
-            self._displayControl.showAll)
+        # DP-705. The overlay's Show all is the toolbar's, scoped to the mode.
+        self._viewportOverlay.showAllRequested.connect(self._showEveryPart)
+        self._viewportOverlay.regionFilterChanged.connect(
+            self._applyRegionFilter)
+        # DP-712. A row click selects the part; Fit and Isolate follow.
+        self._viewportOverlay.partSelectionRequested.connect(
+            lambda key, additive: self._displayControl.selectParts(
+                [key], additive))
+        self._displayControl.selectedActorsChanged.connect(
+            lambda *_args: self._viewportOverlay.setSelectedParts(
+                self._displayControl.selectedActorIds()))
+        self._displayControl.visibilityChanged.connect(
+            lambda *_args: self._syncRegionPicker())
 
         tool.explodeChanged.connect(self._setExplode)
         tool.orbitRequested.connect(self._recordOrbit)
@@ -331,23 +445,44 @@ class MainWindow(QMainWindow):
     # -- WP5.2 / WP7.5 / WP8.3 --------------------------------------------- #
 
     def _installViewportEffectActions(self):
-        """WP4.2/4.3 and WP6, as preferences that all default off.
+        """The Render quality presets, and WP6's reduce-detail preference.
 
-        The plan's own rule is that nothing costing frames is enabled until its
-        cost has been measured on a real case, and that number does not exist
-        yet. So these are offered, off, each saying what it trades -- rather
-        than switched on for everyone on the strength of a screenshot.
+        render0925 DP-726. Cavity shading and FXAA used to be two loose check
+        boxes, defaulting off because their cost had not been measured. It
+        has now (plans/evidence/viewport-audit-20260925/render-after), and
+        FXAA over the viewport's 8x multisampling turned out to draw a black
+        frame -- so they became one exclusive choice that cannot ask for
+        that, each option saying what it costs. Balanced is the default.
         """
+        from PySide6.QtGui import QActionGroup
+        from foammesh.rendering import render_style
+
         view = self._ui.renderingView
         self._effectActions = {}
+        menu = self._ui.menuView.addMenu(self.tr('Render &quality'))
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        self._renderQualityActions = {}
+        for name in render_style.PRESETS:
+            label, tip = render_style.LABELS[name]
+            action = menu.addAction(self.tr(label))
+            action.setCheckable(True)
+            action.setToolTip(self.tr(tip))
+            action.setStatusTip(self.tr(tip))
+            action.setData(name)
+            group.addAction(action)
+            self._renderQualityActions[name] = action
+        menu.setToolTipsVisible(True)
+        settings = getattr(app, '_settings', None)
+        saved = render_style.DEFAULT_PRESET
+        if settings is not None and hasattr(settings, 'getRenderQuality'):
+            saved = settings.getRenderQuality()
+        self._renderQualityActions[saved].setChecked(True)
+        view.setRenderQuality(saved)
+        group.triggered.connect(self._renderQualityChosen)
+
         entries = (
-            (self.tr('Cavity Shading (SSAO)'),
-             self.tr('Depth cues in internal passages. Costs frame time.'),
-             view.setAmbientOcclusion),
-            (self.tr('Smooth Thin Edges (FXAA)'),
-             self.tr('Cleans up outlines and wireframes. Costs frame time.'),
-             view.setFastAntiAliasing),
-            (self.tr('Reduce Detail While Moving'),
+            (self.tr('Re&duce detail while moving'),
              self.tr('Keeps large meshes responsive during a drag, and says '
                      'so on screen while it does.'),
              view.setInteractiveDecimation),
@@ -363,6 +498,15 @@ class MainWindow(QMainWindow):
                 self._applyViewportEffect(apply, item, checked))
             self._effectActions[label] = action
 
+    def _renderQualityChosen(self, action):
+        name = action.data()
+        self._applyViewportEffect(
+            lambda _checked: self._ui.renderingView.setRenderQuality(name),
+            action, True)
+        settings = getattr(app, '_settings', None)
+        if settings is not None and hasattr(settings, 'updateRenderQuality'):
+            settings.updateRenderQuality(name)
+
     def _applyViewportEffect(self, setter, action, checked):
         """Apply an effect, and untick it if this VTK build cannot do it.
 
@@ -374,7 +518,7 @@ class MainWindow(QMainWindow):
             action.setChecked(False)
             action.setEnabled(False)
             action.setToolTip(
-                self.tr('This VTK build does not provide it.'))
+                self.tr('This VTK build does not provide it'))
             self.statusBar().showMessage(
                 self.tr('{0} is not available in this VTK build.').format(
                     action.text()), 6000)
@@ -383,6 +527,57 @@ class MainWindow(QMainWindow):
         if reduced:
             self.statusBar().showMessage(
                 self.tr('Showing reduced detail while the view moves.'), 4000)
+
+    def _isolateSelection(self):
+        """DP-353. Isolate says why it did nothing, like its neighbour does.
+
+        `DisplayControl.isolate()` answers False when the selection is empty,
+        and this was wired as `lambda: self._displayControl.isolate()`, which
+        threw the answer away: the button was enabled, the press was accepted
+        and the window neither changed nor spoke. MEASURED by
+        `verify_plan31_v_cp09.py` V15.2 on a meshed tee -- `isolate` enabled,
+        `scene_changed: false`, `status_message: ""`.
+
+        `Zoom to selection`, two buttons along, has always answered the same
+        condition with a sentence. CP-09 item 2 asks that every enabled action
+        have an observable effect; saying "there is nothing selected" is one.
+        """
+        if not self._displayControl.isolate():
+            self.statusBar().showMessage(
+                self.tr('Select a part first, then show only it.'), 5000)
+
+    def _showEveryPart(self):
+        """DP-353. And the way back says what it did.
+
+        Pressing `Show all` when nothing is hidden is a legitimate press with
+        no picture to change, which is exactly the case that used to leave the
+        window silent. It now confirms the state it put the scene in, which is
+        also the answer to "did that press land?".
+        """
+        control = self._displayControl
+        mode = getattr(self, '_viewMode', '')
+        plan = (view_modes.plan(mode, self.viewScene())
+                if mode in view_modes.MODE_IDS else None)
+        if plan is None or not plan.is_available() or not plan.hidden:
+            hidden = control.hiddenActorCount()
+            control.showAll()
+            self.statusBar().showMessage(
+                self.tr('Showing every part again ({0} were hidden).').format(
+                    hidden) if hidden else
+                self.tr('Every part is already shown.'), 5000)
+            return
+        # DP-705 (viewport audit 0925 F12). In Boundary mode Show all also
+        # brought the geometry back, so the picture mixed two views. Within a
+        # mode it now means every part *of that mode*; the rest stay hidden.
+        hidden = sum(1 for info in control.actorInfosFor(plan.visible)
+                     if not info.isVisible())
+        control.setVisibilities({**{key: False for key in plan.hidden},
+                                 **{key: True for key in plan.visible}})
+        label = self.tr(view_modes.mode(plan.mode).label)
+        self.statusBar().showMessage(
+            self.tr('{0}: showing every part again ({1} were hidden).').format(
+                label, hidden) if hidden else
+            self.tr('{0}: every part is already shown.').format(label), 5000)
 
     def _zoomToSelection(self):
         """WP5.3. Fit the camera to the selected parts rather than the scene.
@@ -405,6 +600,16 @@ class MainWindow(QMainWindow):
             return
         self._renderingTool.updateHistoryButtons()
 
+    def _fitSelectionOrAll(self):
+        """DP-697. `F`: frame the selection, or the whole model without one."""
+        control = self._displayControl
+        if control.selectedActorIds():
+            self._zoomToSelection()
+            return
+        self._renderingTool._fitCamera()
+        self.statusBar().showMessage(
+            self.tr('Nothing is selected, so the whole model is framed.'), 5000)
+
     def _setExplode(self, factor: float):
         if self._meshManager is not None:
             self._meshManager.setExplode(factor)
@@ -423,7 +628,7 @@ class MainWindow(QMainWindow):
                 self.tr('Open a case before saving a view.'), 5000)
             return
         name, accepted = QInputDialog.getText(
-            self, self.tr('Save Current View'), self.tr('Name this view:'))
+            self, self.tr('Save current view'), self.tr('Name this view'))
         if not accepted or not name.strip():
             return
         try:
@@ -579,17 +784,35 @@ class MainWindow(QMainWindow):
         return match
 
     def _quickSection(self):
-        """One click: a plane along the current view normal, already cutting."""
+        """One click: a plane along the current view normal, already cutting.
+
+        VIEW-02. The second click takes the plane back down, because a cut
+        model with a live gizmo on it and no control anywhere reading active
+        is a state a user can only leave by finding the Display Control panel
+        the button exists to save them from opening.
+        """
         tool = self._displayControl.cutTool()
+        if tool.isSectionActive():
+            tool.clearSection()
+            self._renderingTool.setInspectionActive('section', False)
+            self._renderingTool.updateHistoryButtons()
+            return
         if not tool.updateBounds():
+            self._renderingTool.setInspectionActive('section', False)
             self.statusBar().showMessage(
                 self.tr('Nothing is loaded to cut yet.'), 5000)
             return
         panel = tool.panel()
         index = panel.activeIndex()
         tool._useViewNormal()
+        # DP-695. A cut along the view is placed, not dragged: lock it so a
+        # rotation drag that starts on a handle still turns the camera. The
+        # section controls carry the Lock box for whoever wants to drag it.
+        panel.setLocked(True)
         panel._planeToggled(index, True)
         panel._gizmoButtons[index].setChecked(True)
+        self._renderingTool.setInspectionActive(
+            'section', tool.isSectionActive())
         self._renderingTool.updateHistoryButtons()
 
     def _setPartVisible(self, key: str, visible: bool):
@@ -610,13 +833,72 @@ class MainWindow(QMainWindow):
 
     def rebuildOverlayParts(self):
         parts = []
+        groups = {}
+        groupPath = getattr(self._displayControl, '_groupPath', None)
         for key, item in self._displayControl._items.items():
             info = item.actorInfo()
             parts.append((key, info.name(), info.color(), info.isVisible()))
-        self._viewportOverlay.setParts(parts)
+            # DP-712. The rows file under the tree's own headings.
+            if groupPath is not None:
+                groups[key] = ' / '.join(groupPath(info))
+        self._viewportOverlay.setParts(parts, groups)
+        # DP-713. A reload drops the colouring with the actors it was on;
+        # the legend and the button have to drop it too.
+        if (getattr(self, '_fidelityPainted', False)
+                and getattr(self, '_deviationLegend', None) is not None):
+            readout = getattr(self._meshManager, 'deviationReadout', None)
+            if readout is None or readout() is None:
+                self._hideDeviationReadout()
+                self._fidelityPainted = False
+                self._renderingTool.setInspectionActive('fidelity', False)
+        # DP-711. A new scene gets a fresh Region picker.
+        refreshPicker = getattr(self, '_refreshRegionPicker', None)
+        if refreshPicker is not None:
+            refreshPicker()
         self._refreshOverlayChip()
         self._renderingTool.updateScaleReadout()
         self._refreshQualityActions()
+
+    def _regionPickerScope(self):
+        """``(regions, volume parts, picker rows)`` for the scene on screen."""
+        manager = getattr(self, '_meshManager', None)
+        if manager is None or manager.isEmpty():
+            return {}, [], []
+        regions = manager.regions()
+        volumes = manager.volumePartIds()
+        return regions, volumes, picker_entries(regions, volumes)
+
+    def _refreshRegionPicker(self):
+        """DP-711. A new scene gets a fresh picker: everything ticked."""
+        filter_ = getattr(self, '_regionFilter', None)
+        if filter_ is None:
+            filter_ = self._regionFilter = RegionFilter()
+        filter_.reset()
+        _regions, _volumes, entries = self._regionPickerScope()
+        self._viewportOverlay.setRegionEntries(entries)
+
+    def _syncRegionPicker(self):
+        """Show all brings every part back, so the picker ticks All again."""
+        filter_ = getattr(self, '_regionFilter', None)
+        if filter_ is None or not filter_.isFiltering():
+            return
+        if all(item.actorInfo().isVisible()
+               for item in self._displayControl._items.values()):
+            self._refreshRegionPicker()
+
+    def _applyRegionFilter(self, checked):
+        """DP-711 (viewport audit 0925 F1): show only the ticked regions."""
+        regions, volumes, entries = self._regionPickerScope()
+        if not entries:
+            return
+        filter_ = getattr(self, '_regionFilter', None)
+        if filter_ is None:
+            filter_ = self._regionFilter = RegionFilter()
+        items = self._displayControl._items
+        current = {key: item.actorInfo().isVisible()
+                   for key, item in items.items()}
+        self._displayControl.setVisibilities(
+            filter_.apply(regions, volumes, entries, checked, current))
 
     def _countedParts(self):
         """Which parts the chip counts, and the noun for them (F-44).
@@ -632,7 +914,8 @@ class MainWindow(QMainWindow):
         ids = list(partIds()) if partIds is not None else []
         if ids:
             return ids, self.tr('mesh parts')
-        return list(self._displayControl._items), self.tr('parts')
+        # DP-679. Not every row: a region seed marker is not a part.
+        return countedPartIds(self._displayControl._items), self.tr('parts')
 
     def _refreshOverlayChip(self):
         keys, noun = self._countedParts()
@@ -666,15 +949,73 @@ class MainWindow(QMainWindow):
         Run id, how the run ended, and the cell count of *that* artifact --
         not of whatever the case root happens to hold.
 
-        The same sentence goes to the bottom-bar strip (F-09), which is what
-        replaced the completion modal: the viewport is already showing the
-        mesh by the time this is called, so the words belong beside it rather
-        than over it.
+        The same sentence goes to the run details view (F-09), which is what
+        replaced the completion modal.
+
+        GEO-05. A result is news about one case. Reading a stored result is
+        asynchronous, so a handle read for the case that is closing can
+        arrive after the next case is open, and this method used to draw
+        whatever it was handed. MEASURED on the 16 September campaign: a new
+        empty SU2 case carried `gmsh-ae088d48b38041e9 · accepted · 21,952
+        cells · polyMesh`, a sentence about a case that was no longer open.
+        So the handle is asked where it came from, and one that did not come
+        from under the open case is not drawn at all.
+
+        The handle carries its own case root, and falls back to the artifact
+        it names, because a handle rebuilt from an older record may carry
+        only the path of the file. A result with neither is let through: a
+        result that cannot say where it came from is not evidence that it
+        came from somewhere else.
         """
+        home = str(getattr(getattr(app, 'project', None), 'path', '') or '')
+        origin = str(getattr(handle, 'case_root', '')
+                     or getattr(handle, 'artifact_path', '') or '')
+        if handle is not None and home and origin:
+            try:
+                root = Path(home).resolve()
+                came_from = Path(origin).resolve()
+                mine = came_from == root or root in came_from.parents
+            except (OSError, ValueError):
+                mine = False
+            if not mine:
+                logger.debug('run result %s is not from the open case',
+                             getattr(handle, 'run_id', ''))
+                return
         description = handle.describe() if handle is not None else ''
         self._offeredResult = None
         self._viewportOverlay.setResult(description)
         self.showRunStatus(description)
+
+    def offerSurfacePass(self, handle) -> bool:
+        """Say a run kept its surface mesh, and draw it only if asked.
+
+        DP-133. The surface mesh exists for the length of the volume pass and
+        was then discarded unshown, which is why a Gmsh leg of the sweep
+        captured two stages against snappy's five. The runner keeps it now,
+        and this is where it becomes reachable.
+
+        Offered, never substituted. The volume mesh is what the run produced
+        and it stays on screen; swapping it for the surface would be F-37 in
+        a new coat -- one run's artifact shown under another artifact's
+        sentence. The same one-slot offer the earlier-result path uses, so
+        there is no second way for a mesh to reach the viewport.
+
+        Returns whether an offer was made.
+        """
+        strip = getattr(self, '_runStatusStrip', None)
+        surface = (handle.surface_result()
+                   if hasattr(handle, 'surface_result') else None)
+        if strip is None or surface is None:
+            return False
+        self._offeredResult = surface
+        strip.showOffer(
+            f'{handle.describe()} · '
+            f'{self.tr("this run also kept its surface mesh")}',
+            self.tr('Show the surface mesh'), failed=False,
+            # The finished run's log is still the thing a user reaches for
+            # next; the offer must not take it away to put a button there.
+            log=strip.logPath())
+        return True
 
     def offerPreviousResult(self, message: str, handle) -> bool:
         """Say a run left no mesh, and name the one the case still has.
@@ -729,11 +1070,16 @@ class MainWindow(QMainWindow):
         Returns '' when something was drawn or there was nothing to draw, and
         the read failure otherwise.
         """
+        from foammesh.core.case import ArtifactState
         from foammesh.core.run_result import result_on_open
 
+        # DP-794. A root mesh changed since the run that wrote it is not that
+        # run's result, whatever its publication record says.
+        resolution = getattr(app, 'workflowResolution', None)
+        stale = getattr(resolution, 'artifact_state', None) is ArtifactState.STALE
         handle = None
         try:
-            handle = result_on_open(app.project.path)
+            handle = result_on_open(app.project.path, root_mesh_stale=stale)
         except OSError:
             logger.debug('stored results could not be read', exc_info=True)
         if handle is not None:
@@ -761,6 +1107,32 @@ class MainWindow(QMainWindow):
         strip = getattr(self, '_runStatusStrip', None)
         if strip is not None:
             strip.showResult(message, failed=failed, log=log)
+
+    def showRunDetails(self) -> None:
+        """Open the run details view (QA-04).
+
+        The one route to the run sentence now that it has left the page
+        footer. Reached from Help > Run details, and from the Details
+        control on the quality page, which W-I wires to this slot.
+
+        Never raised by the product itself: a run that ends still says so
+        without taking the window away, and this is where a user goes to
+        read it, cancel what is still running, take the offer of an earlier
+        mesh, or open the log.
+        """
+        view = getattr(self, '_runDetailsView', None)
+        if view is None:
+            return
+        strip = getattr(self, '_runStatusStrip', None)
+        empty = getattr(self, '_runDetailsEmpty', None)
+        if empty is not None:
+            empty.setVisible(strip is None or strip.state == 'idle')
+        history = getattr(self, '_runHistoryText', None)
+        if history is not None:
+            history.setPlainText(self._historyText())
+        view.show()
+        view.raise_()
+        view.activateWindow()
 
     def showRunStarted(self, message: str, *, allocation=None) -> None:
         """A run is under way, and this is where its Cancel lives (F-09).
@@ -863,7 +1235,21 @@ class MainWindow(QMainWindow):
         noRun = self.tr(
             'This mesh has not been checked against its reference geometry. '
             'Run the geometry fidelity task to colour deviation here.')
-        fidelityReason = noMesh if not hasMesh else noRun
+        # DP-713. With the reference geometry loaded, deviation is measured
+        # on the spot, so only a mesh with neither is refused -- and told
+        # both ways out.
+        geometry = getattr(self, '_geometryManager', None)
+        hasReference = False
+        if hasMesh and geometry is not None:
+            try:
+                hasReference = geometry.referenceSurface() is not None
+            except Exception:                                 # noqa: BLE001
+                logger.debug('no reference surface', exc_info=True)
+        fidelityReason = noMesh if not hasMesh else self.tr(
+            'This mesh has not been checked against its reference geometry, '
+            'and none is loaded to measure it against. Run the geometry '
+            'fidelity task, or import the geometry the mesh was made from, '
+            'to colour deviation here.')
         features = False
         featuresReason = noMesh if not hasMesh else noRun
         if report is not None:
@@ -882,8 +1268,13 @@ class MainWindow(QMainWindow):
                     'The fidelity run recorded no feature measurements, so '
                     'there are no declared feature lines to draw. Declare '
                     'features on the geometry and run it again.')
+        # A painted viewport keeps its own way back: the button that put the
+        # colouring on is the button that takes it off, so disabling it while
+        # the colour is still there would strand the reader.
+        fidelity = (report is not None or self._fidelityPainted
+                    or hasReference)
         self._renderingTool.setInspectionActionsEnabled(
-            report is not None, fidelityReason, features, featuresReason)
+            fidelity, fidelityReason, features, featuresReason)
 
     def _refreshLayerAction(self, hasMesh: bool):
         """Gate the layer-coverage entry on a layer run having happened.
@@ -909,11 +1300,13 @@ class MainWindow(QMainWindow):
         and it is the same answer either way.
         """
         try:
-            document = query(app.facadeClient, 'mesh.layer_coverage')
+            result = query(app.facadeClient, 'mesh.layer_coverage')
         except (FacadeError, RuntimeError, OSError, ValueError, KeyError):
             logger.debug('no readable layer coverage', exc_info=True)
             return view_modes.LayerCoverage()
-        return view_modes.summarise_layers(document)
+        # DP-667. The document is the result's payload. Handing on the result
+        # itself read as "not measured" on every case, measured or not.
+        return view_modes.summarise_layers(getattr(result, 'payload', None))
 
     def showLayerCoverage(self) -> bool:
         """Put the patches whose prism layers fell short on the screen.
@@ -935,7 +1328,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.tr(coverage.describe()), 15000)
         return True
 
-    def showGeometryFidelity(self):
+    def toggleGeometryFidelity(self):
         """WP3.3. Colour the surface by how far it left the reference geometry.
 
         Two resolutions, and the viewport says which one it is showing. The
@@ -943,43 +1336,155 @@ class MainWindow(QMainWindow):
         per-section verdict comes from the stored report and works on any case
         that has ever been qualified. Falling back silently would leave a user
         reading a patch-level colour as if it located the problem.
+
+        DP-200: the same press takes the colouring off again. Painting is a
+        door, and a door a user cannot walk back through is a trap -- the
+        only way out of the deviation colours used to be reloading the mesh.
         """
-        root = self._captureManager.caseRoot()
-        if root is None or self._meshManager is None:
-            self.statusBar().showMessage(
-                self.tr('Open a case with a mesh first.'), 5000)
-            return
+        try:
+            if self._fidelityPainted:
+                if self._meshManager is not None:
+                    self._meshManager.clearFidelityColouring()
+                self._hideDeviationReadout()
+                self._fidelityPainted = False
+                self.statusBar().showMessage(self.tr(
+                    'Fidelity colouring cleared.'), 4000)
+                return
 
-        report = self._latestFidelityReport()
-        if report is None:
+            root = self._captureManager.caseRoot()
+            if root is None or self._meshManager is None:
+                self.statusBar().showMessage(
+                    self.tr('Open a case with a mesh first.'), 5000)
+                return
+
+            report = self._latestFidelityReport()
+            if report is None:
+                # DP-713. No stored run: measure against the geometry.
+                if self._paintLiveDeviation() is not None:
+                    return
+                self.statusBar().showMessage(self.tr(
+                    'This mesh has not been checked against its reference '
+                    'geometry. Run the geometry fidelity task first.'), 9000)
+                return
+
+            refusal = self.caseOverlayRefusal()
+            if refusal:
+                self.statusBar().showMessage(refusal, 12000)
+                return
+
+            task_id = str(report.get('task_id') or '')
+            fields = hotspot.read(root, task_id) if task_id else {}
+            if fields:
+                painted = self._meshManager.showFidelityHotspots(fields)
+                self._fidelityPainted = painted > 0
+                self._showDeviationReadout()
+                self.statusBar().showMessage(self.tr(
+                    'Deviation from the reference geometry, per face, on {0}.'
+                ).format(count_text(painted, 'patch', 'patches')), 12000)
+                return
+
+            # DP-713. A run with no per-face field says which patch; the
+            # geometry, when it is loaded, says where.
+            if self._paintLiveDeviation():
+                return
+            verdicts = {
+                str(section.get('name') or ''): str(section.get('verdict') or '')
+                for section in report.get('sections') or ()
+            }
+            painted = self._meshManager.showSectionFidelity(verdicts)
+            self._fidelityPainted = painted > 0
             self.statusBar().showMessage(self.tr(
-                'This mesh has not been checked against its reference '
-                'geometry. Run the geometry fidelity task first.'), 9000)
-            return
+                'Fidelity verdict per patch on {0} — no per-face field was '
+                'recorded for this run, so this shows which patch, not where.'
+            ).format(count_text(painted, 'patch', 'patches')), 12000)
+        finally:
+            # VIEW-04. Every exit above either paints, clears or refuses,
+            # and the toolbar icon has to end up saying which -- a refusal
+            # used to leave it looking exactly like a success.
+            self._renderingTool.setInspectionActive(
+                'fidelity', bool(self._fidelityPainted))
 
-        refusal = self.caseOverlayRefusal()
-        if refusal:
-            self.statusBar().showMessage(refusal, 12000)
-            return
+    def _paintLiveDeviation(self):
+        """DP-713. Colour deviation measured now against the loaded geometry.
 
-        task_id = str(report.get('task_id') or '')
-        fields = hotspot.read(root, task_id) if task_id else {}
-        if fields:
-            painted = self._meshManager.showFidelityHotspots(fields)
+        Viewport audit 0925 F8. ``None`` when there is no geometry to
+        measure against, else how many patches were coloured.
+        """
+        geometry = getattr(self, '_geometryManager', None)
+        manager = self._meshManager
+        if geometry is None or manager is None:
+            return None
+        reference = geometry.referenceSurface()
+        if reference is None:
+            return None
+        painted = manager.showLiveDeviation(reference)
+        self._fidelityPainted = painted > 0
+        if painted:
+            self._showDeviationReadout()
             self.statusBar().showMessage(self.tr(
-                'Deviation from the reference geometry, per face, on {0} '
-                'patches.').format(painted), 12000)
-            return
+                'Deviation from the loaded geometry, measured now per face, '
+                'on {0}.').format(count_text(painted, 'patch', 'patches')),
+                12000)
+        else:
+            self.statusBar().showMessage(self.tr(
+                'No patch of this mesh could be measured against the loaded '
+                'geometry.'), 9000)
+        return painted
 
-        verdicts = {
-            str(section.get('name') or ''): str(section.get('verdict') or '')
-            for section in report.get('sections') or ()
-        }
-        painted = self._meshManager.showSectionFidelity(verdicts)
-        self.statusBar().showMessage(self.tr(
-            'Fidelity verdict per patch on {0} patches — no per-face field was '
-            'recorded for this run, so this shows which patch, not where.'
-        ).format(painted), 12000)
+    def _showDeviationReadout(self):
+        """DP-713. The legend, histogram and figures for the colouring."""
+        manager = self._meshManager
+        readout = getattr(manager, 'deviationReadout', None)
+        readout = readout() if readout is not None else None
+        if readout is None:
+            return
+        self._hideDeviationReadout()
+        tokens = (app.themeManager.tokens
+                  if app.themeManager is not None else None)
+        display = getattr(self, '_displayControl', None)
+        if display is not None:
+            self._deviationLegend = deviationScalarBar(
+                readout.lookup_table, tokens)
+            display.addOverlay(self._deviationLegend)
+        panel = getattr(self, '_deviationPanel', None)
+        if panel is not None:
+            panel.setReadout(readout, self._deviationTolerance())
+
+    def _hideDeviationReadout(self):
+        legend = getattr(self, '_deviationLegend', None)
+        display = getattr(self, '_displayControl', None)
+        if legend is not None and display is not None:
+            display.removeOverlay(legend)
+        self._deviationLegend = None
+        panel = getattr(self, '_deviationPanel', None)
+        if panel is not None:
+            panel.clearReadout()
+
+    def _deviationTolerance(self) -> float:
+        """The tolerance the figures count against, in mm.
+
+        The user's own once they have set one; until then a tenth of the
+        base cell, or a thousandth of the model when there is no cell size.
+        """
+        chosen = getattr(self, '_deviationToleranceMm', None)
+        if chosen:
+            return chosen
+        cellSize = extent = None
+        geometry = getattr(self, '_geometryManager', None)
+        try:
+            cellSize = geometry.getCellSize() if geometry is not None else None
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no base cell size', exc_info=True)
+        try:
+            bounds = self._meshManager.getBounds().toTuple()
+            extent = max(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                         bounds[5] - bounds[4])
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no mesh extent', exc_info=True)
+        return live_distance.default_tolerance(cellSize, extent)
+
+    def _deviationToleranceEdited(self, value):
+        self._deviationToleranceMm = float(value) or None
 
     def toggleFeatureCapture(self):
         """WP3.1. Draw the declared features, coloured by whether they survived.
@@ -1030,10 +1535,53 @@ class MainWindow(QMainWindow):
             return None
 
     def _highlightPoorCells(self):
+        """Colour the worst tenth of the metric range, and uncolour it.
+
+        VIEW-01 and VIEW-04. The press painted and never unpainted, and the
+        control said nothing either way -- a mesh with no measurement yet
+        paints seconds later, so the icon follows the colouring rather than
+        the click, through the observer installed here.
+        """
+        tool = self._renderingTool
         info = self._displayControl.meshQualityInfo()
+        info.setHighlightObserver(
+            lambda active: tool.setInspectionActive('poorCells', active))
+        if info.isHighlighting():
+            info.clearHighlight()
+            return
         if not info.highlightWorst():
+            tool.setInspectionActive('poorCells', False)
             self.statusBar().showMessage(
                 self.tr('No mesh is loaded to measure.'), 6000)
+            return
+        # True can also mean "a measurement is running"; the observer says
+        # when it actually paints, so the icon is never lit on a promise.
+        tool.setInspectionActive('poorCells', info.isHighlighting())
+
+    def _resetInspectionView(self):
+        """Put the plain model back, whatever inspection left on it.
+
+        VIEW-05. Every overlay had its own way off, and nothing put them all
+        back at once. The two controls that looked like the way back --
+        Previous view and Next view -- walk the camera history and leave
+        every colour, cut and overlay exactly where it was, so a user who had
+        stacked a section over a quality colouring had no single answer to
+        "show me the mesh again".
+        """
+        tool = self._renderingTool
+        info = self._displayControl.meshQualityInfo()
+        info.clearHighlight()
+        self._displayControl.cutTool().clearSection()
+        if self._meshManager is not None:
+            self._meshManager.clearFailedCells()
+            self._meshManager.clearFidelityColouring()
+        self._failedCellSetIndex = -1
+        self._fidelityPainted = False
+        for name in ('poorCells', 'section', 'failedCells', 'fidelity'):
+            tool.setInspectionActive(name, False)
+        tool.updateHistoryButtons()
+        self.statusBar().showMessage(
+            self.tr('Inspection overlays cleared.'), 4000)
 
     def caseOverlayRefusal(self) -> str:
         """Why a case-root overlay must not be drawn over what is on screen.
@@ -1070,26 +1618,56 @@ class MainWindow(QMainWindow):
         writes several -- skewFaces, nonOrthoFaces, wrongOrientedFaces -- and
         the toolbar could reach exactly one of them, chosen by dictionary
         order, with nothing on screen saying the others existed.
+
+        VIEW-03 and VIEW-04. Stepping wrapped round to the first set, so the
+        overlay had no off state at all; the press after the last set now
+        takes it off, the menu names every set and carries an `Off` entry of
+        its own, and a request that is refused or finds nothing leaves the
+        control dark rather than lit over an unchanged picture.
         """
+        tool = self._renderingTool
+        requested = tool.requestedFailedCellSet()
         sets = getattr(self, '_lastFailedCellSets', None)
+        names = list(sets or ())
+        stepped = getattr(self, '_failedCellSetIndex', -1) + 1
+        # Off: asked for by name from the menu, or reached by stepping past
+        # the last set. Wrapping to the first set again meant the only exit
+        # from the overlay was reloading the mesh.
+        if requested == '' or (requested not in names and names
+                               and stepped >= len(names)):
+            if self._meshManager is not None:
+                self._meshManager.clearFailedCells()
+            self._failedCellSetIndex = -1
+            tool.setInspectionActive('failedCells', False)
+            self.statusBar().showMessage(self.tr('Failed cells hidden.'), 4000)
+            return
         if not sets:
+            tool.setInspectionActive('failedCells', False)
             self.statusBar().showMessage(
                 self.tr('No mesh check has written a failed-cell set yet.'), 6000)
             return
         refusal = self.caseOverlayRefusal()
         if refusal:
+            tool.setInspectionActive('failedCells', False)
             self.statusBar().showMessage(refusal, 12000)
             return
-        names = list(sets)
-        index = getattr(self, '_failedCellSetIndex', -1) + 1
-        if index >= len(names):
-            index = 0
+        index = names.index(requested) if requested in names else stepped
         self._failedCellSetIndex = index
         name = names[index]
         ids = list(sets[name])
         self._meshManager.showFailedCells(ids, name)
-        position = self.tr('  ({0} of {1} sets — press again for the next)'
-                           ).format(index + 1, len(names)) if len(names) > 1 else ''
+        tool.setInspectionActive('failedCells', True)
+        tool.setFailedCellSetShown(name)
+        if len(names) <= 1:
+            position = ''
+        elif index + 1 < len(names):
+            position = self.tr('  ({0} of {1} sets — press again for the next)'
+                               ).format(index + 1, len(names))
+        else:
+            # The last set. Saying "press again for the next" here promised a
+            # set that does not exist, which is how the wrap-round read.
+            position = self.tr('  ({0} of {1} sets — press again to clear)'
+                               ).format(index + 1, len(names))
         self.statusBar().showMessage(
             self.tr('{0}: {1:,} cells.').format(name, len(ids)) + position,
             10000)
@@ -1112,6 +1690,31 @@ class MainWindow(QMainWindow):
         # otherwise, so the first capture of a session looked like a no-op.
         self.showCaptures()
         return path
+
+    def _showCaptureGallery(self):
+        """The gallery button, which has to answer even when nothing moves.
+
+        DP-353. `Open the capture gallery` was wired straight at
+        `showCaptures`, whose whole effect is to bring the Captures page up in
+        the output panel. Press it while that page is already up -- which is
+        the state every capture leaves behind, because taking one opens it --
+        and the window neither redraws nor says anything. An enabled control
+        that answers a press with nothing at all is indistinguishable from a
+        broken one. So the press names what it opened and how much is in it.
+        """
+        page = self.showCaptures()
+        if page is None:
+            self.statusBar().showMessage(
+                self.tr('Open a case before opening the capture gallery.'),
+                5000)
+            return None
+        count = len(self._captureManager.captures())
+        self.statusBar().showMessage(
+            self.tr('Captures: {0} saved for this case.').format(count)
+            if count else
+            self.tr('Captures: none yet — press Capture to save the view.'),
+            6000)
+        return page
 
     def showCaptures(self):
         page = self._outputTabs.show(
@@ -1172,20 +1775,33 @@ class MainWindow(QMainWindow):
         """Show immutable runtime-derived setup in one keyed Region C tab."""
         from .output_pages import EffectiveSetupPage
         return self._outputTabs.show(
-            'effective_setup', self.tr('Effective Setup'),
+            'effective_setup', self.tr('Effective meshing setup'),
             lambda: EffectiveSetupPage(payload, self._ui.regionCTabHost))
 
     def showEffectiveEnginePlan(self, payload: dict):
         from .output_pages import JsonOutputPage
         return self._outputTabs.show(
-            'effective_engine_plan', self.tr('Effective Engine Plan'),
+            'effective_engine_plan', self.tr('Effective engine plan'),
             lambda: JsonOutputPage(
-                self.tr('Immutable Engine Plan'), payload,
+                self.tr('Immutable engine plan'), payload,
                 self._ui.regionCTabHost))
 
     def setScaleNote(self, note):
         """Let the current step page annotate the viewport scale readout."""
         self._renderingTool.setScaleNote(note)
+
+    def _dropScaleNoteOffItsPage(self, step):
+        """The base-cell clause belongs to the page that computes it.
+
+        DP-106. `BaseGridPage.hide` clears the note, and the note was still
+        seen on frames of a Gmsh run -- a route that has no base grid and
+        never will -- which means at least one way of leaving that page does
+        not go through `hide`. Rather than hunt for it, the note is dropped
+        whenever the displayed step is not the one that owns it, so no route
+        out of the page can strand it.
+        """
+        if step is not Step.BASE_GRID:
+            self._renderingTool.setScaleNote('')
 
     @property
     def displayControl(self):
@@ -1206,12 +1822,19 @@ class MainWindow(QMainWindow):
             return
 
         app.settings.updateLastMainWindowGeometry(self.geometry())
-        sizes = self._ui.regionSplitter.sizes()
+        sizes = (
+            self._ui.regionSplitter.sizes()
+            if layout_worth_recording(
+                self._regionSplitterUserMoved, self._savedRegionSizes)
+            else None)
         getattr(app.settings, 'updateThreeRegionLayout', lambda **_kw: None)(
             sizes=sizes, active_output=self._outputTabs.key_for_current())
         if self._jobStateUnsubscribe is not None:
             self._jobStateUnsubscribe()
             self._jobStateUnsubscribe = None
+        if self._stepLockUnsubscribe is not None:
+            self._stepLockUnsubscribe()
+            self._stepLockUnsubscribe = None
         if self._capabilityStateUnsubscribe is not None:
             self._capabilityStateUnsubscribe()
             self._capabilityStateUnsubscribe = None
@@ -1219,17 +1842,31 @@ class MainWindow(QMainWindow):
 
         super().closeEvent(event)
 
+    def _applyRegionSizes(self, total_width: int | None = None):
+        """Re-apply the A/B/C split, asking the outline what width it needs.
+
+        DP-134. A drag of the handle still wins: once the user has moved it,
+        the current sizes are what get re-applied and the outline's request is
+        only a starting point it no longer gets to change.
+        """
+        if not hasattr(self, '_threeRegionShell'):
+            return
+        if total_width is None:
+            total_width = max(self.width(), 1280)
+        sizes = self._ui.regionSplitter.sizes()
+        saved = (sizes if self._regionSplitterUserMoved and len(sizes) == 3
+                 else self._savedRegionSizes)
+        navigation = getattr(self, '_navigationView', None)
+        self._threeRegionShell.apply_sizes(
+            total_width, saved,
+            navigation.wantedPaneWidth() if navigation is not None else None)
+
     def resizeEvent(self, event):
         """Clamp the permanent regions while leaving user-adjusted A/B intact."""
         if not hasattr(self, '_threeRegionShell'):
             super().resizeEvent(event)
             return
-        sizes = self._ui.regionSplitter.sizes()
-        if len(sizes) == 3:
-            self._threeRegionShell.apply_sizes(
-                event.size().width(),
-                sizes if self._regionSplitterUserMoved
-                else self._savedRegionSizes)
+        self._applyRegionSizes(event.size().width())
         self._ui.regionAHost.setProperty(
             'compactMode', event.size().width() < 1000)
         super().resizeEvent(event)
@@ -1262,11 +1899,19 @@ class MainWindow(QMainWindow):
         self._ui.actionOpen.setShortcut('Ctrl+O')
         self._ui.actionSave.setShortcut('Ctrl+S')
         self._ui.actionSaveProjectAs.setShortcut('Ctrl+Shift+S')
-        self._ui.actionClose.setShortcut('Ctrl+E')
+        # DP-755. Ctrl+W and Ctrl+Y are what other applications use; the
+        # keys this window had before stay, so no one's habit breaks.
+        self._ui.actionClose.setShortcuts([QKeySequence('Ctrl+W'), QKeySequence('Ctrl+E')])
         self._ui.actionExit.setShortcut('Ctrl+Q')
         self._ui.actionUndo.setShortcut('Ctrl+Z')
-        self._ui.actionRedo.setShortcut('Ctrl+Shift+Z')
-        self._ui.actionParallelEnvironment.setShortcut('Ctrl+P')
+        self._ui.actionRedo.setShortcuts([QKeySequence('Ctrl+Shift+Z'), QKeySequence('Ctrl+Y')])
+        # The viewport owns Ctrl+Shift+F. The menu entry shows that key so it
+        # can be found, and is scoped to the menu so it is never a second
+        # window-wide binding of it.
+        self._ui.actionViewZoomSelection.setShortcut(QKeySequence(RenderingTool.ZOOM_SELECTION_SHORTCUT))
+        self._ui.actionViewZoomSelection.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        # DP-759. The key every desktop platform uses for its preferences.
+        self._ui.actionPreferences.setShortcut(QKeySequence('Ctrl+,'))
 
     def _applyVtkTheme(self, _name):
         self._applyThemedIcons()
@@ -1327,7 +1972,7 @@ class MainWindow(QMainWindow):
             self._ui.fit: self.tr('Fit view to model'),
             self._ui.alignAxis: self.tr('Align view to nearest axis'),
             self._ui.rotate: self.tr('Roll view 90 degrees'),
-            self._ui.rotationCenter: self.tr('Set rotation center'),
+            self._ui.rotationCenter: self.tr('Set rotation centre'),
             self._ui.loadBoundaryLayerDefaults: self.tr('Load boundary-layer defaults'),
             self._ui.boundaryLayerConfigurationsAdd: self.tr('Add boundary-layer configuration'),
             self._ui.loadCastellationDefaults: self.tr('Load castellation defaults'),
@@ -1344,7 +1989,7 @@ class MainWindow(QMainWindow):
     def _connectSignalsSlots(self):
         app.renderingToggled.connect(self._setRenderingEnabled)
 
-        self._consoleAction = self._ui.menuView.addAction(self.tr('Console'))
+        self._consoleAction = self._ui.menuView.addAction(self.tr('&Console'))
         self._consoleAction.setShortcut('Ctrl+Shift+C')
         self._consoleAction.triggered.connect(
             lambda: self.showOutputTab('console'))
@@ -1355,6 +2000,7 @@ class MainWindow(QMainWindow):
 
         self._stepManager.workingStepChanged.connect(self._displayControl.openedStepChanged)
         self._stepManager.displayStepChanged.connect(self._displayControl.currentStepChanged)
+        self._stepManager.displayStepChanged.connect(self._dropScaleNoteOffItsPage)
 
         self._stepManager.batchStarted.connect(self._disableMenubar)
         self._stepManager.batchStopped.connect(self._enableMenubar)
@@ -1397,7 +2043,6 @@ class MainWindow(QMainWindow):
             ActionId.EXIT: lambda: self.close(),
             ActionId.UNDO: self._undo,
             ActionId.REDO: self._redo,
-            ActionId.TRANSACTION_HISTORY: self._showTransactionHistory,
             ActionId.MESH_INFO: self.showMeshInfo,
             ActionId.MESH_SCALE: lambda: self._runMeshTransformV13('scale'),
             ActionId.MESH_TRANSLATE: lambda: self._runMeshTransformV13('translate'),
@@ -1407,20 +2052,20 @@ class MainWindow(QMainWindow):
             ActionId.MESH_REPAIR: self._runMeshRepair,
             ActionId.MESH_RESTORE: self._restorePreviousMesh,
             ActionId.VIEW_FIT: lambda: self._ui.fit.click(),
+            ActionId.VIEW_ZOOM_SELECTION: self._zoomToSelection,
             ActionId.VIEW_AXIS: lambda: self._ui.axis.click(),
             ActionId.VIEW_CUBE_AXIS: lambda: self._ui.cubeAxis.click(),
             ActionId.VIEW_RULER: lambda: self._ui.ruler.click(),
-            ActionId.VIEW_PERSPECTIVE: lambda: self._ui.perspective.click(),
+            ActionId.VIEW_PARALLEL_PROJECTION: lambda: self._ui.perspective.click(),
             ActionId.VIEW_ALIGN_AXIS: lambda: self._ui.alignAxis.click(),
             ActionId.VIEW_ROLL: lambda: self._ui.rotate.click(),
             ActionId.VIEW_ROTATION_CENTER: lambda: self._ui.rotationCenter.click(),
-            ActionId.PARALLEL_ENVIRONMENT: self._openParallelEnvironmentDialog,
-            ActionId.THEME: self._chooseTheme,
+            ActionId.PREFERENCES: self._openPreferences,
             ActionId.TERMINAL_HERE: self._openTerminalHere,
             ActionId.TUTORIALS: self._openTutorials,
             ActionId.LICENSE: self._openLicense,
-            ActionId.PRIVACY: self._openPrivacySettings,
             ActionId.ABOUT: self._actionAbout,
+            ActionId.RUN_DETAILS: self.showRunDetails,
         }
         if set(handlers) != set(self._policyActions):
             missing = set(self._policyActions) - set(handlers)
@@ -1432,7 +2077,7 @@ class MainWindow(QMainWindow):
                 (ActionId.VIEW_AXIS, self._ui.axis),
                 (ActionId.VIEW_CUBE_AXIS, self._ui.cubeAxis),
                 (ActionId.VIEW_RULER, self._ui.ruler),
-                (ActionId.VIEW_PERSPECTIVE, self._ui.perspective),
+                (ActionId.VIEW_PARALLEL_PROJECTION, self._ui.perspective),
                 (ActionId.VIEW_ROTATION_CENTER, self._ui.rotationCenter)):
             action = self._policyActions[action_id]
             action.setChecked(button.isChecked())
@@ -1445,8 +2090,9 @@ class MainWindow(QMainWindow):
         """Is there a complete polyMesh anywhere this case is allowed to keep one?
 
         R116. MEASURED: editing Boundary Layers on a case that had just meshed
-        reset the quality strip to "No mesh yet." and the Mesh Quality tab to
-        "No mesh has been produced in this case yet.", while the mesh from
+        reset the quality strip and the Mesh quality tab to their dormant
+        no-mesh lines -- two different sentences then, one since DP-107 --
+        while the mesh from
         ninety seconds earlier was still on disk and still the only mesh in the
         case. `clearMeshVerdict` -- the one thing that writes those two lines --
         is reached from exactly one place, `refreshMeshVerdict`, gated on this
@@ -1479,14 +2125,25 @@ class MainWindow(QMainWindow):
             return False
 
     def _actionSnapshot(self):
-        global_capabilities = (
-            frozenset({ActionId.PRIVACY.value}) if self._privacyConfigured else frozenset())
+        global_capabilities = frozenset()
         if app.project is None:
             return AppSnapshot(capabilities=global_capabilities)
         content = ContentState.EMPTY
         try:
-            from foammesh.core.case import classify_case
-            has_mesh = classify_case(app.project.path).has_mesh or self._hasMeshOnDisk()
+            # The engine is asked in the words it answers in. Both probes
+            # this line used to hold -- `classify_case(...).has_mesh` and
+            # `_hasMeshOnDisk()` -- look for `constant/polyMesh` and nothing
+            # else, and Plan 28 makes a Gmsh run targeting SU2 skip the
+            # polyMesh publication on purpose. MEASURED on the 16 September
+            # elbow campaign: 21,952 cells in the viewport and `No mesh has
+            # been produced in this case yet` on the quality page, because
+            # this answer was `False` and `refreshMeshVerdict` clears both
+            # quality surfaces unless it is `True`.
+            from foammesh.core.engine.registry import configured_engine_id
+            from foammesh.core.facade.mesh_presence import has_engine_mesh
+            has_mesh = (has_engine_mesh(app.project.path,
+                                        configured_engine_id(app.db))
+                        or self._hasMeshOnDisk())
             geometry_root = app.project.path / 'constant' / 'triSurface'
             has_geometry = (app.db.elementCount('geometry') > 0 or
                             (geometry_root.is_dir() and any(
@@ -1502,27 +2159,32 @@ class MainWindow(QMainWindow):
         capabilities = global_capabilities | frozenset({
             ActionId.SAVE_AS.value,
             ActionId.CLOSE_PROJECT.value,
-            ActionId.MESH_QUALITY.value,
             ActionId.MESH_INFO.value,
-            ActionId.PARALLEL_ENVIRONMENT.value,
-            ActionId.TRANSACTION_HISTORY.value,
-            ActionId.THEME.value,
+            ActionId.PREFERENCES.value,
             ActionId.LOAD_MESH.value,
             ActionId.SAVE_PROJECT_AS.value,
             ActionId.LOAD_GEOMETRY.value,
         })
         capability_reasons = {}
+        # DP-752. The thresholds are snappy's; a Gmsh case is told why not.
+        from foammesh.core.engine.registry import configured_engine_id
+        quality_available, quality_reason = mesh_quality_capability(
+            configured_engine_id(app.db))
+        if quality_available:
+            capabilities = capabilities | frozenset({ActionId.MESH_QUALITY.value})
+        else:
+            capability_reasons[ActionId.MESH_QUALITY.value] = quality_reason
         terminal_available, terminal_reason = terminal_capability()
         if terminal_available:
             capabilities = capabilities | frozenset({ActionId.TERMINAL_HERE.value})
         else:
             capability_reasons[ActionId.TERMINAL_HERE.value] = terminal_reason
-        check_mesh = app.capabilities.utility('checkMesh')
+        check_mesh = self._capability('checkMesh')
         if check_mesh.available:
             capabilities = capabilities | frozenset({ActionId.MESH_CHECK.value})
         else:
             capability_reasons[ActionId.MESH_CHECK.value] = check_mesh.reason
-        transform_points = app.capabilities.utility('transformPoints')
+        transform_points = self._capability('transformPoints')
         if transform_points.available:
             capabilities = capabilities | frozenset({
                 ActionId.MESH_SCALE.value, ActionId.MESH_TRANSLATE.value,
@@ -1531,10 +2193,12 @@ class MainWindow(QMainWindow):
         else:
             for action_id in (ActionId.MESH_SCALE, ActionId.MESH_TRANSLATE, ActionId.MESH_ROTATE):
                 capability_reasons[action_id.value] = transform_points.reason
-        if self._repairUtilities() or content in (ContentState.GEOMETRY, ContentState.GEOMETRY_AND_MESH):
+        if (self._repairUtilities(self._capability)
+                or content in (ContentState.GEOMETRY, ContentState.GEOMETRY_AND_MESH)):
             capabilities = capabilities | frozenset({ActionId.MESH_REPAIR.value})
         else:
             capability_reasons[ActionId.MESH_REPAIR.value] = (
+                check_mesh.reason if check_mesh.transient else
                 'No supported mesh repair utility was found in the configured environment')
         if MeshRecoveryService().has_available(app.project.path):
             capabilities = capabilities | frozenset({ActionId.MESH_RESTORE.value})
@@ -1558,14 +2222,104 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _repairUtilities():
-        """Return only utility paths that were positively discovered."""
+    def _repairUtilities(lookup=None):
+        """Return only utility paths that were positively discovered.
+
+        `lookup` defaults to the registry call that answers whatever it
+        costs, which is what running a repair wants. Rebuilding a menu
+        passes the non-blocking one instead."""
+        probe = app.capabilities.utility if lookup is None else lookup
         return {
             operation.utility_name: capability.executable
             for operation in RepairOperation
-            if (capability := app.capabilities.utility(operation.utility_name)).available
+            if (capability := probe(operation.utility_name)).available
             and capability.executable is not None
         }
+
+    def _capability(self, name):
+        """Report what is known about a utility without ever waiting for it.
+
+        R194's sibling on this side of the shell. `app.capabilities.utility()`
+        may start a cold WSL runtime to answer, and every path that rebuilds
+        the menus called it on the GUI thread -- so opening a project drew the
+        window, then froze it for the length of the probe. Here a cached answer
+        is used when there is one, and when there is not the action is reported
+        unavailable *for now*: transient, so nothing downstream mistakes the
+        placeholder for a verdict, and carrying a reason that says the
+        environment is being checked rather than that the utility is missing.
+        The probe fills the cache for every utility the menus asked about --
+        not one chosen name. `CapabilityRegistry` caches per name, so warming
+        `checkMesh` leaves `transformPoints` unknown, and a snapshot that asks
+        about both warms again on every rebuild. MEASURED as a second 100% CPU
+        spin, the same shape as DP-116 and reached by the opposite route: a
+        probe that *succeeded*.
+        """
+        known = app.capabilities.utility_if_known(name)
+        if known is not None:
+            return known
+        failure = self._capabilityProbeFailure
+        if failure is not None:
+            # The probe already ran and could not reach the runtime. R194
+            # leaves that answer uncached on purpose, so `utility_if_known`
+            # says `None` again every time it is asked -- and warming again
+            # here arms the refresh that asked, which asks again. MEASURED as
+            # a permanent 100% CPU spin with the window still drawn and no
+            # further output. Report what the probe actually found, and ask
+            # again only when something re-probes.
+            return Capability(name, False, None, failure, transient=True)
+        self._warmCapabilities(name)
+        return Capability(
+            name, False, None,
+            self.tr('Checking the OpenFOAM environment…'), transient=True)
+
+    def _warmCapabilities(self, name):
+        """Probe off the GUI thread, every name the menus have asked about."""
+        self._capabilityWanted.add(name)
+        if self._capabilityWarmPending:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop yet means no window to refresh either.
+            return
+        self._capabilityWarmPending = True
+
+        async def warm():
+            failure = None
+            try:
+                # Drained rather than iterated: a name the menus ask about
+                # while this probe is out belongs to this probe too, and the
+                # first answer warms the runtime the rest of them share.
+                while self._capabilityWanted:
+                    wanted = self._capabilityWanted.pop()
+                    try:
+                        probed = await asyncio.to_thread(
+                            app.capabilities.utility, wanted)
+                    except Exception as error:               # noqa: BLE001
+                        probed = Capability(
+                            wanted, False, None, str(error), transient=True)
+                    if probed.transient:
+                        # Nothing reached the runtime, so the names still
+                        # waiting would each fail the same way, slowly.
+                        failure = probed.reason
+                        break
+            finally:
+                self._capabilityWarmPending = False
+            # Remember what the probe could not answer, so that the refresh
+            # below does not send the next snapshot straight back here.
+            self._capabilityProbeFailure = failure
+            try:
+                self._scheduleMenuRefresh()
+            except RuntimeError:
+                # The window closed while the probe was out.
+                pass
+
+        asyncio.ensure_future(warm())
+
+    def _capabilitiesReprobed(self, *_args, **_kwargs):
+        """A re-probe is the one thing that makes a failed probe worth redoing."""
+        self._capabilityProbeFailure = None
+        self._scheduleMenuRefresh()
 
     def _scheduleMenuRefresh(self, *_args, **_kwargs):
         """Coalesce noisy state notifications into one next-turn refresh."""
@@ -1578,19 +2332,105 @@ class MainWindow(QMainWindow):
         self._menuRefreshPending = False
         self._updateMenuStates()
 
-    def _scheduleProjectRefresh(self, *_args, **_kwargs):
+    def _scheduleProjectRefresh(self, *_args, **kwargs):
         """Coalesce artifact/history events into one truthful scene refresh."""
         self._scheduleMenuRefresh()
+        self._noteRefreshCause(kwargs)
         if self._projectRefreshPending:
             return
         self._projectRefreshPending = True
         QTimer.singleShot(0, self._flushProjectRefresh)
 
+    def _noteRefreshCause(self, payload):
+        """Remember what changed, not only that something did (DP-397).
+
+        The publisher names the changed row three times over -- in the
+        transaction's target, in the geometry event's `geometry_id`, and in
+        the operation's result -- and this subscriber used to discard all
+        three and rebuild the whole scene. On a 129-face import that cost a
+        minute per rename.
+
+        Anything that cannot be read as a rename widens the refresh back to
+        the full rebuild, and the window stays wide until it is flushed: a
+        rename that lands in the same event-loop turn as an import must not
+        narrow the import's refresh.
+        """
+        if self._projectRefreshWide:
+            return
+        renamed = self._renamedGeometry(payload)
+        if renamed is None:
+            self._projectRefreshWide = True
+            self._projectRefreshRenames = []
+            return
+        self._projectRefreshRenames.append(renamed)
+
+    @staticmethod
+    def _renamedGeometry(payload):
+        """The (id, new name) a payload describes, or None if it describes more.
+
+        Two events carry one rename -- `geometry.rename` publishes
+        ARTIFACT_GEOMETRY_CHANGED and the commit publishes
+        TRANSACTION_APPLIED -- so both shapes are read here, and a turn that
+        holds both stays narrow. Read conservatively: a payload that is not
+        exactly this returns None and pays for the rebuild.
+        """
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get('operation') or '') == 'geometry.rename':
+            geometry_id = payload.get('geometry_id')
+            after = payload.get('after')
+            if geometry_id is not None and after is not None:
+                return (str(geometry_id), str(after))
+            return None
+        transaction = payload.get('transaction')
+        if transaction is None:
+            return None
+        if getattr(transaction, 'action', None) != 'rename geometry':
+            return None
+        target = getattr(transaction, 'target', None)
+        if not isinstance(target, str):
+            return None
+        parts = target.split('/')
+        if len(parts) != 3 or parts[0] != 'geometry' or parts[2] != 'name':
+            return None
+        # `reason` is 'previous -> new', which is where the committed name is.
+        after = str(getattr(transaction, 'reason', '') or '')
+        if '->' not in after:
+            return None
+        after = after.split('->')[-1].strip()
+        return (parts[1], after) if after else None
+
+    def _scheduleProjectReload(self, *_args, **_kwargs):
+        """A refresh that must repaint the forms too (DP-363).
+
+        Undo, redo and a restored artifact replace the stored values under
+        the user, so the page they are looking at has to show what is
+        stored now. Every other scene event is a consequence of a write
+        and must leave an unapplied edit where the user typed it.
+        """
+        self._projectRefreshRepaintsForms = True
+        self._scheduleProjectRefresh()
+
     def _flushProjectRefresh(self):
         self._projectRefreshPending = False
+        repaintsForms = self._projectRefreshRepaintsForms
+        self._projectRefreshRepaintsForms = False
+        wide = self._projectRefreshWide or not self._projectRefreshRenames
+        renames = self._projectRefreshRenames
+        self._projectRefreshWide = False
+        self._projectRefreshRenames = []
         if self._geometryManager is not None:
-            self._geometryManager.load()
-        self._stepManager.load()
+            if wide:
+                self._geometryManager.load()
+            else:
+                # DP-397. A rename moves one label and touches nothing about
+                # any geometry, so the other actors are already right. Moving
+                # the label is O(1); rebuilding the scene to show it was the
+                # whole of the cost.
+                for geometry_id, name in renames:
+                    self._geometryManager.renameGeometry(geometry_id, name)
+                self._geometryManager.applyToDisplay()
+        self._stepManager.load(preserveCurrentPage=not repaintsForms)
         if self._meshManager is not None:
             asyncio.create_task(self._meshManager.reload())
         self.refreshMeshVerdictSoon()
@@ -1610,7 +2450,9 @@ class MainWindow(QMainWindow):
         status bar names the element and where it is.
         """
         centroid = element.get('centroid') or ()
-        where = ', '.join('{:.4g}'.format(float(axis)) for axis in centroid)
+        # DP-165. The same point the quality table shows, to the same
+        # precision, and to one precision across its three axes.
+        where = ', '.join(aligned(centroid))
         try:
             self._displayControl.meshQualityInfo().highlightWorst()
         except Exception as error:  # noqa: BLE001 - the viewport must not take the tab down
@@ -1627,6 +2469,7 @@ class MainWindow(QMainWindow):
         is what they want *after*, but a tab the user picked themselves is
         never taken away from them mid-read.
         """
+        verdict = with_layer_coverage(verdict)
         self._verdictStrip.show_verdict(verdict)
         self._meshQualityTab.show_verdict(verdict)
         if verdict.get('stale'):
@@ -1640,7 +2483,7 @@ class MainWindow(QMainWindow):
             self.showQualityReport()
 
     def showQualityReport(self) -> None:
-        """Raise the Mesh Quality tab *and* make it big enough to read.
+        """Raise the Mesh quality tab *and* make it big enough to read.
 
         R62/R114. Raising the tab was the whole of `Details`, and the band it
         raised into was about 40 px tall: the headline clipped to one line and
@@ -1662,7 +2505,7 @@ class MainWindow(QMainWindow):
         bare from two synchronous methods. In this environment that wrapper did
         not schedule anything -- Python reported the coroutine as never awaited
         -- so the refresh had never once run on opening a case, and the strip
-        sat on its dormant "No mesh yet." over a mesh that was on screen.
+        sat on its dormant no-mesh line over a mesh that was on screen.
 
         One implementation, one scheduler, and every entry point uses one of
         the two rather than guessing which calling convention applies.
@@ -1674,7 +2517,7 @@ class MainWindow(QMainWindow):
 
         The quality surfaces used to be filled by exactly one path -- accepting
         a Gmsh gate refusal -- so opening a case whose mesh had already been
-        checked left the strip reading "No mesh yet." above a mesh that was
+        checked left the strip on its dormant no-mesh line above a mesh that was
         drawn on screen and a stored report that said `warning`. `quality.report`
         is a READ of that persisted report, so this costs nothing and is the
         difference between a surface that is empty and one that is honest.
@@ -1683,14 +2526,14 @@ class MainWindow(QMainWindow):
             return
         # "Not checked" is only honest about a mesh that exists. Said about an
         # empty case it invites the user to run checkMesh on nothing, so the
-        # dormant "No mesh yet." stands until there is something to measure.
+        # dormant no-mesh line stands until there is something to measure.
         if not self._actionSnapshot().has_mesh:
             self.clearMeshVerdict()
             return
 
         # The strip's dormant state means "there is no mesh". Once a mesh
         # exists it must never read that way again, whatever happens below --
-        # a mesh drawn on screen under a line saying "No mesh yet." is the
+        # a mesh drawn on screen under a line saying no mesh exists is the
         # plainest kind of lying surface. Every failure path therefore lands on
         # the `unrated` verdict, which names the command that would produce a
         # real one, rather than on a bare `return`.
@@ -1726,7 +2569,8 @@ class MainWindow(QMainWindow):
             # re-read must not downgrade it to "not checked".
             return
 
-        verdict = apply_waivers(verdict_from_report(report), waivers)
+        verdict = with_layer_coverage(
+            apply_waivers(verdict_from_report(report), waivers))
         self._verdictStrip.show_verdict(verdict)
         self._meshQualityTab.show_verdict(verdict)
         if verdict.get('stale'):
@@ -1913,6 +2757,7 @@ class MainWindow(QMainWindow):
         self._ui.actionRedo.setText(
             self.tr('&Redo {0}').format(snapshot.redo_label)
             if snapshot.redo_label else self.tr('&Redo'))
+        holdBatchLock(self._ui, getattr(self, '_batchLocked', False))
         self._updateWindowTitle()
 
     def _pruneStaleScratchCases(self):
@@ -1971,7 +2816,10 @@ class MainWindow(QMainWindow):
 
         submit(app.facadeClient, 'history.redo', {}, then=redone)
 
-    def _showTransactionHistory(self):
+    def _historyText(self) -> str:
+        """The case's state and artifact history, one line per entry (DP-753)."""
+        if app.project is None:
+            return self.tr('Open a case to see its history.')
         result = query(app.facadeClient, 'history.query', {'limit': 50})
         history = ([{'kind': 'state', **item} for item in result.payload['transactions']] +
                    [{'kind': 'artifact', **item} for item in result.payload['artifacts']])
@@ -1983,7 +2831,7 @@ class MainWindow(QMainWindow):
                 recovery = item.get('recovery_status') or 'none'
                 fingerprint = ''
                 if item.get('before_fingerprint') or item.get('after_fingerprint'):
-                    fingerprint = '  {0} â†’ {1}'.format(
+                    fingerprint = '  {0} → {1}'.format(
                         (item.get('before_fingerprint') or 'none')[:10],
                         (item.get('after_fingerprint') or 'none')[:10])
                 lines.append('{0}  Artifact  {1}  [{2}; recovery: {3}]{4}'.format(
@@ -1992,10 +2840,8 @@ class MainWindow(QMainWindow):
             else:
                 lines.append('{0}  State  {1}  [{2}]'.format(
                     timestamp, item.get('action', ''), item.get('status', '')))
-        details = '\n'.join(lines)
-        QMessageBox.information(
-            self, self.tr('Transaction History'),
-            details or self.tr('No state or artifact transactions have been recorded.'))
+        return ('\n'.join(lines)
+                or self.tr('No state or artifact transactions have been recorded.'))
 
     @qasync.asyncSlot()
     async def showMeshInfo(self):
@@ -2013,11 +2859,11 @@ class MainWindow(QMainWindow):
             self._dialog.setWindowFlags(Qt.WindowType.Widget)
             # `replace`: this builds a fresh dialog from a fresh `mesh.info`
             # run every time. Without it the registry kept the first page and
-            # dropped this one, so re-opening Mesh Info showed the numbers from
+            # dropped this one, so re-opening Mesh info showed the numbers from
             # whenever it was first opened -- and did nothing visible at all
             # when its tab was already in front.
             self._outputTabs.show(
-                'mesh_info', self.tr('Mesh Info'), lambda: self._dialog,
+                'mesh_info', self.tr('Mesh info'), lambda: self._dialog,
                 replace=True)
         else:
             self._dialog.open()
@@ -2049,9 +2895,9 @@ class MainWindow(QMainWindow):
         # file the same report, so everything below is unchanged.
         operation = await self._qaOperationName()
         self.statusBar().showMessage(
-            self.tr('Checking the mesh is readable by SU2...')
+            self.tr('Checking the mesh is readable by SU2…')
             if operation == 'quality.su2_readiness'
-            else self.tr('Running checkMesh...'))
+            else self.tr('Running checkMesh…'))
         MainWindow._selectConsole(self)
         unsubscribe = app.facadeClient.subscribe(
             Event.JOB_OUTPUT,
@@ -2060,7 +2906,7 @@ class MainWindow(QMainWindow):
         try:
             execution = await app.facadeClient.run(operation)
         except (FacadeError, OSError, ValueError) as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Check Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh check error'), str(error))
             return
         finally:
             unsubscribe()
@@ -2125,13 +2971,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_outputTabs'):
             self._dialog.setWindowFlags(Qt.WindowType.Widget)
             # A key of its own. This used to ask for 'quality', which WP3 had
-            # since taken for the permanent Mesh Quality tab -- so the registry
+            # since taken for the permanent Mesh quality tab -- so the registry
             # returned that tab, this dashboard was discarded, and running
             # checkMesh looked like it did nothing whatever. The two are
             # different surfaces: this is one run's full log and set list, that
             # is the standing verdict for the loaded mesh.
             self._outputTabs.show(
-                'mesh_check', self.tr('Mesh Check'), lambda: self._dialog,
+                'mesh_check', self.tr('Mesh check'), lambda: self._dialog,
                 replace=True)
         else:
             self._dialog.open()
@@ -2146,8 +2992,9 @@ class MainWindow(QMainWindow):
             return
         if self._meshManager.showFailedCells(cell_sets[name], name):
             self.statusBar().showMessage(
-                self.tr('Highlighted {0} failed cell(s) from {1}.').format(
-                    len(cell_sets[name]), name), 8000)
+                self.tr('Highlighted {0} from {1}.').format(
+                    count_text(len(cell_sets[name]), 'failed cell'),
+                    name), 8000)
 
     @qasync.asyncSlot()
     async def _runMeshTransformV13(self, operation):
@@ -2159,7 +3006,7 @@ class MainWindow(QMainWindow):
         # Nothing said so, so the click was indistinguishable from a dead menu
         # item, and a user who moved on never saw the dialog arrive.
         self.statusBar().showMessage(
-            self.tr('Preparing mesh {0}...').format(operation))
+            self.tr('Preparing mesh {0}…').format(operation))
         try:
             app.project.assertUnchanged()
             info_result, help_result = await asyncio.gather(
@@ -2173,7 +3020,7 @@ class MainWindow(QMainWindow):
             field_support = '-rotateFields' in help_result.output
             if fields_present and operation != 'rotate':
                 proceed = QMessageBox.warning(
-                    self, self.tr('Existing Result Fields'),
+                    self, self.tr('Existing result fields'),
                     self.tr('This case contains result fields. The selected transform changes mesh points '
                             'but does not transform those fields. Continue?'),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2192,9 +3039,9 @@ class MainWindow(QMainWindow):
             request.argv(utility, app.project.path)
         except (OSError, ValueError, CaseConflictError) as error:
             self.statusBar().clearMessage()
-            await AsyncMessageBox().information(self, self.tr('Invalid Transform'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Invalid transform'), str(error))
             return
-        self.statusBar().showMessage(self.tr('Running mesh {0}...').format(operation))
+        self.statusBar().showMessage(self.tr('Running mesh {0}…').format(operation))
         MainWindow._selectConsole(self)
         parameters = {
             'vector': list(request.vector),
@@ -2210,7 +3057,7 @@ class MainWindow(QMainWindow):
             completed = await app.facadeClient.run(
                 f'mesh.transform.{operation}', parameters)
         except FacadeError as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Transform Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh transform error'), str(error))
             return
         finally:
             unsubscribe()
@@ -2254,8 +3101,8 @@ class MainWindow(QMainWindow):
         try:
             await self._stepManager.openGeometryImport()
         except (OSError, RuntimeError, ValueError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Geometry Import Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Geometry import error'), str(error))
 
     async def _startScratchCase(self, name='untitled') -> bool:
         """Open a case in the temporary directory. The one backend for it.
@@ -2271,8 +3118,8 @@ class MainWindow(QMainWindow):
             if app.createScratchCase(name) is None:
                 return False
         except (OSError, ValueError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Case Create Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Case create error'), str(error))
             return False
         self._projectOpened()
         self.statusBar().showMessage(self.tr(
@@ -2291,8 +3138,8 @@ class MainWindow(QMainWindow):
         try:
             await app.facadeClient.run('client_shell.terminal')
         except (FacadeError, OSError, RuntimeError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Terminal Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Terminal error'), str(error))
 
     @qasync.asyncSlot()
     async def _runMeshRepair(self):
@@ -2311,7 +3158,7 @@ class MainWindow(QMainWindow):
             return
         labels = [operation.label for operation in operations]
         selected, accepted = QInputDialog.getItem(
-            self, self.tr('Mesh Repair'), self.tr('Repair operation:'), labels, 0, False)
+            self, self.tr('Mesh repair'), self.tr('Repair operation'), labels, 0, False)
         if not accepted:
             return
         operation = operations[labels.index(selected)]
@@ -2319,16 +3166,16 @@ class MainWindow(QMainWindow):
         subset_destination = None
         if operation is RepairOperation.SUBSET_CELLS:
             cell_set, accepted = QInputDialog.getText(
-                self, self.tr('Subset Mesh'), self.tr('Existing cell-set name:'))
+                self, self.tr('Subset mesh'), self.tr('Existing cell-set name'))
             if not accepted:
                 return
             parent = QFileDialog.getExistingDirectory(
-                self, self.tr('Select Parent for Subset Case'), app.settings.getRecentLocation(),
+                self, self.tr('Select parent for subset case'), app.settings.getRecentLocation(),
                 QFileDialog.Option.ShowDirsOnly)
             if not parent:
                 return
             name, accepted = QInputDialog.getText(
-                self, self.tr('Subset Mesh'), self.tr('New subset case directory name:'),
+                self, self.tr('Subset mesh'), self.tr('New subset case directory name'),
                 text=f'{app.project.name()}-subset')
             if not accepted or not name.strip():
                 return
@@ -2338,8 +3185,8 @@ class MainWindow(QMainWindow):
             preview = service.preview(
                 app.project.path, RepairRequest(operation, cell_set))
         except (OSError, ValueError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Mesh Repair Unavailable'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Mesh repair unavailable'), str(error))
             return
         warning = self.tr(
             'This operation creates a verified recovery point before changing the mesh.\n'
@@ -2349,7 +3196,7 @@ class MainWindow(QMainWindow):
         if operation is RepairOperation.SUBSET_CELLS:
             warning = self.tr('This destructive operation runs only in a new copied case.')
         confirmation = QMessageBox.question(
-            self, self.tr('Run Mesh Repair'), warning,
+            self, self.tr('Run mesh repair'), warning,
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
         if confirmation != QMessageBox.StandardButton.Ok:
@@ -2373,7 +3220,7 @@ class MainWindow(QMainWindow):
                                        if subset_destination else None),
             })
         except (FacadeError, OSError, ValueError, RuntimeError, CaseConflictError) as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Repair Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh repair error'), str(error))
             return
         finally:
             unsubscribe()
@@ -2391,7 +3238,7 @@ class MainWindow(QMainWindow):
         before = completed.payload['before']
         after = completed.payload['after']
         summary = self.tr(
-            '{0} completed. Mesh bytes: {1:,} â†’ {2:,}; patches: {3} â†’ {4}.').format(
+            '{0} completed. Mesh bytes: {1:,} → {2:,}; patches: {3} → {4}.').format(
                 operation.label, before['total_bytes'], after['total_bytes'],
                 len(before['boundary_patches']), len(after['boundary_patches']))
         quality = completed.payload.get('quality')
@@ -2401,7 +3248,7 @@ class MainWindow(QMainWindow):
                 prior = prior_report.result.severity
                 if prior_report.stale:
                     prior = self.tr('{0} (stale)').format(prior)
-            summary += self.tr(' Readiness: {0} â†’ {1}.').format(
+            summary += self.tr(' Readiness: {0} → {1}.').format(
                 prior, quality['severity'])
             # Per-metric before/after delta from the post-repair re-check.
             if prior_report is not None and completed.payload.get('copied_from') is None:
@@ -2409,7 +3256,7 @@ class MainWindow(QMainWindow):
                     comparison = await app.facadeClient.run(
                         'quality.compare', {'baseline': prior_report.to_dict()})
                     changed = [
-                        self.tr('{0} {1}â†’{2}').format(
+                        self.tr('{0} {1} → {2}').format(
                             metric.replace('_', ' '), item['baseline'], item['current'])
                         for metric, item in comparison.payload['metrics'].items()
                         if item['trend'] in ('improved', 'regressed')]
@@ -2419,7 +3266,7 @@ class MainWindow(QMainWindow):
                     pass
         if completed.payload.get('copied_from') is not None:
             QMessageBox.information(
-                self, self.tr('Subset Case Created'),
+                self, self.tr('Subset case created'),
                 summary + '\n' + self.tr('New case: {0}').format(
                     completed.payload['case_path']))
         else:
@@ -2436,14 +3283,14 @@ class MainWindow(QMainWindow):
         recovery = await app.facadeClient.run('mesh.recovery.list')
         points = recovery.payload.get('recovery_points', ())
         if not points:
-            await AsyncMessageBox().information(
-                self, self.tr('Restore Previous Mesh'),
+            await AsyncMessageBox().warning(
+                self, self.tr('Restore previous mesh'),
                 self.tr('No verified previous-mesh recovery point is available.'))
             self._updateMenuStates()
             return
         payload = points[-1]
         confirmation = QMessageBox.question(
-            self, self.tr('Restore Previous Mesh'),
+            self, self.tr('Restore previous mesh'),
             self.tr('Replace the current mesh with the recovery copy saved before '
                     '"{0}" ({1})?\nThis is an artifact restore, not Undo; the '
                     'current mesh will be replaced and its quality results become stale.').format(
@@ -2456,8 +3303,8 @@ class MainWindow(QMainWindow):
             app.project.assertUnchanged()
             outcome = await app.facadeClient.run('mesh.restore')
         except (FacadeError, OSError, ValueError, CaseConflictError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Restore Previous Mesh Failed'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Restore previous mesh failed'), str(error))
             return
         app.refreshWorkflowResolution()
         if self._meshManager is not None:
@@ -2480,7 +3327,7 @@ class MainWindow(QMainWindow):
             return
         labels = [f"{geometry.value('name')} [{g_id}]" for g_id, geometry in surfaces.items()]
         selected, accepted = QInputDialog.getItem(
-            self, self.tr('Geometry Repair'), self.tr('Surface:'), labels, 0, False)
+            self, self.tr('Geometry repair'), self.tr('Surface'), labels, 0, False)
         if not accepted:
             return
         g_id = list(surfaces)[labels.index(selected)]
@@ -2491,10 +3338,10 @@ class MainWindow(QMainWindow):
             TESSELLATED_ACTIONS,
             key=lambda name: (TESSELLATED_ACTIONS[name].band, name))
         labels = [
-            f'{name}  -  {REPAIR_BANDS[TESSELLATED_ACTIONS[name].band][0]}'
+            f'{name}  —  {REPAIR_BANDS[TESSELLATED_ACTIONS[name].band][0]}'
             for name in operations]
         operation_label, accepted = QInputDialog.getItem(
-            self, self.tr('Geometry Repair'), self.tr('Operation:'),
+            self, self.tr('Geometry repair'), self.tr('Operation'),
             labels, 0, False)
         if not accepted:
             return
@@ -2502,7 +3349,8 @@ class MainWindow(QMainWindow):
         hole_size = 1e6
         if operation == 'tess.fill_holes':
             hole_size, accepted = QInputDialog.getDouble(
-                self, self.tr('Fill Surface Holes'), self.tr('Maximum hole size:'),
+                self, self.tr('Fill surface holes'),
+                self.tr('Maximum hole size (m)'),
                 1e6, 1e-12, 1e18, 6)
             if not accepted:
                 return
@@ -2512,14 +3360,14 @@ class MainWindow(QMainWindow):
                 self._geometryManager.polyData(g_id), operation,
                 hole_size=hole_size)
         except (OSError, ValueError) as error:
-            await AsyncMessageBox().information(self, self.tr('Geometry Repair Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Geometry repair error'), str(error))
             return
         before_counts = {item.kind: item.count for item in result.before.findings}
         after_counts = {item.kind: item.count for item in result.after.findings}
         summary = self.tr(
             'Before score: {0}/100\nAfter score: {1}/100\n'
-            'Open edges: {2} â†’ {3}\nNon-manifold edges: {4} â†’ {5}\n'
-            'Duplicate points: {6} â†’ {7}\n\n'
+            'Open edges: {2} → {3}\nNon-manifold edges: {4} → {5}\n'
+            'Duplicate points: {6} → {7}\n\n'
             'Yes: replace the working surface\nNo: save a repaired copy\nCancel: keep unchanged').format(
                 result.before.score, result.after.score,
                 before_counts.get('open_edges', 0), after_counts.get('open_edges', 0),
@@ -2528,7 +3376,7 @@ class MainWindow(QMainWindow):
                 before_counts.get('duplicate_points', 0),
                 after_counts.get('duplicate_points', 0))
         choice = QMessageBox.question(
-            self, self.tr('Geometry Repair Preview'), summary,
+            self, self.tr('Geometry repair preview'), summary,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
             QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -2536,17 +3384,21 @@ class MainWindow(QMainWindow):
             return
         if choice == QMessageBox.StandardButton.No:
             path, _ = QFileDialog.getSaveFileName(
-                self, self.tr('Save Repaired Geometry Copy'),
+                self, self.tr('Save repaired geometry copy'),
                 str(app.project.path / f"{surfaces[g_id].value('name')}-repaired.stl"),
                 self.tr('STL surface (*.stl);;OBJ surface (*.obj)'))
             if path:
                 try:
-                    await asyncio.to_thread(write_surface, result.polydata, path)
+                    # DP-362. The copy keeps the name the surface is known
+                    # by, so an STL saved here can still be keyed on.
+                    await asyncio.to_thread(
+                        partial(write_surface, result.polydata, path,
+                                solid_name=surfaces[g_id].value('name')))
                     self.statusBar().showMessage(
                         self.tr('Saved repaired geometry copy to {0}.').format(path), 8000)
                 except (OSError, ValueError) as error:
-                    await AsyncMessageBox().information(
-                        self, self.tr('Save Repaired Geometry Error'), str(error))
+                    await AsyncMessageBox().warning(
+                        self, self.tr('Save repaired geometry error'), str(error))
             return
         data = app.facadeClient.checkout()
         data.updateGeometryPolyData(surfaces[g_id].value('path'), result.polydata)
@@ -2579,7 +3431,7 @@ class MainWindow(QMainWindow):
         if not source:
             return
         confirmation = QMessageBox.question(
-            self, self.tr('Convert and Replace Mesh'),
+            self, self.tr('Convert and replace mesh'),
             self.tr('Convert this file into the current case? The current mesh will be retained as a recovery copy.'),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -2591,7 +3443,7 @@ class MainWindow(QMainWindow):
             completed = await app.facadeClient.run(
                 'mesh.import.converter', {'format': fmt.value, 'source': source})
         except (FacadeError, OSError, RuntimeError, ValueError, CaseConflictError) as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Conversion Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh conversion error'), str(error))
             return
         if completed.status != 'accepted':
             detail = (completed.payload.get('validation_error') or
@@ -2599,8 +3451,8 @@ class MainWindow(QMainWindow):
             recovery = (self.tr('The previous mesh was restored.')
                         if completed.payload.get('restored') else
                         self.tr('No replacement mesh was committed.'))
-            await AsyncMessageBox().information(
-                self, self.tr('Mesh Conversion Failed'), f'{detail}\n{recovery}')
+            await AsyncMessageBox().warning(
+                self, self.tr('Mesh conversion failed'), f'{detail}\n{recovery}')
             return
         app.refreshWorkflowResolution()
         self._stepManager.load()
@@ -2610,7 +3462,7 @@ class MainWindow(QMainWindow):
         self._updateMenuStates()
 
     async def _showConversionSummary(self, fmt, completed):
-        """Â§13.2 step 8: conversion warnings plus a patch summary after commit."""
+        """§13.2 step 8: conversion warnings plus a patch summary after commit."""
         lines = [self.tr('{0} conversion completed.').format(fmt.label)]
         try:
             info = await asyncio.to_thread(MeshInfoService().inspect, app.project.path)
@@ -2629,7 +3481,7 @@ class MainWindow(QMainWindow):
             lines.append('')
             lines.append(self.tr('Converter warnings:'))
             lines.extend(warnings)
-        await AsyncMessageBox().information(self, self.tr('Mesh Conversion'), '\n'.join(lines))
+        await AsyncMessageBox().information(self, self.tr('Mesh conversion'), '\n'.join(lines))
 
     @staticmethod
     def _converterUtilities():
@@ -2642,16 +3494,16 @@ class MainWindow(QMainWindow):
 
     async def _loadNativeMeshFromCase(self):
         source = QFileDialog.getExistingDirectory(
-            self, self.tr('Select OpenFOAM Mesh Case'), app.settings.getRecentLocation(),
+            self, self.tr('Select OpenFOAM mesh case'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not source:
             return
-        # Â§13.1 native import contract: ask copy versus replace explicitly.
+        # §13.1 native import contract: ask copy versus replace explicitly.
         box = QMessageBox(self)
-        box.setWindowTitle(self.tr('Import Native Mesh'))
+        box.setWindowTitle(self.tr('Import native mesh'))
         box.setText(self.tr('How should the selected polyMesh be imported?'))
-        replace = box.addButton(self.tr('Replace Current Mesh'), QMessageBox.ButtonRole.AcceptRole)
-        copy = box.addButton(self.tr('Import into New Case Copy'), QMessageBox.ButtonRole.ActionRole)
+        replace = box.addButton(self.tr('Replace current mesh'), QMessageBox.ButtonRole.AcceptRole)
+        copy = box.addButton(self.tr('Import into new case copy'), QMessageBox.ButtonRole.ActionRole)
         cancel = box.addButton(QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(cancel)  # destructive choice is never the default
         box.setInformativeText(self.tr(
@@ -2668,7 +3520,7 @@ class MainWindow(QMainWindow):
             app.project.assertUnchanged()
             await app.facadeClient.run('mesh.import.native', {'source': source})
         except (FacadeError, OSError, ValueError, CaseConflictError) as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Import Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), str(error))
             return
         app.refreshWorkflowResolution()
         self._stepManager.load()
@@ -2679,12 +3531,12 @@ class MainWindow(QMainWindow):
 
     async def _importNativeMeshIntoCopy(self, source):
         parent = QFileDialog.getExistingDirectory(
-            self, self.tr('Select Parent for New Case Copy'), app.settings.getRecentLocation(),
+            self, self.tr('Select parent for new case copy'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
         name, accepted = QInputDialog.getText(
-            self, self.tr('Import into New Case Copy'), self.tr('New case directory name:'),
+            self, self.tr('Import into new case copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-imported')
         if not accepted or not name.strip():
             return
@@ -2693,10 +3545,10 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run('mesh.import.native', {
                 'source': source, 'copy_destination': str(destination)})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().information(self, self.tr('Mesh Import Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), str(error))
             return
         open_copy = QMessageBox.question(
-            self, self.tr('Import Complete'),
+            self, self.tr('Import complete'),
             self.tr('Imported the mesh into {0}. Open that case now?').format(
                 result.payload['target_case']),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2717,12 +3569,12 @@ class MainWindow(QMainWindow):
             return
         await app.facadeClient.run('case.save')
         parent = QFileDialog.getExistingDirectory(
-            self, self.tr('Select Copy Parent Directory'), app.settings.getRecentLocation(),
+            self, self.tr('Select copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
         name, accepted = QInputDialog.getText(
-            self, self.tr('Save Project As'), self.tr('New case directory name:'),
+            self, self.tr('Save project as'), self.tr('New case directory name'),
             text=f'{app.project.name()}-copy')
         if not accepted or not name.strip():
             return
@@ -2730,10 +3582,10 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run(
                 'case.copy', {'destination': str(Path(parent) / name.strip())})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().information(self, self.tr('Copy Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Copy error'), str(error))
             return
         open_copy = QMessageBox.question(
-            self, self.tr('Copy Complete'), self.tr('Open the copied case now?'),
+            self, self.tr('Copy complete'), self.tr('Open the copied case now?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if open_copy == QMessageBox.StandardButton.Yes:
@@ -2776,8 +3628,8 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run('case.copy', {
                 'destination': str(destination), 'carry_history': True})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Save Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Save error'), str(error))
             return False
 
         # Opening the destination closes the scratch case, which would put the
@@ -2830,12 +3682,12 @@ class MainWindow(QMainWindow):
 
     async def _saveConflictCopy(self):
         parent = QFileDialog.getExistingDirectory(
-            self, self.tr('Select Save Copy Parent Directory'), app.settings.getRecentLocation(),
+            self, self.tr('Select save copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return False
         name, accepted = QInputDialog.getText(
-            self, self.tr('Save Copy'), self.tr('New case directory name:'),
+            self, self.tr('Save copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-conflict-copy')
         if not accepted or not name.strip():
             return False
@@ -2843,20 +3695,21 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run(
                 'case.copy', {'destination': str(Path(parent) / name.strip())})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().information(self, self.tr('Save Copy Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Save copy error'), str(error))
             return False
         self.statusBar().showMessage(
             self.tr('Saved a conflict-safe copy to {0}.').format(
                 result.payload['destination']), 8000)
         return True
 
-    def _chooseTheme(self):
-        current = app.themeManager.mode.value.title()
-        choices = [ThemeMode.SYSTEM.value.title(), ThemeMode.LIGHT.value.title(), ThemeMode.DARK.value.title()]
-        selected, accepted = QInputDialog.getItem(self, self.tr('Theme'), self.tr('Appearance'),
-                                                   choices, choices.index(current), False)
-        if accepted:
-            app.themeManager.set_mode(selected.lower())
+    def _openPreferences(self):
+        # DP-759. The theme is one page of it; the runtime, diagnostics and
+        # qualification pages write through the setters their readers use.
+        self._dialog = PreferencesDialog(
+            self, settings=app.settings, themeManager=app.themeManager,
+            applyRuntime=app.applyOpenFoamRuntime,
+            privacy=self._openPrivacySettings if self._privacyConfigured else None)
+        self._dialog.open()
 
     def _openRecent(self, path):
         self._openProject(path)
@@ -2868,13 +3721,13 @@ class MainWindow(QMainWindow):
 
     def _actionNew(self):
         path = QFileDialog.getExistingDirectory(
-            self, self.tr('Select Empty Case Directory'), app.settings.getRecentLocation(),
+            self, self.tr('Select empty case directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if path:
             self._createInPlaceCase(Path(path))
 
     def _actionOpen(self):
-        self._dialog = QFileDialog(self, self.tr('Select Project Directory'), app.settings.getRecentLocation())
+        self._dialog = QFileDialog(self, self.tr('Select project directory'), app.settings.getRecentLocation())
         if platform.system() == 'Darwin':  # "show()" for native File dialog does not seem to work on macOS
             self._dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
 
@@ -2894,8 +3747,8 @@ class MainWindow(QMainWindow):
                 await app.facadeClient.run('case.save')
             except CaseConflictError as error:
                 choice = await AsyncMessageBox().question(
-                    self, self.tr('Case Changed Outside FoamMesh'),
-                    self.tr('{0}\n\nYes: Reload case\nNo: Save Copy\nCancel: return without saving.').format(error),
+                    self, self.tr('Case changed outside FoamMesh'),
+                    self.tr('{0}\n\nYes: Reload case\nNo: Save copy\nCancel: Return without saving.').format(error),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
                     QMessageBox.StandardButton.Cancel)
                 if choice == QMessageBox.StandardButton.Yes:
@@ -2916,7 +3769,7 @@ class MainWindow(QMainWindow):
             app.openCase(path)
             self._projectOpened()
         except (OSError, ValueError, Timeout) as error:
-            await AsyncMessageBox().information(self, self.tr('Reload Error'), str(error))
+            await AsyncMessageBox().warning(self, self.tr('Reload error'), str(error))
 
     def _actionSaveAs(self):
         self._dialog = NewProjectDialog(self, self.tr('Save as new project'),
@@ -2928,12 +3781,79 @@ class MainWindow(QMainWindow):
         self._dialog = MeshQualityParametersDialog(self)
         self._dialog.open()
 
-    def _openParallelEnvironmentDialog(self):
-        self._dialog = ParallelEnvironmentDialog(self, app.project.parallelEnvironment())
-        if app.fileSystem.timePathExists(1, app.project.parallelCores() > 1):
-            self._dialog.setReadOnly()
-        self._dialog.accepted.connect(self._updateParallelEnvironment)
-        self._dialog.open()
+    #: Object names for the two Plan 33 FORM-03/FORM-02 Help entries, so a
+    #: gate can find them without matching on the words.
+    STEP_HELP_ACTION = 'actionWhatThisStepIsFor'
+    STEP_DETAILS_ACTION = 'actionCalculatedSettingsForThisStep'
+
+    def _installStepHelpActions(self):
+        """Put the step page's own two explanations in the Help menu.
+
+        Plan 33 FORM-03 and FORM-02. Each task page used to carry a help
+        band of its own -- a header row the height of a control, holding one
+        `?` -- and ten of them ended their settings column with a read-only
+        table of native mappings. Neither is a setting, and both are now
+        where a reader looks for an explanation they did not ask for.
+
+        Added here rather than in the form, because the form is generated.
+        """
+        menu = getattr(self._ui, 'menuHelp', None)
+        if menu is None:
+            return
+        first = menu.actions()[0] if menu.actions() else None
+        menu.setToolTipsVisible(True)  # DP-758
+        self._stepHelpAction = QAction(self.tr('What this step is for'), self)
+        self._stepHelpAction.setObjectName(self.STEP_HELP_ACTION)
+        self._stepHelpAction.triggered.connect(self._openStepHelp)
+        self._stepDetailsAction = QAction(
+            self.tr('Calculated settings for this step'), self)
+        self._stepDetailsAction.setObjectName(self.STEP_DETAILS_ACTION)
+        self._stepDetailsAction.triggered.connect(self._openStepDetails)
+        separator = QAction(self)
+        separator.setSeparator(True)
+        for action in (self._stepHelpAction, self._stepDetailsAction,
+                       separator):
+            menu.insertAction(first, action)
+        menu.aboutToShow.connect(self._updateStepHelpActions)
+        self._updateStepHelpActions()
+
+    def _currentStepPage(self):
+        """The task page the middle region is showing, if it is showing one."""
+        for page in self.findChildren(EngineTaskPage):
+            if page.isVisible():
+                return page
+        return None
+
+    def _updateStepHelpActions(self):
+        """Offer each entry only where it has something to open.
+
+        DP-758: a disabled entry says why, on hover and in the status bar,
+        instead of being grey with no explanation.
+        """
+        page = self._currentStepPage()
+        if page is None:
+            reasons = (self.tr('Open a meshing task to see its help'),) * 2
+        else:
+            reasons = (
+                '' if page.stepHelpText()
+                else self.tr('This step has no help of its own'),
+                '' if page.detailRows()
+                else self.tr('This step has no calculated settings'))
+        for action, reason in zip(
+                (self._stepHelpAction, self._stepDetailsAction), reasons):
+            action.setEnabled(not reason)
+            action.setToolTip(reason or action.text())
+            action.setStatusTip(reason)
+
+    def _openStepHelp(self):
+        page = self._currentStepPage()
+        if page is not None:
+            self._dialog = page.showStepHelp()
+
+    def _openStepDetails(self):
+        page = self._currentStepPage()
+        if page is not None:
+            self._dialog = page.showDetails()
 
     def _actionAbout(self):
         self._dialog = AboutDialog(self)
@@ -2979,7 +3899,7 @@ class MainWindow(QMainWindow):
 
         if kind is CaseKind.FOAMMESH_CASE:
             answer = await AsyncMessageBox().question(
-                self, self.tr('Case Already Here'),
+                self, self.tr('Case already here'),
                 self.tr('{0} already holds a FoamMesh case.\n\n'
                         'Open it instead?').format(path.name))
             if answer == QMessageBox.StandardButton.Yes:
@@ -2987,7 +3907,7 @@ class MainWindow(QMainWindow):
             return
         if kind in {CaseKind.OPENFOAM_CASE, CaseKind.RAW_POLY_MESH_CASE}:
             answer = await AsyncMessageBox().question(
-                self, self.tr('Case Already Here'),
+                self, self.tr('Case already here'),
                 self.tr('{0} already holds an OpenFOAM case.\n\n'
                         'Adopt it instead? Its mesh and dictionaries are '
                         'read where they are; nothing is copied or '
@@ -2996,8 +3916,8 @@ class MainWindow(QMainWindow):
                 await self._openProject(str(path))
             return
         if kind is CaseKind.INVALID:
-            await AsyncMessageBox().information(
-                self, self.tr('Case Create Error'),
+            await AsyncMessageBox().warning(
+                self, self.tr('Case create error'),
                 self.tr('{0} cannot hold a new case: {1}').format(
                     path, reasons or self.tr('it is not empty')))
             return
@@ -3007,8 +3927,8 @@ class MainWindow(QMainWindow):
                 self._recentFilesMenu.addRecentest(app.project.path)
                 self._projectOpened()
         except (FileExistsError, OSError, ValueError) as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Case Create Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Case create error'), str(error))
 
     # Compatibility entry point for callers that still invoke the old name.
     async def _createProject(self):
@@ -3036,24 +3956,24 @@ class MainWindow(QMainWindow):
             # simply been moved, renamed or deleted -- a diagnosis of the
             # wrong thing entirely, and one that sent people looking for a
             # case format problem that was not there.
-            await AsyncMessageBox().information(
-                self, self.tr('Project Open Error'),
+            await AsyncMessageBox().warning(
+                self, self.tr('Project open error'),
                 self.tr('{0} is no longer there. It has been moved, renamed '
                         'or deleted since it was last opened.').format(path))
         except Timeout:
-            await AsyncMessageBox().information(self, self.tr('Project Open Error'),
+            await AsyncMessageBox().warning(self, self.tr('Project open error'),
                                                 self.tr('{0} is already open in another program.').format(path.name))
         except ValidationError as e:
-            await AsyncMessageBox().information(self, self.tr('Project Open Error'),
-                                                self.tr(f'configurations error : {e.path} - {e.name}'))
+            await AsyncMessageBox().warning(self, self.tr('Project open error'),
+                                                self.tr('Configuration error: {0} — {1}.').format(e.path, e.name))
         except ValueError as error:
-            await AsyncMessageBox().information(
-                self, self.tr('Project Open Error'), str(error))
+            await AsyncMessageBox().warning(
+                self, self.tr('Project open error'), str(error))
 
     @qasync.asyncSlot()
     async def _saveAs(self, path):
         if await self._stepManager.saveCurrentPage():
-            progressDialog = ProgressDialog(self, self.tr('Save FoamMesh State As'))
+            progressDialog = ProgressDialog(self, self.tr('Save FoamMesh state as'))
             progressDialog.open()
 
             progressDialog.setLabelText(self.tr(
@@ -3062,11 +3982,11 @@ class MainWindow(QMainWindow):
                 await asyncio.to_thread(app.project.saveStateAsCase, path)
             except (OSError, ValueError, FileExistsError) as error:
                 progressDialog.close()
-                await AsyncMessageBox().information(self, self.tr('Save State Error'), str(error))
+                await AsyncMessageBox().warning(self, self.tr('Save state error'), str(error))
                 return
             progressDialog.close()
             open_copy = QMessageBox.question(
-                self, self.tr('State Copy Complete'),
+                self, self.tr('State copy complete'),
                 self.tr('FoamMesh state was saved without native artifacts. Open it now?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
@@ -3079,12 +3999,17 @@ class MainWindow(QMainWindow):
     def _disableMenubar(self):
         self._ui.menuFile.setEnabled(False)
         self._ui.menuMesh.setEnabled(False)
-        self._ui.menuParallel.setEnabled(False)
+        # DP-756. An undo under a running batch rewrites the case the batch
+        # is still writing, so Edit goes too, and its keys with it.
+        self._ui.menuEdit.setEnabled(False)
+        self._batchLocked = True
+        holdBatchLock(self._ui, True)
 
     def _enableMenubar(self):
         self._ui.menuFile.setEnabled(True)
         self._ui.menuMesh.setEnabled(True)
-        self._ui.menuParallel.setEnabled(True)
+        self._ui.menuEdit.setEnabled(True)
+        self._batchLocked = False
         self._updateMenuStates()
 
     @qasync.asyncSlot()
@@ -3105,9 +4030,9 @@ class MainWindow(QMainWindow):
 
         if app.jobManager.active_job_ids:
             choice = await AsyncMessageBox().question(
-                self, self.tr('Active Operation'),
-                self.tr('A case operation is running.\n\nYes: Cancel Operation\n'
-                        'No: Keep Running and keep this case open\nCancel: Return'),
+                self, self.tr('Active operation'),
+                self.tr('A case operation is running.\n\nYes: Cancel operation\n'
+                        'No: Keep running and keep this case open\nCancel: Return'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
                 QMessageBox.StandardButton.Cancel)
             if choice == QMessageBox.StandardButton.Yes:
@@ -3130,7 +4055,7 @@ class MainWindow(QMainWindow):
         # to save it is the fourth dialog of a four-dialog save, and its only
         # honest answer is the one already given.
         if app.project.isDirty and not self._relocatingScratch:
-            confirm = await AsyncMessageBox().question(self, self.tr('Save Changed'),
+            confirm = await AsyncMessageBox().question(self, self.tr('Save changed'),
                                                        self.tr('Do you want to save your changes?'),
                                                        QMessageBox.StandardButton.Ok
                                                        | QMessageBox.StandardButton.Cancel
@@ -3140,8 +4065,8 @@ class MainWindow(QMainWindow):
                 try:
                     await app.facadeClient.run('case.save')
                 except CaseConflictError as error:
-                    await AsyncMessageBox().information(
-                        self, self.tr('Case Changed Outside FoamMesh'), str(error))
+                    await AsyncMessageBox().warning(
+                        self, self.tr('Case changed outside FoamMesh'), str(error))
                     return False
             elif confirm == QMessageBox.StandardButton.Cancel:
                 return False
@@ -3182,26 +4107,6 @@ class MainWindow(QMainWindow):
 
         return True
 
-    @qasync.asyncSlot()
-    async def _updateParallelEnvironment(self):
-        environment = self._dialog.environment()
-
-        progressDialog = ProgressDialog(self._dialog, self.tr('Case Redistribution'))
-        progressDialog.setLabelText(self.tr('Redistributing the case...'))
-        progressDialog.open()
-        await app.facadeClient.run('case.parallel.configure', {
-            'parallel': {
-                'cores': environment.np(), 'type': environment.type().name,
-                'hosts': environment.hosts(),
-            },
-            'on_progress': progressDialog.setLabelText})
-        if self._meshManager is not None:
-            await self._meshManager.reload()
-        app.capabilities.refresh()
-        app.events.publish(
-            Event.CAPABILITIES_CHANGED, case_id=str(app.project.path))
-        progressDialog.finish('Parallel Environment was Applied.')
-
     def _projectOpened(self):
         self._recentFilesMenu.updateRecentest(app.project.path)
         # MEASURED 2026-09-03: the start-up prompt "Open a case or create a
@@ -3215,32 +4120,44 @@ class MainWindow(QMainWindow):
         self._handler.setFormatter(logging.Formatter("[%(asctime)s][%(name)s] ==> %(message)s"))
         logging.getLogger().addHandler(self._handler)
         scene_events = (
-            Event.TRANSACTION_APPLIED, Event.UNDONE, Event.REDONE,
+            Event.TRANSACTION_APPLIED,
             Event.ARTIFACT_GEOMETRY_CHANGED, Event.ARTIFACT_MESH_CHANGED,
-            Event.ARTIFACT_RESTORED,
+        )
+        # DP-363. These three replace the stored values under the user, so
+        # the form they are looking at has to be repainted to match.
+        history_events = (
+            Event.UNDONE, Event.REDONE, Event.ARTIFACT_RESTORED,
         )
         menu_events = (
             Event.ARTIFACT_QUALITY_CHANGED, Event.ARTIFACT_STALE,
             Event.WORKFLOW_MODE_CHANGED, Event.WORKFLOW_STEP_STALE,
-            Event.PROJECT_SAVED, Event.CAPABILITIES_CHANGED,
+            Event.PROJECT_SAVED,
         )
         self._projectEventUnsubscribes = [
             app.events.subscribe(event, self._scheduleProjectRefresh)
             for event in scene_events
         ] + [
+            app.events.subscribe(event, self._scheduleProjectReload)
+            for event in history_events
+        ] + [
             app.events.subscribe(event, self._scheduleMenuRefresh)
             for event in menu_events
+        ] + [
+            # A re-probe is what changes a capability answer; the rest of the
+            # menu events only change what the answer is being used for.
+            app.events.subscribe(
+                Event.CAPABILITIES_CHANGED, self._capabilitiesReprobed),
         ] + [
             # WP3.1. A verdict for a mesh the settings have moved on from must
             # not keep reading as current.
             app.events.subscribe(
                 Event.MESH_VERDICT_STALE, self._meshVerdictSuperseded),
         ] + [
-            # R143. MEASURED: Snappy QA ran checkMesh -allTopology
+            # R143. MEASURED: the snappy Quality row ran checkMesh -allTopology
             # -allGeometry -writeSets on the 67,662-cell mesh, wrote every
             # metric plus `failed_checks: 1` and the concave-cell finding to
             # foammesh/quality/latest.json, and set the outline row to
-            # warning -- and the Mesh Quality tab underneath still read "This
+            # warning -- and the Mesh quality tab underneath still read "This
             # mesh has not been checked", the strip "Quality limits: not
             # checked". Both surfaces read that exact file, through
             # `quality.report`; nothing ever asked them to read it again.
@@ -3262,6 +4179,18 @@ class MainWindow(QMainWindow):
         self._geometryManager = GeometryManager()
         self._meshManager = MeshManager()
         self._meshManager.cellCountChanged.connect(self._cellCountChanged)
+        # DP-485. A job that rewrites the mesh waits for the viewport to
+        # finish reading it.
+        try:
+            self._projectEventUnsubscribes.append(
+                app.facadeClient.session().jobs.add_read_barrier(
+                    self._meshManager.readsFinished))
+        except Exception:       # noqa: BLE001 - no session, no writers
+            logger.debug('no job manager to hold for mesh reads')
+        # DP-96. What is on screen and how big it is, said where the user
+        # is already looking rather than in a panel they have to open.
+        self._meshManager.meshSummaryChanged.connect(
+            self._viewportOverlay.setMesh)
 
         self._geometryManager.load()
         self._stepManager.load()
@@ -3319,6 +4248,17 @@ class MainWindow(QMainWindow):
         self._viewportOverlay.setParts([])
         # The run line named a mesh from the case that is closing.
         self._viewportOverlay.setResult('')
+        self._viewportOverlay.setMesh('')
+        # GEO-05. So did the run strip, and nothing here ever cleared it, so
+        # the previous case's run id, verdict and cell count were still on
+        # screen over a case that held no mesh at all. The offer and the
+        # allocation go with it: both name workers and a mesh belonging to
+        # the case that is closing.
+        strip = getattr(self, '_runStatusStrip', None)
+        if strip is not None:
+            strip.clear()
+        self._offeredResult = None
+        self._lastRunAllocation = None
         # The sets belong to the case that is closing; carrying them into the
         # next one would enable a button that acts on cells that are gone.
         self._lastFailedCellSets = {}
@@ -3344,3 +4284,10 @@ class MainWindow(QMainWindow):
         text, tip = cell_count_text(visible, total)
         self._ui.cellCount.setText(text)
         self._ui.cellCount.setToolTip(tip)
+        # DP-811. The whole-mesh count is on the overlay card; the toolbar
+        # keeps the readout only while a section makes the two numbers differ.
+        readout = getattr(self._ui, 'widget_17', None) or self._ui.cellCount
+        sectioned = 0 < visible < total
+        isHidden = getattr(readout, 'isHidden', None)
+        if callable(isHidden) and isHidden() == sectioned:
+            readout.setVisible(sectioned)

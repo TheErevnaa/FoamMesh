@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import re
+
+from foammesh.core.quantities import count_text
 
 from .layers import BoundaryLayers, derive_boundary_layers
 from .periodic import PeriodicPlan, derive_periodic_pairs
@@ -166,17 +169,18 @@ EXPORTER_ELEMENT_ORDERS: dict[str, tuple[int, ...]] = {
 #: to a user unchanged.
 ELEMENT_ORDER_REFUSALS: dict[tuple[str, int], str] = {
     ('openfoam', 2): (
-        'OpenFOAM 13 reads first-order MSH 2.2 and nothing else -- gmshToFoam '
-        'and the direct polyMesh publisher both do -- so a quadratic mesh '
+        'OpenFOAM 13 reads first-order MSH 2.2 and nothing else — gmshToFoam '
+        'and the direct polyMesh publisher both do — so a quadratic mesh '
         'cannot be exported to it. Clear the target solver to mesh at order 2: '
         'the native MSH is kept and counted, and no polyMesh is published.'),
     ('su2', 2): (
         "FoamMesh's own SU2 reader and census hold the linear VTK type codes "
-        'only -- 10, 12, 13 and 14 -- so a quadratic SU2 file, whose cells '
+        'only — 10, 12, 13 and 14 — so a quadratic SU2 file, whose cells '
         'carry code 24, is one this application would write and then be unable '
-        'either to open or to count. The export is refused rather than written '
-        'unreadable. Clear the target solver to mesh at order 2 natively; '
-        'qualifying the SU2 exporter for second order is separate work.'),
+        'either to open or to count. So no quadratic SU2 file is written: the '
+        'mesh is made and exported at first order instead. Clear the target '
+        'solver to mesh at order 2 natively; qualifying the SU2 exporter for '
+        'second order is separate work.'),
 }
 #: The order every route accepts, and therefore what an unknown target clamps
 #: to.
@@ -512,6 +516,10 @@ class Dimensionality:
     front_patch: str = 'front'
     back_patch: str = 'back'
     warnings: tuple[str, ...] = ()
+    #: DP-675. ``((name, (curve tag, ...)), ...)``: the patch each boundary
+    #: curve of a section is published as. A curve not listed keeps
+    #: ``edge_<tag>``.
+    edge_names: tuple = ()
 
     @property
     def planar(self) -> bool:
@@ -529,6 +537,7 @@ class Dimensionality:
             'thickness': self.thickness, 'wedgeAngle': self.wedge_angle,
             'wedgeAxis': self.wedge_axis, 'frontPatch': self.front_patch,
             'backPatch': self.back_patch, 'warnings': list(self.warnings),
+            'edgeNames': {name: list(tags) for name, tags in self.edge_names},
             'calculation_version': DIMENSION_VERSION,
         }
 
@@ -548,6 +557,59 @@ def _number(value, default: float) -> float:
     if value is None or value == '':
         return default
     return float(value)
+
+
+#: A patch name OpenFOAM and SU2 both take: a word, no spaces or punctuation.
+_PATCH_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def parse_edge_names(text) -> tuple:
+    """``'inlet: 1; walls: 2, 4'`` -> ``(('inlet', (1,)), ('walls', (2, 4)))``.
+
+    DP-675 (field audit 0924 gmsh-generate-export D11). A section's boundary
+    is curves, and the prepared-geometry store names faces, so there is no
+    name to inherit: the user names the curves by the tag a first run
+    publishes as ``edge_<tag>``. Refused with the offending entry named, never
+    guessed.
+    """
+    names: list = []
+    seen: dict = {}
+    for entry in str(text or '').replace(chr(10), ';').split(';'):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, colon, tags = entry.partition(':')
+        name = name.strip()
+        if not colon or not _PATCH_NAME.match(name):
+            raise PlanDerivationError(
+                f'edge names: {entry!r} is not "name: tag, tag"; a name is '
+                'one word of letters, digits and underscores, followed by a '
+                'colon and the curve tags a first run named edge_<tag>')
+        numbers = []
+        for token in re.split(r'[\s,]+', tags.strip()):
+            if not token:
+                continue
+            token = token[5:] if token.lower().startswith('edge_') else token
+            if not token.isdigit() or int(token) <= 0:
+                raise PlanDerivationError(
+                    f'edge names: {token!r} in {entry!r} is not a curve tag; '
+                    'tags are the positive numbers in edge_<tag>')
+            tag = int(token)
+            if tag in seen and seen[tag] != name:
+                raise PlanDerivationError(
+                    f'edge names: curve {tag} is named both {seen[tag]!r} '
+                    f'and {name!r}; a curve belongs to one patch')
+            seen[tag] = name
+            numbers.append(tag)
+        if not numbers:
+            raise PlanDerivationError(
+                f'edge names: {name!r} lists no curve tags')
+        names.append((name, tuple(numbers)))
+    merged: dict = {}
+    for name, tags in names:
+        merged.setdefault(name, [])
+        merged[name].extend(tag for tag in tags if tag not in merged[name])
+    return tuple((name, tuple(tags)) for name, tags in merged.items())
 
 
 def derive_dimensionality(values: dict) -> Dimensionality:
@@ -590,9 +652,16 @@ def derive_dimensionality(values: dict) -> Dimensionality:
         raise PlanDerivationError(
             f'the front and back patches are both named {front!r}; the two '
             'faces of a planar mesh have to be two patches')
+    edge_names = parse_edge_names(values.get('edgeNames'))
+    for name, _tags in edge_names:
+        if name in (front, back):
+            raise PlanDerivationError(
+                f'edge names: {name!r} is also the name of the front or back '
+                'face; a boundary curve and a face cannot share a patch')
     return Dimensionality(
         mode=mode, thickness=thickness, wedge_angle=angle, wedge_axis=axis,
-        front_patch=front, back_patch=back, warnings=tuple(warnings))
+        front_patch=front, back_patch=back, warnings=tuple(warnings),
+        edge_names=edge_names)
 
 
 @dataclass(frozen=True)
@@ -895,6 +964,12 @@ class JobIntent:
             'gmsh.periodic': list(self.periodic.warnings),
             'gmsh.compute': list(self.export.warnings),
         }
+        # DP-612 (field audit 0924 gmsh-sizing D4): a local-size curve row
+        # that "From points" switches off belongs to both pages involved.
+        curve_texts = curve_size_warnings(self.curve_controls, self.sizing)
+        if curve_texts:
+            by_task['gmsh.curve_controls'] = list(curve_texts)
+            by_task['gmsh.global_sizing'].extend(curve_texts)
         attributed = {text for texts in by_task.values() for text in texts}
         # Anything raised by the derivation itself rather than by a component
         # -- the threading warning today -- belongs where its controls are.
@@ -902,6 +977,49 @@ class JobIntent:
             text for text in self.warnings if text not in attributed)
         return {task_id: tuple(texts) for task_id, texts in by_task.items()
                 if texts}
+
+
+def configured_tasks(intent) -> frozenset:
+    """Which optional Gmsh tasks the configuration in one job asks for.
+
+    DP-228. The recorder used to decide that an optional task was unused from
+    the graph state alone. MEASURED on the `workflow-ux-20260915` audit: the
+    Boundary layers page was saved with three layers on a named patch, the
+    save was refused as locked by prerequisites and reported to the user as
+    `Settings saved`, the run then grew 7,914 prisms, and the record read
+    `gmsh.boundary_layers: skipped` because the task was still READY. What a
+    run used is a property of the job the run consumed, so it is read off the
+    job.
+
+    Each test here is the test the runner itself makes. `apply_boundary_layers`
+    in `src/resources/gmsh/runner_v1.py` returns before it builds anything
+    unless `layers.enabled`; the other four are empty collections, which the
+    runner walks zero times. The keys are the ones :meth:`JobIntent.to_dict`
+    writes, and the task ids are the ones
+    :meth:`JobIntent.derived_settings_by_task` already attributes them to.
+
+    `intent` is whatever the job document carried, which may be nothing at all
+    on a job written by an older build, so every lookup is defended: an
+    unreadable intent names no task and the recorder falls back on the graph.
+    """
+    if not isinstance(intent, dict):
+        return frozenset()
+
+    def block(key):
+        value = intent.get(key)
+        return value if isinstance(value, dict) else {}
+
+    asked = {
+        'gmsh.size_fields': bool(block('sizeFields').get('fields')),
+        'gmsh.curve_controls': bool(intent.get('curveControls')),
+        'gmsh.volume_controls': bool(
+            intent.get('volumeControls')
+            or block('structuring').get('automatic')
+            or block('structuring').get('transfiniteTri')),
+        'gmsh.boundary_layers': bool(block('layers').get('enabled')),
+        'gmsh.periodic': bool(block('periodic').get('pairs')),
+    }
+    return frozenset(task_id for task_id, used in asked.items() if used)
 
 
 def _enum(value, default=''):
@@ -926,6 +1044,16 @@ def _rows(value):
 #: all -- gets tetrahedra, because a recombined mesh fails checkMesh on every
 #: geometry measured (see ``GmshCellShape`` in the schema).
 RECOMBINING_SOLVERS = frozenset({'su2'})
+
+#: DP-628. Said whenever hexahedra are asked for. It is a caution, not a
+#: refusal: the same geometry passed at a finer size.
+HEXAHEDRAL_ON_CURVES = (
+    'hexahedra are made by subdividing the tetrahedra, and on a curved '
+    'surface at a coarse size that can turn a cell inside out: on a box with '
+    'a spherical hole at 0.2 mm, one of 5500 hexahedra came out inverted. '
+    'checkMesh accepted that mesh, but the quality check refuses an inverted '
+    'cell and the refusal cannot be waived. A smaller size on the curved '
+    'faces avoided it (0.12 mm passed).')
 
 
 def derive_structuring(values: dict,
@@ -986,6 +1114,10 @@ def derive_algorithms(values: dict,
             f'{", ".join(sorted(RECOMBINATION_ALGORITHM))}')
     split = bool(values.get('splitQuadrangles', False))
     warnings: tuple = ()
+    if cell_shape == 'hexahedral':
+        # DP-628 (field audit 0924 gmsh-generate-export D5). See
+        # GmshCellShape: subdivision can invert a cell on a curved face.
+        warnings += (HEXAHEDRAL_ON_CURVES,)
     if split and not recombine:
         # A control that changes nothing must say so rather than sit on the
         # page looking as though it did something.
@@ -1056,14 +1188,37 @@ def derive_farfield(values: dict) -> Farfield:
     return Farfield(enabled=enabled, padding=padding, sealed_cavities=policy)
 
 
-def derive_parallel(values: dict, algorithms: Algorithms | None = None
-                    ) -> Parallel:
+def resolve_parallel_threads(resource_policy, *, requested: int = 0) -> int:
+    """How many threads the execution policy gives this Gmsh run.
+
+    Plan 33 SETUP-03 / DP-X2. The runner reads ``intent.parallel.threads`` into
+    ``General.NumThreads``, and that number came from ``gmsh/parallel/threads``
+    alone -- a schema default of 1 that no control in the application writes.
+    MEASURED: every Gmsh mesh started from the window ran on one thread, on a
+    machine with sixteen, with the core control on the page reading whatever
+    the user had set. The count is asked of the shared policy function so that
+    the page, the plan and the job cannot answer differently.
+    """
+    from foammesh.core.execution.resources import effective_cpu_count
+
+    return max(1, min(64, int(effective_cpu_count(
+        resource_policy, requested=max(0, int(requested or 0))))))
+
+
+def derive_parallel(values: dict, algorithms: Algorithms | None = None,
+                    resource_policy=None) -> Parallel:
     # Plan 29 WP8. The fallback is the shipped schema default, not a number
     # chosen here: this line used to say 4 while the schema said 1 and the page
     # said 1, so a project that never touched the control derived a job nobody
     # had asked for.
     default = int(_schema_default('gmsh', 'parallel', 'threads', fallback=1) or 1)
     threads = int(dict(values or {}).get('threads', default) or default)
+    if resource_policy is not None:
+        # A saved thread count above the default is a request and is clamped;
+        # the default is nobody having asked, and then the execution policy
+        # decides. Either way one function answers.
+        threads = resolve_parallel_threads(
+            resource_policy, requested=threads if threads > 1 else 0)
     if not 1 <= threads <= 64:
         raise PlanDerivationError(f'threads {threads} is outside 1-64')
     volume_threaded = (algorithms is None
@@ -1178,9 +1333,27 @@ def derive_corner_points(raw, name: str) -> tuple:
             'transfinite surface interpolates between distinct corners')
     if len(corners) not in (3, 4):
         raise PlanDerivationError(
-            f'curve control {name!r} names {len(corners)} corner(s); a '
+            f'curve control {name!r} names '
+            f'{count_text(len(corners), "corner")}; a '
             'transfinite surface interpolates between three or four')
     return tuple(corners)
+
+
+def curve_size_warnings(curves, sizing) -> tuple[str, ...]:
+    """DP-612 (field audit 0924 gmsh-sizing D4). Local sizes nobody will see.
+
+    A curve row in local-size mode sets a size on its end points, and Gmsh
+    reads point sizes only while Mesh.MeshSizeFromPoints is on. With "From
+    points" unticked the row does nothing, so the runner skips it; this says
+    so before the job runs.
+    """
+    if sizing.from_points:
+        return ()
+    return tuple(
+        f'curve control {curve.name!r} sets a local size, which Gmsh reads '
+        'only while "From points" is ticked on the Global sizing page; it is '
+        'off, so the row will be skipped'
+        for curve in curves if curve.mode == 'size')
 
 
 def derive_curve_controls(rows) -> tuple[CurveControl, ...]:
@@ -1274,11 +1447,18 @@ def derive_job_intent(request) -> JobIntent:
             'engine_id': 'gmsh',
             'configuration_revision': getattr(
                 request, 'configuration_revision', None),
-        })
+        },
+        # Plan 33 DP-X2. The policy reached the plan document and stopped
+        # there; the thread count the plan reports is now the one the job
+        # carries, because both are derived from it here.
+        resource_policy=dict(getattr(request, 'resource_policy', None) or {})
+        or None)
 
 
 def derive_from_native(native: dict, *, bbox=None, metadata=None,
-                       target_solver='unselected') -> JobIntent:
+                       target_solver='unselected',
+                       prepared_geometry=None,
+                       resource_policy=None) -> JobIntent:
     """Derive from the raw ``gmsh`` configuration section.
 
     Split out from :func:`derive_job_intent` so the derivation can be unit
@@ -1287,6 +1467,11 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     ``target_solver`` is the Plan 28 key. It reaches the derivation rather than
     the runner because the element order it gates has to be settled while the
     user can still see the reason.
+
+    Plan 33 W-G1. ``prepared_geometry`` is the revision the job is being
+    written against. Per-surface size rows name a prepared boundary, and the
+    Gmsh tag that boundary holds is a property of the revision, so it is
+    resolved here rather than saved.
     """
     native = dict(native or {})
     dimensionality = derive_dimensionality(native.get('dimensionality'))
@@ -1295,7 +1480,8 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     algorithms = derive_algorithms(
         native.get('algorithms'), target_solver,
         automatic_structuring=structuring.automatic)
-    parallel = derive_parallel(native.get('parallel'), algorithms)
+    parallel = derive_parallel(native.get('parallel'), algorithms,
+                               resource_policy=resource_policy)
     healing = derive_healing(native.get('healing'))
     quality = derive_thresholds(native.get('optimization'))
     layers = derive_boundary_layers(
@@ -1306,7 +1492,8 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     # field, so a second plan would mean a second background field replacing
     # the first.
     size_fields = size_fields.merged_with(derive_surface_sizes(
-        _rows(native.get('surfaceSizes')), target_size=sizing.target_size))
+        _rows(native.get('surfaceSizes')), target_size=sizing.target_size,
+        prepared_geometry=prepared_geometry))
     # Plan 31 CP-08 item 1. The wiring is checked here, on the merged plan,
     # because that is what reaches Gmsh: a reference to a field the plan does
     # not carry, or two fields reading each other, is a refusal now rather
@@ -1347,7 +1534,7 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
         *sizing.warnings, *healing.warnings, *layers.warnings,
         *size_fields.warnings, *periodic.warnings, *export.warnings,
         *algorithms.warnings, *dimensionality.warnings,
-        *structuring.warnings,
+        *structuring.warnings, *curve_size_warnings(curves, sizing),
     )
     if parallel.threads > 1 and not parallel.volume_threaded:
         # Silence here reads as "sixteen threads were used". They were not.

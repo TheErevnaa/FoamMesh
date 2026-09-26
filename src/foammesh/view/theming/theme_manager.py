@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 
 from .palette import build_palette
 from .fonts import install_application_fonts
+from .metrics import install_control_metrics, install_house_style
 from .icons import clear_icon_cache
 from .qss_renderer import render_qss
 from .tokens import ThemeTokens, load_theme_tokens
@@ -64,6 +65,8 @@ class ThemeManager(QObject):
             tokens = load_theme_tokens(self._directory / f'{resolved}.json')
             template = (self._directory / 'base.qss.tmpl').read_text(encoding='utf-8')
             install_application_fonts(self._application)
+            install_house_style(self._application)
+            install_control_metrics(self._application)
             self._application.setPalette(build_palette(tokens))
             self._application.setStyleSheet(render_qss(template, tokens))
             clear_icon_cache()

@@ -72,7 +72,7 @@
        <widget class="QWidget" name="widget_2" native="true">
         <layout class="QHBoxLayout" name="horizontalLayout_2">
          <property name="spacing">
-          <number>2</number>
+          <number>4</number>
          </property>
          <property name="leftMargin">
           <number>0</number>
@@ -89,14 +89,8 @@
             <property name="leftMargin">
              <number>0</number>
             </property>
-            <property name="topMargin">
-             <number>9</number>
-            </property>
             <property name="rightMargin">
              <number>0</number>
-            </property>
-            <property name="bottomMargin">
-             <number>9</number>
             </property>
             <item>
              <widget class="QWidget" name="widget_4" native="true">
@@ -124,7 +118,6 @@
                 <widget class="QLabel" name="value">
                  <property name="font">
                   <font>
-                   <pointsize>10</pointsize>
                    <bold>true</bold>
                   </font>
                  </property>
@@ -137,7 +130,6 @@
                 <widget class="QLabel" name="label_6">
                  <property name="font">
                   <font>
-                   <pointsize>10</pointsize>
                    <bold>true</bold>
                   </font>
                  </property>

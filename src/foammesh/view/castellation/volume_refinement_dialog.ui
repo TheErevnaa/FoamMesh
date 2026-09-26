@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
- <class>VolumeeRefinementDialog</class>
- <widget class="QDialog" name="VolumeeRefinementDialog">
+ <class>VolumeRefinementDialog</class>
+ <widget class="QDialog" name="VolumeRefinementDialog">
   <property name="geometry">
    <rect>
     <x>0</x>
@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Volume Refinement</string>
+   <string>Volume refinement</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
@@ -38,7 +38,7 @@
          <item row="0" column="0">
           <widget class="QLabel" name="label">
            <property name="text">
-            <string>Group Name</string>
+            <string>Group name</string>
            </property>
           </widget>
          </item>
@@ -63,7 +63,7 @@
             <item row="0" column="0">
              <widget class="QLabel" name="label_2">
               <property name="text">
-               <string>Volume Refinement Level</string>
+               <string>Volume refinement level</string>
               </property>
              </widget>
             </item>
@@ -83,7 +83,7 @@
          <item>
           <widget class="QGroupBox" name="gapRefinement">
            <property name="title">
-            <string>Gap Refinement</string>
+            <string>Gap refinement</string>
            </property>
            <property name="checkable">
             <bool>true</bool>
@@ -92,7 +92,7 @@
             <item row="0" column="0">
              <widget class="QLabel" name="label_3">
               <property name="text">
-               <string>Min. Cell Layers in a gap (n, n&gt;3)</string>
+               <string>Min. cell layers in a gap (n, n&gt;3)</string>
               </property>
              </widget>
             </item>
@@ -102,7 +102,7 @@
             <item row="1" column="0">
              <widget class="QLabel" name="label_5">
               <property name="text">
-               <string>Gap Detection Start Level</string>
+               <string>Gap detection start level</string>
               </property>
              </widget>
             </item>
@@ -112,7 +112,7 @@
             <item row="2" column="0">
              <widget class="QLabel" name="label_6">
               <property name="text">
-               <string>Max. Refinement Level</string>
+               <string>Max. refinement level</string>
               </property>
              </widget>
             </item>
@@ -145,7 +145,7 @@
       <item>
        <widget class="QGroupBox" name="levelIncrement">
         <property name="title">
-         <string>Level Increment</string>
+         <string>Level increment</string>
         </property>
         <property name="checkable">
          <bool>true</bool>
@@ -154,7 +154,7 @@
          <item>
           <widget class="QGroupBox" name="groupBox">
            <property name="title">
-            <string>Split Count per Direction</string>
+            <string>Split count per direction</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_5">
             <item>
@@ -217,7 +217,7 @@
             <item>
              <widget class="QLabel" name="label_9">
               <property name="text">
-               <string>Directional Refinement is applied after all other refinement.</string>
+               <string>Directional refinement is applied after all other refinement.</string>
               </property>
              </widget>
             </item>
@@ -243,7 +243,7 @@
                <item row="0" column="0">
                 <widget class="QLabel" name="label_18">
                  <property name="text">
-                  <string>Min. Level (0~10)</string>
+                  <string>Min. level (0~10)</string>
                  </property>
                 </widget>
                </item>
@@ -260,7 +260,7 @@
                <item row="1" column="0">
                 <widget class="QLabel" name="label_19">
                  <property name="text">
-                  <string>Max. Level (0~10)</string>
+                  <string>Max. level (0~10)</string>
                  </property>
                 </widget>
                </item>
@@ -396,7 +396,7 @@
   <connection>
    <sender>cancel</sender>
    <signal>clicked()</signal>
-   <receiver>VolumeeRefinementDialog</receiver>
+   <receiver>VolumeRefinementDialog</receiver>
    <slot>reject()</slot>
    <hints>
     <hint type="sourcelabel">

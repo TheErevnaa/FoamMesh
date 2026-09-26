@@ -45,7 +45,7 @@ BRANCH_PAGES: dict[str, dict] = {
     'snappy': SNAPPY_TASK_PAGES,
 }
 
-_STATE_SEPARATOR = ' - '
+_STATE_SEPARATOR = ' — '
 
 _STATE_SUFFIX = {
     TaskState.LOCKED: 'locked',
@@ -66,6 +66,45 @@ _STATE_SUFFIX = {
 
 logger = logging.getLogger(__name__)
 
+
+def _stage_writer(view):
+    """The generate a stage run on ``view`` has to make first, or None.
+
+    Read off the view with `getattr` rather than as an attribute: both run
+    routes are also called unbound on plain stand-ins (the Region B
+    harnesses), and a stand-in with no window behind it has no domain to
+    write dictionaries over and nothing to write them for.
+    """
+    writers = getattr(view, 'stage_dictionaries', None) or {}
+    return writers.get(getattr(view, '_engine_id', ''))
+
+
+class _ShownPageStack(QStackedWidget):
+    """A task stack as wide at least as the task it shows, and no wider.
+
+    DP-572 (0924 rerun2, S6 and G6). A `QStackedWidget` asks for the widest
+    minimum of every page it holds, shown or not. DP-534 took that floor off
+    the settings column's own stack, but the page that stack shows is this
+    branch, and this stack still carried it: every stage page of both
+    engines asked 449 px, all of it from the Qualification summary page, so
+    the 360 px column scrolled 89 px sideways and cut each page on its
+    right -- `Maximum level` read `Maximun`. The width now follows the page
+    on screen; the height is left as Qt measures it.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        page = self.currentWidget()
+        if page is not None:
+            frame = 2 * self.frameWidth()
+            hint.setWidth(max(0, page.minimumSizeHint().width()) + frame)
+        return hint
+
+
 class EngineBranchView(QWidget):
     """Region B task-page stack for the selected engine.
 
@@ -77,6 +116,11 @@ class EngineBranchView(QWidget):
     engineChanged = Signal(str)
     #: A task page accepted or reverted an edit; listeners re-sync task labels.
     taskChanged = Signal(str)
+
+    #: Plan 32 §7.3. Mirrors `MeshingMethodBranch.lockBypass`, which is the
+    #: only thing that ever writes it, so both doors into a task page answer
+    #: the same about the lock. Off unless a harness turns it on.
+    lockBypass = False
 
     def __init__(self, facade_client, parent=None):
         super().__init__(parent)
@@ -133,7 +177,7 @@ class EngineBranchView(QWidget):
         self.tasks.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tasks.currentRowChanged.connect(self._on_row_changed)
         self.tasks.hide()
-        self.stack = QStackedWidget(self)
+        self.stack = _ShownPageStack(self)
         self.stack.setObjectName('engineBranchPages')
         self.stack.setAccessibleName(
             self.tr('Selected engine task settings page'))
@@ -249,6 +293,11 @@ class EngineBranchView(QWidget):
             stage_signal = getattr(page, 'stageRunRequested', None)
             if stage_signal is not None:
                 stage_signal.connect(self._on_stage_run_requested)
+            # DP-123. A page that can refuse the whole-pipeline run says so
+            # here, because the button that starts it belongs to this row.
+            refusal_signal = getattr(page, 'runAllRefusalChanged', None)
+            if refusal_signal is not None:
+                refusal_signal.connect(lambda _text='': self._gradeRunAll())
             self.stack.addWidget(page)
             self._pages[task_id] = page
             self._order.append(task_id)
@@ -288,6 +337,39 @@ class EngineBranchView(QWidget):
         """
         self._runAll.setVisible(
             bool(engine_id) and engine_id in self.RUN_OPERATIONS)
+        self._gradeRunAll()
+
+    #: What "Run to end" says about itself when nothing refuses it.
+    RUN_ALL_DESCRIPTION = 'Run every stage of the selected engine in one go.'
+
+    def runAllRefusal(self) -> str:
+        """Why the whole-pipeline run cannot start, asked of the page.
+
+        DP-123. The pages had the answer and shut ``_runStage`` with it --
+        a button that is hidden on every Gmsh task page, because none of them
+        declares a ``run_stage``. MEASURED on the Gmsh leg of
+        `two_solid_block`: the Boundary Layers banner said the run would be
+        refused, the Compute note said it in the same words, and "Run to end"
+        was live; the run booted WSL, imported the geometry and refused 76 s
+        later. The page is asked here instead, so the sentence reaches the
+        button the user presses.
+        """
+        ask = getattr(self._pages.get(self._run_all_task_id()),
+                      'runAllRefusal', None)
+        if not callable(ask):
+            return ''
+        try:
+            return str(ask() or '')
+        except Exception:                                    # noqa: BLE001
+            return ''
+
+    def _gradeRunAll(self) -> None:
+        """Shut "Run to end" when the run would refuse, and say why."""
+        refusal = self.runAllRefusal()
+        self._runAll.setEnabled(not refusal)
+        self._runAll.setToolTip(refusal)
+        self._runAll.setAccessibleDescription(
+            refusal or self.tr(self.RUN_ALL_DESCRIPTION))
 
     def _build_graph(self, engine_id: str):
         if not engine_id:
@@ -384,14 +466,26 @@ class EngineBranchView(QWidget):
         task went on saying "Locked - complete the prerequisite tasks first"
         long after the prerequisite passed -- the text and the buttons on the
         same page disagreeing about whether the task could be run.
+
+        One page must not be able to take the other nine down with it, so a
+        page that raises here is skipped rather than propagated. DP-142: it
+        used to be skipped *silently*, and the Export page had been raising
+        `RecursionError` on every graph move for as long as the page had
+        existed. Two fixes were written for the stale sentence it left on
+        screen; both were correct, both were swallowed here, and nothing
+        anywhere said so. The page is still skipped -- it is still not worth
+        a broken branch -- but now it says which page and why.
         """
-        for page in self._pages.values():
+        for task_id, page in self._pages.items():
             refresh = getattr(page, 'refresh_status', None)
             if callable(refresh):
                 try:
                     refresh()
                 except Exception:                            # noqa: BLE001
-                    pass
+                    logger.exception(
+                        'the %s page could not re-read its status; the rest '
+                        'of the branch was refreshed without it', task_id)
+        self._gradeRunAll()
 
     def _on_task_updated(self, task_id: str) -> None:
         """Record settings that were saved without a run (R134/R155).
@@ -443,48 +537,99 @@ class EngineBranchView(QWidget):
 
         C31-12: scheduled, not blocking. The transition rebuilds the graph and
         repaints the outline, and all of that still happens after the facade
-        has answered -- `recorded` is the tail of the old method, unchanged.
-        """
-        def recorded(result) -> None:
-            if getattr(result, 'status', 'accepted') != 'accepted':
-                # R180. The facade refuses a transition by raising, so the
-                # `except` this used to have was the path every refusal
-                # actually took -- and it discarded the sentence saying why.
-                # A refusal now arrives as a result carrying that sentence,
-                # so both shapes of refusal are said out loud in one place.
-                # A row that will not move says what stopped it.
-                message = str(getattr(result, 'message', '')
-                              or self.tr('The transition was rejected.'))
-                # Plan 31 DP-39, MEASURED on every Gmsh run of the `t3` and
-                # `t3-redo` legs. `after_save` is reached only from
-                # `updateRequested`, which a page emits *after* the facade
-                # accepted its field patch -- so the settings are on disk and
-                # the only thing refused is the tick. Reporting that as
-                # `Task state / task is locked by prerequisites:
-                # gmsh.boundary_layers` told the user their save had failed
-                # when it had not, named the task they were already looking
-                # at rather than the one holding it, and offered no way on.
-                if after_save and 'locked by prerequisites' in message:
-                    QMessageBox.warning(
-                        self, self.tr('Settings saved'),
-                        self.tr('Your settings were saved. ')
-                        + self._locked_sentence(task_id))
-                else:
-                    QMessageBox.warning(self, self.tr('Task state'), message)
-            self._graph = self._build_graph(self._engine_id)
-            self._apply_states()
-            self.taskChanged.emit(task_id)
+        has answered -- `_transition_recorded` is the tail of the old method,
+        unchanged.
 
+        The answer is therefore not available to the caller: this returns as
+        soon as the write is scheduled. A caller that has to know whether the
+        task is settled before it does the next thing awaits
+        `record_transition_async` instead (DP-253).
+        """
         submit(self._client, 'mesh.workflow.task_transition', {
             'engine_id': self._engine_id, 'task_id': task_id,
-            'transition': transition}, then=recorded)
+            'transition': transition},
+            then=lambda result: self._transition_recorded(
+                task_id, result, after_save=after_save))
+
+    def _transition_recorded(self, task_id: str, result, *,
+                             after_save: bool = False) -> bool:
+        """Repaint on the facade's answer, and say whether it took it."""
+        accepted = getattr(result, 'status', 'accepted') == 'accepted'
+        if not accepted:
+            # R180. The facade refuses a transition by raising, so the
+            # `except` this used to have was the path every refusal
+            # actually took -- and it discarded the sentence saying why.
+            # A refusal now arrives as a result carrying that sentence,
+            # so both shapes of refusal are said out loud in one place.
+            # A row that will not move says what stopped it.
+            message = str(getattr(result, 'message', '')
+                          or self.tr('The transition was rejected.'))
+            # Plan 31 DP-39, MEASURED on every Gmsh run of the `t3` and
+            # `t3-redo` legs. `after_save` is reached only from
+            # `updateRequested`, which a page emits *after* the facade
+            # accepted its field patch -- so the settings are on disk and
+            # the only thing refused is the tick. Reporting that as
+            # `Task state / task is locked by prerequisites:
+            # gmsh.boundary_layers` told the user their save had failed
+            # when it had not, named the task they were already looking
+            # at rather than the one holding it, and offered no way on.
+            if after_save and 'locked by prerequisites' in message:
+                QMessageBox.warning(
+                    self, self.tr('Settings saved'),
+                    self.tr('Your settings were saved. ')
+                    + self._locked_sentence(task_id))
+            else:
+                QMessageBox.warning(self, self.tr('Task state'), message)
+        self._graph = self._build_graph(self._engine_id)
+        self._apply_states()
+        self.taskChanged.emit(task_id)
+        return accepted
+
+    async def record_transition_async(self, task_id: str, transition: str, *,
+                                      after_save: bool = False) -> bool:
+        """Record the transition and wait for the facade to answer it.
+
+        DP-253. MEASURED on the guided walk, `pipe` for Gmsh: the press on
+        `3. Preparation` accepted the task hosted there, asked one line later
+        whether it was accepted, was told no, and stopped without a word --
+        and the outline then drew the row it had refused to open as unlocked,
+        because the write it had not waited for landed a moment later.
+
+        `_on_task_transition` schedules the write (C31-12) so a Qt slot does
+        not freeze on it, which is right for a slot and wrong for a caller
+        that has to branch on the outcome: the state it reads is the state
+        from before the transition. The wizard is a coroutine and can wait, so
+        this is the same write awaited, with the same repaint after it, and
+        the answer handed back the way `run_stage_async` hands back its own.
+
+        A client with no `run` is a test double or a window with no loop
+        (`submit` says so in as many words); there the scheduled write has
+        already run synchronously by the time this returns, so the recorded
+        state is the one to report.
+        """
+        from foammesh.core.facade.errors import FacadeError
+        from foammesh.view.facade_client import FailedResult
+
+        runner = getattr(self._client, 'run', None)
+        if runner is None:
+            self._on_task_transition(task_id, transition,
+                                     after_save=after_save)
+            return self.is_accepted(task_id)
+        try:
+            result = await runner('mesh.workflow.task_transition', {
+                'engine_id': self._engine_id, 'task_id': task_id,
+                'transition': transition})
+        except FacadeError as error:
+            result = FailedResult(error)
+        return self._transition_recorded(task_id, result,
+                                         after_save=after_save)
 
     #: Engine id -> the facade operation that runs its whole pipeline. An
     #: engine absent here renders no run button.
     #:
     #: Plan 26 WP5.3. Snappy's whole-pipeline run already existed and worked --
     #: ``StepManager._finishPipeline`` calls ``generate_dictionaries`` then
-    #: ``run_pipeline``, fired by "Finish All Steps" and the wizard's
+    #: ``run_pipeline``, fired by "Finish all steps" and the wizard's
     #: "Run & Proceed". The defect was placement: that trigger lives on the
     #: legacy step bar, and ``_showBranchPage`` calls ``hideAll()``, so the
     #: button vanished the moment a user navigated by the snappy tree tokens.
@@ -506,12 +651,67 @@ class EngineBranchView(QWidget):
     #: Installed by the step manager; a branch without one falls back to the
     #: bare facade operation.
     pipeline_runners: dict = {}
+    #: Engine id -> awaitable writing the dictionaries that engine's stages
+    #: mesh from, over the domain the window reads off the Base grid page.
+    #: Installed by the step manager for the engines that need them; a branch
+    #: without an entry runs the stage on what is already on disk.
+    #:
+    #: DP-256. A stage started from a branch row is the same run as a stage
+    #: started from the legacy page, and only the legacy page generated
+    #: first. One engine needs it, the window is the only surface that knows
+    #: the domain, so the window hands the run in rather than this widget
+    #: keeping a second opinion about where the block is.
+    stage_dictionaries: dict = {}
     ACCEPTED_STATES = frozenset(
         {'passed', 'warning', 'skipped', 'completed', 'waived'})
+
+    async def _write_stage_dictionaries(self, stage: str) -> str:
+        """Write the dictionaries ``stage`` meshes from; '' when it worked.
+
+        DP-256. MEASURED by the footer-only walk on `pipe` for snappy: the
+        press of `Generate grid & Proceed` on `5. Base grid` committed the
+        fields, ran nothing and did not advance, and the case was left with
+        no `system/blockMeshDict` and no run log. `workflow.run_stage`
+        refuses a stage whose dictionary is not on disk -- "blockMeshDict is
+        required; generate dictionaries first" -- and every other route to a
+        snappy run writes them first: the legacy Base grid page does it in
+        `_generate`, the window's pipeline does it in `_finishPipeline`.
+        This route did not, so the guided snappy workflow could not mesh at
+        all.
+
+        The dictionaries are rewritten on every run rather than only when
+        one is missing: the press that gets here is the press that saved the
+        fields it is about to mesh with, and a dictionary from the run
+        before is exactly what `_on_run_requested` already refuses to mesh
+        against.
+        """
+        from foammesh.core.facade.errors import FacadeError
+
+        writer = _stage_writer(self)
+        # checkMesh reads a mesh, it does not mesh from a dictionary.
+        if writer is None or stage == 'checkMesh':
+            return ''
+        try:
+            await writer()
+        except (FacadeError, OSError, TypeError, ValueError) as error:
+            # A domain that cannot be read is a sentence about the Base grid
+            # page, not a traceback: `_snappyDomainBounds` raises it in those
+            # words and this is the one place it can be said out loud.
+            return str(error)
+        return ''
 
     def _on_run_requested(self, task_id: str) -> None:
         """Run the selected engine's atomic stage; failures stay actionable."""
         from foammesh.view.meshing_method.method_page import _submit
+
+        # DP-123. A shut button is the first answer; this is the second, for
+        # a state that changed after it was graded. Refusing here costs
+        # nothing, and the run it replaces costs a WSL boot and an import.
+        refusal = self.runAllRefusal()
+        if refusal and task_id == self._run_all_task_id():
+            self._gradeRunAll()
+            self._report_run(refusal, failed=True)
+            return
 
         runner = self.pipeline_runners.get(self._engine_id)
         if runner is not None:
@@ -546,14 +746,14 @@ class EngineBranchView(QWidget):
             else:
                 self._report_run(describe_result(payload, failed=True),
                                  failed=True, log=newest_log(payload))
-                QMessageBox.warning(
-                    self, self.tr('Mesh run'),
-                    str(payload.get('reason') or getattr(result, 'message', '')
-                        or self.tr('The run could not start.')))
+                self._warn_failure(
+                    self.tr('Mesh run'), payload, result,
+                    self.tr('The run could not start.'))
             # The gate's verdict rides back on the payload. It was being
             # dropped here, so the only path that ever reached the strip was
             # accepting a refusal -- and a run that passed left the strip
-            # reading "No mesh yet." over the mesh it had just made. Published
+            # on its dormant no-mesh line over the mesh it had just made.
+            # Published
             # on refusal too: that is precisely when a user needs the numbers.
             self._publish_verdict(payload)
             if getattr(result, 'status', '') == 'accepted':
@@ -561,6 +761,15 @@ class EngineBranchView(QWidget):
             self._graph = self._build_graph(self._engine_id)
             self._apply_states()
             self.taskChanged.emit(task_id)
+
+        # DP-506. The Console shows the run while it runs, as the window's
+        # own pipeline run does; the subscription ends with the result.
+        unsubscribe = self._stream_to_console()
+        finish = on_result
+
+        def on_result(result):
+            unsubscribe()
+            finish(result)
 
         # The run operations have async facade handlers; run_sync raises.
         task = _submit(self._client, operation,
@@ -590,10 +799,12 @@ class EngineBranchView(QWidget):
             return
         self._stage_running = True
         progress = self._open_stage_progress(task_id, stage)
+        unsubscribe = self._stream_to_console()
 
         def released():
             """Give the window back. Idempotent: two callers may reach it."""
             self._stage_running = False
+            unsubscribe()
             progress.close()
 
         def on_result(result):
@@ -609,10 +820,9 @@ class EngineBranchView(QWidget):
                     self.tr('checkMesh reported problems with this mesh; '
                             'see the Quality tab.'))
             else:
-                QMessageBox.warning(
-                    self, self.tr('Stage run'),
-                    str(payload.get('reason') or getattr(result, 'message', '')
-                        or self.tr('The stage could not run.')))
+                self._warn_failure(
+                    self.tr('Stage run'), payload, result,
+                    self.tr('The stage could not run.'), stage=stage)
             self._publish_verdict(payload)
             if getattr(result, 'status', '') == 'accepted' and not is_check:
                 self._reload_mesh()
@@ -623,24 +833,58 @@ class EngineBranchView(QWidget):
             self._apply_states()
             self.taskChanged.emit(task_id)
 
-        task = _submit(self._client, operation, parameters, on_result)
-        if task is None:
-            # R101. `_submit` returns None only when it already ran the
-            # operation synchronously, so the run is over by the time we get
-            # here -- give the window back rather than leaving the guard set
-            # for the life of the page. Idempotent with `on_result`.
-            released()
+        def start() -> None:
+            task = _submit(self._client, operation, parameters, on_result)
+            if task is None:
+                # R101. `_submit` returns None only when it already ran the
+                # operation synchronously, so the run is over by the time we
+                # get here -- give the window back rather than leaving the
+                # guard set for the life of the page. Idempotent with
+                # `on_result`.
+                released()
+                return
+            self._stage_task = task
+            # R101. A run that dies without ever producing a result must not
+            # leave a modal with no way out and a button that never re-arms.
+            task.add_done_callback(lambda _task: released())
+
+        # DP-256. "Run this step" is the other door onto the same run, and it
+        # had the same hole: the stage was submitted against whatever
+        # dictionaries happened to be on disk, which on a case that has never
+        # been meshed is none at all.
+        if is_check or _stage_writer(self) is None:
+            start()
             return
-        self._stage_task = task
-        # R101. A run that dies without ever producing a result must not
-        # leave a modal with no way out and a button that never re-arms.
-        task.add_done_callback(lambda _task: released())
+
+        async def generate_then_run() -> None:
+            failure = await self._write_stage_dictionaries(stage)
+            if failure:
+                released()
+                QMessageBox.warning(self, self.tr('Stage run'), failure)
+                return
+            start()
+
+        self._stage_task = asyncio.ensure_future(generate_then_run())
 
     async def _run_pipeline(self, runner, task_id: str) -> None:
+        """Run the window's own pipeline. It draws its own result.
+
+        DP-128. This used to call `_reload_mesh` here as well, and the two
+        draws fought: the runner drew the artifact *this* run produced, named
+        it, and then this line re-read `constant/polyMesh` over the top of it
+        -- twice the read, and the viewport blank for the whole of the second
+        one. Worse on a refusal, where the runner deliberately takes the
+        failed run's mesh down and offers the previous one *by name*: this
+        line put that previous mesh straight back up, silently, underneath
+        the new run's verdict. That is the F-37 confusion `loadResult` exists
+        to prevent, reintroduced by its own caller.
+
+        `_reload_mesh` still runs for the two paths that genuinely have no
+        other draw -- the bare facade run and a single stage run.
+        """
         try:
             await runner()
         finally:
-            self._reload_mesh()
             self.refresh_states()
             self.taskChanged.emit(task_id)
 
@@ -671,6 +915,20 @@ class EngineBranchView(QWidget):
         except Exception:  # noqa: BLE001
             return False
 
+    def blocking_prerequisites(self, task_id: str) -> tuple:
+        """The tasks holding this one shut, as the graph counts them.
+
+        DP-144. The step manager counted them itself, from `depends_on` and
+        `is_accepted`, and so named the optional steps the graph stopped
+        counting -- "Compute Mesh is waiting on Periodic Pairs".
+        """
+        if self._graph is None:
+            return ()
+        try:
+            return tuple(self._graph.blocking_prerequisites(task_id))
+        except Exception:  # noqa: BLE001
+            return ()
+
     def refresh_states(self) -> None:
         """Re-read the persisted task states and repaint the rows."""
         self._graph = self._build_graph(self._engine_id)
@@ -687,7 +945,7 @@ class EngineBranchView(QWidget):
         R101. MEASURED on Surface Features & Refinement: `Run & Proceed` ran
         surfaceFeatures for about a minute with no modal, no busy cursor and
         nothing but small status text in the bottom-right corner, while Base
-        Grid, Mesh Quality, Export and Load Mesh all raise this same dialog.
+        Grid, Mesh quality, Export and Load Mesh all raise this same dialog.
         A minute of an apparently idle window reads as a dead button.
 
         Cancelable (F-22). It was not, because `workflow.run_stage` was said
@@ -718,7 +976,7 @@ class EngineBranchView(QWidget):
         reaches the WSL process group and the Gmsh runner both.
         """
         if progress is not None:
-            progress.setLabelText(self.tr('Stopping the run...'))
+            progress.setLabelText(self.tr('Stopping the run…'))
         client = self._client
         canceller = getattr(client, 'cancel_active_jobs', None)
         if canceller is None:
@@ -743,6 +1001,83 @@ class EngineBranchView(QWidget):
         """
         job = payload.get('job') or {}
         return str(job.get('status') or '') == 'cancelled'
+
+    @staticmethod
+    def _console():
+        """The window's Console, or ``None`` when there is no window."""
+        from foammesh.app import app
+
+        try:
+            return getattr(app, 'consoleView', None)
+        except (AttributeError, RuntimeError):
+            # `app.consoleView` reads through a window that may not exist.
+            return None
+
+    def _stream_to_console(self):
+        """Put the running job's output in the Console; returns the undo.
+
+        DP-506 (MA-02). The window's whole-pipeline run subscribes the Console
+        to ``JOB_OUTPUT``; the branch's stage runs did not, so a stage the
+        guided route ran left the Console empty. MEASURED on S1_box_cavity:
+        castellation died with a ``FOAM FATAL ERROR`` in its log and nothing
+        at all in the pane beside the failure.
+        """
+        from foammesh.core.project import Event
+
+        subscribe = getattr(self._client, 'subscribe', None)
+        console = self._console()
+        if not callable(subscribe) or console is None:
+            return lambda: None
+        try:
+            unsubscribe = subscribe(
+                Event.JOB_OUTPUT,
+                lambda **event: console.append(str(event.get('line', ''))))
+        except Exception:                                   # noqa: BLE001
+            # No session to listen to (a client double, a closed case).
+            return lambda: None
+        return unsubscribe if callable(unsubscribe) else (lambda: None)
+
+    def _warn_failure(self, title: str, payload: dict, result,
+                      fallback: str, *, stage: str = '') -> None:
+        """Say why a run failed: the stage, its cause, and where its log is.
+
+        DP-506 (MA-02). This was one sentence -- the payload's ``reason`` or
+        "The stage could not run." -- and a failed stage carried no reason,
+        so the S1 and S4 castellation failures said exactly that over a log
+        naming the unknown region and the valid ones. The facade now reads
+        the cause out of the log; this puts it in the modal, names the log
+        and its job, keeps the long diagnostic behind **Details**, and writes
+        the same cause into the Console so it outlives the modal.
+        """
+        reason = str(payload.get('reason') or getattr(result, 'message', '')
+                     or fallback)
+        job = payload.get('job') if isinstance(payload.get('job'), dict) else {}
+        details = str(payload.get('details') or '').strip()
+        log = str(payload.get('log') or job.get('log_path') or '')
+        job_id = str(job.get('job_id') or payload.get('job_id') or '')
+        cause = str(payload.get('cause') or '').strip()
+        text = (self.tr('%s failed.') % stage + '\n\n' + cause
+                if stage and cause else reason)
+        console = self._console()
+        if console is not None:
+            write = getattr(console, 'appendError', None) or console.append
+            write('{0}: {1}'.format(title, reason))
+            if log:
+                write(self.tr('Log: %s') % log)
+        if not details and not log:
+            QMessageBox.warning(self, title, text)
+            return
+        where = []
+        if job_id:
+            where.append(self.tr('Job %s') % job_id)
+        if log:
+            where.append(self.tr('Log: %s') % log)
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text,
+                          QMessageBox.StandardButton.Ok, self)
+        box.setInformativeText('\n'.join(where))
+        if details:
+            box.setDetailedText(details)
+        box.exec()
 
     def _report_cancelled_stage(self, what: str) -> None:
         """Say the run was stopped, in the words of the thing that happened.
@@ -775,14 +1110,20 @@ class EngineBranchView(QWidget):
             return False
         self._stage_running = True
         progress = self._open_stage_progress(task_id, stage)
+        unsubscribe = self._stream_to_console()
         result = None
         failure = ''
         try:
-            result = await runner('workflow.run_stage', {'stage': stage})
+            # DP-256. The dictionaries this stage meshes from, written the
+            # way every other route to a run writes them, before the run.
+            failure = await self._write_stage_dictionaries(stage)
+            if not failure:
+                result = await runner('workflow.run_stage', {'stage': stage})
         except FacadeError as error:
             failure = str(error)
         finally:
             self._stage_running = False
+            unsubscribe()
             # The progress surface goes before anything is said about the
             # run, so a warning is never raised behind a modal still claiming
             # the stage is running (the D6 stacked-dialog shape).
@@ -795,11 +1136,16 @@ class EngineBranchView(QWidget):
             if self._was_cancelled(payload):
                 self._report_cancelled_stage(stage)
             else:
-                QMessageBox.warning(
-                    self, self.tr('Stage run'),
-                    str(payload.get('reason') or getattr(result, 'message', '')
-                        or self.tr('The stage could not run.')))
+                self._warn_failure(
+                    self.tr('Stage run'), payload, result,
+                    self.tr('The stage could not run.'), stage=stage)
         self._publish_verdict(payload)
+        if accepted:
+            # DP-763. `Run & Proceed` on a stage page comes here, and the
+            # stage's mesh stayed on disk: the viewport kept the STL through
+            # base grid, castellation, snap and layers. The tree row's own
+            # run (`_on_stage_run_requested`) has always drawn it.
+            self._reload_mesh()
         page = self._pages.get(task_id)
         if page is not None:
             page.refresh()
@@ -940,8 +1286,64 @@ class EngineBranchView(QWidget):
 
     # -- navigation -------------------------------------------------------- #
 
+    def currentTask(self) -> str:
+        """The task whose page is on screen, or ``''`` for none.
+
+        DP-138. The outline has to put its highlight back after it rebuilds
+        its rows, and it cannot do that without being able to ask what is on
+        screen. Without an answer the highlight stayed where Qt dropped it,
+        which is the section header.
+        """
+        row = self.tasks.currentRow()
+        return self._order[row] if 0 <= row < len(self._order) else ''
+
+    def taskIsLocked(self, task_id: str) -> bool:
+        """Whether the workflow has not reached ``task_id`` yet.
+
+        Plan 32 §7.1. The lock is the graph's own `LOCKED` and nothing else:
+        a second frontier kept beside it would be a second answer to drift
+        out of step with the first.
+        """
+        return self.task_state(task_id) == TaskState.LOCKED.value
+
+    def lockRefusal(self, task_id: str) -> str:
+        """Why ``task_id`` will not open, or ``''`` if it will.
+
+        By title, never by id. DP-39 already found what an id-shaped refusal
+        reads like to the person holding it, and the graph knows which
+        prerequisite is actually in the way -- `blocking_prerequisites` steps
+        through the optional parents the run would skip, so the name here is
+        a step the reader really does have to do.
+        """
+        if not self.taskIsLocked(task_id):
+            return ''
+        titles = {task.get('task_id'): (task.get('title') or task.get('task_id'))
+                  for task in self.workflow_tasks}
+        mine = titles.get(task_id, task_id)
+        blocking = self.blocking_prerequisites(task_id)
+        if not blocking:
+            return self.tr('{0} is not available yet.').format(mine)
+        return self.tr('{0} opens once {1} is finished.').format(
+            mine, titles.get(blocking[0], blocking[0]))
+
+    def selectRefusal(self, task_id: str) -> str:
+        """Why standing on ``task_id`` is refused, or ``''`` to allow it.
+
+        Plan 32 fills the seam it left here with the frontier lock. Both
+        doors into a task page come through `select` -- the outline row, via
+        `MeshingMethodBranch.widgetForToken`, and the branch's own task list
+        beside the page -- so the refusal has one place to live rather than
+        two that can disagree about which step is open. A lock enforced on
+        one door and not the other is a lock with a handle beside it.
+        """
+        if self.lockBypass:
+            return ''
+        return self.lockRefusal(task_id)
+
     def select(self, task_id: str) -> bool:
         if task_id not in self._pages:
+            return False
+        if self.selectRefusal(task_id):
             return False
         self.tasks.setCurrentRow(self._order.index(task_id))
         return True
@@ -951,6 +1353,7 @@ class EngineBranchView(QWidget):
             return
         self.stack.setCurrentIndex(row)
         self._updateHeading()
+        self._gradeRunAll()
         self.taskSelected.emit(self._order[row])
 
     def _updateHeading(self) -> None:

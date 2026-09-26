@@ -26,6 +26,7 @@ from . import background_mesh
 from .dict_format import format_dictionary_file
 from foammesh.core.layer_patterns import (
     PatternError, matching_patches, quoted_key)
+from foammesh.core.quantities import agreeing, count_text
 from .snappy_controls import (
     BACKGROUND_PATCH_GROUP, BOUNDARY_FACES, DEBUG_FLAGS, WRITE_FLAGS)
 from .target import FoamTarget, DEFAULT_TARGET, mesh_quality_controls
@@ -274,12 +275,10 @@ class CaseBuilder:
         CLI/API callers supplied only the overall geometry bounds. Reading the
         selected Hex6 from the shared configuration closes that semantic gap.
         """
-        selected = self._v('baseGrid/boundingHex6')
+        selected = self._bounding_hex6_key()
+        if selected is None:
+            return self._stood_off_bbox()
         geometry = self._collection_item('geometry', selected)
-        if geometry is None:
-            return self.bbox
-        if self._item_value(geometry, 'shape') != 'hex6':
-            return self.bbox
         try:
             from foammesh.core.geometry import BBox
             p1 = geometry.vector('point1')
@@ -293,6 +292,54 @@ class CaseBuilder:
                 max(float(p1[2]), float(p2[2])))
         except Exception:
             return self.bbox
+
+    def _bounding_hex6_key(self):
+        """The bounding Hex6's key, only when it names a ``hex6`` row.
+
+        DP-577 (field audit 0924 snappy-front D4). The block honoured the id
+        only for a ``hex6`` row, while the geometry and refinement writers
+        skipped any volume with that id whatever its shape: an id pointing at
+        a plain ``hex`` refinement box left the block alone and silently
+        dropped that box's refinement, and an id naming no row changed
+        nothing and said nothing. One rule now serves every site, and an id
+        it cannot honour is reported rather than ignored.
+        """
+        selected = self._v('baseGrid/boundingHex6')
+        if selected is None:
+            return None
+        geometry = self._collection_item('geometry', selected)
+        if geometry is not None and self._item_value(geometry, 'shape') == 'hex6':
+            return selected
+        described = ('names no geometry row' if geometry is None else
+                     'names a {0} row, not a hex6'.format(
+                         self._item_value(geometry, 'shape', 'non-hex6')))
+        self.warn(
+            'baseGrid.boundingHex6.unresolved',
+            'Bounding hex6 {0} {1}; the background block was derived from the '
+            'geometry instead.'.format(selected, described),
+            field_id='meshing.base_grid.bounding_hex6', requested=selected)
+        return None
+
+    def _stood_off_bbox(self):
+        """The derived block: the geometry extent pushed out by the standoff.
+
+        DP-576 (field audit 0924 snappy-front D3). ``baseGrid/standoff`` was
+        applied only by the desktop window, through a hidden legacy page's
+        cached box, so the facade, the CLI and the recipes wrote a flush block
+        from the same saved project. Every frontend now passes the geometry
+        extent and the standoff is applied here, once.
+        """
+        if self.bbox is None:
+            return self.bbox
+        try:
+            standoff = float(self._v('baseGrid/standoff', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            standoff = 0.0
+        if standoff <= 0:
+            return self.bbox
+        from foammesh.core.geometry import BBox
+        from foammesh.core.mesh.sizing import stand_off_bounds
+        return BBox(*stand_off_bounds(self._bbox_tuple(self.bbox), standoff))
 
     def _prepared_groups(self) -> tuple[dict, ...]:
         groups = []
@@ -391,14 +438,27 @@ class CaseBuilder:
         bindings = {}
         used = set()
         unmatched = []
+        # DP-661. The import writes the prepared group's patch uuid onto
+        # the configuration surface row it made, which is an exact bridge;
+        # names (``<file>_surface`` against ``<file>``) often are not.
+        by_patch = {}
+        for key, geometry in geometries:
+            uuid = self._item_value(geometry, 'patchUuid')
+            if uuid:
+                by_patch.setdefault(str(uuid), []).append((key, geometry))
         for group in groups:
-            names = {
-                str(group.get(name) or '').casefold()
-                for name in ('display_name', 'solver_name', 'source_region')
-                if group.get(name)}
             candidates = [
-                pair for name in names for pair in by_name.get(name, ())
+                pair for pair in by_patch.get(str(group.get('patch_uuid')), ())
                 if pair[0] not in used]
+            if not candidates:
+                names = {
+                    str(group.get(name) or '').casefold()
+                    for name in ('display_name', 'solver_name',
+                                 'source_region')
+                    if group.get(name)}
+                candidates = [
+                    pair for name in names for pair in by_name.get(name, ())
+                    if pair[0] not in used]
             unique = {str(pair[0]): pair for pair in candidates}
             if len(unique) == 1:
                 key, geometry = next(iter(unique.values()))
@@ -406,8 +466,14 @@ class CaseBuilder:
                 used.add(key)
             else:
                 unmatched.append(group)
+        # A drawn shape (a refinement box, a sphere) has no artifact and so
+        # no prepared group; it must not spoil the count the ordinal
+        # fallback below depends on (DP-661).
         remaining = [
-            (key, geometry) for key, geometry in geometries if key not in used]
+            (key, geometry) for key, geometry in geometries if key not in used
+            and (self._item_value(geometry, 'geometryId') or
+                 self._item_value(geometry, 'shape', 'triSurfaceMesh') in
+                 (None, 'triSurfaceMesh'))]
         if unmatched and len(unmatched) == len(remaining):
             for group, (key, geometry) in zip(
                     sorted(unmatched, key=lambda item: item['solver_name']),
@@ -509,19 +575,66 @@ class CaseBuilder:
         return unique[0] if unique else 0
 
     # dicts ----------------------------------------------------------------
+    #: DP-587: fewer background cells than this on an axis is warned.
+    _FEW_BACKGROUND_CELLS = 3
+
     def _background_cell_counts(self, b) -> tuple[int, int, int]:
         mode = self._enum_value(self._v('baseGrid/sizingMode', 'counts'))
         if mode == 'target_size':
-            target = float(self._v('baseGrid/targetCellSize', 1.0))
+            stored = self._v('baseGrid/targetCellSize')
+            if stored is None or str(stored).strip() == '':
+                target = self._auto_target_cell_size(b)
+            else:
+                target = float(stored)
             if not math.isfinite(target) or target <= 0:
                 raise ValueError('base-grid target cell size must be positive')
-            return (
+            counts = (
                 max(1, math.ceil((float(b.xmax) - float(b.xmin)) / target)),
                 max(1, math.ceil((float(b.ymax) - float(b.ymin)) / target)),
                 max(1, math.ceil((float(b.zmax) - float(b.zmin)) / target)))
+            # DP-587 (field audit 0924 shared-and-harness D-SH-08). The size
+            # defaults to 1 m whatever the part, so switching to target size
+            # on a 0.3 m elbow wrote one cell across it without a word.
+            if min(counts) < self._FEW_BACKGROUND_CELLS:
+                self.warn(
+                    'base_grid.target_cell_size.coarse',
+                    f'the base-grid target cell size {target:g} m gives only '
+                    f'{counts[0]} × {counts[1]} × {counts[2]} background '
+                    f'cells across the domain; lower Target cell size, or '
+                    f'use direct cell counts',
+                    field_id='meshing.base_grid.target_cell_size',
+                    requested=target, applied=list(counts))
+            return counts
         return (self._int('baseGrid/numCellsX', 10),
                 self._int('baseGrid/numCellsY', 10),
                 self._int('baseGrid/numCellsZ', 10))
+
+    def _auto_target_cell_size(self, b) -> float:
+        """The base cell an unset ("Auto") target size stands for (DP-669).
+
+        The block's bounding-box diagonal / 40, the rule the Gmsh global size
+        follows (DP-614), and said with the number so the manifest shows what
+        "Auto" came to.
+        """
+        from foammesh.core.mesh.sizing import (
+            AUTO_CELL_DIAGONAL_DIVISOR, auto_target_cell_size,
+        )
+
+        size = auto_target_cell_size(
+            (b.xmin, b.xmax, b.ymin, b.ymax, b.zmin, b.zmax))
+        if size is None:
+            raise ValueError(
+                'base-grid target cell size is Auto, and the background '
+                'block has no extent to derive it from; type a target cell '
+                'size')
+        self.warn(
+            'base_grid.target_cell_size.auto',
+            f'target cell size {size:.4g} m derived from the background '
+            f'block diagonal (/ {AUTO_CELL_DIAGONAL_DIVISOR:g}); type a size '
+            f'to override it',
+            field_id='meshing.base_grid.target_cell_size',
+            requested='Auto', applied=size, severity='info')
+        return size
 
     def _derived_background_patches(self) -> tuple:
         """The six faces of the derived box, and who owns each name.
@@ -982,6 +1095,22 @@ class CaseBuilder:
         if self.prepared_geometry is not None:
             seed = self.prepared_geometry.manifest.get('fluid_seed')
             if seed is not None:
+                # DP-582 (field audit 0924 snappy-front D9). The import's
+                # suggestion is the geometry's centre -- inside a closed body,
+                # which is the solid for an external flow. The launch gate
+                # refuses a run with no region, but a preview, an exported
+                # dictionary or the CLI wrote this point with no word.
+                self.warn(
+                    'region.seed.suggested',
+                    'No fluid region is defined, so the material point was '
+                    "taken from the import's suggestion ("
+                    + ', '.join(f'{float(value):g}' for value in seed)
+                    + '), the centre of the geometry. For an external flow '
+                    'that point is inside the body and snappy keeps the '
+                    'wrong side. Add a region on the Region page.',
+                    field_id='regions.items',
+                    requested='no region',
+                    applied=[float(value) for value in seed])
                 return (tuple(seed),)
         restored = getattr(self, '_restored_fluid_seed', None)
         return () if restored is None else (tuple(restored),)
@@ -994,6 +1123,114 @@ class CaseBuilder:
         """
         seeds = self._fluid_seeds()
         return seeds[0] if seeds else None
+
+    def _owning_volume(self, geometry):
+        """The volume element a surface belongs to, or ``None``.
+
+        An imported closed surface arrives as a volume row with the surfaces
+        that bound it hanging off it (``geometry_page.py:803-837``), and the
+        back-reference is the child's ``volume`` field.
+        """
+        volume_id = self._item_value(geometry, 'volume')
+        if volume_id is None or str(volume_id) == '':
+            return None
+        elements = self._elements('geometry')
+        volume = elements.get(str(volume_id))
+        if volume is None:
+            volume = elements.get(volume_id)
+        if volume is None:
+            return None
+        kind = self._item_value(volume, 'gType')
+        return volume if kind == 'volume' else None
+
+    def _effective_cfd_type(self, geometry) -> tuple:
+        """What this surface is for, and the zone it belongs to if it is one.
+
+        DP-387. The CellZone radio in the geometry editor lives on the
+        *volume* (``volume_dialog.py:54-57``), because "the cells inside this
+        shape" is a question about a volume. The surfaces that bound an
+        imported volume are written ``cfdType: boundary`` at import and there
+        is no control anywhere that changes that -- ``SurfaceDialog`` offers
+        none, boundary and interface and nothing else
+        (``surface_dialog.py:50-52``). So the cell-zone branch below, which
+        reads the *bound surface's* own ``cfdType``, could not be reached from
+        the GUI by any sequence of clicks: MEASURED by building the project
+        shape the importer produces -- a ``triSurfaceMesh`` volume typed
+        ``cellZone`` with one boundary surface under it -- and generating the
+        dictionary, which came out byte-identical to the same project with the
+        volume typed ``none``. The radio wrote a value no writer read, and the
+        user's request for a cell zone became a plain patch with nothing said.
+
+        A surface that carries its own non-boundary type keeps it; that is the
+        interface and internal-face case and it is decided on the surface. A
+        plain boundary surface asks the volume it bounds, which is where the
+        only control that can answer sits. The returned second value is the
+        name the zone takes -- the volume's, because a volume with several
+        bounding surfaces is one zone and not one per surface.
+        """
+        cfd_type = str(self._item_value(geometry, 'cfdType', 'boundary'))
+        volume = self._owning_volume(geometry)
+        zoned = volume is not None and str(
+            self._item_value(volume, 'cfdType', 'none')) == 'cellZone'
+        if cfd_type == 'interface':
+            # DP-421/DP-422. An interface that bounds a zoned volume is the
+            # surface that *carves* that zone -- heatedDuct's
+            # ``fluidToMetal.stl`` -- so it needs the zone name here. An
+            # interface bounding nothing zoned is the ordinary baffle, and is
+            # unchanged.
+            return 'interface', (self._zone_name(volume) if zoned else None)
+        if cfd_type != 'boundary':
+            return cfd_type, None
+        if not zoned:
+            return cfd_type, None
+        if self._carved_by_an_interface(self._item_value(geometry, 'volume')):
+            # DP-421. The zone is already carved by the interface surface
+            # beside this one, so this surface is the body own outer wall and
+            # nothing else. Promoting it too would write that wall into an
+            # internal faceZone -- which is what every multiregion snappy mesh
+            # on disk did, publishing the six background faces and nothing a
+            # solver could put a condition on.
+            return 'boundary', None
+        return 'cellZone', self._zone_name(volume)
+
+    def _zone_name(self, volume) -> str:
+        """The cell zone a volume row stands for, checked as a word."""
+        name = str(self._item_value(volume, 'name', '') or '')
+        if not name.replace('_', '').replace('.', '').isalnum():
+            raise ValueError(
+                f'{name!r} is not a valid OpenFOAM cell zone name; a zone '
+                f'name is a word, so it may not contain spaces or '
+                f'punctuation other than _ and .')
+        return name
+
+    def _carved_by_an_interface(self, volume_id) -> bool:
+        """Does a surface typed ``interface`` hang off this volume?
+
+        DP-421. That is the shape the geometry split produces and the one v13
+        writes in ``multiRegion/CHT/heatedDuct``: the interface carries the
+        zone keys, and the faces the body shares with nobody carry a patch.
+        Without an interface among its children a zoned volume is the ordinary
+        single-body case -- a porous or MRF region inside a larger domain --
+        where the whole closed surface is the zone boundary, and that reading
+        is left exactly as it was.
+
+        Asked by the volume's *key*, not by the element object: ``_elements``
+        rebuilds its dictionary on every call, so two lookups of the same row
+        are equal rows and not the same object, and an identity test here
+        silently answered "no" for every project.
+        """
+        if volume_id is None or str(volume_id) == '':
+            return False
+        wanted = str(volume_id)
+        for item in self._elements('geometry').values():
+            if str(self._item_value(item, 'gType', '')) != 'surface':
+                continue
+            owner = self._item_value(item, 'volume')
+            if owner is None or str(owner) != wanted:
+                continue
+            if str(self._item_value(item, 'cfdType', 'boundary')) == 'interface':
+                return True
+        return False
 
     def _refinement_surfaces(self) -> dict:
         from foammesh.core.export.poly_mesh_writer import _foam_patch_type
@@ -1012,6 +1249,13 @@ class CaseBuilder:
                         levels, 'minimumLevel', 0))
                     maximum = int(self._item_value(
                         levels, 'maximumLevel', minimum))
+                if minimum > maximum:
+                    # DP-575: OF13 refinementSurfaces.C refuses this at launch
+                    # ("Illegal level specification"); say it here, by name.
+                    name = self._item_value(refinement, 'groupName') or 'a surface group'
+                    raise ValueError(
+                        f'surface refinement group {name}: minimum level '
+                        f'{minimum} is above maximum level {maximum}')
                 entry: dict[str, object] = {'level': [minimum, maximum]}
                 # C31-08. Gap refinement, in Foundation 13's own terms. The
                 # case-wide `castellation/gapLevelIncrement` was already
@@ -1038,7 +1282,7 @@ class CaseBuilder:
                 # pass. Unset leaves the key out, so v13 keeps its own
                 # ``-great`` sentinel and the pass does nothing.
                 self._add_perpendicular_angle(entry, refinement, group)
-                cfd_type = self._item_value(geometry, 'cfdType', 'boundary')
+                cfd_type, zone_name = self._effective_cfd_type(geometry)
                 if cfd_type == 'none':
                     entry.update({
                         'faceZone': group['solver_name'],
@@ -1049,13 +1293,31 @@ class CaseBuilder:
                         self._item_value(geometry, 'nonConformal', False))
                     inter_region = bool(
                         self._item_value(geometry, 'interRegion', False))
-                    entry.update({
-                        'faceZone': group['solver_name'],
-                        'faceType': (
-                            'boundary' if non_conformal or inter_region
-                            else 'baffle'),
-                        'patchInfo': {'type': 'patch'},
-                    })
+                    seed = (None if non_conformal or inter_region
+                            else self._interface_seed(geometry, refinement))
+                    if zone_name and seed is not None:
+                        # DP-421/DP-422, and the shape v13 writes for a
+                        # conjugate assembly. The interface is its own surface,
+                        # carrying the face zone under its *own* name -- not
+                        # once under each region name, which is DP-422 -- and
+                        # the cell zone it carves, seeded by a point inside
+                        # that region. No ``patchInfo``, and ``faceType`` left
+                        # at its default ``internal``: these faces are
+                        # internal, which is what makes the mesh conformal
+                        # across them.
+                        entry.update({
+                            'faceZone': group['solver_name'],
+                            'cellZone': zone_name,
+                        })
+                        entry.update(seed)
+                    else:
+                        entry.update({
+                            'faceZone': group['solver_name'],
+                            'faceType': (
+                                'boundary' if non_conformal or inter_region
+                                else 'baffle'),
+                            'patchInfo': {'type': 'patch'},
+                        })
                 elif cfd_type == 'cellZone':
                     # A closed surface asked to become a cell zone. v13 needs
                     # the zone name, the faces that bound it, and which side of
@@ -1064,7 +1326,7 @@ class CaseBuilder:
                     # through to a plain patch and no zone was created at all,
                     # so a porous or MRF region silently did not exist.
                     entry.update({
-                        'cellZone': group['solver_name'],
+                        'cellZone': zone_name or group['solver_name'],
                         'faceZone': group['solver_name'],
                         'faceType': 'internal',
                     })
@@ -1114,7 +1376,147 @@ class CaseBuilder:
                 }
         # Plan 31. The open primitives refine as surfaces, not as regions.
         result.update(self._open_primitive_refinement_surfaces())
+        result.update(self._closed_primitive_refinement_surfaces())
+        self._warn_primitive_surface_bindings()
         return result
+
+    #: DP-668. The modelled shapes whose ``<name>_surface`` row a surface
+    #: refinement group can refine: each is registered in ``geometry{}`` as a
+    #: closed searchable surface (searchableBox, searchableSphere,
+    #: searchableCylinder), which OpenFOAM 13 accepts in
+    #: ``refinementSurfaces`` exactly as it accepts a triSurface.
+    _CLOSED_PRIMITIVE_SHAPES = ('hex', 'sphere', 'cylinder')
+
+    def _bound_closed_primitive_surfaces(self):
+        """``(volume_key, volume, surface, group)`` per bound shape surface.
+
+        DP-668. The surface row a box, sphere or cylinder carries, bound to a
+        surface refinement group, on a shape the writer registers under its
+        volume's name. The bounding Hex6 is the block, never a shape.
+        """
+        bounding = self._bounding_hex6_key()
+        elements = self._elements('geometry')
+        for geometry_id, surface in elements.items():
+            if self._item_value(surface, 'gType') != 'surface':
+                continue
+            if self._item_value(surface, 'shape') not in self._CLOSED_PRIMITIVE_SHAPES:
+                continue
+            group = self._collection_item(
+                'castellation/refinementSurfaces',
+                self._item_value(surface, 'castellationGroup'))
+            if group is None:
+                continue
+            volume_key = self._item_value(surface, 'volume')
+            volume = self._owning_volume(surface)
+            if volume is None:
+                continue
+            if bounding is not None and str(volume_key) == str(bounding):
+                continue
+            if self._item_value(volume, 'shape') not in self._CLOSED_PRIMITIVE_SHAPES:
+                continue
+            yield str(volume_key), volume, surface, group
+
+    def _closed_primitive_refinement_surfaces(self) -> dict:
+        """``refinementSurfaces`` rows for a box, sphere or cylinder surface.
+
+        DP-668 (supersedes the DP-578 refusal). The picker offers the
+        ``<name>_surface`` row a modelled shape carries, and a group bound to
+        it promises "refine the cells this shape's surface cuts between these
+        two levels". The shape is already a closed searchable surface in
+        ``geometry{}`` under the volume's name, so that key takes the group's
+        levels here.
+
+        What the faces become: a surface refinement group is a request for
+        resolution, so the shape's surface is written as an *internal*
+        faceZone named after the surface row -- the mesh conforms to the
+        shape and keeps the cells on both sides of it. Written as a plain
+        patch instead, snappy would make it a wall and delete everything on
+        the far side of it from the location in mesh, carving the shape out
+        of the domain; the volume dialog types every shape surface
+        ``boundary`` by default, so that would carve every refinement box.
+        When the row says ``boundary`` the substitution is said. A row the
+        user typed ``interface`` becomes a baffle, as an imported one does.
+        """
+        result: dict[str, dict] = {}
+        for _key, volume, surface, group in self._bound_closed_primitive_surfaces():
+            volume_name = str(self._item_value(volume, 'name', f'volume_{_key}'))
+            surface_name = str(self._item_value(surface, 'name', f'{volume_name}_surface'))
+            group_name = self._item_value(group, 'groupName') or 'a surface group'
+            levels = self._item_element(group, 'surfaceRefinement')
+            minimum = int(self._item_value(levels, 'minimumLevel', 0))
+            maximum = int(self._item_value(levels, 'maximumLevel', minimum))
+            if minimum > maximum:
+                raise ValueError(
+                    f'surface refinement group {group_name}: minimum level '
+                    f'{minimum} is above maximum level {maximum}')
+            entry: dict[str, object] = {'level': [minimum, maximum]}
+            increment = self._item_value(group, 'gapLevelIncrement')
+            if increment is not None and str(increment).strip() != '':
+                if int(increment) < 0:
+                    raise ValueError(
+                        f'gap level increment for {surface_name} must not be '
+                        f'negative; Foundation 13 rejects a negative '
+                        f'levelincrement outright')
+                entry['gapLevelIncrement'] = int(increment)
+            cfd_type = str(self._item_value(surface, 'cfdType', 'boundary'))
+            if cfd_type == 'interface':
+                entry.update({'faceZone': surface_name, 'faceType': 'baffle',
+                              'patchInfo': {'type': 'patch'}})
+            else:
+                entry.update({'faceZone': surface_name, 'faceType': 'internal'})
+                if cfd_type == 'boundary':
+                    self.warn(
+                        'refinement.primitive_surface.kept_internal',
+                        f'Surface {surface_name} of the modelled '
+                        f'{self._item_value(surface, "shape")} {volume_name} '
+                        f'is refined at level ({minimum} {maximum}) by group '
+                        f'{group_name} and kept as internal faces (faceZone '
+                        f'{surface_name}); it is not made a wall, which would '
+                        f'cut the shape out of the domain.',
+                        field_id='meshing.castellation.surface_refinements',
+                        requested='boundary', applied='internal faceZone',
+                        severity='info')
+            result[volume_name] = entry
+        return result
+
+    def _warn_primitive_surface_bindings(self) -> None:
+        """Say so when a surface group is bound to a modelled shape's surface.
+
+        DP-578 (field audit 0924 snappy-front D5). Only imported surfaces
+        reach ``refinementSurfaces`` through a surface group. The surface row
+        the volume dialog makes for a box, sphere or cylinder (or a plane,
+        disk, plate or Hex6 face) has no writer, so a group bound to one wrote
+        nothing and nothing said so. Entry now refuses the binding; a project
+        saved before that is reported here.
+        """
+        written = {
+            str(self._item_value(surface, 'name'))
+            for _key, _volume, surface, _group
+            in self._bound_closed_primitive_surfaces()}
+        for geometry_id, geometry in self._elements('geometry').items():
+            if self._item_value(geometry, 'gType') != 'surface':
+                continue
+            shape = self._item_value(geometry, 'shape')
+            if shape in ('triSurfaceMesh', '', None):
+                continue
+            if str(self._item_value(geometry, 'name')) in written:
+                continue  # DP-668: a box, sphere or cylinder surface is written
+            group = self._collection_item(
+                'castellation/refinementSurfaces',
+                self._item_value(geometry, 'castellationGroup'))
+            if group is None:
+                continue
+            name = self._item_value(geometry, 'name', f'surface_{geometry_id}')
+            self.warn(
+                'refinement.primitive_surface.unwritten',
+                f'Surface {name} is the {shape} surface of a modelled shape; '
+                f'surface refinement group '
+                f'{self._item_value(group, "groupName", "")} refines imported '
+                f'surfaces and the surface of a box, sphere or cylinder only, '
+                f'so nothing was written for it. Refine the '
+                f'shape through a volume refinement group instead.',
+                field_id='meshing.castellation.surface_refinements',
+                requested=name, applied='not written')
 
     # -- C31-11: the three per-surface settings v13 reads and we did not --- #
 
@@ -1172,7 +1574,8 @@ class CaseBuilder:
             # dictionary snappy will never look at.
             self.warn(
                 'refinement.surface.in_groups_unused',
-                f'{group["solver_name"]} names the patch group(s) '
+                f'{group["solver_name"]} names the '
+                f'{agreeing(len(names), "patch group")} '
                 f'{" ".join(names)}, but it is written as an internal face '
                 f'zone rather than a patch, so snappyHexMesh creates no patch '
                 f'for the group to hold',
@@ -1197,6 +1600,50 @@ class CaseBuilder:
     #: ``surfaceZonesInfo.C:34-40`` -- the four names v13 registers, and the
     #: only four this writer may emit.
     _ZONE_MODES = ('inside', 'outside', 'insidePoint', 'none')
+
+    def _interface_seed(self, geometry, refinement):
+        """``mode insidePoint`` and the seed, for an interface that carves.
+
+        DP-421. ``mode inside`` means "the volume this surface encloses", and
+        an interface encloses nothing -- it is a patch between two bodies, and
+        it is open. ``surfaceZonesInfo.C:79-82`` makes the point mandatory
+        under ``insidePoint``, so the mode is not a choice here and the seed
+        has to come from somewhere: the volume the interface bounds records
+        one when the geometry split that produced this surface found it, and
+        the refinement group ``zoneInsidePoint`` answers for a user who placed
+        it by hand.
+
+        ``None`` when neither said anything, and that answer is the whole
+        reason this returns rather than raises. An ``interface`` on a zoned
+        volume with no seed anywhere is an older project, or a hand-typed
+        baffle inside a porous region, and DP-387 pinned what it has always
+        produced: ``faceType baffle`` and a patch. Carving is the new reading
+        and it needs a fact the old shape does not carry, so the absence of
+        that fact is what tells the two apart. Nothing that meshes today
+        changes; only a project that records a seed gets the v13 shape.
+        """
+        volume = self._owning_volume(geometry)
+        point = None
+        if volume is not None and bool(
+                self._item_value(volume, 'zoneInsidePointSet', False)):
+            point = self._item_element(volume, 'zoneInsidePoint')
+        if point is None:
+            hand = self._item_element(refinement, 'zoneInsidePoint')
+            if hand is not None and any(
+                    float(self._item_value(hand, axis, 0.0))
+                    for axis in ('x', 'y', 'z')):
+                point = hand
+        if point is None:
+            return None
+        coordinates = [float(self._item_value(point, axis, 0.0))
+                       for axis in ('x', 'y', 'z')]
+        if not all(math.isfinite(value) for value in coordinates):
+            raise ValueError(
+                f'the inside point for the interface '
+                f'{self._item_value(geometry, "name", "")!r} is not a finite '
+                f'coordinate, so OpenFOAM 13 cannot say which side of it the '
+                f'cell zone lies on')
+        return {'mode': 'insidePoint', 'insidePoint': coordinates}
 
     def _zone_selection(self, refinement, group) -> dict:
         """``mode`` (and ``insidePoint`` when it needs one) for a cell zone."""
@@ -1338,6 +1785,9 @@ class CaseBuilder:
         a long log -- so this warns at write time, while the user is still
         looking at the case.
         """
+        # DP-492. Which patches each quoted key named when it was written, so
+        # a request can be reported against the patch names snappy prints.
+        self._layer_pattern_patches = {}
         for layer in self._elements('addLayers/layers').values():
             if not self._layer_selects_by_pattern(layer):
                 continue
@@ -1368,6 +1818,7 @@ class CaseBuilder:
             values = self._canonical_layer_values(layer)
             if values is None:                   # inherit: not mentioned
                 continue
+            self._layer_pattern_patches[key] = matched
             if not values.get('nSurfaceLayers'):  # freeze: mentioned as zero
                 # Record the names, not the pattern: the achieved-layer report
                 # is keyed on the patch names checkMesh reports back.
@@ -1437,6 +1888,29 @@ class CaseBuilder:
         if not hasattr(self, '_frozen_layer_patches'):
             self._layer_surfaces()
         return set(getattr(self, '_frozen_layer_patches', ()))
+
+    def requested_layer_counts(self) -> dict[str, int]:
+        """Map each patch the last dictionary layers to its ``nSurfaceLayers``.
+
+        DP-492. MEASURED on the audit's S2 case: a group matching
+        ``box_inner`` by pattern asked for 3 layers, and the recorded coverage
+        read "not recorded" for box_inner, because the request was keyed by
+        the dictionary key ``"box_inner"`` while the report looks it up by the
+        patch name snappy prints. A quoted key is expanded here to the patches
+        it matched when it was written. v13 resolves the keys the same way
+        (``layerParameters.C:267-292``): it walks ``layers`` in order and sets
+        every patch each key matches, so where two keys match one patch the
+        later one's count is the one the mesher uses.
+        """
+        counts: dict[str, int] = {}
+        patterns = None
+        for key, entry in (self._layer_surfaces() or {}).items():
+            if patterns is None:
+                patterns = dict(getattr(self, '_layer_pattern_patches', {}))
+            count = int(entry.get('nSurfaceLayers') or 0)
+            for name in patterns.get(key, (key,)):
+                counts[str(name)] = count
+        return counts
 
     def _canonical_layer_values(self, layer) -> dict | None:
         """Convert every UI thickness model to v13's first+expansion pair.
@@ -1676,16 +2150,21 @@ class CaseBuilder:
                     wrapper['regions'] = entry['regions']
                 data[surface['name']] = wrapper
 
-        bounding = self._v('baseGrid/boundingHex6')
+        bounding = self._bounding_hex6_key()
+        # DP-668: a shape whose surface a surface group refines is needed in
+        # ``geometry{}`` even when the volume itself asks for nothing.
+        surface_bound = {key for key, *_rest
+                         in self._bound_closed_primitive_surfaces()}
         for geometry_id, geometry in self._elements('geometry').items():
             if self._item_value(geometry, 'gType') != 'volume':
                 continue
             group_id = self._item_value(geometry, 'castellationGroup')
             cfd_type = self._item_value(geometry, 'cfdType', 'none')
-            if group_id is None and cfd_type == 'none':
+            if (group_id is None and cfd_type == 'none'
+                    and str(geometry_id) not in surface_bound):
                 continue
             if bounding is not None and str(geometry_id) == str(bounding):
-                continue
+                continue  # DP-577: only a real hex6 is taken as the block
             name = str(self._item_value(
                 geometry, 'name', f'volume_{geometry_id}'))
             shape = self._item_value(geometry, 'shape')
@@ -1775,8 +2254,8 @@ class CaseBuilder:
             self.warn(
                 'geometry.plate.span_not_planar',
                 f'the plate {name} has a span of {span}: OpenFOAM needs two '
-                f'positive entries and exactly one zero one -- the zero names '
-                f'the direction the plate faces -- and refuses to build the '
+                f'positive entries and exactly one zero one — the zero names '
+                f'the direction the plate faces — and refuses to build the '
                 f'surface otherwise',
                 field_id='geometry', requested=span, severity='error')
         return {
@@ -1815,7 +2294,7 @@ class CaseBuilder:
         minimum and a maximum, so it is written as both.
         """
         result: dict[str, dict] = {}
-        bounding = self._v('baseGrid/boundingHex6')
+        bounding = self._bounding_hex6_key()
         for geometry_id, geometry in self._elements('geometry').items():
             if self._item_value(geometry, 'gType') != 'volume':
                 continue
@@ -1823,7 +2302,7 @@ class CaseBuilder:
             if shape not in self._OPEN_PRIMITIVE_SHAPES:
                 continue
             if bounding is not None and str(geometry_id) == str(bounding):
-                continue
+                continue  # DP-577: only a real hex6 is taken as the block
             group_id = self._item_value(geometry, 'castellationGroup')
             refinement = self._collection_item(
                 'castellation/refinementVolumes', group_id)
@@ -1878,7 +2357,8 @@ class CaseBuilder:
                         result.setdefault(value.casefold(), registered)
         return result
 
-    def _registered_volume_name(self, geometry_id, name, registered):
+    def _registered_volume_name(self, geometry_id, name, registered,
+                                volume=None):
         """The ``geometry{}`` key a volume refinement has to be written under (R139).
 
         Primitive volumes -- searchableBox, sphere, cylinder -- are registered
@@ -1889,9 +2369,45 @@ class CaseBuilder:
         ``geometry{}`` can be named -- an unresolvable region must not be
         written, because snappyHexMesh drops unmatched entries with a warning
         in a log nobody reads and meshes on as though the run were clean.
+
+        DP-476. That resolution used to go by *name*: the display name of a
+        child surface row, looked up against the display names of the
+        published groups. Those are two stores, and the GUI lets the user
+        rename in one of them. MEASURED on the campaign's own cases, where
+        every surface is renamed ``<model>_wall<N>`` on the Geometry page:
+
+        * ``annulus`` -- volume ``annulus`` (body ``d01828bf``), child surface
+          renamed ``annulus_wall1``, published group still ``annulus``. No
+          name matched, the level-2 inside region was dropped, and the GUI
+          reported "1 volume(s) at level 2, inside" applied and verified with
+          no gap filed.
+        * ``baffled_chamber`` -- worse than dropped. The upstream volume
+          resolved to nothing, and the downstream volume matched the one row
+          the rename had missed, the interface
+          ``baffled_chamber_downstream_to_baffled_chamber_upstream``, so its
+          distance ramp was written around the *baffle* rather than around
+          the body that asked for it. That entry was the only
+          ``refinementRegions`` row in the case and it looked like a working
+          one.
+
+        The bridge that does not depend on a name is already in both stores:
+        the volume row carries ``geometryId``, and the published surface
+        carries the same id under ``geometry_id`` -- it is the id the
+        ``geometry{}`` key is spelled out of (``surface_<geometryId>``). Ask
+        that first, and keep the name walk after it for the rows that predate
+        the id.
         """
         if name in registered:
             return name
+        body = str(self._item_value(volume, 'geometryId', '') or '').strip()
+        if body:
+            by_body = {surface['name'] for surface in self.surfaces
+                       if str(surface.get('geometry_id') or '').strip() == body
+                       and surface['name'] in registered}
+            # One body publishes one staged surface. Two would be a key this
+            # code cannot choose between, and guessing is what R139 was.
+            if len(by_body) == 1:
+                return next(iter(by_body))
         by_surface_name = self._registered_surface_names()
         candidates = set()
         for element in self._elements('geometry').values():
@@ -1955,7 +2471,8 @@ class CaseBuilder:
             # answered "Not all entries in refinementRegions dictionary were
             # used ... 1(annulus)" -- in the log only. The GUI called the
             # stage a clean pass and marked Castellation done.
-            key = self._registered_volume_name(geometry_id, name, registered)
+            key = self._registered_volume_name(
+                geometry_id, name, registered, volume=geometry)
             if key is None:
                 if warn:
                     self.warn(
@@ -1984,6 +2501,34 @@ class CaseBuilder:
     #: The two modes ``refinementRegions.C`` sizes from a surface's local span
     #: rather than from a distance ramp.
     _SPAN_MODES = ('insideSpan', 'outsideSpan')
+
+    def _volume_band_ramp(self, refinement, name: str,
+                          mode: str) -> list[tuple[float, int]]:
+        """DP-586: the ``castellation/volumeBands`` rows of one volume group.
+
+        Field audit 0924 snappy-front D13. The ramp a workflow page can
+        author: rows named by the group, in increasing distance, read only in
+        ``distance`` mode. In any other mode Foundation 13 takes one level, so
+        the rows are left out and said to be, rather than the first one
+        standing in for the group's own level.
+        """
+        group = str(self._item_value(refinement, 'groupName', '') or '')
+        if not group.strip():
+            return []
+        rows = sorted(
+            (float(self._item_value(band, 'distance', 0.0)),
+             int(self._item_value(band, 'level', 0)))
+            for band in self._elements('castellation/volumeBands').values()
+            if str(self._item_value(band, 'groupName', '')) == group)
+        if rows and mode != 'distance':
+            self.warn(
+                'refinement.volume_bands.unused',
+                f'volume refinement {name} is in {mode} mode, so the '
+                f'{count_text(len(rows), "distance band")} it holds will not '
+                f'be written; switch the group to distance mode to use them',
+                field_id='meshing.castellation.volume_bands')
+            return []
+        return rows
 
     def _refinement_bands(self, refinement, name: str, mode: str) -> list[list]:
         """The ordered ``(distance level)`` pairs of one refinement region.
@@ -2021,6 +2566,8 @@ class CaseBuilder:
             rows.append((float(self._item_value(band, 'distance', 0.0)),
                          int(self._item_value(band, 'level', 0))))
         if not rows:
+            rows = self._volume_band_ramp(refinement, name, mode)  # DP-586
+        if not rows:
             rows = [(float(self._item_value(refinement, 'distance', 1.0)),
                      int(self._item_value(
                          refinement, 'volumeRefinementLevel', 1)))]
@@ -2029,7 +2576,7 @@ class CaseBuilder:
                 f'volume refinement {name} is in {mode} mode with '
                 f'{len(rows)} refinement bands; Foundation 13 reads a single '
                 f'"level (distance level)" pair for that mode and cannot use '
-                f'a ramp -- use mode distance, or keep one band')
+                f'a ramp — use mode distance, or keep one band')
         for index, (distance, level) in enumerate(rows):
             if not math.isfinite(distance) or distance <= 0:
                 raise ValueError(
@@ -2122,6 +2669,27 @@ class CaseBuilder:
                 wanted[key] = mode
         return wanted
 
+    def _warn_local_cells_above_global(self, castellated: dict) -> None:
+        """DP-585 (field audit 0924 snappy-front D12).
+
+        ``maxLocalCells`` is the per-processor ceiling and ``maxGlobalCells``
+        the whole-mesh one, so a local limit above the global one can never
+        be the limit that stops refinement. OpenFOAM 13 accepts it without a
+        word; the setting is still almost certainly a typo, so it is said
+        here rather than refused.
+        """
+        local = castellated.get('maxLocalCells')
+        total = castellated.get('maxGlobalCells')
+        if isinstance(local, int) and isinstance(total, int) and local > total:
+            self.warn(
+                'castellation.max_local_cells.above_global',
+                f'Max local cells ({local}) is above Max global cells '
+                f'({total}). The local limit is per processor, so it can '
+                f'never stop refinement before the global one does; lower it '
+                f'or raise Max global cells.',
+                field_id='meshing.castellation.max_local_cells',
+                requested=local, applied=local)
+
     def snappy_hex_mesh_dict(self, *, castellation=True, snap=True, layers=True) -> str:
         buffer_layer_enabled = not bool(
             self._v('snap/bufferLayer/disabled', True))
@@ -2144,6 +2712,7 @@ class CaseBuilder:
             'allowFreeStandingZoneFaces': self._v(
                 'castellation/allowFreeStandingZoneFaces', True),
         }
+        self._warn_local_cells_above_global(castellated)  # DP-585
         # F-06. One seed is written singular, several are written as the
         # ``List<point>`` v13 reads; nothing is dropped and nothing is warned
         # about, because Foundation 13 keeps every region the list names.
@@ -2187,6 +2756,23 @@ class CaseBuilder:
         # it always did.
         self._add_toggles(snap_controls, 'snap', ('detectNearSurfacesSnap',))
         layer_surfaces = self._layer_surfaces()
+        if layers and not layer_surfaces:
+            # DP-112. MEASURED on all nine meshed snappy legs of the 1f2787eb
+            # sweep: castellation, snap and layers reported the same cell
+            # count, and the log said `No layers to generate ...`. The stage
+            # ran, exited 0, and was ticked. The dictionary explains it --
+            # `layers { }` is empty, so there is no patch for addLayers to
+            # grow on. v13 treats that as a request for nothing rather than as
+            # an error, which is correct of it; what was missing is anyone
+            # saying so while the user is still looking at the case.
+            self.warn(
+                'layers.no_patch_selected',
+                'the layers stage is enabled but no patch is configured to '
+                'grow layers, so snappyHexMesh will report success without '
+                'changing the mesh; assign a layer group to at least one '
+                'surface, or turn the layers stage off',
+                field_id='addLayers/layers',
+                requested='add layers', applied='(no patch selected)')
         # A frozen patch is `nSurfaceLayers 0` and nothing else, so it carries
         # no thickness to read a global default from and none to disagree
         # about. Taking the defaults from the first entry regardless would
@@ -2369,7 +2955,7 @@ class CaseBuilder:
             # zone cut across processors fails in the solver rather than here.
             self.warn(
                 'decompose.preserve_face_zones.available',
-                f'this case creates {len(zones)} faceZone(s) '
+                f'this case creates {count_text(len(zones), "faceZone")} '
                 f'({", ".join(zones)}) and the decomposition may cut them '
                 f'across processors; "Keep faceZones whole" on the Execution '
                 f'page writes the preserveFaceZones constraint that stops it',

@@ -26,8 +26,12 @@ import numpy as np
 from foammesh.core.export.poly_mesh_writer import (
     FoamPolyMeshWriter, PolyMeshWriteError,
 )
+from foammesh.core.gmsh.layer_targets import publishable_category
 from foammesh.core.mesh.census import MSH_HIGHER_ORDER_VOLUME_TYPES
-from foammesh.core.mesh.connectivity import _FACES, signed_cell_volumes
+from foammesh.core.quantities import agreeing, aligned, count_text
+from foammesh.core.mesh.connectivity import (
+    _FACES, signed_cell_volumes, straddling_faces,
+)
 from foammesh.core.mesh.model import (
     BoundaryBlock, CanonicalMesh, CellBlock, CellType,
 )
@@ -263,6 +267,17 @@ class SectionExtrusion:
             back=str(values.get('backPatch') or 'back'))
 
 
+def _named_spreads(names: str, spreads) -> str:
+    """``x=0.42, y=0.18, z=0`` -- three extents, to one precision.
+
+    DP-165. The reader's whole job on this line is to see which of the three
+    is the small one, and rendering them a number at a time gave each its own
+    decimal count.
+    """
+    return ', '.join(f'{names[index]}={text}'
+                     for index, text in enumerate(aligned(spreads)))
+
+
 def _section_plane(points: np.ndarray) -> tuple[int, float]:
     """Which coordinate the section is flat in, and the value it holds.
 
@@ -279,7 +294,7 @@ def _section_plane(points: np.ndarray) -> tuple[int, float]:
     if not flat:
         raise PublishError(
             'this mesh is not a planar section: it has extent in all three '
-            f'directions ({", ".join(f"{names[a]}={spreads[a]:.6g}" for a in range(3))}). '
+            f'directions ({_named_spreads(names, spreads)}). '
             'A two-dimensional case needs a section flat in one coordinate '
             'direction, which is the direction it is extruded along.')
     if len(flat) > 1:
@@ -492,9 +507,10 @@ def extrude_section(document: MshDocument,
                 or f'curve group {physical}')
         warnings.append(
             f'the boundary {name!r} lies on the {plan.axis} axis this section '
-            f'is revolved about, so its {count} edge(s) swept no area and it '
-            'publishes no patch. An axisymmetric case has no boundary on its '
-            'own centreline; the cells there are collapsed instead.')
+            f'is revolved about, so its {count_text(count, "edge")} swept no '
+            'area and it publishes no patch. An axisymmetric case has no '
+            'boundary on its own centreline; the cells there are collapsed '
+            'instead.')
 
     return MshDocument(
         points=new_points,
@@ -524,9 +540,10 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         if volumes:
             raise PublishError(
                 f'the job asked for a {extrusion.mode} mesh and Gmsh produced '
-                f'{volumes} volume element(s). A section is extruded here into '
-                'exactly one cell of thickness, so a mesh that already has '
-                'cells cannot be the section this route publishes.')
+                f'{count_text(volumes, "volume element")}. A section is '
+                'extruded here into exactly one cell of thickness, so a mesh '
+                'that already has cells cannot be the section this route '
+                'publishes.')
         document, extrusion_warnings = extrude_section(document, extrusion)
     else:
         extrusion_warnings = []
@@ -618,6 +635,15 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         cell_blocks.append(block)
         next_cell += block.count
 
+    # DP-400. Every cell is now positively oriented, which says nothing about
+    # where it is. A boundary layer grown into volume the tetrahedra already
+    # occupied leaves each cell well formed and each face shared by exactly
+    # two of them, and publishes clean; `checkMesh` then calls those cells
+    # open, three stages downstream. Ask it here instead.
+    straddle = straddling_faces(points, cell_blocks)
+    if straddle:
+        raise PublishError(_straddle_message(straddle))
+
     # Boundary from cell ownership. See the module docstring: Gmsh's own
     # adjacency is stale after a geo-kernel extrusion and cannot be trusted.
     face_use: dict[tuple, int] = {}
@@ -646,19 +672,37 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         next_face += connectivity.shape[0]
 
     expected = sum(1 for count in face_use.values() if count == 1)
-    if next_face != expected:
+    if next_face > expected:
+        # DP-462. More named faces than the mesh has boundary faces is not an
+        # open mesh, it is the opposite: a face claimed by two physical
+        # surfaces at once. MEASURED on `tee_with_plug` gmsh, 21 September
+        # 2026 -- 27,394 free faces, every one of them named, and 29,432 kept
+        # copies, because 2,038 faces carry both `tee_with_plug_fluid` and
+        # `tee_with_plug_plug`, the plug's skin lying flush along the fluid's
+        # outer wall. The old message read `only 29432 are named` of a mesh
+        # with 27394 to name and sent the reader to look for a hole. A
+        # polyMesh face belongs to exactly one patch, so this is refused
+        # rather than resolved: picking a winner would put a boundary
+        # condition on a wall the user named twice without saying which name
+        # the solver would see.
+        raise PublishError(_overlap_message(boundary_blocks, face_use,
+                                            document.physical_names,
+                                            next_face - expected))
+    if next_face < expected:
         raise PublishError(
             f'the mesh has {expected} boundary faces but only {next_face} are '
             'named by a physical group; every boundary face needs a patch or '
             'the published mesh would be open')
     if dropped:
         warnings.append(
-            f'{dropped} two-dimensional element(s) lay on interior interfaces '
-            'and were not published as boundary faces')
+            f'{count_text(dropped, "two-dimensional element")} lay on '
+            f'interior interfaces and {agreeing(dropped, "was", "were")} not '
+            'published as boundary faces')
     if flipped_total:
         warnings.append(
-            f'{flipped_total} cell(s) had negative orientation and were '
-            'flipped to positive')
+            f'{count_text(flipped_total, "cell")} had negative orientation '
+            f'and {agreeing(flipped_total, "was", "were")} flipped to '
+            'positive')
 
     patches = _patch_metadata(
         boundary_blocks, document.physical_names, patch_metadata)
@@ -681,6 +725,81 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         warnings=tuple(warnings),
         patch_records=tuple(dict(item) for item in patches.values()))
     return mesh, report
+
+
+def _overlap_message(boundary_blocks, face_use, physical_names,
+                     surplus: int) -> str:
+    """Name the surfaces that claim the same boundary face (DP-462).
+
+    The count alone does not tell a user what to change. The pair of patch
+    names does: it says which two surfaces of their own model overlap, and
+    the face count says over how much of it.
+    """
+    claims: dict[tuple, set] = {}
+    for block in boundary_blocks:
+        for row, patch in zip(block.connectivity, block.patch_ids):
+            key = tuple(sorted(int(value) for value in row))
+            claims.setdefault(key, set()).add(int(patch))
+    shared = [tags for tags in claims.values() if len(tags) > 1]
+    pairs: dict[tuple, int] = {}
+    for tags in shared:
+        pairs[tuple(sorted(tags))] = pairs.get(tuple(sorted(tags)), 0) + 1
+
+    def named(tag: int) -> str:
+        return physical_names.get((2, tag)) or f'physical surface {tag}'
+
+    described = '; '.join(
+        f'{" and ".join(named(tag) for tag in tags)} share '
+        f'{count_text(shared_faces, "boundary face")}'
+        for tags, shared_faces in sorted(pairs.items(), key=lambda item: -item[1]))
+    if not described:
+        described = (f'{count_text(surplus, "boundary face")} carry more than '
+                     'one physical surface')
+    return (
+        f'{count_text(surplus, "boundary face")} in this mesh '
+        f'{agreeing(surplus, "is", "are")} named by more than one physical '
+        f'surface, and a polyMesh face belongs to exactly one patch: '
+        f'{described}. The mesh is closed — every boundary face has a name — '
+        'so what has to change is the geometry: two of the named surfaces '
+        'occupy the same ground, and only one of them can carry the boundary '
+        'condition there.')
+
+
+def _straddle_message(straddle) -> str:
+    """Why a mesh with cells inside other cells is refused rather than written.
+
+    DP-400. `heated_duct` published, was accepted by the quality verdict --
+    gamma mean 0.877, nothing below threshold -- and was then found unusable
+    by `checkMesh`: "Open cells found, max cell openness: 1, number of open
+    cells 342". The 342 is this count. The mesh is not repairable here: the
+    layer has to be grown differently, or not at all.
+
+    The wording names the shapes because they are the tell. A layer extruded
+    into a tetrahedral fill shows up as the layer's own quadrilateral sides
+    and the triangular caps of the cells it landed on, and saying so points
+    at the extrusion rather than at the CAD.
+    """
+    shapes = []
+    if straddle.triangles:
+        shapes.append(count_text(straddle.triangles, 'triangle'))
+    if straddle.quadrilaterals:
+        shapes.append(
+            count_text(straddle.quadrilaterals, 'quadrilateral'))
+    where = ''
+    if straddle.samples:
+        point, owner, neighbour = straddle.samples[0]
+        where = (', first between cells {0} and {1} at ({2:g}, {3:g}, {4:g})'
+                 .format(owner, neighbour, *point))
+    return (f'{count_text(straddle.count, "interior face")} '
+            f'{agreeing(straddle.count, "does", "do")} not lie between the '
+            f'two cells sharing {agreeing(straddle.count, "it", "them")}: '
+            f'both cells are on the same side, so they occupy the same space '
+            f'({" and ".join(shapes)}, '
+            f'{count_text(straddle.cells, "cell")} in all){where}. This is '
+            'usually a boundary layer grown into volume the mesh already '
+            'filled; reduce the layer thickness or the number of layers on '
+            'the surfaces it was grown from. Publishing would give a mesh '
+            'OpenFOAM reports as open.')
 
 
 def _patch_metadata(boundary_blocks, physical_names, supplied):
@@ -809,13 +928,51 @@ def patch_metadata_from(categories=None, periodic_pairs=(),
 # Publication
 # --------------------------------------------------------------------------- #
 
+def substitute_mesh_constrained(categories) -> tuple[dict, list]:
+    """Publish `wall` in place of a type the mesh would have to earn.
+
+    DP-445. `wedge` and `empty` are not declarations, they are geometric
+    contracts: a `wedgePolyPatch` needs two planar faces spanning a small
+    angle about a common axis on a mesh one cell thick, and an `empty` patch
+    needs that same mesh's flat front or back. This pipeline publishes a
+    three-dimensional tetrahedral or hex-dominant mesh everywhere except the
+    section extrusion, so neither contract can hold.
+
+    The category arrives here off the leading word of a patch name, so a
+    model called `wedge` whose surfaces the user named `wedge_wall1 ..
+    wedge_wall7` publishes seven wedge patches -- and seven of them cannot
+    be a pair in any case. MEASURED on that fixture: it is a 0.6x0.3x0.3 box
+    cut by a box rotated 35 degrees, a solid named for its shape, and the
+    collision with the boundary-role vocabulary is a coincidence of English.
+    The snappy pipeline has guarded exactly this since snappyHexMesh died
+    with SIGFPE inside `Foam::wedgePolyPatch::calcGeometry` on the same file;
+    this path had no counterpart.
+
+    Returns the mapping to publish and the substitutions made, so the report
+    can say what was taken away rather than take it away silently.
+    """
+    published = dict(categories or {})
+    unmeshable = []
+    for name, category in list(published.items()):
+        replacement = publishable_category(category)
+        if replacement != category:
+            published[name] = replacement
+            unmeshable.append((str(name), str(category).strip().lower()))
+    return published, unmeshable
+
+
 def publish(msh_path: str | Path, destination: str | Path, *,
             categories=None, periodic_pairs=(), region_metadata=None,
             identities=None, source_fingerprint: str = '',
             extrusion: 'SectionExtrusion | None' = None) -> PublishReport:
     """Read a Gmsh mesh and write ``constant/polyMesh`` at ``destination``."""
     document = read_msh(msh_path)
-    categories = dict(categories or {})
+    # DP-445, and note where this sits: *above* the extrusion block. The
+    # extrusion is the one legitimate producer of these types and writes its
+    # two entries over this mapping a few lines below, so ordering alone
+    # keeps a deliberate `wedge` apart from a guessed one and no provenance
+    # flag has to be invented to carry the difference.
+    categories, unmeshable = substitute_mesh_constrained(categories)
     if extrusion is not None:
         # The front and back categories are the extrusion's, not the prepared
         # geometry's: they are the two faces this code just made, and typing
@@ -841,7 +998,16 @@ def publish(msh_path: str | Path, destination: str | Path, *,
         boundary_faces=report.boundary_faces,
         interior_2d_dropped=report.interior_2d_dropped,
         flipped_cells=report.flipped_cells, patches=report.patches,
-        regions=report.regions, warnings=report.warnings,
+        regions=report.regions,
+        warnings=tuple(report.warnings) + tuple(
+            f'{name} is named for the {requested} category, but a '
+            f'{requested} patch describes a mesh one cell thick and this '
+            f'pipeline published a three-dimensional one, which OpenFOAM '
+            f'aborts on. It is published as a wall. Revolve or extrude a '
+            f'section if the case is axisymmetric or two-dimensional — that '
+            f'path sets these types on the two faces it makes — or rename '
+            f'the surface so it does not lead with "{requested}".'
+            for name, requested in unmeshable),
         export=written.to_dict(), patch_records=report.patch_records)
 
 

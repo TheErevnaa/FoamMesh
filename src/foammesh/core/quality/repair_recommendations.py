@@ -31,7 +31,7 @@ def recommendations(result) -> list[dict]:
     if not output:
         output.append({
             'failure': 'No parsed failure details', 'actions': [],
-            'advice': ('Run Mesh Check with failed-set output enabled; no automated remedy '
+            'advice': ('Run Mesh check with failed-set output enabled; no automated remedy '
                        'can be selected without a classified failure.'),
             'automated_remedy': False,
         })

@@ -3,7 +3,9 @@
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFileDialog, QListWidgetItem
+from PySide6.QtGui import QIntValidator
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog,
+                               QListWidgetItem, QMessageBox)
 
 from foammesh.app import app
 from foammesh.core.geometry.units import UNIT_TO_M, suggest_unit
@@ -24,6 +26,56 @@ UNIT_CHOICES = (
 #: a user to overrule the file, which is how a correct model gets scaled wrong.
 #: BREP is not one of them: it carries geometry only, so it has to be asked.
 SELF_DESCRIBING = {'.step', '.stp', '.iges', '.igs'}
+
+#: The split dialog's own slider and validator: whole degrees, 0 to 180.
+FEATURE_ANGLE_RANGE = (0, 180)
+
+
+def parseFeatureAngle(text) -> int:
+    """The split feature angle, in whole degrees, or a plain refusal.
+
+    DP-637 (field audit 0924 D-SH-03). The field used to be read with a bare
+    ``float()`` outside any ``try``: ``60deg`` raised out of the import slot
+    with nothing on screen, after the CAD half of a mixed selection had
+    already been imported, and an empty field quietly meant "no split".
+    """
+    low, high = FEATURE_ANGLE_RANGE
+    refusal = ValueError(
+        f'Feature angle must be a whole number of degrees from {low} to '
+        f'{high}; "{str(text or "").strip()}" is not. Untick "Split surface" '
+        'to import without splitting.')
+    try:
+        value = int(str(text).strip())
+    except (TypeError, ValueError):
+        raise refusal from None
+    if not low <= value <= high:
+        raise refusal
+    return value
+
+
+def _caseSources():
+    """``(engine id, store entries)`` of the open case, empty when unknown."""
+    engine, entries = '', []
+    try:
+        from foammesh.core.engine.registry import configured_engine_id
+        engine = configured_engine_id(app.db)
+    except Exception:                                      # noqa: BLE001
+        pass
+    project = getattr(app, 'project', None)
+    if project is not None and getattr(project, 'path', None) is not None:
+        try:
+            from foammesh.core.geometry import GeometryArtifactStore
+            entries = GeometryArtifactStore(project.path).entries()
+        except (OSError, ValueError):
+            entries = []
+    return engine, entries
+
+
+def _mixesCadAndSurfaces(engine) -> bool:
+    from foammesh.core.engine.registry import ENGINE_REGISTRY
+    if engine not in ENGINE_REGISTRY.ids():
+        return True
+    return getattr(ENGINE_REGISTRY.get(engine), 'mixes_cad_and_surfaces', True)
 
 
 class ImportDialog(QDialog):
@@ -50,6 +102,10 @@ class ImportDialog(QDialog):
         self._ui.unit.setCurrentIndex(
             self._ui.unit.findData(app.settings.getRecentImportUnit()))
         self._ui.buttonBox.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        # DP-637. Letters cannot be typed; what a paste or an empty field
+        # leaves is refused at OK, before anything is imported.
+        self._ui.featureAngle.setValidator(
+            QIntValidator(*FEATURE_ANGLE_RANGE, self))
 
         self._connectSignalsSlots()
 
@@ -73,7 +129,7 @@ class ImportDialog(QDialog):
         self._ui.select.clicked.connect(self._openFileDialog)
 
     def _openFileDialog(self):
-        self._dialog = QFileDialog(self, self.tr('Select Geometry File'), app.settings.getRecentImportDirectory(), 'Geometry (*.stl *.obj *.step *.stp *.iges *.igs *.brep);;Surface (*.stl *.obj);;CAD (*.step *.stp *.iges *.igs *.brep)')
+        self._dialog = QFileDialog(self, self.tr('Select geometry file'), app.settings.getRecentImportDirectory(), 'Geometry (*.stl *.obj *.step *.stp *.iges *.igs *.brep);;Surface (*.stl *.obj);;CAD (*.step *.stp *.iges *.igs *.brep)')
         self._dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
         self._dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
         self._dialog.filesSelected.connect(self._filesSelected)
@@ -89,7 +145,26 @@ class ImportDialog(QDialog):
         app.settings.updateRecentImportDirectory(Path(files[0]).parent)
         self._suggestUnit()
 
+    def refusal(self):
+        """Why OK cannot import this selection, or ``None``."""
+        if self._ui.splitSurface.isChecked():
+            try:
+                parseFeatureAngle(self._ui.featureAngle.text())
+            except ValueError as error:
+                return str(error)
+        # DP-638. Refused here, before the first file goes in: the page
+        # imports the CAD half of a selection before the surfaces.
+        engine, entries = _caseSources()
+        if not _mixesCadAndSurfaces(engine):
+            from foammesh.core.geometry.store import gmsh_mixed_sources_refusal
+            return gmsh_mixed_sources_refusal(entries, self.files())
+        return None
+
     def accept(self):
+        refusal = self.refusal()
+        if refusal:
+            QMessageBox.warning(self, self.tr('Import geometry'), refusal)
+            return
         # Remembered so the next import opens on what this one used; the
         # measured suggestion still overrides it once files are chosen.
         app.settings.updateRecentImportUnit(self._ui.unit.currentData() or 'mm')

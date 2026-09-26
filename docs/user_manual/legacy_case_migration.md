@@ -3,7 +3,7 @@
 ## What you will see
 
 A case saved by a FoamMesh older than the provenance record opens with its mesh
-on screen, in **External Mesh** mode: the mesh is drawn, Mesh Check and the
+on screen, in **External mesh** mode: the mesh is drawn, Mesh check and the
 exports work, and the meshing steps that would have produced it are not offered.
 Nothing is broken and nothing is lost — the mesh in `constant/polyMesh` is the
 one you made.
@@ -25,20 +25,20 @@ The sidecar is valid and it is ours, so the case is recognised as a FoamMesh
 case. But there is no claim in it that FoamMesh authored the mesh sitting beside
 it, and FoamMesh will not invent one: a mesh it cannot tie to a recorded run is
 treated as somebody else's, which is the safe reading. Resolving that sidecar
-gives **External Mesh** with the reason *"mesh exists but metadata has no
+gives **External mesh** with the reason *"mesh exists but metadata has no
 workflow mode"*.
 
 Measured on 2026-09-05 against `test_cases/snappyhexmesh/duct`,
 `test_cases/snappyhexmesh/elbow` and `test_cases/gmsh/pipe`: all three classify
-as a FoamMesh case, all three resolve to External Mesh, none carries workflow
+as a FoamMesh case, all three resolve to External mesh, none carries workflow
 state. The classification now says so in its own words — `classify_case` returns
 the reason `legacy sidecar: valid FoamMesh metadata with no workflow mode beside
-an existing mesh; the case opens as External Mesh with no workflow state`.
+an existing mesh; the case opens as External mesh with no workflow state`.
 
 ## What you can do with it
 
-**Use the mesh.** Nothing about External Mesh limits the mesh itself. View it,
-run Mesh Check on it, export it, convert it. This is the right choice when the
+**Use the mesh.** Nothing about External mesh limits the mesh itself. View it,
+run Mesh check on it, export it, convert it. This is the right choice when the
 case is a finished result you want to keep exactly as it is.
 
 **Re-author it.** To get the meshing steps back, re-import the geometry and set
@@ -52,6 +52,31 @@ There is no in-place upgrade, deliberately. Stamping `workflow: authored` onto
 an old sidecar would assert that settings in the case produced the mesh next to
 it, which nothing in the file supports — and the first stale-mesh check after
 that would be answering with a guess.
+
+## A case saved before the workflow rows merged
+
+September 2026 merged the outline into one guided workflow: three shared rows
+in front -- **1. Geometry**, **2. Mesh setup**, **3. Preparation** -- and the
+mesher's own rows numbered on from 4, ending at Export. `1. Mesh intent`,
+`2. Execution` and the Gmsh `Describe geometry` row were folded into those
+three; every question they asked is still asked, on **2. Mesh setup** and in
+the Advanced section of **3. Preparation**.
+
+A case saved before that opens on the new outline, and nothing you authored
+and nothing you meshed is lost. What is reset is the task progress alone --
+the ticks beside the rows. Saved progress is tied to the shape of the workflow
+it was recorded against, and carrying a tick across a renumbering would mark a
+row as done that nobody had seen; FoamMesh says so instead, in the status line:
+*The meshing workflow changed, so saved task progress has been reset. Meshes
+and reports are untouched.* Your geometry, every value on every page, the run
+directories under `foammesh/runs/` and the published `constant/polyMesh` are
+untouched, and the case was standing on a row that still exists when you left
+it -- the rows that went away answer to the rows that replaced them, so a
+reopen puts you back where you were rather than nowhere.
+
+Walking the rows again settles the ticks. Where a row was already run, the
+press is the one that runs it again; where it only records what you filled in,
+the press records what is already on the page.
 
 ## Which files matter
 

@@ -11,6 +11,7 @@ from widgets.selector_dialog import SelectorDialog, SelectorItem
 from foammesh.app import app
 from foammesh.db.configurations_schema import CFDType
 from foammesh.core.mesh.extrusion_options import ExtrudeOptions, ExtrudeModel
+from foammesh.view.theming.metrics import FORM_MARGIN
 from .export_2D_plane_dialog_ui import Ui_Export2DPlaneDialog
 from .export_2D_region_widgets import Export2DPlaneRegionWidget
 
@@ -23,8 +24,15 @@ class Export2DPlaneDialog(QDialog):
 
         self._pathWidget = NewProjectWidget(self._ui.path, suffix=None)
 
-        self.setWindowTitle(self.tr('Export 2D Plane Mesh'))
-        self._ui.run.setVisible(False)
+        self.setWindowTitle(self.tr('Export 2D plane mesh'))
+
+        # DP-202. The form used to declare a `Run solver after export`
+        # checkbox that this line hid on every open, and an
+        # `isRunAfterExportChecked()` that no caller in the product ever
+        # asked. FoamMesh meshes; it does not run a solver. A control the
+        # reader can never see is not a setting, and an accessor whose only
+        # readers are tests asserting the value permanent invisibility
+        # guarantees is not an answer. Both are gone from the form.
 
         self._regionWidgets = []
 
@@ -33,13 +41,19 @@ class Export2DPlaneDialog(QDialog):
 
         layout = QVBoxLayout(self._ui.path)
         layout.addWidget(self._pathWidget)
-        self._pathWidget.hideValidationMessage()
+        # DP-201. This used to call `hideValidationMessage()`. R42 took
+        # the same call out of the Export mesh dialog because the label
+        # that reads "<location> is not a folder." was being written and
+        # never drawn: the reason the destination was refused sat one
+        # widget away from the reader and was delivered instead by a
+        # modal after a press, which is a round trip for a sentence that
+        # was already on the form.
 
         regionsWidget = QWidget()
         self._ui.parameters.layout().insertWidget(0, regionsWidget)
 
         layout = QVBoxLayout(regionsWidget)
-        layout.setContentsMargins(0, -1, 0, 0)
+        layout.setContentsMargins(0, FORM_MARGIN, 0, 0)
 
         db = app.facadeClient.checkout()
         for region in db.getElements('region').values():
@@ -58,9 +72,6 @@ class Export2DPlaneDialog(QDialog):
     def projectPath(self):
         return self._pathWidget.projectPath()
 
-    def isRunAfterExportChecked(self):
-        return self._ui.run.isChecked()
-
     def extrudeOptions(self):
         return ([(b.rname(), b.boundary(), b.boundary()) for b in self._regionWidgets],
                 ExtrudeOptions(ExtrudeModel.PLANE, thickness=self._ui.thickness.text()))
@@ -74,29 +85,29 @@ class Export2DPlaneDialog(QDialog):
         self._dialog.open()
 
     def _createBoundarySelector(self):
-        return SelectorDialog(self, self.tr('Select Boundary'), self.tr('Select Boundary'), self._boundaries)
+        return SelectorDialog(self, self.tr('Select boundary'), self.tr('Select boundary'), self._boundaries)
 
     @qasync.asyncSlot()
     async def _accept(self):
         path = self._pathWidget.projectPath()
         if path is None:
             if self._pathWidget.validationMessage():
-                await AsyncMessageBox().information(self, self.tr('Input Error'), self._pathWidget.validationMessage())
+                await AsyncMessageBox().warning(self, self.tr('Input error'), self._pathWidget.validationMessage())
                 return
             else:
-                await AsyncMessageBox().information(self, self.tr('Input Error'), self.tr('Enter Project Name'))
+                await AsyncMessageBox().warning(self, self.tr('Input error'), self.tr('Enter a project name.'))
                 return
 
         for widget in self._regionWidgets:
             if not widget.boundary():
-                await AsyncMessageBox().information(
-                    self, self.tr('Input Error'), self.tr('Select Boundary - ' + widget.rname()))
+                await AsyncMessageBox().warning(
+                    self, self.tr('Input error'), self.tr('Select boundary — {0}').format(widget.rname()))
                 return
 
         try:
             self._ui.thickness.validate(self.tr('Thickness'))
         except ValueError as e:
-            await AsyncMessageBox().information(self, self.tr('Input Error'), str(e))
+            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
             return
 
         super().accept()

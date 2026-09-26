@@ -223,7 +223,7 @@ def _poly_data(points, rows_by_type):
     return surface
 
 
-def read_msh_scene(path) -> MshScene:
+def read_msh_scene(path, *, surface_only: bool = False) -> MshScene:
     """Read a native Gmsh ``.msh`` into datasets the viewport can draw.
 
     Raises :class:`MshSceneError` with the actual reason on a file that cannot
@@ -231,6 +231,15 @@ def read_msh_scene(path) -> MshScene:
     a surface mesh with no volume. A viewport that shows nothing and says
     nothing is the defect this replaces (R95/R156), so every refusal here
     carries a sentence a user can act on.
+
+    DP-133. ``surface_only`` asks for the other reading, and it is opt-in
+    rather than a fallback on purpose. A surface mesh arriving where a volume
+    was expected is the silent failure the refusal above exists to catch --
+    ``generate(3)`` on a sewn face set produces exactly that and raises
+    nothing -- so the refusal stays the default and only a caller that *asked*
+    for a surface pass, and knows it did, gets one drawn. The scene then
+    carries no ``internalMesh``: a surface mesh has no volume, and inventing
+    an empty grid for one would put a pickable nothing in the tree.
     """
     from foammesh.core.gmsh.publish import PublishError, read_msh
 
@@ -241,6 +250,8 @@ def read_msh_scene(path) -> MshScene:
         raise MshSceneError(f'{path.name}: {error}') from error
 
     volume, volume_tags, surfaces, quadratic, higher_orders = _collect(document)
+    if surface_only:
+        return _surface_scene(path, document, surfaces)
     if not volume:
         if quadratic:
             plural = '' if quadratic == 1 else 's'
@@ -288,6 +299,37 @@ def read_msh_scene(path) -> MshScene:
         points=int(len(document.points)),
         cells=int(len(volume_tags)),
         patches=patches, volumes=volumes)
+
+
+def _surface_scene(path, document, surfaces) -> MshScene:
+    """DP-133. The surface pass of a 3D run, drawn as the surfaces it is.
+
+    Same shape as the volume reading and the same physical groups, so the
+    surface mesh reaches the same actors, the same tree and the same
+    selection -- a user picks a patch on it exactly as they would on the
+    finished mesh. ``internalMesh`` is ``None`` because there is no volume
+    yet; :meth:`MeshManager._buildScene` draws the boundary set alone when it
+    sees that.
+    """
+    if not surfaces:
+        raise MshSceneError(
+            f'{path.name} holds no surface elements to display')
+
+    points = _vtk_points(document.points)
+    names = document.physical_names
+    boundary = {}
+    patches = {}
+    for tag, rows_by_type in surfaces.items():
+        name = _group_name(names, _SURFACE_DIMENSION, tag)
+        boundary[name] = _poly_data(points, rows_by_type)
+        patches[name] = sum(len(rows) for rows in rows_by_type.values())
+
+    return MshScene(
+        vtk_mesh={'': {'boundary': boundary, 'internalMesh': None,
+                       'zones': {'cellZones': {}, 'faceZones': {}}}},
+        points=int(len(document.points)),
+        cells=sum(patches.values()),
+        patches=patches, volumes={})
 
 
 def _volume_zones(points, document, tags):

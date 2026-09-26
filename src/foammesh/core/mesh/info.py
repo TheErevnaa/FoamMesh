@@ -146,7 +146,7 @@ class MeshInfo:
             lines.append('Zones: ' + ', '.join(f'{z.name} ({z.kind})' for z in self.zones))
         if self.last_quality:
             stale = 'stale' if self.last_quality.get('stale') else self.last_quality.get('severity', 'unknown')
-            lines.append(f'Last Mesh Check: {stale} at {self.last_quality.get("checked_at", "unknown")}')
+            lines.append(f'Last Mesh check: {stale} at {self.last_quality.get("checked_at", "unknown")}')
         if self.warnings:
             lines.append('Warnings: ' + '; '.join(self.warnings))
         return '\n'.join(lines)

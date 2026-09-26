@@ -49,7 +49,7 @@
        <widget class="QWidget" name="widget_2" native="true">
         <layout class="QVBoxLayout" name="verticalLayout_2">
          <property name="spacing">
-          <number>20</number>
+          <number>12</number>
          </property>
          <item>
           <spacer name="verticalSpacer">
@@ -67,14 +67,14 @@
          <item>
           <widget class="QPushButton" name="add">
            <property name="text">
-            <string>Add &gt;&gt;</string>
+            <string>Add →</string>
            </property>
           </widget>
          </item>
          <item>
           <widget class="QPushButton" name="remove">
            <property name="text">
-            <string>&lt;&lt; Remove</string>
+            <string>← Remove</string>
            </property>
           </widget>
          </item>

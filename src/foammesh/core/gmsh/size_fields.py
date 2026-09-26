@@ -296,7 +296,8 @@ def derive_size_fields(rows, bbox=None) -> SizeFieldPlan:
     return SizeFieldPlan(fields=ordered, warnings=tuple(warnings))
 
 
-def derive_surface_sizes(rows, *, target_size: float) -> tuple[SizeField, ...]:
+def derive_surface_sizes(rows, *, target_size: float,
+                         prepared_geometry=None) -> tuple[SizeField, ...]:
     """Compile per-surface target sizes into Distance+Threshold pairs.
 
     Plan 29 WP8. The row says only "this surface, this size"; everything the
@@ -310,6 +311,14 @@ def derive_surface_sizes(rows, *, target_size: float) -> tuple[SizeField, ...]:
 
     The result is ordinary :class:`SizeField` rows, so they join the same
     background field as every other size source.
+
+    Plan 33 W-G1 (FIELD-03). ``prepared_geometry`` is how the row finds its
+    surface. A Gmsh tag is a position in import order, so the saved number
+    means nothing once the boundaries are renumbered; the row carries the
+    prepared boundary it was authored on and the tag is resolved from that,
+    against the revision being meshed. Passing nothing keeps the old
+    behaviour -- the number is taken as given -- which is what a caller that
+    has no prepared geometry to resolve against can honestly do.
     """
     target = float(target_size or 0.0)
     if target <= 0:
@@ -323,14 +332,17 @@ def derive_surface_sizes(rows, *, target_size: float) -> tuple[SizeField, ...]:
             continue
         control_id = str(row.get('control_id') or row.get('controlId') or index)
         name = str(row.get('name') or f'surface-{control_id}')
-        try:
-            surface = int(row.get('surfaceId') or 0)
-        except (TypeError, ValueError):
-            surface = 0
-        if surface < 1:
-            raise SizeFieldError(
-                f'surface size {name!r} needs a surface number; Gmsh numbers '
-                'imported surfaces from 1')
+        if prepared_geometry is None:
+            surfaces = (_surface_tag(row),)
+            if surfaces[0] < 1:
+                raise SizeFieldError(
+                    f'surface size {name!r} needs a surface number; Gmsh '
+                    'numbers imported surfaces from 1')
+        else:
+            scope = resolve_surface_rows((row,), prepared_geometry)[0]
+            if scope.reason:
+                raise SizeFieldError(scope.reason)
+            surfaces = scope.tags
         size = float(row.get('targetSize', 0.0) or 0.0)
         if size <= 0:
             raise SizeFieldError(
@@ -342,9 +354,205 @@ def derive_surface_sizes(rows, *, target_size: float) -> tuple[SizeField, ...]:
             control_id=control_id, name=name,
             field_type='distance_threshold',
             order=int(row.get('priority', 0) or 0),
-            surfaces=(surface,), size_inside=size, size_outside=target,
+            surfaces=tuple(surfaces), size_inside=size, size_outside=target,
             distance_min=0.0, distance_max=blend))
     return tuple(sorted(derived, key=lambda item: (-item.order, item.name)))
+
+
+# --------------------------------------------------------------------------- #
+# Plan 33 W-G1. Which boundary a row refines, and whether it still exists.
+# --------------------------------------------------------------------------- #
+
+#: What a row that cannot be placed reads as, on the page and in every
+#: refusal built from one. One string so the page and the run agree.
+NEEDS_SELECTION = 'Needs selection'
+
+
+@dataclass(frozen=True)
+class SurfaceScope:
+    """One per-surface size row resolved against a prepared revision.
+
+    ``reference`` is the prepared boundary the row names -- the same
+    ``patch_uuid`` the geometry catalogue and every other scoped control use.
+    ``tags`` are the Gmsh surface tags that boundary holds in *this*
+    revision, and ``reason`` is why there are none.
+    """
+
+    name: str
+    reference: str
+    tags: tuple[int, ...] = ()
+    reason: str = ''
+
+    @property
+    def tag(self) -> int:
+        """The first tag, or 0 -- what a single-surface row means by itself."""
+        return self.tags[0] if self.tags else 0
+
+    @property
+    def resolved(self) -> bool:
+        return bool(self.tags) and not self.reason
+
+
+def _surface_tag(row) -> int:
+    """The saved Gmsh tag on a row, as an integer. 0 when there is none.
+
+    The configuration store hands numbers back as strings, so the saved value
+    is not always an ``int`` even though the schema says it is.
+    """
+    for key in ('surfaceId', 'surface_id'):
+        if key in row:
+            try:
+                return int(row.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _surface_reference(row) -> str:
+    for key in ('surfaceRef', 'surface_ref'):
+        value = str(row.get(key) or '').strip()
+        if value:
+            return value
+    return ''
+
+
+def surface_tags_for_reference(prepared_geometry, reference) -> tuple[int, ...]:
+    """The Gmsh tags a prepared boundary holds in this revision.
+
+    Empty when the boundary is not in the revision at all -- renamed is the
+    same boundary, merged or reimported is not.
+    """
+    # Imported here rather than at module scope: `execution` imports the
+    # derivation, which imports this module.
+    from .execution import scope_surface_map
+
+    indices = scope_surface_map(prepared_geometry).get(
+        str(reference or '').strip()) or ()
+    return tuple(sorted(int(index) + 1 for index in indices))
+
+
+def surface_reference_for_tag(prepared_geometry, tag) -> str:
+    """The prepared boundary a Gmsh surface tag belongs to, or ``''``.
+
+    The migration rule for a row saved before references existed, and the rule
+    the facade stamps every newly authored row with. A tag two boundaries claim
+    is not an identity, so it resolves to nothing rather than to whichever one
+    is first.
+
+    DP-470. This reads `_global_surface_rows` rather than doing the index
+    arithmetic itself, because it is the inverse of `surface_names` and the two
+    have to agree: the picker offers a tag taken from one of them and the
+    facade turns that tag back into a boundary with the other. While this
+    counted within one file and that one did too, they agreed by both being
+    wrong for a multi-source model -- every tag claimed twice, so nothing
+    offered and nothing resolved. With the per-source offset applied in one
+    place they agree by both being right.
+    """
+    from .execution import _global_surface_rows
+
+    try:
+        wanted = int(tag or 0)
+    except (TypeError, ValueError):
+        return ''
+    if wanted < 1:
+        return ''
+    claimed = [token
+               for token, _label, _source, tags in _global_surface_rows(
+                   prepared_geometry)
+               if token and wanted in set(tags)]
+    return claimed[0] if len(claimed) == 1 else ''
+
+
+def resolve_surface_rows(rows, prepared_geometry) -> tuple[SurfaceScope, ...]:
+    """Resolve each per-surface size row against the prepared revision.
+
+    One :class:`SurfaceScope` per row, in the order given, enabled or not --
+    the caller decides which of them are its business.
+    """
+    resolved: list[SurfaceScope] = []
+    for index, row in enumerate(rows or ()):
+        row = dict(row or {})
+        control_id = str(row.get('control_id') or row.get('controlId')
+                         or index)
+        name = str(row.get('name') or f'surface-{control_id}')
+        reference = _surface_reference(row)
+        tag = _surface_tag(row)
+        if reference:
+            tags = surface_tags_for_reference(prepared_geometry, reference)
+            if tags:
+                resolved.append(SurfaceScope(name, reference, tags))
+                continue
+            resolved.append(SurfaceScope(
+                name, reference, (),
+                f'size field {name!r} refines a boundary this geometry no '
+                f'longer has: {NEEDS_SELECTION}'))
+            continue
+        # A row saved before references existed. Its number means the
+        # revision it was authored against, and the only revision there is
+        # to read it against is the one prepared now.
+        migrated = surface_reference_for_tag(prepared_geometry, tag)
+        if migrated:
+            resolved.append(SurfaceScope(name, migrated, (tag,)))
+            continue
+        resolved.append(SurfaceScope(
+            name, '', (),
+            f'size field {name!r} names surface {tag}, which no prepared '
+            f'boundary claims: {NEEDS_SELECTION}'))
+    return tuple(resolved)
+
+
+def _native_rows(value) -> tuple[dict, ...]:
+    """The rows of one ``IntKeyList`` section, in key order."""
+    if isinstance(value, dict):
+        return tuple(dict(item, control_id=str(key))
+                     for key, item in sorted(value.items(),
+                                             key=lambda pair: str(pair[0]))
+                     if isinstance(item, dict))
+    if isinstance(value, (list, tuple)):
+        return tuple(dict(item) for item in value if isinstance(item, dict))
+    return ()
+
+
+def unresolved_scopes(native, prepared_geometry) -> tuple[str, ...]:
+    """Why each enabled control cannot be placed on this geometry.
+
+    Plan 33 W-G1 (FIELD-06, CURVE-04). Empty when every enabled control
+    resolves, which is the only state a run may start in: a scope that
+    reaches nothing used to be found by the runner, inside WSL and minutes
+    into a run, or -- for a row naming its own Gmsh tags -- not at all.
+    """
+    from .execution import scope_surface_map, scope_volume_map
+
+    native = dict(native or {})
+    complaints: list[str] = []
+    for scope in resolve_surface_rows(
+            [row for row in _native_rows(native.get('surfaceSizes'))
+             if bool(row.get('enabled', True))], prepared_geometry):
+        if scope.reason:
+            complaints.append(scope.reason)
+
+    surfaces = set(scope_surface_map(prepared_geometry))
+    volumes = set(scope_volume_map(prepared_geometry))
+    for label, key, allowed in (
+            ('size field', 'sizeFields', surfaces | volumes),
+            ('curve control', 'curveControls', surfaces)):
+        for index, row in enumerate(_native_rows(native.get(key))):
+            if not bool(row.get('enabled', True)):
+                continue
+            if key == 'sizeFields' and str(
+                    row.get('fieldType') or '') in ANALYTIC_KINDS:
+                continue
+            token = str(row.get('scopeToken')
+                        or row.get('scope_token') or '').strip()
+            if not token or token in allowed:
+                continue
+            control_id = str(row.get('control_id') or row.get('controlId')
+                             or index)
+            name = str(row.get('name') or f'{label}-{control_id}')
+            complaints.append(
+                f'{label} {name!r} is scoped to geometry this case no longer '
+                f'has: {NEEDS_SELECTION}')
+    return tuple(complaints)
 
 
 def _expression_field(row, name, control_id, bbox, warnings) -> SizeField:

@@ -2,7 +2,7 @@
 
 The page renders the engine's own workflow descriptor: purpose, prerequisites,
 guided and advanced fields, calculated native settings, and the §5.17 task
-lifecycle actions (Preview, Update, Revert and Edit).  Every editable control is
+lifecycle actions (Preview, Update, Revert and edit).  Every editable control is
 built from the AF2 field registry, so a field that the schema does not publish
 cannot be rendered - which is how release gate 10 ("no UI-only/no-op field") is
 enforced structurally rather than by review.
@@ -15,16 +15,23 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QStyledItemDelegate, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from widgets.fit_to_text import FlowLayout, fit_to_text
+
+from foammesh.view.theming.metrics import (align_form_columns,
+                                           align_unit_column,
+                                           apply_form_metrics)
 
 from foammesh.core.engine.contracts import FieldClassification
 from foammesh.core.facade.errors import ValidationFailedError
 from foammesh.core.facade.fields import REGISTRY as FIELD_REGISTRY
 
+from foammesh.view.menu.help.step_help_dialog import (StepDetailsDialog,
+                                                      StepHelpDialog)
+from foammesh.view.widgets.folder_header import FolderHeader
 from .conditional_fields import refresh_applicability
 from .field_widgets import FieldEditor
 from foammesh.view.facade_client import query, submit
@@ -34,22 +41,20 @@ from foammesh.view.facade_client import query, submit
 #: derived values the runner consumes directly live under Advanced.
 _GUIDED = {FieldClassification.PRECHECK, FieldClassification.DERIVED}
 
+#: The three states the page says anything about, and what to do about
+#: each. Plan 33 FORM-03/SIZE-01/LAYER-05/QA-03: the other nine entries --
+#: `Ready to configure.`, `Accepted.`, `Configured.`, `Running.` and the
+#: rest -- restated what the outline row beside the page already paints, in
+#: a full line at the top of every one of the twenty-nine task pages.
+#: MEASURED: twenty-nine of twenty-nine pages opened with a status sentence,
+#: and on twenty-nine of them it said `Ready to configure.`.
+#:
+#: What is left is the three a reader has to act on, and each names the act.
+#: A state not in here paints no line at all.
 _STATUS_TEXT = {
-    'locked': 'Locked - complete the prerequisite tasks first.',
-    'ready': 'Ready to configure.',
-    'editing': 'Edited - not yet accepted.',
-    'configured': 'Configured.',
-    'running': 'Running.',
-    'passed': 'Accepted.',
-    'warning': 'Accepted with warnings.',
-    'failed': 'Failed.',
-    'skipped': 'Skipped.',
-    'stale': 'Stale - an upstream task changed.',
-    # Plan 23 §8.5 and Plan 26 WP2.1: both are real TaskState values and
-    # neither is a pass. Without them they rendered as raw enum strings the
-    # moment the dynamic channel went live.
-    'completed': 'Completed - evidence recorded, not a pass.',
-    'waived': 'Waived - accepted by a recorded decision, not a pass.',
+    'locked': 'Locked — complete the prerequisite tasks first.',
+    'failed': 'Failed — change a setting below and run this step again.',
+    'stale': 'Stale — an upstream task changed, so run this step again.',
 }
 
 
@@ -61,10 +66,186 @@ _ACCEPTED_STATES = frozenset({
 
 
 #: States that still carry an accepted result. Reverting out of one of these
-#: is the whole job of "Revert and Edit", so a task left in one afterwards
+#: is the whole job of "Revert and edit", so a task left in one afterwards
 #: means the press did nothing (R115).
 _STILL_ACCEPTED = frozenset({
     'passed', 'warning', 'completed', 'waived', 'skipped'})
+
+
+class _ElideLeftDelegate(QStyledItemDelegate):
+    """Cut the head off a cell that does not fit, not the tail.
+
+    DP-161. `QAbstractItemView.setTextElideMode` is a property of the whole
+    view, and only one column of the Calculated table wants it.
+    """
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.TextElideMode.ElideLeft
+
+
+#: DP-166. What `_populate_calculated` writes where a field has no value
+#: for a column. A column that holds only these says nothing, so it is not
+#: shown and does not take width off the columns that do.
+_PLACEHOLDERS = frozenset({'-', ''})
+
+
+class _StepHelpSink:
+    """Where a page hands its own words once it has added to them.
+
+    Plan 33 FORM-03 took away the header band and the `?` button in it. The
+    three pages that write their own extra paragraph still have to say "the
+    words changed, read them again", which is what `setDetail` always meant,
+    so the seam survives the control: it re-reads the page and refreshes the
+    tooltip that is now one of the two routes to the text.
+
+    Not a widget, and nothing a reader can reach -- it holds no words of its
+    own. `_description` and `_prerequisites` on the page are still the only
+    place the words live.
+    """
+
+    def __init__(self, page) -> None:
+        self._page = page
+
+    def setDetail(self, purpose: str = '', prerequisites: str = '') -> None:
+        """Re-read the page's labels and refresh both help routes."""
+        page = self._page
+        page.setToolTip(page.stepHelpText())
+        page._title.setToolTip(page.toolTip())
+        page._title.setAccessibleDescription(page.toolTip())
+        page.setAccessibleDescription(page.accessibleStepDescription())
+
+    def detail(self) -> tuple:
+        """What the two routes would show, as the page has it now."""
+        return self._page.stepHelpDetail()
+
+
+class CalculatedTable(QTableWidget):
+    """The Calculated settings table, sized to fit rather than to scroll.
+
+    DP-158. A `QTableWidget` defaults to a viewport about 157 px tall and
+    scrolls whatever does not fit, in both directions. Measured at the width
+    the task panel actually gets, that put 1009 px of rows behind a 171 px
+    window on `snappy.base_grid` and made nine of the ten pages that have
+    this table carry a horizontal scrollbar as well -- a nested pair of
+    scrollbars inside a page that already scrolls, which is the fault
+    DP-155 closed for the field panels.
+
+    So the table never scrolls. It takes the height of its rows and the page
+    does the scrolling, and the columns are fitted into the width there is:
+    each asks for its content, and when they ask for more than the panel has
+    the widest give way first, down to the header floor, so the text elides
+    with the full value on the item tooltip instead of running off an edge.
+    """
+
+    def __init__(self, columns: int, parent=None) -> None:
+        super().__init__(0, columns, parent)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # DP-161. The field id is a dotted path whose head is shared with its
+        # neighbours and whose tail is what tells one row from the next, so
+        # it is the only column that elides from the left.
+        self._elide_left = _ElideLeftDelegate(self)
+        self.setItemDelegateForColumn(0, self._elide_left)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fitColumns()
+
+    def fitContents(self) -> None:
+        """Take the height of every row, so the page scrolls and not this."""
+        self.resizeRowsToContents()
+        header = self.horizontalHeader()
+        rows = self.verticalHeader()
+        height = header.height() + 2 * self.frameWidth()
+        height += sum(rows.sectionSize(row) for row in range(self.rowCount()))
+        self.setFixedHeight(height)
+        self.fitColumns()
+
+    def _headingWidth(self, column: int) -> int:
+        """What this column's heading needs to be read."""
+        item = self.horizontalHeaderItem(column)
+        text = item.text() if item is not None else ''
+        return self.horizontalHeader().fontMetrics().horizontalAdvance(
+            text) + 20
+
+    def hideEmptyColumns(self) -> None:
+        """Drop a column that says nothing on this page.
+
+        DP-166. Five of the ten tables carry `-` in every row of
+        `Calculation`, and it cost them width twice over: its own heading is
+        an 85 px floor it never gives up, and `fitColumns` handed it the
+        slack on top -- 145 of 575 px on `snappy.snap`, for nine hyphens.
+        On `snappy.castellation` the four columns wanted 653 px in a 575 px
+        table, and because the hyphen column sat at its floor the three that
+        carry real text paid the whole 78 px deficit: that is what cut
+        `allowFreeStandingZoneFaces` short.
+
+        Column 0 is never hidden. It is the column that says which row this
+        is, and a table with no rows has nothing to judge either way.
+        """
+        rows = self.rowCount()
+        for column in range(self.columnCount()):
+            blank = bool(rows) and column > 0 and all(
+                (self.item(row, column) is None
+                 or self.item(row, column).text().strip() in _PLACEHOLDERS)
+                for row in range(rows))
+            self.setColumnHidden(column, blank)
+
+    def fitColumns(self) -> None:
+        """Share the width there is between the columns that want it."""
+        columns = [column for column in range(self.columnCount())
+                   if not self.isColumnHidden(column)]
+        if not columns:
+            return
+        header = self.horizontalHeader()
+        available = self.viewport().width()
+        # A column is never squeezed below its own heading. One global floor
+        # taken from the widest heading was the old rule, and it gave
+        # `Classification`, whose values are one word, the same 117 px as a
+        # column of dotted field ids that wanted 336.
+        floors = [self._headingWidth(column) for column in columns]
+        hints = [self.sizeHintForColumn(column) for column in columns]
+        wanted = [max(floor, hint) for floor, hint in zip(floors, hints)]
+        slack = available - sum(wanted)
+        if slack > 0:
+            # DP-166. To whichever column holds the longest text, which is
+            # the one a reader is most likely to want more of. The old rule
+            # said "the last column, it reads as prose" -- but the last
+            # column is `Calculation`, and what it holds is a version stamp
+            # like `snappy.derivation.v1`, the same string down the whole
+            # column wherever it is not a hyphen. It was the one column
+            # that could not use the room.
+            wanted[hints.index(max(hints))] += slack
+        else:
+            # Every column gives up the same share of what it holds above
+            # the floor. Cutting the widest first instead would take it all
+            # out of the field id, which is the column that says which row
+            # this is, to leave white space in the three beside it.
+            over = -slack
+            room = [width - floors[index]
+                    for index, width in enumerate(wanted)]
+            spare = sum(room)
+            if spare > 0:
+                taken = 0
+                for index, have in enumerate(room):
+                    cut = min(have, over * have // spare)
+                    wanted[index] -= cut
+                    taken += cut
+                over -= taken
+            while over > 0:
+                widest = wanted.index(max(wanted))
+                if wanted[widest] <= floors[widest]:
+                    break
+                cut = min(over, wanted[widest] - floors[widest])
+                wanted[widest] -= cut
+                over -= cut
+        for index, column in enumerate(columns):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Fixed)
+            self.setColumnWidth(column, wanted[index])
 
 
 class EngineTaskPage(QWidget):
@@ -89,6 +270,17 @@ class EngineTaskPage(QWidget):
     #: does not perform, and wrong for one it already did -- a page whose
     #: stage is part of Generate labels its button as the *re*-run it is.
     run_stage_label: str = 'Run this step'
+    #: Whether that button is on the page at all. Plan 32 section 4.5: the
+    #: footer is the one forward control, and since the fold its press runs
+    #: exactly the stage this button ran and then opens the next row --
+    #: `Generate grid & Proceed`, `Castellate & Proceed`, `Snap & Proceed`.
+    #: MEASURED across all 29 task pages of both engines, eight showed this
+    #: button and seven of them duplicated their own row's footer press, six
+    #: of those under the label the footer had just retired. Opt in, not opt
+    #: out: a page added later gets the footer and nothing else until
+    #: somebody decides its press is an act no row performs. `run_stage`
+    #: itself is untouched -- that is what the footer runs.
+    run_stage_on_page: bool = False
     #: Why running this stage on its own is unavailable, when it is. Empty
     #: means available.
     run_stage_unavailable: str = ''
@@ -112,6 +304,10 @@ class EngineTaskPage(QWidget):
     #: ``(task_id, stage)`` -- run this one stage.
     stageRunRequested = Signal(str, str)
     dirtyChanged = Signal(bool)
+    #: DP-123. What this page now says about starting the *whole* pipeline.
+    #: The branch owns that button, so a page that can refuse the run says so
+    #: rather than shutting a button of its own -- see ``runAllRefusal``.
+    runAllRefusalChanged = Signal(str)
 
     def __init__(self, facade_client, task_id: str, parent=None, *,
                  engine_id: str | None = None):
@@ -121,7 +317,12 @@ class EngineTaskPage(QWidget):
         if engine_id is not None:
             self.engine_id = engine_id
         self._editors: dict[str, FieldEditor] = {}
+        #: Field ids whose editor sits behind the Advanced disclosure.
+        self._advanced_fields: list[str] = []
         self._pending: dict[str, object] = {}
+        #: `FieldGroupPage` panels this page has adopted (DP-157). Their
+        #: edits are this page's edits: they have no commit control left.
+        self._panels: list = []
         self._task: dict = {}
         #: The whole page in one read, kept for the length of one refresh so
         #: the four things the page draws are not four facade calls (F-22).
@@ -143,12 +344,23 @@ class EngineTaskPage(QWidget):
         self._title = QLabel(self)
         self._title.setObjectName('engineTaskTitle')
         self._title.setVisible(False)
+        # DP-230. Both labels stay built and stay filled -- they are where the
+        # words are authored, and everything that reads
+        # `page._description.text()` still gets them -- and both stay out of
+        # the layout, like `_title` above. The help control repeats them
+        # verbatim, one press away.
         self._description = QLabel(self)
         self._description.setWordWrap(True)
+        self._description.setVisible(False)
         self._status = QLabel(self)
         self._status.setObjectName('engineTaskStatus')
+        # DP-572 (0924 rerun2). The locked sentence names every prerequisite
+        # still open -- on Qualification summary most of the workflow -- and
+        # on one line it asked 417 px, wider than the settings column.
+        self._status.setWordWrap(True)
         self._prerequisites = QLabel(self)
         self._prerequisites.setWordWrap(True)
+        self._prerequisites.setVisible(False)
         self._warnings = QLabel(self)
         self._warnings.setObjectName('engineTaskWarnings')
         self._warnings.setWordWrap(True)
@@ -177,9 +389,25 @@ class EngineTaskPage(QWidget):
         self._revisit.setAccessibleName(
             self.tr('What editing this task would invalidate'))
         self._revisit.setVisible(False)
-        for widget in (self._description, self._prerequisites, self._status,
-                       self._revisit, self._warnings, self._preview_note):
+        # Plan 33 FORM-03. DP-230 put the page's two paragraphs behind a `?`
+        # in a header band of its own. The band is the fault this time: a row
+        # of chrome the height of a control, at the top of all twenty-nine
+        # pages, holding one button and a badge -- an empty header band above
+        # the first thing the page asks for. The words did not move again;
+        # they are on the page tooltip and in the Help menu's `What this step
+        # is for`, which is where a reader looks for an explanation they did
+        # not ask for. `_description` and `_prerequisites` are still built,
+        # still filled, and still where the words are authored.
+        for widget in (self._status, self._revisit, self._warnings,
+                       self._preview_note):
             outer.addWidget(widget)
+        # Three pages -- Gmsh Size Fields, snappy Domain Regions, snappy Mesh
+        # QA -- append a paragraph of their own to `_description` after
+        # `refresh` has read it, and then tell the help control to re-read.
+        # That call is still exactly right; only the thing it used to reach
+        # has gone, so the seam stays and lands the words where the two
+        # routes now read them.
+        self._help = _StepHelpSink(self)
 
         self._body = QWidget(self)
         self._body_layout = QVBoxLayout(self._body)
@@ -195,11 +423,37 @@ class EngineTaskPage(QWidget):
         outer.addWidget(scroll, 1)
 
         self._guided = self._make_group(self.tr('Guided'))
-        self._advanced = self._make_group(self.tr('Advanced'))
-        self._advanced.setCheckable(True)
-        self._advanced.setChecked(False)
+        # DP-149. Advanced used to be a checkable QGroupBox, which in Qt
+        # disables everything inside it when unchecked -- and unchecked was
+        # the default.  The settings behind it are not off: `_populate_fields`
+        # registers their editors in `self._editors` exactly like the guided
+        # ones, and nothing anywhere reads the box's checked state, so a
+        # greyed-out `Gamma` is the quality measure the mesh is built with.
+        # The rest of the product already had the right idiom for this -- the
+        # Castellation page's own Advanced section is a `FolderHeader` that
+        # shows and hides its contents -- so two Advanced sections meant two
+        # opposite things.  Now both hide, and the header says when there is
+        # something behind it that is not at its default.
+        self._advancedTitle = self.tr('Advanced')
+        self._advancedHeader = FolderHeader(self._advancedTitle, self)
+        self._advancedHeader.setObjectName('advancedDisclosure')
+        # Plan 33 FORM-01. DP-149 made this a disclosure instead of a switch
+        # and left it closed, which was right about the mechanism and wrong
+        # about the default: MEASURED, nine of the twenty-nine task pages
+        # opened with applicable, editable settings folded away while a
+        # read-only table of native mappings sat open below them. Every
+        # setting behind it applies -- an inapplicable one is not on the form
+        # at all now (FIELD-02, `FieldEditor.setApplicability`) -- so it opens.
+        # The header stays a `FolderHeader`: the reader can still fold it.
+        #
+        # W-O2 moved the `setChecked(True)` that used to sit here into
+        # `FolderHeader` itself, because a page outside this class inherits
+        # nothing from it and one such page had already opened closed.
+        self._body_layout.addWidget(self._advancedHeader)
+        self._advanced = self._make_group('')
+        self._advancedHeader.setContents(self._advanced)
 
-        self._calculated = QTableWidget(0, 4, self)
+        self._calculated = CalculatedTable(4, self)
         self._calculated.setHorizontalHeaderLabels((
             self.tr('Field'), self.tr('Classification'),
             self.tr('Native mapping'), self.tr('Calculation')))
@@ -210,18 +464,29 @@ class EngineTaskPage(QWidget):
         # Every column used to take a quarter of the width, so the field id
         # was elided to `gmsh.comput...` beside two thirds of a column of
         # white space. Give the three short columns their content and let the
-        # calculation description absorb the slack.
-        header = self._calculated.horizontalHeader()
-        for column in range(3):
-            header.setSectionResizeMode(
-                column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setMinimumSectionSize(
-            header.fontMetrics().horizontalAdvance(
-                self.tr('Native mapping')) + 24)
-        self._calculatedBox = QGroupBox(self.tr('Calculated settings'), self)
-        QVBoxLayout(self._calculatedBox).addWidget(self._calculated)
-        self._body_layout.addWidget(self._calculatedBox)
+        # calculation description absorb the slack. DP-158 does that fitting
+        # in `CalculatedTable.fitColumns`, because `ResizeToContents` answers
+        # with the content's width whether or not the panel has it. The one
+        # global minimum this used to carry, the width of `Native mapping`,
+        # is per-column now: a column's own heading is its floor.
+        # Plan 33 FORM-02/SIZE-02/VOLUME-01/LAYER-04. The table is built and
+        # filled exactly as before and is not in the form: it is mounted in
+        # the Details dialog, reached from the Help menu and from the link at
+        # the foot of the form. Field id, classification, native dictionary
+        # key and calculation version are what the engine does with the
+        # settings, not settings; ten of the twenty-nine pages spent the foot
+        # of their one narrow column on them.
+        self._calculated.setVisible(False)
+        self._detailsLink = QPushButton(self.tr('Details…'), self)
+        self._detailsLink.setObjectName('stepDetailsLink')
+        self._detailsLink.setFlat(True)
+        # DP-186: the words on the control are its name; the explanation
+        # is its description.
+        self._detailsLink.setAccessibleDescription(
+            self.tr('Open the calculated settings for this step.'))
+        self._detailsLink.setVisible(False)
+        self._detailsLink.clicked.connect(self.showDetails)
+        self._body_layout.addWidget(self._detailsLink)
 
         self.build_sections(self._body_layout)
         self._body_layout.addStretch(1 if not self._bodyStretchClaimed else 0)
@@ -229,7 +494,7 @@ class EngineTaskPage(QWidget):
 
         self._preview = QPushButton(self.tr('Preview'), self)
         self._update = QPushButton(self.tr('Update'), self)
-        self._revert = QPushButton(self.tr('Revert and Edit'), self)
+        self._revert = QPushButton(self.tr('Revert and edit'), self)
         # Plan 30 WP-09 / F-23. The whole-pipeline run is not a per-task
         # action: in this row it put "Run this step" and "Run complete mesh"
         # within a button's width of each other, and only one of them meant
@@ -239,7 +504,8 @@ class EngineTaskPage(QWidget):
         # and nowhere else; `runRequested` survives for the branch to drive.
         self._runStage = QPushButton(self.tr(self.run_stage_label), self)
         self._runStage.setObjectName('runTaskStage')
-        self._runStage.setVisible(bool(self.run_stage))
+        self._runStage.setVisible(
+            bool(self.run_stage) and bool(self.run_stage_on_page))
         self._runStage.setAccessibleDescription(
             self.tr('Run only this step, leaving the rest of the mesh alone.'))
         self._preview.clicked.connect(self.preview)
@@ -257,6 +523,7 @@ class EngineTaskPage(QWidget):
                        self._runStage):
             fit_to_text(button)
             buttons.addWidget(button)
+        self._commitButtons = (self._preview, self._update, self._revert)
         outer.addLayout(buttons)
 
         self.setRunStageAvailable(not self.run_stage_unavailable,
@@ -275,6 +542,21 @@ class EngineTaskPage(QWidget):
         self._runStage.setAccessibleDescription(
             self.tr('Run only this step, leaving the rest of the mesh alone.')
             if available else str(reason or ''))
+
+    def runAllRefusal(self) -> str:
+        """Why the whole-pipeline run cannot start, or `''` if it can.
+
+        DP-123. ``setRunStageAvailable`` gates ``_runStage``, which is only
+        shown for a page that declares ``run_stage`` -- and MEASURED, no Gmsh
+        task page declares one, so on that engine it gates a button that is
+        never on screen. The control a Gmsh run actually starts from is the
+        branch heading's "Run to end"
+        (:attr:`~foammesh.view.main_window.engine_branch.EngineBranchView._runAll`),
+        which nothing asked. This is the question the branch asks it, so a
+        refusal the page already knows reaches the button that would have
+        ignored it.
+        """
+        return ''
 
     def setRunStageLabel(self, text: str) -> None:
         """Name the action the button performs, when the page knows better.
@@ -331,7 +613,11 @@ class EngineTaskPage(QWidget):
 
     def _make_group(self, title: str) -> QGroupBox:
         box = QGroupBox(title, self)
-        QFormLayout(box)
+        # DP-105. Guided and Advanced are two halves of one page and used to
+        # be laid out by whatever the style handed each of them; on Compute
+        # Mesh that put their field columns at different x and their rows at
+        # different pitches. One call, one scale, both groups.
+        apply_form_metrics(QFormLayout(box))
         self._body_layout.addWidget(box)
         return box
 
@@ -427,9 +713,17 @@ class EngineTaskPage(QWidget):
         self.page_model(refresh=True)
         self._task = self.task_document()
         self._title.setText(self._task.get('title') or self.task_id)
+        # Plan 32 §5.4 put an `Optional` badge on the six task pages the
+        # workflow declares optional. Plan 33 FORM-03/FIELD-01/LAYER-05 takes
+        # the badge off the form: it is workflow state, the outline row
+        # beside the page already carries it, and it sat in the header band
+        # that has gone. The sentence itself is not lost -- it is the page's
+        # accessible description, so a screen reader still hears it, and the
+        # page is still the only thing that knows.
+        self._optional = bool(self._task.get('optional'))
         self.setAccessibleName(self._title.text())
         self._description.setText(self._task.get('description', ''))
-        depends = self._task.get('depends_on') or ()
+        depends = self._prerequisite_ids()
         titles = self._task_titles()
         self._prerequisites.setText(
             self.tr('Requires: ')
@@ -445,6 +739,15 @@ class EngineTaskPage(QWidget):
             self.refresh_status()
         finally:
             self._reuse_page_once = False
+        # DP-230. After `refresh_status`, not before: the qualification pages
+        # rewrite the prerequisite line in there ("Waiting on: ..."), and the
+        # help has to carry the sentence the page settled on, not the one it
+        # started with. Plan 33 FORM-03: the two routes to it are this
+        # tooltip and the Help menu, both reading `stepHelpText()`.
+        self.setToolTip(self.stepHelpText())
+        self._title.setToolTip(self.toolTip())
+        self._title.setAccessibleDescription(self.toolTip())
+        self.setAccessibleDescription(self.accessibleStepDescription())
         fields = list(self._task.get('fields', []))
         declared = {field.get('field_id') for field in fields}
         # Advanced rather than guided: a field the engine does not declare as
@@ -457,11 +760,34 @@ class EngineTaskPage(QWidget):
         self._populate_fields(fields)
         self._populate_calculated(self._task.get('fields', []))
         self._update_empty_sections()
-        # Again, now the editors exist: `refresh_status` above runs before the
-        # fields are built, and the note is derived from what those fields
-        # declare they invalidate.
-        self._set_revisit_note(getattr(self, '_last_status', ''))
+        # Plan 33 SIZE-01. The note is not a standing paragraph any more, so
+        # a refresh clears it: it is written at the moment of an edit that
+        # has a downstream cost and taken away again when the edit is gone.
+        self._clear_revisit_note()
         self._set_dirty(False)
+
+    def _prerequisite_ids(self) -> tuple:
+        """The tasks this line should name: what the user must settle first.
+
+        Plan 31 DP-144, MEASURED on the `dp143-labels` leg. `depends_on` is
+        the chain the state machine walks, and Gmsh threads its five optional
+        tasks through that chain in a line, so Compute Mesh read "Requires:
+        Periodic Pairs" -- a step the run skips on its own, and one this
+        interface offers no control to decline. Eight pages across the two
+        engines named an optional task this way.
+
+        `requires` comes from `WorkflowDescriptor.required_prerequisites`, and
+        is absent from a page model built by an older facade or by a test
+        double; `depends_on` is then still the better answer than silence.
+        """
+        try:
+            page = self.page_model()
+        except Exception:                                    # noqa: BLE001
+            page = {}
+        requires = page.get('requires')
+        if requires is not None:
+            return tuple(requires)
+        return tuple(self._task.get('depends_on') or ())
 
     def _task_titles(self) -> dict:
         """Task id to the name the outline shows for it.
@@ -486,10 +812,15 @@ class EngineTaskPage(QWidget):
         """
         self.page_model(refresh=True)
         status, warnings = self.task_state()
-        self._status.setText(self._status_sentence(status))
+        sentence = self._status_sentence(status)
+        self._status.setText(sentence)
+        # Plan 33 FORM-03. An empty line is still a line: a `QLabel` with no
+        # text takes its own height and the layout's spacing above and below
+        # it, which on a page that says nothing about its status is the space
+        # the first setting should be in.
+        self._status.setVisible(bool(sentence))
         self._set_warnings(warnings)
         self._last_status = str(status)
-        self._set_revisit_note(status)
 
     def _status_sentence(self, status: str) -> str:
         """The status line, with a locked one naming what it waits for.
@@ -503,11 +834,13 @@ class EngineTaskPage(QWidget):
         done.
         """
         if str(status) != 'locked':
-            return _STATUS_TEXT.get(status, status)
+            # Plan 33 FORM-03. `''` for every state the page has nothing to
+            # ask of the reader about, which is every state but these three.
+            return _STATUS_TEXT.get(status, '')
         blocking = self._blocking_prerequisites()
         if not blocking:
             return _STATUS_TEXT['locked']
-        return self.tr('Locked - complete {0} first.').format(
+        return self.tr('Locked — complete {0} first.').format(
             ', '.join(blocking))
 
     def _blocking_prerequisites(self) -> list:
@@ -522,7 +855,13 @@ class EngineTaskPage(QWidget):
         except Exception:                                    # noqa: BLE001
             return []
         task = self._task if isinstance(getattr(self, '_task', None), dict) else {}
-        depends = tuple(task.get('depends_on') or ())
+        # DP-144. The required ones, for the same reason the "Requires:" line
+        # above names those: "Locked - complete Periodic Pairs first." told a
+        # user to complete an optional step to reach Compute Mesh, when what
+        # was actually holding it was Global Sizing.
+        depends = tuple(page.get('requires') or ())
+        if not depends:
+            depends = tuple(task.get('depends_on') or ())
         if not depends:
             depends = tuple((page.get('task') or {}).get('depends_on') or ())
         if not depends:
@@ -554,43 +893,61 @@ class EngineTaskPage(QWidget):
         'exports': 'the files already exported',
     }
 
-    def _set_revisit_note(self, status: str) -> None:
-        """Say, on arrival, what changing this task would throw away.
+    def _clear_revisit_note(self) -> None:
+        """Take the consequence sentence away: no edit is pending."""
+        note = getattr(self, '_revisit', None)
+        if note is None:
+            return
+        note.clear()
+        note.setVisible(False)
 
-        Only on a task that has already run: on a task nobody has run yet
-        there is nothing to lose, and a standing warning there would be the
-        boy who cried wolf on every page of the workflow.
+    def _set_revisit_note(self, field_id: str = '') -> None:
+        """Say what the edit just made would cost, at the moment it is made.
+
+        CP-09 wrote this on arrival, as a standing paragraph above the
+        settings of every page whose task had already run. Plan 33 SIZE-01
+        measures what that came to: a three-line warning on a page where
+        nothing had been changed and nothing was therefore at risk -- the boy
+        who cried wolf, which is the failure the previous docstring named and
+        then committed by firing from `refresh` rather than from an edit.
+
+        It fires from the pending-patch path now, and only for a field whose
+        own descriptor declares a downstream cost. One sentence, and it goes
+        again when the edit does.
         """
         note = getattr(self, '_revisit', None)
         if note is None:
             return
-        if str(status) not in self._ALREADY_RUN:
-            note.clear()
-            note.setVisible(False)
+        if str(getattr(self, '_last_status', '')) not in self._ALREADY_RUN:
+            self._clear_revisit_note()
             return
-        costs = self.invalidation_costs()
+        costs = self.invalidation_costs(field_id)
         if not costs:
-            note.clear()
-            note.setVisible(False)
+            self._clear_revisit_note()
             return
         if len(costs) == 1:
             listed = costs[0]
         else:
             listed = ', '.join(costs[:-1]) + self.tr(' and ') + costs[-1]
-        note.setText(self.tr(
-            'You can change anything here. This task has already run, so '
-            'applying a change discards {0}, and the steps after it will '
-            'need running again.').format(listed))
+        note.setText(
+            self.tr('Applying this change discards {0}.').format(listed))
         note.setVisible(True)
 
-    def invalidation_costs(self) -> list:
-        """What this page's own fields declare they invalidate, in words.
+    def invalidation_costs(self, field_id: str = '') -> list:
+        """What this page's fields declare they invalidate, in words.
 
         Read off the shared metadata rather than listed per page, so a field
         moving between tasks cannot leave a page describing the wrong cost.
+        Plan 33 SIZE-01: named one field, it answers for that field alone,
+        so the reader is told the cost of the edit they just made rather than
+        the cost of every edit the page could carry.
         """
+        editors = list(self._editors.values())
+        if field_id:
+            one = self._editors.get(field_id)
+            editors = [] if one is None else [one]
         tokens: list[str] = []
-        for editor in self._editors.values():
+        for editor in editors:
             for token in getattr(editor.descriptor, 'invalidates', ()) or ():
                 token = str(token)
                 if token not in tokens:
@@ -604,6 +961,71 @@ class EngineTaskPage(QWidget):
                 words.append(word)
         return words
 
+    def stepHelpDetail(self) -> tuple:
+        """This page's own two paragraphs: what it is for, what it needs.
+
+        The single place both routes read from. The words are still authored
+        on the page, in `_description` and `_prerequisites`, exactly as they
+        were when a `?` button in the header band showed them.
+        """
+        return (self._description.text(), self._prerequisites.text())
+
+    def stepHelpText(self) -> str:
+        """The same two paragraphs as one piece of prose."""
+        parts = [part.strip() for part in self.stepHelpDetail()
+                 if str(part).strip()]
+        return '\n\n'.join(parts)
+
+    def accessibleStepDescription(self) -> str:
+        """What a screen reader is told about the step, before its fields.
+
+        Plan 32 §5.4 put an `Optional` badge on the header band; Plan 33
+        FORM-03 took the band away. The sentence is not lost -- a reader who
+        cannot see a badge never had it, and both the words the badge said
+        and the words the `?` said are here, on the page itself.
+        """
+        parts = [self.stepHelpText()]
+        if self._optional:
+            parts.append(self.tr('This step is optional.'))
+        return '\n\n'.join(part for part in parts if part)
+
+    def derived_quantities(self) -> tuple:
+        """`(label, value, unit)` rows this page derives from its settings.
+
+        Plan 33 FORM-02. The allow list is per page and it is empty here: a
+        page says what it has worked out only if it has decided the number is
+        worth a reader's attention, which is the opposite of the table this
+        replaced -- that one published every native mapping the engine
+        happened to have.
+        """
+        return ()
+
+    def detailRows(self) -> int:
+        """How many rows the Details dialog would have to show."""
+        return self._calculated.rowCount() + len(self.derived_quantities())
+
+    def showStepHelp(self):
+        """Open `What this step is for` for this page.
+
+        Returns the dialog so a caller -- the Help menu, a gate -- can read
+        what it put on screen.
+        """
+        dialog = StepHelpDialog(self._title.text(), self._description.text(),
+                                self._prerequisites.text(), self)
+        self._helpDialog = dialog
+        dialog.open()
+        return dialog
+
+    def showDetails(self):
+        """Open `Calculated settings for this step`, or nothing to open."""
+        if not self.detailRows():
+            return None
+        dialog = StepDetailsDialog(self._title.text(), self._calculated,
+                                   self.derived_quantities(), self)
+        self._detailsDialog = dialog
+        dialog.open()
+        return dialog
+
     def _update_empty_sections(self) -> None:
         """Hide the boxes that have nothing in them.
 
@@ -614,8 +1036,25 @@ class EngineTaskPage(QWidget):
         earn their space once they hold something.
         """
         self._guided.setVisible(self._guided.layout().count() > 0)
-        self._advanced.setVisible(self._advanced.layout().count() > 0)
-        self._calculatedBox.setVisible(self._calculated.rowCount() > 0)
+        has_advanced = self._advanced.layout().count() > 0
+        self._advancedHeader.setVisible(has_advanced)
+        # Visible only when there is something to show *and* the disclosure is
+        # open; setVisible(True) here would re-open a section the user closed.
+        self._advanced.setVisible(
+            has_advanced and self._advancedHeader.isChecked())
+        # Plan 33 FORM-02. The link, not the table: the table belongs to the
+        # Details dialog now, and the link is only worth a row on the form
+        # when that dialog would have something in it.
+        self._detailsLink.setVisible(bool(self.detailRows()))
+        # Plan 33 SIZE-05. Preview, Update and Revert and edit commit an edit
+        # to this page's own settings. A page with no editor and no adopted
+        # panel has no edit to commit -- MEASURED, the qualification and
+        # report pages of both engines are in that position -- and on those
+        # pages `apply` returned at its first line and `preview` at its own,
+        # so three live-looking buttons did nothing at all.
+        commits = bool(self._editors or self._panels)
+        for button in self._commitButtons:
+            button.setVisible(commits)
 
     def _set_warnings(self, warnings) -> None:
         """Show what the derivation changed about this task's request.
@@ -646,6 +1085,7 @@ class EngineTaskPage(QWidget):
                 while layout.rowCount():
                     layout.removeRow(0)
         self._editors.clear()
+        self._advanced_fields.clear()
         for field in fields:
             field_id = field['field_id']
             # Repeatable child definitions carry an "/{id}/" template segment;
@@ -659,6 +1099,8 @@ class EngineTaskPage(QWidget):
             # about a field that is in fact fully editable a few rows below.
             if field_id in FIELD_REGISTRY.collections:
                 continue
+            if not self.renders_field(field_id):
+                continue
             try:
                 descriptor = self._client.descriptor(field_id)
             except (KeyError, ValidationFailedError):
@@ -670,7 +1112,10 @@ class EngineTaskPage(QWidget):
             editor = FieldEditor(descriptor, self)
             editor.valueChanged.connect(self._on_field_changed)
             classification = _classification(field.get('classification'))
-            box = self._guided if classification in _GUIDED else self._advanced
+            advanced = classification not in _GUIDED
+            box = self._advanced if advanced else self._guided
+            if advanced:
+                self._advanced_fields.append(field_id)
             form = self.field_form(field_id, classification)
             parent = box
             if form is None:
@@ -678,14 +1123,46 @@ class EngineTaskPage(QWidget):
             else:
                 parent = form.parentWidget() or box
             row = QHBoxLayout()
+            # DP-518. The form's own spacing separates rows. Left on the
+            # style's 8 px margins, a 30 px spin box took a 46 px row --
+            # MEASURED on the snappy Castellation page, 16 px of nothing under
+            # each of its twenty-odd Advanced rows.
+            row.setContentsMargins(0, 0, 0, 0)
             row.addWidget(editor.editor, 1)
-            if descriptor.unit:
-                row.addWidget(editor.unit_label)
+            # DP-156. Added whether or not there is a unit: the column
+            # alignment gives every one of them the same width, so a row with
+            # `deg` and a row with nothing end their editors at the same x.
+            row.addWidget(editor.unit_label)
             container = QWidget(parent)
             container.setLayout(row)
             form.addRow(editor.label, container)
+            # Plan 33 FORM-01. The editor needs its layout and its row widget
+            # to take its own row away when the field does not apply: hiding
+            # the three widgets alone leaves `QFormLayout` holding the line.
+            editor.setRow(form, container)
             self._editors[field_id] = editor
         self.reload_values()
+
+    def renders_field(self, field_id: str) -> bool:
+        """Whether this page draws its own editor for one of its task's fields.
+
+        DP-153. A task binds the fields it owns, and the page renders every
+        one of them. A page that also mounts a panel of its own over the same
+        ids therefore drew each of them twice: the QA page bound the twenty-
+        seven ``meshQuality`` limits *and* mounted ``_MeshQualityGroup``,
+        whose ``field_ids`` are the same twenty-seven, so every limit appeared
+        in two editors -- two `Max Non Orthogonality` rows, two `Min Vol`
+        rows, fifty-four controls where there are twenty-seven values. The
+        two sets are independent: typing in one leaves the other showing the
+        number that was there before, and each has its own Apply, so the mesh
+        is decided by whichever button was pressed last while the other copy
+        still reads a value that is no longer true.
+
+        Returning ``False`` says the panel owns the field. The binding stays
+        -- it is what makes the field part of the task -- and only the
+        duplicate editor goes.
+        """
+        return True
 
     def field_form(self, field_id: str, classification):
         """Where this page wants one field's control to land, or ``None``.
@@ -721,16 +1198,108 @@ class EngineTaskPage(QWidget):
         self._guided.layout().addRow(label)
 
     def reload_values(self) -> None:
-        if not self._editors:
-            return
-        values = self._client.field_values(tuple(self._editors))
-        for field_id, editor in self._editors.items():
-            editor.set_value(values.get(field_id, editor.descriptor.default))
-        self._pending.clear()
-        # CP-09 item 4. After the values, because what a field's condition
-        # reads may be one of the values just written.
-        self._inactive_fields = refresh_applicability(
-            self._client, self._editors, self._pending)
+        if self._editors:
+            values = self._client.field_values(tuple(self._editors))
+            for field_id, editor in self._editors.items():
+                editor.set_value(
+                    values.get(field_id, editor.descriptor.default))
+            self._pending.clear()
+            # CP-09 item 4. After the values, because what a field's condition
+            # reads may be one of the values just written.
+            self._inactive_fields = refresh_applicability(
+                self._client, self._editors, self._pending)
+            self._refresh_advanced_header()
+        # After applicability, not before: CP-09 appends " (inactive)"
+        # to a label it rules out, and a column measured before that
+        # would be re-measured the moment the text changed. Outside the
+        # guard, because DP-153 leaves a page whose fields are all owned by
+        # panels with no editors of its own and those panels still need
+        # aligning with each other (DP-154).
+        self._align_field_columns()
+
+    def _align_field_columns(self) -> None:
+        """Guided and Advanced are two halves of one page: one column.
+
+        DP-151. `apply_form_metrics` has given both groups the same
+        alignment and pitch since DP-105, and the DP-105 comment claims
+        that puts their editors at the same x. It does not -- each
+        `QFormLayout` sizes its label column from its own longest label,
+        so Compute Mesh drew Guided's editors 25 px right of Advanced's
+        and Global Sizing drew them 69 px apart. Any form the page has
+        claimed fields into is aligned with them, because it is on the
+        same page and reads as part of the same form.
+        """
+        forms = [self._guided.layout(), self._advanced.layout()]
+        forms.extend(self.field_forms())
+        forms.extend(self.aligned_forms())
+        align_form_columns(forms)
+        # DP-156. The same set of forms, the other end of the row: one width
+        # for the unit suffixes, so every editor in the column ends at the
+        # same x whether its unit is `deg`, `cells` or nothing.
+        align_unit_column(forms)
+
+    def aligned_forms(self):
+        """Forms the page does not own but which read as part of its form.
+
+        DP-154. A page that mounts `FieldGroupPage` panels one under the
+        other gets a form per panel, and each sizes its label column from
+        its own longest label -- which is DP-151 again, one level down and
+        out of reach of the fix, because the panels are separate widgets
+        with separate layouts. The QA page put its two panels' editors 20 px
+        apart and Surface Features put its two 32 px apart, down a single
+        scrolling column. Unlike `field_forms`, these are not emptied on
+        refresh: the panel owns its own rows and rebuilds them itself.
+        """
+        return ()
+
+    def adoptPanel(self, panel):
+        """Mount a `FieldGroupPage` as a section of this page.
+
+        DP-157. The panel was written to be a page and brought a page's
+        furniture with it. DP-155 took its scroller; this takes its commit
+        controls. MEASURED before: the snappy QA page carried Revert/Apply
+        for checkMesh's settings, Revert/Apply for the mesh quality limits
+        and then Preview/Update/Revert plus Edit/Run this step for the page
+        -- three commit controls, seven buttons -- and because the page has
+        held no editors of its own since DP-153, its own Update returned at
+        the first line of `apply` and committed nothing at all. The obvious
+        button did nothing and the two that worked looked like part of the
+        form.
+
+        Adopted, a panel's pending values join this page's patch, its
+        dirtiness lights this page's Update, and Revert here reloads it.
+        """
+        panel.setEmbedded()
+        panel.dirtyChanged.connect(self._on_panel_dirty)
+        self._panels.append(panel)
+        return panel
+
+    def panels(self):
+        """The panels this page has adopted, in mounting order."""
+        return tuple(self._panels)
+
+    def _on_panel_dirty(self, dirty: bool) -> None:
+        self._set_dirty(bool(self._pending))
+
+    def _refresh_advanced_header(self) -> None:
+        """Say on the closed header when something behind it is not default.
+
+        A disclosure that hides a setting the user changed is as misleading as
+        one that greys a setting that is live.  The count is what the header
+        is for: it is read without opening anything.
+        """
+        changed = 0
+        for field_id in self._advanced_fields:
+            editor = self._editors.get(field_id)
+            if editor is None:
+                continue
+            default = editor.descriptor.default
+            value = self._pending.get(field_id, editor.value())
+            if default is not None and value != default:
+                changed += 1
+        self._advancedHeader.setText(
+            self._advancedTitle if not changed
+            else f'{self._advancedTitle}  ({changed} not at default)')
 
     def inactive_fields(self) -> dict:
         """``{field_id: why it is inactive}`` for this page's editors."""
@@ -738,36 +1307,81 @@ class EngineTaskPage(QWidget):
 
     def _populate_calculated(self, fields) -> None:
         self._calculated.setRowCount(len(fields))
+        # DP-158. Every id in this table belongs to this one task, so every
+        # id begins with the same twelve to twenty characters. Spending the
+        # column on them left `gmsh.compute.seco...` twice over, two rows
+        # that read alike and name different fields. The shared head goes on
+        # the heading's tooltip and the whole id on the cell's.
+        ids = [str(field['field_id']) for field in fields]
+        shared = _shared_field_prefix(ids)
+        heading = self._calculated.horizontalHeaderItem(0)
+        if heading is not None:
+            heading.setToolTip(
+                self.tr('Every field id here begins with {0}').format(shared)
+                if shared else self.tr('Field id'))
         for row, field in enumerate(fields):
             values = (
-                field['field_id'],
+                str(field['field_id'])[len(shared):],
                 _classification_name(field.get('classification')),
                 field.get('native_name') or '-',
                 field.get('calculation_version') or '-',
             )
             for column, value in enumerate(values):
-                self._calculated.setItem(row, column, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                # DP-158. A fitted column elides what it cannot show, so the
+                # whole value has to stay reachable somewhere.
+                if column == 0:
+                    item.setToolTip(ids[row])
+                elif column == 1:
+                    # DP-159. The word is short; what it means is not.
+                    item.setToolTip(_classification_help(
+                        field.get('classification')) or str(value))
+                else:
+                    item.setToolTip(str(value))
+                self._calculated.setItem(row, column, item)
+        # DP-166. Before the fit, so the fit shares the width between the
+        # columns that are going to be on screen.
+        self._calculated.hideEmptyColumns()
+        self._calculated.fitContents()
 
     # -- editing ----------------------------------------------------------- #
 
     def _on_field_changed(self, field_id: str, value) -> None:
         self._pending[field_id] = value
         self._set_dirty(True)
+        # Plan 33 SIZE-01. Here and nowhere else: the moment of an edit with
+        # a downstream consequence is the moment that consequence is worth a
+        # line, and this is the path every edit on this page already takes.
+        self._set_revisit_note(field_id)
+        if field_id in self._advanced_fields:
+            self._refresh_advanced_header()
 
     def _set_dirty(self, dirty: bool) -> None:
+        # DP-157. An adopted panel has no Apply of its own, so an edit made in
+        # one is an edit made on this page and has to light this page's
+        # Update.
+        dirty = bool(dirty) or any(panel.is_dirty for panel in self._panels)
         self._update.setEnabled(dirty)
         self._preview.setEnabled(dirty)
         self.dirtyChanged.emit(dirty)
 
     @property
     def is_dirty(self) -> bool:
-        return bool(self._pending)
+        return bool(self._pending) or any(
+            panel.is_dirty for panel in self._panels)
 
     def pending_patch(self) -> dict:
-        return dict(self._pending)
+        # DP-157. The page's own fields are written last: a field can only be
+        # on one surface, so there is nothing to collide, and if that ever
+        # stops being true the page the user is looking at should win.
+        patch: dict = {}
+        for panel in self._panels:
+            patch.update(panel.pending_patch())
+        patch.update(self._pending)
+        return patch
 
     def preview(self) -> None:
-        if not self._pending:
+        if not self.is_dirty:
             return
         result = query(
             self._client, 'configuration.dry_run',
@@ -801,20 +1415,30 @@ class EngineTaskPage(QWidget):
         self._preview_note.clear()
         self._preview_note.setVisible(False)
 
+    def _patch_accepted(self, result) -> bool:
+        """Take an accepted patch, and say whether it was accepted."""
+        if getattr(result, 'status', 'accepted') != 'accepted':
+            return False
+        payload = getattr(result, 'payload', {}) or {}
+        self._last_change_set_id = payload.get('change_set_id')
+        self._pending.clear()
+        # DP-157. The panels' values went out in this patch, so their
+        # pending sets are spent; reloading clears them and re-reads
+        # what the facade now holds.
+        for panel in self._panels:
+            panel.reload()
+        self.clear_preview()
+        self._set_dirty(False)
+        self.updateRequested.emit(self.task_id)
+        self.refresh()
+        return True
+
     def apply(self):
-        if not self._pending:
+        if not self.is_dirty:
             return None
 
         def applied(result):
-            if getattr(result, 'status', 'accepted') == 'accepted':
-                payload = getattr(result, 'payload', {}) or {}
-                self._last_change_set_id = payload.get('change_set_id')
-                self._pending.clear()
-                self.clear_preview()
-                self._set_dirty(False)
-                self.updateRequested.emit(self.task_id)
-                self.refresh()
-            else:
+            if not self._patch_accepted(result):
                 QMessageBox.warning(
                     self, self.tr('Update failed'),
                     str(getattr(result, 'message', '')
@@ -826,10 +1450,41 @@ class EngineTaskPage(QWidget):
         return submit(self._client, 'configuration.patch',
                       {'patch': self.pending_patch()}, then=applied)
 
+    async def save(self) -> bool:
+        """Write this page's pending edits and wait to be told the answer.
+
+        DP-254. `apply` is a button handler: C31-12 made its patch a
+        scheduled write, so it returns before the facade has taken it and the
+        `is_dirty` flag on the next line is still the one from before the
+        press. MEASURED on the guided walk, `pipe` for Gmsh: the press on
+        `4. Global sizing` applied the ten fields the page had authored, read
+        `is_dirty` one line later, was told the page was still dirty and
+        returned in silence -- the press did nothing, said nothing, and the
+        walk sat on that row until its budget ran out.
+
+        A caller that has to know before it moves the outline awaits this
+        instead: the same command, awaited, with the same tail once it lands,
+        answering True only when the facade accepted it. The refusal belongs
+        to whoever asked, so there is no dialog here (DP-227).
+        """
+        if not self.is_dirty:
+            return True
+        runner = getattr(self._client, 'run', None)
+        if runner is None:
+            return False
+        try:
+            result = await runner('configuration.patch',
+                                  {'patch': self.pending_patch()})
+        except Exception:
+            return False
+        return self._patch_accepted(result)
+
     def revert(self):
         """Discard pending values or revert only this page's accepted edit."""
-        if self._pending:
+        if self.is_dirty:
             self._pending.clear()
+            for panel in self._panels:
+                panel.revert()
             self.clear_preview()
             self.reload_values()
             self._set_dirty(False)
@@ -846,10 +1501,14 @@ class EngineTaskPage(QWidget):
             # finished task was indistinguishable from a dead one. Say what
             # happened instead.
             if self.task_state()[0] in _STILL_ACCEPTED:
+                # Plan 33 FORM-03 leaves the routine states silent, so
+                # there is no sentence to append to; this one is the whole
+                # line, and it is here because a press that changed nothing
+                # has to say so.
                 self._status.setText(
-                    self._status.text() + ' '
-                    + self.tr('Revert and Edit did not reopen this task - its '
-                              'recorded result still stands.'))
+                    self.tr('Revert and edit did not reopen this task — its '
+                            'recorded result still stands.'))
+                self._status.setVisible(True)
 
         def reverted(result):
             # R115. The facade *raises* when a change set is no longer the
@@ -859,7 +1518,7 @@ class EngineTaskPage(QWidget):
             # left the page reading "Accepted." with nothing else changed,
             # which is indistinguishable from a dead button. A stale change
             # set is not a reason to refuse to reopen the task -- reopening
-            # it for editing is the half of "Revert and Edit" that still
+            # it for editing is the half of "Revert and edit" that still
             # works -- so it is reported and the lifecycle revert goes ahead.
             # C31-12 keeps that: a refusal now arrives as a failed result
             # rather than as an exception, and `reopen()` still runs after it.
@@ -883,6 +1542,28 @@ class EngineTaskPage(QWidget):
                       then=reverted)
 
 
+def _shared_field_prefix(field_ids) -> str:
+    """The dotted head every one of these ids shares, trailing dot included.
+
+    DP-158. Empty when there is nothing to share, when a single id would be
+    swallowed whole, or when stripping would leave any row with no name.
+    """
+    ids = [str(field_id) for field_id in field_ids]
+    if len(ids) < 2:
+        return ''
+    parts = ids[0].split('.')[:-1]
+    for field_id in ids[1:]:
+        other = field_id.split('.')[:-1]
+        keep = 0
+        while (keep < len(parts) and keep < len(other)
+               and parts[keep] == other[keep]):
+            keep += 1
+        parts = parts[:keep]
+        if not parts:
+            return ''
+    return '.'.join(parts) + '.'
+
+
 def _classification(value):
     if isinstance(value, FieldClassification):
         return value
@@ -892,6 +1573,39 @@ def _classification(value):
         return FieldClassification.PRECHECK
 
 
+#: What each classification is called on screen, and what it means. DP-159:
+#: the Calculated settings table printed the enum's own value, so the column
+#: read `foammesh_precheck` -- a token from the schema, in the one column of
+#: that table whose values are words rather than identifiers.
+_CLASSIFICATION_LABELS = {
+    FieldClassification.NATIVE: 'Native',
+    FieldClassification.DERIVED: 'Derived',
+    FieldClassification.PRECHECK: 'Pre-check',
+    FieldClassification.EXPERIMENTAL: 'Experimental',
+    FieldClassification.DEFERRED: 'Deferred',
+}
+
+_CLASSIFICATION_HELP = {
+    FieldClassification.NATIVE:
+        'Written straight into the engine dictionary named beside it.',
+    FieldClassification.DERIVED:
+        'Computed from the other settings on this page before the run.',
+    FieldClassification.PRECHECK:
+        'Checked by FoamMesh before the run; the engine never sees it.',
+    FieldClassification.EXPERIMENTAL:
+        'Available, but not yet covered by the acceptance runs.',
+    FieldClassification.DEFERRED:
+        'Recorded and carried, but not acted on by this release.',
+}
+
+
 def _classification_name(value) -> str:
+    """What to call this classification on screen (DP-159)."""
     resolved = _classification(value)
-    return getattr(resolved, 'value', str(resolved))
+    return _CLASSIFICATION_LABELS.get(
+        resolved, getattr(resolved, 'value', str(resolved)))
+
+
+def _classification_help(value) -> str:
+    """One line saying what this classification means (DP-159)."""
+    return _CLASSIFICATION_HELP.get(_classification(value), '')

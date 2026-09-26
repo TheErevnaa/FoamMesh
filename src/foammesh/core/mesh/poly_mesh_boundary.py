@@ -53,8 +53,9 @@ class PolyMeshReadError(ValueError):
 #: mesh with no internal faces is not a volume mesh, and its absence has meant a
 #: half-written directory every time it has come up.
 REQUIRED = ('points', 'faces', 'owner', 'neighbour', 'boundary')
-#: Read when present, absent without complaint. Our writer emits ``cellZones``
-#: only for multi-region meshes and never emits ``faceZones``.
+#: Read when present, absent without complaint. Our writer emits both only for
+#: multi-region meshes, and ``faceZones`` only where two of those zones actually
+#: touch (DP-420); a single-region mesh carries neither.
 OPTIONAL = ('cellZones', 'faceZones')
 
 _COMMENT_BLOCK = re.compile(rb'/\*.*?\*/', re.DOTALL)
@@ -258,17 +259,34 @@ def _numbers(text: bytes, dtype) -> np.ndarray:
 
     An empty list is legitimate -- a single-cell mesh has an empty
     ``neighbour`` -- and must not be an error, which is why this does not hand
-    a whitespace-only buffer to numpy's text parser.
+    a whitespace-only buffer to a numeric parser.
+
+    DP-414. ``np.fromstring(..., sep=' ')`` is the obvious call here and is
+    roughly a microsecond per token: 6.64 s to read the 6,484,577 tokens of
+    `coaxial_ducts`'s ``faces``, which is nearly all of the time it took to
+    open that mesh. Splitting first and casting through ``fromiter`` reads the
+    same file in 0.87 s and returns a bit-identical array. It is also no
+    longer deprecated, which ``fromstring`` has been since numpy 1.14.
     """
     cleaned = text.replace(b'(', b' ').replace(b')', b' ')
-    if not cleaned.strip():
+    tokens = cleaned.split()
+    if not tokens:
         return np.empty(0, dtype=dtype)
+    cast = int if np.issubdtype(dtype, np.integer) else float
     try:
-        return np.fromstring(cleaned, dtype=dtype, sep=' ')
+        return np.fromiter(map(cast, tokens), dtype=dtype, count=len(tokens))
     except ValueError:
-        # Trailing tokens the fast parser will not accept (a stray keyword, a
-        # terminating banner). Falling back is slower but never mis-reads.
-        return np.array(cleaned.split(), dtype=dtype)
+        # A stray keyword or a terminating banner among the numbers. numpy's
+        # own text parser stops at the first token it cannot read and returns
+        # what it had; do the same, rather than refusing a list that is
+        # otherwise sound.
+        kept = []
+        for token in tokens:
+            try:
+                kept.append(cast(token))
+            except ValueError:
+                break
+        return np.fromiter(kept, dtype=dtype, count=len(kept))
 
 
 def _read_points(mesh: Path) -> np.ndarray:
@@ -319,25 +337,36 @@ def _read_faces(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
             offsets = np.arange(count + 1, dtype=np.int64) * width
             return np.ascontiguousarray(grid[:, 1:].reshape(-1)), offsets
 
-    sizes = np.empty(count, dtype=np.int64)
-    starts = np.empty(count, dtype=np.int64)
+    # Ragged path: a snappyHexMesh mesh is mostly quadrilateral but not
+    # entirely, so the widths have to be walked. Where each face begins
+    # depends on the width of the one before it and that scan is sequential,
+    # but it runs over a list rather than a numpy array -- pulling 1.3 M
+    # scalars out of an ndarray one at a time was 8.5 s of the time it took to
+    # open `coaxial_ducts`. Nothing after the scan is sequential: the flat
+    # list is a size token followed by that many vertices, repeated, so the
+    # vertices are what is left once the size tokens are masked out.
+    data = flat.tolist()
+    total = len(data)
+    heads = []
     position = 0
-    for index in range(count):
-        if position >= flat.size:
+    while position < total:
+        size = data[position]
+        if size < 0 or position + 1 + size > total:
             raise PolyMeshReadError(
                 'malformed_list',
-                f'faces declares {count} entries but ran out at {index}')
-        size = int(flat[position])
-        sizes[index] = size
-        starts[index] = position + 1
+                f'faces declares {count} entries but ran out at {len(heads)}')
+        heads.append(position)
         position += 1 + size
+    if len(heads) != count:
+        raise PolyMeshReadError(
+            'malformed_list',
+            f'faces declares {count} entries but holds {len(heads)}')
+    heads = np.array(heads, dtype=np.int64)
     offsets = np.zeros(count + 1, dtype=np.int64)
-    np.cumsum(sizes, out=offsets[1:])
-    vertices = np.empty(int(offsets[-1]), dtype=np.int64)
-    for index in range(count):
-        vertices[offsets[index]:offsets[index + 1]] = \
-            flat[starts[index]:starts[index] + sizes[index]]
-    return vertices, offsets
+    np.cumsum(flat[heads], out=offsets[1:])
+    keep = np.ones(total, dtype=bool)
+    keep[heads] = False
+    return flat[keep], offsets
 
 
 def _read_boundary(mesh: Path) -> tuple[BoundaryPatch, ...]:
@@ -369,12 +398,54 @@ def _read_boundary(mesh: Path) -> tuple[BoundaryPatch, ...]:
     return tuple(patches)
 
 
+#: Which key holds the labels of each kind of zone. A zone body is not one
+#: list: a ``faceZone`` carries a ``flipMap`` of booleans beside its
+#: ``faceLabels``, so the labels have to be found by name.
+_ZONE_LABELS = {'cellZones': b'cellLabels', 'faceZones': b'faceLabels',
+                'pointZones': b'pointLabels'}
+
+
+def _zone_labels(body: bytes, key: bytes,
+                 hint: str) -> tuple[np.ndarray, bytes]:
+    """Return ``(labels, the body ahead of them)`` for one zone entry.
+
+    A label list is flat, so the first ``)`` after it closes it. That is the
+    whole point of finding the key first: taking everything between the first
+    ``(`` and the *last* ``)`` swallows a faceZone's flipMap, and ``false`` is
+    not a label.
+    """
+    at = body.find(key)
+    if at < 0:
+        head_at = body.find(b'(')
+        head = body if head_at < 0 else body[:head_at]
+        return np.empty(0, dtype=np.int64), head
+    open_at = body.find(b'(', at)
+    if open_at < 0:
+        return np.empty(0, dtype=np.int64), body[:at]
+    close_at = body.find(b')', open_at)
+    if close_at < 0:
+        raise PolyMeshReadError(
+            'malformed_list', f'{hint} has no closing paren')
+    labels = _numbers(body[open_at + 1:close_at], np.int64)
+    declared = body[at + len(key):open_at].split()
+    if declared and declared[-1].isdigit() and int(declared[-1]) != labels.size:
+        raise PolyMeshReadError(
+            'malformed_list',
+            f'{hint} declares {int(declared[-1])} labels but holds '
+            f'{labels.size}')
+    return labels, body[:at]
+
+
 def _read_zones(mesh: Path, name: str) -> tuple[Zone, ...]:
     """Read a zone list, treating absence as empty rather than as an error.
 
-    Our own writer emits ``cellZones`` only for multi-region meshes and never
-    emits ``faceZones``, so a missing file is the normal case for a
-    FoamMesh-published mesh and must not be reported as damage.
+    Our own writer emits these only for multi-region meshes -- and
+    ``faceZones`` only where two of those zones share a face -- so a missing
+    file is the normal case for a FoamMesh-published mesh and must not be
+    reported as damage. A mesh snappyHexMesh wrote carries both, in OpenFOAM's
+    own spelling: no ``type`` key, because ``cellZone`` is the default entry
+    type of a ``cellZoneList``, and two lists in a faceZone body rather than
+    one. Ours names the type explicitly and is read by the same code.
     """
     if _member(mesh, name) is None:
         return ()
@@ -383,19 +454,16 @@ def _read_zones(mesh: Path, name: str) -> tuple[Zone, ...]:
         _count, open_at = _leading_count(payload, name)
     except PolyMeshReadError:
         return ()
+    key = _ZONE_LABELS.get(name, b'cellLabels')
+    default_type = (name[:-1] if name.endswith('s') else name).encode('ascii')
     zones = []
     for zone_name, body in _NAMED_DICT.findall(payload[open_at:]):
-        # A zone body is ``... cellLabels List<label> N ( ... );`` -- the list
-        # is terminated by ``);``, so slice to the closing paren rather than
-        # reading to the end of the body and swallowing the semicolon.
-        labels_at = body.find(b'(')
-        close_at = body.rfind(b')')
-        labels = (_numbers(body[labels_at + 1:close_at], np.int64)
-                  if 0 <= labels_at < close_at else np.empty(0, dtype=np.int64))
-        entries = dict(_ENTRY.findall(body))
+        labels, head = _zone_labels(
+            body, key, f'{name} zone {zone_name.decode("ascii", "replace")}')
+        entries = dict(_ENTRY.findall(head))
         zones.append(Zone(
             name=zone_name.decode('ascii'),
-            zone_type=entries.get(b'type', b'cellZone').strip().decode(
+            zone_type=entries.get(b'type', default_type).strip().decode(
                 'ascii', 'replace'),
             labels=labels))
     return tuple(zones)
@@ -448,6 +516,102 @@ def read_poly_mesh(path: str | Path, *,
         owner=owner, neighbour=neighbour, patches=patches,
         cell_zones=_read_zones(mesh, 'cellZones'),
         face_zones=_read_zones(mesh, 'faceZones'))
+
+
+@dataclass(frozen=True)
+class FaceZoneSurface:
+    """One ``faceZone`` as a drawable surface, in its own point numbering.
+
+    A zone's ``faceLabels`` address the mesh's faces and its faces address the
+    mesh's points, so a zone rendered from the mesh arrays carries the whole
+    point set behind it. These are compacted: ``points`` holds only the points
+    the zone's own faces use and ``face_vertices`` addresses that array, which
+    is what a renderer wants and what makes an interface of a few thousand
+    faces cheap to draw out of a mesh of half a million cells.
+    """
+
+    name: str
+    zone_type: str
+    points: np.ndarray            # (n_points, 3) float64
+    face_vertices: np.ndarray     # flat int64 into ``points``
+    face_offsets: np.ndarray      # (n_faces + 1,) int64 into ``face_vertices``
+
+    @property
+    def face_count(self) -> int:
+        return int(self.face_offsets.size - 1)
+
+
+def _gather_ranges(starts: np.ndarray, sizes: np.ndarray) -> np.ndarray:
+    """``concat(arange(s, s + n) for s, n in zip(starts, sizes))``, vectorised.
+
+    A faceZone on a real interface holds tens of thousands of faces and the
+    obvious Python loop over them is the whole cost of drawing one. This walks
+    the ragged run in two cumulative sums instead.
+    """
+    total = int(sizes.sum())
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    bounds = np.zeros(starts.size + 1, dtype=np.int64)
+    np.cumsum(sizes, out=bounds[1:])
+    steps = np.ones(total, dtype=np.int64)
+    steps[0] = starts[0]
+    if starts.size > 1:
+        steps[bounds[1:-1]] = starts[1:] - (starts[:-1] + sizes[:-1] - 1)
+    return np.cumsum(steps)
+
+
+def read_face_zone_surfaces(
+        path: str | Path, *,
+        layout_expectation: str = 'any') -> tuple[FaceZoneSurface, ...]:
+    """Every ``faceZone`` of one polyMesh, as surfaces.
+
+    DP-414. The conformal interface is the one thing the viewport could not
+    see. `vtkPOpenFOAMReader` is asked for zones with ``ReadZonesOn()`` and
+    returns the ``cellZones`` correctly, but OpenFOAM 13 writes a faceZone's
+    ``flipMap`` as ``List<bool>`` with the literals ``true`` and ``false``,
+    which that reader cannot parse: it errors at ``vtkOpenFOAMReader.cxx:10114``
+    once per processor directory per load and hands back a ``zones`` block with
+    no ``faceZones`` in it at all, while the mesh and its cell zones draw
+    normally -- so nothing on screen says an interface is missing.
+
+    The flipMap is not needed to draw the zone. It says which way each face is
+    oriented relative to the zone's own normal, which matters to a solver and
+    not to a surface, and this module's ``_read_zones`` already steps over it
+    by name rather than swallowing it. Only the labels are read here.
+
+    ``layout_expectation`` defaults to ``'any'`` because the caller is drawing
+    what is on disk rather than qualifying it: a decomposed case is one mesh
+    per rank and the viewport draws the union, which is a different question
+    from whether one rank may stand in for the mesh.
+    """
+    mesh = _resolve(path, layout_expectation=layout_expectation)
+    zones = _read_zones(mesh, 'faceZones')
+    if not zones:
+        return ()
+    points = _read_points(mesh)
+    vertices, offsets = _read_faces(mesh)
+    face_count = int(offsets.size - 1)
+
+    surfaces = []
+    for zone in zones:
+        labels = zone.labels
+        if labels.size and (int(labels.min()) < 0
+                            or int(labels.max()) >= face_count):
+            raise PolyMeshReadError(
+                'inconsistent_mesh',
+                f'faceZone {zone.name} addresses face {int(labels.max())} of '
+                f'{face_count}', path=mesh)
+        sizes = offsets[labels + 1] - offsets[labels]
+        gathered = vertices[_gather_ranges(offsets[labels], sizes)]
+        used = np.unique(gathered)
+        zone_offsets = np.zeros(labels.size + 1, dtype=np.int64)
+        np.cumsum(sizes, out=zone_offsets[1:])
+        surfaces.append(FaceZoneSurface(
+            name=zone.name, zone_type=zone.zone_type,
+            points=points[used] if used.size else np.empty((0, 3), np.float64),
+            face_vertices=np.searchsorted(used, gathered),
+            face_offsets=zone_offsets))
+    return tuple(surfaces)
 
 
 # --------------------------------------------------------------------------- #

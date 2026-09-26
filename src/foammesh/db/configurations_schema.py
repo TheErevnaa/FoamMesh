@@ -5,6 +5,7 @@
 from enum import Enum, auto, IntEnum
 
 from foammesh.support.simple_db.simple_schema import FloatType, IdReference, IntKeyList, EnumType, IntType, TextType, BoolType, VectorComposite
+from foammesh.support.simple_db.simple_schema import ErrorType, ValidationError
 
 
 CURRENT_CONFIGURATIONS_VERSION = 14
@@ -211,6 +212,14 @@ class GmshCellShape(Enum):
     checkMesh, at roughly four times the cell count and higher
     non-orthogonality than tetrahedra.
 
+    DP-628 (field audit 0924 gmsh-generate-export D5). That is not a promise
+    on curved geometry. MEASURED (Gmsh 4.15.2, a box with a spherical hole,
+    target 0.2 mm, minimum 0.05 mm): 5500 hexahedra, one of them inverted at
+    SICN -0.256. checkMesh called that mesh OK; the product's quality gate
+    refuses it as invalid, and that cannot be waived. At 0.12 mm the worst
+    SICN was 0.307 and it passed. The derivation says so when hexahedra are
+    asked for.
+
     Gmsh's 3D *recombination* (``Mesh.RecombineAll``) is deliberately absent.
     It produces tet/pyramid meshes that Gmsh reports as sound -- zero inverted
     elements -- and OpenFOAM rejects: negative cell volumes, open cells and
@@ -229,6 +238,52 @@ class GmshCellShape(Enum):
 
     TETRAHEDRAL = 'tetrahedral'
     HEXAHEDRAL = 'hexahedral'
+
+
+class DecompositionOrder(Enum):
+    """The axis order ``hierarchicalCoeffs`` accepts (DP-594).
+
+    A free-text box took ``abc`` and generation then failed with "unknown
+    decomposition order"; these are the six orders
+    ``openfoam/decomposition.ORDERS`` writes.
+    """
+
+    XYZ = 'xyz'
+    XZY = 'xzy'
+    YXZ = 'yxz'
+    YZX = 'yzx'
+    ZXY = 'zxy'
+    ZYX = 'zyx'
+
+
+class DecompositionCellsType(TextType):
+    """Three whole numbers of at least 1, or empty to split evenly (DP-594).
+
+    Refused at entry, with the field named, rather than at generation, where
+    ``2 2`` or ``audit_x`` used to fail with "need three values".
+    """
+
+    CLAUSE = ('must be three whole numbers of at least 1, one per axis '
+              '(for example 2 2 1), or empty to split the ranks evenly')
+
+    @classmethod
+    def usable(cls, text) -> bool:
+        values = [item for item in str(text or '').replace(',', ' ').split()
+                  if item]
+        if not values:
+            return True
+        if len(values) != 3:
+            return False
+        try:
+            return all(int(item) >= 1 for item in values)
+        except ValueError:
+            return False
+
+    def validate(self, value, name=None):
+        validated = super().validate(value, name)
+        if not self.usable(validated):
+            raise ValidationError(ErrorType.RangeError, self.CLAUSE, name)
+        return validated
 
 
 class DecompositionMethod(Enum):
@@ -345,6 +400,18 @@ class GmshLayerMode(Enum):
     NONE = 'none'
     FIRST_AND_RATIO = 'first_and_ratio'
     TOTAL_AND_COUNT = 'total_and_count'
+
+
+class GmshLayerPatchMode(Enum):
+    """Which surfaces a boundary layer grows on.
+
+    Plan 33 section 1.1. There used to be no such control: an empty list of
+    patches meant every boundary surface, so a case that named nothing grew
+    prisms across its inlet and outlet planes and nothing on screen said so.
+    """
+
+    SELECTED = 'selected'
+    ALL_ELIGIBLE_WALLS = 'all_eligible_walls'
 
 
 class GmshPeriodicTransform(Enum):
@@ -673,6 +740,20 @@ geometry = {
     # before this field existed simply has no id, and is matched by name as
     # it always was.
     'geometryId': TextType().setOptional(),
+    # Which boundary of that artifact, by the uuid the import minted. The id
+    # above ties the row to the file; this ties it to the patch, and only the
+    # name did that before (DP-383). The name is not enough: every STEP body
+    # is faced face0..faceN from zero, so a second CAD file collides with the
+    # first, and the tree -- which must show unique names -- quietly makes the
+    # second one face01 while the manifest keeps face0. Optional for the same
+    # reason geometryId is: a row saved before this field existed has none.
+    'patchUuid': TextType().setOptional(),
+    # DP-419. Which body of that artifact, for a volume row. The import
+    # records one region per CAD body and the tree showed none of them, so a
+    # two-body STEP arrived as loose surfaces: no volume row, nothing for the
+    # CellZone radio to sit on, and a Gmsh cell zone named after whatever the
+    # STEP called its solid. Optional, for the same reason the two above are.
+    'regionUuid': TextType().setOptional(),
     'shape': EnumType(Shape),
     'cfdType': EnumType(CFDType),
     'nonConformal': BoolType(False),
@@ -684,6 +765,17 @@ geometry = {
     'castellationGroup': IntType().setOptional().setDefault(None),
     'layerGroup': IntType().setOptional().setDefault(None),
     'slaveLayerGroup': IntType().setOptional().setDefault(None),
+    # DP-421. A point inside the region a volume row stands for. An interface
+    # that carves a cell zone is written `mode insidePoint`, because `inside`
+    # means "the volume this surface encloses" and an interface encloses
+    # nothing, and `surfaceZonesInfo.C:79-82` makes the point mandatory under
+    # that mode. The region owns the point, not the refinement group: it is a
+    # fact about the body, and the geometry split that produces the interface
+    # is what measures it.
+    'zoneInsidePoint': VectorComposite().schema(),
+    # (0 0 0) is a coordinate a user may legitimately mean, so "recorded" is
+    # carried separately from the value rather than inferred from it.
+    'zoneInsidePointSet': BoolType(False),
 }
 
 region = {
@@ -698,11 +790,15 @@ surfaceRefinement = {
         # 150 is the OpenFOAM standard (cube edges at 90 deg are captured).
         # Verified live on v13: 30 extracts zero edges from a cube.
         'includedAngle': FloatType().setRange(0, 180).setDefault(150),
+    # DP-581 (field audit 0924 snappy-front D8). Level 0 is legal for both:
+    # OF13 refuses only a negative level (`refinementSurfaces.C`), a maximum
+    # of 0 leaves the surface at the background size, and a feature level of
+    # 0 is how a group asks for no feature refinement without being unbound.
     'surfaceRefinement': {
         'minimumLevel': IntType().setRange(0, 10).setDefault(1),
-        'maximumLevel': IntType().setRange(1, 10).setDefault(1)
+        'maximumLevel': IntType().setRange(0, 10).setDefault(1)
     },
-    'featureEdgeRefinementLevel': IntType().setRange(1, 10).setDefault(1),
+    'featureEdgeRefinementLevel': IntType().setRange(0, 10).setDefault(1),
     # C31-08. Extra refinement inside a narrow gap, expressed the way
     # Foundation 13 expresses it: an *increment* on this surface's maximum
     # level. ``refinementSurfaces.C:100-110`` reads ``gapLevelIncrement`` per
@@ -808,11 +904,17 @@ layer = {
     'nSurfaceLayers': IntType().setLowLimit(0),
     'thicknessModel': EnumType(ThicknessModel).setDefault(ThicknessModel.FINAL_AND_EXPANSION),
     'relativeSizes': BoolType(True),
-    'firstLayerThickness': FloatType().setDefault(0.3),
-    'finalLayerThickness': FloatType().setDefault(0.5),
-    'thickness': FloatType().setDefault(0.5),
-    'expansionRatio': FloatType().setDefault(1.2),
-    'minThickness': FloatType().setDefault(0.3),
+    # DP-599 (field audit 0924 snappy-back D9). These took any number, and a
+    # negative thickness or ratio was refused only when the dictionary was
+    # built (``CaseBuilder._canonical_layer_values``). The writer's own rule
+    # is now the entry rule: each value, minimum included, is above zero. A
+    # ratio below 1 is legal (layers thinning away from the wall), so it is
+    # not refused.
+    'firstLayerThickness': FloatType().setLowLimit(0, False).setDefault(0.3),
+    'finalLayerThickness': FloatType().setLowLimit(0, False).setDefault(0.5),
+    'thickness': FloatType().setLowLimit(0, False).setDefault(0.5),
+    'expansionRatio': FloatType().setLowLimit(0, False).setDefault(1.2),
+    'minThickness': FloatType().setLowLimit(0, False).setDefault(0.3),
     # C31-11. See LayerPatchSelector. ``geometry`` is the default because it
     # is what every layer group written before this field did, so an existing
     # project writes the same ``layers {}`` block.
@@ -859,7 +961,10 @@ gmshSizeField = {
         GmshSizeFieldType.DISTANCE_THRESHOLD),
     # Scope names prepared surfaces for distance fields; analytic shapes
     # (box/ball/cylinder/frustum) ignore it and use their own geometry.
-    'scopeToken': TextType(),
+    # DP-531. So it is optional here: an analytic field stores none, and a
+    # field that does need one is refused for its absence at plan time
+    # (`size_fields.SizeField.needs_scope`) and by the panel before that.
+    'scopeToken': TextType().setOptional().setDefault(''),
     'sizeInside': FloatType().setLowLimit(0, False).setDefault(0.01),
     'sizeOutside': FloatType().setLowLimit(0, False).setDefault(0.1),
     'distanceMin': FloatType().setLowLimit(0, True).setDefault(0.0),
@@ -892,7 +997,10 @@ gmshSizeField = {
     'curvatureMax': FloatType().setLowLimit(0, False).setDefault(1.0),
     # Only read by math_eval rows. Validated against an allowlist of names and
     # costed against the domain before a job is accepted.
-    'expression': TextType().setDefault('0.01'),
+    # DP-610. The default was `0.01`, which that check refuses as a constant
+    # size, so a new row's defaults could never run. A new row now starts
+    # from a size that grows away from the origin; saved rows keep theirs.
+    'expression': TextType().setDefault('0.01 + 0.05*sqrt(x*x + y*y + z*z)'),
 }
 
 
@@ -907,6 +1015,21 @@ gmshSurfaceSize = {
     # A Gmsh surface tag, 1-based in import order -- the same numbering the
     # prepared-geometry scope maps and `surfaceNames` are keyed on.
     'surfaceId': IntType().setLowLimit(1).setDefault(1),
+    # Plan 33 W-G1. The prepared boundary that number stood for, stamped when
+    # the row is written. A tag is a position in import order, so every edit
+    # that renumbers the imported surfaces moved every saved row onto a
+    # different face; the reference is what the tag is resolved from at
+    # derivation time, and a row whose boundary is gone is refused by name
+    # rather than pointed somewhere else. Empty on a case saved before this.
+    #
+    # DP-412. Optional, and it has to be: nobody types this. It is stamped by
+    # `_stamp_surface_reference` from the tag, *after* the patch is
+    # normalized, so a required field here refused the row before the thing
+    # that fills it ever ran. Every Add on the per-surface size panel sends
+    # the whole editor set, blank reference included, so every row a human or
+    # a harness added was answered with "entity value failed validation" and
+    # no row -- MEASURED on 34 Gmsh legs of the Plan 34 campaign.
+    'surfaceRef': TextType().setOptional().setDefault(''),
     'targetSize': FloatType().setLowLimit(0, False).setDefault(0.005),
     # How far the size ramps back to the global target. Zero means "one global
     # cell", derived at plan time, because a Threshold with no ramp is a step
@@ -961,7 +1084,12 @@ gmshCurveControl = {
     #   * named three real corners and one point that is not on the face at
     #     all -- 44 triangles, silently. Gmsh does not check membership, so
     #     the run does, and says which corners the face actually has.
-    'cornerPoints': TextType(),
+    #
+    # DP-412, the same defect one field over: "blank to let it choose" is the
+    # documented default and a required TextType refuses blank, so a curve
+    # control added without naming corners was refused the same way. Not
+    # measured in the campaign only because it writes no curve controls.
+    'cornerPoints': TextType().setOptional().setDefault(''),
     'localSize': FloatType().setLowLimit(0, False).setDefault(0.01),
     'priority': IntType().setRange(0, 100).setDefault(0),
 }
@@ -1028,11 +1156,14 @@ schema = {
             # Read only by `hierarchical` and `simple`, which refuse to run
             # without their coefficients. Shipping the combo without these
             # would write a decomposeParDict that decomposePar rejects.
-            'decompositionOrder': TextType().setDefault('xyz'),
+            # DP-594. A choice of the six orders, not free text.
+            'decompositionOrder': EnumType(DecompositionOrder).setDefault(
+                DecompositionOrder.XYZ),
             # Empty means "derive a balanced split from the rank count", which
             # is the only sane default: a fixed n vector would be wrong for
             # every rank count but one.
-            'decompositionCells': TextType().setOptional().setDefault(''),
+            'decompositionCells': DecompositionCellsType().setOptional()
+            .setDefault(''),
             # Plan 31 (parallel.decompose_extras). The `constraints {}` block
             # of decomposeParDict. Every one of these is off or empty by
             # default and nothing is written unless one is set, so a case that
@@ -1116,12 +1247,23 @@ schema = {
             # out of the way rather than colliding.
             'frontPatch': TextType().setDefault('front'),
             'backPatch': TextType().setDefault('back'),
+            # DP-675. Names for the section's boundary curves, as
+            # `inlet: 1; walls: 2 4`, keyed by the curve tag a first run
+            # names `edge_<tag>`. Empty keeps every curve `edge_<tag>`.
+            'edgeNames': TextType().setOptional().setDefault(''),
         },
         'globalSizing': {
-            # Derived from the bounding box when the user has not set it;
-            # derive_global_sizing warns rather than silently using 1.0.
-            'targetSize': FloatType().setLowLimit(0, False).setDefault(0.01),
-            'minimumSize': FloatType().setLowLimit(0, False).setDefault(0.001),
+            # DP-614 (field audit 0924 gmsh-sizing D1, D11). Unset ("Auto")
+            # in a new project: the job derives the target from the prepared
+            # geometry (bounding-box diagonal / 40) and the minimum as a tenth
+            # of it, and the Global Sizing page is told the number. The old
+            # defaults were 0.01 m and 0.001 m whatever the geometry, so the
+            # derivation this comment described never ran. A project that
+            # saved those numbers keeps them.
+            'targetSize': FloatType().setOptional().setDefault(None)
+            .setLowLimit(0, False),
+            'minimumSize': FloatType().setOptional().setDefault(None)
+            .setLowLimit(0, False),
             'sizeFactor': FloatType().setRange(0.01, 100).setDefault(1.0),
             'fromCurvature': IntType().setRange(0, 50).setDefault(12),
             'fromPoints': BoolType(True),
@@ -1399,13 +1541,20 @@ schema = {
             # subset used to leave the surface loop open, so this was global;
             # the runner now deletes each un-extruded surface and rebuilds it
             # from the extrusion's inner rim, MEASURED closed on a live duct.
-            # Empty means every boundary surface, which is what shipped.
-            # Optional with an empty default, because empty is the
-            # shipped meaning above and a bare TextType() is REQUIRED:
-            # every case carrying the default then failed revalidation,
-            # which is the path undo/redo, reopen and delta-commit all
-            # take (38 suite failures, one cause).
+            # Plan 33 section 1.1. Empty used to mean every boundary
+            # surface, so a case that named nothing grew prisms across its
+            # inlet and outlet planes. The surfaces are now named beside
+            # `patchMode`, which says whether this list is the answer or
+            # whether the run is to read every eligible wall off the
+            # geometry it imports. A case saved without the choice is given
+            # one by `migrateDocument` below.
+            # Optional with an empty default, because a bare TextType() is
+            # REQUIRED: every case carrying the default then failed
+            # revalidation, which is the path undo/redo, reopen and
+            # delta-commit all take (38 suite failures, one cause).
             'patches': TextType().setOptional().setDefault(''),
+            'patchMode': EnumType(GmshLayerPatchMode).setDefault(
+                GmshLayerPatchMode.SELECTED),
             'enabled': BoolType(False),
             'mode': EnumType(GmshLayerMode).setDefault(GmshLayerMode.FIRST_AND_RATIO),
             'firstHeight': FloatType().setLowLimit(0, False).setDefault(0.0006),
@@ -1496,7 +1645,12 @@ schema = {
     },
     'baseGrid': {
         'sizingMode': EnumType(BaseGridSizingMode).setDefault(BaseGridSizingMode.COUNTS),
-        'targetCellSize': FloatType().setLowLimit(0, False).setDefault(1.0),
+        # DP-669 (DP-587 left it). Unset ("Auto") in a new project: the
+        # block is divided at its bounding-box diagonal / 40, as the Gmsh
+        # global size is (DP-614). The old 1 m default wrote one cell across
+        # a 0.3 m part. A project that saved a number keeps it.
+        'targetCellSize': FloatType().setOptional().setDefault(None)
+        .setLowLimit(0, False),
         'numCellsX': IntType().setLowLimit(1).setDefault(10),
         'numCellsY': IntType().setLowLimit(1).setDefault(10),
         'numCellsZ': IntType().setLowLimit(1).setDefault(10),
@@ -1597,6 +1751,13 @@ schema = {
         # every feature file keeps the single ``level`` the writer has always
         # emitted. See ``featureBand``.
         'featureBands': IntKeyList(featureBand),
+        # DP-586 (field audit 0924 snappy-front D13). The ``levels`` ramp of a
+        # distance-mode volume group, one row per ``(distance level)`` band
+        # named by the group it belongs to -- the same shape as
+        # ``featureBands`` and top level for the same reason: the nested
+        # ``refinementVolumes/<id>/bands`` list has no facade operation, so
+        # no workflow page could author it.
+        'volumeBands': IntKeyList(featureBand),
     },
     'snap': {
         'nSmoothPatch': IntType().setLowLimit(0).setDefault(0),
@@ -1664,39 +1825,55 @@ schema = {
         'meshShrinker': EnumType(MeshShrinker).setDefault(
             MeshShrinker.MEDIAL_AXIS),
     },
+    # DP-597 (field audit 0924 snappy-back D6). Every threshold took any
+    # number: a non-orthogonality of 200 degrees and an error reduction of
+    # 1.0275 were saved and written. The ranges are the quantities' own: an
+    # angle between face normals is 0-180 (180 switches the check off), a
+    # twist is a cosine, a determinant is 1 for a hex, a face weight is at
+    # most one half, a volume ratio at most one, and ``errorReduction`` scales
+    # a displacement back each iteration, so it lies strictly between 0 and
+    # 1. The skewness limits stay open: a value of 0 or less is how
+    # ``motionSmootherAlgoCheck`` is told to skip that check.
     'meshQuality': {
-        'maxNonOrtho': FloatType().setDefault(65),
+        'maxNonOrtho': FloatType().setRange(0, 180).setDefault(65),
         'maxBoundarySkewness': FloatType().setDefault(20),
         'maxInternalSkewness': FloatType().setDefault(4),
-        'maxConcave': FloatType().setDefault(80),
+        'maxConcave': FloatType().setRange(0, 180).setDefault(80),
         'minVol': FloatType().setDefault('-1e30'),
         'minTetQuality': FloatType().setDefault('1e-15'),
         'minVolCollapseRatio': FloatType().setDefault(-1),
         'minArea': FloatType().setDefault(-1),
-        'minTwist': FloatType().setDefault(0.02),
-        'minDeterminant': FloatType().setDefault(0.001),
-        'minFaceWeight': FloatType().setDefault(0.05),
-        'minVolRatio': FloatType().setDefault(0.01),
-        'nSmoothScale': IntType().setDefault(4),
-        'errorReduction': FloatType().setDefault(0.75),
-        'mergeTolerance': FloatType().setDefault(1e-6),
+        'minTwist': FloatType().setRange(-1, 1).setDefault(0.02),
+        'minDeterminant': FloatType().setHighLimit(1).setDefault(0.001),
+        'minFaceWeight': FloatType().setHighLimit(0.5).setDefault(0.05),
+        'minVolRatio': FloatType().setHighLimit(1).setDefault(0.01),
+        'nSmoothScale': IntType().setLowLimit(0).setDefault(4),
+        'errorReduction': FloatType().setLowLimit(0, False)
+        .setHighLimit(1, False).setDefault(0.75),
+        'mergeTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
         # The thresholds snappy falls back to while adding layers, when the
         # strict ones cannot be met.  Only maxNonOrtho has ever been written;
         # the rest stay unset so an existing case keeps the mesh it had, and
         # each one that is set is written beside it.
         'relaxed': {
-            'maxNonOrtho': FloatType().setDefault(75),
+            # DP-597: the same ranges as the strict thresholds above.
+            'maxNonOrtho': FloatType().setRange(0, 180).setDefault(75),
             'maxBoundarySkewness': FloatType().setOptional().setDefault(None),
             'maxInternalSkewness': FloatType().setOptional().setDefault(None),
-            'maxConcave': FloatType().setOptional().setDefault(None),
+            'maxConcave': FloatType().setRange(0, 180).setOptional()
+            .setDefault(None),
             'minVol': FloatType().setOptional().setDefault(None),
             'minTetQuality': FloatType().setOptional().setDefault(None),
             'minVolCollapseRatio': FloatType().setOptional().setDefault(None),
             'minArea': FloatType().setOptional().setDefault(None),
-            'minTwist': FloatType().setOptional().setDefault(None),
-            'minDeterminant': FloatType().setOptional().setDefault(None),
-            'minFaceWeight': FloatType().setOptional().setDefault(None),
-            'minVolRatio': FloatType().setOptional().setDefault(None),
+            'minTwist': FloatType().setRange(-1, 1).setOptional()
+            .setDefault(None),
+            'minDeterminant': FloatType().setHighLimit(1).setOptional()
+            .setDefault(None),
+            'minFaceWeight': FloatType().setHighLimit(0.5).setOptional()
+            .setDefault(None),
+            'minVolRatio': FloatType().setHighLimit(1).setOptional()
+            .setDefault(None),
         }
     },
     # Plan 31 (checkmesh.thresholds_and_region + checkmesh.write_surfaces).
@@ -1894,6 +2071,28 @@ POSITION_ADDRESSED_LISTS = (
 )
 
 
+def _resetOutOfRange(values: dict, node: dict) -> None:
+    """Put each scalar of *values* its *node* schema refuses back to default.
+
+    DP-597. Only range and type refusals are reset; the value a user set is
+    kept whenever the schema still accepts it.
+    """
+    for key, primitive in node.items():
+        if key not in values:
+            continue
+        if isinstance(primitive, dict):
+            if isinstance(values[key], dict):
+                _resetOutOfRange(values[key], primitive)
+            continue
+        if not isinstance(primitive, FloatType):
+            continue
+        try:
+            primitive.validate(values[key], key)
+        except ValidationError:
+            values[key] = (primitive.default() if primitive.isRequired()
+                           else None)
+
+
 def migrateDocument(document):
     """Rewrite a saved document onto the current field names, in place.
 
@@ -1919,6 +2118,10 @@ def migrateDocument(document):
       and it survived here because nothing ever compared the two. The value a
       user set is carried across, so no project loses a tuned angle.
 
+    One meaning is handled: a Gmsh layer block saved before the surfaces
+    were a choice. ``foammesh.core.gmsh.layer_migration`` reads it, because
+    the reading has to be the same one the derivation and the page apply.
+
     One removal is handled: ``mesh/intent`` (Plan 30 WP-09, F-23). Validation
     would drop it anyway; it is dropped here so that a case saved with the six
     sizing fields never reaches a reader that still expects them, and so that
@@ -1927,9 +2130,28 @@ def migrateDocument(document):
     """
     if not isinstance(document, dict):
         return document
+    from foammesh.core.gmsh.layer_migration import migrate_document
+
+    migrate_document(document)
     mesh = document.get('mesh')
     if isinstance(mesh, dict):
         mesh.pop('intent', None)
+        # DP-594. The order and cells were free text, and a value no
+        # decomposition can use would now refuse to load; it was already
+        # refused at generation, so it opens as the default instead.
+        execution = mesh.get('execution')
+        if isinstance(execution, dict):
+            order = execution.get('decompositionOrder')
+            if order is not None and str(getattr(order, 'value', order))                     not in {item.value for item in DecompositionOrder}:
+                execution['decompositionOrder'] = DecompositionOrder.XYZ.value
+            if not DecompositionCellsType.usable(
+                    execution.get('decompositionCells')):
+                execution['decompositionCells'] = ''
+    # DP-597. A threshold saved outside the range it now has would refuse to
+    # load; it opens as the default (unset, for a relaxed one) instead.
+    quality = document.get('meshQuality')
+    if isinstance(quality, dict):
+        _resetOutOfRange(quality, schema['meshQuality'])
     snap = document.get('snap')
     if isinstance(snap, dict) and 'featureSnapType' in snap:
         stored = snap.pop('featureSnapType')
@@ -1943,6 +2165,11 @@ def migrateDocument(document):
         addLayers.setdefault('minMedialAxisAngle', retired)
     layers = addLayers.get('layers') if isinstance(addLayers, dict) else None
     if isinstance(layers, dict):
+        # DP-599. A stack value saved at or below zero would refuse to load;
+        # it opens as the default instead.
+        for group in layers.values():
+            if isinstance(group, dict):
+                _resetOutOfRange(group, layer)
         for group in layers.values():
             if not isinstance(group, dict) or 'layerPolicy' in group:
                 continue

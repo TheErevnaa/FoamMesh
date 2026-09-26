@@ -46,7 +46,7 @@ OPEN_SURFACE_NOTES = {
     Shape.PLANE: ('An unbounded plane. It cuts the whole domain, so it is for '
                   'refining along a shear layer or a symmetry cut, not for '
                   'enclosing anything.'),
-    Shape.DISK: ('A flat circular disc facing along the normal -- a fan face, '
+    Shape.DISK: ('A flat circular disc facing along the normal — a fan face, '
                  'an actuator disc, an orifice.'),
     Shape.PLATE: ('A flat rectangle aligned with the axes. The span needs two '
                   'positive entries and exactly one zero; the zero names the '

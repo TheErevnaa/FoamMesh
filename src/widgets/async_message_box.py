@@ -30,14 +30,20 @@ class AsyncMessageBox:
                                     buttons=buttons, defaultButton=defaultButton)
 
     def warning(self, parent, title, text, buttons=QMessageBox.StandardButton.Ok,
-                defaultButton=QMessageBox.StandardButton.NoButton):
+                defaultButton=QMessageBox.StandardButton.NoButton, *,
+                informativeText='', detailedText=''):
+        # DP-506. A failure names its log beneath the sentence and keeps the
+        # long diagnostic behind Details, rather than in the sentence.
         return self._showMessageBox(parent, QMessageBox.Icon.Warning, title, text,
-                                    buttons=buttons, defaultButton=defaultButton)
+                                    buttons=buttons, defaultButton=defaultButton,
+                                    informativeText=informativeText,
+                                    detailedText=detailedText)
 
     async def confirm(self, parent, title, text, defaultButton=QMessageBox.StandardButton.NoButton):
         return await self.question(parent, title, text, defaultButton=defaultButton) == QMessageBox.StandardButton.Yes
 
-    def _showMessageBox(self, parent, icon, title, text, buttons, defaultButton):
+    def _showMessageBox(self, parent, icon, title, text, buttons, defaultButton,
+                        informativeText='', detailedText=''):
         self._messageBoxes.add(self)
 
         loop = asyncio.get_running_loop()
@@ -46,6 +52,10 @@ class AsyncMessageBox:
         self._mbox = QMessageBox(icon, title, text, buttons=buttons, parent=parent)
         self._mbox.setWindowModality(Qt.WindowModality.ApplicationModal)
         self._mbox.finished.connect(self._finished)
+        if informativeText:
+            self._mbox.setInformativeText(informativeText)
+        if detailedText:
+            self._mbox.setDetailedText(detailedText)
 
         if defaultButton != QMessageBox.StandardButton.NoButton:
             self._mbox.setDefaultButton(defaultButton)

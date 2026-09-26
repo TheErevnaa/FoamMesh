@@ -4,18 +4,23 @@
 import qasync
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout,
-    QHeaderView, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QComboBox, QDialog, QHBoxLayout,
+    QHeaderView, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget)
 
 from foammesh.support.simple_db.simple_schema import ValidationError
+from foammesh.view.widgets.commit_guard import (
+    CONFLICT_ERRORS, commit_guard, conflict_message)
 from widgets.async_message_box import AsyncMessageBox
 from widgets.multi_selector_dialog import MultiSelectorDialog, SelectorItem
 
 from foammesh.app import app
+from foammesh.core.quantities import format_group
 from foammesh.db.configurations_schema import (
     GeometryType, GapRefinementMode, RefinementRegionMode)
-from .volume_refinement_dialog_ui import Ui_VolumeeRefinementDialog
+from foammesh.view.theming.metrics import (
+    CompactDoubleSpinBox, CompactSpinBox, unit_cell)
+from .volume_refinement_dialog_ui import Ui_VolumeRefinementDialog
 
 
 baseName = 'Group_'
@@ -24,8 +29,13 @@ baseName = 'Group_'
 class VolumeRefinementDialog(QDialog):
     def __init__(self, parent, db, groupId=None):
         super().__init__(parent)
-        self._ui = Ui_VolumeeRefinementDialog()
+        self._ui = Ui_VolumeRefinementDialog()
         self._ui.setupUi(self)
+        # DP-202. Hidden, and now said so here rather than only in the
+        # accountability generator: the gap region controls and the
+        # anisotropic refinement controls are both non-Foundation-13,
+        # so the groups stay in the form to keep the generated module
+        # its shape and never reach a reader.
         self._ui.gapRefinement.hide()
         self._ui.levelIncrement.hide()
 
@@ -40,10 +50,10 @@ class VolumeRefinementDialog(QDialog):
                 (self.tr('Inside'), RefinementRegionMode.INSIDE),
                 (self.tr('Outside'), RefinementRegionMode.OUTSIDE),
                 (self.tr('Distance'), RefinementRegionMode.DISTANCE),
-                (self.tr('Inside Span'), RefinementRegionMode.INSIDE_SPAN),
-                (self.tr('Outside Span'), RefinementRegionMode.OUTSIDE_SPAN)):
+                (self.tr('Inside span'), RefinementRegionMode.INSIDE_SPAN),
+                (self.tr('Outside span'), RefinementRegionMode.OUTSIDE_SPAN)):
             self._regionMode.addItem(label, mode)
-        self._regionDistance = QDoubleSpinBox(self._ui.widget)
+        self._regionDistance = CompactDoubleSpinBox(self._ui.widget)
         self._regionDistance.setRange(1e-12, 1e12)
         self._regionDistance.setDecimals(8)
         # C31-08. A span is measured across a triangulated surface, so v13
@@ -51,15 +61,20 @@ class VolumeRefinementDialog(QDialog):
         # reads ``cellsAcrossSpan`` with ``lookup``, not ``lookupOrDefault``:
         # leaving it out is a FatalIOError while the dictionary is still being
         # parsed, which is why this control is mandatory rather than optional.
-        self._cellsAcrossSpan = QSpinBox(self._ui.widget)
+        self._cellsAcrossSpan = CompactSpinBox(self._ui.widget)
         self._cellsAcrossSpan.setRange(1, 1000)
         self._cellsAcrossSpan.setToolTip(self.tr(
             'How many cells snappyHexMesh lays across the local thickness of '
-            'the surface.'))
+            'the surface'))
         self._ui.formLayout_3.addRow(self.tr('Refinement mode'), self._regionMode)
-        self._ui.formLayout_3.addRow(self.tr('Distance'), self._regionDistance)
-        self._ui.formLayout_3.addRow(self.tr('Cells Across Span'),
-                                     self._cellsAcrossSpan)
+        # DP-164. The row's field is the cell holding the box and its unit,
+        # so the cell is what gets hidden and what the label is asked for.
+        self._regionDistanceCell = unit_cell(self._regionDistance, 'm')
+        self._cellsAcrossSpanCell = unit_cell(self._cellsAcrossSpan, 'cells')
+        self._ui.formLayout_3.addRow(self.tr('Distance'),
+                                     self._regionDistanceCell)
+        self._ui.formLayout_3.addRow(self.tr('Cells across span'),
+                                     self._cellsAcrossSpanCell)
         self._buildBandTable()
         self._regionMode.currentIndexChanged.connect(self._modeChanged)
 
@@ -104,7 +119,7 @@ class VolumeRefinementDialog(QDialog):
         """
         self._bands = QTableWidget(0, 2, self._ui.widget)
         self._bands.setHorizontalHeaderLabels(
-            [self.tr('Distance'), self.tr('Level')])
+            [self.tr('Distance (m)'), self.tr('Level')])
         self._bands.verticalHeader().hide()
         self._bands.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
@@ -116,7 +131,7 @@ class VolumeRefinementDialog(QDialog):
 
         self._addBand = QPushButton(self.tr('Add'), self._ui.widget)
         self._removeBand = QPushButton(self.tr('Remove'), self._ui.widget)
-        self._addBand.clicked.connect(self._appendBand)
+        self._addBand.clicked.connect(self._addBandClicked)
         self._removeBand.clicked.connect(self._deleteBand)
 
         buttons = QHBoxLayout()
@@ -130,8 +145,21 @@ class VolumeRefinementDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._bands)
         layout.addLayout(buttons)
-        self._ui.formLayout_3.addRow(self.tr('Refinement Bands'),
+        self._ui.formLayout_3.addRow(self.tr('Refinement bands'),
                                      self._bandsBox)
+
+    def _addBandClicked(self, _checked=False):
+        """The Add button, which carries a `checked` flag nobody wants.
+
+        DP-385. `clicked` is `clicked(bool checked = false)` and PySide6
+        hands that bool to any slot willing to take an argument, so
+        connecting the button straight to `_appendBand` called it as
+        `_appendBand(False)` -- a distance of False, which is not None, so
+        the branch that computes the next band never ran and the level
+        stayed None. `str(int(None))` then raised, and the only way to add
+        a second band by hand was a button that could not add one.
+        """
+        self._appendBand()
 
     def _appendBand(self, distance=None, level=None):
         row = self._bands.rowCount()
@@ -212,12 +240,12 @@ class VolumeRefinementDialog(QDialog):
         self._bandsBox.setVisible(isDistance)
         self._ui.formLayout_3.labelForField(self._bandsBox).setVisible(
             isDistance)
-        self._cellsAcrossSpan.setVisible(isSpan)
-        self._ui.formLayout_3.labelForField(self._cellsAcrossSpan).setVisible(
-            isSpan)
-        self._regionDistance.setVisible(isSpan)
-        self._ui.formLayout_3.labelForField(self._regionDistance).setVisible(
-            isSpan)
+        self._cellsAcrossSpanCell.setVisible(isSpan)
+        self._ui.formLayout_3.labelForField(
+            self._cellsAcrossSpanCell).setVisible(isSpan)
+        self._regionDistanceCell.setVisible(isSpan)
+        self._ui.formLayout_3.labelForField(
+            self._regionDistanceCell).setVisible(isSpan)
         self._regionDistance.setEnabled(isSpan)
         if isDistance and not self._bands.rowCount():
             self._appendBand()
@@ -239,79 +267,132 @@ class VolumeRefinementDialog(QDialog):
 
     @qasync.asyncSlot()
     async def _accept(self):
-        try:
-            groupName = self._ui.groupName.text().strip()
-            if self._db.getKeys('castellation/refinementVolumes',
-                                lambda i, e: e['groupName'] == groupName and i != self._groupId):
-                await AsyncMessageBox().information(self, self.tr('Input Error'),
-                                                    self.tr('Group name "{0}" already exists.').format(groupName))
-                return
-
-            if not self._volumes:
-                await AsyncMessageBox().information(self, self.tr('Input Error'), self.tr('Select volumes'))
-                return
-
-            mode = self._regionMode.currentData()
-            rows = self._bandRows() if mode is RefinementRegionMode.DISTANCE \
-                else []
-            if rows:
-                message = self._bandError(rows)
-                if message:
-                    await AsyncMessageBox().information(
-                        self, self.tr('Input Error'), message)
+        # DP-427. This dialog used to write its group into the working
+        # copy the page handed it at construction and never commit it, so
+        # the group survived only while that copy was still the one the case
+        # later took. MEASURED over the 148-leg W-G campaign: of the 32
+        # snappy legs whose dictionary was written down the plain
+        # `patchInfo` path, exactly 1 kept its refinement level and 31 came
+        # out `level (0 0)` on every surface -- `SimpleDB.commit` returns
+        # `{}` and writes nothing when the copy is not editable, silently,
+        # so 31 meshes were castellated against a dictionary that asked for
+        # nothing and every one of them was graded runnable. On three legs
+        # the copy was already spent and `addElement` raised `LookupError`
+        # out of the slot instead, which is the same fault with a symptom.
+        # The write is this dialog's, so this dialog commits it, against a
+        # copy taken at OK rather than one as old as the dialog. DP-119
+        # made this repair in `boundary_setting_dialog.py` for the same
+        # reason and named this exception in doing so.
+        with commit_guard(self._ui.ok):
+            try:
+                groupName = self._ui.groupName.text().strip()
+                if self._db.getKeys('castellation/refinementVolumes',
+                                    lambda i, e: e['groupName'] == groupName and i != self._groupId):
+                    await AsyncMessageBox().warning(self, self.tr('Input error'),
+                                                        self.tr('Group name "{0}" already exists.').format(groupName))
                     return
 
-            self._dbElement.setValue('groupName', groupName, self.tr('Group Name'))
-            self._dbElement.setValue('mode', mode)
-            # C31-08. ``bands`` is the ramp; ``distance`` and
-            # ``volumeRefinementLevel`` stay the first band so a project saved
-            # by an older build, which has no ``bands`` at all, still means
-            # exactly what it meant before -- the writer falls back to them.
-            self._dbElement.removeAllElements('bands')
-            if rows:
-                for distance, level in rows:
-                    band = self._dbElement.newElement('bands')
-                    band.setValue('distance', str(distance))
-                    band.setValue('level', str(level))
-                    self._dbElement.addElement('bands', band)
-                self._dbElement.setValue('distance', rows[0][0])
-                self._dbElement.setValue(
-                    'volumeRefinementLevel', str(rows[0][1]),
-                    self.tr('Volume Refinement Level'))
-            else:
-                self._dbElement.setValue(
-                    'volumeRefinementLevel',
-                    self._ui.volumeRefinementLevel.text(),
-                    self.tr('Volume Refinement Level'))
-                self._dbElement.setValue('distance', self._regionDistance.value())
-            self._dbElement.setValue('cellsAcrossSpan',
-                                     str(self._cellsAcrossSpan.value()),
-                                     self.tr('Cells Across Span'))
+                if not self._volumes:
+                    await AsyncMessageBox().warning(self, self.tr('Input error'), self.tr('Select at least one volume.'))
+                    return
 
-            if self._groupId:
-                self._db.commit(self._dbElement)
-            else:
-                self._groupId = self._db.addElement('castellation/refinementVolumes', self._dbElement)
+                mode = self._regionMode.currentData()
+                rows = self._bandRows() if mode is RefinementRegionMode.DISTANCE \
+                    else []
+                if rows:
+                    message = self._bandError(rows)
+                    if message:
+                        await AsyncMessageBox().warning(
+                            self, self.tr('Input error'), message)
+                        return
 
-            volumes = {gId: None for gId in self._oldVolumes}
-            for gId in self._volumes:
-                if gId in volumes:
-                    volumes.pop(gId)
+                self._dbElement.setValue('groupName', groupName, self.tr('Group name'))
+                self._dbElement.setValue('mode', mode)
+                # C31-08. ``bands`` is the ramp; ``distance`` and
+                # ``volumeRefinementLevel`` stay the first band so a project saved
+                # by an older build, which has no ``bands`` at all, still means
+                # exactly what it meant before -- the writer falls back to them.
+                self._dbElement.removeAllElements('bands')
+                if rows:
+                    for distance, level in rows:
+                        band = self._dbElement.newElement('bands')
+                        band.setValue('distance', str(distance))
+                        band.setValue('level', str(level))
+                        self._dbElement.addElement('bands', band)
+                    self._dbElement.setValue('distance', rows[0][0])
+                    self._dbElement.setValue(
+                        'volumeRefinementLevel', str(rows[0][1]),
+                        self.tr('Volume refinement level'))
                 else:
-                    volumes[gId] = self._groupId
+                    self._dbElement.setValue(
+                        'volumeRefinementLevel',
+                        self._ui.volumeRefinementLevel.text(),
+                        self.tr('Volume refinement level'))
+                    self._dbElement.setValue('distance', self._regionDistance.value())
+                self._dbElement.setValue('cellsAcrossSpan',
+                                         str(self._cellsAcrossSpan.value()),
+                                         self.tr('Cells across span'))
 
-            for gId, group in volumes.items():
-                self._db.setValue(f'geometry/{gId}/castellationGroup', group)
+                # Taken here rather than at load(): the window between OK and
+                # the commit is microseconds, where the window between opening
+                # the dialog and OK is however long the user spends in it.
+                db = app.facadeClient.checkout()
+                if self._groupId:
+                    db.commit(self._dbElement)
+                    groupId = self._groupId
+                else:
+                    groupId = db.addElement(
+                        'castellation/refinementVolumes', self._dbElement)
 
-            super().accept()
-        except ValidationError as error:
-            await AsyncMessageBox().information(self, self.tr('Input Error'), error.toMessage())
+                volumes = {gId: None for gId in self._oldVolumes}
+                for gId in self._volumes:
+                    if gId in volumes:
+                        volumes.pop(gId)
+                    else:
+                        volumes[gId] = groupId
+
+                for gId, group in volumes.items():
+                    db.setValue(f'geometry/{gId}/castellationGroup', group)
+
+                await app.facadeClient.commit_working_copy(
+                    db, action='update volume refinement')
+
+                # Only now: a refused commit added no group, and a dialog that
+                # had already taken the id would reopen editing an element the
+                # case has never heard of.
+                self._groupId = groupId
+                super().accept()
+            except CONFLICT_ERRORS as error:
+                # Stay open. Every value below is read back off the
+                # widgets on the next OK, so the user loses nothing.
+                self._reopenElement()
+                await AsyncMessageBox().warning(
+                    self, self.tr('Case changed'),
+                    self.tr(conflict_message(error)))
+            except ValidationError as error:
+                await AsyncMessageBox().warning(self, self.tr('Input error'), error.toMessage())
 
     def _connectSignalsSlots(self):
         self._ui.volumeRefinementLevel.editingFinished.connect(self._updateCellSize)
         self._ui.select.clicked.connect(self._selectVolumes)
         self._ui.ok.clicked.connect(self._accept)
         self._ui.cancel.clicked.connect(self.close)
+
+    def _reopenElement(self):
+        """Take the element again after a commit the case refused.
+
+        Committing an element marks it read-only, so the OK pressed after
+        "the case changed" would raise ``LookupError`` out of a slot rather
+        than retry. Every value this dialog writes is read back off its
+        widgets, so a fresh element and a fresh copy are all it needs.
+        """
+        self._db = app.facadeClient.checkout()
+        if self._groupId:
+            self._dbElement = self._db.checkout(
+                f'castellation/refinementVolumes/{self._groupId}')
+        else:
+            self._dbElement = self._db.newElement(
+                f'castellation/refinementVolumes')
 
     def _load(self):
         if self._groupId:
@@ -365,13 +446,18 @@ class VolumeRefinementDialog(QDialog):
 
     def _updateCellSize(self):
         d = 2 ** int(self._ui.volumeRefinementLevel.text())
-        self._ui.cellSize.setText(
-            'cell size <b>({:g} x {:g} x {:g})</b>'.format(
-                self._xCellSize / d, self._yCellSize / d, self._zCellSize / d))
+        # DP-179. This said the same thing as the surface editor and said
+        # it differently: `{:g}` is six significant figures per component
+        # where that one had settled on four, so one cell size read two
+        # ways depending on which editor was open. Both now go through the
+        # house helper, which also supplies the unit neither of them had.
+        self._ui.cellSize.setText(self.tr('cell size <b>({0})</b>').format(
+            format_group((self._xCellSize / d, self._yCellSize / d,
+                          self._zCellSize / d))))
 
     def _selectVolumes(self):
         self._dialog = MultiSelectorDialog(
-            self, self.tr('Select Volumes'), self._availableVolumes,
+            self, self.tr('Select volumes'), self._availableVolumes,
             self._volumes, app.selectionService)
         self._dialog.itemsSelected.connect(self._setVolumes)
         self._dialog.open()

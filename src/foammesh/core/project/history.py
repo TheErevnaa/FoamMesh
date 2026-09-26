@@ -3,24 +3,31 @@
 
 """Undo/redo over project-state snapshots.
 
-The engine takes a snapshot (the project's serialized YAML configuration) before
-each committed change. Undo restores the previous snapshot; redo re-applies an
+The engine takes a snapshot of the project's configuration before each
+committed change. Undo restores the previous snapshot; redo re-applies an
 undone one. A bounded depth keeps memory in check on large projects.
 
-NOTE: snapshots cover the configuration state (the YAML). Binary geometry data
-(imported polyData held outside the YAML) is not yet captured by undo — see the
+A snapshot is opaque here: this class stores it and hands it back, and only
+the state engine that produced it knows what it holds. Today that is a copy of
+the configuration document. It used to be that document serialized to YAML
+text, which cost about forty times as much to take — DP-72.
+
+NOTE: snapshots cover the configuration state. Binary geometry data (imported
+polyData held outside the configuration) is not yet captured by undo — see the
 phase-02 plan; this is a documented limitation to be closed later.
 """
 from __future__ import annotations
 
+from typing import Any
+
 
 class History:
     def __init__(self, max_depth: int = 50):
-        self._undo: list[tuple[str, str]] = []
-        self._redo: list[tuple[str, str]] = []
+        self._undo: list[tuple[Any, str]] = []
+        self._redo: list[tuple[Any, str]] = []
         self._max_depth = max_depth
 
-    def record(self, snapshot: str, label: str = '') -> None:
+    def record(self, snapshot, label: str = '') -> None:
         """Record the state *before* a change so it can be undone to."""
         self._undo.append((snapshot, label))
         if len(self._undo) > self._max_depth:
@@ -39,7 +46,7 @@ class History:
     def redo_label(self) -> str:
         return self._redo[-1][1] if self._redo else ''
 
-    def undo(self, current: str) -> str | None:
+    def undo(self, current):
         """Return the snapshot to restore, pushing *current* onto the redo stack."""
         if not self._undo:
             return None
@@ -47,7 +54,7 @@ class History:
         self._redo.append((current, label))
         return snapshot
 
-    def redo(self, current: str) -> str | None:
+    def redo(self, current):
         if not self._redo:
             return None
         snapshot, label = self._redo.pop()

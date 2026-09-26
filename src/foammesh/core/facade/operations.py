@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from foammesh.core.naming import humanise_option
+
 from .policy import ConfirmationClass, ImpactClass, confirmation_for
 
 
@@ -182,11 +184,6 @@ def _lifecycle_operations() -> list[OperationDescriptor]:
                             ImpactClass.MESH_MUTATION, recovery='restore_point',
                             capabilities=('decomposePar', 'reconstructPar'),
                             artifact_contract=('mesh',)),
-        OperationDescriptor('case.parallel.configure', 'Configure case parallelism', 'case',
-                            ImpactClass.MESH_MUTATION, recovery='restore_point',
-                            capabilities=('decomposePar', 'reconstructPar')),
-        OperationDescriptor('client_shell.paraview', 'Open in ParaView', 'case',
-                            ImpactClass.READ, capabilities=('paraview',)),
         OperationDescriptor('client_shell.terminal', 'Open terminal here', 'case',
                             ImpactClass.READ, capabilities=('blockMesh',)),
         OperationDescriptor('artifact.stage.clear', 'Clear a generated stage', 'case',
@@ -238,6 +235,10 @@ def _geometry_operations() -> list[OperationDescriptor]:
                             'Split a surface into boundaries by feature angle',
                             'case', ImpactClass.MESH_MUTATION,
                             recovery='artifact_backup'),
+        OperationDescriptor('geometry.split_interfaces',
+                            'Cut an assembly into its interfaces and outer skin',
+                            'case', ImpactClass.MESH_MUTATION,
+                            recovery='artifact_backup'),
         OperationDescriptor('quality.tolerance.get',
                             'Read the project fidelity tolerance', 'case',
                             ImpactClass.READ),
@@ -284,6 +285,18 @@ def _geometry_operations() -> list[OperationDescriptor]:
         OperationDescriptor('geometry.prepared.select', 'Select prepared geometry',
                             'case', ImpactClass.FILE_PRODUCING,
                             artifact_contract=('prepared-geometry-selection',)),
+        # Plan 33 GEO-08. The counterpart of `create`: unlocking the
+        # geometry step throws the published revision away, because the
+        # meshers read it and it describes a file the reader is replacing.
+        # FILE_PRODUCING rather than DESTRUCTIVE -- the revision folders are
+        # kept and `select` can bring one back, so what this unwrites is the
+        # selection, not the work.
+        OperationDescriptor('geometry.prepared.discard',
+                            'Discard prepared geometry', 'case',
+                            ImpactClass.FILE_PRODUCING,
+                            artifact_contract=('prepared-geometry-selection',),
+                            summary='Reopen preparation after the geometry '
+                                    'it described has changed.'),
     ]
 
 
@@ -308,7 +321,7 @@ def _workflow_operations() -> list[OperationDescriptor]:
                             ImpactClass.READ,
                             summary='Serial or parallel, on how many '
                                     'workers, and whether the CPU ceiling '
-                                    'cut the request down - resolved by the '
+                                    'cut the request down — resolved by the '
                                     'same allocator the run uses.'),
         OperationDescriptor('mesh.engine.workflow', 'Describe engine workflow', 'case',
                             ImpactClass.READ),
@@ -523,9 +536,16 @@ def _import_export_operations() -> list[OperationDescriptor]:
         OperationDescriptor('mesh.import.converter', 'Import via converter', 'case',
                             ImpactClass.MESH_MUTATION, recovery='restore_point',
                             artifact_contract=('mesh',)),
+        # Plan 33 W-P. No artifact contract, because listing is not
+        # producing: `_export_entries` reads the format registry and censuses
+        # `constant/polyMesh`, and writes nothing anywhere. The contract it
+        # used to carry made it a MUTATION, which `DesktopFacadeClient.query`
+        # refuses -- so the Export step's synchronous read raised on every
+        # call and the step fell back to a one-item list. The rule the
+        # contract encodes is untouched: every writer below still carries it.
         OperationDescriptor('case.export.entries',
                             'List export formats for this case', 'case',
-                            ImpactClass.READ, artifact_contract=('export',)),
+                            ImpactClass.READ),
         OperationDescriptor('case.export.native', 'Export native case', 'case',
                             ImpactClass.FILE_PRODUCING, artifact_contract=('export',)),
         OperationDescriptor('case.export.vtk', 'Export VTK', 'case', ImpactClass.FILE_PRODUCING,
@@ -551,7 +571,7 @@ def _import_export_operations() -> list[OperationDescriptor]:
                             artifact_contract=('export',)),
         OperationDescriptor('case.export.authored', 'Export authored OpenFOAM mesh', 'case',
                             ImpactClass.FILE_PRODUCING,
-                            capabilities=('splitMeshRegions', 'topoSet',
+                            capabilities=('splitMeshRegions', 'createZones',
                                           'createPatch', 'extrudeMesh',
                                           'collapseEdges', 'reconstructPar',
                                           'mpirun'),
@@ -560,7 +580,9 @@ def _import_export_operations() -> list[OperationDescriptor]:
 
 
 def _presentation_operations(presentation_ids) -> list[OperationDescriptor]:
-    return [OperationDescriptor(operation, operation.rsplit('.', 1)[-1].replace('_', ' ').title(),
+    # DP-224. The label a presentation operation is listed under
+    # is a name on a screen, so the one rule spells it.
+    return [OperationDescriptor(operation, humanise_option(operation.rsplit('.', 1)[-1]),
                                 'presentation', ImpactClass.READ, result_type='presentation_state')
             for operation in presentation_ids]
 

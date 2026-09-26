@@ -1,14 +1,51 @@
 """Stable, engine-neutral scope selection and viewport coordination."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterable
 from uuid import uuid4
+from weakref import WeakSet
 
 
 class SelectionError(ValueError):
     pass
+
+
+#: Every live service, so the facade can republish the prepared scope
+#: catalogue without owning a reference to the GUI that reads it.
+_LIVE_SERVICES: 'WeakSet[SelectionService]' = WeakSet()
+
+#: Owners whose entities belong to one case and to no other.
+CASE_OWNED = ('prepared-groups', 'prepared-regions')
+
+
+def _case_key(case_path) -> str:
+    """One comparable spelling of a case directory."""
+    try:
+        return os.path.normcase(os.path.abspath(os.fspath(case_path)))
+    except TypeError:
+        return str(case_path)
+
+
+def notify_prepared_case(case_path, db) -> None:
+    """Republish the prepared scope catalogue of *case_path* everywhere.
+
+    Plan 33 CURVE-01/FIELD-02. The catalogue was filled once, by whichever
+    control panel happened to be built first, and never again: preparing the
+    geometry a second time, or opening another case, left every picker
+    offering the scopes of the geometry that was prepared when that panel was
+    constructed. The facade calls this the moment a revision is materialized
+    or selected and the moment a case is attached, so the one writer of the
+    catalogue hears about the change rather than waiting to be asked.
+    """
+    for service in tuple(_LIVE_SERVICES):
+        try:
+            service.synchronize_prepared_case(case_path, db)
+        except (AttributeError, FileNotFoundError, KeyError, OSError,
+                ValueError):
+            continue
 
 
 class SelectionKind(str, Enum):
@@ -117,6 +154,9 @@ class SelectionService:
         self._active_editor: tuple[
             str, Callable[[tuple[str, ...]], None], frozenset[str]] | None = None
         self._applying_renderer = False
+        #: The case the prepared-geometry owners were last published for.
+        self._prepared_case_key = ''
+        _LIVE_SERVICES.add(self)
 
     def entities(
             self, *, kinds: Iterable[SelectionKind | str] | None = None,
@@ -334,9 +374,32 @@ class SelectionService:
         self._renderer = callback
         self._apply()
 
+    def forget_prepared_case(self) -> None:
+        """Forget which case the prepared owners were published for.
+
+        The entities themselves are removed with ``remove_owner``; this is the
+        other half of the state, and a caller that empties the catalogue
+        without clearing it would make the next case look like the same one.
+        """
+        self._prepared_case_key = ''
+
     def synchronize_prepared_case(self, case_path, db) -> tuple[SelectionEntity, ...]:
-        """Publish prepared patch UUIDs as the typed engine scope catalogue."""
+        """Publish prepared patch UUIDs as the typed engine scope catalogue.
+
+        Plan 33 CURVE-01. ``synchronize`` marks what it no longer sees as
+        ORPHAN, which is right within one case -- the boundary really did stop
+        existing -- and wrong across two: closing the elbow and opening the box
+        left the picker offering a disabled ``elbow_wall1 -- Missing geometry``
+        from a case that is not open. A different case means the old rows are
+        dropped rather than orphaned, and any selection that stood on them
+        goes with them.
+        """
         from foammesh.core.geometry import PreparedGeometryStore
+        key = _case_key(case_path)
+        if key != self._prepared_case_key:
+            for owner in CASE_OWNED:
+                self.remove_owner(owner)
+            self._prepared_case_key = key
         store = PreparedGeometryStore(case_path)
         prepared = store.current()
         status = SelectionStatus.VALID

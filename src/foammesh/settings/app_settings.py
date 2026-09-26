@@ -3,13 +3,13 @@
 
 from enum import Enum
 import os
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 
 import yaml
 from PySide6.QtCore import QLocale, QRect
 
-from foammesh.support.mpi import ParallelEnvironment, ParallelType
 
 
 FORMAT_VERSION = 1
@@ -26,10 +26,6 @@ class SettingKey(Enum):
     RECENT_IMPORT_UNIT = 'recent_import_unit'
     LAST_START_WINDOW_GEOMETRY = 'LAST_START_WINDOW_GEOMETRY'
     LAST_MAIN_WINDOW_GEOMETRY = 'LAST_MAIN_WINDOW_GEOMETRY'
-    PARAVIEW_INSTALLED_PATH = 'paraview_installed_path'
-    PARALLEL_NP = 'parallel_np'
-    PARALLEL_TYPE = 'parallel_type'
-    PARALLEL_HOSTFILE = 'parallel_hostfile'
     THEME = 'theme'
     OPENFOAM_PROFILE_ID = 'openfoam_profile_id'
     OPENFOAM_WSL_DISTRO = 'openfoam_wsl_distro'
@@ -44,6 +40,12 @@ class SettingKey(Enum):
     # Whether geometry-fidelity and resolution verdicts gate anything, or only
     # report. See foammesh.core.quality.qualification.
     GEOMETRY_QUALIFICATION_MODE = 'geometry_qualification_mode'
+    # DP-710. How interior mesh lines are drawn in the viewport.
+    MESH_LINE_STYLE = 'mesh_line_style'
+    # DP-701. The viewport gradient colours the user picked, if any.
+    VIEWPORT_BACKGROUND = 'viewport_background'
+    # DP-726. The viewport's Render quality preset.
+    RENDER_QUALITY = 'render_quality'
 
 
 #: The store every surface shares, as the GUI bootstrap names it.
@@ -173,10 +175,17 @@ class AppSettings:
 
         FoamMesh is a new-build application.  Obsolete sidebar and dock keys
         are deliberately not interpreted or migrated.
+
+        DP-134.  Schema 1 wrote the splitter's sizes on every close, whether or
+        not anyone had touched the handle, so a width the clamp merely happened
+        to produce came back looking like a width someone had chosen -- and,
+        being honoured, could never widen again.  Schema 2 records sizes only
+        for a handle that was actually dragged.  A schema 1 record is therefore
+        dropped rather than migrated: its sizes carry no intent to preserve.
         """
         value = self._get(SettingKey.THREE_REGION_LAYOUT, {})
-        if not isinstance(value, dict) or value.get('version') != 1:
-            return {'version': 1, 'sizes': None, 'active_output': 'mesh'}
+        if not isinstance(value, dict) or value.get('version') != 2:
+            return {'version': 2, 'sizes': None, 'active_output': 'mesh'}
         sizes = value.get('sizes')
         if (not isinstance(sizes, (list, tuple)) or len(sizes) != 3
                 or any(not isinstance(item, int) or item < 0
@@ -184,20 +193,90 @@ class AppSettings:
             sizes = None
         active_output = str(value.get('active_output') or 'mesh')
         return {
-            'version': 1,
+            'version': 2,
             'sizes': list(sizes) if sizes is not None else None,
             'active_output': active_output,
         }
 
     def updateThreeRegionLayout(self, *, sizes, active_output: str):
-        values = [int(value) for value in sizes]
-        if len(values) != 3 or any(value < 0 for value in values):
-            raise ValueError('three-region layout requires three non-negative sizes')
+        """Record the layout.  ``sizes`` is ``None`` unless a drag chose them.
+
+        DP-134.  Handing this the splitter's current sizes unconditionally is
+        what froze Region A at whatever the clamp last produced, so the caller
+        now has to say that a person moved the handle.
+        """
+        if sizes is None:
+            values = None
+        else:
+            values = [int(value) for value in sizes]
+            if len(values) != 3 or any(value < 0 for value in values):
+                raise ValueError('three-region layout requires three non-negative sizes')
         return self._set(SettingKey.THREE_REGION_LAYOUT, {
-            'version': 1,
+            'version': 2,
             'sizes': values,
             'active_output': str(active_output or 'mesh'),
         })
+
+    def getMeshLineStyle(self) -> dict:
+        """DP-710. The Mesh lines opacity, colour and width the user chose.
+
+        Anything unreadable is dropped key by key, so one bad value cannot
+        take the other two with it; the viewport clamps what it is given.
+        """
+        value = self._get(SettingKey.MESH_LINE_STYLE, {})
+        if not isinstance(value, dict):
+            return {}
+        style = {}
+        for key in ('opacity', 'width'):
+            try:
+                style[key] = float(value[key])
+            except (KeyError, TypeError, ValueError):
+                pass
+        if isinstance(value.get('color'), str):
+            style['color'] = value['color']
+        return style
+
+    def updateMeshLineStyle(self, *, opacity: float, color: str, width: float):
+        return self._set(SettingKey.MESH_LINE_STYLE, {
+            'opacity': float(opacity), 'color': str(color),
+            'width': float(width)})
+
+    def getViewportBackground(self) -> dict:
+        """DP-701. The gradient ends the user picked, as ``#rrggbb``.
+
+        Keys are ``bottom`` and ``top``; an end never picked, or stored in a
+        form this cannot read, is left out so the theme's colour shows.
+        """
+        value = self._get(SettingKey.VIEWPORT_BACKGROUND, {})
+        if not isinstance(value, dict):
+            return {}
+        return {key: value[key] for key in ('bottom', 'top')
+                if isinstance(value.get(key), str)
+                and re.fullmatch(r'#[0-9a-fA-F]{6}', value[key])}
+
+    def updateViewportBackground(self, *, bottom: str | None = None,
+                                 top: str | None = None):
+        value = dict(self.getViewportBackground())
+        if bottom is not None:
+            value['bottom'] = str(bottom)
+        if top is not None:
+            value['top'] = str(top)
+        return self._set(SettingKey.VIEWPORT_BACKGROUND, value)
+
+    def clearViewportBackground(self):
+        """DP-739. Forget the picked gradient; the theme's shows again."""
+        return self._set(SettingKey.VIEWPORT_BACKGROUND, {})
+
+    def getRenderQuality(self) -> str:
+        """DP-726. ``performance``, ``balanced`` or ``quality``."""
+        from foammesh.rendering import render_style
+        value = self._get(SettingKey.RENDER_QUALITY, render_style.DEFAULT_PRESET)
+        return value if value in render_style.PRESETS else render_style.DEFAULT_PRESET
+
+    def updateRenderQuality(self, name: str):
+        from foammesh.rendering import render_style
+        return self._set(SettingKey.RENDER_QUALITY,
+                         render_style.quality(name).name)
 
     def getOpenFoamRuntime(self):
         return {
@@ -227,21 +306,6 @@ class AppSettings:
             SettingKey.OPENFOAM_BASHRC.value: str(bashrc),
             SettingKey.OPENFOAM_STAGE_TIMEOUT.value: int(stage_timeout),
         })
-        self._save()
-
-    def getParallenEnvironment(self):
-        np = self._get(SettingKey.PARALLEL_NP)
-        type_ = self._get(SettingKey.PARALLEL_TYPE)
-        
-        return ParallelEnvironment(
-            1 if np is None else int(np),
-            ParallelType.LOCAL_MACHINE if type_ is None else ParallelType[type_],
-            self._get(SettingKey.PARALLEL_HOSTFILE))
-
-    def updateParallelEnvironment(self, environment):
-        self._set(SettingKey.PARALLEL_NP, environment.np())
-        self._set(SettingKey.PARALLEL_TYPE, environment.type().name)
-        self._set(SettingKey.PARALLEL_HOSTFILE, environment.hosts())
         self._save()
 
     def getDiagnosticBudget(self):
@@ -316,12 +380,6 @@ class AppSettings:
     def setLanguage(self, language):
         # FoamMesh currently supports one UI language: English.
         return False
-
-    def getParaviewInstalledPath(self):
-        return self._get(SettingKey.PARAVIEW_INSTALLED_PATH, '')
-
-    def updateParaviewInstalledPath(self, path):
-        self._set(SettingKey.PARAVIEW_INSTALLED_PATH, path)
 
     def _save(self):
         with open(self._settingsFile, 'w') as file:

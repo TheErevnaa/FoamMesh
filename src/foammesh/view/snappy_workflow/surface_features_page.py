@@ -12,16 +12,17 @@ governing control -- ``includedAngle`` -- had no visible effect at all.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDoubleSpinBox, QFormLayout, QGroupBox, QHeaderView,
+    QAbstractItemView, QFormLayout, QGroupBox, QHeaderView,
     QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
 from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.facade_client import query, submit
+from foammesh.view.theming.metrics import (
+    CompactDoubleSpinBox, apply_form_metrics, unit_cell,
+)
 
 #: What ``surfaceFeatures`` extracts with when no group says otherwise
 #: (``case_builder._surface_angle``, and the schema's own default).
@@ -30,6 +31,15 @@ DEFAULT_INCLUDED_ANGLE = 150.0
 #: The angle is stored per refinement group, so this page edits that
 #: collection rather than inventing a second home for the value.
 REFINEMENT_COLLECTION = 'meshing.castellation.surface_refinements'
+
+#: Plan 33 OF-04. What the included angle does, said once, on the control it
+#: is about. It used to be the third sentence of a standing paragraph in the
+#: result box and the whole of a second label under the spin box, so a reader
+#: met it twice before meeting anything they could set.
+INCLUDED_ANGLE_HELP = (
+    'surfaceFeatures keeps an edge whose two faces meet at less than this '
+    'angle, so a low angle keeps almost every edge and a high one keeps only '
+    'sharp creases.')
 
 
 class SnappySurfaceFeaturesPage(EngineTaskPage):
@@ -49,29 +59,36 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
 
     def build_sections(self, layout) -> None:
         self._build_angle_section(layout)
-        self._filters = _FeatureFilterGroup(self._client, self)
+        self._filters = self.adoptPanel(
+            _FeatureFilterGroup(self._client, self))
         layout.addWidget(self._filters)
-        self._diagnostics = _FeatureDiagnosticsGroup(self._client, self)
+        self._diagnostics = self.adoptPanel(
+            _FeatureDiagnosticsGroup(self._client, self))
         layout.addWidget(self._diagnostics)
 
         box = QGroupBox(self.tr('Extracted feature edges'), self)
         inner = QVBoxLayout(box)
-        self._note = QLabel(self.tr(
-            'surfaceFeatures writes an .eMesh per surface. The included angle '
-            'decides which edges survive: a low angle keeps almost every '
-            'edge, a high one keeps only sharp creases. Re-run after changing '
-            'it to see the effect.'), box)
-        # F11. The empty state was written into this label and never taken
-        # back out, so "No feature edges have been extracted yet" stayed on
-        # screen directly above the table listing the 84 edges that had just
-        # been extracted. Keep the standing explanation to return to.
-        self._noteText = self._note.text()
+        # Plan 33 OF-04. One line, and it reports rather than explains: the
+        # four sentences that used to open this box said what the stage
+        # writes and what the angle does, above a table that is empty until
+        # the stage has run. What the angle does is on the angle now.
+        self._note = QLabel('', box)
+        self._note.setObjectName('featureEdgeResult')
         self._note.setWordWrap(True)
+        # W-O1. Whether a run has happened is the state of the case, not a
+        # setting, and the box it reports on is the thing it reports about.
+        # The label carries the words for `stepHelpText` and for the tests
+        # that read them; the box says them where a reader asks.
+        self._note.setVisible(False)
+        self._featureBox = box
         inner.addWidget(self._note)
 
-        self._features = QTableWidget(0, 3, box)
+        # DP-512. The File column held `surface_<uuid>.eMesh`, a name the
+        # user never chose and cannot act on; the user struck it out. The
+        # table is Surface and Edges, and the file is the Surface tooltip.
+        self._features = QTableWidget(0, 2, box)
         self._features.setHorizontalHeaderLabels(
-            [self.tr('Surface'), self.tr('Edges'), self.tr('File')])
+            [self.tr('Surface'), self.tr('Edges')])
         self._features.setAccessibleName(
             self.tr('Feature edges extracted per surface'))
         self._features.setEditTriggers(
@@ -87,7 +104,6 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         header = self._features.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         inner.addWidget(self._features)
         layout.addWidget(box)
 
@@ -107,23 +123,55 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         """
         box = QGroupBox(self.tr('Feature extraction'), self)
         form = QFormLayout(box)
+        # Plan 33 section 6 check 4, W-O2. This was the one form on the page
+        # built without the shared setters, so it carried the `QFormLayout`
+        # default 9 px margin where the two panels below it carry 4 --
+        # MEASURED, labels at x=31 above labels at x=26, on one column.
+        apply_form_metrics(form)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        self._angle = QDoubleSpinBox(box)
+        self._angle = CompactDoubleSpinBox(box)
         self._angle.setObjectName('includedAngle')
         self._angle.setRange(0.001, 179.999)
         self._angle.setDecimals(3)
-        self._angle.setSuffix(self.tr(' deg'))
         self._angle.setAccessibleName(self.tr('Feature included angle'))
+        described = self.tr(INCLUDED_ANGLE_HELP)
+        self._angle.setToolTip(described)
+        self._angle.setAccessibleDescription(described)
         # Tracking every keystroke would write 1, then 15, then 150 to every
         # group on the way to typing one value.
         self._angle.setKeyboardTracking(False)
         self._angle.editingFinished.connect(self.apply_included_angle)
-        form.addRow(self.tr('Included angle'), self._angle)
+        # DP-164. ` deg` was a Qt suffix inside the box, so this page drew
+        # `150.000 deg` next to four registry boxes reading `0` with their
+        # unit in a column of its own. One rule now, for both.
+        form.addRow(self.tr('Included angle'), unit_cell(self._angle, 'deg'))
         self._angleNote = QLabel('', box)
         self._angleNote.setObjectName('includedAngleNote')
         self._angleNote.setWordWrap(True)
+        # W-O1. Off until `_populate_angle` finds a reason to draw it. The
+        # reason a control is shut is said on the control; a disagreement
+        # between groups is a warning about a value and stays on the form.
+        self._angleNote.setVisible(False)
         form.addRow(self._angleNote)
+        self._angleForm = form
         layout.addWidget(box)
+
+    def aligned_forms(self):
+        """Every form on this page is one column (DP-154).
+
+        This used to return the two panels only, and said of the
+        included-angle box that it "is a single row in a group of its own, at
+        its own indent". W-O2 took that indent away -- an embedded panel sits
+        at the page's own left margin now, not 18 px inside it -- and what
+        was left was one field column at x=294 with a single row at x=121
+        above it. A row at the page's indent is part of the page's form.
+        """
+        forms = [getattr(self, '_angleForm', None)]
+        forms += [group.form_layout()
+                  for group in (getattr(self, '_filters', None),
+                                getattr(self, '_diagnostics', None))
+                  if group is not None]
+        return tuple(form for form in forms if form is not None)
 
     def refresh(self) -> None:
         super().refresh()
@@ -132,7 +180,10 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         for name in ('_filters', '_diagnostics'):
             group = getattr(self, name, None)
             if group is not None:
-                group.reload()
+                # DP-339. A refresh keeps an uncommitted edit.
+                group.reload(discard_pending=False)
+        # After the panels reload, for the reason given on the QA page.
+        self._align_field_columns()
         if hasattr(self, '_features'):
             self._populate_features()
 
@@ -165,25 +216,38 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         self._angle.setValue(angles[-1] if angles else DEFAULT_INCLUDED_ANGLE)
         self._angle.blockSignals(False)
         self._angle.setEnabled(bool(groups))
+        # Plan 33 OF-04. One sentence per branch, and each of them says what
+        # is true of this case right now. The standing explanation that used
+        # to be the third branch is `INCLUDED_ANGLE_HELP`, carried by the spin
+        # box itself, so it is there for all three.
         if not groups:
             # Disabled and *explained*: this page already claimed a control it
             # did not have, and an unlabelled dead spin box says the same
             # thing over again.
             self._angleNote.setText(self.tr(
-                'The angle is stored per surface refinement group and no '
-                'group exists yet, so extraction runs at the OpenFOAM '
-                'default of %.0f degrees. Add a refinement group on '
-                'Castellation to change it.') % DEFAULT_INCLUDED_ANGLE)
+                'Stored per surface refinement group, and no group exists '
+                'yet, so add one on Castellation to change it.'))
+            # W-O1. Why this spin box is shut is the spin box's own
+            # description, beside what the angle does, so the reader who
+            # clicks the dead control is answered by it.
+            described = ' '.join(
+                (self.tr(INCLUDED_ANGLE_HELP), self._angleNote.text()))
+            self._angle.setToolTip(described)
+            self._angle.setAccessibleDescription(described)
         elif len(angles) > 1:
             self._angleNote.setText(self.tr(
-                'The %d refinement groups do not agree (%s). Changing this '
-                'writes one angle to all of them.')
-                % (len(groups), ', '.join(format(a, 'g') for a in angles)))
+                'The refinement groups do not agree (%s), and changing this '
+                'writes one angle to every one of them.')
+                % ', '.join(format(a, 'g') for a in angles))
         else:
-            self._angleNote.setText(self.tr(
-                'surfaceFeatures keeps an edge whose two faces meet at less '
-                'than this angle. Applies to all %d refinement groups; '
-                're-run this step after changing it.') % len(groups))
+            self._angleNote.setText('')
+        if groups:
+            described = self.tr(INCLUDED_ANGLE_HELP)
+            self._angle.setToolTip(described)
+            self._angle.setAccessibleDescription(described)
+        # W-O1. Only the disagreement branch stands: the other two are the
+        # state of the case, said on the control above.
+        self._angleNote.setVisible(bool(groups) and len(angles) > 1)
 
     def apply_included_angle(self) -> None:
         """Write the angle to every refinement group, then re-read it."""
@@ -214,6 +278,9 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
                         self.tr('The included angle was not saved: %s')
                         % (getattr(result, 'message', '')
                            or self.tr('the facade refused the change')))
+                    # W-O1. A refusal is a validation error beside the input
+                    # it concerns, which Plan 33 section 1 keeps on the form.
+                    self._angleNote.setVisible(True)
                     return
                 write_next(index + 1, True)
 
@@ -247,28 +314,30 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
             # `surface_0ff6ff6343d247a39df11ad5dffa94ce` for the geometry the
             # rest of the app calls `annulus`, and with several surfaces the
             # ids are indistinguishable at a glance. The name is the whole
-            # point of the column; the File column still shows the id.
+            # point of the column.
             path = str(entry.get('path') or '')
             values = (str(entry.get('display_name') or entry.get('name') or ''),
-                      f'{int(entry.get("edges") or 0):,}',
-                      # R80. This column held the .eMesh's absolute path,
-                      # which is mostly the case directory the user just chose
-                      # and was the width that pushed the column off screen.
-                      # The full path stays reachable as the tooltip.
-                      Path(path).name if path else '')
+                      f'{int(entry.get("edges") or 0):,}')
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column == 2 and path:
-                    item.setToolTip(path)
+                if column == 0 and path:
+                    # R80/DP-512. The .eMesh this surface's edges were
+                    # written to stays reachable for diagnosis, as the
+                    # tooltip of the surface it belongs to.
+                    item.setToolTip(self.tr('{0}\nEdges file: {1}').format(
+                        value, path))
                 self._features.setItem(row, column, item)
         self._features.setVisible(bool(rows))
-        if rows:
-            # F11. Both the label and the table read the same list now.
-            self._note.setText(self._noteText)
-        else:
-            self._note.setText(self.tr(
-                'No feature edges have been extracted yet. Run this task to '
-                'write an .eMesh per surface at the included angle above.'))
+        # F11. The label and the table read the same run: an empty table with
+        # no line above it would say "extraction produced nothing", which is a
+        # different fact from "extraction has not run".
+        said = (self.tr('The last extraction kept these edges.') if rows
+                else self.tr('No feature edges have been extracted yet.'))
+        self._note.setText(said)
+        box = getattr(self, '_featureBox', None)
+        if box is not None:
+            box.setToolTip(said)
+            box.setAccessibleDescription(said)
 
 
 class _FeatureFilterGroup(FieldGroupPage):

@@ -27,6 +27,7 @@ from vtkmodules.vtkRenderingCore import vtkActor, vtkRenderer, vtkPropPicker, vt
 
 from foammesh.support.vtk_threads import isRenderingHold
 
+from foammesh.rendering import render_style
 from foammesh.view.theming.vtk_theme import apply_vtk_theme
 from app_properties import meshAppProperties
 from foammesh.core.branding import watermark_geometry
@@ -35,15 +36,54 @@ from foammesh.core.branding import watermark_geometry
 RENDER_DELAY_TIME = 200
 REPAINT_SUPPRESS_TIME = 100
 
-#: Multisampling for the opaque scene. Depth peeling cannot coexist with it on
-#: the OpenGL2 backend, so the viewport trades one for the other rather than
-#: pretending both are on.
-MULTI_SAMPLES = 8
-DEPTH_PEELS = 8
-DEPTH_PEEL_OCCLUSION = 0.05
+#: Multisampling for the opaque scene at start-up -- the Balanced preset's.
+#: Depth peeling cannot coexist with it on the OpenGL2 backend; how the view
+#: trades one for the other now lives in foammesh.rendering.render_style.
+MULTI_SAMPLES = render_style.quality(render_style.DEFAULT_PRESET).multiSamples
 
 #: How many camera positions the back/forward history remembers.
 VIEW_HISTORY_LIMIT = 24
+
+#: The axis views and the isometric view: (direction of projection, view up).
+_VIEW_PRESETS = {
+    '+x': ((-1, 0, 0), (0, 0, 1)),
+    '-x': ((1, 0, 0), (0, 0, 1)),
+    '+y': ((0, -1, 0), (0, 0, 1)),
+    '-y': ((0, 1, 0), (0, 0, 1)),
+    '+z': ((0, 0, -1), (0, 1, 0)),
+    '-z': ((0, 0, 1), (0, 1, 0)),
+    'isometric': ((-1, -1, -1), (0, 0, 1)),
+}
+
+
+def _presetDirections(preset: str):
+    try:
+        return _VIEW_PRESETS[preset.lower()]
+    except KeyError as error:
+        raise ValueError(f'unknown view preset: {preset}') from error
+
+
+def _sameModel(old, new) -> bool:
+    """DP-736. Whether two scene bounds frame the same model.
+
+    A reload, a new time step or geometry-to-mesh on the same part keeps the
+    centre and the size within half of the model; another project's model
+    does not. A view recorded on the one is still a view of the other.
+    """
+    def diagonal(bounds):
+        return math.sqrt(sum((bounds[i + 1] - bounds[i]) ** 2
+                             for i in (0, 2, 4)))
+
+    def centre(bounds):
+        return [(bounds[i] + bounds[i + 1]) / 2 for i in (0, 2, 4)]
+
+    a, b = diagonal(old), diagonal(new)
+    size = max(a, b)
+    if size <= 0:
+        return centre(old) == centre(new)
+    if min(a, b) < 0.5 * size:
+        return False
+    return math.dist(centre(old), centre(new)) <= 0.5 * size
 
 #: Dwell before the part under the cursor is named. Long enough that crossing
 #: the mesh does not make the readout flicker, short enough to feel immediate.
@@ -92,6 +132,102 @@ def cubeAxesPolicy(width: int, height: int) -> dict:
     # than none.
     return {'labels': 0, 'screen_size': 9,
             'label_format': '%-#4.2g', 'gridlines': False}
+
+
+#: DP-704. Width of one label character, as a fraction of the actor's
+#: screen size: a twelve-point "0.20" measured 39 pixels offscreen.
+LABEL_CHAR_WIDTH = 0.8
+#: Clear space between two labels on the same axis, in pixels.
+LABEL_GAP = 8
+
+
+def cubeAxisTicks(lo: float, hi: float) -> list[float]:
+    """Roughly the values `vtkCubeAxesActor` labels along one axis.
+
+    A 1-2-5 step giving at most six intervals, which is what the actor's own
+    tick adjustment lands on for the ranges a mesh has. Only the count and
+    the widest label matter here, so near enough is enough.
+    """
+    span = float(hi) - float(lo)
+    if not math.isfinite(span) or span <= 0:
+        return [float(lo)]
+    magnitude = 10 ** math.floor(math.log10(span / 6))
+    step = next(factor * magnitude for factor in (1, 2, 2.5, 5, 10, 20)
+                if span / (factor * magnitude) <= 6)
+    first = math.ceil(float(lo) / step - 1e-9) * step
+    ticks = []
+    value = first
+    while value <= float(hi) + step * 1e-9:
+        ticks.append(0.0 if abs(value) < step * 1e-9 else value)
+        value += step
+    return ticks or [float(lo)]
+
+
+def cubeAxisLabels(lo: float, hi: float) -> list[str]:
+    """Roughly the strings `vtkCubeAxesActor` draws along one axis.
+
+    The actor ignores the label format for the text it draws: it scales a
+    range below 10^-1.5 or above 10^3 by a power of a thousand, puts the
+    "(x10^-3)" on the title, and prints each tick with only the decimals the
+    step needs -- "-30" for a 60 mm pipe, "0.20" for a 200 mm one.
+    """
+    ticks = cubeAxisTicks(lo, hi)
+    largest = max(abs(float(lo)), abs(float(hi)))
+    exponent = 0
+    if largest > 0 and not 10 ** -1.5 <= largest <= 1e3:
+        exponent = 3 * math.floor(math.log10(largest) / 3)
+    scaled = [value / 10 ** exponent for value in ticks]
+    step = abs(scaled[1] - scaled[0]) if len(scaled) > 1 else 1.0
+    decimals = max(0, -math.floor(math.log10(step) + 1e-9)) if step > 0 else 0
+    return [f'{value:.{decimals}f}' for value in scaled]
+
+
+def cubeAxisLabelsFit(pixels: float, lo: float, hi: float,
+                      screen_size: float) -> bool:
+    """Whether one axis's labels fit along the length it has on screen.
+
+    DP-704 (viewport audit 0925 F13). `cubeAxesPolicy` budgets labels by the
+    size of the viewport, but the labels lie along each axis, and an axis can
+    be short on screen in a large viewport: the S5 pipe seen from the side
+    drew seven labels down a 125-pixel Y axis, and they ran into one block.
+    The labels an axis cannot fit are better not drawn; the box and the
+    other axes still say where the model sits.
+    """
+    labels = cubeAxisLabels(lo, hi)
+    widest = max(len(label) for label in labels)
+    width = widest * LABEL_CHAR_WIDTH * float(screen_size)
+    return float(pixels) >= len(labels) * (width + LABEL_GAP)
+
+
+def fitCubeAxesLabels(actor, renderer, policy: dict) -> dict:
+    """Show each axis's labels only where they fit; returns axis -> shown.
+
+    Measured on screen, from the actor's bounds through the renderer's
+    current camera, so it has to run again whenever the camera moves --
+    the rendering widget runs it at the start of every render.
+    """
+    bounds = actor.GetBounds()
+    shown = {}
+    origin = (bounds[0], bounds[2], bounds[4])
+
+    def display(point):
+        renderer.SetWorldPoint(point[0], point[1], point[2], 1.0)
+        renderer.WorldToDisplay()
+        return renderer.GetDisplayPoint()
+
+    start = display(origin)
+    for index, axis in enumerate('XYZ'):
+        end = list(origin)
+        end[index] = bounds[2 * index + 1]
+        tip = display(end)
+        pixels = math.hypot(tip[0] - start[0], tip[1] - start[1])
+        visible = bool(policy.get('labels')) and cubeAxisLabelsFit(
+            pixels, bounds[2 * index], bounds[2 * index + 1],
+            policy['screen_size'])
+        if bool(getattr(actor, f'Get{axis}AxisLabelVisibility')()) != visible:
+            getattr(actor, f'Set{axis}AxisLabelVisibility')(1 if visible else 0)
+        shown[axis] = visible
+    return shown
 
 
 class RenderWindowInteractor(QVTKRenderWindowInteractor):
@@ -215,6 +351,10 @@ class RenderingWidget(QWidget):
     #: True while the viewport is showing less than the full mesh to stay
     #: responsive. Nothing may drop detail without saying so.
     detailReduced = Signal(bool)
+    #: DP-696. The camera history gained or lost an entry. Back and Forward
+    #: used to be refreshed only by the handful of callers that remembered to
+    #: ask, so a view preset recorded history the Back button never showed.
+    historyChanged = Signal()
 
     def __init__(self, parent: QWidget = None):
         super().__init__(parent)
@@ -225,6 +365,9 @@ class RenderingWidget(QWidget):
         self._originAxesActor: Optional[vtkAxesActor] = None
         self._cubeAxesActor: Optional[vtkCubeAxesActor] = None
         self._themeTokens = None
+        # DP-701. The gradient ends the user picked, which a theme pass must
+        # not paint over; see `_keepUserBackground`.
+        self._userBackground = {}
 
         self._actorPicker = vtkPropPicker()
 
@@ -236,11 +379,16 @@ class RenderingWidget(QWidget):
         self._depthPeeling = False
         self._viewHistory = []
         self._viewFuture = []
+        #: DP-736. The visible bounds the camera history was recorded on.
+        self._historyBounds = None
         self._cameraMovedByUser = False
         self._refitOnResize = False
 
         self._ambientOcclusion = False
         self._fxaa = False
+        # render0925. One preset for anti-aliasing, peeling and cavity
+        # shading; the View menu's Render quality submenu sets it.
+        self._renderQuality = render_style.DEFAULT_PRESET
         self._interactiveDecimation = False
 
         self._hoverEnabled = True
@@ -262,6 +410,9 @@ class RenderingWidget(QWidget):
         self._renderer.SetBackground2(0.22, 0.24, 0.33)
 
         self._lightKit = vtkLightKit()
+        # render0925 DP-727. VTK's default kit lights a curved part almost
+        # evenly; the tuned one gives it form (measured in render_style).
+        render_style.tuneLightKit(self._lightKit)
         self._lightKit.AddLightsToRenderer(self._renderer)
 
         self._logoWidget = vtkLogoWidget()
@@ -339,6 +490,13 @@ class RenderingWidget(QWidget):
         if cubeAxesOn:
             self._showCubeAxes()
 
+        if self._ambientOcclusion:
+            # The cavity-shading radius is a fraction of the model, and the
+            # model is whatever was just loaded -- not what was on screen when
+            # Quality was chosen (often nothing, which gave a 0.1 m radius).
+            render_style.applyAmbientOcclusion(
+                self._renderer, True, self.modelExtent())
+
         # A mesh fitted to a narrow viewport used to stay small when the window
         # was widened, because resizeEvent never re-fitted. It does now -- but
         # only until the user moves the camera, after which the framing is
@@ -372,6 +530,11 @@ class RenderingWidget(QWidget):
         self._logoWidget.Off()
         self._renderer.RemoveAllViewProps()
         self._showLogo()
+        # DP-791. Only a project closing clears the view, and its views go
+        # with it. DP-736's bounds test cannot tell two small models near
+        # the origin apart, so the next project's Back walked into these.
+        self.clearViewHistory()
+        self._historyBounds = None
 
     def _turnCamera(self, orientation: tuple[float, float, float], up: tuple[float, float, float]):
         camera = self._renderer.GetActiveCamera()
@@ -396,29 +559,22 @@ class RenderingWidget(QWidget):
         up = camera.GetViewUp()
         up = self._getClosestAxis(up)
 
+        self.rememberView()
         self._turnCamera(orientation, up)
         self._widget.Render()
 
     def rollCamera(self):
+        self.rememberView()
         self._renderer.GetActiveCamera().Roll(-90)
         self._widget.Render()
 
     def setViewPreset(self, preset: str):
         """Set one of the six axis views or a stable isometric view."""
-        presets = {
-            '+x': ((-1, 0, 0), (0, 0, 1)),
-            '-x': ((1, 0, 0), (0, 0, 1)),
-            '+y': ((0, -1, 0), (0, 0, 1)),
-            '-y': ((0, 1, 0), (0, 0, 1)),
-            '+z': ((0, 0, -1), (0, 1, 0)),
-            '-z': ((0, 0, 1), (0, 1, 0)),
-            'isometric': ((-1, -1, -1), (0, 0, 1)),
-        }
-        try:
-            orientation, up = presets[preset.lower()]
-        except KeyError as error:
-            raise ValueError(f'unknown view preset: {preset}') from error
+        orientation, up = _presetDirections(preset)
         self.rememberView()
+        self._turnToPreset(orientation, up)
+
+    def _turnToPreset(self, orientation, up):
         length = math.sqrt(sum(value * value for value in orientation))
         self._turnCamera(
             tuple(value / length for value in orientation), up)
@@ -455,16 +611,13 @@ class RenderingWidget(QWidget):
         if enabled == self._depthPeeling:
             return
 
-        window = self._widget.GetRenderWindow()
-        if enabled:
-            window.SetAlphaBitPlanes(1)
-            window.SetMultiSamples(0)
-            self._renderer.SetUseDepthPeeling(True)
-            self._renderer.SetMaximumNumberOfPeels(DEPTH_PEELS)
-            self._renderer.SetOcclusionRatio(DEPTH_PEEL_OCCLUSION)
-        else:
-            self._renderer.SetUseDepthPeeling(False)
-            window.SetMultiSamples(MULTI_SAMPLES)
+        # render0925 DP-725. Dropping MSAA for peeling used to leave the
+        # frame with no anti-aliasing at all -- and imported geometry is
+        # drawn at 0.9 opacity, so that was every geometry view. FXAA,
+        # which works alongside peeling, now takes over.
+        self._fxaa = render_style.applyTransparency(
+            self._renderer, self._widget.GetRenderWindow(),
+            self._renderQuality, enabled)
 
         self._depthPeeling = enabled
         self.refresh()
@@ -474,40 +627,33 @@ class RenderingWidget(QWidget):
 
     # -- WP4.2/4.3: effects that cost frames, so nobody pays without asking -- #
 
-    def setAmbientOcclusion(self, enabled: bool) -> bool:
-        """Screen-space cavity shading.
+    def setRenderQuality(self, name: str) -> bool:
+        """render0925 DP-726. Performance, Balanced or Quality, in one step.
 
-        On a mesh with internal passages this is the difference between reading
-        depth and guessing it -- and it is not free, which is why it is a
-        preference and not a default. Returns whether the renderer took it.
+        Replaces the separate SSAO and FXAA check boxes (and the
+        ``setAmbientOcclusion`` / ``setFastAntiAliasing`` setters behind
+        them). Ticked over the 8x multisampling, FXAA drew a black frame on
+        this backend, and SSAO quietly cancelled the multisampling; a preset
+        cannot ask for either. Returns whether this VTK build could apply
+        all of it.
         """
+        chosen = render_style.quality(name)
+        self._renderQuality = chosen.name
         renderer = self._renderer
-        if not hasattr(renderer, 'SetUseSSAO'):
-            return False
-        enabled = bool(enabled)
-        renderer.SetUseSSAO(enabled)
-        if enabled:
-            radius = self.modelExtent() * 0.05 or 0.1
-            renderer.SetSSAORadius(radius)
-            renderer.SetSSAOBias(radius * 0.01)
-            renderer.SetSSAOKernelSize(32)
-            renderer.SetSSAOBlur(True)
-        self._ambientOcclusion = enabled
+        window = self._widget.GetRenderWindow()
+        self._fxaa = render_style.applyTransparency(
+            renderer, window, chosen, self._depthPeeling)
+        applied = render_style.applyAmbientOcclusion(
+            renderer, chosen.ssao, self.modelExtent())
+        self._ambientOcclusion = applied and chosen.ssao
         self.refresh()
-        return True
+        return applied or not chosen.ssao
+
+    def renderQuality(self) -> str:
+        return self._renderQuality
 
     def usesAmbientOcclusion(self) -> bool:
         return self._ambientOcclusion
-
-    def setFastAntiAliasing(self, enabled: bool) -> bool:
-        """FXAA on top of MSAA, for thin lines like the feature outline."""
-        renderer = self._renderer
-        if not hasattr(renderer, 'SetUseFXAA'):
-            return False
-        renderer.SetUseFXAA(bool(enabled))
-        self._fxaa = bool(enabled)
-        self.refresh()
-        return True
 
     def usesFastAntiAliasing(self) -> bool:
         return self._fxaa
@@ -524,9 +670,14 @@ class RenderingWidget(QWidget):
         window = self._widget.GetRenderWindow()
         window.Render()  # warm the pipeline; the first frame is not typical
         samples = max(1, samples)
+        # render0925. Render() returns once the commands are queued, so
+        # without waiting for the GPU this measured ~0.2 ms for any scene.
+        wait = getattr(window, 'WaitForCompletion', None)
         start = time.perf_counter()
         for _ in range(samples):
             window.Render()
+            if wait is not None:
+                wait()
         return (time.perf_counter() - start) / samples
 
     def setInteractiveDecimation(self, enabled: bool) -> None:
@@ -582,12 +733,73 @@ class RenderingWidget(QWidget):
         accidental drag, and the reason a cautious user stops being afraid to
         touch the picture at all.
         """
-        state = self._cameraState()
+        self._pushView(self._cameraState())
+
+    def _pushView(self, state):
         if self._viewHistory and self._viewHistory[-1] == state:
             return
         self._viewHistory.append(state)
         del self._viewHistory[:-VIEW_HISTORY_LIMIT]
         self._viewFuture.clear()
+        self.historyChanged.emit()
+
+    def fitCameraFromUser(self):
+        """The Fit button: a fit the user asked for is a move Back can undo.
+
+        DP-696. Fit was the one camera move Back could not undo, so a stray
+        press lost a carefully set-up view. Only a fit that actually moved
+        the camera is recorded, and only this entry point records it: the
+        fits the program makes on load and resize are not the user's moves.
+        """
+        before = self._cameraState()
+        self.fitCamera()
+        if self._cameraState() != before:
+            self._pushView(before)
+
+    def frameScene(self, preset: Optional[str] = None):
+        """The fit the program makes after the scene changed (a load).
+
+        DP-736. Only the user's Fit was recorded (DP-696); a load's first
+        frame went through the isometric preset, which pushed the camera it
+        replaced, so after opening another model Back aimed at the old one,
+        and every later refit of the same model was not recorded at all. Now
+        a scene fit asks whether the model is the one the history was
+        recorded on. Another model clears Back and Forward: those views look
+        at something that is no longer there. The same model records the
+        view the refit replaced, so Back undoes a refit the user did not ask
+        for.
+        """
+        direction = None if preset is None else _presetDirections(preset)
+        bounds = self._visibleBounds()
+        record = (bounds is not None and self._historyBounds is not None
+                  and _sameModel(self._historyBounds, bounds))
+        if not record:
+            self.clearViewHistory()
+        before = self._cameraState()
+        if direction is None:
+            self.fitCamera()
+        else:
+            self._turnToPreset(*direction)
+        if record and self._cameraState() != before:
+            self._pushView(before)
+        self._historyBounds = bounds
+
+    def clearViewHistory(self):
+        """Forget Back and Forward, e.g. when the model on screen changed."""
+        if not self._viewHistory and not self._viewFuture:
+            return
+        self._viewHistory.clear()
+        self._viewFuture.clear()
+        self.historyChanged.emit()
+
+    def _visibleBounds(self):
+        compute = getattr(self._renderer, 'ComputeVisiblePropBounds', None)
+        if compute is None:
+            return None
+        bounds = tuple(compute())
+        if len(bounds) != 6 or bounds[0] > bounds[1]:
+            return None
+        return bounds
 
     def canGoBack(self) -> bool:
         return len(self._viewHistory) > 0
@@ -600,6 +812,7 @@ class RenderingWidget(QWidget):
             return False
         self._viewFuture.append(self._cameraState())
         self._restoreCameraState(self._viewHistory.pop())
+        self.historyChanged.emit()
         return True
 
     def goForward(self):
@@ -607,6 +820,7 @@ class RenderingWidget(QWidget):
             return False
         self._viewHistory.append(self._cameraState())
         self._restoreCameraState(self._viewFuture.pop())
+        self.historyChanged.emit()
         return True
 
     def cameraState(self):
@@ -634,9 +848,18 @@ class RenderingWidget(QWidget):
         self._widget.Render()
 
     def zoomToProps(self, props):
-        """Fit the camera to a subset of the scene rather than all of it."""
+        """Fit the camera to a subset of the scene rather than all of it.
+
+        DP-697. Hidden props are left out of the frame: a selection that
+        still names a part the user hid framed empty space around it. Only
+        when every prop is hidden does the fit fall back to all of them, so
+        the button never silently does nothing.
+        """
+        props = list(props)
+        shown = [prop for prop in props
+                 if not hasattr(prop, 'GetVisibility') or prop.GetVisibility()]
         bounds = None
-        for prop in props:
+        for prop in shown or props:
             propBounds = prop.GetBounds()
             if propBounds is None:
                 continue
@@ -695,10 +918,47 @@ class RenderingWidget(QWidget):
         return self._renderer.ComputeVisiblePropBounds()
 
     def setBackground1(self, r, g, b):
+        self._userBackground['bottom'] = (r, g, b)
         self._renderer.SetBackground(r, g, b)
 
     def setBackground2(self, r, g, b):
+        self._userBackground['top'] = (r, g, b)
         self._renderer.SetBackground2(r, g, b)
+
+    def _keepUserBackground(self):
+        """Put back the gradient ends the user picked after a theme pass.
+
+        DP-701 (viewport audit 0925 F15). ``apply_vtk_theme`` paints the
+        background from the theme, and it runs again whenever the cube axes
+        or the origin axes are first shown, so a colour picked from the
+        swatches lasted only until the next of those.
+        """
+        bottom = self._userBackground.get('bottom')
+        if bottom is not None:
+            self._renderer.SetBackground(*bottom)
+        top = self._userBackground.get('top')
+        if top is not None:
+            self._renderer.SetBackground2(*top)
+
+    def hasUserBackground(self) -> bool:
+        """Whether either gradient end is one the user picked."""
+        return bool(self._userBackground)
+
+    def resetBackground(self):
+        """Forget the picked gradient ends and paint the theme's again.
+
+        DP-739. DP-701 kept a pick across every theme pass, which left no way
+        back to the theme's gradient short of picking its two colours by
+        hand, and a theme switch went on painting the old pick over the new
+        theme.
+        """
+        self._userBackground.clear()
+        if self._themeTokens is not None:
+            apply_vtk_theme(self._renderer, self._themeTokens,
+                            cube_axes=self._cubeAxesActor,
+                            origin_axes=self._originAxesActor,
+                            logo=self._logoRepresentation)
+        self.refresh()
 
     def applyTheme(self, tokens):
         """Apply semantic viewport tokens supplied by the runtime theme manager."""
@@ -706,6 +966,7 @@ class RenderingWidget(QWidget):
         self._loadLogo(tokens.name)
         apply_vtk_theme(self._renderer, tokens, cube_axes=self._cubeAxesActor,
                         origin_axes=self._originAxesActor, logo=self._logoRepresentation)
+        self._keepUserBackground()
         self.refresh()
 
     def _themeChanged(self, _name):
@@ -746,9 +1007,16 @@ class RenderingWidget(QWidget):
         self._applyCubeAxesPolicy()
 
         self._renderer.AddActor(self._cubeAxesActor)
+        # DP-704. Whether an axis's labels fit depends on how long it is on
+        # screen, which every camera move changes; re-measure every render.
+        addObserver = getattr(self._renderer, 'AddObserver', None)
+        if addObserver is not None:
+            self._cubeAxesObserver = addObserver(
+                'StartEvent', lambda *_args: self._fitCubeAxesLabels())
         if self._themeTokens is not None:
             apply_vtk_theme(self._renderer, self._themeTokens, cube_axes=self._cubeAxesActor,
                             origin_axes=self._originAxesActor, logo=self._logoRepresentation)
+            self._keepUserBackground()
 
     def _applyCubeAxesPolicy(self):
         """Size the axis labels to the viewport they have to fit in (F-44).
@@ -781,7 +1049,23 @@ class RenderingWidget(QWidget):
             getattr(actor, f'Draw{axis}Gridlines'
                     f'{"On" if policy["gridlines"] else "Off"}')()
 
+    def _fitCubeAxesLabels(self):
+        """DP-704. Hide the labels of any axis too short on screen for them."""
+        if self._cubeAxesActor is None:
+            return
+        try:
+            fitCubeAxesLabels(self._cubeAxesActor, self._renderer,
+                              cubeAxesPolicy(self.width(), self.height()))
+        except (AttributeError, TypeError):
+            # A renderer or actor without a camera projection has nothing
+            # to measure; the viewport-wide policy stands.
+            pass
+
     def _hideCubeAxes(self):
+        observer = getattr(self, '_cubeAxesObserver', None)
+        if observer is not None:
+            self._renderer.RemoveObserver(observer)
+            self._cubeAxesObserver = None
         if self._cubeAxesActor is not None:
             self._renderer.RemoveActor(self._cubeAxesActor)
             self._cubeAxesActor = None
@@ -798,6 +1082,7 @@ class RenderingWidget(QWidget):
                                 cube_axes=self._cubeAxesActor,
                                 origin_axes=self._originAxesActor,
                                 logo=self._logoRepresentation)
+                self._keepUserBackground()
 
         self._originAxes.EnabledOn()
 

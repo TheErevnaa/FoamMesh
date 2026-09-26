@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Mesh Qualitiy Parameters</string>
+   <string>Mesh quality parameters</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
@@ -20,7 +20,7 @@
       <item row="0" column="0">
        <widget class="QLabel" name="label">
         <property name="text">
-         <string>Max. Face non-ortho, Angle</string>
+         <string>Max face non-orthogonality</string>
         </property>
        </widget>
       </item>
@@ -30,119 +30,119 @@
       <item row="1" column="0">
        <widget class="QLabel" name="label_2">
         <property name="text">
-         <string>Max. Face non-ortho, Angle (Relaxed)</string>
+         <string>Max face non-orthogonality (relaxed)</string>
         </property>
        </widget>
       </item>
       <item row="2" column="0">
        <widget class="QLabel" name="label_3">
         <property name="text">
-         <string>Max. Boundary Skewness</string>
+         <string>Max boundary skewness</string>
         </property>
        </widget>
       </item>
       <item row="3" column="0">
        <widget class="QLabel" name="label_4">
         <property name="text">
-         <string>Max. Internal Face Skewness</string>
+         <string>Max internal face skewness</string>
         </property>
        </widget>
       </item>
       <item row="4" column="0">
        <widget class="QLabel" name="label_5">
         <property name="text">
-         <string>Max. Cell Concavity</string>
+         <string>Max cell concavity</string>
         </property>
        </widget>
       </item>
       <item row="5" column="0">
        <widget class="QLabel" name="label_6">
         <property name="text">
-         <string>Min. Cell Pyramid Volume (m&lt;sup&gt;3&lt;/sup&gt;)</string>
+         <string>Min cell pyramid volume</string>
         </property>
        </widget>
       </item>
       <item row="6" column="0">
        <widget class="QLabel" name="label_7">
         <property name="text">
-         <string>Min. Tetrahedron Quality</string>
+         <string>Min tetrahedron quality</string>
         </property>
        </widget>
       </item>
       <item row="7" column="0">
        <widget class="QLabel" name="label_8">
         <property name="text">
-         <string>Min. Volume Collapse Ratio</string>
+         <string>Min volume collapse ratio</string>
         </property>
        </widget>
       </item>
       <item row="8" column="0">
        <widget class="QLabel" name="label_9">
         <property name="text">
-         <string>Min. Face Area (m&lt;sup&gt;2&lt;/sup&gt;)</string>
+         <string>Min face area</string>
         </property>
        </widget>
       </item>
       <item row="9" column="0">
        <widget class="QLabel" name="label_10">
         <property name="text">
-         <string>Min. Twist</string>
+         <string>Min face twist</string>
         </property>
        </widget>
       </item>
       <item row="10" column="0">
        <widget class="QLabel" name="label_11">
         <property name="text">
-         <string>Min. Cell Determinant</string>
+         <string>Min cell determinant</string>
         </property>
        </widget>
       </item>
       <item row="11" column="0">
        <widget class="QLabel" name="label_12">
         <property name="text">
-         <string>Min. Face Interpolation Weight</string>
+         <string>Min face interpolation weight</string>
         </property>
        </widget>
       </item>
       <item row="12" column="0">
        <widget class="QLabel" name="label_13">
         <property name="text">
-         <string>Min. Face Flatness</string>
+         <string>Min face flatness</string>
         </property>
        </widget>
       </item>
       <item row="13" column="0">
        <widget class="QLabel" name="label_14">
         <property name="text">
-         <string>Min. Volume Ratio</string>
+         <string>Min volume ratio</string>
         </property>
        </widget>
       </item>
       <item row="14" column="0">
        <widget class="QLabel" name="label_15">
         <property name="text">
-         <string>Min. Triangle Twist</string>
+         <string>Min triangle twist</string>
         </property>
        </widget>
       </item>
       <item row="15" column="0">
        <widget class="QLabel" name="label_16">
         <property name="text">
-         <string>smoothing Iteration</string>
+         <string>Smoothing iterations</string>
         </property>
        </widget>
       </item>
       <item row="16" column="0">
        <widget class="QLabel" name="label_17">
         <property name="text">
-         <string>Error Reduction</string>
+         <string>Error reduction</string>
         </property>
        </widget>
       </item>
       <item row="17" column="0">
        <widget class="QLabel" name="label_18">
         <property name="text">
-         <string>Merge Tolerance</string>
+         <string>Merge tolerance</string>
         </property>
        </widget>
       </item>

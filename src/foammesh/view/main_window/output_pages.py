@@ -25,7 +25,7 @@ class EffectiveSetupPage(QWidget):
         self.setObjectName('effectiveSetupOutput')
         self.setAccessibleName('Effective meshing setup and provenance')
         layout = QVBoxLayout(self)
-        heading = QLabel('Effective Setup', self)
+        heading = QLabel('Effective meshing setup', self)
         layout.addWidget(heading)
         tabs = QTabWidget(self)
         tabs.setObjectName('effectiveSetupTabs')

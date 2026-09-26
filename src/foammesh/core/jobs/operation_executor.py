@@ -171,8 +171,19 @@ class OperationExecutor:
         recovery_status = None
         if recovery_point is not None:
             if job.status is JobStatus.DONE:
-                await self._to_thread(self.recovery.mark_available, recovery_point)
-                recovery_status = 'available'
+                try:
+                    await self._to_thread(self.recovery.mark_available, recovery_point)
+                    recovery_status = 'available'
+                except Exception as error:
+                    # DP-111. The stage ran and its mesh is on disk. This
+                    # journal entry is bookkeeping for a rollback the user may
+                    # never ask for, so a failure to write it costs exactly
+                    # that rollback -- it must not turn a finished stage into a
+                    # refusal. Record what was lost and keep the result.
+                    recovery_status = 'unavailable'
+                    warnings.append(
+                        'the mesh was produced, but the recovery point for it could not be '
+                        f'recorded, so the previous mesh cannot be restored: {error}')
             else:
                 try:
                     await self._to_thread(self.recovery.restore, session.case_path, recovery_point)
@@ -192,6 +203,19 @@ class OperationExecutor:
         self.jobs.record_result(job)
 
         after = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
+        if (job.status is JobStatus.DONE and spec.mutation
+                and before is not None and before == after):
+            # DP-113. MEASURED on `two_solid_block`: castellation, snap and
+            # layers each reported 91,562 cells, 31,920 boundary faces and
+            # 129,402 points, and the outline ticked all three. The only mesh
+            # any of them produced was the one the first of them made. A tick
+            # is a claim that something happened, and both fingerprints were
+            # already computed -- what was missing was comparing them. This
+            # does not fail the stage: running a stage that turns out to be a
+            # no-op is not an error, it is a result worth stating.
+            warnings.append(
+                'this stage completed without changing the mesh: the mesh it '
+                'wrote is identical to the one it started from')
         artifacts = []
         for item in spec.expected_artifacts:
             path = item.path if item.path.is_absolute() else cwd / item.path

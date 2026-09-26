@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from foammesh.core.naming import EXACT_NAMES, humanise_option
+
 #: Comparisons the metadata uses. Longest first so ``!=`` is not read as
 #: ``=`` with a stray ``!``.
 _OPERATORS = ('==', '!=')
@@ -133,14 +135,22 @@ def _reason(clause: Clause, values, titles) -> str:
 
 
 def humanise_field(field_id: str) -> str:
+    # DP-224. `str.capitalize` spelled `occ_parallel` as `Occ
+    # parallel`, flattening an acronym the one rule keeps. The
+    # reason sentence this name stands in is shown to a reader,
+    # so it is spelled the way every other name on screen is.
     leaf = str(field_id).rsplit('.', 1)[-1]
-    return leaf.replace('_', ' ').strip().capitalize()
+    return humanise_option(leaf.strip())
 
 
 def humanise_value(value) -> str:
     text = normalise(value)
     if not text:
         return 'not set'
-    known = {'gmsh': 'Gmsh', 'snappy': 'snappyHexMesh', 'su2': 'SU2',
-             'openfoam': 'OpenFOAM', 'true': 'on', 'false': 'off'}
-    return known.get(text, str(value).replace('_', ' '))
+    # DP-226. The four proper names this table carried are four that
+    # `EXACT_NAMES` already holds, so the reason sentence and every
+    # screen now read one table. What is left is the two booleans,
+    # which are a state rather than a name.
+    if text in ('true', 'false'):
+        return 'on' if text == 'true' else 'off'
+    return EXACT_NAMES.get(text) or str(value).replace('_', ' ')

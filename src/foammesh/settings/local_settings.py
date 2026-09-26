@@ -10,7 +10,6 @@ from filelock import FileLock
 
 from foammesh.support.mpi import ParallelEnvironment, ParallelType
 
-from foammesh.settings.app_settings import appSettings
 from foammesh.core.case.locking import (
     LOCK_INFO_FILE, CaseLockInfo, write_case_lock_info,
 )
@@ -27,6 +26,9 @@ class LocalSettingKey(Enum):
     PARALLEL_NP = 'parallel_np'
     PARALLEL_TYPE = 'parallel_type'
     PARALLEL_HOSTS = 'parallel_hosts'
+    #: DP-691. Set once the legacy ``parallel_np`` has been carried onto
+    #: ``mesh/execution/maxCpuCores``, so it is carried only once.
+    PARALLEL_NP_CARRIED = 'parallel_np_carried'
     EXECUTION_PROFILE_ID = 'execution_profile_id'
     CASE_RESOURCE_OVERRIDE = 'case_resource_override'
 
@@ -64,11 +66,6 @@ class LocalSettings:
             parallelType,
             self.get(LocalSettingKey.PARALLEL_HOSTS, '')
         )
-
-    def setParallelEnvironment(self, environment):
-        self.set(LocalSettingKey.PARALLEL_NP, environment.np()),
-        self.set(LocalSettingKey.PARALLEL_TYPE, environment.type().name),
-        self.set(LocalSettingKey.PARALLEL_HOSTS, environment.hosts())
 
     def acquireLock(self, timeout):
         self._lock = FileLock(self.path / 'case.lock')
@@ -135,12 +132,10 @@ class LocalSettings:
                 self._stamp = None
 
     def _create(self):
-        environment = appSettings.getParallenEnvironment()
-
+        # DP-692. A new case was seeded with the application-wide core count
+        # the removed Parallel > Environment dialog last applied; the count
+        # lives on Meshing resources now, so nothing is seeded here.
         self._settings = {
-            LocalSettingKey.PARALLEL_NP.value:      environment.np(),
-            LocalSettingKey.PARALLEL_TYPE.value:    environment.type().name,
-            LocalSettingKey.PARALLEL_HOSTS.value:   environment.hosts(),
             LocalSettingKey.EXECUTION_PROFILE_ID.value: 'local',
             LocalSettingKey.CASE_RESOURCE_OVERRIDE.value: None,
         }
@@ -165,3 +160,45 @@ class LocalSettings:
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+
+#: Where the one core-count input lives in the project database.
+CORE_COUNT_PATH = 'mesh/execution/maxCpuCores'
+
+
+def carryLegacyCoreCount(storagePath, db) -> bool:
+    """Carry an old case's Parallel Environment count onto Meshing resources.
+
+    DP-691. The Parallel > Environment dialog wrote ``parallel_np`` here, and
+    the snappy launcher read it before the count on ``2. Mesh setup >
+    Meshing resources``. The dialog is gone and the page is the only input,
+    so a case whose dialog held a count would silently lose it. It is carried
+    across once, when the case is opened: onto the field when the field set no
+    cap, and under the cap when it did -- which is the count such a case
+    already ran on. Returns whether the project changed.
+    """
+    storagePath = Path(storagePath)
+    if not (storagePath / FILE_NAME).is_file():
+        return False
+    settings = LocalSettings(storagePath)
+    if settings.get(LocalSettingKey.PARALLEL_NP_CARRIED):
+        return False
+    try:
+        cores = int(settings.get(LocalSettingKey.PARALLEL_NP, 1) or 1)
+    except (TypeError, ValueError):
+        cores = 1
+    changed = False
+    if cores > 1:
+        try:
+            ceiling = int(db.getValue(CORE_COUNT_PATH) or 0)
+        except (TypeError, ValueError):
+            ceiling = 0
+        wanted = min(cores, ceiling) if ceiling else cores
+        if wanted != ceiling:
+            working = db.checkout()
+            working.setValue(CORE_COUNT_PATH, wanted)
+            db.commit(working)
+            db.save()
+            changed = True
+    settings.set(LocalSettingKey.PARALLEL_NP_CARRIED, True)
+    return changed

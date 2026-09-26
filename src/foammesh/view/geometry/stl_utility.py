@@ -42,6 +42,13 @@ class StlSurface:
         self.fName = fName
         self.sName = sName
         self.sIndex = sIndex
+        # DP-383. Which artifact and which patch record this piece came from,
+        # for the pieces that were read back out of the geometry artifact
+        # store. A surface loaded any other way has neither and says so.
+        self.geometryId = None
+        self.patchUuid = None
+        # DP-419. Which CAD body this face bounds, where the import knew.
+        self.regionUuid = None
 
 
 def isClosed(surfaces):
@@ -106,7 +113,8 @@ class StlImporter:
             self._surfaceList.extend(solids)
 
     def loadNamedSolids(self, path: Path, names: dict, fileName: str = None,
-                        volumeName: str = None) -> list:
+                        volumeName: str = None, geometryId: str = None,
+                        uuids: dict = None) -> list:
         """Load a file the geometry artifact store wrote, naming its solids
         as the store's patch records do.
 
@@ -117,6 +125,11 @@ class StlImporter:
         name it was written with. ``fileName`` is what the pieces are
         grouped under (the source's stem rather than the artifact's
         ``rev2``) and ``volumeName`` names the volume they close, if they do.
+
+        ``geometryId`` and ``uuids`` (patch name -> patch uuid) stamp each
+        piece with the record it stands for, so the database row written from
+        it can be traced back to the manifest by identity rather than by the
+        name, which the two stores are allowed to spell differently (DP-383).
         """
         self.load([Path(path)])
         pieces = []
@@ -129,6 +142,8 @@ class StlImporter:
             self._addArray(surface.polyData, 'fIndex', fName, count)
             sIndex = self._addArray(surface.polyData, 'sIndex', name, count)
             piece = StlSurface(surface.polyData, fName, name, sIndex)
+            piece.geometryId = geometryId
+            piece.patchUuid = (uuids or {}).get(name)
             if volumeName:
                 piece.volumeName = volumeName
             pieces.append(piece)

@@ -71,7 +71,7 @@ class RecentFilesMenu(QObject):
 
     def _addClearAction(self):
         self._root.addSeparator()
-        clear = self._root.addAction(self.tr('Clear Recent'))
+        clear = self._root.addAction(self.tr('Clear recent'))
         clear.triggered.connect(self.clearRequested)
 
     def updateRecentest(self, path):
@@ -103,7 +103,7 @@ class RecentFilesMenu(QObject):
         name = display_name or path.name
         parent = path.parent
         folder = parent.name or str(parent)
-        label = f'{name}  --  {folder}' if folder else name
+        label = f'{name}  —  {folder}' if folder else name
         return label.replace('&', '&&')
 
     def _newAction(self, path, display_name=None):

@@ -16,6 +16,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
 
+from foammesh.view.theming.metrics import GAP, apply_bar_metrics
+
 from .run_narration import log_label
 
 
@@ -40,8 +42,10 @@ class RunStatusStrip(QFrame):
         self._state = 'idle'
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 2, 8, 2)
-        layout.setSpacing(8)
+        # DP-191. The shell's bars share one inset, measured from the
+        # bar's own edge, so their content starts at one x.
+        apply_bar_metrics(self, layout)
+        layout.setSpacing(GAP)
         self._text = QLabel(self)
         self._text.setObjectName('runStatusText')
         self._text.setWordWrap(True)
@@ -49,7 +53,13 @@ class RunStatusStrip(QFrame):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._cancel = QPushButton(self.tr('Cancel'), self)
         self._cancel.setObjectName('runStatusCancel')
-        self._cancel.setAccessibleName(self.tr('Stop the running job'))
+        # DP-186. The name a screen reader announces has to contain the
+        # words painted on the button, or voice control cannot reach it:
+        # `click Cancel` matched nothing while the name read `Stop the
+        # running job`. The button's own text is its name; what it does
+        # is a description, which is where the rest of the app puts it.
+        self._cancel.setAccessibleDescription(
+            self.tr('Stop the running job.'))
         self._cancel.clicked.connect(self._onCancel)
         self._offer = QPushButton(self)
         self._offer.setObjectName('runStatusOffer')
@@ -60,7 +70,8 @@ class RunStatusStrip(QFrame):
         # the internals this work package exists to stop making them read.
         self._log = QPushButton(self.tr('Show log'), self)
         self._log.setObjectName('runStatusLog')
-        self._log.setAccessibleName(self.tr('Open the log of this run'))
+        self._log.setAccessibleDescription(
+            self.tr('Open the log of this run.'))
         self._log.setFlat(True)
         self._log.clicked.connect(self._onLog)
         self._logPath = ''
@@ -125,7 +136,7 @@ class RunStatusStrip(QFrame):
         self.setVisible(bool(message))
 
     def showOffer(self, message: str, action: str, *,
-                  failed: bool = True) -> None:
+                  failed: bool = True, log: str = '') -> None:
         """Say what happened, and put one named alternative next to it.
 
         CP-02. A run that produced no mesh clears the viewport -- leaving the
@@ -141,13 +152,17 @@ class RunStatusStrip(QFrame):
         self._offer.setText(action)
         self._offer.setAccessibleName(action)
         self._offer.setVisible(bool(action))
-        self._setLog('')
+        # DP-133. An offer is not always a failure now -- a run that finished
+        # can offer its surface pass -- and a finished run's log has to
+        # survive the offer replacing the result line. Defaults to '', which
+        # is what the CP-02 caller passed by hand.
+        self._setLog(log)
         self.setVisible(bool(message))
 
     def markCancelling(self) -> None:
         self._state = 'cancelling'
         self._cancel.setEnabled(False)
-        self._cancel.setText(self.tr('Cancelling...'))
+        self._cancel.setText(self.tr('Cancelling…'))
 
     # -- internals --------------------------------------------------------- #
 

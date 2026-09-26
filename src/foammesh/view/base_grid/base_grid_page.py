@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import qasync
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGridLayout, QLabel,
+from PySide6.QtWidgets import (QComboBox, QGridLayout, QLabel,
                                QMessageBox, QWidget)
 
 from pathlib import Path
@@ -19,7 +19,10 @@ from foammesh.core.mesh.sizing import (background_estimate,
                                        derive_background_counts,
                                        stand_off_bounds)
 from foammesh.rendering.vtk_loader import hexPolyData, polyDataToFeatureActor
+from foammesh.support import field_complaint
+from foammesh.view.length_readout import format_lengths
 from foammesh.view.step_page import StepPage
+from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
 from foammesh.view.theming.vtk_theme import rgb
 
 
@@ -55,15 +58,22 @@ class BaseGridPage(StepPage):
         self._sizingMode.setObjectName('baseGridSizingMode')
         self._sizingMode.addItem(self.tr('Direct cell counts'), BaseGridSizingMode.COUNTS.value)
         self._sizingMode.addItem(self.tr('Target cell size'), BaseGridSizingMode.TARGET_SIZE.value)
-        self._targetCellSize = QDoubleSpinBox(ui.groupBox_2)
+        self._targetCellSize = CompactDoubleSpinBox(ui.groupBox_2)
         self._targetCellSize.setObjectName('targetCellSize')
         self._targetCellSize.setDecimals(8)
-        self._targetCellSize.setRange(1e-12, 1e12)
-        self._targetCellSize.setValue(1.0)
+        # DP-669. The floor is "Auto" (unset): the block diagonal / 40, as
+        # the Gmsh global size. Any typed size is above it.
+        self._targetCellSize.setRange(0.0, 1e12)
+        self._targetCellSize.setSpecialValueText(self.tr('Auto'))
+        self._targetCellSize.setValue(0.0)
         self._sizingWarning = QLabel(ui.groupBox_2)
         self._sizingWarning.setWordWrap(True)
         ui.formLayout.addRow(self.tr('Sizing mode'), self._sizingMode)
-        ui.formLayout.addRow(self.tr('Target cell size (m)'), self._targetCellSize)
+        # DP-164. The unit sits after the box in its own column, the way
+        # every registry-built row has spelled a unit since DP-156.
+        self._targetSizeCell = unit_cell(self._targetCellSize, 'm')
+        ui.formLayout.addRow(self.tr('Target cell size'),
+                             self._targetSizeCell)
         #: The form row the target size lives on, so the mode can hide it.
         self._targetSizeRow = ui.formLayout
         ui.formLayout.addRow(self._sizingWarning)
@@ -85,7 +95,7 @@ class BaseGridPage(StepPage):
     # to be ``symmetry`` or ``empty`` for the case to run at all, meant hand
     # editing the dictionary after every generate.
     def _buildBlockControls(self, ui):
-        self._scale = QDoubleSpinBox(ui.groupBox_2)
+        self._scale = CompactDoubleSpinBox(ui.groupBox_2)
         self._scale.setObjectName('baseGridScale')
         self._scale.setDecimals(8)
         self._scale.setRange(1e-12, 1e12)
@@ -93,13 +103,14 @@ class BaseGridPage(StepPage):
         self._scale.setToolTip(self.tr(
             'blockMeshDict convertToMeters. Multiplies every vertex, so the '
             'bounds above are read in these units.'))
-        ui.formLayout.addRow(self.tr('Scale to metres'), self._scale)
+        ui.formLayout.addRow(self.tr('Scale to metres'),
+                             unit_cell(self._scale))
 
         # R167. The flush-block warning below said "grow the block" on a page
         # where the span was six read-only labels. This is the control it
         # names: the block the page derives from the geometry, pushed out on
         # all six faces so no surface is coplanar with one of them.
-        self._standoff = QDoubleSpinBox(ui.groupBox_2)
+        self._standoff = CompactDoubleSpinBox(ui.groupBox_2)
         self._standoff.setObjectName('baseGridStandoff')
         self._standoff.setDecimals(3)
         self._standoff.setRange(0.0, 100.0)
@@ -110,12 +121,12 @@ class BaseGridPage(StepPage):
             'fraction of the geometry\'s largest span. 0 is the geometry\'s '
             'own bounding box. Ignored while a bounding Hex6 is chosen, '
             'because that block is yours.'))
-        ui.formLayout.addRow(self.tr('Standoff (x largest span)'),
-                             self._standoff)
+        ui.formLayout.addRow(self.tr('Standoff of largest span'),
+                             unit_cell(self._standoff, 'fraction'))
 
         self._grading = {}
         for axis in 'xyz':
-            box = QDoubleSpinBox(ui.groupBox_2)
+            box = CompactDoubleSpinBox(ui.groupBox_2)
             box.setObjectName(f'baseGridGrading{axis.upper()}')
             box.setDecimals(4)
             box.setRange(1e-4, 1e4)
@@ -125,7 +136,8 @@ class BaseGridPage(StepPage):
                 'the first. 1 is a uniform block.'))
             self._grading[axis] = box
             ui.formLayout.addRow(
-                self.tr('Grading {0}').format(axis.upper()), box)
+                self.tr('Grading {0}').format(axis.upper()),
+                unit_cell(box, 'ratio'))
 
         self._boundaryTypes = {}
         # D3. Six near-identical rows -- ``xMin type`` .. ``zMax type``, all
@@ -318,6 +330,41 @@ class BaseGridPage(StepPage):
             app.window.setScaleNote('')
         self._outlineActor = None
 
+    def dropOutline(self):
+        """Take the domain box and its base-cell note off the viewport.
+
+        DP-139. `hide()` is the page's own way out, and it is deliberately
+        not called when the Meshing Method branch moves between tasks --
+        a blind save there would un-finish a passed stage. So the box and
+        the note it is annotated with stayed drawn over Castellation, Snap,
+        Layers and Export, and survived a case close into the next case,
+        where the shipped 10/10/10 counts of the *new* case were divided
+        into the *old* case's span. Every Gmsh frame of the ten-model sweep
+        carried the same `base cell 411.1 x 405.9 x 516.1 mm` -- the last
+        snappy case's domain -- on a route that has no base grid at all.
+
+        This is the way out that takes the overlays down without writing
+        anything: whoever moves the panel away calls it.
+        """
+        self._hideOutline()
+
+    def _clear(self):
+        """Forget the domain, so the next case is never sized against it.
+
+        DP-139. `unload()` reaches here on a case close. The span lives on
+        this page as `_xLen/_yLen/_zLen` and was kept, so `load()` for the
+        next case -- which fills the count boxes from the new case before
+        the span is re-measured -- could annotate one model's box with
+        another model's dimensions.
+        """
+        self.dropOutline()
+        self._bounds = None
+        self._xLen = None
+        self._yLen = None
+        self._zLen = None
+        self._boundingHex6 = None
+        self._countsAreDefault = True
+
     def _cellSizeNote(self):
         """The base cell as one line, or nothing when it is not yet known."""
         try:
@@ -329,8 +376,13 @@ class BaseGridPage(StepPage):
         lengths = (self._xLen, self._yLen, self._zLen)
         if None in lengths or min(counts) <= 0:
             return ''
-        sizes = ' x '.join('{0:.4g}'.format(length / count)
-                           for length, count in zip(lengths, counts))
+        # DP-106. With a unit, off the same ladder the extent clause beside
+        # it reads from, and one unit for all three numbers -- three numbers
+        # in three units cannot be compared, which is the whole point.
+        sizes = format_lengths(length / count
+                               for length, count in zip(lengths, counts))
+        if not sizes:
+            return ''
         return self.tr('base cell {0}').format(sizes)
 
     async def save(self):
@@ -347,7 +399,7 @@ class BaseGridPage(StepPage):
             'meshing.base_grid.cells.y': self._ui.numCellsY.text(),
             'meshing.base_grid.cells.z': self._ui.numCellsZ.text(),
             'meshing.base_grid.sizing_mode': self._sizingMode.currentData(),
-            'meshing.base_grid.target_cell_size': self._targetCellSize.value(),
+            'meshing.base_grid.target_cell_size': self._storedTargetCellSize(),
             'meshing.base_grid.scale': self._scale.value(),
             'meshing.base_grid.standoff': self._standoff.value(),
         }
@@ -361,7 +413,7 @@ class BaseGridPage(StepPage):
             return True
         except FacadeError as error:
             message = error.details.get('error', str(error))
-            QMessageBox.information(self._widget, self.tr("Input Error"), message)
+            QMessageBox.warning(self._widget, self.tr("Input error"), message)
             return False
 
     def _outputPath(self):
@@ -514,8 +566,9 @@ class BaseGridPage(StepPage):
             str(value) == str(self.DEFAULT_COUNT) for value in cells)
         mode = client.field_value('meshing.base_grid.sizing_mode')
         self._sizingMode.setCurrentIndex(max(0, self._sizingMode.findData(mode)))
-        self._targetCellSize.setValue(float(
-            client.field_value('meshing.base_grid.target_cell_size')))
+        stored = client.field_value('meshing.base_grid.target_cell_size')
+        # DP-669: unset is "Auto", which the box shows on its floor.
+        self._targetCellSize.setValue(0.0 if stored is None else float(stored))
         self._applySizingMode()
 
         self._scale.setValue(float(client.field_value('meshing.base_grid.scale')))
@@ -542,11 +595,14 @@ class BaseGridPage(StepPage):
         form = getattr(self, '_targetSizeRow', None)
         if form is None:
             return
-        label = form.labelForField(self._targetCellSize)
+        # DP-164. The row's field is the cell holding the box and its unit,
+        # not the box, so that is what the layout is asked about.
+        cell = self._targetSizeCell
+        label = form.labelForField(cell)
         if hasattr(form, 'setRowVisible'):
-            form.setRowVisible(self._targetCellSize, visible)
+            form.setRowVisible(cell, visible)
         else:                                   # Qt older than 6.4
-            self._targetCellSize.setVisible(visible)
+            cell.setVisible(visible)
             if label is not None:
                 label.setVisible(visible)
 
@@ -568,7 +624,10 @@ class BaseGridPage(StepPage):
         if None in (self._xLen, self._yLen, self._zLen):
             return
         bounds = (0, self._xLen, 0, self._yLen, 0, self._zLen)
-        counts = derive_background_counts(bounds, self._targetCellSize.value())
+        size = self._effectiveTargetCellSize()
+        if size is None:
+            return
+        counts = derive_background_counts(bounds, size)
         for edit, value in zip(
                 (self._ui.numCellsX, self._ui.numCellsY, self._ui.numCellsZ), counts):
             edit.setText(str(value))
@@ -640,6 +699,8 @@ class BaseGridPage(StepPage):
         if None in lengths or min(lengths) <= 0:
             return
         current = self._targetCellSize.value()
+        if current == 0.0:
+            return  # DP-669: "Auto" is derived from this block, so it fits
         if 0 < current <= min(lengths) / 2.0:
             return
         implied = self._impliedCellSize()
@@ -647,6 +708,31 @@ class BaseGridPage(StepPage):
             implied = (lengths[0] * lengths[1] * lengths[2]
                        / self.DEFAULT_CELL_BUDGET) ** (1.0 / 3.0)
         self._targetCellSize.setValue(implied)
+
+    def _storedTargetCellSize(self):
+        """The typed target size, or ``None`` for "Auto" (DP-669)."""
+        value = self._targetCellSize.value()
+        return None if value <= 0.0 else value
+
+    def _effectiveTargetCellSize(self):
+        """The size the counts are derived from: typed, or Auto's number.
+
+        DP-669. "Auto" is the block's diagonal / 40, the same number the
+        dictionary writer derives, and the box's tooltip says what it came to.
+        """
+        typed = self._storedTargetCellSize()
+        if typed is not None:
+            self._targetCellSize.setToolTip('')
+            return typed
+        from foammesh.core.mesh.sizing import auto_target_cell_size
+
+        size = auto_target_cell_size(
+            (0, self._xLen, 0, self._yLen, 0, self._zLen))
+        if size is not None:
+            self._targetCellSize.setToolTip(self.tr(
+                'Auto: {0:.4g} m (background block diagonal / 40). Type a '
+                'size to override it.').format(size))
+        return size
 
     def _flushFaces(self):
         """Which faces of the block coincide with the geometry extent (R28)."""
@@ -727,7 +813,9 @@ class BaseGridPage(StepPage):
             name = self._ui.boundingHex6.currentText()
             gId, geometry = self._getHex6ByName(name)
             if geometry is None:
-                QMessageBox.information(self._widget, self.tr('Error'), self.tr('Cannot find Hex6 of the name ') + name )
+                QMessageBox.warning(
+                    self._widget, self.tr('Hex6 not found'),
+                    self.tr('There is no Hex6 named {0}.').format(name))
                 return
             self._boundingHex6 = gId
             x1, y1, z1 = geometry.vector('point1')
@@ -745,7 +833,9 @@ class BaseGridPage(StepPage):
 
         gId, geometry = self._getHex6ByName(name)
         if geometry is None:
-            QMessageBox.information(self._widget, self.tr('Error'), self.tr('Cannot find Hex6 of the name ') + name)
+            QMessageBox.warning(
+                self._widget, self.tr('Hex6 not found'),
+                self.tr('There is no Hex6 named {0}.').format(name))
             return
 
         self._boundingHex6 = gId
@@ -777,7 +867,9 @@ class BaseGridPage(StepPage):
         if int(self._ui.numCellsX.text()) < 2 \
                 or int(self._ui.numCellsY.text()) < 2 \
                 or int(self._ui.numCellsZ.text()) < 2:
-            return False, self.tr('Number of Cells per Direction should be greater than 1')
+            return False, field_complaint.sentence(
+                self.tr('Number of cells per direction'),
+                field_complaint.range_clause(low=2))
 
         return True, ''
 
@@ -785,7 +877,8 @@ class BaseGridPage(StepPage):
     async def _generate(self):
         valid, msg = self._validate()
         if not valid:
-            await AsyncMessageBox().warning(self._widget, self.tr('Warning'), msg)
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Input error'), msg)
             return False
 
         # R18. The page's edits reached the facade *after* the Save-case
@@ -808,9 +901,9 @@ class BaseGridPage(StepPage):
         # it; `autoCloseOnCancel` stays off so the dialog survives long enough
         # to report what cancelling did.
         progressDialog = ProgressDialog(
-            self._widget, self.tr('Base Grid Generating'),
+            self._widget, self.tr('Base grid generating'),
             cancelable=True, autoCloseOnCancel=False)
-        progressDialog.setLabelText(self.tr('Generating Block Mesh'))
+        progressDialog.setLabelText(self.tr('Generating the base grid…'))
         progressDialog.cancelClicked.connect(self._cancelGenerate)
         progressDialog.open()
 
@@ -823,10 +916,11 @@ class BaseGridPage(StepPage):
             self._streamedLines += 1
             console.append(line)
 
-        # Use the bounds rendered by this page: these already reflect a selected
-        # bounding Hex6, while the geometry-manager bounds represent the global
-        # geometry only.
-        bounds = self.boundingBox()
+        # DP-576. The raw geometry extent: the case builder applies the saved
+        # bounding Hex6 and standoff itself, for every frontend alike, so
+        # handing over this page's already stood-off box would apply the
+        # standoff twice.
+        bounds = app.window.geometryManager.getBounds().toTuple()
         try:
             await app.facadeClient.run(
                 'workflow.generate_dictionaries', {'bbox': list(bounds)})
@@ -883,7 +977,8 @@ class BaseGridPage(StepPage):
         # the check, and runs it on the mesh that ships.
         progressDialog.close()
 
-        await app.window.meshManager.load(self.OUTPUT_TIME)
+        await app.window.meshManager.load(self.OUTPUT_TIME,
+                                          stage=self.tr('Base grid'))
         self._updatePage()
         self._reportGeneratedMesh()
 
@@ -906,7 +1001,7 @@ class BaseGridPage(StepPage):
         discards them too. Say so before doing it.
         """
         confirm = await AsyncMessageBox().question(
-            self._widget, self.tr('Reset Base Grid'),
+            self._widget, self.tr('Reset base grid'),
             self.tr('Delete the background grid and every mesh stage built on '
                     'it, so the grid can be generated again? '
                     'Castellation, snapping and boundary layers will have to '
@@ -924,8 +1019,8 @@ class BaseGridPage(StepPage):
                 'engine_id': 'snappy', 'task_id': 'snappy.base_grid',
                 'transition': 'configure'})
         except FacadeError as error:
-            await AsyncMessageBox().critical(
-                self._widget, self.tr('Reset Failed'), str(error))
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Reset failed'), str(error))
             return
 
         self._showPreviousMesh()

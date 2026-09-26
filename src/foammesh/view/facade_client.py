@@ -17,6 +17,7 @@ from collections.abc import Callable
 from foammesh.core.facade import (
     Actor, ActorKind, Command, CommandSource, FIELD_REGISTRY, OperationResult)
 from foammesh.core.facade.field_adapters import read_value
+from foammesh.support import lifecycle
 
 
 class NoOpenCaseError(RuntimeError):
@@ -48,7 +49,15 @@ class DesktopFacadeClient:
         return self.session().case_id
 
     def has_case(self) -> bool:
-        return self._session_provider() is not None
+        # DP-361. Asked through `session()` rather than the provider behind it,
+        # so that anything substituting a session -- a test double, a wrapper
+        # that lends one out -- is answered by the same call the guarded code
+        # would have made. The two must never be able to disagree.
+        try:
+            self.session()
+        except NoOpenCaseError:
+            return False
+        return True
 
     @property
     def case_path(self):
@@ -65,11 +74,25 @@ class DesktopFacadeClient:
 
     # -- commands ---------------------------------------------------------- #
 
+    def _is_query(self, operation: str) -> bool:
+        kind_of = getattr(self._facade, 'operation_kind', None)
+        try:
+            kind = kind_of(operation) if kind_of is not None else None
+        except Exception:                                    # noqa: BLE001
+            return False
+        return getattr(kind, 'value', str(kind)) == 'query'
+
     def _command(self, operation: str, parameters: dict, *, scope: str = 'case',
                  expected_revision: int | None = None) -> Command:
         # Only application-scoped settings commands omit the case id; case and
         # presentation commands both target the attached desktop case session.
         case_id = '' if scope == 'application' else self.case_id
+        # DP-551. Every GUI command is built here, so this is the one place
+        # that knows what the window last asked for when a process dies.
+        # Reads are left out: a page repaint asks dozens of them, and what a
+        # post-mortem needs is the last thing the user set in motion.
+        if not self._is_query(operation):
+            lifecycle.note_operation(operation)
         return Command(operation, case_id, parameters, self._actor, CommandSource.GUI,
                        scope=scope, expected_revision=expected_revision)
 
@@ -374,9 +397,18 @@ def submit(client, operation: str, parameters: dict | None = None, *,
         if then is not None:
             loop.call_soon(then, result)
 
-    coroutine = call()
+    # DP-79, MEASURED. This asked `ensure_future` to raise `RuntimeError` and
+    # took that as "no loop". It does not: on Python 3.11
+    # `asyncio.get_event_loop()` still *creates* a loop for the main thread on
+    # demand, so `ensure_future` happily returned a pending Task attached to a
+    # loop that was never going to run, and the write -- with everything the
+    # caller passed as `then` -- was dropped in silence. A page refreshed
+    # before the qasync loop starts drew nothing and reported nothing: the
+    # readiness table measured 0 rows with an empty banner, which is neither
+    # the report nor the refusal. The running loop is what decides, so ask for
+    # it by name.
     try:
-        return asyncio.ensure_future(coroutine)
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        coroutine.close()
         return run_blocking()
+    return loop.create_task(call())

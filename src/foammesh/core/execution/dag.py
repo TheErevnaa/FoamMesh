@@ -90,6 +90,7 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
                          interface_couples: tuple[tuple[str, str], ...] = (),
                          check_profile=None,
                          check_request=None,
+                         layers: bool = True,
                          ) -> ExecutionDag:
     """The snappy pipeline, optionally decomposed so it can pause after snapping.
 
@@ -109,7 +110,7 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
     :func:`core.quality.checkmesh_service.checkmesh_command`, the same builder
     ``mesh.check`` uses (Plan 30 F-04). It used to run bare, so a pipeline run
     wrote a report with no cell sets and no per-cell fields over whatever a
-    full Mesh Check had produced. ``check_profile`` is the probed capability
+    full Mesh check had produced. ``check_profile`` is the probed capability
     of the configured utility; without one the verified Foundation-13 baseline
     flags apply.
 
@@ -117,7 +118,7 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
     reporting thresholds, whether to write the problem faces as a surface,
     whether to judge against the mesher's own limits (Plan 31). It used to be
     unreachable from here, so a threshold set on the QA page changed the
-    verdict of a manual Mesh Check and not the verdict of the pipeline's own
+    verdict of a manual Mesh check and not the verdict of the pipeline's own
     check node, while both wrote to the same report file. Without one, the
     defaults are OpenFOAM 13's and the command line is the one this DAG has
     always built.
@@ -128,6 +129,11 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
     without ``--allow-run-as-root`` there the requested ranks and the running
     ranks disagree by all of them. It stays empty for an ordinary user, where
     the same flag is itself an error.
+
+    ``layers`` False drops the split route's ``layers`` phase: the user
+    skipped the optional Boundary layers task, and that phase exists only to
+    grow them (DP-591). The combined route needs nothing here, because its one
+    invocation reads the enable flag the dictionary already carries.
     """
     from foammesh.core.quality.checkmesh_service import checkmesh_command
 
@@ -162,6 +168,8 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
                     case, ('snappyHexMesh',), publishes_mesh=True),
             ))
         snappy = ('snappyHexMesh', '-case', str(case))
+        grow = ((ExecutionNode('layers', snappy, case, ('snap',),
+                               mutates_mesh=True),) if layers else ())
         return dag(*serial, *(
             ExecutionNode('castellation', snappy, case, ('surfaceFeatures',),
                           mutates_mesh=True),
@@ -169,9 +177,10 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
             # and nothing has overwritten it yet.
             ExecutionNode('snap', snappy, case, ('castellation',),
                           mutates_mesh=True, pauses_after=True),
-            ExecutionNode('layers', snappy, case, ('snap',), mutates_mesh=True),
+            *grow,
             ExecutionNode('checkMesh', check_argv(False),
-                          case, ('layers',), publishes_mesh=True),
+                          case, ('layers' if layers else 'snap',),
+                          publishes_mesh=True),
         ))
 
     parallel_snappy = (mpirun, *mpi_options, '-np', str(ranks),
@@ -203,9 +212,10 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
         ExecutionNode('reconstructSnap',
                       ('reconstructPar', '-constant', '-case', str(case)),
                       case, ('snap',), pauses_after=True),
-        ExecutionNode('layers', parallel_snappy, case, ('reconstructSnap',),
-                      mutates_mesh=True),
-        ExecutionNode('checkMesh', check_argv(True), case, ('layers',)),
+        *((ExecutionNode('layers', parallel_snappy, case, ('reconstructSnap',),
+                         mutates_mesh=True),) if layers else ()),
+        ExecutionNode('checkMesh', check_argv(True), case,
+                      ('layers' if layers else 'reconstructSnap',)),
         ExecutionNode(
             'reconstructPar',
             ('reconstructPar', '-constant', '-case', str(case)),

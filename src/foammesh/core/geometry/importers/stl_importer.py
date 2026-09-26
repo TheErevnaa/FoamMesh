@@ -73,6 +73,32 @@ def solid_names(path) -> list[str]:
     return names
 
 
+def facet_count(path) -> int | None:
+    """How many facets the file itself declares, before anything reads it.
+
+    ``None`` when the number cannot be had from the file alone. A binary STL
+    states its count in the four bytes after the 80-byte header; an ASCII one
+    is counted by its ``facet`` keywords. This is deliberately not a VTK read:
+    the whole point is to know what the reader was given, not what it kept.
+    """
+    path = Path(path)
+    try:
+        if not _is_ascii_stl(path):
+            with path.open('rb') as stream:
+                header = stream.read(84)
+            if len(header) < 84:
+                return None
+            return int.from_bytes(header[80:84], 'little')
+        facets = 0
+        with path.open('r', encoding='ascii', errors='replace') as stream:
+            for line in stream:
+                if line.lstrip().lower().startswith('facet'):
+                    facets += 1
+        return facets
+    except OSError:
+        return None
+
+
 def face_ids_for(names: list[str]) -> list[int]:
     """The ``cadFaceId`` each solid gets: its own number when every name is
     ``face<N>`` with distinct ``N``, else its position in the file."""

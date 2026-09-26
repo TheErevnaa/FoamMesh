@@ -5,6 +5,8 @@ from enum import Enum, auto
 
 from PySide6.QtCore import QObject
 
+from foammesh.support import field_complaint
+
 
 class ErrorType(Enum):
     EmptyError = auto()
@@ -37,7 +39,8 @@ def validateData(data, schema, path='', fillWithDefault=False):
             elif fillWithDefault:
                 configuration[key] = validateData({}, schema[key], subPath, fillWithDefault=fillWithDefault)
             else:
-                raise ValidationError(ErrorType.EmptyError, 'Empty value is not allowed', key, subPath)
+                raise ValidationError(
+                    ErrorType.EmptyError, field_complaint.required_clause(), key, subPath)
         elif isinstance(schema[key], SchemaList):
             if key in data:
                 configuration[key] = schema[key].validate(data[key], subPath, fillWithDefault=fillWithDefault)
@@ -52,12 +55,18 @@ def validateData(data, schema, path='', fillWithDefault=False):
                 elif fillWithDefault:
                     configuration[key] = schema[key].default()
                 else:
-                    raise ValidationError(ErrorType.EmptyError, 'Empty value is not allowed', key, subPath)
+                    raise ValidationError(
+                    ErrorType.EmptyError, field_complaint.required_clause(), key, subPath)
             except ValidationError as ce:
                 ce.setPath(subPath)
                 raise ce
             except KeyError as ke:
-                raise ValidationError(ErrorType.EmptyError, repr(ke), None, subPath)
+                # The key that is missing is the one this branch is about, so
+                # the complaint is that it is missing -- not the repr of the
+                # KeyError that told us so.
+                raise ValidationError(
+                    ErrorType.EmptyError, field_complaint.required_clause(),
+                    key, subPath) from ke
 
     return configuration
 
@@ -90,7 +99,15 @@ class ValidationError(ValueError):
         self._path = path
 
     def toMessage(self):
-        return f'{self._path if self._name is None else self._name} - {self._message}'
+        """The whole sentence a person reads when an entry is refused.
+
+        ``message`` is a clause, not a sentence: every raise site in this
+        module supplies a verb phrase that can follow the name of a field, so
+        that the product complains in one grammar wherever it complains. See
+        ``foammesh.support.field_complaint``.
+        """
+        return field_complaint.sentence(
+            self._path if self._name is None else self._name, self._message)
 
 
 class PrimitiveType(QObject):
@@ -119,7 +136,8 @@ class PrimitiveType(QObject):
     def validate(self, value, name=None):
         validated = None if value is None else str(value).strip()
         if self._required and (validated is None or validated == ''):
-            raise ValidationError(ErrorType.EmptyError, self.tr('Empty value is not allowed'), name)
+            raise ValidationError(
+                ErrorType.EmptyError, field_complaint.required_clause(), name)
 
         return validated
 
@@ -144,7 +162,9 @@ class EnumType(PrimitiveType):
         if value in self._cls.__members__:
             return value
 
-        raise ValidationError(ErrorType.EnumError, self.tr('Only {} are allowed.').format(self._cls), name)
+        raise ValidationError(
+            ErrorType.EnumError,
+            field_complaint.one_of_clause(sorted(self._values)), name)
 
     def toEnum(self, value):
         return self._values.get(value) or self._cls[value]
@@ -179,26 +199,21 @@ class FloatType(PrimitiveType):
 
         return self
 
+    def _numberClause(self):
+        """What this box needs, so that ``IntType`` can say something else.
+
+        ``IntType`` parses through ``FloatType``, so without this hook a
+        letter typed into a whole-number box was answered with
+        ``must be a number`` -- true, but not the whole truth.
+        """
+        return field_complaint.number_clause()
+
+    def _rangeClause(self):
+        return field_complaint.range_clause(
+            self._lowLimit, self._highLimit,
+            self._lowLimitInclusive, self._highLimitInclusive)
+
     def validate(self, value, name=None):
-        def rangeToText():
-            if self._highLimit is None:
-                if self._lowLimitInclusive:
-                    return f' (value ≥ {self._lowLimit})'
-                else:
-                    return f' (value > {self._lowLimit})'
-
-            lowLimit = ' ('
-            if self._lowLimit is not None:
-                if self._lowLimitInclusive:
-                    lowLimit =  f' ({self._lowLimit} ≤ '
-                else:
-                    lowLimit =  f' ({self._lowLimit} < '
-
-            if self._highLimitInclusive:
-                return f'{lowLimit}value ≤ {self._highLimit})'
-            else:
-                return f'{lowLimit}value < {self._highLimit})'
-
         value = super().validate(value, name)
 
         if value is None or value == '':
@@ -206,15 +221,18 @@ class FloatType(PrimitiveType):
 
         try:
             v = float(value)
-        except Exception as e:
-            raise ValidationError(ErrorType.TypeError, repr(e), name)
+        except Exception as error:
+            # What the box needs is a number; the CPython message about a
+            # failed conversion is for a log, not for a dialog.
+            raise ValidationError(
+                ErrorType.TypeError, self._numberClause(), name) from error
 
         if self._lowLimit is not None:
             if v < self._lowLimit or (v == self._lowLimit and not self._lowLimitInclusive):
-                raise ValidationError(ErrorType.RangeError, self.tr('Out of Range') + rangeToText(), name)
+                raise ValidationError(ErrorType.RangeError, self._rangeClause(), name)
         if self._highLimit is not None:
             if v > self._highLimit or (v == self._highLimit and not self._highLimitInclusive):
-                raise ValidationError(ErrorType.RangeError, self.tr('Out of Range') + rangeToText(), name)
+                raise ValidationError(ErrorType.RangeError, self._rangeClause(), name)
 
         return value
 
@@ -224,6 +242,9 @@ class IntType(FloatType):
         super().__init__()
         self._default = '0'
 
+    def _numberClause(self):
+        return field_complaint.whole_number_clause()
+
     def validate(self, value, name=None):
         value = super().validate(value, name)
 
@@ -232,10 +253,18 @@ class IntType(FloatType):
 
         try:
             f = float(value)
-            if int(f) != f:
-                raise ValidationError(ErrorType.TypeError, self.tr('Only integers are allowed'), name)
-        except Exception as e:
-            raise ValidationError(ErrorType.TypeError, repr(e), name)
+        except Exception as error:
+            raise ValidationError(
+                ErrorType.TypeError, field_complaint.whole_number_clause(),
+                name) from error
+
+        # This used to sit inside the try above, where the bare ``except``
+        # caught the ValidationError it had just raised and re-raised it as
+        # its own repr, so the dialog read
+        # ``ValidationError('Only integers are allowed')``.
+        if int(f) != f:
+            raise ValidationError(
+                ErrorType.TypeError, field_complaint.whole_number_clause(), name)
 
         return value
 
@@ -307,7 +336,8 @@ class IntKeyList(SchemaList):
                 int(key)
             except (TypeError, ValueError) as error:
                 raise ValidationError(
-                    ErrorType.TypeError, repr(error), 'Key of List'
+                    ErrorType.TypeError,
+                    field_complaint.whole_number_clause(), 'List key'
                 ) from error
 
         return str(key)
@@ -355,10 +385,11 @@ class SimpleArray(PrimitiveType):
 
     def validate(self, value, name=None, fillWithDefault=False):
         if not isinstance(value, list):
-            raise ValidationError(ErrorType.TypeError, self.tr('A list is required'), name)
+            raise ValidationError(ErrorType.TypeError, field_complaint.list_clause(), name)
 
         if self._size and len(value) != self._size:
-            raise ValidationError(ErrorType.SizeError, self.tr('Length must be {}'.format(self._size)), name)
+            raise ValidationError(
+                ErrorType.SizeError, field_complaint.length_clause(self._size), name)
 
         validated = [None] * len(value)
         for i in range(len(value)):

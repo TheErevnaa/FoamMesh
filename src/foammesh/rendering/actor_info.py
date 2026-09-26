@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import weakref
 from enum import Enum, auto
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QColor
 from PySide6.QtCore import QObject, Signal
@@ -17,7 +18,7 @@ from vtkmodules.vtkRenderingCore import vtkPolyDataMapper, vtkDataSetMapper, vtk
 from vtkmodules.vtkRenderingLOD import vtkQuadricLODActor
 
 from foammesh.support.mesh import Bounds
-from foammesh.support.colormap import sequentialRedLut
+from foammesh.support.colormap import qualityBandLut, sequentialRedLut
 from foammesh.app import app
 from foammesh.view.theming.tokens import PALETTE_FAMILIES, PATCH_TOKENS
 from foammesh.view.theming.vtk_theme import rgb
@@ -37,8 +38,106 @@ BASE_SPECULAR_POWER = 30
 #: and noise once it is not. At full strength they tile the surface and become
 #: the fill -- which is what a "blue mesh" actually was. Kept, but faint; the
 #: silhouette below is what carries the shape.
-EDGE_OPACITY = 0.22
+#:
+#: DP-710 (viewport audit 0925 F7). "Faint" went too far: at 0.22 in a muted
+#: grey the S5 grid measured a mean edge gradient of 2.77 at fit and 1.38 at
+#: 3x zoom -- the grid the user asked to see was effectively not drawn, and
+#: nothing let them turn it up. The default is now 0.6 in a colour picked to
+#: contrast with the surface the lines lie on, and the Mesh lines control
+#: sets opacity, colour and width for every actor (see `setMeshLineStyle`).
+EDGE_OPACITY = 0.6
 HIGHLIGHT_EDGE_OPACITY = 0.45
+
+
+@dataclass(frozen=True)
+class MeshLineStyle:
+    """How interior mesh edges are drawn, on every actor at once.
+
+    ``color`` is ``'auto'`` -- dark lines on a light surface, light lines on a
+    dark one -- or a ``#rrggbb`` the user chose.
+    """
+    opacity: float = EDGE_OPACITY
+    color: str = 'auto'
+    width: float = 1.0
+
+
+MESH_LINE_WIDTH_RANGE = (1.0, 3.0)
+#: Auto colours: what a line reads as against a light and a dark surface.
+MESH_LINE_DARK = '#1c2530'
+MESH_LINE_LIGHT = '#eef2f7'
+
+_meshLineStyle = MeshLineStyle()
+#: Every live actor, so one change of style reaches all of them without each
+#: caller having to know which manager owns which actor.
+_liveActors = weakref.WeakSet()
+
+
+def meshLineStyle() -> MeshLineStyle:
+    return _meshLineStyle
+
+
+class _MeshLineStyleNotifier(QObject):
+    changed = Signal()
+
+
+_styleNotifier = None
+
+
+def meshLineStyleNotifier() -> _MeshLineStyleNotifier:
+    """DP-738. Says when the mesh-line style changed, whoever changed it.
+
+    The toolbar and the display panel each hold a control for the one style;
+    each re-reads it on this signal, so the two never show different values.
+    """
+    global _styleNotifier
+    if _styleNotifier is None:
+        _styleNotifier = _MeshLineStyleNotifier()
+    return _styleNotifier
+
+
+def _validColor(value) -> str:
+    text = str(value or 'auto')
+    if text == 'auto':
+        return text
+    color = QColor(text)
+    return color.name() if color.isValid() else 'auto'
+
+
+def setMeshLineStyle(opacity=None, color=None, width=None) -> MeshLineStyle:
+    """Change the mesh-line style and repaint every live actor with it."""
+    global _meshLineStyle
+    current = _meshLineStyle
+    low, high = MESH_LINE_WIDTH_RANGE
+    _meshLineStyle = MeshLineStyle(
+        opacity=min(1.0, max(0.0, float(
+            current.opacity if opacity is None else opacity))),
+        color=_validColor(current.color if color is None else color),
+        width=min(high, max(low, float(
+            current.width if width is None else width))))
+    for actor in list(_liveActors):
+        try:
+            actor.applyMeshLineStyle()
+        except RuntimeError:
+            # A C++ object Qt already destroyed; nothing left to paint.
+            pass
+    meshLineStyleNotifier().changed.emit()
+    return _meshLineStyle
+
+
+def meshLineColorFor(surface: QColor, style: MeshLineStyle = None) -> str:
+    """The colour interior edges take on a surface of colour *surface*."""
+    style = style or _meshLineStyle
+    if style.color != 'auto':
+        return style.color
+    lum = (0.2126 * surface.redF() + 0.7152 * surface.greenF()
+           + 0.0722 * surface.blueF())
+    return MESH_LINE_DARK if lum >= 0.45 else MESH_LINE_LIGHT
+
+
+def highlightEdgeOpacity(style: MeshLineStyle = None) -> float:
+    """A selected part's edges stay a step stronger than everyone else's."""
+    style = style or _meshLineStyle
+    return min(1.0, max(HIGHLIGHT_EDGE_OPACITY, style.opacity * 1.5))
 
 #: Feature/boundary edges drawn as a separate prop. This is the outline that
 #: interior edges used to be relied on for, at a width that survives a mesh
@@ -109,6 +208,16 @@ class MeshQualityIndex(Enum):
         return [c.value for c in cls]
 
 
+#: DP-714. Metrics whose bad cells are the low values: the tiny cells.
+QUALITY_WORST_IS_LOW = frozenset({MeshQualityIndex.VOLUME})
+
+#: DP-737. The relative polygon offset of the poor-cell overlay. A flagged
+#: cell on the boundary has a face exactly where the patch face over it is;
+#: with no offset the two tie in the depth test and the red shimmers through
+#: the faded patch as the model turns. Negative pulls the cells in front.
+POOR_CELL_DEPTH_BIAS = -2.0
+
+
 @dataclass
 class Properties:
     visibility: bool
@@ -167,6 +276,9 @@ class ActorInfo(QObject):
         self._mapper.SetScalarModeToUseCellFieldData()
         self._mapper.SetColorModeToMapScalars()
         self._mapper.SetLookupTable(sequentialRedLut)
+        #: Standing depth-test bias, in polygon-offset units. Restored
+        #: whenever something that suspends it is taken back off.
+        self._depthBias = 0.0
 
         self._actor = self._createActor()
         self._actor.SetMapper(self._mapper)
@@ -206,7 +318,6 @@ class ActorInfo(QObject):
         self._silhouette.PickableOff()
 
         self._highlightColor = '#00a6d6'
-        self._edgeColor = '#7b8794'
         self._surfaceColor = '#b3c0cf'
         self._silhouetteColor = '#233040'
         self._highlightRole = None
@@ -236,6 +347,7 @@ class ActorInfo(QObject):
             DisplayMode.SURFACE: self._applySurfaceMode,
             DisplayMode.SURFACE_EDGE: self._applySurfaceEdgeMode
         }
+        _liveActors.add(self)
 
     def id(self):
         return self._id
@@ -298,19 +410,60 @@ class ActorInfo(QObject):
         # wireframe cage, so the outline fades with what it outlines.
         self._silhouette.GetProperty().SetOpacity(opacity)
 
+    def _applyDepthBias(self, units: float):
+        self._mapper.SetResolveCoincidentTopologyToPolygonOffset()
+        self._mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
+            units, units)
+
+    def setDepthBias(self, units: float):
+        """Break a tie with another surface drawn in the same place (DP-141).
+
+        Two actors can describe the same square metre of mesh -- a region's
+        volume and the named boundary patches that are its skin are the
+        standing example -- and when they do, the depth buffer has no answer:
+        which one a pixel shows comes down to float error in two different
+        triangulations of the same face. MEASURED on a snapped elbow: the
+        result is per-pixel salt-and-pepper across the whole model, and the
+        patch palette that exists to tell inlet from outlet from wall is
+        shredded into noise.
+
+        A positive ``units`` pushes this actor away from the camera by that
+        many depth units *relative* to everything else, so the tie stops
+        being a tie. It moves nothing in the scene -- the offset is applied
+        in the depth test, not to the geometry -- so the picture is the same
+        picture, minus the fight.
+        """
+        self._depthBias = float(units)
+        self._applyDepthBias(self._depthBias)
+
     def setColor(self, color: QColor):
         self._properties.color = color
         self._colorIsDefault = False
         self._actor.GetProperty().SetColor(color.redF(), color.greenF(), color.blueF())
+        if not self._properties.highlighted:
+            self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
         self.colorChanged.emit()
 
-    def setFaceScalars(self, name: str, face_ids, values) -> bool:
+    def setFaceScalars(self, name: str, face_ids, values, *,
+                       start_face: int | None = None, value_range=None,
+                       lookup_table=None) -> bool:
         """Colour this actor by a per-face field.
 
-        ``face_ids`` index the boundary faces of the *whole* mesh; this actor
-        holds a subset, so the values are scattered into cell order by position
-        within the actor's own dataset. Faces with no measurement stay ``nan``
-        and VTK leaves them uncoloured -- absent, not zero, because zero on a
+        ``face_ids`` are the mesh's own face labels. A patch's cells are its
+        faces in label order from ``start_face``, so face ``f`` is cell
+        ``f - start_face``; with ``start_face`` given the values are scattered
+        there, and a field over part of a patch lands on that part.
+
+        DP-713 (viewport audit 0925 F8). This used to scatter by position --
+        the first value onto the first cell whatever face it was measured on
+        -- so a field over any subset of a patch painted the wrong faces. With
+        no ``start_face`` a field is only taken when it has one value per
+        cell, the one case where position and label agree.
+
+        ``value_range`` is the range the colours span; the caller passes one
+        range for every patch, so a colour means the same distance
+        everywhere. Faces with no measurement stay ``nan`` and are drawn in
+        the lookup table's nan colour -- absent, not zero, because zero on a
         deviation field is a claim of perfection.
         """
         import numpy as np
@@ -320,38 +473,68 @@ class ActorInfo(QObject):
         if data is None:
             return False
         count = data.GetNumberOfCells()
-        values = np.asarray(values, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float64).ravel()
         if count <= 0 or values.size == 0:
             return False
 
-        # The actor's cells are this section's faces in the order the reader
-        # produced them, which is the order `face_ids` was gathered in.
         scalars = np.full(count, np.nan, dtype=np.float64)
-        span = min(count, values.size)
-        scalars[:span] = values[:span]
+        if start_face is not None:
+            cells = (np.asarray(face_ids, dtype=np.int64).ravel()
+                     - int(start_face))
+            if cells.size != values.size:
+                return False
+            inside = (cells >= 0) & (cells < count)
+            scalars[cells[inside]] = values[inside]
+        elif values.size == count:
+            scalars[:] = values
+        else:
+            return False
+
+        finite = scalars[np.isfinite(scalars)]
+        if finite.size == 0:
+            return False
 
         array = numpy_to_vtk(scalars, deep=True)
         array.SetName(name)
         data.GetCellData().AddArray(array)
         data.GetCellData().SetActiveScalars(name)
 
-        finite = scalars[np.isfinite(scalars)]
-        if finite.size == 0:
-            return False
-
+        if value_range is None:
+            value_range = (float(finite.min()), float(finite.max()))
+        low, high = (float(value_range[0]), float(value_range[1]))
+        if lookup_table is not None:
+            lookup_table.SetTableRange(low, high)
+            self._mapper.SetLookupTable(lookup_table)
         self._mapper.SetScalarModeToUseCellFieldData()
         self._mapper.SelectColorArray(name)
-        self._mapper.SetScalarRange(float(finite.min()), float(finite.max()))
+        self._mapper.SetScalarRange(low, high)
         self._mapper.UseLookupTableScalarRangeOff()
         self._mapper.ScalarVisibilityOn()
         self._mapper.Update()
         self._faceScalarName = name
         return True
 
+    def faceScalars(self, name: str | None = None):
+        """The per-face field this actor is coloured by, in cell order."""
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        name = name or getattr(self, '_faceScalarName', None)
+        if name is None or self._dataSet is None:
+            return None
+        array = self._dataSet.GetCellData().GetArray(name)
+        return None if array is None else vtk_to_numpy(array).copy()
+
+    def scalarRange(self):
+        """The range the mapper spans its colours over."""
+        return tuple(self._mapper.GetScalarRange())
+
     def clearFaceScalars(self):
         if getattr(self, '_faceScalarName', None) is None:
             return
         self._mapper.ScalarVisibilityOff()
+        # DP-713. The deviation scale is lent for the colouring only; the
+        # quality colouring shares this mapper and expects its own back.
+        self._mapper.SetLookupTable(sequentialRedLut)
         self._faceScalarName = None
         self._mapper.Update()
 
@@ -459,7 +642,8 @@ class ActorInfo(QObject):
         self._highlightColor = (
             HIGHLIGHT_ROLE_COLORS.get(self._highlightRole)
             or tokens.value('accent.default'))
-        self._edgeColor = tokens.value('foreground.muted')
+        # DP-710. Interior edges no longer wear a fixed muted grey; their
+        # colour follows the Mesh lines style and the surface they lie on.
         self._surfaceColor = tokens.value('viewport.surface')
         self._silhouetteColor = tokens.value('viewport.silhouette')
         self._paletteColors = {
@@ -471,7 +655,7 @@ class ActorInfo(QObject):
             self._actor.GetProperty().SetEdgeColor(*rgb(self._highlightColor))
             self._silhouette.GetProperty().SetColor(*rgb(self._highlightColor))
         else:
-            self._actor.GetProperty().SetEdgeColor(*rgb(self._edgeColor))
+            self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
             self._silhouette.GetProperty().SetColor(*rgb(self._silhouetteColor))
 
     def _paletteColor(self) -> str:
@@ -499,6 +683,8 @@ class ActorInfo(QObject):
         if self._properties is None or not self._properties.highlighted:
             self._actor.GetProperty().SetColor(
                 color.redF(), color.greenF(), color.blueF())
+            self._actor.GetProperty().SetEdgeColor(
+                *rgb(meshLineColorFor(color)))
             self._silhouette.GetProperty().SetColor(*rgb(self._silhouetteColor))
         if self._properties is not None:
             self._properties.color = color
@@ -655,11 +841,24 @@ class ActorInfo(QObject):
         self._actor.GetProperty().EdgeVisibilityOff()
         self._silhouette.SetVisibility(self._properties.visibility)
 
+    def _meshLineColor(self) -> str:
+        return meshLineColorFor(self._currentSurfaceColor())
+
+    def applyMeshLineStyle(self):
+        """DP-710. Repaint the interior edges with the current style."""
+        if self._properties.highlighted:
+            self._highlightOn()
+        elif self._properties.displayMode is DisplayMode.SURFACE_EDGE:
+            self._applySurfaceEdgeMode()
+
     def _applySurfaceEdgeMode(self):
+        style = meshLineStyle()
         self._actor.GetProperty().SetRepresentationToSurface()
         self._actor.GetProperty().EdgeVisibilityOn()
-        self._actor.GetProperty().SetLineWidth(1.0)
-        self._setEdgeOpacity(EDGE_OPACITY)
+        self._actor.GetProperty().SetLineWidth(style.width)
+        self._setEdgeOpacity(style.opacity)
+        if not self._properties.highlighted:
+            self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
         self._silhouette.SetVisibility(self._properties.visibility)
 
     def _highlightOn(self):
@@ -674,9 +873,9 @@ class ActorInfo(QObject):
             self._applyWireframeMode()
         else:
             self._applySurfaceEdgeMode()
-        self._setEdgeOpacity(HIGHLIGHT_EDGE_OPACITY)
+        self._setEdgeOpacity(highlightEdgeOpacity())
         self._actor.GetProperty().SetEdgeColor(*rgb(self._highlightColor))
-        self._actor.GetProperty().SetLineWidth(1.0)
+        self._actor.GetProperty().SetLineWidth(meshLineStyle().width)
         # R5/R44. The outline alone does not read -- see HIGHLIGHT_AMBIENT. The
         # surface itself takes the role colour and brightens, so a cap that is
         # 3% of the model says "this one" without the user hunting for a
@@ -696,8 +895,8 @@ class ActorInfo(QObject):
         color = self._currentSurfaceColor()
         self._actor.GetProperty().SetColor(
             color.redF(), color.greenF(), color.blueF())
-        self._actor.GetProperty().SetEdgeColor(*rgb(self._edgeColor))
-        self._actor.GetProperty().SetLineWidth(1)
+        self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
+        self._actor.GetProperty().SetLineWidth(meshLineStyle().width)
         self._silhouette.GetProperty().SetColor(*rgb(self._silhouetteColor))
         self._silhouette.GetProperty().SetLineWidth(SILHOUETTE_WIDTH)
 
@@ -736,6 +935,29 @@ class MeshActor(ActorInfo):
         self._mapper.SetInputConnection(self._surfaceFilter.GetOutputPort())
         self._silhouetteFilter.SetInputConnection(
             self._surfaceFilter.GetOutputPort())
+        self._invalidateLevelOfDetail()
+
+    def _invalidateLevelOfDetail(self):
+        """Make the decimated copy follow what the volume now shows.
+
+        DP-814. ``vtkQuadricLODActor`` draws its decimated copy on every
+        interactive frame -- a camera drag and, above all, a section-handle
+        drag, because the widget raises the render rate for the drag -- and
+        rebuilds it only when the *actor* is modified. A clip, a slice or a
+        quality threshold changes the mapper's input and not the actor, so
+        the copy stayed the mesh it was first built from: while a plane was
+        dragged the volume drew uncut, the cut appearing only when the
+        mouse was let go, and a sectioned mesh turned into the whole mesh
+        for as long as the camera moved.
+        """
+        actor = getattr(self, '_actor', None)
+        if actor is not None:
+            actor.Modified()
+
+    def setDataSet(self, dataSet):
+        # DP-814. A reloaded mesh is new data under the same actor.
+        self._invalidateLevelOfDetail()
+        super().setDataSet(dataSet)
 
     def _createActor(self):
         """WP6.2. Level of detail, on the one actor that can be enormous.
@@ -856,8 +1078,14 @@ class MeshActor(ActorInfo):
         self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
 
         self._mapper.ScalarVisibilityOff()
+        # DP-714. The band's scale was lent for the colouring only.
+        self._mapper.SetLookupTable(sequentialRedLut)
+
+        # Whatever suspended the standing bias is off too, so it comes back.
+        self._applyDepthBias(self._depthBias)
 
         self._mapper.Update()
+        self._invalidateLevelOfDetail()
 
     def applyCellFilter(self):
         self._cellFilter = vtkThreshold()
@@ -874,11 +1102,27 @@ class MeshActor(ActorInfo):
         self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
 
         self._mapper.ScalarVisibilityOn()
+        # DP-714. A scale of its own on the band, not the shared table's 0-1
+        # range, which painted every value above 1 the same red.
+        self._mapper.SetLookupTable(qualityBandLut(
+            self._mqLow, self._mqHigh,
+            worstIsHigh=self._mqIndex not in QUALITY_WORST_IS_LOW))
         self._mapper.SetScalarRange(self._mqLow, self._mqHigh)
         self._mapper.UseLookupTableScalarRangeOn()
         self._mapper.SelectColorArray(self._mqIndex.value)
 
+        # A thresholded volume is no longer a duplicate of its own skin -- it
+        # is the subset of cells the user asked to be shown, and asking to see
+        # the worst cells and then being shown the patches that cover them is
+        # not an answer. So the bias that keeps the whole volume behind its
+        # patches (DP-141) stands down for as long as the filter is on --
+        # and turns round (DP-737): at zero a boundary cell's face tied with
+        # the patch face over it and shimmered through it, so the cells are
+        # pulled in front instead. clearCellFilter puts the standing bias back.
+        self._applyDepthBias(POOR_CELL_DEPTH_BIAS)
+
         self._mapper.Update()
+        self._invalidateLevelOfDetail()
 
 
 class BoundaryActor(ActorInfo):

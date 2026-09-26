@@ -79,7 +79,7 @@ _FATAL_SIGNALS = {
 }
 
 
-def runner_crash_reason(returncode) -> str:
+def runner_crash_reason(returncode, *, threads: int = 0) -> str:
     """How the Gmsh process died if a signal killed it, or ``''``.
 
     DP-30. A crash and a refusal reach this application the same way -- no
@@ -132,18 +132,94 @@ def runner_crash_reason(returncode) -> str:
                 'this route means it ran out of memory. Re-running unchanged '
                 'will be killed again. Most often the mesh being asked for is '
                 'simply larger than the memory available to it, so ask for '
-                'fewer elements -- a larger target element size is the first '
+                'fewer elements — a larger target element size is the first '
                 'thing to raise, then any refinement or boundary-layer '
-                'settings that multiply it -- or give the Linux runtime more '
+                'settings that multiply it — or give the Linux runtime more '
                 'memory. If it is killed again at a size that should fit, the '
                 'geometry is worth checking too: a surface that does not '
                 'close can consume memory without meshing anything.')
-    return (f'Gmsh itself crashed ({named}) part-way through, so it wrote no '
-            'mesh and no reason. This is a defect in Gmsh rather than a '
-            'refusal of your geometry, so re-running unchanged will crash '
-            'again: change one meshing choice and re-run -- the surface or '
-            'volume algorithm first, since those are the settings measured '
-            'to trigger it.')
+    opening = (f'Gmsh itself crashed ({named}) part-way through, so it wrote '
+               'no mesh and no reason. This is a defect in Gmsh rather than a '
+               'refusal of your geometry, so re-running unchanged will crash '
+               'again. ')
+    # DP-56. The first version of this sentence sent the user to the surface
+    # and volume algorithms, and an eleven-arm rerun of the crash it was
+    # written from falsifies that: delaunay, hxt and frontal volumes and a
+    # delaunay surface pass all still crash at eight threads, and the same job
+    # at one thread refuses cleanly, naming the surface it could not mesh.
+    if threads > 1:
+        return opening + (
+            f'The setting that decides it is the thread count, and this run '
+            f'asked for {threads}. A single-threaded run of the job that '
+            'produced this message stopped crashing and named the surface it '
+            'could not mesh instead, which is something you can act on. Lower '
+            'the thread count before changing anything else.')
+    if threads == 1:
+        return opening + (
+            'This run was already single-threaded, which is the setting that '
+            'stopped the crash everywhere it has been measured, so there is '
+            'no thread count left to lower. Ask for a coarser mesh, and if it '
+            'still crashes the job is worth reporting: a crash at one thread '
+            'is not a shape this build has seen.')
+    return opening + (
+        'The setting measured to decide it is the thread count: a job that '
+        'crashed at eight threads refused cleanly at one, naming the surface '
+        'it could not mesh. Lower it before changing anything else.')
+
+
+def retry_at_one_thread(layout, job, payload) -> str:
+    """Rewrite this run's job to a single thread, or ``''`` to leave it alone.
+
+    DP-56. A crash is the one failure that carries no information: no mesh, no
+    result file, no reason, just a signal number. MEASURED on leg t4's
+    `drone_quadcopter` job over eleven arms -- nine at eight threads, all of
+    them 139, against two at one thread, both of them a clean refusal naming
+    `Invalid boundary mesh (overlapping facets) on surface 35`. The volume
+    algorithm, the surface algorithm and the boundary layers were each varied
+    across those arms and none of them changed the outcome; the thread count
+    changed it every time.
+
+    So the crash is retried rather than reported. The first attempt wrote no
+    result and no mesh, so there is nothing in the run directory to clobber
+    and the same one is reused. Returns the sentence to record when it has
+    rewritten the job, so the caller can re-stamp the manifest and say on it
+    that this mesh was not built the way the job originally asked.
+
+    Deliberately not retried: a cancellation, which the user asked for; a
+    SIGKILL, which is the machine reclaiming memory and whose remedy is a
+    smaller mesh rather than fewer threads; and a job that already asked for
+    one thread, which has nothing left to lower.
+    """
+    import json
+
+    status = str((payload.get('job') or {}).get('status') or '')
+    if status == 'cancelled':
+        return ''
+    try:
+        code = int((payload.get('job') or {}).get('returncode'))
+    except (TypeError, ValueError):
+        return ''
+    number = -code if code < 0 else (code - 128 if code > 128 else 0)
+    if number <= 0 or number > 64 or number == _SIGKILL:
+        return ''
+    intent = job.get('intent')
+    if not isinstance(intent, dict):
+        return ''
+    parallel = dict(intent.get('parallel') or {})
+    try:
+        threads = int(parallel.get('threads', 1) or 1)
+    except (TypeError, ValueError):
+        return ''
+    if threads <= 1:
+        return ''
+    parallel.update({'threads': 1, 'effectiveVolumeThreads': 1,
+                     'retriedFromThreads': threads})
+    intent['parallel'] = parallel
+    layout.job.write_text(
+        json.dumps(job, indent=2, sort_keys=True) + chr(10), encoding='utf-8')
+    return (f'Gmsh crashed at {threads} threads and the run was retried once '
+            'at a single thread, which is the setting measured to decide it. '
+            'This mesh, if there is one, was built single-threaded.')
 
 
 def _read_runner_result(layout) -> dict:
@@ -231,6 +307,59 @@ def _job_export_settings(record) -> dict:
     return ((job.get('intent') or {}).get('export')) or {}
 
 
+def _job_edge_categories(record) -> dict:
+    """Patch name -> boundary category for a section's named curves.
+
+    DP-675. The prepared geometry types faces, and a section's patches are
+    its curves, so a curve the user named is typed from its name exactly as a
+    prepared patch is (``inlet_left`` is an inlet); any other name is a wall,
+    which is what an unnamed ``edge_<tag>`` publishes as.
+    """
+    from foammesh.db.configurations_schema import BoundaryCategory
+
+    try:
+        job = json.loads(record.layout.job.read_text(encoding='utf-8'))
+    except (OSError, ValueError, AttributeError):
+        return {}
+    intent = job.get('intent') if isinstance(job, dict) else None
+    names = ((intent or {}).get('dimensionality') or {}).get('edgeNames') or {}
+    known = {item.value for item in BoundaryCategory}
+    return {str(name): _category_for_name(str(name).lower(), known, 'wall')
+            for name in names}
+
+
+def _job_is_planar(record) -> bool:
+    """Whether this run meshed a 2D or axisymmetric section, from its job.
+
+    DP-674. A section's cells are faces, so the run is judged by those.
+    """
+    try:
+        job = json.loads(record.layout.job.read_text(encoding='utf-8'))
+    except (OSError, ValueError, AttributeError):
+        return False
+    intent = job.get('intent') if isinstance(job, dict) else None
+    return bool(((intent or {}).get('dimensionality') or {}).get('planar'))
+
+
+def _job_configured_tasks(record) -> frozenset:
+    """The optional tasks whose configuration this run actually consumed.
+
+    DP-228. Read back from the immutable job for the same reason the export
+    settings above are: the question is what the run was asked to build, and
+    the case may have been edited since. It is read from the job rather than
+    from the workflow graph because the graph cannot answer it -- a page save
+    refused as locked by prerequisites leaves its task READY, and DP-35 grades
+    a READY optional task as unused.
+    """
+    from foammesh.core.gmsh.plan_derivation import configured_tasks
+
+    try:
+        job = json.loads(record.layout.job.read_text(encoding='utf-8'))
+    except (OSError, ValueError, AttributeError):
+        return frozenset()
+    return configured_tasks(job.get('intent') if isinstance(job, dict) else None)
+
+
 def _require_every_prepared_source(prepared, job) -> None:
     """Refuse a Gmsh run whose job does not carry every prepared source.
 
@@ -255,7 +384,13 @@ def _require_every_prepared_source(prepared, job) -> None:
 
 
 def _prepared_bbox(prepared):
-    """Bounds of the prepared geometry, or None when it records none."""
+    """Bounds of the prepared geometry, or None when it records none.
+
+    DP-614 (field audit 0924 gmsh-sizing D1). Neither the prepared result nor
+    its reference has a bounds attribute, so this always returned None and
+    the job never had a box to derive a size from. The manifest records each
+    source's bounds (VTK order, metres); their union is the geometry's.
+    """
     for source in (prepared, getattr(prepared, 'reference', None)):
         if source is None:
             continue
@@ -263,7 +398,18 @@ def _prepared_bbox(prepared):
             value = getattr(source, attribute, None)
             if value is not None:
                 return value
-    return None
+    from foammesh.core.geometry.bbox import BBox
+
+    boxes = []
+    manifest = getattr(prepared, 'manifest', None) or {}
+    for record in manifest.get('sources') or ():
+        bounds = record.get('bbox') if isinstance(record, dict) else None
+        try:
+            if bounds is not None and len(bounds) == 6:
+                boxes.append(BBox.from_bounds([float(item) for item in bounds]))
+        except (TypeError, ValueError):
+            continue
+    return BBox.union(boxes)
 
 
 def _gmsh_patch_categories(prepared) -> dict:
@@ -469,23 +615,6 @@ def _meshing_intent(configuration: dict, native_section: str = ''):
     )
 
 
-def _configured_parallel_cores(session) -> int:
-    """The core count the case's parallel environment asks meshing to use.
-
-    Returns 0 when the case has no readable settings -- including the light
-    session doubles the facade tests use -- so callers fall back to the
-    execution ceiling exactly as they did before.
-    """
-    storage = getattr(session, 'storage_path', None)
-    if storage is None:
-        return 0
-    try:
-        from foammesh.settings.local_settings import LocalSettings
-        return int(LocalSettings(storage).parallelEnvironment().np())
-    except Exception:  # noqa: BLE001 - settings are advisory here
-        return 0
-
-
 def _resource_policy(configuration: dict) -> dict:
     execution = ((configuration.get('mesh') or {}).get('execution') or {})
     maximum = int(execution.get('maxCpuCores') or 0)
@@ -652,6 +781,84 @@ def _prepared_boundary_categories(db, geometry_entries: list[dict]) -> dict:
 #: the missing runtime is noticed without restarting the window.
 _PROBE_TTL_SECONDS = 300.0
 
+#: The engine tasks whose questions `3. Preparation` asks, and which therefore
+#: have no row of their own to reopen by hand (Plan 32 section 4.4).
+#:
+#: The desktop names the same set in
+#: `foammesh/view/main_window/meshing_method_branch.py` as `HOSTED_TASKS`,
+#: because that is where a row is decided; core cannot import the view, and
+#: the view importing this would make the facade a dependency of the outline.
+#: Two names for one set is a thing to keep in step, so it is written down
+#: here rather than derived: a task missing from this list is a task an unlock
+#: leaves accepted on geometry that no longer exists.
+PREPARATION_HOSTED_TASKS = frozenset({'gmsh.describe_geometry'})
+
+
+def _publish_prepared_catalogue(session: CaseSession) -> None:
+    """Republish the prepared scope catalogue for a revision that just landed.
+
+    Plan 33 CURVE-01/FIELD-02. Preparing the geometry is the event that makes
+    every scope picker in the application wrong, and nothing told the picker:
+    it read the catalogue once, when its panel was constructed. The catalogue
+    is written here, by the operation that changed the geometry, so a panel
+    that is older than the revision still offers the revision.
+
+    Advisory: a revision that materialized is a revision, whether or not the
+    catalogue could be rebuilt from it.
+    """
+    from foammesh.core.selection.service import notify_prepared_case
+    try:
+        notify_prepared_case(session.case_path, session.state.db)
+    except (AttributeError, FileNotFoundError, OSError, ValueError):
+        pass
+
+
+def _refuse_unresolved_scopes(session, prepared) -> None:
+    """Stop a run whose controls name geometry this case no longer has.
+
+    Plan 33 W-G1 (FIELD-06, CURVE-04). The refusal names each row and says
+    ``Needs selection``, which is the same words the row reads on its page,
+    so what the user is told to fix is where they go to fix it.
+
+    Silence here is the whole point: a control the user enabled and a mesh
+    that does not carry it are indistinguishable once the run has finished,
+    and the run is what they will trust.
+    """
+    from foammesh.core.gmsh.execution import _native_section
+    from foammesh.core.gmsh.size_fields import unresolved_scopes
+
+    reference = getattr(prepared, 'reference', prepared)
+    complaints = unresolved_scopes(_native_section(session.state.db),
+                                   reference)
+    if not complaints:
+        return
+    raise ValidationFailedError(
+        'these enabled controls name geometry this case no longer has, so '
+        'the mesh would silently be missing them:\n  '
+        + '\n  '.join(complaints)
+        + '\nChoose the geometry each one means, or turn it off, and run '
+          'again.',
+        details={'unresolved_scopes': list(complaints)})
+
+
+def _meshes_a_section(db) -> bool:
+    """Whether this case asks Gmsh for a 2D or axisymmetric section.
+
+    DP-673 (field audit 0924 gmsh-generate-export D2). A section is one planar
+    face and bounds no volume by design, so the run seams' "the surfaces
+    cannot bound a volume" refusal is the wrong question for it: the runner
+    meshes it with ``generate(2)`` and the publisher makes the one cell of
+    thickness. The engine is asked: one that meshes no sections has no
+    ``meshes_a_section`` and is held to the volume rule.
+    """
+    from foammesh.core.engine import resolve_engine
+    try:
+        engine = resolve_engine(db)
+    except Exception:                                        # noqa: BLE001
+        return False
+    asks = getattr(engine, 'meshes_a_section', None)
+    return bool(asks(db)) if callable(asks) else False
+
 
 def _ensure_prepared_geometry(session, *, producer: str,
                               require_domain: bool = False):
@@ -739,8 +946,6 @@ class DomainOperations:
             'case.clean.preview': self._clean_preview,
             'case.clean': self._clean,
             'case.parallel.redistribute': self._parallel_redistribute,
-            'case.parallel.configure': self._parallel_configure,
-            'client_shell.paraview': self._launch_paraview,
             'client_shell.terminal': self._launch_terminal,
             'artifact.stage.clear': self._stage_clear,
             'history.query': self._history_query,
@@ -771,11 +976,13 @@ class DomainOperations:
             'geometry.patches.merge': self._geometry_patches_merge,
             'geometry.patches.split': self._geometry_patches_split,
             'geometry.patches.split_by_angle': self._geometry_patches_split_by_angle,
+            'geometry.split_interfaces': self._geometry_split_interfaces,
             'geometry.prepare.cancel': self._geometry_prepare_cancel,
             'geometry.prepared.create': self._geometry_prepared_create,
             'geometry.prepared.load': self._geometry_prepared_load,
             'geometry.prepared.current': self._geometry_prepared_current,
             'geometry.prepared.select': self._geometry_prepared_select,
+            'geometry.prepared.discard': self._geometry_prepared_discard,
             # Slice 4: workflow
             'mesh.engine.list': self._mesh_engine_list,
             'mesh.target_solver.get': self._mesh_target_solver_get,
@@ -885,14 +1092,27 @@ class DomainOperations:
                                   command: Command) -> OperationResult:
         session.require_writable()
         from foammesh.core.geometry import PreparedGeometryError, PreparedGeometryStore
+        from foammesh.core.geometry.prepared import (
+            prepare_readiness, preparation_with_topology,
+        )
         store = PreparedGeometryStore(session.case_path)
         categories = command.parameters.get('boundary_categories')
         if categories is None:
             categories = _prepared_boundary_categories(
                 session.state.db, store.source.entries())
         try:
+            # DP-122. The automatic route recorded the classifier's volume
+            # count on the revision and this one, the route the GUI's Prepare
+            # step takes, passed the caller's `{'decision': 'as_is'}` through
+            # untouched -- so every revision a user made read
+            # `volumes_source: unknown`, and DP-52, DP-53 and DP-115 all
+            # refuse nothing on an unknown count. Inside the `try`, because
+            # reading the store to count is as able to fail as writing to it.
+            preparation = preparation_with_topology(
+                prepare_readiness(store),
+                command.parameters.get('preparation'))
             result = store.materialize(
-                preparation=command.parameters.get('preparation'),
+                preparation=preparation,
                 boundary_categories=categories,
                 fluid_seed=command.parameters.get('fluid_seed'),
                 transform=command.parameters.get('transform'))
@@ -902,6 +1122,7 @@ class DomainOperations:
         payload['geometry_reference'] = self._materialize_geometry_reference(
             session, result,
             tolerance=command.parameters.get('fidelity_tolerance_m'))
+        _publish_prepared_catalogue(session)
         return self._artifact_result(
             session, command, payload,
             invalidates=('engine_plan', 'mesh', 'quality', 'exports'),
@@ -995,6 +1216,86 @@ class DomainOperations:
             'prepared': result.to_dict() if result is not None else None,
         })
 
+    def _geometry_prepared_discard(self, session: CaseSession,
+                                   command: Command) -> OperationResult:
+        """Throw the published prepared revision away and reopen the step.
+
+        Plan 33 GEO-08. Unlocking `1. Geometry` is the reader saying the
+        geometry is about to change, and every page above the unlocked step is
+        asked to drop what it produced. Preparation had nothing to ask for:
+        `current.json` is written by `geometry.prepared.create` and there was
+        no operation that unwrote it, so the meshers -- which read
+        `PreparedGeometryStore.current()` and nothing else -- went on reading a
+        revision of the file the reader had just replaced.
+
+        Three things say the geometry is prepared and all three are undone
+        here, because leaving any one of them standing leaves a surface that
+        contradicts the other two: the published revision on disk, the
+        recorded decision in the case, and the state of the tasks whose
+        questions `3. Preparation` asks.
+
+        The revision folders themselves are kept. They are dated work with a
+        manifest, `geometry.prepared.select` can still bring one back, and
+        deleting a reader's earlier preparation is not what unlocking a step
+        asked for.
+        """
+        session.require_writable()
+        from foammesh.core.geometry import PreparedGeometryStore
+
+        store = PreparedGeometryStore(session.case_path)
+        discarded = store.current_path.is_file()
+        if discarded:
+            store.current_path.unlink()
+        reopened = self._invalidate_geometry_preparation(session)
+        reverted = self._revert_preparation_tasks(session, command)
+        payload = {'discarded': discarded, 'reverted_tasks': reverted,
+                   'changed': bool(discarded or reopened or reverted)}
+        if not payload['changed']:
+            # DP-350. A discard that found nothing prepared has not changed
+            # the geometry, and saying it has costs more than a wrong word.
+            # `MainWindow` refreshes the whole scene on
+            # ARTIFACT_GEOMETRY_CHANGED; the refresh runs `StepManager.load`,
+            # which answers by calling `clearResult()` on every page above the
+            # reachable step; `GeometryRepairPage.clearResult` submits this
+            # operation. MEASURED on a live gmsh leg: the announcement came
+            # back round as the refresh that produced it, 1,940 times in
+            # 240 s -- 8.1/s, on an idle application, starting 0.01 s after
+            # the case attached and never stopping. Each turn of it wrote
+            # configurations.h5 and reloaded every page in the shell, which is
+            # why presses went unanswered underneath it.
+            return self._read_result(session, command, payload)
+        _publish_prepared_catalogue(session)
+        return self._artifact_result(
+            session, command, payload,
+            invalidates=('engine_plan', 'mesh', 'quality', 'exports'),
+            event=Event.ARTIFACT_GEOMETRY_CHANGED)
+
+    def _revert_preparation_tasks(self, session: CaseSession,
+                                  command: Command) -> list:
+        """Reopen the tasks `3. Preparation` hosts, and say which.
+
+        A hosted task has no row of its own, so a reader cannot see that it is
+        still accepted and cannot reopen it by hand; the press that settled it
+        is the press this undoes. A store that cannot name an engine, or a
+        graph that refuses the transition, is not a reason to leave the
+        revision on disk -- the revision is already gone by the time this
+        runs, and the task state is a claim about it.
+        """
+        from foammesh.core.workflow.task_state_store import TaskStateError
+
+        try:
+            _engine_id, store = self._task_state_store(session, command)
+        except (FacadeError, KeyError, OSError, ValueError):
+            return []
+        reverted = []
+        for task_id in sorted(PREPARATION_HOSTED_TASKS):
+            try:
+                store.apply(task_id, 'revert')
+            except (TaskStateError, KeyError, OSError, ValueError):
+                continue
+            reverted.append(task_id)
+        return reverted
+
     def _geometry_prepared_select(self, session: CaseSession,
                                   command: Command) -> OperationResult:
         session.require_writable()
@@ -1009,6 +1310,7 @@ class DomainOperations:
                 'prepared geometry revision was not found') from error
         except PreparedGeometryError as error:
             raise ValidationFailedError(str(error)) from error
+        _publish_prepared_catalogue(session)
         return self._artifact_result(
             session, command, result.to_dict(),
             invalidates=('engine_plan', 'mesh', 'quality', 'exports'),
@@ -1403,15 +1705,25 @@ class DomainOperations:
             ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
             allocate_resources,
         )
-        from foammesh.core.execution.resources import ResourceError
+        from foammesh.core.execution.resources import (
+            ResourceError, requested_cpu_count,
+        )
 
         configuration = _resource_policy(session.configuration())
         mode = ResourceMode(str(command.parameters.get('mode')
                                 or configuration['mode']))
-        parallel_cores = _configured_parallel_cores(session)
-        requested = int(command.parameters.get('cores')
-                        or parallel_cores
-                        or configuration['max_cpu_cores'] or 1)
+        # Plan 33 DP-X2. The ceiling used to be reachable only when the case
+        # had no parallel environment at all, and every case has one answering
+        # 1, so the count on the Mesh setup page was never the count previewed
+        # here. One function decides the precedence now, and the launcher asks
+        # it the same question.
+        # DP-691. ``configured`` was the Parallel Environment dialog's count
+        # in local.cfg, a second input the page never showed. Meshing
+        # resources is the only input now; an old case's count was carried
+        # onto it when the case was opened.
+        requested = requested_cpu_count(
+            configuration,
+            requested=int(command.parameters.get('cores') or 0)) or 1
         policy = ResourcePolicy(
             mode, configuration['max_cpu_cores'],
             configuration['max_memory_bytes'],
@@ -1421,7 +1733,7 @@ class DomainOperations:
             'mode': mode.value if hasattr(mode, 'value') else str(mode),
             'requested_cores': requested,
             'max_cpu_cores': configuration['max_cpu_cores'] or 0,
-            'source': ('parallel environment' if parallel_cores
+            'source': ('the run' if 'cores' in command.parameters
                        else 'the execution ceiling'),
         }
         try:
@@ -1523,7 +1835,8 @@ class DomainOperations:
 
         from foammesh.core.engine.registry import ENGINE_REGISTRY
 
-        document = ENGINE_REGISTRY.get(engine_id).workflow_descriptor().to_dict()
+        descriptor = ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
+        document = descriptor.to_dict()
         tasks = list(document.get('tasks') or ())
         task = next((item for item in tasks
                      if item.get('task_id') == task_id), None)
@@ -1539,6 +1852,12 @@ class DomainOperations:
             'task': task,
             'titles': {item['task_id']: item.get('title') or item['task_id']
                        for item in tasks if item.get('task_id')},
+            # DP-144. `task['depends_on']` is the chain the state machine
+            # walks; this is the answer to "what must I do before this", which
+            # is a different question wherever an optional task sits in that
+            # chain. Computed here so the CLI and the API read the same
+            # sentence the page shows (§9 parity).
+            'requires': list(descriptor.required_prerequisites(task_id)),
             'status': str(statuses.get(task_id) or 'ready'),
             'warnings': list(warnings.get(task_id) or ()),
             'state': snapshot,
@@ -1609,7 +1928,10 @@ class DomainOperations:
         if reader is None:
             return {}
         try:
-            return dict(reader(session.state.db) or {})
+            # DP-614: the prepared bounds, so an unset ("Auto") target size
+            # is derived here as it is for the run, and the page shows it.
+            bbox = _prepared_bbox(self._current_prepared(session))
+            return dict(reader(session.state.db, bbox=bbox) or {})
         except Exception:                                    # noqa: BLE001
             # A warning channel that can break the page it warns on would be
             # worse than the silence it replaces.
@@ -1763,9 +2085,12 @@ class DomainOperations:
 
         from foammesh.core.engine.registry import ENGINE_REGISTRY
         from foammesh.core.gmsh.execution import ExecutionError, write_job
-        from foammesh.core.gmsh.manifest import RunBuilder, RunLayout, RunManifest
+        from foammesh.core.gmsh.manifest import (
+            RunBuilder, RunLayout, RunManifest, sha256_of,
+        )
         from foammesh.core.gmsh.quality import (
             REPORT_TASK_ID as _GMSH_GATE_TASK_ID, assess, derive_thresholds,
+            refusal_words,
         )
         from foammesh.core.run_result import RunResultHandle, failure_payload
 
@@ -1781,20 +2106,34 @@ class DomainOperations:
         # one engine and blocked in the other.
         prepared = await asyncio.to_thread(
             _ensure_prepared_geometry, session, producer='mesh.gmsh.run',
-            require_domain=True)
+            # DP-673. A 2D or axisymmetric section bounds no volume by
+            # design; asking it to refused every section not prepared by hand.
+            require_domain=not _meshes_a_section(session.state.db))
         if prepared is None:
             raise PreconditionFailedError(
                 'import geometry before running Gmsh; there is nothing to '
                 'prepare or mesh')
 
+        # Plan 33 W-G1 (FIELD-06, CURVE-04). Every enabled control that names
+        # geometry is resolved against the revision about to be meshed, here,
+        # before a run directory exists. The runner used to be where this was
+        # found -- inside WSL, minutes in, after the geometry had imported --
+        # and for a per-surface row naming its own Gmsh tag it was not found
+        # at all: the run published a mesh with the refinement silently
+        # missing.
+        _refuse_unresolved_scopes(session, prepared)
+
         run_id = str(command.parameters.get('run_id')
                      or f'gmsh-{uuid.uuid4().hex[:16]}')
-        formats = tuple(command.parameters.get('formats') or ('msh',))
+        # DP-676. What the run writes follows from the saved case alone: the
+        # MSH, and the SU2 on an SU2 case. It used to read a `formats` list
+        # off the command that nothing could send; MED and UNV are written by
+        # the Export page's Gmsh conversion.
         try:
             written = write_job(
                 session.state.db, _prepared_bbox(prepared), session.case_path,
                 prepared_geometry=prepared.reference, profile=profile,
-                run_id=run_id, formats=formats)
+                run_id=run_id)
         except ExecutionError as error:
             raise ValidationFailedError(str(error)) from error
         _require_every_prepared_source(prepared, written['job'])
@@ -1805,16 +2144,29 @@ class DomainOperations:
             _gmsh_runner_path(), layout.job, cwd=session.case_path)
         RunBuilder.record_launch(record, launch)
 
+        spec = OperationSpec(
+            operation=command.operation,
+            argv=launch.argv, cwd=session.case_path,
+            timeout=float(command.parameters.get('timeout_seconds', 3600)),
+            max_output_bytes=8 * 1024 * 1024,
+            log_path=layout.log,
+            cleanup_argv=launch.cleanup_argv,
+            invalidated_outputs=('quality', 'exports'))
         execution = await self._context(session).executor.execute(
-            session, OperationSpec(
-                operation=command.operation,
-                argv=launch.argv, cwd=session.case_path,
-                timeout=float(command.parameters.get('timeout_seconds', 3600)),
-                max_output_bytes=8 * 1024 * 1024,
-                log_path=layout.log,
-                cleanup_argv=launch.cleanup_argv,
-                invalidated_outputs=('quality', 'exports')),
-            on_line=command.parameters.get('on_line'))
+            session, spec, on_line=command.parameters.get('on_line'))
+
+        # DP-56. A segmentation fault is the one failure with nothing in it
+        # for the user, and the thread count is what decides it. Retried here
+        # rather than reported, once, and only once: the second attempt has
+        # one thread, so `retry_at_one_thread` refuses to arm again.
+        retry = retry_at_one_thread(layout, written['job'],
+                                    execution.to_payload())
+        if retry:
+            record.document['job_sha256'] = sha256_of(layout.job)
+            record.document.setdefault('warnings', []).append(retry)
+            record.write()
+            execution = await self._context(session).executor.execute(
+                session, spec, on_line=command.parameters.get('on_line'))
 
         result = _read_runner_result(layout)
         payload = execution.to_payload()
@@ -1854,7 +2206,13 @@ class DomainOperations:
             # and it is already in the payload, recorded on the manifest two
             # statements above.
             crashed = runner_crash_reason(
-                (payload.get('job') or {}).get('returncode'))
+                (payload.get('job') or {}).get('returncode'),
+                # DP-56. The remedy depends on how many threads this attempt
+                # had, and after a retry that is one -- so the message must
+                # read the job as it now stands, not as it was written.
+                threads=int((((written['job'].get('intent') or {})
+                              .get('parallel') or {})
+                             .get('threads', 0)) or 0))
             payload.update(failure_payload(
                 task='gmsh.compute',
                 reason=('the run was cancelled before it finished' if cancelled
@@ -1862,6 +2220,11 @@ class DomainOperations:
                         or result.get('error') or 'the Gmsh run failed'),
                 log=str(layout.log)))
             payload['cancelled'] = cancelled
+            if not cancelled:
+                # DP-506. The long text behind the failure's Details, read
+                # from this run's log the way a snappy stage's is.
+                from foammesh.core.run_result import read_failure_cause
+                payload['details'] = read_failure_cause(layout.log)[1]
             return OperationResult('failed', command.operation,
                                    session.revisions, payload=payload)
 
@@ -1893,9 +2256,11 @@ class DomainOperations:
         # solver can integrate over it. `accept_quality` must not reach it.
         accept = bool(command.parameters.get('accept_quality'))
         if not verdict.accepted and accept and not verdict.overridable:
+            # DP-94. The remedy the gate found travels with the refusal.
             reason = (
-                f'{verdict.reason} This verdict is {verdict.verdict}, which '
-                'cannot be accepted; re-mesh instead.')
+                f'{refusal_words(verdict)} This verdict is '
+                f'{verdict.verdict}, which cannot be accepted; re-mesh '
+                'instead.')
             RunBuilder.record_publication_failure(record, reason)
             payload.update(failure_payload(
                 task=_GMSH_GATE_TASK_ID, reason=reason, log=str(layout.log),
@@ -1904,9 +2269,13 @@ class DomainOperations:
             return OperationResult('failed', command.operation,
                                    session.revisions, payload=payload)
         if not verdict.accepted and not accept:
-            RunBuilder.record_publication_failure(record, verdict.reason)
+            # DP-94. The gate wrote the remedy into the verdict's warnings
+            # and the failure carried only the count, so the one sentence
+            # that says what to do next never reached the window.
+            refusal = refusal_words(verdict)
+            RunBuilder.record_publication_failure(record, refusal)
             payload.update(failure_payload(
-                task=_GMSH_GATE_TASK_ID, reason=verdict.reason,
+                task=_GMSH_GATE_TASK_ID, reason=refusal,
                 log=str(layout.log), built=True))
             return OperationResult('failed', command.operation,
                                    session.revisions, payload=payload)
@@ -1969,6 +2338,13 @@ class DomainOperations:
         #     handed to a publisher that reads 2.2;
         #   * with no target chosen there is no export anyone asked for, so a
         #     publisher failure is recorded and the native mesh survives it.
+        # Check 5. What the run grew, written before anything is made from the
+        # mesh, so a publication that fails still leaves the layer measurement
+        # the run took.
+        coverage = self._record_gmsh_layer_coverage(session, record)
+        if coverage:
+            payload['layer_coverage'] = coverage
+
         export_settings = _job_export_settings(record)
         target = str(export_settings.get('targetSolver') or 'unselected')
         if export_settings.get('writesSu2'):
@@ -1994,8 +2370,12 @@ class DomainOperations:
             payload['check_mesh'] = check
         else:
             census = self._census_native_gmsh_mesh(record)
+            if _job_is_planar(record):
+                # DP-674. A planar section's cells are its faces.
+                from dataclasses import replace as _replace
+                census = _replace(census, dimension=2)
             payload['element_census'] = census.to_dict()
-            if not census.has_volume_elements:
+            if not census.has_cells:
                 reason = census.read_error or (
                     'the mesh has no volume elements of any order; Gmsh '
                     'produced a surface mesh, which usually means the CAD '
@@ -2038,6 +2418,7 @@ class DomainOperations:
         waived = () if accepted else ('gmsh.compute',)
         payload['task_state'] = self._record_engine_run_success(
             session, command, warning=warning, waived=waived,
+            configured=_job_configured_tasks(record),
             exclude=() if check.get('ran') else ('gmsh.qa',))
         return self._artifact_result(session, command, payload,
                                      invalidates=('quality', 'exports'))
@@ -2076,7 +2457,8 @@ class DomainOperations:
                 'the SU2 export was requested but no file was written; the '
                 'Gmsh mesh itself is in the run directory')}
         census = element_census(path)
-        if census.read_error or not census.has_volume_elements:
+        # DP-674: a planar SU2 file (NDIME= 2) holds faces as its cells.
+        if census.read_error or not census.has_cells:
             return {'status': 'failed', 'artifact': str(path),
                     'reason': census.read_error or (
                         f'{path.name} holds no volume elements; the SU2 write '
@@ -2262,7 +2644,13 @@ class DomainOperations:
         try:
             result = await handler(session, inner)
         except FacadeError as error:
-            return {'ran': False, 'reason': str(error), 'check': operation,
+            # DP-50. Named, because the record was a dict with no status in it
+            # and every reader had to guess. A check that could not run is not
+            # a check that failed: the mesh was published and nobody has an
+            # opinion on it yet. Callers key off this to leave `gmsh.qa` to be
+            # run rather than marking it passed or refused.
+            return {'ran': False, 'status': 'unchecked', 'reason': str(error),
+                    'check': operation,
                     'details': dict(getattr(error, 'details', None) or {})}
         payload = result.payload or {}
         report = payload.get('parsed') if isinstance(
@@ -2673,6 +3061,7 @@ class DomainOperations:
     def _record_engine_run_success(self, session: CaseSession, command: Command,
                                    *, warning: bool = False,
                                    exclude: tuple = (),
+                                   configured=(),
                                    waived: tuple = ()) -> dict | None:
         """Advance the tasks this engine's atomic run actually performed.
 
@@ -2695,6 +3084,10 @@ class DomainOperations:
             covered = tuple(task for task in covered if task not in exclude)
             return store.record_atomic_run_success(
                 covered, warning=warning,
+                # DP-228. The optional tasks the job this run consumed carried
+                # settings for. The graph answers the same question from a page
+                # save that may have been refused, so it is not asked.
+                configured=tuple(configured),
                 # R119/R158. Only tasks this run actually covered: a waiver
                 # names a gate the run reached, never one it skipped.
                 waived=tuple(task for task in waived if task in covered))
@@ -2842,7 +3235,8 @@ class DomainOperations:
         try:
             report = publish(
                 record.layout.mesh, staged,
-                categories=_gmsh_patch_categories(prepared),
+                categories={**_gmsh_patch_categories(prepared),
+                            **_job_edge_categories(record)},
                 identities=_gmsh_patch_identities(prepared),
                 periodic_pairs=_job_periodic_pairs(record),
                 extrusion=_job_extrusion(record),
@@ -3144,7 +3538,7 @@ runTimeModifiable true;
             # the fact that this mesh is ours becomes knowable, and nothing
             # recorded it. `resolve_workflow` therefore read the sidecar's
             # `workflow=none` as `mesh exists but metadata has no workflow
-            # mode` -- External Mesh -- so the first re-resolution after a
+            # mode` -- External mesh -- so the first re-resolution after a
             # save re-opened our own freshly meshed case as an import and
             # collapsed the workflow outline to Scene / Display.
         from foammesh.core.case import record_generated_mesh
@@ -3447,6 +3841,12 @@ runTimeModifiable true;
                 retained.append('foammesh/runs')
         preview = service.preview(session.state.db, engine_id, probe=probe,
                                   retained_artifacts=retained)
+        if not getattr(ENGINE_REGISTRY.get(engine_id),
+                       'mixes_cad_and_surfaces', True):
+            # DP-638. Refused here, dry run included, because the method page
+            # shows the dry run's refusal beside the method; the Gmsh job
+            # would otherwise refuse the same case only at the run.
+            self._refuse_mixed_sources_for_gmsh(session)
         if command.parameters.get('dry_run', False):
             return self._read_result(session, command, {'preview': preview.to_dict()})
         session.require_writable()
@@ -3475,6 +3875,71 @@ runTimeModifiable true;
             payload={'preview': preview.to_dict(),
                      'transaction': transaction.to_dict() if transaction else None})
 
+    @staticmethod
+    def _refuse_mixed_sources_for_gmsh(session: CaseSession,
+                                       new_sources=()) -> None:
+        """DP-638: raise when Gmsh would be handed CAD and surfaces together."""
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.geometry.store import gmsh_mixed_sources_refusal
+        try:
+            entries = GeometryArtifactStore(session.case_path).entries()
+        except (OSError, ValueError):
+            entries = []
+        reason = gmsh_mixed_sources_refusal(entries, new_sources)
+        if reason:
+            raise PreconditionFailedError(reason, details={
+                'error': 'mixed_geometry_sources', 'engine': 'gmsh',
+                'new_sources': [str(source) for source in new_sources]})
+
+    #: Every OpenFOAM utility a mesh run reaches for before it launches
+    #: anything. One probe boots the runtime and answers for all of them, so
+    #: a run path asks for the whole list once rather than paying the boot at
+    #: whichever question happens to be first.
+    RUN_PATH_UTILITIES = (
+        'blockMesh', 'surfaceFeatures', 'snappyHexMesh', 'checkMesh',
+        'createNonConformalCouples', 'decomposePar', 'reconstructPar',
+        'mpirun')
+
+    async def _warm_utility_probes(self, names=None) -> None:
+        """Ask "is this utility there?" on a worker thread, before asking here.
+
+        DP-354. :meth:`CapabilityRegistry.utility` is a read that boots
+        something: it enters WSL and sources an OpenFOAM profile. Plan 30
+        WP-08 moved the *reading* paths off the event loop -- engine probes,
+        runtime diagnostics -- and left the *running* ones where they were,
+        and nothing noticed, because the CP-10 latency harness ran against a
+        stand-in load that awaited a timer and yielded instantly.
+
+        MEASURED once a live mesher was the load: the first yield after
+        ``workflow.run_pipeline`` was started came back in 22,630 ms cold and
+        4,554 ms warm, against CP-10's 200 ms. Timed one probe at a time, the
+        first costs 19,631 ms and the six after it cost 0.1 ms together --
+        the boot is the whole figure, and it was being paid by the window
+        that started the run, which is frozen for the duration.
+
+        The work still happens and still refuses exactly the runs it refused
+        before; it happens on a worker thread. The registry's own cache means
+        every later question in the same session is free.
+        """
+        import asyncio
+
+        registry = self._capabilities_registry()
+        if not hasattr(registry, 'utility'):
+            return
+        wanted = tuple(names or self.RUN_PATH_UTILITIES)
+
+        def probe():
+            for name in wanted:
+                try:
+                    registry.utility(name)
+                except Exception:                             # noqa: BLE001
+                    # Warming is never where a run fails. Whatever this was,
+                    # the caller is about to ask the same question on this
+                    # thread and report it in the words it already uses.
+                    pass
+
+        await asyncio.to_thread(probe)
+
     def _require_utility(self, name: str) -> str:
         capability = self._capabilities_registry().utility(name)
         if not getattr(capability, 'available', False) or not getattr(capability, 'executable', None):
@@ -3492,6 +3957,61 @@ runTimeModifiable true;
             raise PreconditionFailedError('the case has no polyMesh', details={
                 'case_path': str(session.case_path)})
         return poly_mesh
+
+    #: Which mesh each single-file export is written from, and the reader
+    #: on ``ImportExportService`` that finds it. ``vtk`` and ``gmsh`` are
+    #: absent because they read the published polyMesh directly. Plan 31
+    #: DP-15.
+    _EXPORT_SOURCES = {
+        'su2': ('native_su2_artifact', 'mesh.su2'),
+        'med': ('native_msh_artifact', 'mesh.msh'),
+        'unv': ('native_msh_artifact', 'mesh.msh'),
+        'cgns': ('native_msh_artifact', 'mesh.msh'),
+    }
+
+    @classmethod
+    def _require_exportable_mesh(cls, session: CaseSession,
+                                 entry_id: str) -> Path:
+        """The mesh this format is written from, or a refusal naming both.
+
+        Plan 31 DP-15, the export half of the wall DP-19 met on the readiness
+        check. MEASURED in leg t7-su2-r2 of the campaign: ten Gmsh runs
+        against an SU2 target meshed, passed the readiness check, and were
+        then refused at the export -- because a Gmsh run aimed at SU2
+        publishes no ``constant/polyMesh`` by design (the ``mesh.su2`` it
+        wrote *is* the mesh, and re-deriving one would hand the user a
+        different mesh under the same name), and this precondition asked for
+        one anyway. ``ImportExportService.export_su2`` hands over that file
+        without ever looking at a polyMesh; it was simply never reached, and
+        the GUI showed the refusal inside a progress dialog, so the campaign
+        recorded only the window's title.
+
+        Which mesh is needed depends on the format. ``vtk`` and ``gmsh`` read
+        the published polyMesh directly -- ``load_case_dataset`` and
+        ``load_case_blocks`` open it -- and still demand one. ``su2`` is
+        copied from the accepted run's ``mesh.su2``, and ``med``, ``unv`` and
+        ``cgns`` are converted from its ``mesh.msh``; each of those is
+        satisfied by the artifact its exporter actually reads, asked for
+        through the same reader the exporter asks with.
+        """
+        poly_mesh = session.case_path / 'constant' / 'polyMesh'
+        if (poly_mesh / 'points').exists() or (poly_mesh / 'faces').exists():
+            return poly_mesh
+        reader, filename = cls._EXPORT_SOURCES.get(entry_id, ('', ''))
+        if not reader:
+            raise PreconditionFailedError('the case has no polyMesh', details={
+                'case_path': str(session.case_path), 'entry_id': entry_id})
+        from foammesh.core.import_export.service import ImportExportService
+
+        artifact = getattr(ImportExportService, reader)(session.case_path)
+        if artifact is not None:
+            return Path(artifact.get('path') or '')
+        raise PreconditionFailedError(
+            f'the case has no mesh the {entry_id} export can read: no '
+            f'polyMesh in constant/, and no accepted Gmsh run has recorded a '
+            f'native {filename}',
+            details={'case_path': str(session.case_path),
+                     'poly_mesh': str(poly_mesh), 'entry_id': entry_id})
 
     @staticmethod
     def _require_readiness_mesh(session: CaseSession) -> Path:
@@ -3696,12 +4216,47 @@ runTimeModifiable true;
 
     # -- Slice 1: lifecycle / persistence / history ------------------------ #
 
+    @staticmethod
+    def _native_mesh_artifact(case_path):
+        """The mesh file an accepted run wrote, where no polyMesh exists.
+
+        DP-62. ``has_mesh`` answers one question -- is there a
+        ``constant/polyMesh`` -- and for most of this application that is the
+        same question as "is there a mesh". It is not the same question on the
+        SU2 route: a Gmsh run targeting SU2 records a publication whose status
+        is ``skipped``, because the solver reads the file Gmsh wrote and a
+        polyMesh would be a copy nobody asked for. Ten such runs in leg t7-su2
+        meshed and then found every Export button disabled.
+
+        SU2 first, then the ``.msh``, because the SU2 artifact is the one the
+        run was asked for; the ``.msh`` is there for every accepted run and is
+        what the conversion formats are written from. Either is a mesh the
+        user can be handed a file of.
+
+        Wrapped, because a classification that cannot answer must not stop a
+        case from opening -- the caller reads a payload, not an exception.
+
+        The reading itself now lives in ``core.facade.mesh_presence``, so
+        that the shell asking "has this case a mesh" and this payload key
+        are one implementation rather than two that agree today.
+        """
+        from foammesh.core.facade.mesh_presence import native_mesh_artifact
+        return native_mesh_artifact(case_path)
+
     def _classify(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.case import classify_case
         classification = classify_case(session.case_path)
+        native_mesh_path = self._native_mesh_artifact(session.case_path)
         payload = {'kind': getattr(classification.kind, 'value', str(classification.kind)),
                    'reasons': list(getattr(classification, 'reasons', [])),
                    'has_mesh': classification.has_mesh,
+                   # DP-62. Both, separately: `has_mesh` is still exactly
+                   # "there is a polyMesh", which is what every other reader
+                   # of this payload means by it, and the export gate asks
+                   # the wider question it actually has.
+                   'native_mesh_path': native_mesh_path,
+                   'has_exportable_mesh': bool(classification.has_mesh
+                                               or native_mesh_path),
                    'case_path': str(classification.path),
                    'poly_mesh_path': (str(classification.poly_mesh_path)
                                       if classification.poly_mesh_path else None)}
@@ -3788,11 +4343,14 @@ runTimeModifiable true;
             'change_sets': list(session.change_sets)})
 
     async def _parallel_redistribute(self, session: CaseSession, command: Command) -> OperationResult:
-        from foammesh.settings.local_settings import LocalSettings, LocalSettingKey
         case_root = (session.case_path if (session.case_path / 'constant').is_dir()
                      else session.case_path / 'case')
+        # DP-691. The default was the Parallel Environment dialog's count in
+        # local.cfg, so the base grid decomposed for a number the meshing run
+        # did not use and castellation threw the processor cases away. It is
+        # the run's own rank count now.
         cores = int(command.parameters.get(
-            'cores', LocalSettings(session.storage_path).get(LocalSettingKey.PARALLEL_NP, 1)))
+            'cores', self._stage_ranks(session, command)))
         if cores < 1:
             raise ValidationFailedError('cores must be positive')
         execution = None
@@ -3814,79 +4372,6 @@ runTimeModifiable true;
             ('accepted' if execution is None or execution.succeeded else 'failed'),
             command.operation, session.revisions, payload=payload)
 
-    async def _parallel_configure(self, session: CaseSession, command: Command) -> OperationResult:
-        parallel = command.parameters.get('parallel')
-        if not isinstance(parallel, dict):
-            raise ValidationFailedError('a serializable parallel configuration is required')
-        from foammesh.support.mpi import ParallelEnvironment, ParallelType
-        try:
-            cores = int(parallel['cores'])
-            if cores < 1:
-                raise ValueError('cores must be positive')
-            type_value = parallel.get('type', 'LOCAL_MACHINE')
-            parallel_type = (ParallelType[type_value] if isinstance(type_value, str)
-                             else ParallelType(int(type_value)))
-            environment = ParallelEnvironment(
-                cores, parallel_type, str(parallel.get('hosts', '')))
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValidationFailedError(f'invalid parallel configuration: {error}') from error
-        from foammesh.settings.local_settings import LocalSettings
-        settings = LocalSettings(session.storage_path)
-        previous = settings.parallelEnvironment().np()
-        case_root = (session.case_path if (session.case_path / 'constant').is_dir()
-                     else session.case_path / 'case')
-        executions = []
-        if cores != previous:
-            processor_cases = tuple(case_root.glob('processor[0-9]*'))
-            if processor_cases:
-                reconstructed = await self._run_openfoam_utility(
-                    session, command, 'reconstructPar',
-                    ('-constant', '-noFields', '-case', str(case_root)),
-                    cwd=case_root, mutation=True)
-                executions.append(reconstructed)
-                if not reconstructed.succeeded:
-                    return OperationResult(
-                        'failed', command.operation, session.revisions,
-                        payload={'previous_cores': previous, 'cores': cores,
-                                 'executions': [
-                                     item.to_payload() for item in executions]})
-            # Redistribution only applies to a mesh that exists. Choosing the
-            # core count before meshing is the normal order of work, and
-            # running decomposePar on an empty case failed -- which left the
-            # setting unwritten, so parallel meshing could never be requested
-            # up front. The dictionary is still written, because that is what
-            # the mesher decomposes with when it runs.
-            has_mesh = (case_root / 'constant' / 'polyMesh' / 'owner').is_file()
-            if cores > 1:
-                self._write_decompose_par_dict(
-                    case_root, cores,
-                    DecompositionSettings.read(session.state.db))
-            if cores > 1 and has_mesh:
-                decomposed = await self._run_openfoam_utility(
-                    session, command, 'decomposePar',
-                    ('-case', str(case_root), '-force'),
-                    cwd=case_root, mutation=True,
-                    expected=(ExpectedArtifact(
-                        case_root / 'processor0', kind='processor-case',
-                        validator=lambda path: path.is_dir()),))
-                executions.append(decomposed)
-                if not decomposed.succeeded:
-                    return OperationResult(
-                        'failed', command.operation, session.revisions,
-                        payload={'previous_cores': previous, 'cores': cores,
-                                 'executions': [
-                                     item.to_payload() for item in executions]})
-        settings.setParallelEnvironment(environment)
-        return self._read_result(
-            session, command, {
-                'previous_cores': previous, 'cores': cores,
-                'executions': [item.to_payload() for item in executions],
-                'runtime_fingerprint':
-                    self._capabilities_registry().runtime_fingerprint(
-                        'decomposePar' if cores > 1 else 'reconstructPar')
-                    if executions else None,
-            })
-
     @staticmethod
     def _write_decompose_par_dict(case_root: Path, cores: int,
                                   settings=None) -> Path:
@@ -3903,7 +4388,8 @@ runTimeModifiable true;
         `hierarchical` dictionary with a `scotch` one and the user's choice
         vanished between two controls on the same case. It is now read from
         the project, and the three fields travel as one object so the order
-        and the cell counts cannot be left behind either.
+        and the cell counts cannot be left behind either. (DP-692 removed that
+        dialog; `_parallel_redistribute` is the one caller left.)
         """
         from foammesh.openfoam import decomposition
 
@@ -3926,14 +4412,6 @@ runTimeModifiable true;
                 recover_mesh=mutation,
                 cleanup_argv=launch.cleanup_argv),
             on_line=command.parameters.get('on_line'))
-
-    def _launch_paraview(self, session: CaseSession, command: Command) -> OperationResult:
-        import subprocess
-        from foammesh.core.shell import paraview_argv
-        executable = self._require_utility('paraview')
-        process = subprocess.Popen(
-            paraview_argv(executable, session.case_path), cwd=session.case_path)
-        return self._read_result(session, command, {'pid': process.pid, 'started': True})
 
     async def _launch_terminal(self, session: CaseSession, command: Command) -> OperationResult:
         import shutil
@@ -4024,13 +4502,21 @@ runTimeModifiable true;
 
     _GEOMETRY_EXTENSIONS = {'.stl', '.obj', '.step', '.stp', '.iges', '.igs', '.brep'}
 
-    def _geometry_import(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _geometry_import(self, session: CaseSession, command: Command) -> OperationResult:
+        import asyncio
         session.require_writable()
         source = self._source(command)
         if source.suffix.lower() not in self._GEOMETRY_EXTENSIONS:
             raise ValidationFailedError('unsupported geometry format', details={
                 'suffix': source.suffix,
                 'supported': sorted(self._GEOMETRY_EXTENSIONS)})
+        from foammesh.core.engine.registry import (
+            ENGINE_REGISTRY, configured_engine_id)
+        engine_id = configured_engine_id(session.state.db)
+        if engine_id in ENGINE_REGISTRY.ids() and not getattr(
+                ENGINE_REGISTRY.get(engine_id), 'mixes_cad_and_surfaces', True):
+            # DP-638: a STEP beside an STL is a case Gmsh cannot mesh.
+            self._refuse_mixed_sources_for_gmsh(session, (source,))
         from foammesh.core.geometry import GeometryArtifactStore
         from foammesh.core.geometry.diagnostics import budget as budget_module
 
@@ -4041,11 +4527,16 @@ runTimeModifiable true;
         # and drive its Cancel button, and registering the budget gives that
         # button something to act on.
         job_id = f'geometry-import-{uuid.uuid4().hex[:12]}'
-        budget = budget_module.budget_from_settings(
-            'geometry.import',
-            on_progress=lambda check, fraction, message: session.state.bus.publish(
+        loop = asyncio.get_running_loop()
+
+        def progress(check, fraction, message):
+            # Reported from the worker thread; the bus belongs to the loop.
+            loop.call_soon_threadsafe(lambda: session.state.bus.publish(
                 Event.JOB_PROGRESS, job_id=job_id, name=command.operation,
                 stage=check, fraction=fraction, message=message))
+
+        budget = budget_module.budget_from_settings(
+            'geometry.import', on_progress=progress)
         budget_module.register(job_id, budget)
         session.state.bus.publish(
             Event.JOB_STARTED, job_id=job_id, name=command.operation,
@@ -4060,7 +4551,15 @@ runTimeModifiable true;
             # be a constant inside the store, so the panel that asks for it
             # had nowhere to send the answer and no import ever recorded what
             # it had been faceted at.
-            imported = GeometryArtifactStore(session.case_path).import_file(
+            #
+            # DP-508 (MA-12). Off the loop. In the desktop this handler ran on
+            # the GUI thread, so the status-bar Cancel the budget is registered
+            # for could never be clicked: MEASURED, `helical_pipe.step` held
+            # the owner loop for 9.3 s in one slice at the default deflection,
+            # and the audit's import of it sat at "Not Responding" for four
+            # minutes.
+            imported = await asyncio.to_thread(
+                GeometryArtifactStore(session.case_path).import_file,
                 source, budget=budget,
                 unit=command.parameters.get('unit'),
                 tessellation=command.parameters.get('tessellation'))
@@ -4102,25 +4601,52 @@ runTimeModifiable true;
         from foammesh.core.geometry import GeometryArtifactStore
         try:
             reports = GeometryArtifactStore(session.case_path).diagnose(
-                command.parameters.get('geometry_id'))
+                command.parameters.get('geometry_id'),
+                target_cell_size=self._readiness_target_cell_size(session),
+                engine=self._readiness_engine(session))
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
                 'geometry_id': str(error.args[0])}) from error
         return self._read_result(session, command, {
             'geometry_count': len(reports), 'geometries': reports})
 
+    @staticmethod
+    def _readiness_target_cell_size(session: CaseSession) -> float | None:
+        """The size a geometry verdict is taken against, or None (DP-409).
+
+        Four call sites ask the store for the same verdict and three of them
+        used to ask it differently: the readiness operation passed the target
+        cell size and the engine, the preparation decision passed only the
+        engine, the repair plan passed only the size, and the diagnostics
+        operation passed only the engine. `assess` is handed both and grades
+        by both, so those are four different questions about one geometry,
+        and the gate that decides preparation was reading a verdict the
+        readiness page never showed. They ask the same question now.
+        """
+        try:
+            return float(session.state.db.getValue('baseGrid/targetCellSize'))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _readiness_engine(session: CaseSession) -> str | None:
+        """Which mesher a geometry verdict is being asked for (DP-114).
+
+        ``None`` while no engine is chosen: the verdict is then advisory for
+        both, which is the honest answer and not a silent vote for either.
+        """
+        from foammesh.core.engine import configured_engine_id
+        engine = configured_engine_id(session.state.db)
+        return engine if engine in ('snappy', 'gmsh') else None
+
     def _geometry_readiness(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.geometry import GeometryArtifactStore
         store = GeometryArtifactStore(session.case_path)
-        target_cell_size = None
-        try:
-            target_cell_size = float(session.state.db.getValue('baseGrid/targetCellSize'))
-        except (KeyError, TypeError, ValueError):
-            pass
         try:
             report = store.readiness_report(
                 command.parameters.get('geometry_id'),
-                target_cell_size=target_cell_size)
+                target_cell_size=self._readiness_target_cell_size(session),
+                engine=self._readiness_engine(session))
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
                 'geometry_id': str(error.args[0])}) from error
@@ -4152,13 +4678,46 @@ runTimeModifiable true;
         if decision is GeometryPreparationDecision.UNDECIDED:
             raise ValidationFailedError('undecided is not a completion decision')
 
-        report = GeometryArtifactStore(session.case_path).readiness_report()
+        report = GeometryArtifactStore(session.case_path).readiness_report(
+            target_cell_size=self._readiness_target_cell_size(session),
+            engine=self._readiness_engine(session))
         states = {
             item['diagnostics']['readiness']['state']
             for item in report['geometries']
             if item['diagnostics'].get('readiness')
         }
         acknowledgment = command.parameters.get('ack_reason')
+        # DP-125. `blocked` is overridable on a written reason. That is right
+        # where the block is a judgement -- a wrap recommendation, a risk the
+        # user may know better than the checks do -- and wrong where it is a
+        # fact about the chosen engine. DP-114 taught the grader that a free
+        # edge is a leak risk to snappy and fatal to Gmsh, which has to fill a
+        # volume the surface bounds; it did not stop the override. MEASURED on
+        # `cyclone` in the `9f6abca1` sweep: readiness said `blocked` and named
+        # the 54 edges, the Prepare step took a written reason for them, and
+        # the Gmsh run died 62 s later on the same 54 edges. No reason a user
+        # can write closes a hole, so the override is refused with the routes
+        # that do: repair, wrap, or the engine that meshed this geometry.
+        fatal = sorted({
+            kind
+            for item in report['geometries']
+            for kind in ((item['diagnostics'].get('readiness') or {})
+                         .get('engine_fatal') or ())})
+        if (decision in (GeometryPreparationDecision.AS_IS,
+                         GeometryPreparationDecision.OVERRIDDEN) and fatal):
+            engine = self._readiness_engine(session)
+            raise ValidationFailedError(
+                f'this geometry cannot be meshed by {engine} as it is, and no '
+                'acknowledgement changes that: '
+                + '; '.join(sorted({
+                    reason
+                    for item in report['geometries']
+                    for reason in ((item['diagnostics'].get('readiness') or {})
+                                   .get('reasons') or ())}))
+                + '. Repair or wrap the geometry, or choose the other engine.',
+                details={'readiness_states': sorted(states),
+                         'engine': engine,
+                         'engine_fatal': fatal})
         risky = bool(states & {'blocked', 'wrap_recommended'})
         if decision is GeometryPreparationDecision.AS_IS and risky:
             if not isinstance(acknowledgment, str) or not acknowledgment.strip():
@@ -4193,13 +4752,20 @@ runTimeModifiable true;
         })
 
     @staticmethod
-    def _invalidate_geometry_preparation(session: CaseSession) -> None:
+    def _invalidate_geometry_preparation(session: CaseSession) -> bool:
+        """Reopen the preparation decision, and say whether it had to.
+
+        DP-350. The answer is the caller's evidence that anything happened.
+        A decision already reading `undecided` is the ordinary state of a
+        case nobody has prepared yet, and an operation that reaches this and
+        finds it has changed nothing.
+        """
         from foammesh.core.project import Source
         from foammesh.db.configurations_schema import GeometryPreparationDecision
         current = session.state.db.getValue('geometryPreparation/decision')
         current_value = current.value if hasattr(current, 'value') else current
         if current_value == GeometryPreparationDecision.UNDECIDED.value:
-            return
+            return False
         data = session.state.checkout()
         data.setValue('geometryPreparation/decision', GeometryPreparationDecision.UNDECIDED)
         data.setValue('geometryPreparation/geometryFingerprint', None)
@@ -4207,6 +4773,7 @@ runTimeModifiable true;
         session.state.commit(
             data, action='reopen geometry preparation', source=Source.SYSTEM,
             target='geometryPreparation', reason='geometry changed')
+        return True
 
     def _geometry_classify(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.geometry import GeometryArtifactStore
@@ -4398,6 +4965,203 @@ runTimeModifiable true;
                      'split': report, 'patches': rows,
                      'geometry_rows': reconciled})
 
+    def _geometry_split_interfaces(self, session: CaseSession,
+                                   command: Command) -> OperationResult:
+        """Cut an assembly into the surfaces OpenFOAM 13 names.
+
+        DP-421/DP-422. ``multiRegion/CHT/heatedDuct`` is written as one
+        surface per interface plus one for the outer skin, each interface
+        carrying its own ``faceZone``/``cellZone`` pair and the point inside
+        the region it encloses. FoamMesh could not author that shape: an
+        imported body is one closed surface, and one closed surface can be
+        typed one thing, so a conjugate assembly came out as two cell zones
+        with the shared wall drawn twice and no interface at all.
+
+        This is the operation that makes the shape: the store cuts the shared
+        walls away, and the rows here are what the writer reads -- the body
+        keeps its own skin as a plain boundary, the shared wall becomes a
+        surface typed ``interface`` hanging off the enclosed body's volume,
+        and that volume is typed ``cellZone`` and carries the seed. Bodies
+        that share nothing are the single-region catalogue and are left
+        exactly as they were, rows and fingerprints both.
+
+        ``preview`` measures and writes nothing, in either store.
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+
+        preview = bool(command.parameters.get('preview', False))
+        if not preview:
+            session.require_writable()
+        store = GeometryArtifactStore(session.case_path)
+        geometry_ids = command.parameters.get('geometry_ids') or None
+        try:
+            result = store.split_interfaces(geometry_ids, preview=preview)
+        except KeyError as error:
+            raise PreconditionFailedError('geometry artifact does not exist', details={
+                'geometry_id': str(error.args[0])}) from error
+        except (OSError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
+        if preview:
+            return self._read_result(session, command, result)
+        rows = self._rows_from_the_cut(session, result)
+        self._invalidate_geometry_preparation(session)
+        session.state.bus.publish(
+            Event.ARTIFACT_GEOMETRY_CHANGED, operation=command.operation,
+            count=len(result['interfaces']))
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            invalidated_outputs=('mesh', 'quality'),
+            payload={'is_assembly': result['is_assembly'],
+                     'interfaces': result['interfaces'],
+                     'bodies': result['bodies'],
+                     'warnings': result['warnings'],
+                     'geometry_rows': rows})
+
+    def _rows_from_the_cut(self, session: CaseSession, result: dict) -> dict:
+        """Give the project tree the pieces the cut left behind.
+
+        Three edits, and each of them is a fact the snappy writer reads. The
+        bodies that lost faces get their polydata replaced, or the tree and
+        the viewport would go on showing a wall that is no longer theirs.
+        The enclosed body's volume is typed ``cellZone`` and given the seed,
+        because ``surfaceZonesInfo.C:79-82`` makes the point mandatory under
+        ``mode insidePoint`` and an interface -- enclosing nothing -- cannot
+        be written any other way. And the interface itself becomes a surface
+        row typed ``interface`` under that volume, which is the shape
+        ``_effective_cfd_type`` reads to decide the wall carves the zone.
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.geometry.patches.pieces import patch_polydata
+        from foammesh.core.project import Source
+        from foammesh.db.configurations_schema import CFDType, GeometryType, Shape
+
+        if not result['interfaces']:
+            # Nothing was cut, so nothing in the tree is out of date. Most of
+            # the catalogue lands here and must not pay a commit for it.
+            return {}
+        artifacts = {str(entry.get('geometry_id')): entry.get('artifact')
+                     for entry in GeometryArtifactStore(session.case_path).entries()}
+        editor = self._patch_editor(session)
+        manifest = self._patch_rows(editor)
+        data = session.state.checkout()
+        summary: dict = {'bodies': {}, 'interfaces': []}
+
+        for body in result['bodies']:
+            if not body['removed']:
+                continue
+            geometry_id = str(body['geometry_id'])
+            keys = self._owned_surface_keys(data, geometry_id, [])
+            artifact = artifacts.get(geometry_id)
+            if not keys or not artifact:
+                summary['bodies'][geometry_id] = {'refreshed': False}
+                continue
+            kept = self._rows_for(manifest, geometry_id)
+            pieces = patch_polydata(artifact, kept)
+            refreshed = self._refresh_polydata(data, keys, kept, pieces)
+            summary['bodies'][geometry_id] = {'refreshed': True,
+                                              'rows': refreshed}
+
+        for item in result['interfaces']:
+            enclosed = str(item.get('inside_geometry_id') or '')
+            volume = self._volume_of(data, enclosed)
+            if volume is None:
+                raise PreconditionFailedError(
+                    'the body this interface encloses has no volume in the '
+                    'project tree', details={'geometry_id': enclosed,
+                                             'interface': item['name']})
+            data.setValue(f'geometry/{volume}/cfdType', CFDType.CELL_ZONE.value)
+            for axis, value in zip(('x', 'y', 'z'), item['inside_point']):
+                data.setValue(
+                    f'geometry/{volume}/zoneInsidePoint/{axis}', float(value))
+            data.setValue(f'geometry/{volume}/zoneInsidePointSet', True)
+
+            geometry_id = str(item['geometry_id'])
+            rows = self._rows_for(manifest, geometry_id)
+            if not rows:
+                raise PreconditionFailedError(
+                    'the interface the cut wrote has no boundary of its own',
+                    details={'geometry_id': geometry_id,
+                             'interface': item['name']})
+            pieces = patch_polydata(artifacts.get(geometry_id), rows)
+            added = []
+            for row in rows:
+                name = str(row.get('name'))
+                surface = data.newElement('geometry')
+                surface.setValue('gType', GeometryType.SURFACE.value)
+                surface.setValue('geometryId', geometry_id)
+                if row.get('patch_uuid'):
+                    surface.setValue('patchUuid', str(row['patch_uuid']))
+                surface.setValue('name', name)
+                surface.setValue('shape', Shape.TRI_SURFACE_MESH.value)
+                surface.setValue('cfdType', CFDType.INTERFACE.value)
+                surface.setValue('volume', volume)
+                surface.setValue('path', data.addGeometryPolyData(pieces[name]))
+                added.append(str(data.addElement('geometry', surface)))
+            summary['interfaces'].append({
+                'geometry_id': geometry_id, 'name': item['name'],
+                'volume': str(volume), 'added': added,
+                'inside_point': list(item['inside_point'])})
+
+        session.state.commit(
+            data, action='split interfaces', source=Source.GUI,
+            target='geometry',
+            reason='; '.join(str(item['name'])
+                             for item in summary['interfaces']))
+        for item in summary['interfaces']:
+            item['added'] = [str(data.remappedKey('geometry', key))
+                             for key in item['added']]
+        return summary
+
+    @staticmethod
+    def _refresh_polydata(data, keys: list, rows: list, pieces: dict) -> list:
+        """Point each surviving row at the shell the cut left it.
+
+        By patch identity first, then by name, and by position only when the
+        two lists are the same length -- which is the single-solid body, the
+        one case where a name can have drifted (an import suffixes a name the
+        tree already holds) and position still says the right thing.
+        """
+        elements = {str(key): data.getElement('geometry', key) for key in keys}
+        by_uuid = {str(element.value('patchUuid')): key
+                   for key, element in elements.items()
+                   if element.value('patchUuid')}
+        by_name = {str(element.value('name')): key
+                   for key, element in elements.items()}
+        moved = []
+        for position, row in enumerate(rows):
+            name = str(row.get('name'))
+            key = by_uuid.get(str(row.get('patch_uuid') or ''))
+            if key is None:
+                key = by_name.get(name)
+            if key is None and len(rows) == len(keys):
+                key = str(keys[position])
+            if key is None or name not in pieces:
+                continue
+            previous = elements[key].value('path')
+            if previous:
+                data.removeGeometryPolyData(previous)
+            data.setValue(f'geometry/{key}/path',
+                          data.addGeometryPolyData(pieces[name]))
+            moved.append(key)
+        return moved
+
+    @staticmethod
+    def _volume_of(data, geometry_id: str):
+        """The volume row the surfaces of one artifact hang off."""
+        from foammesh.db.configurations_schema import GeometryType
+
+        if not geometry_id:
+            return None
+        for key in data.getKeys(
+                'geometry',
+                lambda key, element: (
+                    str(element.get('gType')) == GeometryType.SURFACE.value
+                    and str(element.get('geometryId') or '') == str(geometry_id))):
+            volume = data.getElement('geometry', key).value('volume')
+            if volume is not None and str(volume) != '':
+                return volume
+        return None
+
     # -- one boundary, two stores (R169) ----------------------------------- #
 
     def _reconcile_geometry_rows(self, session: CaseSession,
@@ -4487,6 +5251,11 @@ runTimeModifiable true;
                 element = data.newElement('geometry')
                 element.setValue('gType', GeometryType.SURFACE.value)
                 element.setValue('geometryId', geometry_id)
+                # DP-383. The rebuilt row keeps the patch identity too, or the
+                # first edit on the Repair page would cost the tree the handle
+                # the edit dialog renames by.
+                if row.get('patch_uuid'):
+                    element.setValue('patchUuid', str(row['patch_uuid']))
                 element.setValue('name', name)
                 element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
                 element.setValue('cfdType',
@@ -4620,7 +5389,8 @@ runTimeModifiable true;
         # undoing a patch rename is a second write, while abandoning an
         # uncommitted working copy costs nothing.
         editor = self._patch_editor(session)
-        patch_uuid = self._patch_uuid_named(editor, previous)
+        patch_uuid = self._patch_uuid_for(
+            editor, data.getElement('geometry', geometry_id), previous, data)
         action = None
         if patch_uuid is not None:
             try:
@@ -4677,6 +5447,55 @@ runTimeModifiable true;
             if str(row.get('name')) == str(name):
                 return row.get('patch_uuid')
         return None
+
+    def _patch_uuid_for(self, editor, element, previous: str, data=None):
+        """The manifest row one tree row stands for.
+
+        The stamped uuid first, because it is the only handle that means the
+        same thing in both stores. DP-383: the name is not a handle. Every
+        STEP body is faced ``face0..faceN`` from zero, so a second CAD file
+        collides with the first, and the tree -- which has to show unique
+        names -- quietly records the second one as ``face01`` while the
+        manifest keeps ``face0``. Matching by name then found nothing, the
+        rename wrote the tree alone, and the mesh shipped the boundary under a
+        name the user had already replaced and could no longer see anywhere.
+
+        Then the name, scoped to the artifact the row belongs to, for a row
+        stamped before the uuid was carried; then the name alone, for a
+        project saved before either field existed. Both fall back to what this
+        did before rather than refusing a rename that used to work.
+        """
+        rows = self._patch_rows(editor)
+        stamped = str(element.value('patchUuid') or '')
+        if stamped:
+            for row in rows:
+                if str(row.get('patch_uuid')) == stamped:
+                    return row.get('patch_uuid')
+        geometry_id = str(element.value('geometryId') or '')
+        if geometry_id:
+            owned = [row for row in rows
+                     if str(row.get('geometry_id') or '') == geometry_id]
+            if owned:
+                for row in owned:
+                    if str(row.get('name')) == str(previous):
+                        return row.get('patch_uuid')
+                # DP-636. One boundary in the artifact and one surface row
+                # standing for it: that pairing is not a guess. A single-solid
+                # STL's row was stamped with the artifact but never with the
+                # uuid, and the tree names it `<volume>_surface` where the
+                # manifest keeps the solid's own name, so the name pass above
+                # misses it and the rename used to write the tree alone.
+                if len(owned) == 1 and data is not None and len(data.getKeys(
+                        'geometry', lambda _key, row: (
+                            str(row.get('geometryId') or '') == geometry_id
+                            and str(row.get('gType')) == 'surface'))) == 1:
+                    return owned[0].get('patch_uuid')
+                # The artifact is known and none of its boundaries answers to
+                # this name. Falling through to the unscoped search from here
+                # would rename another file's boundary, which is the whole of
+                # the fault above with the blame moved.
+                return None
+        return self._patch_uuid_named(editor, previous)
 
     def _geometry_combine(self, session: CaseSession, command: Command) -> OperationResult:
         session.require_writable()
@@ -4761,12 +5580,10 @@ runTimeModifiable true;
         from foammesh.core.geometry.store import is_cad_entry
         store = GeometryArtifactStore(session.case_path)
         geometry_id = command.parameters.get('geometry_id')
-        try:
-            target_cell_size = float(session.state.db.getValue('baseGrid/targetCellSize'))
-        except (KeyError, TypeError, ValueError):
-            target_cell_size = None
         report = store.readiness_report(
-            geometry_id, target_cell_size=target_cell_size)
+            geometry_id,
+            target_cell_size=self._readiness_target_cell_size(session),
+            engine=self._readiness_engine(session))
         selected = report.get('geometries', ())
         inferred_route = ('cad' if len(selected) == 1 and is_cad_entry(selected[0])
                           else 'tessellated')
@@ -4801,8 +5618,14 @@ runTimeModifiable true;
             raise ValidationFailedError(str(error)) from error
         finally:
             self._finish_geometry_prepare(session.case_id, token)
+        # DP-89. The store's convention is that a private key on a report
+        # starts with an underscore; the CAD route returns six of them, two
+        # of which are raw OCCT shapes. Stripping one by name shipped those
+        # to the GUI, where json.dumps raised and killed the repair. Strip
+        # the prefix, the way the store's own apply path does.
         return self._read_result(session, command, {
-            key: value for key, value in report.items() if key != '_polydata'})
+            key: value for key, value in report.items()
+            if not key.startswith('_')})
 
     async def _geometry_repair_apply(self, session: CaseSession, command: Command) -> OperationResult:
         import asyncio
@@ -5023,6 +5846,17 @@ runTimeModifiable true;
     async def _workflow_generate_dictionaries(self, session: CaseSession, command: Command) -> OperationResult:
         session.require_writable()
         values = command.parameters.get('bbox')
+        if values is None:
+            # DP-576 (field audit 0924 snappy-front D3). The recipes and any
+            # caller that has already saved its standoff ask for the
+            # dictionaries without a box, and were refused. The box is the
+            # geometry's own extent (the builder adds the saved standoff, or
+            # uses the named bounding hex), so derive it rather than refuse.
+            values = self._generation_bounds(session)
+            if values is None:
+                raise ValidationFailedError(
+                    'bbox was not given and there is no imported geometry or '
+                    'bounding hex to take it from')
         if not isinstance(values, (list, tuple)) or len(values) != 6:
             raise ValidationFailedError(
                 'bbox must contain xmin, xmax, ymin, ymax, zmin, zmax')
@@ -5046,7 +5880,7 @@ runTimeModifiable true;
         if configured_engine_id(session.state.db) == 'unselected':
             raise PreconditionFailedError(
                 'Choose a meshing method before generating dictionaries. '
-                'Open step 3, Meshing Method, and apply one.')
+                'Open the Meshing method step and apply one.')
         engine = resolve_engine(session.state.db)
         # F-12. Both engines, one answer. This used to run for snappy only,
         # so an imported case was ready to generate dictionaries in one
@@ -5056,7 +5890,7 @@ runTimeModifiable true;
             prepared = await asyncio.to_thread(
                 _ensure_prepared_geometry, session,
                 producer='workflow.generate_dictionaries',
-                require_domain=True)
+                require_domain=not _meshes_a_section(session.state.db))
         except (PreparedGeometryError, TypeError, ValueError) as error:
             raise ValidationFailedError(
                 f'geometry preparation failed: {error}') from error
@@ -5146,13 +5980,15 @@ runTimeModifiable true;
         if configured_engine_id(session.state.db) == 'unselected':
             raise PreconditionFailedError(
                 'Choose a meshing method before running a meshing stage. '
-                'Open step 3, Meshing Method, and apply one.')
+                'Open the Meshing method step and apply one.')
         engine = resolve_engine(session.state.db)
         try:
             definition = engine.validate(stage)
         except ValueError as error:
             raise ValidationFailedError(
                 'unknown meshing stage', details={'stage': stage}) from error
+        # DP-354. Before anything on this path asks the runtime a question.
+        await self._warm_utility_probes()
         feature_payload = None
         if definition.stage in {'castellation', 'snappyHexMesh'}:
             self._validate_fluid_seed(session)
@@ -5196,10 +6032,35 @@ runTimeModifiable true;
             # app had told them something went wrong.
             payload['task_state'] = self._record_stage_run_failure(
                 session, command, getattr(definition, 'task_id', None))
+            job = payload.get('job') or {}
+            if str(job.get('status') or '') != 'cancelled':
+                payload.update(self._stage_failure(definition.stage, job))
         return OperationResult(
             'accepted' if execution.succeeded else 'failed', command.operation,
             session.revisions, invalidated_outputs=('quality',),
             warnings=execution.warnings, payload=payload)
+
+    @staticmethod
+    def _stage_failure(stage: str, job: Mapping) -> dict:
+        """Why a meshing stage failed, and where the rest of it is written.
+
+        DP-506 (MA-02). A failed stage carried only the job's own words,
+        ``process exited with code 1``, and no ``reason`` at all, so the
+        window fell back to "The stage could not run." MEASURED on S1_box_cavity:
+        castellation died of ``FOAM FATAL ERROR: Unknown region name
+        box_with_cavity ... Valid region names are 1(...)`` -- the one sentence
+        that says what to change -- and it reached nothing but the log file.
+        The cause is read out of that log here, once, so every surface that
+        reports the failure says the same thing.
+        """
+        from foammesh.core.run_result import read_failure_cause
+
+        log = str(job.get('log_path') or '')
+        cause, details = read_failure_cause(log)
+        cause = cause or str(job.get('error') or '').strip()
+        reason = f'{stage} failed: {cause}' if cause else f'{stage} failed'
+        return {'reason': reason, 'cause': cause, 'details': details,
+                'log': log}
 
     def _trace_mesh_state(self, session: CaseSession, stage: str,
                           execution=None) -> dict:
@@ -5257,17 +6118,19 @@ runTimeModifiable true;
                      definition=None) -> int:
         """How many ranks this meshing stage should run on.
 
-        The count is the case's parallel environment -- what the Parallel
-        Environment dialog writes -- clamped by the execution ceiling and by
-        the machine. Stages used to ignore it entirely and always build a
-        serial command line, so a case configured for sixteen cores still
-        meshed on one.
+        The count is the one on ``2. Mesh setup > Meshing resources``,
+        clamped by the machine. Stages used to ignore it entirely and always
+        build a serial command line, so a case configured for sixteen cores
+        still meshed on one. DP-691: the Parallel Environment dialog's
+        ``local.cfg`` count is no longer a second input.
         """
         from foammesh.core.execution import (
             ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
             allocate_resources,
         )
-        from foammesh.core.execution.resources import ResourceError
+        from foammesh.core.execution.resources import (
+            ResourceError, requested_cpu_count,
+        )
 
         policy_values = _resource_policy(session.configuration())
         # Every snappy phase decomposes. Measured directly against OpenFOAM 13
@@ -5276,9 +6139,16 @@ runTimeModifiable true;
         # no reason for a mode that decomposes only some of them.
         if str(policy_values['mode'] or '').lower() == 'serial':
             return 1
+        # Plan 33 DP-X2. The ceiling belongs in this precedence. It was left
+        # out, and an unopened Parallel Environment dialog answers 1, so a
+        # case whose page said three cores built a serial command line -- the
+        # ceiling could take ranks away from a number set elsewhere and never
+        # ask for any. `requested_cpu_count` is the same rule the preview and
+        # the page read, so the three cannot drift apart again.
         try:
-            requested = (int(command.parameters.get('cores') or 0)
-                         or _configured_parallel_cores(session))
+            requested = requested_cpu_count(
+                policy_values,
+                requested=int(command.parameters.get('cores') or 0))
         except (TypeError, ValueError):
             return 1
         if requested <= 1:
@@ -5315,12 +6185,87 @@ runTimeModifiable true;
     def _gather_pending(cls, case_path: Path) -> bool:
         return (case_path / cls.PENDING_GATHER).is_file()
 
+    #: Where the case-root mesh waits while the processor cases are gathered
+    #: over it. See `_ensure_reconstructed` for why it has to wait anywhere.
+    PARKED_ROOT_MESH = 'constant/polyMesh.before-gather'
+
+    @staticmethod
+    def _polymesh_cell_count(poly_mesh: Path) -> int | None:
+        """Cells in a written mesh, read from the header OpenFOAM writes.
+
+        `owner` carries `note "nPoints: .. nCells: .. nFaces: .."`. Counting
+        the entries instead would mean reading a file that is hundreds of
+        megabytes on a real mesh to learn one number. `None` means the header
+        did not say, and a caller that cannot read the count does not get to
+        claim the gather was wrong.
+        """
+        owner = poly_mesh / 'owner'
+        if not owner.is_file():
+            return None
+        try:
+            with owner.open(encoding='utf-8', errors='replace') as handle:
+                head = handle.read(4096)
+        except OSError:
+            return None
+        found = re.search(r'nCells\s*:\s*(\d+)', head)
+        return int(found.group(1)) if found else None
+
+    @classmethod
+    def _decomposed_cell_count(cls, case_path: Path) -> int | None:
+        """Cells across the processor cases, or `None` if one will not say.
+
+        Decomposition shares no cell between two ranks, so this is what a
+        gathered root must hold.
+        """
+        total = 0
+        seen = False
+        for processor in sorted(case_path.glob('processor[0-9]*')):
+            counted = cls._polymesh_cell_count(
+                processor / 'constant' / 'polyMesh')
+            if counted is None:
+                return None
+            total += counted
+            seen = True
+        return total if seen else None
+
     @staticmethod
     def _discard_decomposition(case_path: Path) -> None:
         """Remove processor cases whose mesh has been superseded."""
         from foammesh.support.utils import rmtree
         for processor in case_path.glob('processor[0-9]*'):
             rmtree(processor)
+
+    @classmethod
+    def _pending_gather_ranks(cls, case_path: Path) -> int | None:
+        """The rank count the pending gather has to read, or `None`."""
+        try:
+            ranks = int(json.loads(
+                (case_path / cls.PENDING_GATHER).read_text(
+                    encoding='utf-8')).get('ranks') or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            ranks = 0
+        if ranks < 1:
+            ranks = len(tuple(case_path.glob('processor[0-9]*')))
+        return ranks or None
+
+    def _align_gather_ranks(self, session: CaseSession) -> None:
+        """DP-663. `reconstructPar` reads `numberOfSubdomains`, not the disk.
+
+        The dictionaries are regenerated between snappy phases, and generation
+        writes the serial default (CP-07 item 6). A gather reading that found
+        one processor case of twelve and stopped on its processor patches, so
+        the dictionary is put back to the ranks that split the mesh first.
+        """
+        from foammesh.openfoam import decomposition
+        case_path = session.case_path
+        ranks = self._pending_gather_ranks(case_path)
+        if ranks is None or decomposition.written_ranks(case_path) == ranks:
+            return
+        try:
+            settings = DecompositionSettings.read(session.state.db)
+        except Exception:  # noqa: BLE001 - the method does not change a gather
+            settings = None
+        decomposition.write(case_path, ranks, settings)
 
     async def _ensure_reconstructed(self, session: CaseSession,
                                     command: Command) -> dict | None:
@@ -5333,15 +6278,70 @@ runTimeModifiable true;
         """
         if not self._gather_pending(session.case_path):
             return None
-        execution = await self._run_openfoam_utility(
-            session, command, 'reconstructPar',
-            ('-constant', '-case', str(session.case_path)),
-            cwd=session.case_path, mutation=True)
-        if not execution.succeeded:
-            raise PreconditionFailedError(
-                'the parallel mesh could not be reconstructed into the case '
-                'root', details={'error': 'reconstruct_failed'})
-        (session.case_path / self.PENDING_GATHER).unlink(missing_ok=True)
+        from foammesh.support.utils import rmtree
+        case_path = session.case_path
+        root_mesh = case_path / 'constant' / 'polyMesh'
+        parked = case_path / self.PARKED_ROOT_MESH
+        # DP-70. `reconstructPar` gathers the *points* only -- and still exits
+        # 0 -- when a complete mesh is already at the case root and the
+        # processor cases still carry `cellProcAddressing`. OF13,
+        # `domainDecomposition::readReconstruct`:
+        #
+        #     const bool load = faceIo.headerOk() && procAddrIo.headerOk();
+        #     if (load) { readComplete(false); ... reconstructPoints(); }
+        #     else      { ... reconstruct(); }
+        #
+        # Both files are present as a matter of course, because a full
+        # reconstruct writes `cellProc` into the root and `cellProcAddressing`
+        # back into every processor case. So the gather that follows one moves
+        # the stale grid's vertices and leaves its cells alone. MEASURED in
+        # the acceptance sweep as a finished snappy run whose root held
+        # blockMesh's 14,450 cells at 0.0 non-orthogonality -- the best
+        # quality verdict in the sweep, on a mesh that had never been snapped.
+        #
+        # The root mesh is therefore taken out of `reconstructPar`'s sight
+        # rather than left where it decides on it. Parked, not deleted: if the
+        # gather does not produce a mesh to replace it, it goes back.
+        self._align_gather_ranks(session)
+        if parked.exists():
+            rmtree(parked)
+        if root_mesh.is_dir():
+            root_mesh.rename(parked)
+        try:
+            execution = await self._run_openfoam_utility(
+                session, command, 'reconstructPar',
+                ('-constant', '-case', str(case_path)),
+                cwd=case_path, mutation=True)
+            if not execution.succeeded:
+                raise PreconditionFailedError(
+                    'the parallel mesh could not be reconstructed into the '
+                    'case root', details={'error': 'reconstruct_failed'})
+            # And then say so out loud. A gather that returns 0 having done
+            # nothing is what DP-70 was, and reading the two counts back is
+            # the cheapest thing that can tell the difference.
+            if not root_mesh.is_dir():
+                raise PreconditionFailedError(
+                    'the gather reported success and left no mesh in the '
+                    'case root', details={'error': 'reconstruct_incomplete'})
+            gathered = self._polymesh_cell_count(root_mesh)
+            decomposed = self._decomposed_cell_count(case_path)
+            if (gathered is not None and decomposed is not None
+                    and gathered != decomposed):
+                raise PreconditionFailedError(
+                    'the gathered mesh does not hold the cells the processor '
+                    'cases do, so the case root is not this stage result',
+                    details={'error': 'reconstruct_incomplete',
+                             'root_cells': gathered,
+                             'processor_cells': decomposed})
+        except BaseException:
+            if parked.is_dir():
+                if root_mesh.is_dir():
+                    rmtree(root_mesh)
+                parked.rename(root_mesh)
+            raise
+        if parked.exists():
+            rmtree(parked)
+        (case_path / self.PENDING_GATHER).unlink(missing_ok=True)
         payload = execution.to_payload()
         payload['trace'] = self._trace_mesh_state(session, 'reconstruct')
         return payload
@@ -5363,6 +6363,13 @@ runTimeModifiable true;
         case_root = session.case_path
         existing = tuple(case_root.glob('processor[0-9]*'))
         if existing and len(existing) == int(ranks):
+            # DP-663. Regenerating the dictionaries between phases writes the
+            # serial default, and a reused decomposition kept it -- so the
+            # gather that followed read one processor case of twelve.
+            from foammesh.openfoam import decomposition
+            if decomposition.written_ranks(case_root) != int(ranks):
+                engine.write_parallel_config(
+                    session.state.db, case_root, int(ranks))
             return []
         if existing:
             # Processor cases from an earlier run with a different rank count
@@ -5405,6 +6412,18 @@ runTimeModifiable true;
         # surfaceFeatures has no parallel form.
         ranks = (self._stage_ranks(session, command, definition)
                  if definition.utility == 'snappyHexMesh' else 1)
+        if definition.utility == 'snappyHexMesh':
+            # DP-678. The cap and the ranks it gave this stage, on disk.
+            from foammesh.core.execution.resources import (
+                execution_record, record_stage_execution,
+            )
+            try:
+                record_stage_execution(
+                    session.case_path, definition.stage, execution_record(
+                        _resource_policy(session.configuration()),
+                        effective=ranks, unit='ranks'))
+            except OSError:
+                pass
         decomposition: list = []
         if ranks == 1 and self._gather_pending(session.case_path):
             # A serial phase reads the case root, so an earlier decomposed
@@ -5494,7 +6513,7 @@ runTimeModifiable true;
             # the fact that this mesh is ours becomes knowable, and nothing
             # recorded it. `resolve_workflow` therefore read the sidecar's
             # `workflow=none` as `mesh exists but metadata has no workflow
-            # mode` -- External Mesh -- so the first re-resolution after a
+            # mode` -- External mesh -- so the first re-resolution after a
             # save re-opened our own freshly meshed case as an import and
             # collapsed the workflow outline to Scene / Display.
             from foammesh.core.case import record_generated_mesh
@@ -5591,7 +6610,7 @@ runTimeModifiable true;
         Snappy exits successfully even when every layer was rejected, so a
         stage result without this reads as a layered mesh that does not exist.
         """
-        from foammesh.core.quality import parse_layer_log
+        from foammesh.core.quality import NO_LAYERS_MARKER, parse_layer_log
         log_path = (payload.get('job') or {}).get('log_path')
         if not log_path:
             return {}
@@ -5603,7 +6622,22 @@ runTimeModifiable true;
             text, cls._requested_layer_counts(session, engine),
             cls._frozen_layer_patches(session, engine))
         if not report.patches:
-            return {}
+            # DP-112. This is the one place that exists to say what the layers
+            # stage actually produced, and on a run that produced nothing it
+            # returned an empty dict and said nothing at all -- so a stage that
+            # printed `No layers to generate ...` and left the mesh byte for
+            # byte as it found it was reported exactly like one that layered
+            # every wall. MEASURED on all nine meshed snappy legs of the
+            # 1f2787eb sweep. There is no coverage document to write, but
+            # there is a fact to report.
+            if NO_LAYERS_MARKER in text:
+                return {'layer_warnings': [
+                    'snappyHexMesh added no layers: no patch was selected to '
+                    'grow them on, so this stage left the mesh unchanged']}
+            return {'layer_warnings': [
+                'the layers stage produced no per-patch coverage table, so '
+                'how many layers reached the mesh could not be read from its '
+                'log']}
         document = report.to_dict()
         # Plan 26 WP6.1. Only the warning list was ever consumed, and only for
         # patches below the 50% floor -- so a patch that got its layers was
@@ -5633,6 +6667,27 @@ runTimeModifiable true;
         except OSError:
             # Losing the record must not fail the layer stage that produced it.
             pass
+
+    @classmethod
+    def _record_gmsh_layer_coverage(cls, session: CaseSession, record) -> dict:
+        """Keep what a finished Gmsh run grew, where the page reads it.
+
+        Plan 32 check 5. The snappy layers stage has written
+        ``foammesh/quality/layer-coverage.json`` since Plan 26 and the Quality
+        page reads it back through ``mesh.layer_coverage``; the Gmsh run
+        measured the same thing per patch and left it in its own manifest, so
+        the page said no per-patch layer measurement had been recorded. This
+        is the one line that connects the two -- the projection itself lives
+        in ``core/gmsh/layers.py`` beside the request it is held against.
+        """
+        from foammesh.core.gmsh.layers import achieved_coverage
+
+        document = achieved_coverage(
+            (getattr(record, 'document', None) or {}).get('statistics') or {})
+        if document.get('patches'):
+            cls._write_layer_coverage(session, document)
+            return document
+        return {}
 
     def _mesh_layer_coverage(self, session: CaseSession,
                              command: Command) -> OperationResult:
@@ -5726,13 +6781,17 @@ runTimeModifiable true;
         if configured_engine_id(session.state.db) == MeshEngine.UNSELECTED.value:
             raise PreconditionFailedError(
                 'Choose a meshing method before running the mesh. Open '
-                'step 3, Meshing Method, and apply one.')
+                'the Meshing method step and apply one.')
         try:
             engine = resolve_engine(session.state.db)
         except EngineNotRegisteredError as error:
             raise PreconditionFailedError(
                 f'this case names a meshing method this build does not have: '
                 f'{configured_engine_id(session.state.db)}') from error
+        # DP-354. The engine's own preflight asks the runtime which utilities
+        # it has, one at a time and from inside this coroutine. Answer them
+        # all off the loop first so the window stays alive while it does.
+        await self._warm_utility_probes()
         return await engine.run(EngineRunRequest(session, command, self))
 
     async def run_snappy_pipeline(self, session: CaseSession,
@@ -5747,6 +6806,7 @@ runTimeModifiable true;
             ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
             allocate_resources, openfoam_meshing_dag,
         )
+        from foammesh.core.execution.resources import execution_record
         from foammesh.core.jobs import OperationSpec
         from foammesh.core.mesh import MeshLayout, MeshStateError, MeshStateStore
         from foammesh.core.run_result import failure_payload
@@ -5767,16 +6827,21 @@ runTimeModifiable true;
         configuration = _resource_policy(session.configuration())
         mode = ResourceMode(str(command.parameters.get(
             'mode') or configuration['mode']))
-        # What to run on comes from the case's parallel environment -- the
-        # count the Parallel Environment dialog writes and decomposeParDict is
-        # built from. Without this the dialog applied, reported success, and
-        # every mesh stage still ran on one rank, because the only number
-        # consulted here was the execution *ceiling*, which has no GUI control.
-        # ``maxCpuCores`` stays the ceiling and still clamps the request below.
-        parallel_cores = _configured_parallel_cores(session)
-        requested_cores = int(command.parameters.get('cores')
-                              or parallel_cores
-                              or configuration['max_cpu_cores'] or 1)
+        # What to run on is the count on Meshing resources (DP-691: the
+        # Parallel Environment dialog, which used to be read first, is gone).
+        # ``maxCpuCores`` still clamps an explicit request below.
+        # DP-590 (field audit 0924 snappy-back D1). An unopened dialog answers
+        # 1, and 1 used to outrank the ceiling here, so "Run to end" meshed a
+        # case whose page said six cores on one rank while the Plan preview
+        # said six. The same rule the preview and ``_stage_ranks`` ask.
+        from foammesh.core.execution.resources import requested_cpu_count
+
+        try:
+            requested_cores = requested_cpu_count(
+                configuration,
+                requested=int(command.parameters.get('cores') or 0)) or 1
+        except (TypeError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
         policy = ResourcePolicy(
             mode, configuration['max_cpu_cores'],
             configuration['max_memory_bytes'],
@@ -5860,8 +6925,14 @@ runTimeModifiable true;
             mpi_options = tuple(registry.mpi_options())
         from foammesh.core.quality.checkmesh_service import checkmesh_request
 
+        # DP-591. A skipped Boundary layers task grows nothing: the
+        # dictionary was regenerated without them above, the split route
+        # drops its layers phase, and the tree keeps the skip.
+        layers_skipped = bool(getattr(
+            engine, 'layers_skipped', lambda _path: False)(session.case_path))
         dag = openfoam_meshing_dag(
             session.case_path, allocation, split_at_snap=mode.enforces,
+            layers=not layers_skipped,
             mpi_options=mpi_options,
             check_profile=self._checkmesh_profile()[0],
             # Plan 31. The same request ``mesh.check`` builds, from the same
@@ -5881,6 +6952,11 @@ runTimeModifiable true;
             session, engine_id='snappy',
             job={'job_digest': dag.digest if hasattr(dag, 'digest') else '',
                  'dag': dag.to_dict(), 'allocation': allocation.to_dict(),
+                 # DP-678. The CPU cap beside the ranks it resolved to.
+                 'execution': execution_record(
+                     {**configuration, 'mode': mode.value},
+                     effective=allocation.effective_ranks,
+                     unit='ranks'),
                  'revision_seal': revision_seal})
         checkpoints = []
         executions = []
@@ -5913,11 +6989,16 @@ runTimeModifiable true;
                 check_execution = execution
             if not execution.succeeded:
                 failure = execution.to_payload()
-                stopped = str((failure.get('job') or {}).get('status')
-                              or '') == 'cancelled'
+                job = failure.get('job') or {}
+                stopped = str(job.get('status') or '') == 'cancelled'
+                # DP-506. This read `error` and `log_path` off the execution
+                # payload, where neither lives -- both are on its `job` -- so
+                # every failed node was reported as "<node> failed" with no
+                # log. The same cause the stage route reports, read the same
+                # way.
+                explained = self._stage_failure(node.node_id, job)
                 reason = ('the run was cancelled before it finished' if stopped
-                          else (str(failure.get('error') or '').strip()
-                                or f'{node.node_id} failed'))
+                          else explained['reason'])
                 self._close_run_manifest(
                     record, status='cancelled' if stopped else 'failed',
                     reason=reason)
@@ -5935,8 +7016,8 @@ runTimeModifiable true;
                              # know which orchestrator it is reading.
                              **failure_payload(
                                  task=f'snappy.{node.node_id}',
-                                 reason=reason,
-                                 log=str(failure.get('log_path') or ''))})
+                                 reason=reason, log=explained['log']),
+                             'details': '' if stopped else explained['details']})
             if node.pauses_after:
                 # The snapped boundary is in the case root and the next node is
                 # about to overwrite it. Capture it immutably now; GF1 measures
@@ -5985,7 +7066,8 @@ runTimeModifiable true;
         not_clean = quality_verdict.get('verdict') not in ('pass', None)
         try:
             recorded = self._record_engine_run_success(
-                session, command, warning=not_clean)
+                session, command, warning=not_clean,
+                exclude=('snappy.layers',) if layers_skipped else ())
         except FacadeError:
             # The mesh is on disk and published; a tree that cannot be told
             # about it (no registered engine, no descriptor) is not a failure
@@ -6105,7 +7187,7 @@ runTimeModifiable true;
                     'reason': 'a point inside the assembled surface'})
         return self._read_result(session, command, {
             'point': centre, 'inside': False, 'source': 'bounding_box_centre',
-            'reason': 'no interior point was found -- the surface is probably '
+            'reason': 'no interior point was found — the surface is probably '
                       'open, so place the seed yourself'})
 
     def _geometry_fluid_seed_check(self, session: CaseSession,
@@ -6141,43 +7223,187 @@ runTimeModifiable true;
             probe = validate_fluid_seed(surface, point)
         except (ValueError, RuntimeError) as error:
             raise ValidationFailedError(str(error)) from error
+        # DP-574: outside the body but inside the background box is an
+        # external-flow seed, which the launch gate accepts, so the page
+        # must not call it invalid.
+        external = False
+        if not probe.get('valid') and not probe.get('on_surface'):
+            domain = self._background_domain_bounds(session.case_path)
+            external = bool(domain is not None
+                            and self._point_inside_bounds(point, domain))
         return self._read_result(session, command, dict(
-            probe, known=True, point=point))
+            probe, known=True, point=point, external=external))
+
+    @staticmethod
+    def _region_label(key, region) -> str:
+        """What to call this region in a refusal the user has to act on."""
+        try:
+            name = region.value('name')
+        except Exception:  # noqa: BLE001 - a double, or a row without a name
+            name = None
+        return str(name) if name else f'region {key}'
 
     def _validate_fluid_seed(self, session: CaseSession) -> None:
-        """Reject a surface/outside locationInMesh before launching snappy."""
+        """Reject a surface/off-domain locationInMesh before launching snappy.
+
+        DP-574: a seed outside every closed body is an external-flow seed and
+        is accepted when it lies inside the background mesh box; every seed
+        must lie inside that box once a blockMeshDict has been written.
+
+        Every region, not the first one. DP-391, MEASURED on the multiregion
+        fixture `jacketed_pipe`: this read `regions[0]` and nothing else, so a
+        second region could carry any point at all and snappy was launched
+        with it. Here that happened to be harmless; with the region order
+        reversed it would have meshed the wrong cells without a word.
+
+        And against the components as well as the assembly. A valid CFD
+        enclosure is often partitioned into separate wall, inlet and outlet
+        artifacts, none of them watertight on its own, so the assembled
+        surface set is the right thing to probe for a single region -- it is
+        also what `geometry.fluid_seed.suggest` searches, so a suggested seed
+        cannot be refused here. But a *multiregion* case is the other shape:
+        each region is its own closed solid, the assembly nests them, and
+        `vtkSelectEnclosedPoints` counts ray crossings with odd parity. A
+        point in the inner region crosses the inner wall and then the outer
+        wall -- two crossings, even, "outside" -- so the assembled test can
+        never accept it. MEASURED on `jacketed_pipe`: the fluid seed
+        [0, 0, 0.1] is inside `jacketed_pipe_fluid` by winding number 1.0 and
+        was refused by the assembly, which sees the shared interface twice
+        (84 triangles written into both region files by design) and reads six
+        crossings where the component reads two.
+
+        So the seed is accepted when the assembly encloses it *or* any single
+        component does. Both readings are recorded in the refusal, because
+        which one refused it is what tells the user whether the seed or the
+        geometry is wrong.
+        """
         from foammesh.core.geometry import GeometryArtifactStore
         from foammesh.core.mesh.sizing import validate_fluid_seed
         store = GeometryArtifactStore(session.case_path)
         entries = store.entries()
         if not entries:  # legacy DB-only geometry has no immutable artifact to probe
             return
-        regions = list(session.state.db.getElements('region').values())
+        regions = session.state.db.getElements('region')
         if not regions:
             raise PreconditionFailedError('a fluid region seed is required')
-        point = regions[0].vector('point')
-        # A valid CFD enclosure is often partitioned into separate wall,
-        # inlet, and outlet artifacts.  No individual artifact is watertight,
-        # so probing them one-by-one rejects a perfectly valid pipe.  Validate
-        # the assembled immutable surface set as the solver sees it -- the
-        # same assembly `geometry.fluid_seed.suggest` searches, so a suggested
-        # seed cannot be refused here.
         assembled_surface = self._assembled_surface(session)
-        assembled = validate_fluid_seed(assembled_surface, point)
-        if assembled['valid']:
+        for key, region in regions.items():
+            point = region.vector('point')
+            label = self._region_label(key, region)
+            assembled = validate_fluid_seed(assembled_surface, point)
+            if assembled['valid']:
+                continue
+            individual = (
+                [assembled] if len(entries) == 1 else [
+                    validate_fluid_seed(store._polydata(entry), point)
+                    for entry in entries
+                ])
+            # Sitting on a wall is refused before the components are consulted,
+            # and the assembly is the right judge of it: it carries every
+            # component's triangles, so its distance test already answers for
+            # all of them. Consulting the components first would accept a seed
+            # lying exactly on an inner wall merely because the outer solid
+            # encloses that wall -- a point snappy cannot use either way.
+            on_surface = (assembled['on_surface']
+                          or any(probe['on_surface'] for probe in individual))
+            if not on_surface and any(probe['valid'] for probe in individual):
+                continue
+            details = {'error': 'invalid_fluid_seed', 'region': label,
+                       'point': list(point),
+                       'assembled_probe': assembled,
+                       'component_probes': individual}
+            if on_surface:
+                raise PreconditionFailedError(
+                    f'{label} seed lies on a geometry surface', details=details)
+            # DP-574 (field audit 0924 snappy-front D1). Outside every closed
+            # body is not "outside the domain": it is external flow, the
+            # motorBike pattern, where snappy keeps the cells around the body
+            # and removes the body. The domain is the background mesh, so a
+            # seed there is judged against the blockMeshDict box. What stays
+            # refused is a seed off that box, or one that cannot be judged
+            # because the background mesh has not been written yet.
+            domain = self._background_domain_bounds(session.case_path)
+            details['background_bounds'] = domain
+            if domain is None:
+                raise PreconditionFailedError(
+                    f'{label} seed is outside the intended closed geometry '
+                    'region, and there is no background mesh (blockMeshDict) '
+                    'to check it against as an external-flow seed; generate '
+                    'the base grid first', details=details)
+            if not self._point_inside_bounds(point, domain):
+                raise PreconditionFailedError(
+                    f'{label} seed is outside the geometry and outside the '
+                    'background mesh box '
+                    f'{self._describe_bounds(domain)}; move it inside the '
+                    'box, around the body', details=details)
+        domain = self._background_domain_bounds(session.case_path)
+        if domain is None:
             return
-        individual = (
-            [assembled] if len(entries) == 1 else [
-                validate_fluid_seed(store._polydata(entry), point)
-                for entry in entries
-            ])
-        on_surface = assembled['on_surface']
-        raise PreconditionFailedError(
-            'fluid seed lies on a geometry surface' if on_surface else
-            'fluid seed is outside the intended closed geometry region',
-            details={'error': 'invalid_fluid_seed', 'point': list(point),
-                     'assembled_probe': assembled,
-                     'component_probes': individual})
+        for key, region in regions.items():
+            point = region.vector('point')
+            if not self._point_inside_bounds(point, domain):
+                label = self._region_label(key, region)
+                raise PreconditionFailedError(
+                    f'{label} seed is outside the background mesh box '
+                    f'{self._describe_bounds(domain)}; snappy cannot find a '
+                    'cell to start from there',
+                    details={'error': 'invalid_fluid_seed', 'region': label,
+                             'point': list(point),
+                             'background_bounds': domain})
+
+    @staticmethod
+    def _background_domain_bounds(case_path) -> list[float] | None:
+        """The box the background mesh spans, from the written blockMeshDict.
+
+        ``[xmin, xmax, ymin, ymax, zmin, zmax]`` in metres (vertices times
+        ``scale``), or ``None`` when no dictionary has been written or it
+        cannot be read. The vertex hull is exact for the derived single block
+        and a close enough bound for authored blocks (curved edges aside).
+        """
+        path = Path(case_path) / 'system' / 'blockMeshDict'
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return None
+        text = re.sub(r'//[^\n]*', '', text)
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        scale = 1.0
+        match = re.search(r'(?:^|[;\s])(?:scale|convertToMeters)\s+'
+                          r'([-+0-9.eE]+)\s*;', text)
+        if match:
+            try:
+                scale = float(match.group(1))
+            except ValueError:
+                return None
+        match = re.search(r'\bvertices\s*\((.*?)\)\s*;', text, flags=re.S)
+        if not match:
+            return None
+        number = r'([-+0-9.eE]+)'
+        points = re.findall(
+            rf'\(\s*{number}\s+{number}\s+{number}\s*\)', match.group(1))
+        if not points:
+            return None
+        try:
+            coords = [[float(value) * scale for value in point]
+                      for point in points]
+        except ValueError:
+            return None
+        return [bound for axis in range(3) for bound in (
+            min(point[axis] for point in coords),
+            max(point[axis] for point in coords))]
+
+    @staticmethod
+    def _point_inside_bounds(point, bounds) -> bool:
+        span = max(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                   bounds[5] - bounds[4], 0.0)
+        margin = span * 1e-9
+        return all(bounds[2 * axis] + margin < float(point[axis])
+                   < bounds[2 * axis + 1] - margin for axis in range(3))
+
+    @staticmethod
+    def _describe_bounds(bounds) -> str:
+        return ('x [{:g}, {:g}] y [{:g}, {:g}] z [{:g}, {:g}] m'
+                .format(*bounds))
 
     @staticmethod
     def _preflight_snappy_inputs(session: CaseSession, utility: str) -> None:
@@ -6318,7 +7544,27 @@ runTimeModifiable true;
                 '-allTopology -allGeometry -writeSets profile.')
         return CheckMeshProfile.fallback(), warnings
 
-    async def _mesh_check(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _mesh_check(self, session: CaseSession,
+                          command: Command) -> OperationResult:
+        """Qualify this mesh the way the saved Mesh setup selection asks.
+
+        Plan 33 QA-06. This operation used to *be* checkMesh, so which checks
+        ran was decided by which button had been pressed. On a Gmsh project
+        that meant the native element gate -- the only measurement of the
+        elements Gmsh actually produced -- counted for nothing here, and a
+        route that needed two checks settled its QA row on one.
+
+        The entry point is unchanged, because the footer, the menu and the CLI
+        all reach the quality run through
+        :func:`core.engine.base.qa_operation` and a mesh is still qualified by
+        pressing it. What changed is that the run now reads
+        :func:`core.facade.quality_routes.quality_checks_for` and executes
+        every check that selection names, in the order it names them.
+        """
+        return await self._run_route_checks(session, command)
+
+    async def _run_checkmesh(self, session: CaseSession,
+                             command: Command) -> OperationResult:
         # checkMesh judges the case-root mesh, so a decomposed result has to be
         # gathered first or the check would grade the previous stage's mesh.
         await self._ensure_reconstructed(session, command)
@@ -6393,18 +7639,11 @@ runTimeModifiable true;
         override = (self._accept_checked_mesh(session, command, payload,
                                               verdict)
                     if execution.succeeded and not mesh_accepted else None)
-        if execution.succeeded:
-            # checkMesh is the QA task's evidence, so the run that produced
-            # the report is what advances the row. Exactly this one task: a
-            # report on the case-root mesh proves nothing about which stages
-            # ran before it, and never about an optional layers stage that
-            # was skipped. A poor mesh is still complete evidence (§8.5) and
-            # advances the task as a warning; qualification is the summary's
-            # business. A QA row whose parents are not yet accepted is left
-            # blocked, with the reason in the payload.
-            payload['task_state'] = self._record_qa_run(
-                session, command, warning=not mesh_accepted,
-                waived=override is not None)
+        # checkMesh is one of the QA task's checks, so the row is advanced by
+        # the route runner that knows which others the selection asked for --
+        # not here, where only this one check's verdict is in view. A poor
+        # mesh is still complete evidence (§8.5) and advances the task as a
+        # warning; a route with a check still missing advances nothing.
         return OperationResult(
             'accepted' if execution.succeeded and (mesh_accepted or override)
             else 'failed',
@@ -6449,7 +7688,18 @@ runTimeModifiable true;
 
     async def _quality_su2_readiness(self, session: CaseSession,
                                      command: Command) -> OperationResult:
-        """Judge the mesh for SU2, and advance the QA row on the strength of it.
+        """Qualify this mesh the way the saved selection asks, for SU2.
+
+        The SU2 counterpart of :meth:`_mesh_check`, and route-aware for the
+        same reason: a Gmsh project targeting SU2 needs the native element
+        check as well as the readiness check, and a readiness pass on its own
+        never stood for both.
+        """
+        return await self._run_route_checks(session, command)
+
+    async def _run_su2_readiness(self, session: CaseSession,
+                                 command: Command) -> OperationResult:
+        """Judge the mesh for SU2, and report what the check found.
 
         The counterpart of ``mesh.check`` for an SU2 project: same report
         file, same task-state effect, and no OpenFOAM runtime, because a Gmsh
@@ -6472,8 +7722,6 @@ runTimeModifiable true;
             job_id=None, artifacts=[], quality='su2-readiness')
         payload = {'readiness': verdict, 'report': verdict,
                    'succeeded': accepted}
-        payload['task_state'] = self._record_qa_run(
-            session, command, warning=not accepted)
         return OperationResult(
             'accepted' if accepted else 'failed', command.operation,
             session.revisions, invalidated_outputs=('quality',),
@@ -6503,6 +7751,188 @@ runTimeModifiable true;
             # check still ran and its report stands; only the row is left.
             return {'advanced': [], 'blocked': {'reason': str(error)}}
 
+    # -- QA-06: the route decides which checks run ------------------------- #
+
+    async def _run_route_checks(self, session: CaseSession,
+                                command: Command) -> OperationResult:
+        """Run every check the saved Mesh setup selection asks for, in order.
+
+        Plan 33 QA-06. The selection is the single source of truth about
+        which checks a mesh owes, so it is read here and nowhere else in this
+        run. Each check contributes one entry to
+        ``foammesh/quality/route-checks.json``: what it answered, which mesh
+        it answered about, and whether it ran now or stood already.
+
+        Progression follows from the whole list rather than from whichever
+        check happened to be pressed. ``PASSED`` needs every check; a check
+        that never ran leaves the route ``INCOMPLETE`` and advances no row at
+        all, because a row that settles on absent evidence is the fault this
+        exists to stop.
+        """
+        from foammesh.core.engine.registry import configured_target_solver
+        from foammesh.core.facade.quality_routes import (
+            PASSED, compose_verdict, load_route_record, quality_checks_for,
+            reusable_entry, route_key, save_route_record,
+        )
+
+        target = configured_target_solver(session.state.db)
+        engine = self._engine_id(session)
+        required = quality_checks_for(target, engine)
+        route = route_key(target, engine)
+        previous = load_route_record(session.case_path)
+        terminal = required[-1]
+        entries: list[dict] = []
+        outcome: OperationResult | None = None
+        for name in required:
+            carried = None
+            if name != terminal:
+                # The terminal check is the one the user just pressed, so it
+                # always runs; the evidence beside it is carried forward when
+                # it still describes this mesh on this route.
+                carried = reusable_entry(
+                    previous, route, name,
+                    self._route_check_identity(session, name))
+            if carried is not None:
+                entries.append(carried)
+                continue
+            entry, produced = await self._run_route_check(
+                session, command, name)
+            entries.append(entry)
+            if name == terminal:
+                outcome = produced
+        verdict = compose_verdict(entries)
+        record = {
+            'schema_version': 1, 'route': route, 'target_solver': target,
+            'engine_id': engine, 'required': list(required),
+            'checks': entries, 'verdict': verdict,
+            'mesh_identity': entries[-1].get('mesh_identity', '')
+            if entries else '',
+        }
+        save_route_record(session.case_path, record)
+
+        payload = dict(outcome.payload) if outcome is not None else {}
+        payload['route_checks'] = record
+        missing = [entry['check'] for entry in entries
+                   if entry.get('verdict') == 'missing']
+        if missing:
+            payload['task_state'] = {'advanced': [], 'blocked': {
+                'reason': 'this route still owes ' + ', '.join(
+                    str(name) for name in missing)}}
+        else:
+            payload['task_state'] = self._record_qa_run(
+                session, command, warning=verdict != PASSED,
+                waived='quality_override' in payload)
+        warnings = tuple(outcome.warnings) if outcome is not None else ()
+        return OperationResult(
+            'accepted' if verdict == PASSED else 'failed',
+            command.operation, session.revisions,
+            invalidated_outputs=('quality',), warnings=warnings,
+            payload=payload)
+
+    async def _run_route_check(self, session: CaseSession, command: Command,
+                               check: str):
+        """Run one named check, and describe what it answered.
+
+        Returns the record entry and, for a check that is an operation of its
+        own, the result that operation produced -- the caller needs it to keep
+        the payload the pressed operation has always returned.
+        """
+        from foammesh.core.facade.quality_routes import (
+            CHECK_LABELS, NATIVE_GMSH_CHECK,
+        )
+        from foammesh.core.quality.checkmesh_service import (
+            NATIVE_CHECK, SU2_READINESS_CHECK,
+        )
+
+        if check == NATIVE_GMSH_CHECK:
+            return self._native_route_entry(session), None
+        if check == NATIVE_CHECK:
+            produced = await self._run_checkmesh(session, command)
+        elif check == SU2_READINESS_CHECK:
+            produced = await self._run_su2_readiness(session, command)
+        else:                                               # pragma: no cover
+            raise PreconditionFailedError(
+                'no check is registered under this name',
+                details={'check': check})
+        entry = {
+            'check': check, 'label': CHECK_LABELS.get(check, check),
+            'status': 'ran',
+            'verdict': 'passed' if produced.status == 'accepted' else 'failed',
+            'mesh_identity': self._route_check_identity(session, check),
+            'detail': self._route_check_detail(session, check),
+        }
+        return entry, produced
+
+    def _native_route_entry(self, session: CaseSession) -> dict:
+        """What the generator's element gate already said about this mesh.
+
+        Nothing re-runs it: it is produced by the meshing run itself and filed
+        at ``foammesh/quality/mesh-quality.json``. Absence is therefore a
+        missing check rather than a failed one -- the mesh was made by a run
+        that did not measure it, and saying so is the honest answer.
+        """
+        from foammesh.core.facade.quality_routes import (
+            CHECK_LABELS, NATIVE_GMSH_CHECK,
+        )
+        from foammesh.core.gmsh.quality import REPORT_TASK_ID
+
+        report = self._current_report(session, REPORT_TASK_ID)
+        entry = {'check': NATIVE_GMSH_CHECK, 'status': 'ran',
+                 'label': CHECK_LABELS[NATIVE_GMSH_CHECK]}
+        if not report:
+            entry.update({
+                'verdict': 'missing', 'mesh_identity': '',
+                'detail': 'the Gmsh element check has produced no report for '
+                          'this mesh'})
+            return entry
+        gate = str(report.get('gate_verdict')
+                   or report.get('verdict') or '').lower()
+        entry.update({
+            'verdict': 'passed' if gate == 'pass' else 'failed',
+            'native_verdict': gate,
+            'mesh_identity': str(report.get('subject_mesh_fingerprint')
+                                 or report.get('report_fingerprint') or ''),
+            'detail': self._native_route_detail(report) or gate,
+        })
+        return entry
+
+    @staticmethod
+    def _native_route_detail(report: dict) -> str:
+        """The element gate's own words about the mesh it measured."""
+        reason = str(report.get('reason') or '').strip()
+        if reason:
+            return reason
+        measure = str(report.get('measure') or '').strip()
+        if not measure:
+            return ''
+        return '{0} at least {1:g}, worst {2:g}'.format(
+            measure, float(report.get('requestedMinimum') or 0.0),
+            float(report.get('achievedMinimum') or 0.0))
+
+    def _route_check_identity(self, session: CaseSession, check: str) -> str:
+        """Which mesh a check's stored answer is about.
+
+        The digest the check's own report carries, never one recomputed here:
+        reuse is only safe when the identity travels with the evidence.
+        """
+        from foammesh.core.facade.quality_routes import NATIVE_GMSH_CHECK
+        from foammesh.core.gmsh.quality import REPORT_TASK_ID
+        from foammesh.core.quality.checkmesh_service import MeshCheckService
+
+        if check == NATIVE_GMSH_CHECK:
+            report = self._current_report(session, REPORT_TASK_ID) or {}
+            return str(report.get('subject_mesh_fingerprint')
+                       or report.get('report_fingerprint') or '')
+        stored = MeshCheckService.load_report(session.case_path, check)
+        return str(getattr(stored, 'mesh_fingerprint', '') or '')
+
+    def _route_check_detail(self, session: CaseSession, check: str) -> str:
+        from foammesh.core.quality.checkmesh_service import MeshCheckService
+
+        stored = MeshCheckService.load_report(session.case_path, check)
+        result = getattr(stored, 'result', None)
+        return str(getattr(result, 'verdict', '') or '')
+
     def _current_quality_report(self, session: CaseSession):
         """The stored verdict of the check this project's target asks for.
 
@@ -6514,7 +7944,16 @@ runTimeModifiable true;
         than a blank: it names its own command, so nothing is mislabelled,
         and a project whose target check has not run yet is no worse off than
         it was before the slots were split.
+
+        Plan 33 QA-06 narrows that fallback. It used to hand back the
+        checkMesh verdict on every route, so switching a Gmsh project from
+        OpenFOAM to SU2 kept showing the OpenFOAM numbers under the SU2
+        question -- a result relabelled for a route that never asked for it.
+        The fallback now applies only where the saved selection really does
+        require checkMesh, which is every OpenFOAM route and no SU2 one.
         """
+        from foammesh.core.engine.registry import configured_target_solver
+        from foammesh.core.facade.quality_routes import quality_checks_for
         from foammesh.core.quality.checkmesh_service import (
             NATIVE_CHECK, MeshCheckService, check_for,
         )
@@ -6525,7 +7964,14 @@ runTimeModifiable true;
             check = NATIVE_CHECK
         report = MeshCheckService.load_report(session.case_path, check)
         if report is None and check != NATIVE_CHECK:
-            report = MeshCheckService.load_report(session.case_path)
+            try:
+                required = quality_checks_for(
+                    configured_target_solver(session.state.db),
+                    self._engine_id(session))
+            except Exception:                               # noqa: BLE001
+                required = (NATIVE_CHECK,)
+            if NATIVE_CHECK in required:
+                report = MeshCheckService.load_report(session.case_path)
         return report
 
     def _quality_report(self, session: CaseSession, command: Command) -> OperationResult:
@@ -6564,7 +8010,46 @@ runTimeModifiable true;
         waivers = self._binding_waivers(session, waiver_module)
         return self._read_result(session, command, {
             'report': _to_payload(report) if report else None,
-            'waivers': waivers})
+            'waivers': waivers,
+            'route_checks': self._route_checks_payload(session)})
+
+    def _route_checks_payload(self, session: CaseSession) -> dict:
+        """What this project's route asks for, and what it has so far.
+
+        Plan 33 QA-06. A page cannot say which checks are outstanding unless
+        it is told, and it must not work that out from which page it is: the
+        saved Mesh setup selection decides, so the answer is composed here and
+        carried on the report the page already reads.
+        """
+        from foammesh.core.engine.registry import configured_target_solver
+        from foammesh.core.facade.quality_routes import (
+            CHECK_LABELS, INCOMPLETE, load_route_record, quality_checks_for,
+            route_key, route_verdict,
+        )
+
+        try:
+            target = configured_target_solver(session.state.db)
+            engine = self._engine_id(session)
+        except Exception:                                   # noqa: BLE001
+            return {'required': [], 'checks': [], 'verdict': INCOMPLETE}
+        required = quality_checks_for(target, engine)
+        route = route_key(target, engine)
+        record = load_route_record(session.case_path) or {}
+        if str(record.get('route') or '') != route:
+            record = {}
+        stored = {str(entry.get('check')): entry
+                  for entry in record.get('checks') or ()
+                  if isinstance(entry, dict)}
+        checks = []
+        for name in required:
+            entry = dict(stored.get(name) or {
+                'check': name, 'verdict': 'missing', 'status': 'not-run',
+                'mesh_identity': '', 'detail': ''})
+            entry.setdefault('label', CHECK_LABELS.get(name, name))
+            checks.append(entry)
+        return {'route': route, 'target_solver': target, 'engine_id': engine,
+                'required': list(required), 'checks': checks,
+                'verdict': route_verdict(session.case_path, target, engine)}
 
     def _mesh_repair_recommendations(
             self, session: CaseSession, command: Command) -> OperationResult:
@@ -7118,6 +8603,17 @@ runTimeModifiable true;
             session.state.db, bounds=bounds,
             hex_bounds=self._bounding_hex_bounds(session) or bounds)
         return RequestedSize(size, source, reason)
+
+    def _generation_bounds(self, session: CaseSession):
+        """DP-576. The imported geometry's extent, else the bounding hex's."""
+        try:
+            surface = self._assembled_surface(session)
+        except Exception:                                   # noqa: BLE001
+            surface = None
+        if surface is not None and surface.GetNumberOfPoints() > 0:
+            return list(surface.GetBounds())
+        hex_bounds = self._bounding_hex_bounds(session)
+        return list(hex_bounds) if hex_bounds is not None else None
 
     def _bounding_hex_bounds(self, session: CaseSession):
         """The base-grid hex the case names, as six bounds, or ``None``."""
@@ -7987,7 +9483,7 @@ runTimeModifiable true;
                                                     'qualification': qualification})
 
     def _dataset_export(self, session, command, entry_id) -> OperationResult:
-        self._require_mesh(session)
+        self._require_exportable_mesh(session, entry_id)
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
         from foammesh.core.import_export.service import ImportExportService
@@ -8001,12 +9497,33 @@ runTimeModifiable true;
                 'med': 'export_med',
                 'unv': 'export_unv',
             }[entry_id]
-            result = getattr(service, adapter)(session.case_path, destination)
+            with self._replacing(session, command, destination, entry_id):
+                result = getattr(service, adapter)(session.case_path,
+                                                   destination)
         except (OSError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
         payload = dict(_to_payload(result))
         payload['qualification'] = qualification
         return self._read_result(session, command, payload)
+
+    @staticmethod
+    def _replacing(session, command, destination, entry_id):
+        """The one overwrite an export may do, when it was asked (DP-680).
+
+        ``overwrite`` is honoured for the two exports the Export page offers
+        it on, an OpenFOAM case folder and an SU2 file; asked of any other
+        format it is refused rather than ignored.
+        """
+        from foammesh.core.import_export.overwrite import (
+            FOLDER, SU2, replacing)
+        overwrite = bool(command.parameters.get('overwrite', False))
+        kind = {'openfoam': FOLDER, 'su2': SU2}.get(entry_id)
+        if overwrite and kind is None:
+            raise ValidationFailedError(
+                f'overwrite is offered for OpenFOAM case folders and SU2 '
+                f'files only, not {entry_id}')
+        return replacing(destination, kind or FOLDER, overwrite=overwrite,
+                         protected=(session.case_path,))
 
     def _export_vtk(self, session, command):
         return self._dataset_export(session, command, 'vtk')
@@ -8080,12 +9597,14 @@ runTimeModifiable true;
                 raise ValidationFailedError('invalid authored extrusion options') from error
         from foammesh.core.import_export.authored import AuthoredExportService
         try:
-            payload = await AuthoredExportService(
-                capabilities=self._capabilities_registry()).run(
-                session, destination,
-                boundaries=command.parameters.get('boundaries', ()), options=options,
-                on_line=command.parameters.get('on_line'),
-                on_progress=command.parameters.get('on_progress'))
+            with self._replacing(session, command, destination, 'openfoam'):
+                payload = await AuthoredExportService(
+                    capabilities=self._capabilities_registry()).run(
+                    session, destination,
+                    boundaries=command.parameters.get('boundaries', ()),
+                    options=options,
+                    on_line=command.parameters.get('on_line'),
+                    on_progress=command.parameters.get('on_progress'))
         except (OSError, ValueError, RuntimeError) as error:
             raise ValidationFailedError(str(error)) from error
         payload = dict(payload or {})

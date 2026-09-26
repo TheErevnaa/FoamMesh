@@ -6,7 +6,7 @@ from PySide6.QtCore import Signal
 from foammesh.support.simple_db.simple_db import Element
 
 from foammesh.app import app
-from foammesh.db.configurations_schema import GeometryType, Shape
+from foammesh.db.configurations_schema import CFDType, GeometryType, Shape
 from foammesh.core.mesh.sizing import stand_off_bounds
 from foammesh.core.selection import (
     SelectionEntity, SelectionKind, SelectionStatus)
@@ -127,6 +127,45 @@ class GeometryManager(ActorManager):
 
     def polyData(self, gId):
         return self._actorInfos[gId].dataSet()
+
+    def referenceSurface(self):
+        """DP-713. The loaded geometry as one surface to measure a mesh by.
+
+        Viewport audit 0925 F8: deviation could only be coloured from a
+        stored fidelity run, although the geometry the mesh was made from is
+        loaded right here. A surface marked as refinement only (CFD type
+        ``none``) shapes the cells, not the boundary, so it is left out --
+        unless it is all there is. ``None`` when there is no geometry.
+        """
+        from vtkmodules.vtkFiltersCore import vtkAppendPolyData
+
+        surfaces = {
+            gId: info.dataSet() for gId, info in self._actorInfos.items()
+            if isinstance(info, GeometryActor)
+            and info.dataSet() is not None
+            and info.dataSet().GetNumberOfCells() > 0}
+        if not surfaces:
+            return None
+        try:
+            geometries = app.facadeClient.checkout().getElements('geometry')
+        except Exception:                                     # noqa: BLE001
+            geometries = {}
+
+        def refinementOnly(gId):
+            geometry = geometries.get(gId) if geometries else None
+            try:
+                return (geometry is not None
+                        and geometry.value('cfdType') == CFDType.NONE.value)
+            except (KeyError, LookupError, TypeError):
+                return False
+
+        kept = [data for gId, data in surfaces.items()
+                if not refinementOnly(gId)] or list(surfaces.values())
+        append = vtkAppendPolyData()
+        for data in kept:
+            append.AddInputData(data)
+        append.Update()
+        return append.GetOutput()
 
     def load(self):
         self.clear()
@@ -398,7 +437,7 @@ class GeometryManager(ActorManager):
         every level below. Refinement levels are chosen against these
         numbers, so a user sizing a boundary layer or a feature refinement
         was sizing it against the wrong cell. A Hex6 the user modelled is
-        left alone, the same as on the Base Grid page.
+        left alone, the same as on the Base grid page.
         """
         gId, geometry = self.getBoundingHex6()
 

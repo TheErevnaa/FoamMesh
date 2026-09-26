@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from foammesh.core.quality import MeshCheckService
+from foammesh.core.quantities import aligned, count_text
 from foammesh.core.shell import CapabilityRegistry
 from foammesh.openfoam.case_builder import CaseBuilder
 
@@ -95,22 +96,22 @@ _SUMMARY = ArtifactContract(
 
 
 SNAPPY_WORKFLOW = WorkflowDescriptor(
-    engine_id='snappy', version=1, display_name='Snappy Hex Mesh',
+    engine_id='snappy', version=1, display_name='snappyHexMesh',
     description='OpenFOAM-native hex-dominant staged meshing workflow.',
     tasks=(
         WorkflowTask(
-            'snappy.domain_regions', 'Domain & Regions', 10,
+            'snappy.domain_regions', 'Domain & regions', 10,
             description='Define fluid seeds, CFD patches, and region intent.'),
         # GF0. Evidence readiness, not an engineering decision -- so it is the
         # one geometry task that does NOT accept an override (§8.6): waiving
         # "we have no reference" would waive the ability to measure anything.
         WorkflowTask(
-            'common.reference_readiness', 'Reference Readiness', 15,
+            'common.reference_readiness', 'Reference readiness', 15,
             depends_on=('snappy.domain_regions',),
             description='Confirm a validation reference and feature manifest '
                         'exist for the prepared geometry.'),
         WorkflowTask(
-            'snappy.base_grid', 'Base Grid', 20,
+            'snappy.base_grid', 'Base grid', 20,
             depends_on=('snappy.domain_regions',), engine_stage='blockMesh',
             capabilities=(CapabilityRequirement('blockMesh'),),
             fields=_fields(
@@ -155,7 +156,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # saved task progress with a notice -- cheaper than a standing lie in
         # the outline.
         WorkflowTask(
-            'snappy.surface_features', 'Surface Features', 30,
+            'snappy.surface_features', 'Surface features', 30,
             depends_on=('snappy.base_grid',), engine_stage='surfaceFeatures',
             capabilities=(CapabilityRequirement('surfaceFeatures'),),
             description='Extract feature edges from the prepared surfaces at '
@@ -189,7 +190,8 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
             ) + _collection_fields(
                 'castellation/refinementSurfaces',
                 'castellation/refinementVolumes',
-                'castellation/featureBands'),
+                'castellation/featureBands',
+                'castellation/volumeBands'),  # DP-586
             artifacts=(_POLY_MESH,), run_gated=True),
         WorkflowTask(
             'snappy.snap', 'Snap', 50,
@@ -206,7 +208,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # layers mutate the boundary in place -- after layers the surface that
         # was snapped no longer exists to measure.
         WorkflowTask(
-            'snappy.fidelity_snap', 'Snap Fidelity', 55,
+            'snappy.fidelity_snap', 'Snap fidelity', 55,
             depends_on=('snappy.snap', 'common.reference_readiness'),
             artifacts=(_FIDELITY_SNAP,), accepts_override=True,
             run_gated=True,
@@ -215,7 +217,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                          'common.export'),
             description='Geometry fidelity of the snapped boundary.'),
         WorkflowTask(
-            'snappy.layers', 'Boundary Layers', 60,
+            'snappy.layers', 'Boundary layers', 60,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('snappy.fidelity_snap',), engine_stage='layers',
             capabilities=(CapabilityRequirement('snappyHexMesh'),),
@@ -238,7 +240,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # none blocks another and all three run even when one fails. §8.1's
         # "complete diagnosis" is exactly this shape.
         WorkflowTask(
-            'common.fidelity', 'Geometry Fidelity', 65,
+            'common.fidelity', 'Geometry fidelity', 65,
             depends_on=('snappy.layers', 'common.reference_readiness'),
             artifacts=(_FIDELITY,), accepts_override=True,
             run_gated=True,
@@ -249,7 +251,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # whatever checkMesh had last run -- on the live walk, the base grid,
         # three mutating stages earlier. Only a checkMesh run advances it now.
         WorkflowTask(
-            'snappy.qa', 'Snappy QA', 70,
+            'snappy.qa', 'Quality', 70,
             depends_on=('snappy.layers',), engine_stage='checkMesh',
             capabilities=(CapabilityRequirement('checkMesh'),),
             # The thresholds do double duty: snappy undoes a phase that breaks
@@ -277,7 +279,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
             artifacts=(_QUALITY,), accepts_override=True, run_gated=True,
             invalidates=('common.summary', 'common.export')),
         WorkflowTask(
-            'common.resolution', 'Resolution Adequacy', 74,
+            'common.resolution', 'Resolution adequacy', 74,
             depends_on=('snappy.layers', 'common.reference_readiness'),
             artifacts=(_RESOLUTION,), accepts_override=True,
             run_gated=True,
@@ -286,7 +288,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # Q. Not overridable: it is the record that binds the decision
         # together, so waiving it would waive the evidence of the waiver.
         WorkflowTask(
-            'common.summary', 'Qualification Summary', 78,
+            'common.summary', 'Qualification summary', 78,
             depends_on=('common.fidelity', 'common.resolution', 'snappy.qa'),
             artifacts=(_SUMMARY,), run_gated=True,
             invalidates=('common.export',),
@@ -299,7 +301,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
 
 
 SNAPPY_DESCRIPTOR = EngineDescriptor(
-    engine_id='snappy', display_name='Snappy Hex Mesh', workflow_version=1,
+    engine_id='snappy', display_name='snappyHexMesh', workflow_version=1,
     summary='Hex-dominant OpenFOAM-native meshing.',
     # Plan 28: 'hexahedron', not 'hex'. Gmsh already said 'hexahedron' for
     # the same shape, so every set comparison across the two engines was
@@ -372,6 +374,11 @@ class SnappyMeshingEngine:
     #: GF1, the snap-fidelity gate. Gmsh has no equivalent, which is why the
     #: facade asks the engine rather than asking whether it is snappy.
     blocking_gate_task = 'snappy.fidelity_snap'
+    #: DP-638. snappy stages a CAD import's facets beside any STL, so one
+    #: case may hold both.
+    mixes_cad_and_surfaces = True
+    #: DP-641. An NCC pair is written for OpenFOAM's non-conformal coupling.
+    builds_non_conformal_interfaces = True
 
     @property
     def descriptor(self) -> EngineDescriptor:
@@ -412,7 +419,7 @@ class SnappyMeshingEngine:
             self.engine_id, not missing, results,
             '' if not missing else (
                 f"runtime unavailable: {', '.join(missing)}"
-                + (f' -- {cause}' if cause else '')),
+                + (f' — {cause}' if cause else '')),
             profile_id=selected.get('profile_id'),
             runtime_fingerprint=selected.get('fingerprint'),
             version=selected.get('version'))
@@ -489,6 +496,28 @@ class SnappyMeshingEngine:
             raise ValueError(f'not a decomposable snappy phase: {phase}')
         return CaseBuilder(db, _unit_bbox()).regenerate_stage(case_path, phase)
 
+    def layers_skipped(self, case_path) -> bool:
+        """Whether the user skipped the optional Boundary layers task.
+
+        DP-591 (field audit 0924 snappy-back D12). The skip was recorded in
+        the task tree and read by nothing that builds a run, so "Run to end"
+        grew every configured layer group anyway and then recorded the task
+        PASSED over the skip. An unreadable tree answers False: the run then
+        does what it always did.
+        """
+        from foammesh.core.workflow.task_state_store import (
+            EngineTaskStateStore,
+        )
+
+        from .contracts import TaskState
+
+        try:
+            graph = EngineTaskStateStore(
+                case_path, self.workflow_descriptor()).load()
+            return graph.state('snappy.layers') is TaskState.SKIPPED
+        except Exception:  # noqa: BLE001 - the tree is advisory here
+            return False
+
     def refresh_pipeline_config(self, db, case_path):
         """Regenerate every pipeline dictionary from the current revision."""
         builder = CaseBuilder(db, _unit_bbox())
@@ -496,7 +525,8 @@ class SnappyMeshingEngine:
         builder.regenerate_stage(case_path, 'surfaceFeatures')
         return builder.regenerate_stage(
             case_path, 'snappyHexMesh',
-            castellation=True, snap=True, layers=True)
+            castellation=True, snap=True,
+            layers=not self.layers_skipped(case_path))
 
     #: The generated inputs every node of a pipeline run has to agree on.
     #: ``snappyHexMeshDict`` is deliberately absent: the split route rewrites
@@ -585,9 +615,9 @@ class SnappyMeshingEngine:
         """
         builder = CaseBuilder(db, _unit_bbox())
         builder.load_case_context(case_path)
-        return {
-            str(name): int(entry.get('nSurfaceLayers') or 0)
-            for name, entry in (builder._layer_surfaces() or {}).items()}
+        # DP-492. Keyed by patch, not by dictionary key: a pattern group's
+        # key is its quoted expression, which no patch in the log is called.
+        return builder.requested_layer_counts()
 
     @staticmethod
     def frozen_layer_patches(db, case_path) -> set:
@@ -721,11 +751,26 @@ class SnappyMeshingEngine:
         value = _db_value(db)
         mode = str(value('baseGrid/sizingMode', 'counts') or 'counts')
         if mode == 'target_size':
-            try:
-                base = float(value('baseGrid/targetCellSize'))
-            except (TypeError, ValueError):
-                return None, 'unavailable', 'baseGrid/targetCellSize is not set'
-            base_reason = f'base-grid target cell size {base:.4g}'
+            stored = value('baseGrid/targetCellSize')
+            if stored is None or str(stored).strip() == '':
+                # DP-669: unset is "Auto", the block diagonal / 40.
+                from foammesh.core.mesh.sizing import auto_target_cell_size
+
+                extent = hex_bounds or bounds
+                base = (auto_target_cell_size(extent)
+                        if extent is not None else None)
+                if base is None:
+                    return (None, 'unavailable',
+                            'baseGrid/targetCellSize is Auto and there is no '
+                            'mesh extent to derive it from')
+                base_reason = f'base-grid target cell size {base:.4g} (Auto)'
+            else:
+                try:
+                    base = float(stored)
+                except (TypeError, ValueError):
+                    return (None, 'unavailable',
+                            'baseGrid/targetCellSize is not set')
+                base_reason = f'base-grid target cell size {base:.4g}'
         else:
             try:
                 counts = tuple(int(value(f'baseGrid/numCells{axis}'))
@@ -742,8 +787,8 @@ class SnappyMeshingEngine:
             cells = [abs(span) / count for span, count in zip(spans, counts)]
             base = float(sum(cells) / len(cells))
             base_reason = ('base-grid cell '
-                           + ' x '.join(f'{item:.4g}' for item in cells)
-                           + f' from counts {counts[0]}x{counts[1]}x{counts[2]}')
+                           + ' × '.join(aligned(cells))
+                           + f' from counts {counts[0]}×{counts[1]}×{counts[2]}')
         level = 0
         try:
             for key in dict(db.getElements('castellation/refinementSurfaces')):
@@ -753,7 +798,7 @@ class SnappyMeshingEngine:
         except Exception:                                   # noqa: BLE001
             level = 0
         return (base / float(2 ** level), 'derived',
-                f'{base_reason}, refined {level} level(s)')
+                f'{base_reason}, refined {count_text(level, "level")}')
 
     def reset_stage(self, case_path, stage: str) -> dict:
         """Forget a recorded stage run and put the mesh back to its input.

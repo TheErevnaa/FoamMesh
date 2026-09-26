@@ -38,17 +38,33 @@ def suggest(readiness_report: dict, route: str = 'tessellated') -> dict:
                             if item.get('kind') == 'cad_validity'), {})
         census = cad_finding.get('details', {}).get('census', {}).get(
             'tolerance_census', {})
+        # DP-530. Both terms are in metres: the bounding box is the metre
+        # surface's, and the census is converted out of the shape's units
+        # where it is taken. It used to be the census in the shape's units --
+        # millimetres for STEP -- against a floor in metres, and the larger
+        # of the two was then handed to OCCT as millimetres. The tolerance
+        # the plan carries is in metres; the healing backend converts it.
         working = max(float(census.get('avg', 0) or 0), diagonal * 1e-6)
         size_finding = next((item for item in diagnostics
                              if item.get('kind') == 'small_features_vs_target'), {})
         target_size = size_finding.get('details', {}).get('target_cell_size')
-        linear = (.1 if not target_size else max(diagonal * 1e-5,
+        # DP-532. With no target cell size to grade against, the repaired
+        # solid is re-faceted as finely as it was imported (F-10). The plan
+        # used to say `0.1` here, which the re-tessellation applies in
+        # metres: every repair without a target re-faceted the part at a
+        # 0.1 m chord, a thousand times coarser than the 0.1 mm it was
+        # imported at, and silently.
+        from .store import stored_tessellation, tessellation_params
+        imported = tessellation_params(stored_tessellation(selected_geometry))
+        linear = (float(imported.linear_deflection)
+                  if not target_size else max(diagonal * 1e-5,
                   min(diagonal * 1e-2, float(target_size) / 5)))
+        angular = float(imported.angular_deflection_deg)
         actions = [
             {'action': action, 'params': (
                 {'tolerance': working} if action in {
                     'cad.fix_shape', 'cad.sew', 'cad.fix_wireframe'} else
-                {'linear_deflection': linear, 'angular_deflection_deg': 20}
+                {'linear_deflection': linear, 'angular_deflection_deg': angular}
                 if action == 'cad.retessellate' else {}),
              'enabled': action not in {'cad.remove_small_faces', 'cad.unify_same_domain'}}
             for action in CAD_ACTION_ORDER]

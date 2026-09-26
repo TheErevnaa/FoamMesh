@@ -40,8 +40,8 @@
    <item>
     <layout class="QHBoxLayout" name="buttonLayout">
      <item><spacer name="buttonSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property></spacer></item>
-     <item><widget class="QPushButton" name="copyDiagnostics"><property name="text"><string>Copy Diagnostics</string></property></widget></item>
-     <item><widget class="QPushButton" name="thirdPartySoftwares"><property name="text"><string>Licenses and Notices</string></property></widget></item>
+     <item><widget class="QPushButton" name="copyDiagnostics"><property name="text"><string>Copy diagnostics</string></property></widget></item>
+     <item><widget class="QPushButton" name="thirdPartySoftwares"><property name="text"><string>Licenses and notices</string></property></widget></item>
      <item><widget class="QPushButton" name="close"><property name="text"><string>Close</string></property><property name="default"><bool>true</bool></property></widget></item>
     </layout>
    </item>

@@ -3,18 +3,20 @@
 
 import logging
 import math
+from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QMessageBox, QWidget
+from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QWidget
 
 import qasync
 
 from foammesh.app import app
 from foammesh.core.case import ExternalMeshSummary, WorkflowMode
 from foammesh.core.engine.registry import ENGINE_REGISTRY
+from foammesh.core.naming import humanise_option
 from foammesh.core.project import Event
 from foammesh.core.run_result import RunResultHandle
 from foammesh.db.configurations_schema import Step
@@ -30,7 +32,8 @@ from foammesh.view.region.region_page import RegionPage
 from .external_mesh_page import ExternalMeshPage
 from .empty_case_page import EmptyCasePage
 from .meshing_method_branch import (
-    METHOD_TOKEN, TASK_TOKEN_PREFIX, MeshingMethodBranch)
+    DEFAULT_PROCEED, HOSTED_TASKS, METHOD_TOKEN, TASK_TOKEN_PREFIX,
+    MeshingMethodBranch, row_tasks)
 from widgets.async_message_box import AsyncMessageBox
 from foammesh.view.facade_client import FailedResult, query, submit
 
@@ -39,6 +42,68 @@ from .run_narration import describe_start
 
 logger = logging.getLogger(__name__)
 
+
+async def record_transition(branch, task_id: str, transition: str) -> None:
+    """Send one lifecycle transition and wait for it to land.
+
+    DP-253. `_on_task_transition` schedules the write and returns before the
+    facade has taken it (C31-12), so every settle below it read the task
+    state from before its own transition, answered "not accepted" and stopped
+    the press without a word. MEASURED on the guided walk, `pipe` for Gmsh:
+    the press on `3. Preparation` accepted the task hosted there, refused to
+    move, said nothing, and the screenshot taken afterwards shows the row it
+    would not open already unlocked -- the write landed just after the press
+    gave up.
+
+    A branch that offers no awaitable transition is a stand-in with no facade
+    behind it, and `submit` runs the write synchronously there, so the state
+    it reports next is already the new one.
+    """
+    recorder = getattr(branch, 'record_transition_async', None)
+    if recorder is None:
+        branch._on_task_transition(task_id, transition)
+        return
+    await recorder(task_id, transition)
+
+
+async def commit_page_edits(page) -> bool:
+    """Write what the page is holding, and wait to be told whether it landed.
+
+    DP-254. The press used to call `page.apply()` and read `is_dirty` on the
+    very next line. `apply` is a button handler whose patch C31-12 made a
+    scheduled write, so the flag it read was still the one from before its
+    own press: the press returned in silence, on a page whose edits were
+    about to be accepted. MEASURED on the guided walk, `pipe` for Gmsh: the
+    press on `4. Global sizing`, with ten of ten fields authored by the walk,
+    did nothing, said nothing and left the reader on that row.
+
+    A page that offers `save` is awaited, because that is the same write with
+    an answer (DP-227). A stand-in with only `apply` has no facade behind it,
+    `submit` runs its write synchronously, and the flag it reports next is
+    already the new one.
+    """
+    if not getattr(page, 'is_dirty', False):
+        return True
+    saver = getattr(page, 'save', None)
+    if saver is None:
+        page.apply()
+        return not getattr(page, 'is_dirty', False)
+    return bool(await saver())
+
+
+
+def unpublished_mesh_reason(payload: dict) -> str:
+    """Why an accepted run left no ``constant/polyMesh``, or '' if it did not.
+
+    DP-483. Only a publication that *failed* counts. A run that published
+    nothing by design -- an SU2-only target -- records ``skipped`` and has
+    nothing to apologise for.
+    """
+    publication = (payload or {}).get('publication') or {}
+    if publication.get('status') != 'failed':
+        return ''
+    return str(publication.get('reason') or '').strip() or (
+        'The mesh could not be written as an OpenFOAM polyMesh.')
 
 class ButtonID(Enum):
     NEXT    = auto()
@@ -143,7 +208,7 @@ class StepManager(QObject):
             if isinstance(self._contentStack, QWidget) else None)
         self._emptyCasePage.setObjectName('emptyCaseRegionBPage')
         self._emptyCasePage.setAccessibleName(
-            self.tr('Region B guidance when no case is open'))
+            self.tr('Guidance shown when no case is open'))
         self._emptyCasePage.setGuidance(
             getattr(ui, 'actionNew', None), getattr(ui, 'actionOpen', None),
             getattr(ui, 'actionLoadGeometry', None))
@@ -151,6 +216,11 @@ class StepManager(QObject):
 
         self._batchRunning = False
         self._externalMeshMode = False
+        # DP-464. Which step the content panel is actually showing, so that a
+        # lock taken on the way in can be reconsidered without navigating.
+        self._displayedStep = None
+        # DP-240. Whether a press of Proceed that runs a stage is in flight.
+        self._proceedBusy = False
         self._sceneVisible = False
         # R195. Routes, not widgets: `(widget, branch token or None)`.
         # Every task inside an engine branch is served by the one branch
@@ -202,6 +272,17 @@ class StepManager(QObject):
         self._methodBranch.pipeline_runners = {
             engine_id: partial(self._finishPipeline, engine_id)
             for engine_id in ENGINE_REGISTRY.ids()
+        }
+        # DP-256. A single stage run from a branch row is the same run as a
+        # single stage run from the legacy page, and only the legacy page
+        # wrote the dictionaries it meshes from. The rule for which engines
+        # need them and the domain they are written over both live here, so
+        # the branch is handed the finished act rather than a second copy of
+        # the rule.
+        self._methodBranch.stage_dictionaries = {
+            engine_id: self._generateDictionaries
+            for engine_id in ENGINE_REGISTRY.ids()
+            if self._needsGeneratedDictionaries(engine_id)
         }
         self._methodBranch.pageRequested.connect(self._showBranchPage)
         # R104/R162. See `_acceptExportTask`: an export that succeeded is the
@@ -282,10 +363,10 @@ class StepManager(QObject):
                 'This page belongs to a specific meshing engine, and no '
                 'engine has been chosen yet. Its settings cannot be written '
                 'until you pick one on '
-                '<a href="#method">3. Meshing Method</a>.'))
+                '<a href="#method">Mesh setup</a>.'))
         banner.setVisible(blocked)
 
-    def load(self):
+    def load(self, *, preserveCurrentPage: bool = False):
         self._contentStack.show()
         self._sceneVisible = False
         self._externalMeshMode = app.workflowResolution.workflow is WorkflowMode.MESH_EXTERNAL
@@ -313,7 +394,17 @@ class StepManager(QObject):
         self._contentStack.setEnabled(True)
         self._navigation.setExternalMeshMode(False)
 
+        # DP-363. `unload()` clears the page's loaded flag and `load()`
+        # repaints every control from the stored values, so rebuilding the
+        # page the user is filling in replaces their input with the last
+        # saved state. A background refresh must not do that; a history
+        # move must, because changing what the form shows is the point of
+        # it. The caller says which kind of refresh this is.
+        keep = (self._pages.get(self._navigation.currentStep())
+                if preserveCurrentPage else None)
         for page in self._pages.values():
+            if page is keep:
+                continue
             page.unload()
             page.load()
 
@@ -362,6 +453,35 @@ class StepManager(QObject):
         # route that still exists, it stays there.
         if not self._restoreBranchRoute():
             self._open(step)
+        self._paintSetupRows()
+
+    def _paintSetupRows(self) -> None:
+        """Tick `1. Geometry`, `2. Mesh setup` and `3. Preparation` from their records.
+
+        DP-762. None of the three is an engine task, so nothing painted them
+        anything but ready -- after an export on both engines the outline
+        still read ``○`` against all three. The records asked are the ones
+        Proceed already gates on: a geometry in the case, a meshing method
+        that is no longer ``unselected``, and a geometry-preparation
+        decision that is current for this geometry.
+        """
+        if self._externalMeshMode or app.facadeClient is None:
+            return
+        try:
+            engine = app.facadeClient.checkout().getValue('mesh/engine')
+            engine = str(getattr(engine, 'value', engine) or '')
+            records = (
+                (Step.GEOMETRY, self._pages[Step.GEOMETRY].isNextStepAvailable()),
+                (Step.GEOMETRY_REPAIR,
+                 self._pages[Step.GEOMETRY_REPAIR].isNextStepAvailable()),
+            )
+        except Exception:                                   # noqa: BLE001
+            logger.debug('setup rows left as they were', exc_info=True)
+            return
+        for step, settled in records:
+            self._navigation.setStepSettled(step, bool(settled))
+        self._navigation.setBranchNodeSettled(
+            METHOD_TOKEN, engine not in ('', 'unselected'))
 
     def _restoreBranchRoute(self) -> bool:
         """Put the panel back on the branch task it was on before a refresh.
@@ -474,7 +594,7 @@ class StepManager(QObject):
             # question that has to be answered before it can be used.
             self._navigation.requestBranch(METHOD_TOKEN)
             self._ui.statusbar.showMessage(
-                self.tr('Choose a meshing method first - the next page '
+                self.tr('Choose a meshing method first — the next page '
                         'belongs to one.'), 5000)
             return
         if engine:
@@ -483,6 +603,52 @@ class StepManager(QObject):
                 step = Step(step + 1)
         self._open(step)
 
+    def _stepLockHeld(self, step) -> bool:
+        """Whether any of the three conditions that shut a page still holds.
+
+        The predicate itself is unchanged and was already written twice in
+        `_moveToStep`; it is named here so that the answer can be asked for
+        again later, which is the whole of DP-464.
+        """
+        try:
+            mutating = app.facadeClient.session().jobs.has_mutating_job
+        except Exception:       # noqa: BLE001 - no case open is not a lock
+            mutating = False
+        return bool(step < self._workingStep or self._batchRunning or mutating)
+
+    def refreshStepLock(self):
+        """Reopen the current page once the job that shut it has finished.
+
+        DP-464. `_moveToStep` decides the lock once, on the way in, from a
+        one-shot read of `has_mutating_job` -- and nothing ever asked again.
+        A page opened while the case was mutating therefore stayed shut after
+        the mutation ended, and the only way back was to navigate away and
+        return, which re-runs the same one-shot read against a quiet case.
+
+        MEASURED 21 September 2026 on the `buildings` snappy leg: blockMesh
+        ran 317 s, the base grid submitted its `decomposePar` behind it, the
+        castellation page was opened inside that window and its run button
+        never came back -- `the castellation run button is disabled (a job is
+        still mutating the case)`. The two earlier attempts at this both tried
+        to guess from outside when the stage had finished, which is the wrong
+        question: the lock is not a race to be timed, it is a condition that
+        stops holding, and the job manager already says so through
+        `subscribe_state`.
+
+        Only unlocking is done here, never locking. A page that was open when
+        a job started keeps whatever the user was doing on it; taking a page
+        away mid-interaction would be a second defect wearing this one's
+        clothes, and entry is still the moment a lock is applied.
+        """
+        step = self._displayedStep
+        if step is None or self._externalMeshMode:
+            return
+        page = self._pages.get(step)
+        if page is None or self._stepLockHeld(step):
+            return
+        page.unlock()
+        self._updateControlButtons(step)
+
     def retranslatePages(self):
         for page in self._pages.values():
             page.retranslate()
@@ -490,7 +656,10 @@ class StepManager(QObject):
     def _connectSignalsSlots(self):
         self._navigation.currentStepChanged.connect(self._moveToStep)
         self._navigation.currentStepReactivated.connect(self._showWorkflowStep)
-        self._navigation.sceneRequested.connect(self._showScene)
+        # GEO-07. The outline no longer carries a `Scene / display` row, so
+        # there is no navigation signal to route here. `_showScene` stays:
+        # `_showExternalMesh` calls it, and an opened mesh reaching the
+        # display panel is the route that never had a workflow behind it.
         self._buttons.nextButtonClicked.connect(self.openNextStep)
         self._buttons.finishButtonClicked.connect(self._finishSteps)
         self._buttons.cancelButtonClicked.connect(self._cancelFinishSteps)
@@ -509,6 +678,9 @@ class StepManager(QObject):
             self._pages[step].stepReset.connect(lambda: self._buttons.showButton(ButtonID.FINISH))
 
         self._pages[Step.GEOMETRY].geometryRemoved.connect(self._geometryRemoved)
+        # DP-301. The controls that finish `3. Preparation` live on the page;
+        # the route off a step lives here. This is the one wire between them.
+        self._connectPreparationProceed()
 
         # R86. The task rows paint from a graph snapshot the engine branch
         # holds in memory, and only the branch's own buttons refreshed it. A
@@ -602,6 +774,7 @@ class StepManager(QObject):
     def _showWorkflowStep(self, step):
         if self._externalMeshMode:
             return
+        self._leaveBranchRoute()
         self._sceneVisible = False
         self._contentStack.show()
         self._contentStack.setCurrentIndex(step)
@@ -611,7 +784,22 @@ class StepManager(QObject):
             else getattr(self._pages[step], '_widget', None)
         )
         self._rememberPage(current_widget)
+        self._syncOutlineToStep(step)
         self._updateControlButtons(step)
+
+    def _leaveBranchRoute(self) -> None:
+        """Stop holding the branch task the panel is moving off (DP-561).
+
+        `_restoreBranchRoute` puts a refresh back on `_branchWidget`, which is
+        right while the reader is on that task (R149) and wrong once a
+        numbered step has been chosen. `_open` let go of it (DP-250); a click
+        on a numbered row goes through `_moveToStep` or `_showWorkflowStep`
+        instead, and neither did. MEASURED on the 0924 rerun, G6: from
+        `4. Global sizing` a click on `1. Geometry` showed the Geometry page
+        while a refresh inside the move put the highlight back on row 4.
+        """
+        self._branchPage = None
+        self._branchWidget = None
 
     @qasync.asyncSlot()
     async def _showExternalMesh(self):
@@ -628,7 +816,7 @@ class StepManager(QObject):
         # The retained mesh is snapshotted by the transition service before
         # authored navigation becomes available.
         confirmation = QMessageBox.question(
-            app.window, self.tr('Start Meshing Workflow'),
+            app.window, self.tr('Start meshing workflow'),
             self.tr('The external mesh will be retained as a recovery copy. '
                     'A future generated-mesh run may replace the current mesh. Continue?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -651,7 +839,7 @@ class StepManager(QObject):
 
     def _returnExternalMesh(self):
         confirmation = QMessageBox.question(
-            app.window, self.tr('Return to External Mesh'),
+            app.window, self.tr('Return to external mesh'),
             self.tr('Restore the retained external polyMesh and suspend authored navigation?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -697,11 +885,31 @@ class StepManager(QObject):
         if self._externalMeshMode:
             return
         self._pages[step].open()
+        # DP-249. Opening a step is the decision that the workflow has
+        # reached it, so the row stops being locked here -- before the
+        # outline is asked to stand on it, not after. MEASURED on the
+        # footer-only walk: `setCurrentStep` was handed `3. Preparation`
+        # while that row was still disabled (a fresh case enables Geometry
+        # alone), and `QAbstractItemView.setCurrentIndex` drops a disabled
+        # index in silence. `_setWorkingStep` below enables the row two
+        # lines too late, so the press that accepted the meshing method
+        # left the highlight on `2. Mesh setup` and the walk stopped there.
+        self._navigation.enableStep(step)
+        # DP-250. And let go of the branch route on the way past. Every
+        # applied transaction runs `load()`, which ends on
+        # `_restoreBranchRoute()`; the press that opens this step commits
+        # one, so the refresh it triggered put the panel straight back on
+        # the branch page the press had just left. A redraw must not eject
+        # a reader from a branch task (R149) -- but after a navigation the
+        # workflow is no longer standing on that route, and holding the
+        # widget is what says otherwise.
+        self._branchPage = None
+        self._branchWidget = None
         self._navigation.setCurrentStep(step)
         self._syncOutlineToStep(step)
         # R93. `setCurrentStep` moves the outline synchronously and leaves the
         # panel to `_moveToStep`, which is an async slot with several early
-        # returns. Opening a case from File > Open Recent painted the outline
+        # returns. Opening a case from File > Open recent painted the outline
         # with every step and the title bar with the case name while the panel
         # still read "No Case Open" and told the user to create one -- until
         # any outline row was clicked. Whether a case is open is not a
@@ -730,6 +938,12 @@ class StepManager(QObject):
         if task_id is None and step == Step.EXPORT:
             task_id = 'common.export'
         if task_id is None:
+            # DP-561. A step with a row of its own was left to the mouse
+            # press that chose it, and a refresh landing inside the move
+            # re-selected the branch task being left. Say it here instead.
+            setStepRow = getattr(self._navigation, 'setStepRowCurrent', None)
+            if setStepRow is not None:
+                setStepRow(step)
             return
         setCurrent = getattr(self._navigation, 'setBranchCurrent', None)
         if setCurrent is not None:
@@ -754,11 +968,12 @@ class StepManager(QObject):
             # and the outline listed every finished task. Showing the page is
             # this method's job whether or not the step moved.
             page = self._pages[step]
+            self._leaveBranchRoute()
             await page.show(self._isWorkingStep(step), self._batchRunning)
             if self._routeSuperseded(generation):
                 return
-            if (step < self._workingStep or self._batchRunning
-                    or app.facadeClient.session().jobs.has_mutating_job):
+            self._displayedStep = step
+            if self._stepLockHeld(step):
                 page.lock()
             else:
                 page.unlock()
@@ -777,13 +992,17 @@ class StepManager(QObject):
         if not hidden:
             self._navigation.setCurrentStep(prev)
             return
+        # DP-561. The page being left is gone, so the branch task it may
+        # have been standing on goes with it -- before the next await, where
+        # a refresh would otherwise put the panel back on that task.
+        self._leaveBranchRoute()
 
         page = self._pages[step]
         await page.show(self._isWorkingStep(step), self._batchRunning)
         if self._routeSuperseded(generation):
             return
-        if (step < self._workingStep or self._batchRunning
-                or app.facadeClient.session().jobs.has_mutating_job):
+        self._displayedStep = step
+        if self._stepLockHeld(step):
             page.lock()
         else:
             page.unlock()
@@ -814,6 +1033,58 @@ class StepManager(QObject):
         if not self._routeHistory or self._routeHistory[-1] != entry:
             self._routeHistory.append(entry)
         self._updateWizardActions()
+        self._dropStrandedBaseGridOutline(widget)
+
+    def _dropStrandedBaseGridOutline(self, widget):
+        """The domain box belongs to the page that draws it (DP-139).
+
+        DP-106 dropped the base-cell note whenever the displayed *step*
+        changed. Every task of the Meshing Method branch is one step, so
+        walking from Base Grid to Castellation, Snap, Layers or Export
+        changed nothing the note keyed on: the blue domain box stayed drawn
+        around a castellated mesh it had nothing to do with, and the chip
+        beside the model extent went on naming a base cell for a page that
+        was no longer on screen. This is the one funnel every route move
+        goes through, and the page that owns the box is the only one it may
+        stay on.
+        """
+        owner = self._pages.get(Step.BASE_GRID)
+        if owner is None or widget is getattr(owner, '_widget', None):
+            return
+        drop = getattr(owner, 'dropOutline', None)
+        if drop is not None:
+            drop()
+
+    def _currentRouteToken(self) -> str:
+        """The branch row the footer is standing on, or nothing.
+
+        DP-255. The footer used to read `self._methodBranch.currentToken`
+        whatever page was on screen, and that token is the last branch task
+        this *window* visited -- it survives a numbered step, a `Back`, and
+        the closing of the whole case, because nothing resets it. MEASURED on
+        the guided walk: leg one meshed `pipe` with Gmsh and exported it,
+        leaving the token at `engine_task:common.export`; the window then
+        opened a second case, and the footer on `1. Geometry` of that new
+        case was graded by the export rule below -- no mesh in a case seconds
+        old, so the button was dead, on the first row of a fresh workflow,
+        with a tooltip that talked about saving this step. The walk had
+        nowhere to go and the case could not be started at all.
+
+        The row a press belongs to is a fact about the page in front of the
+        reader. Only the branch shows task rows, so when the panel is on any
+        other page there is no task token to grade, and the footer falls back
+        to the plain forward label the numbered steps use.
+
+        A stand-in panel that cannot say what it is showing -- the Region B
+        harnesses put a plain object there -- is taken at its word that the
+        branch is the page, which is what it was before this fix.
+        """
+        token = str(getattr(self._methodBranch, 'currentToken', '') or '')
+        branch = getattr(self._methodBranch, 'branch', None)
+        showing = getattr(self._contentStack, 'currentWidget', None)
+        if branch is None or showing is None:
+            return token
+        return token if showing() is branch else ''
 
     def _updateWizardActions(self):
         if not hasattr(self._ui, 'wizardBackButton'):
@@ -821,43 +1092,35 @@ class StepManager(QObject):
         self._ui.wizardBackButton.setEnabled(len(self._routeHistory) > 1)
         enabled = (
             not self._batchRunning and not self._externalMeshMode
+            # DP-240. A press that started a mesher used to leave its own
+            # button live for the whole of the run, so the ordinary reflex
+            # when nothing visibly happens -- click again -- queued a second
+            # run of the same stage. Any of the half-dozen signals that repaint
+            # this bar would switch it back on mid-run, so the guard has to be
+            # read here and not only set once by the press.
+            and not getattr(self, '_proceedBusy', False)
             and self._contentStack.isEnabled())
         self._ui.wizardProceedButton.setEnabled(enabled)
-        token = self._methodBranch.currentToken
+        token = self._currentRouteToken()
+        # DP-238. Plan 32 §4.2/§4.3. One table, keyed by the row, read here.
+        # This button used to write its own labels, four names for one act
+        # until Plan 30 WP-09 cut them to three names for nine acts. That
+        # vocabulary was private to the footer, so the only cure anyone could
+        # apply was to make it smaller. What the press does is a fact about
+        # the row, and the row is where it is now written.
+        ask = getattr(self._methodBranch, 'proceedLabel', None)
+        label, tip = ask(token) if ask is not None else DEFAULT_PROCEED
+        # `&` is Qt's mnemonic marker: handed over singly it vanishes and
+        # underlines whatever follows it.
+        self._ui.wizardProceedButton.setText(self.tr(label).replace('&', '&&'))
+        self._ui.wizardProceedButton.setToolTip(self.tr(tip))
         if token.endswith('common.export'):
-            # Plan 28 WP3. It used to say "Run & Proceed" and mean it: the
-            # last row of the wizard re-ran the entire mesh. What this row
-            # does is write a file.
-            self._ui.wizardProceedButton.setText(self.tr('Export'))
             # R50. It was live on a case with no geometry, no region and no
             # mesh, where it can only lead to a failure or an empty case
             # directory. The page knows whether there is a mesh to write.
             canExport = getattr(self._pages.get(Step.EXPORT), 'canExport', None)
             if canExport is not None:
                 self._ui.wizardProceedButton.setEnabled(enabled and canExport())
-            return
-        if not self._proceedRuns(token):
-            self._ui.wizardProceedButton.setText(self.tr('Proceed'))
-            self._ui.wizardProceedButton.setToolTip(self.tr(
-                'Save this task and open the next one.'))
-            return
-        # Plan 30 WP-09, §7.1. There is one forward idiom now. This button
-        # used to invent two more of its own -- `Run pipeline && Proceed` and
-        # `Run && Proceed` -- for the same act the task page calls "Run this
-        # step", so the same action had three names depending on where the
-        # user's eye landed. The three the bottom bar may say are exactly
-        # `Run this step`, `Proceed` and `Export`; what else the press does is
-        # in the tooltip, not in a fourth label.
-        self._ui.wizardProceedButton.setText(self.tr('Run this step'))
-        if self._proceedRunsPipeline(token):
-            # A10. One press of this ran compute, publish and QA. It still
-            # does -- that is what the task is -- and it says so here.
-            self._ui.wizardProceedButton.setToolTip(self.tr(
-                'Runs every remaining stage of this engine, not just this '
-                'one, and then opens the next task.'))
-            return
-        self._ui.wizardProceedButton.setToolTip(self.tr(
-            'Runs this task, then opens the next one.'))
 
     def _proceedWillRun(self) -> bool:
         """Whether pressing Proceed now runs a utility rather than just saving.
@@ -880,18 +1143,52 @@ class StepManager(QObject):
                 or (branch.is_accepted(task_id)
                     and not self._skipIsContradicted(branch, task_id))):
             return False
-        if task_id == 'snappy.layers' and not self._layersConfigured():
+        if not self._taskIsConfigured(task_id):
             return False
         return True
 
     @staticmethod
-    def _repairIsPrepared(page) -> bool:
-        """Whether a prepared geometry exists for the meshers to read (R203).
+    def _preparationVerdict(page):
+        """What the Preparation page says Proceed may do, or None.
+
+        Plan 32 W3. The page holds the readiness report and the recorded
+        decision; asking it, rather than re-deriving either here, is what
+        keeps the wizard from refusing a geometry the page calls ready or
+        naming a finding the table does not show. None means it cannot say
+        -- no case, no report, a read that raised -- and the caller falls
+        back to what it did before rather than treating silence as a no.
+        """
+        ask = getattr(page, 'preparationVerdict', None)
+        if ask is None:
+            return None
+        try:
+            return ask()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _repairIsPrepared(page, verdict=None) -> bool:
+        """Whether Proceed may leave Preparation (R203, Plan 32 W3).
+
+        Two ways to be true, and both end with a prepared revision the
+        meshers can read. Either one exists already, or the checks found
+        nothing that needs a written reason, in which case this press is
+        enough to record and freeze one -- repair is optional (Plan 32
+        section 2), so a clean geometry does not owe the user a visit to a
+        repair tab.
 
         The page answers this for the outline already. A page that cannot
         answer -- no facade session, a readiness call that raises -- does not
         get to block the wizard; the run refuses on its own and says why.
+
+        ``verdict`` is the page's own answer when the caller already has it,
+        so the question is asked once per press; left out, the page is asked
+        here. The predicate is the same either way.
         """
+        if verdict is None:
+            verdict = StepManager._preparationVerdict(page)
+        if verdict is not None:
+            return bool(verdict.can_proceed or verdict.accept_as_is)
         ask = getattr(page, 'isNextStepAvailable', None)
         if ask is None:
             return True
@@ -906,14 +1203,11 @@ class StepManager(QObject):
             return True
         return await app.window._requireSavedCase(self.tr('meshing'))
 
-    def _proceedRunsPipeline(self, token: str) -> bool:
-        """Whether Proceed on this task runs the whole rest of the engine."""
-        branch = self._methodBranch.branch
-        if branch is None or not token.startswith(TASK_TOKEN_PREFIX):
-            return False
-        task_id = token[len(TASK_TOKEN_PREFIX):]
-        page = branch.page(task_id)
-        return getattr(page, 'run_all_task_id', None) == task_id
+    # DP-239. `_proceedRunsPipeline` used to live here, and its one reader was
+    # the footer tooltip that offered to run every remaining stage of the
+    # engine -- the promise `Run to end` exists to make, made a second time by
+    # a control standing next to it. The promise went back to the branch
+    # heading; the predicate had nothing left to answer.
 
     def _proceedRuns(self, token: str) -> bool:
         """Whether Proceed on this task has to run something before moving on."""
@@ -929,7 +1223,7 @@ class StepManager(QObject):
         # `Run & Proceed` on a task the settle path was about to skip. Two
         # answers to the same question is how a button comes to promise
         # something the code below it never intended to do.
-        if task_id == 'snappy.layers' and not self._layersConfigured():
+        if not self._taskIsConfigured(task_id):
             return False
         from foammesh.core.facade.domain_operations import CHECK_TASK_OPERATIONS
         return (task_id in CHECK_TASK_OPERATIONS
@@ -956,6 +1250,59 @@ class StepManager(QObject):
         self._contentStack.setCurrentWidget(widget)
         self._updateWizardActions()
 
+    def _findRunToEnd(self):
+        """The branch heading's `Run to end`, found the way the branch names it.
+
+        By object name rather than by attribute, so the wizard can reach a
+        control it does not own without either file importing the other, and
+        so a branch stand-in that is not a real widget simply has none.
+        """
+        branch = getattr(self._methodBranch, 'branch', None)
+        find = getattr(branch, 'findChild', None)
+        if find is None:
+            return None
+        return find(QPushButton, 'branchRunCompleteMesh')
+
+    @contextmanager
+    def _proceedInFlight(self):
+        """Hold both forward controls dead for the length of one press.
+
+        DP-240. Proceed on a generation row starts a mesher and then awaits
+        it; the button stayed live for the whole of that wait, and so did
+        `Run to end` beside it, so the ordinary reflex when nothing visibly
+        happens -- click again -- queued a second run of the same stage
+        against the same case directory. The graph refuses nothing here: while
+        the first run is in flight the task is still runnable.
+
+        A context manager, because the restore has to happen on every way out
+        of the press: a refusal, and a mesher that dies raising through the
+        whole stack. A failed run is when the button matters most -- left dead
+        it turns a failure into a hang and the case into a dead end.
+
+        `Run to end` is restored by asking the branch to grade it again, not
+        by switching it on: it is disabled for its own reasons too, and
+        handing back a control the branch had refused would be the same defect
+        with the sign flipped.
+        """
+        self._proceedBusy = True
+        button = getattr(self._ui, 'wizardProceedButton', None)
+        if button is not None:
+            button.setEnabled(False)
+        runToEnd = self._findRunToEnd()
+        if runToEnd is not None:
+            runToEnd.setEnabled(False)
+        try:
+            yield
+        finally:
+            self._proceedBusy = False
+            self._updateWizardActions()
+            grade = getattr(getattr(self._methodBranch, 'branch', None),
+                            '_gradeRunAll', None)
+            if grade is not None:
+                grade()
+            elif runToEnd is not None:
+                runToEnd.setEnabled(True)
+
     @qasync.asyncSlot()
     async def _wizardProceed(self):
         """Settle the current task, then advance to the next one that is open.
@@ -968,6 +1315,12 @@ class StepManager(QObject):
         accepted lets the wizard move on.
         """
         if self._batchRunning or self._externalMeshMode:
+            return
+        # DP-240. The dead button is the guard a user sees; this is the one
+        # that holds when the press arrives another way -- a shortcut, a
+        # repaint race that re-enabled the button, a queued click delivered
+        # after the run began.
+        if getattr(self, '_proceedBusy', False):
             return
         # H10. The save this app demands before it will mesh used to be asked
         # for from inside the run -- after this method had already taken hold
@@ -982,16 +1335,31 @@ class StepManager(QObject):
         widget = self._contentStack.currentWidget()
         method_page = self._methodBranch.methodPage
         if widget is method_page:
-            checked = method_page._group.checkedButton()
-            if checked is None or not checked.isEnabled():
-                self._ui.statusbar.showMessage(
-                    self.tr('Select an available meshing method first.'), 5000)
-                return
-            method_page._apply_selection()
+            # Plan 33 SETUP-05. This press is the whole commit of Mesh setup,
+            # and the page owns what that means: the target solver, the
+            # meshing method and the resource settings under them, in one
+            # order, awaited. The window's part is to press it and to say
+            # what came back -- three copies of the page's own rules used to
+            # live here, and the one that mattered (DP-251: the settings are
+            # saved before the method is applied, because applying it
+            # refreshes the page over whatever was pending) is now beside the
+            # settings it protects.
+            accepted, reason = await method_page.commitSelection()
+            if not accepted and reason:
+                self._ui.statusbar.showMessage(str(reason), 8000)
             return
 
         if widget is self._scenePage:
             self._open(Step.GEOMETRY_REPAIR)
+            return
+
+        # A stand-in for the branch (the Region B harnesses use one) has no
+        # field pages to offer, and being asked for one must not be an error --
+        # the same reason `methodPage` is read through `getattr` above.
+        field_page_token = getattr(self._methodBranch, 'fieldPageToken', None)
+        field_token = field_page_token(widget) if field_page_token else None
+        if field_token is not None:
+            await self._proceedFromFieldPage(widget, field_token)
             return
 
         page_by_widget = {
@@ -1001,13 +1369,30 @@ class StepManager(QObject):
         mapped = page_by_widget.get(widget)
         if mapped is not None:
             step, page = mapped
+            # DP-251, the other band DP-157 left without a commit: the import
+            # and healing section of `3. Preparation`. It is saved before the
+            # page is, because the page's own Proceed prepares the geometry
+            # the section describes how to read. `getattr`, because only one
+            # step page carries such a section.
+            saveHealing = getattr(page, 'savePendingHealing', None)
+            if saveHealing is not None and not await saveHealing():
+                self._ui.statusbar.showMessage(self.tr(
+                    'The import and healing settings were not saved, so the '
+                    'geometry was not prepared with them.'), 8000)
+                return
             if not await page.save():
                 self._ui.statusbar.showMessage(
                     self.tr('Resolve the validation errors before proceeding.'),
                     5000)
                 return
             if step == Step.GEOMETRY:
-                self._open(Step.GEOMETRY_REPAIR)
+                # Plan 32 section 4.1. Geometry used to walk straight on to
+                # the repair page, which then asked the user to prepare a
+                # geometry for a method nobody had chosen -- and the method
+                # decides what preparing it means, because only Gmsh reads
+                # the import and healing settings that page now carries. The
+                # order is Geometry, Mesh setup, Preparation.
+                self._navigation.requestBranch(METHOD_TOKEN)
                 return
             if step == Step.GEOMETRY_REPAIR:
                 # R203. MEASURED on tee_gmsh_r2: Proceed walked off this page
@@ -1020,14 +1405,27 @@ class StepManager(QObject):
                 # one exists, and Proceed never asked it. Preparing on the
                 # user's behalf is not the fix: accepting geometry the checks
                 # call blocked is a decision with a written reason attached.
-                if not self._repairIsPrepared(page):
-                    self._ui.statusbar.showMessage(self.tr(
-                        'Prepare the geometry before proceeding - the meshers '
-                        'read the prepared revision, not the import. Apply a '
-                        'repair plan, wrap it, or accept it on the "Use '
-                        'as-is" tab.'), 12000)
-                    return
-                self._navigation.requestBranch(METHOD_TOKEN)
+                #
+                # DP-246/DP-247. A geometry the checks call ready is not
+                # that geometry. MEASURED on the unit cube: the refusal
+                # below fired on a surface with no finding at all, and
+                # reaching the first engine row from here took three more
+                # controls -- the "Use as-is" tab, its button, and Proceed
+                # again -- to record a decision nobody was being asked to
+                # weigh. And when there was something to weigh, the same
+                # sentence named none of it. The page is asked once, and
+                # its answer decides both: prepare here and go on, or stay
+                # and say what must be fixed, in the words the findings
+                # table above is already using.
+                #
+                # DP-301. The body of this branch is now `_proceedFromPreparation`,
+                # because the page grew controls that finish this step --
+                # `Use as-is and proceed`, `Apply repairs and proceed`,
+                # `Apply wrap and proceed` -- and a second copy of the route
+                # is a second answer to "which row comes next".
+                refusal = await self._proceedFromPreparation(page)
+                if refusal:
+                    self._ui.statusbar.showMessage(refusal, 12000)
                 return
             if self._engineId() == 'unselected':
                 # R52. Same walk as `openNextStep`, on the control that
@@ -1039,37 +1437,29 @@ class StepManager(QObject):
                 # the user to the one question that unblocks the rest instead.
                 self._navigation.requestBranch(METHOD_TOKEN)
                 self._ui.statusbar.showMessage(
-                    self.tr('Choose a meshing method first - the rest of the '
+                    self.tr('Choose a meshing method first — the rest of the '
                             'workflow belongs to one.'), 5000)
                 return
-            if not await self._settleLegacyTask(step, page):
-                self._updateWizardActions()
-                return
-            self._methodBranch._syncChildren()
-            # A7. `currentToken` is whatever branch node was last routed to,
-            # and a legacy step page reached through the outline never routes
-            # one -- so Proceed resolved "the next task" against a stale row
-            # and re-opened work the user had already finished. The step knows
-            # which task it stands for; ask that.
-            own_task = self._SNAPPY_STEP_TASKS.get(step)
-            token = (TASK_TOKEN_PREFIX + own_task if own_task
-                     else self._methodBranch.currentToken)
-            next_token = self._methodBranch.nextAvailableTaskToken(token)
-            if next_token:
-                self._navigation.requestBranch(next_token)
-            elif step == Step.EXPORT:
-                await self._proceedFromExport()
-            else:
-                self._reportNoNextTask()
+            # DP-240. The legacy snappy pages run their stage through
+            # `runInBatchMode`, so this press is a run too and is held the
+            # same way.
+            with self._proceedInFlight():
+                if not await self._settleLegacyTask(step, page):
+                    return
+                await self._advanceFromLegacyStep(step)
             return
 
         branch = self._methodBranch.branch
         if widget is branch and branch is not None:
             task_page = branch.stack.currentWidget()
-            if getattr(task_page, 'is_dirty', False):
-                task_page.apply()
-                if getattr(task_page, 'is_dirty', False):
-                    return
+            if not await commit_page_edits(task_page):
+                # DP-254. A press that will not move says why. It used to
+                # return here without a word, which read as a dead button.
+                self._ui.statusbar.showMessage(
+                    self.tr('The edits on this step were not saved, so the '
+                            'workflow stayed here. Correct them and press '
+                            'Proceed again.'), 8000)
+                return
             task_id = self._taskIdForToken(
                 self._methodBranch.currentToken, task_page)
             if task_id == 'common.export':
@@ -1079,17 +1469,85 @@ class StepManager(QObject):
                 await self._proceedFromExport()
                 self._updateWizardActions()
                 return
-            if task_id and not await self._settleTask(branch, task_page, task_id):
-                self._updateWizardActions()
-                return
-            self._methodBranch._syncChildren()
-            token = self._methodBranch.currentToken
-            next_token = self._methodBranch.nextAvailableTaskToken(token)
-            if next_token:
-                self._navigation.requestBranch(next_token)
-                return
+            # DP-240. Everything past this line can start a mesher, so both
+            # forward controls stay dead until the press settles -- whichever
+            # way out of it the press takes.
+            with self._proceedInFlight():
+                settled = not task_id or await self._settleRow(
+                    branch, task_page, task_id)
+                # The outline is repainted whichever way the press went. It
+                # used to be repainted only on the way forward, so a press
+                # that refused left the row painted as it had been before --
+                # and a row whose substep had just failed was painted green
+                # by the settle that preceded it. The reader was left with a
+                # button that did not move, a sentence that expires in eight
+                # seconds, and an outline saying the step was done.
+                self._methodBranch._syncChildren()
+                if not settled:
+                    return
+                token = self._methodBranch.currentToken
+                next_token = self._methodBranch.nextAvailableTaskToken(token)
+                if next_token:
+                    self._navigation.requestBranch(next_token)
+                    return
+                self._reportNoNextTask()
+
+    async def _advanceFromLegacyStep(self, step) -> None:
+        """Open whatever follows a legacy snappy step page."""
+        self._methodBranch._syncChildren()
+        # A7. `currentToken` is whatever branch node was last routed to,
+        # and a legacy step page reached through the outline never routes
+        # one -- so Proceed resolved "the next task" against a stale row
+        # and re-opened work the user had already finished. The step knows
+        # which task it stands for; ask that.
+        own_task = self._SNAPPY_STEP_TASKS.get(step)
+        token = (TASK_TOKEN_PREFIX + own_task if own_task
+                 else self._methodBranch.currentToken)
+        next_token = self._methodBranch.nextAvailableTaskToken(token)
+        if next_token:
+            self._navigation.requestBranch(next_token)
+        elif step == Step.EXPORT:
+            await self._proceedFromExport()
+        else:
+            self._reportNoNextTask()
+
+    async def _proceedFromFieldPage(self, page, token: str) -> None:
+        """Save a field-group page, then open the outline row beneath it.
+
+        UX-11 / DP-227. This method knew the method page, the scene page,
+        the `_pages` table keyed by Step, and the engine branch. The two
+        field-group rows the outline now opens with -- `1. Mesh intent` and
+        `2. Execution` -- were in none of them, so Proceed on either
+        returned without a transition and without a message: on the first
+        two screens of the workflow the only forward control did nothing at
+        all, and nothing said why.
+
+        The route is asked of the outline, which is the one place that
+        knows what row follows what, so replacing these two rows with a
+        single Mesh setup page later changes nothing here.
+        """
+        if not await page.save():
+            self._ui.statusbar.showMessage(
+                self.tr('Resolve the validation errors before proceeding.'),
+                5000)
+            return
+        route = self._navigation.nextOutlineRoute(token)
+        if route is None:
+            # Never silent. `_reportNoNextTask` is the sentence the engine
+            # branch already uses when Proceed has nowhere to go.
             self._reportNoNextTask()
             self._updateWizardActions()
+            return
+        kind, value = route
+        if kind == 'token':
+            self._navigation.requestBranch(str(value))
+        else:
+            # Not `_open`: that records a new working step in the case, and
+            # a reopened case standing on a later step would be regressed to
+            # Geometry by a click on Proceed. This is exactly what clicking
+            # the outline row does.
+            self._navigation.setCurrentStep(Step(int(value)))
+        self._updateWizardActions()
 
     def _reportNoNextTask(self) -> None:
         """Say why Proceed stopped, and offer the row that is in the way.
@@ -1118,9 +1576,15 @@ class StepManager(QObject):
     def _reportBlockedTask(self, branch, task_id: str) -> None:
         """Name the prerequisite that is holding this task shut (A8)."""
         titles = self._methodBranch.taskTitles()
-        info = branch.task_info(task_id) or {}
-        blocking = [dep for dep in (info.get('depends_on') or ())
-                    if not branch.is_accepted(dep)]
+        # DP-144. The graph is the one that knows which prerequisites still
+        # count, and an optional step nobody configured no longer does. A
+        # branch double that predates the accessor still gets the old count.
+        ask = getattr(branch, 'blocking_prerequisites', None)
+        blocking = list(ask(task_id)) if callable(ask) else []
+        if not blocking:
+            info = branch.task_info(task_id) or {}
+            blocking = [dep for dep in (info.get('depends_on') or ())
+                        if not branch.is_accepted(dep)]
         if not blocking:
             self._ui.statusbar.showMessage(
                 self.tr('Finish the earlier tasks before this one.'), 5000)
@@ -1171,8 +1635,201 @@ class StepManager(QObject):
         if branch is not None:
             title = str(branch.task_info(task_id).get('title') or task_id)
         self._ui.statusbar.showMessage(
-            self.tr('{0} was skipped -- nothing is configured for it, so '
+            self.tr('{0} was skipped — nothing is configured for it, so '
                     'nothing ran.').format(title), 8000)
+
+    # -- one route off Preparation (DP-301) ---------------------------------- #
+
+    async def _proceedFromPreparation(self, page):
+        """Finish `3. Preparation` and open whichever row comes next.
+
+        DP-301, PREP-04/PREP-06. The footer's Proceed owned this walk, and the
+        page's own controls owned half of it: `Use geometry as-is` recorded a
+        decision, froze a revision, refreshed the page and stopped -- leaving
+        the task hosted on this page unsettled and the reader on the step they
+        had just finished, with a second press to find. Both controls call
+        this, so there is one answer to what finishing preparation means.
+
+        Returns ``None`` when the reader was moved on, and the sentence to say
+        otherwise; ``''`` means the refusal was already reported where it
+        happened.
+        """
+        verdict = self._preparationVerdict(page)
+        if not self._repairIsPrepared(page, verdict):
+            return (verdict.message if verdict is not None and verdict.message
+                    else self.tr(
+                        'Prepare the geometry before proceeding — the '
+                        'meshers read the prepared revision, not the '
+                        'import. Apply a repair plan, wrap it, or accept '
+                        'it on the "Use as-is" tab.'))
+        # Plan 32 check 1. The visible step never decreases, and this sent
+        # Proceed on `3. Preparation` up to `2. Mesh setup` -- the row above
+        # it, and the question the user answered to get here. R203 is about
+        # geometry nobody prepared; a prepared geometry is owed the work that
+        # reads it. Which row that is belongs to the engine, so the branch is
+        # asked rather than told: the walk starts at the node itself, which is
+        # how it answers with the first row that still wants something.
+        if self._engineId() == 'unselected':
+            # No method, no engine rows to open. Opening Mesh setup would be
+            # the same backwards move under a better reason, so the row is
+            # named instead. DP-188. The row is named, not numbered: a
+            # sentence that spells the number goes stale the next time the
+            # outline gains or loses a row.
+            return self.tr(
+                'Choose a meshing method on the Mesh setup row first — the '
+                'tasks that follow preparation belong to one.')
+        if verdict is not None and verdict.accept_as_is:
+            # The same two facade operations the "Use as-is" tab submits, in
+            # the same order, with the same parameters: there is one way to
+            # prepare a geometry, and nothing downstream can tell which
+            # control asked for it.
+            failure = await page.acceptGeometryAsIs()
+            if failure is not None:
+                return self.tr(
+                    'The geometry was not prepared: {0}. Record a decision '
+                    'on the "Use as-is" tab.').format(failure)
+            # Said out loud. A decision recorded on someone's behalf that
+            # they never see is not one they made.
+            self._ui.statusbar.showMessage(verdict.message, 8000)
+        # DP-252. The row this press opens is locked until the task hosted on
+        # this page is settled, and nothing settled it.
+        if not await self._settleHostedTasks():
+            return ''
+        next_token = self._methodBranch.nextAvailableTaskToken(METHOD_TOKEN)
+        if next_token:
+            self._navigation.requestBranch(next_token)
+        else:
+            self._reportNoNextTask()
+        return None
+
+    @qasync.asyncSlot()
+    async def _preparationProceedRequested(self):
+        """A control on the page asked for the route the footer takes."""
+        page = self._pages.get(Step.GEOMETRY_REPAIR)
+        if page is None:
+            return
+        # The footer saves the import and healing band and then the page
+        # before it prepares anything (DP-251); a control on the page that
+        # finishes the same step owes the same two saves.
+        saveHealing = getattr(page, 'savePendingHealing', None)
+        if saveHealing is not None and not await saveHealing():
+            page.showProceedRefusal(self.tr(
+                'The import and healing settings were not saved, so the '
+                'geometry was not prepared with them.'))
+            return
+        if not await page.save():
+            page.showProceedRefusal(self.tr(
+                'Resolve the validation errors before proceeding.'))
+            return
+        refusal = await self._proceedFromPreparation(page)
+        if refusal:
+            # Beside the control that was pressed, not in the status bar at
+            # the bottom of a window the reader is not looking at.
+            page.showProceedRefusal(refusal)
+
+    def _connectPreparationProceed(self) -> None:
+        """Let the Preparation page ask for the footer's own route."""
+        page = self._pages.get(Step.GEOMETRY_REPAIR)
+        requested = getattr(page, 'proceedRequested', None)
+        if requested is not None:
+            requested.connect(self._preparationProceedRequested)
+
+    async def _settleHostedTasks(self) -> bool:
+        """Settle the tasks that live on `3. Preparation` and have no row.
+
+        DP-252. `HOSTED_TASKS` says it in words -- the task still exists,
+        still has prerequisites and still has to be settled -- and nothing
+        settled it. MEASURED by the footer-only walk on `pipe` for Gmsh:
+        Preparation prepared the geometry, the press asked for the next row,
+        and the status bar answered "Global sizing opens once Describe
+        geometry is finished." Every Gmsh row depends on that task, the row
+        that used to accept it was folded into this page, so the guided
+        workflow ended on row 3 and no Gmsh case could be meshed from it.
+
+        The band those questions now live in is already written by the press
+        that gets here (DP-251), so this is the press that settles them: the
+        page that asks a task's questions is the page that finishes it.
+
+        A refusal stops the press. `_settleTask` has already said why, and
+        this is the last thing standing between the reader and a row that
+        will refuse to open with a sentence naming a step they cannot see.
+
+        A branch that cannot answer `is_accepted` is a stand-in with no task
+        graph behind it (the Region B harnesses use one), and asking it to
+        settle anything is not a refusal -- it has nothing to settle.
+        """
+        branch = self._methodBranch.branch
+        if branch is None or not hasattr(branch, 'is_accepted'):
+            return True
+        declared = [str(task.get('task_id') or '')
+                    for task in getattr(branch, 'workflow_tasks', ())]
+        for task_id in declared:
+            if task_id not in HOSTED_TASKS:
+                continue
+            # No page is passed: a hosted task has no row and no page of its
+            # own, and the one thing `_settleTask` reads a page for is the
+            # stage a run-gated task runs. Hosting the questions of a task
+            # that runs something is a different problem than this one.
+            if not await self._settleTask(branch, None, task_id):
+                return False
+        self._methodBranch._syncChildren()
+        return True
+
+    async def _settleRow(self, branch, task_page, row_task_id: str) -> bool:
+        """Settle every task the outline row owning ``row_task_id`` folds in.
+
+        Plan 32 §4.2/§4.3 fold thirteen tasks into eight rows: `5. Quality` is
+        one press and four tasks, `Generate mesh` one press and three. One
+        press therefore has to settle all of them, in the order `ROW_TASKS`
+        lists -- the row task first, because the substeps grade what it
+        produced and settling one of them first would grade the previous run.
+
+        A refusal stops the row where it happened and does not advance. When
+        the refusal came from a substep the sentence names it: folding the row
+        away took the substep's own red row with it, so without the name the
+        reader is left with a button that did not move and no reason -- the
+        dead-button symptom A8 exists to kill, one level down. A refusal from
+        the row task itself is left alone, because `_settleTask` has already
+        said why and a second sentence would overwrite the first.
+        """
+        engine_id = str(getattr(branch, 'engine_id', '') or '')
+        tasks = row_tasks(engine_id, row_task_id)
+        # Asked with a substep token -- a stale `currentToken` pointing at a
+        # task the fold hid -- `row_tasks` answers the owning row, so the row
+        # task is the head of that tuple and not the id this was called with.
+        head = tasks[0] if tasks else row_task_id
+        for task_id in tasks:
+            page = branch.page(task_id) or task_page
+            if await self._settleTask(branch, page, task_id):
+                continue
+            if task_id != head:
+                title = str(branch.task_info(task_id).get('title') or task_id)
+                self._ui.statusbar.showMessage(
+                    self.tr('This step did not finish: {0} could not be '
+                            'completed.').format(title), 8000)
+            return False
+        return True
+
+    def _reportRunOnThisPage(self, task_id: str) -> None:
+        """Say what to press once the run this page owns has finished.
+
+        Plan 32 §4.2/§4.3. Both settle paths reach a row whose run the wizard
+        cannot start for the reader, and both used to answer with a sentence
+        naming a control by a name nothing on screen carries: Item E retired
+        the three-word footer label for standing over nine different acts, so
+        the one sentence that says what to press was pointing at a button that
+        had been renamed per row. They said it two different ways as well,
+        which is two sentences to keep in step with one table.
+
+        One wording, and the name comes from the same table the footer reads,
+        so neither the two paths nor the sentence and the button can part
+        again.
+        """
+        label = self._methodBranch.proceedLabel(
+            TASK_TOKEN_PREFIX + task_id)[0]
+        self._ui.statusbar.showMessage(
+            self.tr('Run this stage on this page, then press '
+                    '"{0}".').format(label), 5000)
 
     async def _settleTask(self, branch, task_page, task_id: str) -> bool:
         """Bring an engine-branch task to an accepted state, or say why not."""
@@ -1185,8 +1842,22 @@ class StepManager(QObject):
             self._reportBlockedTask(branch, task_id)
             return False
         info = branch.task_info(task_id)
+        if (str(info.get('cardinality') or '').endswith('optional')
+                and not self._taskIsConfigured(task_id)):
+            # Plan 32 §5.2. This question used to be asked inside the
+            # `run_gated` arm below, and Gmsh's five optional rows are not
+            # run-gated, so none of them ever reached it: an empty Size
+            # fields, Curve controls, Volume controls, Boundary layers or
+            # Periodic pairs fell through to `accept`, and the outline drew a
+            # finished row over a step that produced nothing. Optionality is
+            # a property of the task, not of how the task is started, so it
+            # is asked before the dispatch and not inside one arm of it.
+            await record_transition(branch, task_id, 'skip')
+            self._reportSkippedTask(task_id)
+            branch.refresh_states()
+            return branch.is_accepted(task_id)
         if task_id in CHECK_TASK_OPERATIONS:
-            branch._on_task_transition(task_id, 'run')
+            await record_transition(branch, task_id, 'run')
         elif str(info.get('engine_stage') or '') == 'checkMesh':
             # The QA row. It used to be hand-accepted here, which passed it
             # on whatever report happened to exist -- on the live snappy walk
@@ -1199,18 +1870,16 @@ class StepManager(QObject):
             elif stage:
                 await branch.run_stage_async(task_id, stage)
             elif str(info.get('cardinality') or '').endswith('optional'):
-                branch._on_task_transition(task_id, 'skip')
+                await record_transition(branch, task_id, 'skip')
                 self._reportSkippedTask(task_id)
             else:
                 # Plan 30 WP-09 / F-23: this used to click the task page's
                 # hidden `Run complete mesh` button, which was never visible,
                 # so the branch was unreachable in both senses.
-                self._ui.statusbar.showMessage(
-                    self.tr('Run this task, then proceed once it has finished.'),
-                    5000)
+                self._reportRunOnThisPage(task_id)
                 return False
         else:
-            branch._on_task_transition(task_id, 'accept')
+            await record_transition(branch, task_id, 'accept')
         branch.refresh_states()
         return branch.is_accepted(task_id)
 
@@ -1233,16 +1902,14 @@ class StepManager(QObject):
             self._reportBlockedTask(branch, task_id)
             return False
         if task_id == 'snappy.domain_regions':
-            branch._on_task_transition(task_id, 'accept')
-        elif task_id == 'snappy.layers' and not self._layersConfigured():
-            branch._on_task_transition(task_id, 'skip')
+            await record_transition(branch, task_id, 'accept')
+        elif not self._taskIsConfigured(task_id):
+            await record_transition(branch, task_id, 'skip')
             self._reportSkippedTask(task_id)
         else:
             runner = getattr(page, 'runInBatchMode', None)
             if runner is None:
-                self._ui.statusbar.showMessage(
-                    self.tr('Run this step, then proceed once it has finished.'),
-                    5000)
+                self._reportRunOnThisPage(task_id)
                 return False
             if not await runner():
                 return False
@@ -1280,7 +1947,7 @@ class StepManager(QObject):
             return False
         branch = self._methodBranch.branch
         if branch is not None and not branch.is_accepted('common.export'):
-            branch._on_task_transition('common.export', 'accept')
+            await record_transition(branch, 'common.export', 'accept')
             branch.refresh_states()
             self._methodBranch._syncChildren()
         self._updateWizardActions()
@@ -1324,16 +1991,44 @@ class StepManager(QObject):
         question is here, where the user has just pressed the button that
         means "do this task".
         """
+        from foammesh.view.workflow_controls.configured import CONFIGURED_PATHS
+
         if branch is None or branch.task_state(task_id) != 'skipped':
             return False
-        return task_id == 'snappy.layers' and self._layersConfigured()
+        # Plan 32 §4.5. This used to end by naming the snappy layers row, so
+        # the five Gmsh rows carrying the same question -- size fields,
+        # curve controls, volume controls, boundary layers, periodic pairs --
+        # answered `False` here however much the user had since put into them,
+        # and every one of them kept its earlier refusal for the life of the
+        # case. The row is looked up in a table now, so a sixth row is an
+        # entry and not a sixth special case in a third method. A skip on a
+        # task the table says nothing about is left alone: there is no
+        # configuration of it that could contradict anything.
+        if task_id not in CONFIGURED_PATHS:
+            return False
+        return self._taskIsConfigured(task_id)
 
-    def _layersConfigured(self) -> bool:
+    def _taskIsConfigured(self, task_id: str) -> bool:
+        """Whether the optional row ``task_id`` has anything in it.
+
+        The question is asked of storage and not of the page, because a page
+        that was never opened has no dirty state, and "the user did not visit
+        the tab" is not the same statement as "the user has nothing to put in
+        it" -- which is exactly the difference a `Run to end` or a reload
+        walks into. A task the table says nothing about is not optional and
+        answers ``True``: a missing entry must never read as an empty row, or
+        a required stage would be skipped by the press meant to run it.
+        """
+        from foammesh.view.workflow_controls.configured import (
+            CONFIGURED_PATHS, task_is_configured)
+
+        if task_id not in CONFIGURED_PATHS:
+            return True
         try:
             db = app.facadeClient.checkout()
-            return bool(db.getElements('addLayers/layers'))
-        except Exception:  # noqa: BLE001 - no layer table means no layers
+        except Exception:  # noqa: BLE001 - no case open means nothing in it
             return False
+        return task_is_configured(db, task_id)
 
     def _showPipelineVerdict(self, payload: dict) -> None:
         verdict = (payload or {}).get('quality_verdict')
@@ -1349,26 +2044,55 @@ class StepManager(QObject):
             branch.refresh_states()
         self._methodBranch._syncChildren()
         self._updateWizardActions()
+        self._paintSetupRows()
+
+    async def _generateDictionaries(self) -> None:
+        """Write this case's engine dictionaries over the current domain.
+
+        One act, two callers: the window's own pipeline and (DP-256) a single
+        stage started from a branch row.
+        """
+        await app.facadeClient.run(
+            'workflow.generate_dictionaries',
+            {'bbox': self._snappyDomainBounds()})
 
     def _snappyDomainBounds(self) -> list:
-        """The base-grid domain, from the page that owns it."""
-        page = self._pages.get(Step.BASE_GRID) if hasattr(self._pages, 'get') else None
-        bounds = page.boundingBox() if hasattr(page, 'boundingBox') else None
-        if bounds is None:
-            bounds = app.window.geometryManager.getBounds().toTuple()
+        """The geometry extent the base grid is derived from.
+
+        DP-576. The raw extent, like every other frontend: the case builder
+        applies the saved standoff and a chosen bounding Hex6 itself. This
+        used to hand over the hidden legacy page's cached, already stood-off
+        box, so the same project wrote a different blockMeshDict here than
+        from the CLI or the facade.
+        """
+        bounds = app.window.geometryManager.getBounds().toTuple()
         values = [float(value) for value in bounds]
         if (len(values) != 6
                 or any(math.isnan(v) or math.isinf(v) for v in values)
                 or any(values[i + 1] <= values[i] for i in (0, 2, 4))):
             raise ValueError(self.tr(
-                'The base grid has no valid domain. Set it on the Base Grid page.'))
+                'The base grid has no valid domain. Set it on the Base grid page.'))
         return values
 
     def _onWizardMethodAccepted(self, _engine_id: str):
+        """Publish the engine rows, then open the row that comes next.
+
+        DP-248. This asked the branch for `firstAvailableTaskToken()`, which
+        is an engine row, and section 4.1 puts `3. Preparation` between Mesh
+        setup and the engine rows. MEASURED by the footer-only walk: on Gmsh
+        every engine row depends on `gmsh.describe_geometry`, which is hosted
+        on Preparation and publishes no row, so every row was locked, the
+        token was empty and the press moved nothing -- the guided workflow
+        ended at row 2. On snappy `snappy.domain_regions` has no
+        prerequisites, so the press opened row 4 and skipped the row that
+        prepares the geometry those rows read.
+
+        The rows are still published first: the reader has to see where the
+        walk goes, and `3. Preparation` is followed by `4. ...`, not by an
+        empty branch node.
+        """
         self._methodBranch._syncChildren()
-        token = self._methodBranch.firstAvailableTaskToken()
-        if token:
-            self._navigation.requestBranch(token)
+        self._open(Step.GEOMETRY_REPAIR)
 
     @qasync.asyncSlot()
     async def _finishSteps(self):
@@ -1415,7 +2139,7 @@ class StepManager(QObject):
 
                 self._workingStep += 1
             else:
-                await AsyncMessageBox().information(self._contentStack, self.tr('Process Completed'),
+                await AsyncMessageBox().information(self._contentStack, self.tr('Process completed'),
                                                     self.tr('All steps complete.'))
 
             if self._workingStep > Step.LAST_STEP:
@@ -1435,14 +2159,13 @@ class StepManager(QObject):
 
         self.currentPage().updateWorkingStatus()
 
-    #: How each engine is named in a modal or a status line. An engine the
-    #: build registers but nobody has named here is called by its own id
-    #: rather than nothing at all.
-    ENGINE_DISPLAY_NAMES = {'snappy': 'Snappy', 'gmsh': 'Gmsh'}
-
+    # DP-226. A modal here called the second mesher `Snappy` while the
+    # page that offers it called it `Snappy Hex Mesh`. The one rule
+    # that spells a stored name names both meshers now, so a reader
+    # who chose a mesher meets the same word when the run reports.
     def _engineDisplayName(self, engine_id: str) -> str:
-        return self.tr(self.ENGINE_DISPLAY_NAMES.get(
-            str(engine_id), str(engine_id) or 'The meshing engine'))
+        return (humanise_option(engine_id) if str(engine_id)
+                else self.tr('The meshing engine'))
 
     async def _finishPipeline(self, engine_id: str) -> None:
         """Run this case's whole mesh and report it, whichever engine it is.
@@ -1471,9 +2194,7 @@ class StepManager(QObject):
         unsubscribe = None
         try:
             if self._needsGeneratedDictionaries(engine_id):
-                await app.facadeClient.run(
-                    'workflow.generate_dictionaries',
-                    {'bbox': self._snappyDomainBounds()})
+                await self._generateDictionaries()
             unsubscribe = app.facadeClient.subscribe(
                 Event.JOB_OUTPUT,
                 lambda **payload: console.append(payload.get('line', '')))
@@ -1517,13 +2238,28 @@ class StepManager(QObject):
             # nothing about the mesh on disk, so it leaves the viewport alone.
             if built or handle.run_id:
                 await self._drawFinishedMesh(handle)
-            if result.status == 'accepted':
+            unpublished = unpublished_mesh_reason(payload)
+            if result.status == 'accepted' and unpublished:
+                # DP-483. With no target solver chosen, a Gmsh mesh the
+                # publisher refused still leaves the run accepted -- the
+                # native mesh is kept -- and this box said "completed" over
+                # a case with no constant/polyMesh at all. MEASURED on
+                # tee_with_plug: the refusal was in the run manifest and
+                # nowhere on screen.
+                await AsyncMessageBox().warning(
+                    self._contentStack,
+                    self.tr('{0} mesh was built but not published').format(
+                        name),
+                    unpublished)
+            elif result.status == 'accepted':
                 await AsyncMessageBox().information(
-                    self._contentStack, self.tr('Process Completed'),
+                    self._contentStack, self.tr('Process completed'),
                     self.tr('The %s pipeline completed.') % name)
             else:
                 await self._reportPipelineFailure(
-                    name, str(payload.get('reason') or ''), built=built)
+                    name, str(payload.get('reason') or ''), built=built,
+                    log=str(payload.get('log') or ''),
+                    details=str(payload.get('details') or ''))
         except Exception as error:
             await self._reportPipelineFailure(
                 self._engineDisplayName(engine_id), str(error))
@@ -1629,6 +2365,14 @@ class StepManager(QObject):
                 status(self.tr('%s · could not be drawn: %s')
                        % (handle.run_id or handle.engine, problem),
                        failed=True)
+            return
+        # DP-133. Last, and only when the volume mesh is actually on screen:
+        # the offer replaces the result line, and replacing it with an offer
+        # to see the surface of a mesh that could not be drawn would be an
+        # offer about a picture that is not there.
+        offer = getattr(app.window, 'offerSurfacePass', None)
+        if offer is not None:
+            offer(handle)
 
     def _clearAndOfferPrevious(self, manager, handle) -> None:
         """Take the failed run down, and name what the case still has.
@@ -1660,7 +2404,8 @@ class StepManager(QObject):
             offer(message, previous)
 
     async def _reportPipelineFailure(self, engine: str, reason: str,
-                                     *, built: bool = False) -> None:
+                                     *, built: bool = False, log: str = '',
+                                     details: str = '') -> None:
         """Say a run did not finish, where the user is already looking (R204).
 
         MEASURED on tee_gmsh_r2: Compute Mesh refused because no prepared
@@ -1687,9 +2432,19 @@ class StepManager(QObject):
         console = app.consoleView
         if console is not None:
             console.appendError('{0}: {1}'.format(headline, detail))
+            if log:
+                console.appendError(self.tr('Log: %s') % log)
         self._ui.statusbar.showMessage(detail, 10000)
+        # DP-506 (MA-02). The log the failure is written in, and the block of
+        # it that says why, travel with the failure: the Gmsh compute and the
+        # snappy whole-pipeline run report the way a single stage does.
+        extra = {}
+        if log:
+            extra['informativeText'] = self.tr('Log: %s') % log
+        if details.strip():
+            extra['detailedText'] = details.strip()
         await AsyncMessageBox().warning(
-            self._contentStack, headline, detail)
+            self._contentStack, headline, detail, **extra)
 
     @qasync.asyncSlot()
     async def _cancelFinishSteps(self):
@@ -1706,11 +2461,10 @@ class StepManager(QObject):
                 self._navigation.disableStep(step)
                 self._pages[Step(step)].clearResult()
         except PermissionError:
-            await AsyncMessageBox().information(
+            await AsyncMessageBox().warning(
                 self._contentStack,
-                self.tr('Permission Error'),
-                self.tr('Permission Error:\n'
-                        'A file in the project folder might be open in another program.\n'
+                self.tr('Permission error'),
+                self.tr('A file in the project folder might be open in another program.\n'
                         'Close the file and try again.'))
 
             return

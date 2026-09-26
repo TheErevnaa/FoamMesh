@@ -3,6 +3,8 @@
 
 from PySide6.QtCore import QObject
 
+from foammesh.support import field_complaint
+
 
 def isEditable(edit):
     return edit.isVisible() and edit.isEnabled()
@@ -32,7 +34,8 @@ class FormValidator(Validator):
     def validate(self):
         for edit, name in self._required:
             if isEditable(edit) and not edit.text().strip():
-                return False, self.tr('{} is required.'.format(name))
+                return False, field_complaint.sentence(
+                    name, field_complaint.required_clause())
 
         for v in self._validations:
             valid, msg = v.validate()
@@ -75,39 +78,31 @@ class FloatValidator(Validator):
         return self
 
     def validate(self):
-        def rangeToText():
-            if self._highLimit is None:
-                if self._lowLimitInclusive:
-                    return f' (value ≥ {self._lowLimit})'
-                else:
-                    return f' (value > {self._lowLimit})'
-
-            lowLimit = ' ('
-            if self._lowLimit is not None:
-                if self._lowLimitInclusive:
-                    lowLimit =  f' ({self._lowLimit} ≤ '
-                else:
-                    lowLimit =  f' ({self._lowLimit} < '
-
-            if self._highLimitInclusive:
-                return f'{lowLimit}value ≤ {self._highLimit})'
-            else:
-                return f'{lowLimit}value < {self._highLimit})'
+        if not self._edit.text().strip():
+            return False, field_complaint.sentence(
+                self._name, field_complaint.required_clause())
 
         try:
             value = float(self._edit.text())
-
-            if self._lowLimit is not None:
-                if value < self._lowLimit or (value == self._lowLimit and not self._lowLimitInclusive):
-                    return False, self.tr('Out of Range: ') + rangeToText()
-
-            if self._highLimit is not None:
-                if value > self._highLimit or (value == self._highLimit and not self._highLimitInclusive):
-                    return False, self.tr('Out of Range: ') + rangeToText()
-
-            return True, value
         except ValueError:
-            return False, self.tr('{} must be a number'.format(self._name))
+            return False, field_complaint.sentence(
+                self._name, field_complaint.number_clause())
+
+        # One clause, naming the field and spelling out the whole permitted
+        # span. The old text was an unnamed 'Out of Range: ' followed by that
+        # span in mathematical notation, so a reader could not tell which box
+        # it meant.
+        low, high = self._lowLimit, self._highLimit
+        if ((low is not None
+                and (value < low or (value == low and not self._lowLimitInclusive)))
+                or (high is not None
+                    and (value > high or (value == high and not self._highLimitInclusive)))):
+            return False, field_complaint.sentence(self._name, field_complaint.range_clause(
+                low=low, high=high,
+                lowInclusive=self._lowLimitInclusive,
+                highInclusive=self._highLimitInclusive))
+
+        return True, value
 
 
 class NotGreaterValidator(FloatValidator):
@@ -127,6 +122,8 @@ class NotGreaterValidator(FloatValidator):
             return valid, other
 
         if me > other:
-            return False, self.tr('{} cannot be greater than {}'.format(self._name, self._otherName))
+            return False, field_complaint.sentence(
+                self._name,
+                field_complaint.no_greater_than_clause(self._otherName))
 
         return True, None

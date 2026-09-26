@@ -11,6 +11,13 @@ REQUIRED_TOKENS = frozenset({
     'background.canvas', 'background.surface', 'background.elevated',
     'foreground.primary', 'foreground.secondary', 'foreground.muted',
     'border.default', 'accent.default', 'accent.hover',
+    # DP-193. The accent has two jobs and they want opposite lightnesses: a
+    # hairline, ring or rail has to stand off the page, and a filled button has
+    # to carry words on top of it. `accent.default` stayed the bright line
+    # colour and read at 3.22:1 under white -- so `accent.fill` is the surface
+    # the label sits on, dark enough to carry it, and the button keeps its
+    # `accent.default` border so its edge is still the bright accent.
+    'accent.fill', 'accent.fill.hover',
     # Text drawn *on* the accent, for the one filled primary button per dialog.
     # Without it a default button had to reuse the page foreground, which is
     # why FoamMesh had no primary action colour at all while FoamFlow did.
@@ -48,14 +55,34 @@ _COLOUR = re.compile(r'^#[0-9a-fA-F]{6}$')
 
 # Text pairs are part of the theme contract, not merely recommendations.  This
 # prevents a syntactically valid custom theme from making core UI unreadable.
+#: DP-193. Every colour a theme paints words in, against every ground it can
+#: be painted on. The status colours have no ground of their own -- a status
+#: label inherits whichever page surface it lands on -- so each is held
+#: against all three, and the darkest of the three (`background.elevated` in
+#: both shipped themes) is what actually binds.
+_PAGE_GROUNDS = ('background.canvas', 'background.surface', 'background.elevated')
+_STATUS_TEXT = ('status.success', 'status.warning', 'status.error', 'status.info')
+#: Every colour the theme paints words in on an ordinary page.
+_PAGE_TEXT = ('foreground.primary', 'foreground.secondary',
+              'foreground.muted') + _STATUS_TEXT
+
 _CONTRAST_PAIRS = (
-    ('foreground.primary', 'background.canvas', 4.5),
-    ('foreground.primary', 'background.surface', 4.5),
     ('foreground.primary', 'input.background', 4.5),
     ('console.foreground', 'console.background', 4.5),
     ('tooltip.foreground', 'tooltip.background', 4.5),
     ('disabled.foreground', 'disabled.background', 2.5),
-)
+    # The label on the one filled button that advances the workflow.
+    ('accent.text', 'accent.fill', 4.5),
+    ('accent.text', 'accent.fill.hover', 4.5),
+) + tuple((foreground, ground, 4.5)
+          for foreground in _PAGE_TEXT for ground in _PAGE_GROUNDS)
+
+#: DP-193. Lines, rings and rails are not text: WCAG 2.1 SC 1.4.11 asks 3:1 of
+#: them, not 4.5:1. Held separately so that darkening a fill to carry a label
+#: can never quietly drag the focus ring down with it.
+_NON_TEXT_PAIRS = tuple(
+    (foreground, ground, 3.0)
+    for foreground in ('accent.default', 'focus.ring') for ground in _PAGE_GROUNDS)
 
 
 class TokenValidationError(ValueError):
@@ -76,6 +103,27 @@ def relative_luminance(value: str) -> float:
     linear = [channel / 12.92 if channel <= 0.04045
               else ((channel + 0.055) / 1.055) ** 2.4 for channel in channels]
     return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def icon_ink_prefix(tokens: 'ThemeTokens') -> str:
+    """Which of the two shipped icon sets this theme can be read in.
+
+    DP-203. Qt hands a sub-control back to the base style only while the
+    style sheet says nothing about it. The sheet sizes
+    ``QAbstractSpinBox::up-button`` -- it has to, or the step buttons come out
+    as a 12px column -- and that alone moves the whole spin box onto the
+    style-sheet paint path, where an arrow with no ``image`` is not a default
+    arrow but no arrow at all. The same is true of ``QComboBox::down-arrow``.
+    So the sheet has to name the picture, and a named picture does not follow
+    the palette the way a base-style arrow would: the ionicons ship as black
+    ink, which is invisible on a dark canvas, and the white set is invisible
+    on a light one. This picks the set by the ink the theme writes its words
+    in, so a custom theme gets the legible one without listing an icon path
+    among its colours.
+    """
+    return ('icons-white'
+            if relative_luminance(tokens.value('foreground.primary')) > 0.5
+            else 'icons')
 
 
 def contrast_ratio(first: str, second: str) -> float:
@@ -110,7 +158,7 @@ def load_theme_tokens(path: str | Path) -> ThemeTokens:
     if any(not isinstance(value, str) or not _COLOUR.fullmatch(value) for value in tokens.values()):
         raise TokenValidationError('every token value must be a six-digit hexadecimal colour')
     failures = [f'{foreground}/{background} < {minimum:g}:1'
-                for foreground, background, minimum in _CONTRAST_PAIRS
+                for foreground, background, minimum in _CONTRAST_PAIRS + _NON_TEXT_PAIRS
                 if contrast_ratio(tokens[foreground], tokens[background]) < minimum]
     if failures:
         raise TokenValidationError('insufficient contrast: ' + '; '.join(failures))

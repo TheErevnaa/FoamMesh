@@ -140,7 +140,7 @@ def parse_cells(text, ranks: int) -> tuple[int, int, int]:
     product = math.prod(parsed)
     if product != int(ranks):
         raise DecompositionError(
-            f'the decomposition {parsed[0]}x{parsed[1]}x{parsed[2]} makes '
+            f'the decomposition {parsed[0]}×{parsed[1]}×{parsed[2]} makes '
             f'{product} subdomains but the run uses {int(ranks)}; '
             'decomposePar requires them to be equal')
     return parsed                                        # type: ignore[return-value]
@@ -392,6 +392,14 @@ class DecompositionSettings:
             raw = value(path, 'false')
             return str(raw).strip().lower() in ('true', '1', 'yes', 'on')
 
+        # DP-593 (field audit 0924 snappy-back D11). Only Parallel shows the
+        # decomposition fields on Mesh setup; automatic mode picks the rank
+        # count itself and applied the hidden method, cells and order anyway,
+        # so a stored `2 2 1` failed an 8-rank launch with nothing on the page
+        # to fix. Any other mode decomposes with the defaults; the stored
+        # values stay and apply again when Parallel is chosen.
+        if value('mesh/execution/mode', 'parallel').lower() != 'parallel':
+            return cls()
         return cls(
             value('mesh/execution/decompositionMethod', 'scotch'),
             value('mesh/execution/decompositionOrder', 'xyz'),

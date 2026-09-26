@@ -1,26 +1,26 @@
-# Mesh Check & Repair
+# Mesh check & Repair
 
-## Mesh Info (Mesh → Info)
+## Mesh info (Mesh → Info)
 
 Reads `constant/polyMesh` directly — no solver launch. Reports point/face/
 internal-face/cell counts, bounding box (with display unit), patches (name,
 type, faces, start face), zones, per-file format/compression metadata, and
-the last Mesh Check verdict with its staleness. Parser limits (for example a
+the last Mesh check verdict with its staleness. Parser limits (for example a
 binary points file) are reported as warnings — FoamMesh never fabricates
-zero counts. **Copy Summary** and **Save Report...** (JSON/CSV) are built in.
+zero counts. **Copy summary** and **Save report...** (JSON/CSV) are built in.
 
 Headless: `foammesh info <case> [--json|--report out.json]`, or semantic
 operation `mesh.info` through `/api/v1`.
 
-## Mesh Check (Mesh → Mesh Check)
+## Mesh check (Mesh → Mesh check)
 
 Runs the configured `checkMesh` with `-allTopology -allGeometry` (the exact
 options are probed from the utility's own `-help` output, never assumed).
 Output streams live into the console; the raw log is kept under
 `foammesh/logs/`.
 
-The dashboard shows **Verdict · Key Metrics · Failed Checks · Patches/Sets ·
-Recommendations · Raw Log**. Verdicts are words (`pass / warning / fail /
+The dashboard shows **Verdict · Key metrics · Failed checks · Patches/Sets ·
+Recommendations · Raw log**. Verdicts are words (`pass / warning / fail /
 incomplete`) — never colour alone. A cancelled or truncated run is reported
 as *incomplete*, not as a pass.
 
@@ -50,7 +50,7 @@ the configured environment *and* its case prerequisites are satisfied:
 | Combine patch faces | `combinePatchFaces` | reviewed `system/combinePatchFacesDict` |
 
 Every run creates a verified recovery point first, validates the produced
-polyMesh, reruns Mesh Check when available, and reports the before/after
+polyMesh, reruns Mesh check when available, and reports the before/after
 byte/patch counts plus the readiness delta. A failed repair restores the
 previous mesh automatically; a successful one can still be reverted with
-**Mesh → Restore Previous Mesh...** until a newer recovery point replaces it.
+**Mesh → Restore previous mesh...** until a newer recovery point replaces it.

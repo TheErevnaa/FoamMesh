@@ -33,6 +33,8 @@ from __future__ import annotations
 import hashlib
 from typing import Iterable
 
+from ..store import ordered_entries
+
 from .ops import PatchError, Patch, PatchSet
 
 #: Prefix for the uuid of a patch that covers more than one sub-surface.
@@ -81,7 +83,10 @@ def members_of(record: dict) -> list[dict]:
 def rows(entries: Iterable[dict]) -> list[dict]:
     """A flat, display-ready list of every boundary the case would produce."""
     out: list[dict] = []
-    for entry in sorted(entries, key=lambda item: item.get('geometry_id') or ''):
+    # DP-380. Ordered by the same key the prepared set uses, not by the
+    # import uuid: this is the list the user reads, and it has to agree
+    # with the order the mesher merges in.
+    for entry in ordered_entries(entries):
         for record in records(entry):
             member_list = members_of(record)
             out.append({

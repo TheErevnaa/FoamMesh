@@ -50,7 +50,7 @@ def mergedPatchRows():
 
     client = getattr(app, 'facadeClient', None)
     try:
-        if client is None or client.session() is None:
+        if client is None or not client.has_case():
             return ()
         payload = query(client, 'geometry.patches.list').payload
     except (FacadeError, AttributeError, KeyError, OSError, RuntimeError,

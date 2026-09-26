@@ -20,7 +20,7 @@ class WorkflowTransitionService:
         case = Path(case_path)
         metadata = load_case_metadata(case)
         if metadata.workflow is not WorkflowMode.MESH_EXTERNAL:
-            raise ValueError('Start Meshing Workflow requires mesh_external mode')
+            raise ValueError('Start meshing workflow requires mesh_external mode')
         classification = classify_case(case)
         if classification.poly_mesh_path is None:
             raise ValueError('no external polyMesh is available to retain')

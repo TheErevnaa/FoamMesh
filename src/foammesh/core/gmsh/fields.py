@@ -113,6 +113,14 @@ CONTROLS = _register(
     GmshControl('gmsh/dimensionality/backPatch', PUBLISH,
                 'polyMesh.boundary.back', native_kind=API,
                 note='the other of the two faces the extrusion makes'),
+    # DP-675. The runner names the section's boundary curves with these
+    # instead of `edge_<tag>`; the physical group is what becomes the SU2
+    # marker and the polyMesh patch.
+    GmshControl('gmsh/dimensionality/edgeNames', RUNNER,
+                'model.addPhysicalGroup(1)', 'gmsh.dimensionality.v1',
+                native_kind=API,
+                note='names the section boundary curves by tag; a curve not '
+                     'listed keeps edge_<tag>'),
 
     # -- global sizing -------------------------------------------------- #
     GmshControl('gmsh/globalSizing/targetSize', DERIVATION,
@@ -223,7 +231,7 @@ CONTROLS = _register(
     GmshControl('gmsh/structuring/transfiniteTri', RUNNER,
                 'Mesh.TransfiniteTri',
                 note='structures the inside of a three-sided transfinite '
-                     'face: measured 120 triangles down to 64, which is 8x8'),
+                     'face: measured 120 triangles down to 64, which is 8×8'),
 
     # -- farfield -------------------------------------------------------- #
     # Plan 30 WP12. Built with the OCC kernel, not set as an option: the box
@@ -243,7 +251,14 @@ CONTROLS = _register(
 
     # -- parallel -------------------------------------------------------- #
     GmshControl('gmsh/parallel/threads', RUNNER,
-                'General.NumThreads+Mesh.MaxNumThreads3D'),
+                'General.NumThreads+Mesh.MaxNumThreads3D'
+                '+Mesh.MaxNumThreads2D',
+                note='one count, three stages, and only two of them here: '
+                     'the surface limit takes the request whole and the '
+                     'volume limit takes what the chosen volume algorithm '
+                     'can actually use. Mesh.MaxNumThreads1D exists in this '
+                     'build and is deliberately not set — see the '
+                     'curve-stage row of the capability ledger'),
 
     # -- healing --------------------------------------------------------- #
     GmshControl('gmsh/healing/importTolerance', RUNNER, 'Geometry.Tolerance'),
@@ -361,10 +376,16 @@ CONTROLS = _register(
     # -- boundary layers -------------------------------------------------- #
     # R118. Which patches grow layers. MEASURED on the venturi: prisms sat on
     # the inlet plane (z=0.004999) and on the outlet plane (z=0.5937), which is
-    # wrong for every flow case. Empty keeps the shipped whole-boundary
-    # behaviour; the runner rebuilds each un-extruded patch from the
-    # extrusion's inner rim, so the core volume still closes.
+    # wrong for every flow case. Empty now means empty, not everything; the
+    # runner rebuilds each un-extruded patch from the extrusion's inner rim,
+    # so the core volume still closes.
     GmshControl('gmsh/boundaryLayers/patches', DERIVATION,
+                'geo.extrudeBoundaryLayer', 'gmsh.layers.v1', native_kind=API),
+    # Plan 33 section 1.1. Whether the list above is the answer or whether
+    # the run is to read every eligible wall off the geometry it imports.
+    # The rule that decides what a wall is lives in one file the page and the
+    # runner both read, so a ticked list and an extruded surface agree.
+    GmshControl('gmsh/boundaryLayers/patchMode', DERIVATION,
                 'geo.extrudeBoundaryLayer', 'gmsh.layers.v1', native_kind=API),
     GmshControl('gmsh/boundaryLayers/enabled', DERIVATION,
                 'geo.extrudeBoundaryLayer', 'gmsh.layers.v1', native_kind=API),
@@ -446,8 +467,13 @@ CONTROLS = _register(
                 'gmsh.size_fields.v1', native_kind=API),
     GmshControl('gmsh/surfaceSizes/{id}/surfaceId', DERIVATION,
                 'Distance.SurfacesList', 'gmsh.size_fields.v1', native_kind=API,
-                note='a Gmsh surface tag, named directly rather than through '
-                     'a prepared scope'),
+                note='the Gmsh surface tag the row last resolved to; the '
+                     'reference beside it is what the run resolves'),
+    GmshControl('gmsh/surfaceSizes/{id}/surfaceRef', DERIVATION,
+                'Distance.SurfacesList', 'gmsh.size_fields.v1', native_kind=API,
+                note='Plan 33 W-G1: the prepared boundary the row refines. A '
+                     'tag is a position in import order, so the reference is '
+                     'the identity and the tag is derived from it'),
     GmshControl('gmsh/surfaceSizes/{id}/targetSize', RUNNER,
                 'Threshold.SizeMin', native_kind=API),
     GmshControl('gmsh/surfaceSizes/{id}/blendDistance', DERIVATION,

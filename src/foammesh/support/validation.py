@@ -3,7 +3,7 @@
 
 from typing import Optional
 
-from PySide6.QtCore import QCoreApplication
+from foammesh.support import field_complaint
 
 
 FLOAT_PATTERN = r'[-+]?\d*\.?\d+([eE][-+]?\d+)?'
@@ -29,35 +29,22 @@ class FloatValidationResult(ValidationResult):
 
 def validateFloat(input: str, name: str,
                   low: Optional[float] = None, high: Optional[float] = None, lowInclusive=True, highInclusive=True):
-    def rangeToText():
-        if high is None:
-            if lowInclusive:
-                return f' (value ≥ {low})'
-            else:
-                return f' (value > {low})'
-
-        lowText = ' ('
-        if low is not None:
-            if lowInclusive:
-                lowText =  f' ({low} ≤ '
-            else:
-                lowText =  f' ({low} < '
-
-        if highInclusive:
-            return f'{lowText}value ≤ {high})'
-        else:
-            return f'{lowText}value < {high})'
+    if not input.strip():
+        raise ValueError(field_complaint.sentence(
+            name, field_complaint.required_clause()))
 
     try:
         v = float(input)
-    except ValueError as e:
-        raise ValueError(f'{name} - {str(e)}')
+    except ValueError as error:
+        raise ValueError(field_complaint.sentence(
+            name, field_complaint.number_clause())) from error
 
-    if low is not None:
-        if v < low or (v == low and not lowInclusive):
-            raise ValueError(f"{name} - {QCoreApplication.translate('Validation', 'Out of Range')}{rangeToText()}")
-    if high is not None:
-        if v > high or (v == high and not highInclusive):
-            raise ValueError(f"{name} - {QCoreApplication.translate('Validation', 'Out of Range')}{rangeToText()}")
+    # One clause, spelling out the whole permitted span, so that this reads
+    # the same as every other refused entry in the product.
+    if ((low is not None and (v < low or (v == low and not lowInclusive)))
+            or (high is not None and (v > high or (v == high and not highInclusive)))):
+        raise ValueError(field_complaint.sentence(name, field_complaint.range_clause(
+            low=low, high=high,
+            lowInclusive=lowInclusive, highInclusive=highInclusive)))
 
     return FloatValidationResult(input)

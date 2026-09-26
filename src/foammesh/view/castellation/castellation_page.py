@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import asyncio
+
 import qasync
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import QCheckBox, QGridLayout, QLabel, QLineEdit
@@ -18,6 +20,7 @@ from foammesh.db.configurations import defaultsDB
 from foammesh.view.main_window.main_window_ui import Ui_MainWindow
 from foammesh.view.step_page import StepPage
 from foammesh.view.main_window.inpage_editor import open_in_page
+from foammesh.view.theming.metrics import unit_cell
 from .surface_refinement_dialog import SurfaceRefinementDialog
 from .volume_refinement_dialog import VolumeRefinementDialog
 
@@ -32,6 +35,10 @@ class CastellationPage(StepPage):
         self._db = None
         self._dialog = None
         self._cm = None
+        # DP-376. `save` is entered from two places that can overlap: the
+        # button, and `StepPage.hide` when a navigation route leaves this
+        # page. Both spend `self._db`, which lives as long as the page does.
+        self._saving = asyncio.Lock()
 
         ui.castellationConfigurationHeader.setContents(ui.castellationConfiguration)
         ui.castellationAdvancedHeader.setContents(ui.castellationAdvanced)
@@ -51,7 +58,10 @@ class CastellationPage(StepPage):
         self._cellRisk = QLabel(ui.castellationConfiguration)
         self._cellRisk.setObjectName('castellationCellEstimate')
         self._cellRisk.setWordWrap(True)
-        self._cellRisk.setAccessibleName(self.tr('Estimated background cell count warning'))
+        # DP-186. The label's text is the estimate and is rewritten on
+        # every edit; a fixed accessible name did not shorten that for
+        # an assistive reader, it replaced it. With no name of its own
+        # the label is read out as what it says.
         ui.castellationConfiguration.layout().addWidget(self._cellRisk)
 
         ui.castellationCancel.hide()
@@ -118,33 +128,38 @@ class CastellationPage(StepPage):
         self._gapLevelIncrement.setToolTip(self.tr(
             'Extra refinement levels inside narrow gaps, on top of the surface '
             'level. Leave empty to use snappyHexMesh’s own default.'))
-        form.addRow(self.tr('Gap Level Increment'), self._gapLevelIncrement)
+        form.addRow(self.tr('Gap level increment'), self._gapLevelIncrement)
 
         self._planarAngle = QLineEdit()
         self._planarAngle.setPlaceholderText(self.tr('OpenFOAM default'))
         self._planarAngle.setToolTip(self.tr(
             'Angle below which two faces count as planar when detecting cells '
             'that cannot be snapped. Leave empty to use the default.'))
-        form.addRow(self.tr('Planar Angle (deg)'), self._planarAngle)
+        # DP-198. DP-164 left this one in the label on the grounds that a
+        # line edit cannot carry a unit. It can: `unit_cell` takes any
+        # editor, and this row now ends the way the registry rows beside it
+        # do.
+        form.addRow(self.tr('Planar angle'),
+                    unit_cell(self._planarAngle, 'deg'))
 
         self._useTopologicalSnapDetection = self._toggle(self.tr(
             'Detect unsnappable cells from mesh topology rather than geometry.'))
-        form.addRow(self.tr('Topological Snap Detection'),
+        form.addRow(self.tr('Topological snap detection'),
                     self._useTopologicalSnapDetection)
 
         self._handleSnapProblems = self._toggle(self.tr(
             'Run the extra castellation pass that removes cells snapping '
             'cannot resolve.'))
-        form.addRow(self.tr('Handle Snap Problems'), self._handleSnapProblems)
+        form.addRow(self.tr('Handle snap problems'), self._handleSnapProblems)
 
         # C31-08. The companion switch to the span refinement modes on the
         # volume dialog. ``meshRefinement.C:1142`` reads it out of
         # castellatedMeshControls with a default of true; turning it off keeps
         # a span's refinement inside the span instead of letting it extend.
         self._extendedRefinementSpan = self._toggle(self.tr(
-            'Let refinement asked for by an Inside/Outside Span region reach '
-            'beyond the span itself. OpenFOAM leaves this on.'))
-        form.addRow(self.tr('Extended Refinement Span'),
+            'Let refinement asked for by an Inside span or Outside span region '
+            'reach beyond the span itself. OpenFOAM leaves this on.'))
+        form.addRow(self.tr('Extended refinement span'),
                     self._extendedRefinementSpan)
 
     def _toggle(self, tip):
@@ -193,6 +208,31 @@ class CastellationPage(StepPage):
         self.updateWorkingStatus()
 
     async def save(self):
+        # DP-376. One at a time, and each against a copy of its own.
+        #
+        # MEASURED on `two_cubes_one_file`, the topology fixture of core rows
+        # V03 and V04: a route out of this page (step 4 -> step 3) was started
+        # and then overtaken, but `_moveToStep` awaits `hide()` -- and so the
+        # autosave -- before it asks whether it has been superseded. That
+        # autosave was still inside `commit_working_copy` when the explicit
+        # save began, so both held the same working copy, `id` for `id`. The
+        # first commit spent it (`_editable = False`); the second was refused
+        # with `commit_working_copy requires an editable working copy`, which
+        # is neither a conflict nor a `ValidationError` and so escaped both
+        # handlers below and ended the leg.
+        #
+        # The copy could be taken per save now that DP-427 has made the
+        # refinement dialogs commit their own -- which is what used to make
+        # a fresh checkout here drop their groups. Serialising is kept
+        # anyway, because it is what stops two saves of *this* page's own
+        # two subtrees from spending one copy twice, and it loses nothing -- the waiting save re-reads the
+        # widgets and runs against the copy the finished one re-checked out,
+        # so it writes what the page says now rather than what it said when
+        # it was first asked.
+        async with self._saving:
+            return await self._save()
+
+    async def _save(self):
         try:
             # WP-13 / F-33. This one stays a whole-database copy: the page writes
             # two subtrees, `castellation` and `snappyAdvanced`, and a scoped copy
@@ -202,23 +242,23 @@ class CastellationPage(StepPage):
             castellation = self._db.checkout('castellation')
 
             castellation.setValue('nCellsBetweenLevels', self._ui.nCellsBetweenLevels.text(),
-                              self.tr('Number of Cells between Levels'))
+                              self.tr('Number of cells between levels'))
             castellation.setValue('resolveFeatureAngle', self._ui.resolveFeatureAngle.text(),
-                              self.tr('Feature Angle Threshold'))
-            castellation.setValue('maxGlobalCells', self._ui.maxGlobalCells.text(), self.tr('Max. Global Cell Count'))
-            castellation.setValue('maxLocalCells', self._ui.maxLocalCells.text(), self.tr('Max. Local Cell Count'))
+                              self.tr('Feature angle threshold'))
+            castellation.setValue('maxGlobalCells', self._ui.maxGlobalCells.text(), self.tr('Max. global cell count'))
+            castellation.setValue('maxLocalCells', self._ui.maxLocalCells.text(), self.tr('Max. local cell count'))
             castellation.setValue('minRefinementCells', self._ui.minRefinementCells.text(),
-                              self.tr('Min.Refinement Cell Count'))
-            castellation.setValue('maxLoadUnbalance', self._ui.maxLoadUnbalance.text(), self.tr('Max. Load Unbalance'))
+                              self.tr('Min. refinement cell count'))
+            castellation.setValue('maxLoadUnbalance', self._ui.maxLoadUnbalance.text(), self.tr('Max. load unbalance'))
             castellation.setValue('allowFreeStandingZoneFaces', self._ui.allowFreeStandingZoneFaces.isChecked())
             # An empty box means "no opinion": the key is left out of the
             # dictionary entirely so OpenFOAM's own default still governs.
             castellation.setValue(
                 'gapLevelIncrement', self._gapLevelIncrement.text().strip() or None,
-                self.tr('Gap Level Increment'))
+                self.tr('Gap level increment'))
             castellation.setValue(
                 'planarAngle', self._planarAngle.text().strip() or None,
-                self.tr('Planar Angle'))
+                self.tr('Planar angle'))
             castellation.setValue('useTopologicalSnapDetection',
                                   self._useTopologicalSnapDetection.currentData())
             castellation.setValue('handleSnapProblems',
@@ -249,11 +289,11 @@ class CastellationPage(StepPage):
 
             return True
         except CONFLICT_ERRORS as error:
-            await AsyncMessageBox().information(
-                self._widget, self.tr('Case Changed'), self.tr(conflict_message(error)))
+            await AsyncMessageBox().warning(
+                self._widget, self.tr('Case changed'), self.tr(conflict_message(error)))
             return False
         except ValidationError as e:
-            await AsyncMessageBox().information(self._widget, self.tr('Input Error'), e.toMessage())
+            await AsyncMessageBox().warning(self._widget, self.tr('Input error'), e.toMessage())
             return False
 
     def load(self):
@@ -312,9 +352,9 @@ class CastellationPage(StepPage):
     @qasync.asyncSlot()
     async def _loadDefaults(self):
         if await AsyncMessageBox().confirm(
-                self._widget, self.tr('Reset Settings'),
+                self._widget, self.tr('Reset settings'),
                 self.tr(
-                    'Would you like to reset all Castallation settings to default, excluding the Refinement Groups?')):
+                    'Would you like to reset all Castellation settings to default, excluding the refinement groups?')):
             self._setConfigurastions(defaultsDB.getElement('castellation'))
 
     def _setConfigurastions(self, castellation):
@@ -409,6 +449,12 @@ class CastellationPage(StepPage):
 
     def _surfaceRefinementDialogAccepted(self):
         element = self._dialog.dbElement()
+        # DP-427. The dialog committed its own copy, so this page's is a
+        # revision behind: the group and the `geometry/<id>/castellationGroup`
+        # it set are in the case and not in `self._db`. Left stale, the next
+        # Apply would commit over them and the table below would read the
+        # members off a copy that has never heard of the group.
+        self._db = app.facadeClient.checkout()
         if self._dialog.isCreationMode():
             self._addSurfaceRefinementItem(self._dialog.groupId(), element.getValue('groupName'),
                                            element.getValue('surfaceRefinement/minimumLevel'),
@@ -445,6 +491,12 @@ class CastellationPage(StepPage):
 
     def _volumeRefinementDialogAccepted(self):
         element = self._dialog.dbElement()
+        # DP-427. The dialog committed its own copy, so this page's is a
+        # revision behind: the group and the `geometry/<id>/castellationGroup`
+        # it set are in the case and not in `self._db`. Left stale, the next
+        # Apply would commit over them and the table below would read the
+        # members off a copy that has never heard of the group.
+        self._db = app.facadeClient.checkout()
         if self._dialog.isCreationMode():
             self._addVolumeRefinementItem(self._dialog.groupId(), element.getValue('groupName'),
                                           element.getValue('volumeRefinementLevel'))
@@ -520,13 +572,14 @@ class CastellationPage(StepPage):
                     self._widget, self.tr('Castellation refinement failed'),
                     self.stageFailureDetail(execution))
         except Exception as e:
-            await AsyncMessageBox().information(self._widget, self.tr('Error'),
-                                                self.tr('Castellation refinement Failed:') + str(e))
+            await AsyncMessageBox().warning(
+                self._widget,
+                self.tr('Castellation refinement failed'), str(e))
 
         if not result:
             self.clearResult()
         else:
-            await self._reloadResultMesh()
+            await self._reloadResultMesh(self.tr('Castellated mesh'))
 
         return result
 

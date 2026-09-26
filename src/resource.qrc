@@ -57,7 +57,6 @@
     <file alias="originAxesOff.png">resources/graphicsIcons/originAxesOff.png</file>
     <file alias="originAxesOn.png">resources/graphicsIcons/originAxesOn.png</file>
     <file alias="orthogonalOn.png">resources/graphicsIcons/orthogonalOn.png</file>
-    <file alias="ParaView.png">resources/graphicsIcons/ParaView.png</file>
     <file alias="perspective.png">resources/graphicsIcons/perspective.png</file>
     <file alias="plusX.png">resources/graphicsIcons/plusX.png</file>
     <file alias="plusY.png">resources/graphicsIcons/plusY.png</file>
@@ -67,6 +66,7 @@
     <file alias="ruler.svg">resources/graphicsIcons/ruler.svg</file>
     <file alias="planeHandle.svg">resources/graphicsIcons/planeHandle.svg</file>
     <file alias="volume.svg">resources/graphicsIcons/volume.svg</file>
+    <file alias="resetOverlays.svg">resources/graphicsIcons/resetOverlays.svg</file>
   </qresource>
   <qresource prefix="icons">
     <file alias="accessibility.svg">resources/ionicons/accessibility.svg</file>
