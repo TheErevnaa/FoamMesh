@@ -40,6 +40,11 @@
   to stay at the centre of the first model opened, and could miss a later
   model altogether. Hidden, switched-off and empty parts no longer move it, and
   the cut stays visible while the plane is dragged or the view is turned.
+- **Finding OpenFOAM and Gmsh.** On its first start FoamMesh looks through
+  WSL for OpenFOAM 13 and Gmsh instead of assuming a distribution called
+  `OpenFOAM13Runtime`. It tries `foamuser` first, then each distribution's
+  own user, and Gmsh runs wherever OpenFOAM was found. Settings > Preferences
+  has Find automatically.
 - A mesh changed outside FoamMesh is no longer credited to the run that made
   the previous one, and a single-region mesh no longer reads "in 1 region ()".
 - A timed-out runtime probe no longer leaves a `.pid` file in the folder the
