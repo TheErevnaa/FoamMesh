@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -583,36 +584,102 @@ class GeometryArtifactStore:
 
     def _import_cad(self, source: Path, *, budget=None, unit=None,
                     tessellation=None) -> dict:
-        from .cad import read_cad
-        from .cad.tessellate import tessellate
-        # STEP and IGES say what they are written in; the unit given only
-        # reaches a BREP, which does not.
-        shape, model = read_cad(source, unit)
-        # F-10. The deflection is the one thing that decides whether the
-        # facets the mesher sees are the part or a caricature of it, and it
-        # used to be a constant nobody could reach and nothing recorded.
-        params = tessellation_params(tessellation)
-        # F-11. A BREP declares no unit, so the Gmsh runner's
-        # `Geometry.OCCTargetUnit` -- which converts what a STEP or IGES
-        # header declares -- has nothing to act on, and a millimetre BREP
-        # reached the mesher a thousand times too large. Scale the shape
-        # itself and the artifact is in metres like everything else, with no
-        # reader left to be told.
-        cad_scale = 1.0
-        if detect_format(source) == 'brep':
-            factor = self._unit_factor(model.unit)
-            if factor != 1.0:
-                shape = _scaled_shape(shape, factor)
-                cad_scale = factor
-        # DP-520. The deflection is in metres and the shape is in whatever the
-        # reader handed back -- millimetres for STEP and IGES -- so it is
-        # converted into the shape's units rather than applied as a raw
-        # number. It was applied raw: the panel's `0.1 m` faceted a STEP at
-        # 0.1 mm, and the same panel's Re-tessellate, which goes through the
-        # repair route below on a shape already in metres, at 0.1 m.
-        shape_unit = 'm' if cad_scale != 1.0 else model.unit
-        polydata = tessellate(shape, params,
-                              unit_factor=self._unit_factor(shape_unit))
+        """Import a STEP, IGES or BREP. The OCCT half runs in a worker.
+
+        Plan 35 CR7. Reading, scaling and faceting the B-Rep is
+        :func:`foammesh.workers.cad_ops.import_stage`, and outside a worker
+        it runs in one: a reader that crashes takes that process down and
+        this import fails with a message that says so, while the window
+        stays. What comes back -- the model under ``cad_import/v1``, the
+        facets, the shape -- is what the same statements produced here.
+        """
+        from .cad import worker_client
+
+        if worker_client.in_worker():
+            from foammesh.workers.cad_ops import import_stage
+
+            return self._store_cad_import(
+                source, import_stage(source, unit, tessellation),
+                budget=budget)
+        params = dataclasses.asdict(tessellation_params(tessellation))
+        cancelled = (None if budget is None else
+                     (lambda: bool(getattr(budget, 'cancelled', False))))
+        try:
+            with worker_client.call(
+                    'cad.import', {'source': str(source), 'unit': unit,
+                                   'tessellation': params},
+                    label=f'import of {source.name}', source=source,
+                    cancelled=cancelled) as answer:
+                return self._store_cad_import(
+                    source, self._cad_import_answer(answer), budget=budget)
+        except worker_client.CadWorkerCancelled as error:
+            from .diagnostics.budget import Cancelled
+
+            raise Cancelled(
+                f'import of {source.name} cancelled by request') from error
+
+    @staticmethod
+    def _cad_findings(cad_artifact, unit_factor: float) -> list:
+        """The B-Rep checks of one artifact. OCCT runs in a worker (CR7).
+
+        A worker that crashed or could not start leaves the tessellation's
+        findings standing, as an absent OCCT always did: raised as
+        ``RuntimeError``, which the caller already treats that way.
+        """
+        from .cad import worker_client
+
+        if worker_client.in_worker():
+            from .cad import read_cad
+            from .diagnostics.cad_checks import check_cad
+
+            shape, _model = read_cad(cad_artifact)
+            return check_cad(shape, unit_factor=unit_factor)
+        from foammesh.workers.cad_ops import finding_from_json
+
+        try:
+            with worker_client.call(
+                    'cad.check', {'cad_artifact': str(cad_artifact),
+                                  'unit_factor': float(unit_factor)},
+                    label='CAD check', source=cad_artifact) as answer:
+                return [finding_from_json(item)
+                        for item in answer['findings']]
+        except worker_client.CadWorkerError as error:
+            raise RuntimeError(str(error)) from error
+
+    @staticmethod
+    def _cad_import_answer(answer: dict) -> dict:
+        """What :func:`import_stage` returned, rebuilt from a worker answer."""
+        from foammesh.workers.cad_ops import unlabelled
+
+        from .cad import worker_client
+        from .cad.model import (
+            CAD_IMPORT_MAJOR, CadModel, CadSchemaError, schema_major,
+        )
+
+        if schema_major(answer.get('schema')) != CAD_IMPORT_MAJOR:
+            raise CadSchemaError(
+                f'CAD import answer {answer.get("schema")!r} is a version '
+                f'this build cannot read (it reads v{CAD_IMPORT_MAJOR})')
+        model = CadModel.from_json(answer['model'])
+        surface = answer['tessellation']
+        polydata = unlabelled(worker_client.read_polydata(
+            surface['path'], surface.get('sha256')))
+        brep = answer.get('brep') or {}
+        if brep and worker_client.file_digest(brep['path']) != brep['sha256']:
+            raise worker_client.CadWorkerError(
+                'the CAD worker wrote a shape that changed before it was '
+                'read', reason='digest_mismatch')
+        return {'model': model, 'polydata': polydata,
+                'cad_scale': float(answer.get('cad_scale', 1.0)),
+                'shape_unit': str(answer.get('shape_unit') or model.unit),
+                'params': tessellation_params(answer.get('params')),
+                'brep_path': brep.get('path')}
+
+    def _store_cad_import(self, source: Path, stage: dict, *,
+                          budget=None) -> dict:
+        model, polydata = stage['model'], stage['polydata']
+        params, cad_scale = stage['params'], stage['cad_scale']
+        shape_unit = stage['shape_unit']
         if polydata.GetNumberOfCells() <= 0:
             raise ValueError('CAD geometry tessellation contains no surface cells')
         # The coordinates arrive in whatever unit the reader emits, which for
@@ -628,8 +695,14 @@ class GeometryArtifactStore:
         cad_artifact = artifact_root / f'rev1{source.suffix.lower()}'
         if cad_scale != 1.0:
             # What is stored is the scaled solid, not the file that was
-            # picked, so it is written rather than copied.
-            self._write_brep(shape, cad_artifact)
+            # picked, so it is written rather than copied -- by the worker
+            # that holds the solid, since this process never does (CR7).
+            if stage.get('brep_path'):
+                temporary_cad = cad_artifact.with_suffix('.tmp.brep')
+                shutil.copy2(stage['brep_path'], temporary_cad)
+                os.replace(temporary_cad, cad_artifact)
+            else:
+                self._write_brep(stage['shape'], cad_artifact)
         else:
             temporary_cad = cad_artifact.with_suffix(cad_artifact.suffix + '.tmp')
             shutil.copy2(source, temporary_cad)
@@ -828,15 +901,12 @@ class GeometryArtifactStore:
                     cell_count=int(polydata.GetNumberOfCells()), engine=engine)
             if item.get('cad_artifact'):
                 try:
-                    from .cad import read_cad
-                    from .diagnostics.cad_checks import check_cad
                     from .diagnostics.readiness import classify
-                    shape, _model = read_cad(item['cad_artifact'])
                     # DP-530. The shape comes back in `reader_unit` --
                     # millimetres for STEP and IGES -- and the census the
                     # Repair plan suggests a tolerance from is in metres.
-                    health.findings.extend(check_cad(
-                        shape, unit_factor=self._unit_factor(
+                    health.findings.extend(self._cad_findings(
+                        item['cad_artifact'], self._unit_factor(
                             read_back_unit(item))))
                     health.readiness = classify(
                         health.findings,
@@ -1761,19 +1831,89 @@ class GeometryArtifactStore:
                 'plan_digest': plan.get('digest'),
             })
 
-    def _preview_cad_repair_plan(self, plan: dict, *, progress=None, cancelled=None) -> dict:
+    def _preview_cad_repair_plan(self, plan: dict, *, progress=None,
+                                 cancelled=None, brep_to=None) -> dict:
+        """The CAD repair preview. OCCT heals in a worker (Plan 35 CR7).
+
+        What can be refused without the B-Rep -- no CAD source, a stale base
+        revision -- is refused here, before a worker starts. ``brep_to``
+        keeps the healed solid the worker wrote at that path and names it
+        ``_brep_path`` in the preview, for an apply to move into place.
+        """
+        from .cad import worker_client
+
+        if worker_client.in_worker():
+            return self._preview_cad_repair_plan_here(
+                plan, progress=progress, cancelled=cancelled)
+        self._cad_repair_entry(plan)
+        with self._cad_repair_in_worker(plan, progress, cancelled) as preview:
+            healed = preview.pop('_brep_path', None)
+            if brep_to is not None and healed:
+                Path(brep_to).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(healed, brep_to)
+                preview['_brep_path'] = str(brep_to)
+            return preview
+
+    def _cad_repair_entry(self, plan: dict) -> dict:
+        """The entry a CAD repair plan heals, or the refusal it gets first."""
+        _, entry = self._entry(self.entries(), str(plan.get('geometry_id') or ''))
+        if not is_cad_entry(entry):
+            raise ValueError('CAD repair requires a B-Rep source revision')
+        if plan.get('base_revision') is not None and \
+                int(plan['base_revision']) != int(entry['revision']):
+            raise ValueError('preview_stale')
+        return entry
+
+    @contextmanager
+    def _cad_repair_in_worker(self, plan: dict, progress, cancelled):
+        """Heal and re-facet in a worker; yields the preview it computed.
+
+        The preview is the one :meth:`_preview_cad_repair_plan_here` returns,
+        with the healed facets read back and ``_brep_path`` naming the healed
+        solid, which exists only inside the ``with`` block. The worker cannot
+        stream the healing stages, so progress is reported as a start and an
+        end; cancelling stops the worker.
+        """
+        from .cad import worker_client
+
+        if progress is not None:
+            progress('cad.worker', 0.0)
+        try:
+            with worker_client.call(
+                    'cad.repair_preview',
+                    {'case_path': str(self.case_path.resolve()),
+                     'plan': dict(plan)},
+                    label='CAD repair', cancelled=cancelled) as answer:
+                surface = answer['tessellation']
+                brep = answer['brep']
+                if worker_client.file_digest(brep['path']) != brep['sha256']:
+                    raise worker_client.CadWorkerError(
+                        'the CAD worker wrote a healed shape that changed '
+                        'before it was read', reason='digest_mismatch')
+                preview = {
+                    **answer['preview'],
+                    '_polydata': worker_client.read_polydata(
+                        surface['path'], surface['sha256']),
+                    '_params': tessellation_params(answer['params']),
+                    '_unit_factor': float(answer['unit_factor']),
+                    '_patch_map': answer['patch_map'],
+                    '_brep_path': brep['path'],
+                }
+                if progress is not None:
+                    progress('cad.worker', 1.0)
+                yield preview
+        except worker_client.CadWorkerCancelled as error:
+            raise ValueError('operation_cancelled') from error
+
+    def _preview_cad_repair_plan_here(self, plan: dict, *, progress=None,
+                                      cancelled=None) -> dict:
         from .cad import read_cad
         from .cad.healing_pipeline import (
             CadRepairAction, OcctHealingBackend, execute)
         from .cad.tessellate import tessellate
         from .wrap import _deviation
         geometry_id = str(plan.get('geometry_id') or '')
-        _, entry = self._entry(self.entries(), geometry_id)
-        if not is_cad_entry(entry):
-            raise ValueError('CAD repair requires a B-Rep source revision')
-        if plan.get('base_revision') is not None and \
-                int(plan['base_revision']) != int(entry['revision']):
-            raise ValueError('preview_stale')
+        entry = self._cad_repair_entry(plan)
         shape, _model = read_cad(entry['cad_artifact'])
         actions = [CadRepairAction(
             str(item.get('action')), dict(item.get('params') or {}),
@@ -1865,8 +2005,16 @@ class GeometryArtifactStore:
         return result
 
     def _apply_cad_repair_plan(self, plan: dict, *, progress=None, cancelled=None) -> dict:
-        preview = self._preview_cad_repair_plan(
-            plan, progress=progress, cancelled=cancelled)
+        staged = (self.root / str(plan.get('geometry_id') or 'cad')
+                  / '.healed.staging.brep')
+        try:
+            preview = self._preview_cad_repair_plan(
+                plan, progress=progress, cancelled=cancelled, brep_to=staged)
+            return self._apply_cad_repair_preview(plan, preview)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    def _apply_cad_repair_preview(self, plan: dict, preview: dict) -> dict:
         expected_preview = plan.get('expected_preview_digest')
         if expected_preview and expected_preview != preview.get('preview_digest'):
             raise ValueError('preview_stale')
@@ -1876,7 +2024,11 @@ class GeometryArtifactStore:
         root = self.root / entry['geometry_id']
         cad_artifact = root / f'rev{revision}.brep'
         surface_artifact = root / f'rev{revision}.stl'
-        self._write_brep(preview['_shape'], cad_artifact)
+        if preview.get('_brep_path'):
+            # The worker wrote the healed solid; this process never held it.
+            os.replace(preview['_brep_path'], cad_artifact)
+        else:
+            self._write_brep(preview['_shape'], cad_artifact)
         self._write_polydata(preview['_polydata'], surface_artifact)
         fingerprint = self._combined_fingerprint((cad_artifact, surface_artifact))
         report = {key: value for key, value in preview.items()

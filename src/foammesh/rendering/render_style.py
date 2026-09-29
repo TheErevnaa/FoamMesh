@@ -23,6 +23,9 @@ from dataclasses import dataclass
 #: Order is the order of the menu.
 PRESETS = ('performance', 'balanced', 'quality')
 DEFAULT_PRESET = 'balanced'
+#: Plan 35 CR8. Graphics safe mode's preset. Not in the menu and never saved:
+#: it belongs to one start (``support.safe_mode``), not to the user's choice.
+SAFE_PRESET = 'fast'
 
 #: Depth peeling for translucent parts. Peeling and multisampling cannot be
 #: combined on the OpenGL2 backend, so while it runs MSAA is off.
@@ -48,6 +51,14 @@ class RenderQuality:
     ssao: bool = False
     peels: int = DEPTH_PEELS
     occlusion: float = DEPTH_PEEL_OCCLUSION
+    #: FXAA when there is no multisampling. Off only for the safe preset,
+    #: which runs no post-process pass at all.
+    fxaa: bool = True
+
+    @property
+    def peeling(self) -> bool:
+        """Whether this preset may ever turn depth peeling on."""
+        return self.peels > 0
 
 
 #: MEASURED (render0925, VTK 9.5.2, AMD Radeon, 1600x900, median of 3x60
@@ -69,6 +80,10 @@ QUALITIES = {
     # background in one colour, the gradient's lower end. 1.4-1.7x Balanced's
     # frame time. Not the default.
     'quality': RenderQuality('quality', 0, ssao=True),
+    # Plan 35 CR8 safe mode: the fewest GL features that still draw the
+    # scene. No multisampling, no FXAA, no SSAO and no depth peeling, so a
+    # see-through part is blended in draw order instead of peeled.
+    SAFE_PRESET: RenderQuality(SAFE_PRESET, 0, peels=0, fxaa=False),
 }
 
 #: What the menu says each preset costs, from the measurement above.
@@ -119,7 +134,7 @@ def antiAliasing(preset, peeling: bool) -> tuple[int, bool]:
     """
     chosen = quality(preset)
     samples = 0 if peeling or chosen.ssao else chosen.multiSamples
-    return samples, samples == 0
+    return samples, samples == 0 and chosen.fxaa
 
 
 def tuneLightKit(kit) -> None:
@@ -141,8 +156,10 @@ def applyAntiAliasing(renderer, window, preset, peeling: bool) -> bool:
 def applyTransparency(renderer, window, preset, enabled: bool) -> bool:
     """Depth peeling on or off, and the anti-aliasing that goes with it.
 
-    Returns whether FXAA is now on.
+    Returns whether FXAA is now on. A preset without peeling (the safe
+    preset) keeps it off whatever is asked.
     """
+    enabled = bool(enabled) and quality(preset).peeling
     if enabled:
         window.SetAlphaBitPlanes(1)
         renderer.SetUseDepthPeeling(True)
@@ -188,3 +205,27 @@ def applyRenderQuality(renderer, window, preset, *, lightKit=None,
         renderer, chosen.ssao,
         modelExtent(renderer) if extent is None else extent)
     return chosen
+
+
+def report(renderer, window) -> dict:
+    """What a renderer and its window actually draw with, read back from VTK.
+
+    Plan 35 CR8: the safe-mode gate asks this, not the preset table, whether
+    depth peeling is off.
+    """
+    def read(owner, name, default=None):
+        getter = getattr(owner, name, None)
+        if getter is None:
+            return default
+        try:
+            return getter()
+        except Exception:                                  # noqa: BLE001
+            return default
+
+    return {
+        'depth_peeling': bool(read(renderer, 'GetUseDepthPeeling', False)),
+        'peels': int(read(renderer, 'GetMaximumNumberOfPeels', 0) or 0),
+        'fxaa': bool(read(renderer, 'GetUseFXAA', False)),
+        'ssao': bool(read(renderer, 'GetUseSSAO', False)),
+        'multi_samples': int(read(window, 'GetMultiSamples', 0) or 0),
+    }

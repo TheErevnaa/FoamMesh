@@ -182,9 +182,22 @@ def sections_from(mesh: PolyMesh, identity: IdentityMap, *,
 
 def load(case_or_mesh: str | Path, identity: IdentityMap, *,
          checkpoint: str = 'final', expected_uuids=None,
-         layout_expectation: str = 'reconstructed') -> BoundaryModel:
-    """Read a published mesh and reconcile its sections in one step."""
-    mesh = read_poly_mesh(case_or_mesh, layout_expectation=layout_expectation)
+         layout_expectation: str = 'reconstructed',
+         boundary_only: bool = False) -> BoundaryModel:
+    """Read a published mesh and reconcile its sections in one step.
+
+    ``boundary_only`` (Plan 35 CR2) reads the boundary patches' faces and the
+    points they use, not the volume: what fidelity measures, at a fraction of
+    the memory. The sections, their areas and every face id are the same as a
+    full read's; :func:`outward_fraction` needs owners and so a full read.
+    """
+    if boundary_only:
+        from foammesh.core.mesh.poly_mesh_boundary import read_poly_mesh_boundary
+
+        mesh = read_poly_mesh_boundary(
+            case_or_mesh, layout_expectation=layout_expectation)
+    else:
+        mesh = read_poly_mesh(case_or_mesh, layout_expectation=layout_expectation)
     return BoundaryModel(
         mesh=mesh,
         sections=sections_from(mesh, identity, expected_uuids=expected_uuids),

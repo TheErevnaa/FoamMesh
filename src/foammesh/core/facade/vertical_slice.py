@@ -126,12 +126,20 @@ class VerticalSliceOperations:
                              if budget_module.cancel(job_id)]
         job_ids = tuple(session.jobs.active_job_ids)
         cancelled_jobs = await session.jobs.cancel_all()
-        cancelled = len(cancelled_budgets) + cancelled_jobs
+        # Plan 35 CR2. Check workers are not the job manager's -- they make
+        # no run record and hold no recovery gate -- so they are stopped by
+        # their own registry, by case.
+        from foammesh.core.jobs import local_worker
+
+        cancelled_checks = await asyncio.to_thread(
+            local_worker.cancel_all, str(session.case_path))
+        cancelled = len(cancelled_budgets) + cancelled_jobs + cancelled_checks
         return OperationResult(
             'accepted', command.operation, session.revisions,
             payload={'cancelled': cancelled,
                      'job_ids': list(job_ids),
                      'diagnostic_ids': cancelled_budgets,
+                     'checks_cancelled': cancelled_checks,
                      'recovery': ('managed_by_operation' if cancelled_jobs
                                   else 'not_required')})
 

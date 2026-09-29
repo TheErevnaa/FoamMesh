@@ -13,9 +13,11 @@ from vtkmodules.util.numpy_support import (
     numpy_to_vtk, numpy_to_vtkIdTypeArray)
 from foammesh.core.mesh.poly_mesh_boundary import (
     PolyMeshReadError, read_face_zone_surfaces)
+from foammesh.core.mesh.mesh_preview import case_layout
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 from vtkmodules.vtkRenderingLOD import vtkQuadricLODActor
 from vtkmodules.vtkCommonCore import vtkCommand
+from foammesh.support import disposal
 from foammesh.support.vtk_threads import vtk_run_in_thread
 from vtkmodules.util.vtkConstants import VTK_MULTIBLOCK_DATA_SET, VTK_UNSTRUCTURED_GRID, VTK_POLY_DATA
 from pathlib import Path
@@ -208,6 +210,24 @@ class PolyMeshLoader(QObject):
         self._progress_range = [0, 100]
 
         self._reader.AddObserver(vtkCommand.ProgressEvent, self._readerProgressed)
+        disposal.track(self, 'PolyMeshLoader')
+
+    def dispose(self):
+        """Drop the reader, and with it the copy of the mesh it caches.
+
+        Plan 35 CR3. The reader keeps the whole mesh (`CacheMeshOn`) for as
+        long as it lives, and its progress observer is a bound method of this
+        object, so the pair formed a cycle only the collector could free --
+        a second full copy of the mesh held until it ran, on whatever thread
+        it ran on. Called once the read is over; never while `loadMesh` may
+        still be running on the VTK thread.
+        """
+        reader = self._reader
+        if reader is None:
+            return
+        self._reader = None
+        disposal.untrack(self, 'PolyMeshLoader')
+        reader.RemoveAllObservers()
 
     def _polyMeshDirectories(self, root: Path) -> list:
         """Every polyMesh directory under one case root, in no order.
@@ -254,16 +274,9 @@ class PolyMeshLoader(QObject):
         it is the only mesh there is, or when it is the newer of the two and so
         is what the last run actually produced.
         """
-        if not self._polyMeshDirectories(self._processorPath):
-            return vtkPOpenFOAMReader.RECONSTRUCTED_CASE
-        if not self._polyMeshDirectories(self._caseDir):
-            return vtkPOpenFOAMReader.DECOMPOSED_CASE
-
-        reconstructed = self._meshWrittenAt(self._caseDir)
-        decomposed = self._meshWrittenAt(self._processorPath)
-        if reconstructed is None:
-            return vtkPOpenFOAMReader.DECOMPOSED_CASE
-        if decomposed is not None and decomposed > reconstructed:
+        # Plan 35 CR3: the rule lives in ``mesh_preview.case_layout``, which
+        # the window also asks before it starts a preview worker.
+        if case_layout(self._caseDir) == 'decomposed':
             return vtkPOpenFOAMReader.DECOMPOSED_CASE
         return vtkPOpenFOAMReader.RECONSTRUCTED_CASE
 
@@ -297,6 +310,31 @@ class PolyMeshLoader(QObject):
         self._progress_range = [50, 100]
         return await vtk_run_in_thread(
             self._getVtkMesh, self._buildPatchArrayStatus())
+
+    def readNow(self, time, *, boundaryOnly=False):
+        """The same scene as :meth:`loadMesh`, read on the calling thread.
+
+        Plan 35 CR3. Only the preview worker calls this, in its own process:
+        the window no longer runs the reader. ``boundaryOnly`` leaves the
+        volume and the cell zones unread -- what the default surface preview
+        needs of a mesh the bounded reader cannot read.
+        """
+        if not self.hasMesh():
+            return None
+        self._reader.SetCaseType(self._caseType())
+        self._reader.UpdateInformation()
+        self._reader.SetTimeValue(time)
+        if self._reader.GetTimeValue() != time:
+            return None
+        if boundaryOnly:
+            self._reader.ReadZonesOff()
+        self._reader.Modified()
+        self._reader.Update()
+        status = self._buildPatchArrayStatus()
+        if boundaryOnly:
+            status = {name: 0 if name.endswith('internalMesh') else value
+                      for name, value in status.items()}
+        return self._getVtkMesh(status)
 
     def _buildPatchArrayStatus(self):
         #

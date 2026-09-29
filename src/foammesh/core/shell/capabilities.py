@@ -242,6 +242,14 @@ class CapabilityRegistry:
             self._help_cache[name] = result
         return result
 
+    def help_if_known(self, name: str) -> UtilityHelp | None:
+        """The cached ``-help`` answer, instantly, or ``None`` if not asked yet.
+
+        Plan 35 CR7. :meth:`help` may boot a cold runtime; a caller on the
+        owner loop asks it on a worker thread first and reads this after.
+        """
+        return self._help_cache.get(name)
+
     def command(self, name: str, arguments=(), *, cwd) -> LaunchCommand:
         capability = self.utility(name)
         if not capability.available or capability.executable is None:

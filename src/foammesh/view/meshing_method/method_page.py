@@ -492,45 +492,15 @@ class MeshingMethodPage(QWidget):
         self.probeFinished.emit(available)
 
     def _show_runtime_diagnostics(self):
-        def show(result):
-            if getattr(result, 'status', '') != 'accepted':
-                QMessageBox.warning(
-                    self, self.tr('OpenFOAM runtime'),
-                    str(getattr(result, 'message', '')
-                        or self.tr('Runtime diagnostics failed.')))
-                return
-            selected = (result.payload or {}).get('selected_profile')
-            if not selected:
-                profiles = (result.payload or {}).get('profiles') or []
-                reason = '\n'.join(
-                    str(item.get('reason') or item.get('profile_id'))
-                    for item in profiles)
-                QMessageBox.warning(
-                    self, self.tr('OpenFOAM runtime'),
-                    reason or self.tr('No qualified runtime is available.'))
-                return
-            utilities = selected.get('utilities') or {}
-            lines = [
-                f"Profile: {selected.get('profile_id', '')}",
-                f"Distribution: {selected.get('distribution', '')}",
-                f"User: {selected.get('user', '')}",
-                f"Bashrc: {selected.get('bashrc', '')}",
-                f"Project: {selected.get('project', '')}",
-                f"Version: {selected.get('version', '')}",
-                f"Build: {selected.get('wm_options', '')}",
-                f"MPI: {selected.get('mpi_identity', '')}",
-                f"Fingerprint: {selected.get('fingerprint', '')}",
-                '',
-                'Utilities:',
-                *(f"  {name}: {path}"
-                  for name, path in sorted(utilities.items())),
-            ]
-            QMessageBox.information(
-                self, self.tr('OpenFOAM runtime diagnostics'),
-                '\n'.join(lines))
-
-        self._track(_submit(
-            self._client, 'openfoam.runtime.diagnostics', {}, show))
+        # Plan 35 CR6. The window opens at once and fills in when the facade
+        # answers; it also carries the WSL health and the one place
+        # `wsl --shutdown` is offered.
+        from foammesh.app import app
+        from foammesh.view.main_window.wsl_health_bar import show_runtime_diagnostics
+        dialog = show_runtime_diagnostics(
+            self, self._client, getattr(app, 'wslHealth', None))
+        self._track(getattr(dialog, '_submitted', None))
+        return dialog
 
     def _show_effective_dictionaries(self):
         checked = self._group.checkedButton()

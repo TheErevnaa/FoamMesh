@@ -13,6 +13,8 @@ No module here imports Qt or a view; the shared services under
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import os
@@ -28,7 +30,8 @@ from foammesh.core.project import Event
 from foammesh.core.mesh import detection_record  # RP13 #3
 
 from .commands import Command
-from .errors import (CapabilityUnavailableError, FacadeError,
+from .errors import (CapabilityUnavailableError, CheckOverBudgetError,
+                     CheckUnavailableError, FacadeError,
                      PreconditionFailedError, ValidationFailedError)
 from .probe_cache import ProbeCache
 from .results import OperationResult
@@ -98,13 +101,14 @@ def runner_crash_reason(returncode, *, threads: int = 0) -> str:
     command inside WSL -- reports a signal death as 128 + N; Python's own
     `subprocess` reports it as -N. 128 exactly is not a signal and is left
     alone.
+
+    Plan 35 CR5. The signal is read by the decoder both engines share
+    (:func:`foammesh.core.run_result.exit_signal`); this keeps only the
+    Gmsh-specific advice.
     """
-    try:
-        code = int(returncode)
-    except (TypeError, ValueError):
-        return ''
-    number = -code if code < 0 else (code - 128 if code > 128 else 0)
-    if number <= 0 or number > 64:
+    from foammesh.core.run_result import exit_signal
+    number = exit_signal(returncode)
+    if not number:
         return ''
     name, what = _FATAL_SIGNALS.get(number, ('', ''))
     named = f'{name}, {what}' if name else f'signal {number}'
@@ -168,7 +172,7 @@ def runner_crash_reason(returncode, *, threads: int = 0) -> str:
         'it could not mesh. Lower it before changing anything else.')
 
 
-def retry_at_one_thread(layout, job, payload) -> str:
+def retry_at_one_thread(layout, job, payload, *, attempt: int = 0) -> str:
     """Rewrite this run's job to a single thread, or ``''`` to leave it alone.
 
     DP-56. A crash is the one failure that carries no information: no mesh, no
@@ -190,19 +194,15 @@ def retry_at_one_thread(layout, job, payload) -> str:
     SIGKILL, which is the machine reclaiming memory and whose remedy is a
     smaller mesh rather than fewer threads; and a job that already asked for
     one thread, which has nothing left to lower.
+
+    Plan 35 CR6. The decision is the shared retry policy's
+    (:func:`foammesh.core.jobs.retry.automatic_thread_retry`): once, and never
+    on a run that is itself a retry (*attempt* above zero).
     """
     import json
 
-    status = str((payload.get('job') or {}).get('status') or '')
-    if status == 'cancelled':
-        return ''
-    try:
-        code = int((payload.get('job') or {}).get('returncode'))
-    except (TypeError, ValueError):
-        return ''
-    number = -code if code < 0 else (code - 128 if code > 128 else 0)
-    if number <= 0 or number > 64 or number == _SIGKILL:
-        return ''
+    from foammesh.core.jobs.retry import automatic_thread_retry
+
     intent = job.get('intent')
     if not isinstance(intent, dict):
         return ''
@@ -211,7 +211,10 @@ def retry_at_one_thread(layout, job, payload) -> str:
         threads = int(parallel.get('threads', 1) or 1)
     except (TypeError, ValueError):
         return ''
-    if threads <= 1:
+    ended = payload.get('job') or {}
+    if not automatic_thread_retry(status=str(ended.get('status') or ''),
+                                  returncode=ended.get('returncode'),
+                                  threads=threads, attempt=attempt):
         return ''
     parallel.update({'threads': 1, 'effectiveVolumeThreads': 1,
                      'retriedFromThreads': threads})
@@ -935,6 +938,12 @@ class DomainOperations:
         #: what the Execution page offers, and asking costs a WSL boot.
         self._decomposition_probe = ProbeCache(_PROBE_TTL_SECONDS)
 
+    def forget_runtime_probes(self) -> None:
+        """Plan 35 CR6: the runtime came back; its cached verdicts are stale."""
+        for cache in (self._probe_results, self._runtime_diagnostics,
+                      self._decomposition_probe):
+            cache.clear()
+
     # -- registration ------------------------------------------------------ #
 
     def register_all(self, register) -> None:
@@ -942,7 +951,7 @@ class DomainOperations:
             register(operation, handler)
 
     def handlers(self) -> dict:
-        return {
+        table = {
             # Slice 1: lifecycle / persistence / history
             'case.classify': self._classify,
             'case.save': self._save,
@@ -1031,7 +1040,7 @@ class DomainOperations:
             'mesh.reconstruct': self._mesh_reconstruct,
             'mesh.feature_edges': self._mesh_feature_edges,
             'mesh.layer_coverage': self._mesh_layer_coverage,
-            'quality.cell_fields': self._quality_cell_fields,
+            'quality.cell_fields': self._worker_handler('quality.cell_fields'),
             'quality.mesh_report': self._quality_mesh_report,
             'mesh.run.accept': self._mesh_run_accept,
             'quality.report': self._quality_report,
@@ -1040,9 +1049,9 @@ class DomainOperations:
             'quality.compare': self._quality_compare,
             'quality.report.export': self._quality_report_export,
             'quality.waiver.record': self._quality_waiver_record,
-            'quality.fidelity': self._quality_fidelity,
-            'quality.resolution': self._quality_resolution,
-            'quality.summary': self._quality_summary,
+            'quality.fidelity': self._worker_handler('quality.fidelity'),
+            'quality.resolution': self._worker_handler('quality.resolution'),
+            'quality.summary': self._worker_handler('quality.summary'),
             'quality.summary.read': self._quality_summary_read,
             'quality.evidence.read': self._quality_evidence_read,
             'mesh.repair.preview': self._mesh_repair_preview,
@@ -1069,6 +1078,8 @@ class DomainOperations:
             'case.export.format_convert': self._export_format_convert,
             'case.export.authored': self._export_authored,
         }
+        _assert_worker_isolation(table)
+        return table
 
     # -- shared helpers ---------------------------------------------------- #
 
@@ -1822,7 +1833,17 @@ class DomainOperations:
             # over `WorkflowTask.to_dict()` and is the invalidation key for
             # persisted task state, so a field that changes whenever a warning
             # appears would wipe the user's progress on every status change.
-            'warnings': self._task_warnings(session, engine_id)})
+            'warnings': self._task_warnings(session, engine_id),
+            # Plan 35 CR2. Checks run in workers now, so "running" is a
+            # state a task can be in between two reads, and "could not run"
+            # is an answer that is not a verdict.
+            **self._check_status(session)})
+
+    def _check_status(self, session: CaseSession) -> dict:
+        checks = self._checks_for(session)
+        return {'checking': dict(checks['checking']),
+                'check_failures': {task: dict(failure) for task, failure
+                                   in checks['failures'].items()}}
 
     def _mesh_workflow_task_page(self, session: CaseSession,
                                  command: Command) -> OperationResult:
@@ -1870,6 +1891,10 @@ class DomainOperations:
             'status': str(statuses.get(task_id) or 'ready'),
             'warnings': list(warnings.get(task_id) or ()),
             'state': snapshot,
+            # Plan 35 CR2: running in a worker, or could not run.
+            'checking': task_id in self._checks_for(session)['checking'],
+            'check_failure': dict(
+                self._checks_for(session)['failures'].get(task_id) or {}),
             # The tasks this one unlocks, under the names the outline shows.
             # The readiness page names them ("Until you do, Snap Fidelity
             # stays locked") and read the whole descriptor again to do it.
@@ -1995,6 +2020,14 @@ class DomainOperations:
         'common.summary': 'quality.summary',
     }
 
+    def _check_command(self, command: Command, task_id: str):
+        from dataclasses import replace as _replace
+
+        operation = self.CHECK_TASK_OPERATIONS[task_id]
+        return operation, _replace(
+            command, operation=operation,
+            parameters={**dict(command.parameters), 'task_id': task_id})
+
     def _run_check_task(self, session: CaseSession, command: Command,
                         task_id: str, store):
         """Execute a check task and record its verdict as evidence.
@@ -2007,20 +2040,37 @@ class DomainOperations:
         "the evidence exists" (``COMPLETED``) from "the mesh passed". A
         ``fail`` report is complete evidence, and recording it as a failed
         *task* would make a successful check look like a broken one.
-        """
-        from dataclasses import replace as _replace
 
-        operation = self.CHECK_TASK_OPERATIONS[task_id]
-        inner = _replace(command, operation=operation,
-                         parameters={**dict(command.parameters),
-                                     'task_id': task_id})
-        # Both check handlers are synchronous, so this is too. Making the
-        # transition operation async to accommodate an awaitable would change
-        # the contract of an existing operation every caller already uses --
-        # measured: it broke 17 tests with "requires the async execute() path".
+        Plan 35 CR2. The check handlers now run in a worker process, so the
+        handler returns an awaitable; this then returns a coroutine that
+        awaits the worker and records the verdict when it lands. A handler
+        that answers synchronously (a test double) is recorded at once, as
+        before.
+        """
+        operation, inner = self._check_command(command, task_id)
         handler = self.handlers()[operation]
         result = handler(session, inner)
+        if not inspect.isawaitable(result):
+            return self._record_check(task_id, operation, result, store)
 
+        async def finish():
+            checks = self._checks_for(session)
+            checks['checking'][task_id] = operation
+            checks['failures'].pop(task_id, None)
+            try:
+                outcome = await result
+            except FacadeError as error:
+                checks['failures'][task_id] = _check_failure(
+                    operation, error)
+                raise
+            finally:
+                checks['checking'].pop(task_id, None)
+            return self._record_check(task_id, operation, outcome, store)
+
+        return finish()
+
+    def _record_check(self, task_id: str, operation: str, result, store):
+        """Store one check's verdict as the task's evidence."""
         payload = result.payload or {}
         document = payload.get('report') or payload.get('summary') or {}
         # R38/R161. `Summary.to_dict()` publishes `worst_verdict`, never
@@ -2068,6 +2118,106 @@ class DomainOperations:
                                      'report_fingerprint': fingerprint,
                                      'payload': payload})
 
+    # -- Plan 35 CR2: checks run in a worker process ------------------------ #
+
+    def _worker_handler(self, operation: str):
+        """The registered handler of a check: dispatch to a worker process.
+
+        The measuring bodies (``_quality_fidelity`` and the rest) are
+        unchanged and still methods here; the worker runs them. Nothing in
+        this process calls them, which ``_assert_worker_isolation`` holds.
+        """
+        async def dispatch(session, command):
+            return await self._run_in_worker(session, command, operation)
+
+        dispatch._foammesh_worker = operation
+        dispatch.__name__ = dispatch.__qualname__ = (
+            'worker:' + operation.replace('.', '_'))
+        return dispatch
+
+    def _worker_args(self, session: CaseSession, command: Command) -> dict:
+        db = getattr(getattr(session, 'state', None), 'db', None)
+        db_yaml = None
+        if db is not None and hasattr(db, 'toYaml'):
+            db_yaml = db.toYaml()
+        return {'case_path': str(session.case_path),
+                'case_id': str(getattr(session, 'case_id', '')
+                               or command.case_id or ''),
+                'db_yaml': db_yaml,
+                'parameters': dict(command.parameters or {}),
+                'fidelity_budget_seconds':
+                    self._fidelity_budget_seconds(session)}
+
+    async def _run_in_worker(self, session: CaseSession, command: Command,
+                             operation: str) -> OperationResult:
+        """Admit, run ``operation`` in a worker, and map how it ended.
+
+        Admission reads only the mesh headers (``read_counts``), estimates
+        the peak and asks the budget before any list is parsed: a check that
+        would not fit is refused with both numbers rather than started. The
+        worker then runs under a memory cap; hitting it is ``over_budget``,
+        not a crash. Every other way it can end -- it would not start, it
+        died, it was cancelled -- is ``check_unavailable`` and retryable. No
+        path falls back to measuring in this process.
+        """
+        from foammesh.core.jobs import local_worker
+        from foammesh.core.mesh.poly_mesh_boundary import (
+            PolyMeshReadError, read_counts,
+        )
+        from foammesh.support import resource_budget as budget
+
+        from . import errors as errors_module
+
+        counts = None
+        if operation in budget.HEAVY_OPERATIONS:
+            try:
+                counts = (await asyncio.to_thread(
+                    read_counts, session.case_path)).to_dict()
+            except (PolyMeshReadError, OSError, ValueError):
+                counts = None           # the worker's reader refuses by name
+        estimate = budget.estimate_peak_bytes(operation, counts)
+        priority = (budget.PRIORITY_INTERACTIVE
+                    if operation == 'quality.cell_fields'
+                    else budget.PRIORITY_BACKGROUND)
+        try:
+            grant = await budget.controller().admit(
+                operation, estimate, priority=priority)
+        except budget.OverBudget as refusal:
+            raise CheckOverBudgetError(
+                f'{operation} was not started: {refusal}',
+                details=dict(refusal.to_dict(), outcome='refused',
+                             operation=operation, retryable=True)) from None
+        args = await asyncio.to_thread(self._worker_args, session, command)
+        async with grant:
+            outcome = await local_worker.run_worker(
+                operation, args, cap_bytes=grant.cap_bytes,
+                group=str(session.case_path))
+        if outcome.ok:
+            return OperationResult('accepted', command.operation,
+                                   session.revisions, payload=outcome.payload)
+        details = dict(outcome.to_dict(), outcome=outcome.status,
+                       estimate=estimate.to_dict()
+                       if hasattr(estimate, 'to_dict') else {},
+                       retryable=outcome.status != local_worker.FAILED)
+        if outcome.status == local_worker.OVER_BUDGET:
+            raise CheckOverBudgetError(
+                f'{operation} stopped: {outcome.message}', details=details)
+        if outcome.status == local_worker.FAILED:
+            # The body refused, in the worker, exactly as it would have here:
+            # re-raise the same facade error with the same code.
+            details = dict(outcome.details or {}, **{
+                'outcome': outcome.status, 'reason': outcome.reason,
+                'retryable': False})
+            error_class = getattr(errors_module, outcome.error_class or '', None)
+            if (isinstance(error_class, type)
+                    and issubclass(error_class, FacadeError)):
+                raise error_class(outcome.message, details=details)
+            raise ValidationFailedError(
+                f'{operation} failed: {outcome.message}', details=details)
+        raise CheckUnavailableError(
+            f'{operation} did not produce a result: {outcome.message}',
+            details=details)
+
     def _mesh_workflow_task_transition(self, session: CaseSession,
                                        command: Command) -> OperationResult:
         from foammesh.core.workflow.task_state_store import TaskStateError
@@ -2087,6 +2237,25 @@ class DomainOperations:
                     session, command, task_id, store)
             except (TaskStateError, ValueError, KeyError) as error:
                 raise ValidationFailedError(str(error)) from error
+            if inspect.isawaitable(recorded):
+                # Plan 35 CR2: the check is in a worker. This awaits it on
+                # the loop -- the window keeps drawing -- and records the
+                # verdict when it lands.
+                pending = recorded
+
+                async def finish():
+                    try:
+                        landed = await pending
+                    except (TaskStateError, ValueError, KeyError) as error:
+                        raise ValidationFailedError(str(error)) from error
+                    session.state.bus.publish(
+                        Event.ARTIFACT_QUALITY_CHANGED,
+                        operation=command.operation, job_id=None,
+                        artifacts=[], quality=task_id)
+                    return self._read_result(session, command, dict(
+                        landed, engine_id=engine_id))
+
+                return finish()
             return self._read_result(session, command, dict(
                 recorded, engine_id=engine_id))
 
@@ -2203,8 +2372,10 @@ class DomainOperations:
         # for the user, and the thread count is what decides it. Retried here
         # rather than reported, once, and only once: the second attempt has
         # one thread, so `retry_at_one_thread` refuses to arm again.
+        from foammesh.core.jobs.retry import attempt_of
+        attempt = attempt_of(command.parameters)
         retry = retry_at_one_thread(layout, written['job'],
-                                    execution.to_payload())
+                                    execution.to_payload(), attempt=attempt)
         if retry:
             record.document['job_sha256'] = sha256_of(layout.job)
             record.document.setdefault('warnings', []).append(retry)
@@ -2269,6 +2440,15 @@ class DomainOperations:
                 # from this run's log the way a snappy stage's is.
                 from foammesh.core.run_result import read_failure_cause
                 payload['details'] = read_failure_cause(layout.log)[1]
+                # Plan 35 CR6. A lost WSL relay or a memory kill is offered a
+                # retry; the thread retry above already spent this run's one.
+                from foammesh.core.jobs.retry import retry_offer
+                offer = retry_offer(
+                    (payload.get('job') or {}).get('exit'),
+                    attempt=attempt + (1 if retry else 0),
+                    fatal='FOAM FATAL' in str(payload.get('details') or ''))
+                if offer is not None:
+                    payload['retry'] = offer
             return OperationResult('failed', command.operation,
                                    session.revisions, payload=payload)
 
@@ -3240,66 +3420,168 @@ class DomainOperations:
 
     def _advance_pipeline_gates(self, session: CaseSession, command: Command,
                                 recorded: dict | None) -> dict | None:
-        """Run the check gates a finished pipeline is blocked behind, when it may.
+        """Start the check gates a finished pipeline is blocked behind.
 
         The atomic recorder stops at the first gate. When that gate is a
         check task whose own prerequisites are met, the mesh it judges is on
         disk right now, so the check is run and recorded and the remaining
         run tasks are advanced. A gate whose prerequisite is a manual
         confirmation stays blocked, and the payload says so.
+
+        Plan 35 CR2. The checks parse the mesh, which on a large case is
+        minutes and gigabytes, and they used to do it here, on the thread
+        that runs the window. Now they are submitted to worker processes and
+        this returns at once, naming them under ``checking``; the verdicts
+        arrive later as task-state transitions and an
+        ``ARTIFACT_QUALITY_CHANGED`` event. A check that cannot run is left
+        unrun and retryable, and the mesh stays published and usable.
         """
         if not recorded:
             return recorded
+        gates = self._runnable_gates(session, command, recorded)
+        if not gates:
+            return recorded
+        checks = self._checks_for(session)
+        for gate in gates:
+            checks['checking'][gate] = CHECK_TASK_OPERATIONS[gate]
+            checks['failures'].pop(gate, None)
+        task = asyncio.ensure_future(
+            self._gates_in_background(session, command, recorded))
+        checks['tasks'].add(task)
+        task.add_done_callback(checks['tasks'].discard)
+        return dict(recorded, checking=list(gates))
+
+    def _runnable_gates(self, session: CaseSession, command: Command,
+                        recorded: dict | None) -> list:
+        """The check tasks ``recorded`` is blocked behind that may run now."""
+        from foammesh.core.workflow.task_state_store import TaskStateError
+
+        blocked = recorded.get('blocked') if isinstance(recorded, dict) else None
+        if not blocked:
+            return []
+        accepted = ('passed', 'warning', 'skipped', 'completed', 'waived')
+        try:
+            _engine_id, store = self._task_state_store(session, command)
+            graph = store.load_result().graph
+            task = store.descriptor.task(str(blocked.get('task_id') or ''))
+            return [
+                parent for parent in task.depends_on
+                if parent in CHECK_TASK_OPERATIONS
+                and graph.state(parent).value not in accepted
+                and graph.is_runnable(parent)]
+        except (TaskStateError, LookupError, OSError, ValueError,
+                AttributeError):
+            return []
+
+    async def _gates_in_background(self, session: CaseSession,
+                                   command: Command, recorded: dict) -> dict:
+        """Run the gates in workers, then record them through the queue.
+
+        The workers are awaited outside the command queue, so edits made
+        while a check runs are not held behind it; the store is written only
+        from inside the queue, where every other write to it happens.
+        """
         from foammesh.core.engine.registry import ENGINE_REGISTRY
         from foammesh.core.workflow.task_state_store import TaskStateError
 
-        accepted = ('passed', 'warning', 'skipped', 'completed', 'waived')
-        for _attempt in range(8):
-            blocked = recorded.get('blocked') if isinstance(recorded, dict) else None
-            if not blocked:
-                return recorded
-            try:
-                engine_id, store = self._task_state_store(session, command)
-                covered = getattr(
-                    ENGINE_REGISTRY.get(engine_id), 'ATOMIC_RUN_TASKS', ())
-                graph = store.load_result().graph
-                task = store.descriptor.task(str(blocked.get('task_id') or ''))
-                gates = [
-                    parent for parent in task.depends_on
-                    if parent in CHECK_TASK_OPERATIONS
-                    and graph.state(parent).value not in accepted
-                    and graph.is_runnable(parent)]
-            except (TaskStateError, LookupError, OSError, ValueError,
-                    AttributeError):
-                return recorded
-            if not gates:
-                return recorded
-            try:
+        checks = self._checks_for(session)
+        try:
+            for _attempt in range(8):
+                blocked = recorded.get('blocked')
+                gates = self._runnable_gates(session, command, recorded)
+                if not blocked or not gates:
+                    return recorded
+                results = {}
                 for gate in gates:
-                    self._run_check_task(session, command, gate, store)
-                attribution = {}
-                if (recorded.get('warning')
-                        and recorded.get('warning_for') is not None):
-                    attribution['warning_for'] = tuple(recorded['warning_for'])
-                if recorded.get('warning_reasons'):
-                    attribution['reasons'] = tuple(recorded['warning_reasons'])
-                progressed = store.record_atomic_run_success(
-                    covered, warning=bool(recorded.get('warning')),
-                    **attribution)
-            except (TaskStateError, LookupError, OSError, ValueError,
-                    FacadeError):
-                return recorded
-            progressed['advanced'] = list(recorded.get('advanced', ())) + list(
-                progressed.get('advanced', ()))
-            progressed['gates_run'] = list(recorded.get('gates_run', ())) + gates
-            progressed['warning'] = recorded.get('warning')
-            for key in ('warning_for', 'warning_reasons'):
-                if key in recorded:
-                    progressed[key] = recorded[key]
-            if progressed.get('blocked') == blocked:
-                return progressed
-            recorded = progressed
-        return recorded
+                    operation, inner = self._check_command(command, gate)
+                    checks['checking'][gate] = operation
+                    try:
+                        outcome = self.handlers()[operation](session, inner)
+                        if inspect.isawaitable(outcome):
+                            outcome = await outcome
+                        results[gate] = (operation, outcome)
+                    except FacadeError as error:
+                        checks['failures'][gate] = _check_failure(
+                            operation, error)
+                        logger.warning('check %s did not run: %s', gate, error)
+                    finally:
+                        checks['checking'].pop(gate, None)
+                if len(results) != len(gates):
+                    return recorded
+                previous = recorded
+
+                async def record(results=results, previous=previous):
+                    engine_id, store = self._task_state_store(session, command)
+                    for gate, (operation, outcome) in results.items():
+                        self._record_check(gate, operation, outcome, store)
+                    covered = getattr(
+                        ENGINE_REGISTRY.get(engine_id), 'ATOMIC_RUN_TASKS', ())
+                    attribution = {}
+                    if (previous.get('warning')
+                            and previous.get('warning_for') is not None):
+                        attribution['warning_for'] = tuple(
+                            previous['warning_for'])
+                    if previous.get('warning_reasons'):
+                        attribution['reasons'] = tuple(
+                            previous['warning_reasons'])
+                    return store.record_atomic_run_success(
+                        covered, warning=bool(previous.get('warning')),
+                        **attribution)
+
+                try:
+                    scheduler = getattr(session, 'scheduler', None)
+                    if scheduler is not None:
+                        progressed = await scheduler.submit(record)
+                    else:
+                        progressed = await record()
+                except (TaskStateError, LookupError, OSError, ValueError,
+                        FacadeError) as error:
+                    for gate, (operation, _outcome) in results.items():
+                        checks['failures'][gate] = {
+                            'operation': operation, 'reason': 'not_recorded',
+                            'message': str(error), 'retryable': True}
+                    return recorded
+                progressed['advanced'] = list(
+                    recorded.get('advanced', ())) + list(
+                        progressed.get('advanced', ()))
+                progressed['gates_run'] = list(
+                    recorded.get('gates_run', ())) + list(gates)
+                progressed['warning'] = recorded.get('warning')
+                for key in ('warning_for', 'warning_reasons'):
+                    if key in recorded:
+                        progressed[key] = recorded[key]
+                if progressed.get('blocked') == blocked:
+                    return progressed
+                recorded = progressed
+            return recorded
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            # A background task has nobody to raise to: say it, keep going.
+            logger.exception('the pipeline check gates could not run')
+            return recorded
+        finally:
+            for gate in list(checks['checking']):
+                checks['checking'].pop(gate, None)
+            try:
+                session.state.bus.publish(
+                    Event.ARTIFACT_QUALITY_CHANGED,
+                    operation='workflow.run_pipeline', job_id=None,
+                    artifacts=[], quality='checks')
+            except Exception:                               # noqa: BLE001
+                logger.debug('check completion was not announced',
+                             exc_info=True)
+
+    def _checks_for(self, session: CaseSession) -> dict:
+        """What this case is checking right now, and what could not be."""
+        registry = self.__dict__.setdefault('_gate_checks', {})
+        key = str(getattr(session, 'case_path', '') or '')
+        return registry.setdefault(
+            key, {'checking': {}, 'failures': {}, 'tasks': set()})
+
+    def check_tasks_in_flight(self, session: CaseSession) -> list:
+        """The background gate tasks of ``session`` (tests and shutdown)."""
+        return list(self._checks_for(session)['tasks'])
 
     @staticmethod
     def _gmsh_volume_types(session: CaseSession, prepared) -> dict:
@@ -3869,7 +4151,7 @@ runTimeModifiable true;
         if not pairs:
             return []
 
-        self._require_utility('createNonConformalCouples')
+        await self._utility_ready('createNonConformalCouples')
         registry = self._capabilities_registry()
         results = []
         for pair in pairs:
@@ -4025,20 +4307,78 @@ runTimeModifiable true;
 
         registry = self._capabilities_registry()
         if not hasattr(registry, 'utility'):
-            return
+            return {}
         wanted = tuple(names or self.RUN_PATH_UTILITIES)
 
         def probe():
+            found = {}
             for name in wanted:
                 try:
-                    registry.utility(name)
+                    found[name] = registry.utility(name)
                 except Exception:                             # noqa: BLE001
                     # Warming is never where a run fails. Whatever this was,
                     # the caller is about to ask the same question on this
                     # thread and report it in the words it already uses.
                     pass
+            return found
 
-        await asyncio.to_thread(probe)
+        return await asyncio.to_thread(probe)
+
+    async def _utilities_ready(self, names) -> None:
+        """Probe ``names`` off the loop; refuse one the runtime did not answer.
+
+        Plan 35 CR7. After the warm, every answer the registry *cached* is
+        free to ask again here. One it did not cache -- a probe that timed
+        out or could not reach the runtime (R194) -- would be asked again on
+        the owner loop by whoever asks next, and wait as long; so it is
+        refused now, with the probe's own reason, and the next attempt asks
+        again off the loop.
+        """
+        found = await self._warm_utility_probes(tuple(names))
+        for name, capability in (found or {}).items():
+            if getattr(capability, 'transient', False) is True and \
+                    not getattr(capability, 'available', False):
+                raise CapabilityUnavailableError(
+                    'required utility is unavailable', details={
+                        'utility': name,
+                        'reason': getattr(capability, 'reason', ''),
+                        'retryable': True})
+
+    async def _utility_ready(self, name: str) -> str:
+        """:meth:`_require_utility`, with the probe paid off the owner loop."""
+        await self._utilities_ready((name,))
+        return self._require_utility(name)
+
+    def _utility_without_waiting(self, registry, name: str):
+        """A utility's cached answer, or ``None`` while one is fetched.
+
+        Plan 35 CR7. For a synchronous read the window makes from a Qt slot
+        (the Export step lists its formats that way): an unknown utility is
+        probed on a background thread, and this listing treats it as not
+        there yet rather than booting a cold runtime on the GUI thread. The
+        next listing has the answer.
+        """
+        known = getattr(registry, 'utility_if_known', None)
+        if known is None:
+            return registry.utility(name)       # a test double: no runtime
+        capability = known(name)
+        inflight = self.__dict__.setdefault('_warming_in_background', set())
+        if capability is None and name not in inflight:
+            import threading
+
+            inflight.add(name)
+
+            def warm():
+                try:
+                    registry.utility(name)
+                except Exception:                             # noqa: BLE001
+                    pass
+                finally:
+                    inflight.discard(name)
+
+            threading.Thread(target=warm, name=f'probe-{name}',
+                             daemon=True).start()
+        return capability
 
     def _require_utility(self, name: str) -> str:
         capability = self._capabilities_registry().utility(name)
@@ -4499,7 +4839,7 @@ runTimeModifiable true;
             self, session: CaseSession, command: Command, utility: str,
             arguments, *, cwd: Path, mutation: bool = False,
             expected=()):
-        self._require_utility(utility)
+        await self._utility_ready(utility)
         launch = self._capabilities_registry().command(
             utility, arguments, cwd=cwd)
         return await self._context(session).executor.execute(
@@ -4518,7 +4858,7 @@ runTimeModifiable true;
         import shlex
         import subprocess
         registry = self._capabilities_registry()
-        self._require_utility('blockMesh')
+        await self._utility_ready('blockMesh')
         profile = registry.launch_profile('blockMesh')
         if profile is None:
             raise CapabilityUnavailableError(
@@ -5597,14 +5937,18 @@ runTimeModifiable true;
                 return None
         return self._patch_uuid_named(editor, previous)
 
-    def _geometry_combine(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _geometry_combine(self, session: CaseSession, command: Command) -> OperationResult:
         session.require_writable()
         geometry_ids = command.parameters.get('geometry_ids')
         if not isinstance(geometry_ids, list):
             raise ValidationFailedError('geometry_ids must be a list')
         from foammesh.core.geometry import GeometryArtifactStore
         try:
-            combined = GeometryArtifactStore(session.case_path).combine(
+            # Plan 35 CR7: the combined revision is re-diagnosed, and the
+            # shell-pair intersection check waits on a Python child per pair
+            # (0.4-0.7 s measured) -- on a worker thread, not the owner loop.
+            combined = await asyncio.to_thread(
+                GeometryArtifactStore(session.case_path).combine,
                 geometry_ids, name=command.parameters.get('name'),
                 replace_sources=bool(command.parameters.get('replace_sources', False)))
         except KeyError as error:
@@ -5620,7 +5964,7 @@ runTimeModifiable true;
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('mesh', 'quality'), payload=combined)
 
-    def _geometry_transform(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _geometry_transform(self, session: CaseSession, command: Command) -> OperationResult:
         session.require_writable()
         geometry_id = command.parameters.get('geometry_id')
         if not geometry_id:
@@ -5632,7 +5976,9 @@ runTimeModifiable true;
             operations = [{'kind': kind, 'values': values}]
         from foammesh.core.geometry import GeometryArtifactStore
         try:
-            transformed = GeometryArtifactStore(session.case_path).transform(
+            # Plan 35 CR7: as combine -- the re-diagnosis runs off the loop.
+            transformed = await asyncio.to_thread(
+                GeometryArtifactStore(session.case_path).transform,
                 geometry_id, operations)
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
@@ -6138,7 +6484,15 @@ runTimeModifiable true;
                 session, command, getattr(definition, 'task_id', None))
             job = payload.get('job') or {}
             if str(job.get('status') or '') != 'cancelled':
-                payload.update(self._stage_failure(definition.stage, job))
+                from foammesh.core.jobs.retry import attempt_of
+                payload.update(self._with_retry_offer(
+                    self._stage_failure(definition.stage, job), job,
+                    ranks=payload.get('ranks') or 1,
+                    attempt=attempt_of(command.parameters)))
+            if payload.get('discard_note'):
+                # Plan 35 D8: the reason says what was cleaned up.
+                reason = str(payload.get('reason') or f'{definition.stage} failed')
+                payload['reason'] = f"{reason} ({payload['discard_note']})"
         return OperationResult(
             'accepted' if execution.succeeded else 'failed', command.operation,
             session.revisions, invalidated_outputs=('quality',),
@@ -6162,10 +6516,46 @@ runTimeModifiable true;
 
         log = str(job.get('log_path') or '')
         cause, details = read_failure_cause(log)
+        # Plan 35 CR5 step 3. How the process ended, decoded: a signal, a
+        # lost WSL connection or an earlier run still unresolved says more
+        # than `process exited with code 139`.
+        decoded = job.get('exit') if isinstance(job.get('exit'), Mapping) else {}
+        kind = str(decoded.get('kind') or '')
+        exit_reason = str(decoded.get('reason') or '').strip()
+        if kind in {'segfault', 'fpe', 'oom', 'signal', 'transport',
+                    'recovery_pending'} and exit_reason:
+            cause = exit_reason if not cause else f'{exit_reason}: {cause}'
+        elif kind == 'abort' and exit_reason:
+            cause = cause or exit_reason
         cause = cause or str(job.get('error') or '').strip()
         reason = f'{stage} failed: {cause}' if cause else f'{stage} failed'
-        return {'reason': reason, 'cause': cause, 'details': details,
-                'log': log}
+        failure = {'reason': reason, 'cause': cause, 'details': details,
+                   'log': log}
+        if kind and kind not in {'ok', 'exit'}:
+            failure.update({'exit_kind': kind,
+                            'actions': list(decoded.get('actions') or ()),
+                            'hint': str(decoded.get('hint') or '')})
+            if decoded.get('signal'):
+                failure['signal'] = decoded['signal']
+        return failure
+
+    @staticmethod
+    def _with_retry_offer(failure: dict, job: Mapping, *, ranks: int = 1,
+                          attempt: int = 0) -> dict:
+        """Plan 35 CR6. *failure* with the retry the policy offers, if any.
+
+        [Retry] for a lost transport or a memory kill, and [Retry with fewer
+        cores] for the kill of a parallel run -- never for a FOAM FATAL ERROR,
+        and never for a run that is already a retry.
+        """
+        from foammesh.core.jobs.retry import retry_offer
+        decoded = job.get('exit') if isinstance(job.get('exit'), Mapping) else {}
+        text = f"{failure.get('cause') or ''} {failure.get('details') or ''}"
+        offer = retry_offer(decoded, ranks=ranks, attempt=attempt,
+                            fatal='FOAM FATAL' in text)
+        if offer is not None:
+            failure = {**failure, 'retry': offer}
+        return failure
 
     def _trace_mesh_state(self, session: CaseSession, stage: str,
                           execution=None) -> dict:
@@ -6496,7 +6886,7 @@ runTimeModifiable true;
                                     engine, definition):
         """Regenerate the stage dictionary and execute one meshing stage."""
         stage = definition.stage
-        utility = self._require_utility(definition.utility)
+        utility = await self._utility_ready(definition.utility)
         dictionary = session.case_path / 'system' / definition.dictionary
         if not dictionary.is_file():
             raise PreconditionFailedError(
@@ -6504,9 +6894,13 @@ runTimeModifiable true;
         if definition.utility in {'surfaceFeatures', 'snappyHexMesh'}:
             self._preflight_snappy_inputs(session, definition.utility)
         try:
-            stage_run = engine.run_stage(
-                stage, db=session.state.db, case_path=session.case_path,
-                executable=utility)
+            # Plan 35 CR2 (F11). Preparing the stage copies the input mesh
+            # aside -- a whole polyMesh, gigabytes on a large case -- and
+            # regenerates its dictionary: file work, done off the loop so
+            # the window keeps drawing through it.
+            stage_run = await asyncio.to_thread(
+                engine.run_stage, stage, db=session.state.db,
+                case_path=session.case_path, executable=utility)
         except (FileNotFoundError, ValueError) as error:
             raise PreconditionFailedError(
                 str(error), details={'error': 'stage_inputs_unavailable',
@@ -6538,6 +6932,8 @@ runTimeModifiable true;
             await self._ensure_reconstructed(session, command)
             self._discard_decomposition(session.case_path)
         if ranks > 1:
+            await self._utilities_ready(
+                ('decomposePar', 'reconstructPar', 'mpirun'))
             for name in ('decomposePar', 'reconstructPar', 'mpirun'):
                 capability = registry.utility(name) if hasattr(
                     registry, 'utility') else None
@@ -6607,6 +7003,7 @@ runTimeModifiable true;
                 for processor in sorted(
                     session.case_path.glob('processor[0-9]*'))
             ) if ranks > 1 else (),
+            ranks=ranks,
         ), on_line=command.parameters.get('on_line'))
         payload = execution.to_payload()
         payload.update({
@@ -6615,6 +7012,23 @@ runTimeModifiable true;
             'profile_id': launch.profile_id,
             'ranks': ranks,
         })
+        if ranks > 1 and not execution.succeeded:
+            # Plan 35 D8. A failed parallel run leaves processor cases that
+            # are neither the old mesh nor a new one; the next run would
+            # start off them. They go, and the failure says so.
+            removed = sorted(path.name for path in
+                             session.case_path.glob('processor[0-9]*') if path.is_dir())
+            self._discard_decomposition(session.case_path)
+            try:
+                (session.case_path / 'foammesh' / 'pending-gather.json').unlink(
+                    missing_ok=True)
+            except OSError:
+                pass
+            if removed:
+                payload['discarded_decomposition'] = removed
+                payload['discard_note'] = (
+                    f'the {len(removed)} processor directories of the failed '
+                    'parallel run were deleted')
         if decomposition:
             payload['decomposition'] = decomposition
         if ranks > 1 and execution.succeeded:
@@ -6636,15 +7050,26 @@ runTimeModifiable true;
                 'generated_by': f'{engine.engine_id}:{definition.stage}'})
         if feature_stage and execution.succeeded:
             import hashlib
-            payload['feature_artifacts'] = [{
-                'path': str(path),
-                'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-                'dictionary': str(dictionary),
-            } for path in sorted(poly_mesh.glob('*.eMesh'))]
+
+            def feature_artifacts():
+                return [{
+                    'path': str(path),
+                    'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'dictionary': str(dictionary),
+                } for path in sorted(poly_mesh.glob('*.eMesh'))]
+
+            # Plan 35 CR2 (F11): hashing every .eMesh is file work, off the
+            # loop.
+            payload['feature_artifacts'] = await asyncio.to_thread(
+                feature_artifacts)
             provenance = self._surface_feature_inputs(session)
             from foammesh.core.geometry import GeometryArtifactStore
             advisories = []
-            for geometry in GeometryArtifactStore(session.case_path).diagnose():
+            # Plan 35 CR7: an uncached diagnosis reads each B-Rep in a CAD
+            # worker; the loop does not wait for it.
+            diagnosed = await asyncio.to_thread(
+                GeometryArtifactStore(session.case_path).diagnose)
+            for geometry in diagnosed:
                 if int(geometry.get('cells', 0)) < 100:
                     advisories.append({
                         'geometry_id': geometry['geometry_id'], 'kind': 'coarse_tessellation',
@@ -6990,6 +7415,7 @@ runTimeModifiable true;
             required_utilities.extend(
                 ('decomposePar', 'reconstructPar', 'mpirun'))
         if hasattr(registry, 'utility'):
+            await self._utilities_ready(required_utilities)
             capabilities = [
                 registry.utility(name) for name in required_utilities]
             missing = [
@@ -7049,6 +7475,7 @@ runTimeModifiable true;
         # drops its layers phase, and the tree keeps the skip.
         layers_skipped = bool(getattr(
             engine, 'layers_skipped', lambda _path: False)(session.case_path))
+        await self._checkmesh_help_ready()
         dag = openfoam_meshing_dag(
             session.case_path, allocation, split_at_snap=mode.enforces,
             layers=not layers_skipped,
@@ -7115,7 +7542,11 @@ runTimeModifiable true;
                 # every failed node was reported as "<node> failed" with no
                 # log. The same cause the stage route reports, read the same
                 # way.
-                explained = self._stage_failure(node.node_id, job)
+                from foammesh.core.jobs.retry import attempt_of
+                explained = self._with_retry_offer(
+                    self._stage_failure(node.node_id, job), job,
+                    ranks=allocation.effective_ranks,
+                    attempt=attempt_of(command.parameters))
                 reason = ('the run was cancelled before it finished' if stopped
                           else explained['reason'])
                 self._close_run_manifest(
@@ -7138,7 +7569,11 @@ runTimeModifiable true;
                              **failure_payload(
                                  task=f'snappy.{node.node_id}',
                                  reason=reason, log=explained['log']),
-                             'details': '' if stopped else explained['details']})
+                             'details': '' if stopped else explained['details'],
+                             # Plan 35 CR6: re-run from the restored snapshot.
+                             **({'retry': explained['retry']}
+                                if not stopped and explained.get('retry')
+                                else {})})
             if node.pauses_after:
                 # The snapped boundary is in the case root and the next node is
                 # about to overwrite it. Capture it immutably now; GF1 measures
@@ -8888,6 +9323,23 @@ runTimeModifiable true;
                 raise ValidationFailedError(str(error)) from error
         return self._read_result(session, command, payload)
 
+    async def _checkmesh_help_ready(self) -> None:
+        """Ask ``checkMesh -help`` on a worker thread (Plan 35 CR7).
+
+        The first ask of a session boots the runtime (DP-693 measured a cold
+        start past 5 s); the registry caches an answer, and
+        :meth:`_checkmesh_profile` reads that cache on the loop.
+        """
+        import asyncio
+
+        registry = self._capabilities_registry()
+        if getattr(registry, 'help_if_known', None) is None:
+            return
+        try:
+            await asyncio.to_thread(registry.help, 'checkMesh')
+        except Exception:                                     # noqa: BLE001
+            pass    # the profile falls back to the verified baseline
+
     def _checkmesh_profile(self) -> tuple[object, list[str]]:
         """What the configured ``checkMesh`` can do, and what was assumed.
 
@@ -8902,7 +9354,11 @@ runTimeModifiable true;
 
         registry = self._capabilities_registry()
         warnings: list[str] = []
-        help_result = registry.help('checkMesh') if hasattr(registry, 'help') else None
+        # Plan 35 CR7: read the cached answer when the registry keeps one;
+        # `_checkmesh_help_ready` asked it off the owner loop first.
+        lookup = (getattr(registry, 'help_if_known', None)
+                  or getattr(registry, 'help', None))
+        help_result = lookup('checkMesh') if lookup is not None else None
         if help_result is not None and getattr(help_result, 'available', False):
             try:
                 return CheckMeshProfile.from_help(help_result.output), warnings
@@ -8941,11 +9397,12 @@ runTimeModifiable true;
         # gathered first or the check would grade the previous stage's mesh.
         await self._ensure_reconstructed(session, command)
         self._require_mesh(session)
-        utility = self._require_utility('checkMesh')
+        utility = await self._utility_ready('checkMesh')
         from foammesh.core.quality import (
             CheckMeshRequest, MeshCheckService, parse_checkmesh)
         from foammesh.core.quality.checkmesh_service import checkmesh_flags
         registry = self._capabilities_registry()
+        await self._checkmesh_help_ready()
         profile, profile_warnings = self._checkmesh_profile()
         from foammesh.core.quality.checkmesh_service import checkmesh_request
         # Plan 31. The project's own checkMesh settings first -- thresholds,
@@ -9616,7 +10073,7 @@ runTimeModifiable true;
         except ValueError as error:
             raise ValidationFailedError('unknown repair operation', details={
                 'repair': operation}) from error
-        utility = self._require_utility(repair.utility_name)
+        utility = await self._utility_ready(repair.utility_name)
         registry = self._capabilities_registry()
         launcher = getattr(registry, 'command', None)
         from foammesh.core.mesh.repair import MeshRepairService, RepairRequest
@@ -9662,7 +10119,7 @@ runTimeModifiable true;
 
     async def _transform(self, session: CaseSession, command: Command, kind: str) -> OperationResult:
         self._require_mesh(session)
-        utility = self._require_utility('transformPoints')
+        utility = await self._utility_ready('transformPoints')
         registry = self._capabilities_registry()
         from foammesh.core.mesh import MeshInfoService, MeshTransformRequest
         try:
@@ -9733,7 +10190,7 @@ runTimeModifiable true;
 
     async def _mesh_extrude(self, session: CaseSession, command: Command) -> OperationResult:
         self._require_mesh(session)
-        utility = self._require_utility('extrudeMesh')
+        utility = await self._utility_ready('extrudeMesh')
         registry = self._capabilities_registry()
         import math
         import os
@@ -9839,7 +10296,7 @@ runTimeModifiable true;
             converter = ConverterFormat(fmt)
         except ValueError as error:
             raise ValidationFailedError('unknown converter format', details={'format': fmt}) from error
-        self._require_utility(converter.utility_name)
+        await self._utility_ready(converter.utility_name)
         registry = self._capabilities_registry()
         try:
             result = await ConverterImportService(
@@ -9888,15 +10345,16 @@ runTimeModifiable true;
         policy = tolerance_source.for_case(case_path, db=session.state.db)
         evidence = self._current_evidence(session)
 
-        model = self._boundary_model(session, patch_identity)
+        refusals: list = []
+        model = self._boundary_model(session, patch_identity,
+                                     boundary_only=True, refusals=refusals)
         if model is None:
             report = report_module.build(
                 task_id, (), evidence=evidence, policy=policy)
             path = report_module.write(case_path, report)
             return self._read_result(session, command, {
                 'report': report.to_dict(), 'path': str(path),
-                'reason': 'no published mesh or no patch-identity sidecar, so '
-                          'no section could be joined to a prepared patch'})
+                **_unreadable_mesh(refusals)})
 
         reference_for = self._section_reference(
             session, str(evidence.get('prepared_revision') or ''),
@@ -9963,16 +10421,16 @@ runTimeModifiable true;
         policy = tolerance_source.for_case(case_path, db=session.state.db)
         evidence = self._current_evidence(session)
 
-        model = self._boundary_model(session, patch_identity)
+        refusals: list = []
+        model = self._boundary_model(session, patch_identity,
+                                     refusals=refusals)
         if model is None:
             report = report_module.build(
                 task_id, (), evidence=evidence, policy=policy)
             path = report_module.write(case_path, report)
             return self._read_result(session, command, {
                 'report': report.to_dict(), 'path': str(path),
-                'requested_size': None,
-                'reason': 'no published mesh or no patch-identity sidecar, so '
-                          'no section could be joined to a prepared patch'})
+                'requested_size': None, **_unreadable_mesh(refusals)})
 
         requested = self._requested_cell_size(session, model.mesh)
         features_for = self._section_features(
@@ -10107,8 +10565,16 @@ runTimeModifiable true;
                 drawable[name] = records
         return drawable
 
-    def _boundary_model(self, session: CaseSession, patch_identity):
-        """The reconciled boundary, or ``None`` when it cannot be built."""
+    def _boundary_model(self, session: CaseSession, patch_identity, *,
+                        boundary_only: bool = False, refusals=None):
+        """The reconciled boundary, or ``None`` when it cannot be built.
+
+        ``boundary_only`` (Plan 35 CR2) reads the boundary faces and their
+        points, not the volume -- all fidelity measures. ``refusals``, a list,
+        receives the reader's refusal code when the mesh could not be read,
+        so the report can say *why* it is unrated. ``MemoryError`` is not a
+        refusal: it propagates, and the worker reports ``over_budget``.
+        """
         from foammesh.core.quality.geometry_fidelity import boundary
 
         case_path = Path(session.case_path)
@@ -10132,8 +10598,16 @@ runTimeModifiable true;
         if identity is None:
             return None
         try:
-            return boundary.load(case_path, identity)
-        except Exception:                                   # noqa: BLE001
+            return boundary.load(case_path, identity,
+                                 boundary_only=boundary_only)
+        except MemoryError:
+            raise
+        except Exception as error:                          # noqa: BLE001
+            if refusals is not None:
+                refusals.append({
+                    'reason': str(getattr(error, 'reason', '')
+                                  or type(error).__name__),
+                    'message': str(error)})
             return None
 
     def _section_features(self, session: CaseSession, revision_id: str = ''):
@@ -10877,8 +11351,8 @@ runTimeModifiable true;
         registry = self._capabilities_registry()
         utilities = {}
         for name in ('foamMeshToFluent', 'foamFormatConvert'):
-            capability = registry.utility(name)
-            if capability.available:
+            capability = self._utility_without_waiting(registry, name)
+            if capability is not None and capability.available:
                 utilities[name] = capability.executable
         entries = ImportExportService(utilities).export_entries(
             case_path=session.case_path)
@@ -10900,29 +11374,92 @@ runTimeModifiable true;
                                                     'destination': str(destination),
                                                     'qualification': qualification})
 
-    def _dataset_export(self, session, command, entry_id) -> OperationResult:
+    #: The exports that convert through Gmsh. Plan 35 CR7: Gmsh is native
+    #: code the window does not load, and its WSL route used to hold the
+    #: owner loop for up to 900 s, so these run in a worker process. CGNS
+    #: converts through Gmsh whenever the case has an accepted Gmsh run.
+    _GMSH_EXPORTS = frozenset({'gmsh', 'med', 'unv', 'cgns'})
+
+    async def _dataset_export(self, session, command, entry_id) -> OperationResult:
         self._require_exportable_mesh(session, entry_id)
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
         from foammesh.core.import_export.service import ImportExportService
-        service = ImportExportService()
+        adapter = {
+            'vtk': 'export_vtu',
+            'cgns': 'export_cgns',
+            'gmsh': 'export_gmsh',
+            'su2': 'export_su2',
+            'med': 'export_med',
+            'unv': 'export_unv',
+        }[entry_id]
         try:
-            adapter = {
-                'vtk': 'export_vtu',
-                'cgns': 'export_cgns',
-                'gmsh': 'export_gmsh',
-                'su2': 'export_su2',
-                'med': 'export_med',
-                'unv': 'export_unv',
-            }[entry_id]
             with self._replacing(session, command, destination, entry_id):
-                result = getattr(service, adapter)(session.case_path,
-                                                   destination)
+                if entry_id in self._GMSH_EXPORTS:
+                    payload = await self._export_in_worker(
+                        session, adapter, destination)
+                else:
+                    # Plan 35 CR7: a VTK write is file work, off the loop.
+                    payload = dict(_to_payload(await asyncio.to_thread(
+                        getattr(ImportExportService(), adapter),
+                        session.case_path, destination)))
         except (OSError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
-        payload = dict(_to_payload(result))
         payload['qualification'] = qualification
         return self._read_result(session, command, payload)
+
+    async def _export_in_worker(self, session, adapter: str,
+                                destination) -> dict:
+        """One ``ImportExportService`` export, run in a worker process.
+
+        A refusal the service raised comes back as the same ``ValueError`` or
+        ``OSError``; a worker that died says the writer crashed; one that
+        could not start or was stopped says so. Nothing falls back to running
+        the conversion in this process.
+        """
+        from foammesh.core.jobs import local_worker
+        from foammesh.support import resource_budget as budget
+
+        operation = 'export.dataset'
+        estimate = budget.estimate_peak_bytes(operation, None)
+        try:
+            grant = await budget.controller().admit(
+                operation, estimate, priority=budget.PRIORITY_INTERACTIVE)
+        except budget.OverBudget as refusal:
+            raise CheckOverBudgetError(
+                f'the export was not started: {refusal}',
+                details=dict(refusal.to_dict(), outcome='refused',
+                             operation=operation, retryable=True)) from None
+        async with grant:
+            outcome = await local_worker.run_worker(
+                operation, {'parameters': {
+                    'format': adapter.removeprefix('export_'),
+                    'case_path': str(Path(session.case_path).resolve()),
+                    'destination': str(Path(destination).resolve()),
+                    'gmsh_runtime': _gmsh_runtime()}},
+                cap_bytes=grant.cap_bytes, group=str(session.case_path))
+        if outcome.ok:
+            return dict(outcome.payload.get('result') or {})
+        if outcome.status == local_worker.FAILED:
+            if outcome.error_class in ('OSError', 'FileNotFoundError',
+                                       'PermissionError'):
+                raise OSError(outcome.message)
+            if outcome.error_class == 'RuntimeError':
+                raise CapabilityUnavailableError(
+                    outcome.message, details={'capability': 'gmsh',
+                                              'error': 'gmsh_unavailable'})
+            raise ValueError(outcome.message)
+        details = dict(outcome.to_dict(), outcome=outcome.status,
+                       retryable=True)
+        if outcome.status == local_worker.CRASHED:
+            raise ValidationFailedError(
+                'export failed (the Gmsh writer crashed); the case is '
+                'untouched and the export can be run again', details=details)
+        if outcome.status == local_worker.OVER_BUDGET:
+            raise CheckOverBudgetError(
+                f'the export stopped: {outcome.message}', details=details)
+        raise CheckUnavailableError(
+            f'the export did not run: {outcome.message}', details=details)
 
     @staticmethod
     def _replacing(session, command, destination, entry_id):
@@ -10943,27 +11480,27 @@ runTimeModifiable true;
         return replacing(destination, kind or FOLDER, overwrite=overwrite,
                          protected=(session.case_path,))
 
-    def _export_vtk(self, session, command):
-        return self._dataset_export(session, command, 'vtk')
+    async def _export_vtk(self, session, command):
+        return await self._dataset_export(session, command, 'vtk')
 
-    def _export_cgns(self, session, command):
-        return self._dataset_export(session, command, 'cgns')
+    async def _export_cgns(self, session, command):
+        return await self._dataset_export(session, command, 'cgns')
 
-    def _export_gmsh(self, session, command):
-        return self._dataset_export(session, command, 'gmsh')
+    async def _export_gmsh(self, session, command):
+        return await self._dataset_export(session, command, 'gmsh')
 
-    def _export_su2(self, session, command):
-        return self._dataset_export(session, command, 'su2')
+    async def _export_su2(self, session, command):
+        return await self._dataset_export(session, command, 'su2')
 
-    def _export_med(self, session, command):
-        return self._dataset_export(session, command, 'med')
+    async def _export_med(self, session, command):
+        return await self._dataset_export(session, command, 'med')
 
-    def _export_unv(self, session, command):
-        return self._dataset_export(session, command, 'unv')
+    async def _export_unv(self, session, command):
+        return await self._dataset_export(session, command, 'unv')
 
     async def _export_fluent(self, session, command):
         self._require_mesh(session)
-        self._require_utility('foamMeshToFluent')
+        await self._utility_ready('foamMeshToFluent')
         qualification = self._require_export_authorization(session, command)
         registry = self._capabilities_registry()
         from foammesh.core.import_export.fluent_export import FluentMeshExportService
@@ -10981,7 +11518,7 @@ runTimeModifiable true;
         write_format = command.parameters.get('write_format')
         if write_format not in {'ascii', 'binary'}:
             raise ValidationFailedError('write_format must be ascii or binary')
-        self._require_utility('foamFormatConvert')
+        await self._utility_ready('foamFormatConvert')
         registry = self._capabilities_registry()
         from foammesh.core.import_export.format_convert import FoamFormatConvertService
         result = await FoamFormatConvertService(
@@ -11033,3 +11570,59 @@ runTimeModifiable true;
 #: The check-task table at module level, for the callers that never hold a
 #: ``DomainOperations`` (the wizard's step manager, the gate advancer).
 CHECK_TASK_OPERATIONS = DomainOperations.CHECK_TASK_OPERATIONS
+
+
+#: Plan 35 CR2. The operations that parse a mesh and so run in a worker
+#: process, never in the window's.
+WORKER_OPERATIONS = ('quality.fidelity', 'quality.resolution',
+                     'quality.summary', 'quality.cell_fields')
+
+
+def _unreadable_mesh(refusals: list) -> dict:
+    """Why no section could be measured, with the reader's code if it refused."""
+    reason = ('no published mesh or no patch-identity sidecar, so no section '
+              'could be joined to a prepared patch')
+    if not refusals:
+        return {'reason': reason}
+    refusal = refusals[-1]
+    return {'reason': '{0}: the mesh could not be read ({1}: {2})'.format(
+                reason, refusal['reason'], refusal['message']),
+            'read_error': refusal['reason']}
+
+
+def _check_failure(operation: str, error: FacadeError) -> dict:
+    """What the task page says about a check that produced no verdict."""
+    details = dict(getattr(error, 'details', None) or {})
+    return {'operation': operation, 'code': error.code,
+            'reason': str(details.get('reason') or error.code),
+            'message': str(error),
+            'retryable': bool(details.get('retryable', True))}
+
+
+def _assert_worker_isolation(table: dict) -> None:
+    """Every mesh-parsing check is dispatched to a worker (Plan 35 CR2).
+
+    A handler table that maps one of them to anything else would parse the
+    mesh on the window's thread again, which is the crash this plan removes;
+    it is refused when the table is built rather than found in the field.
+    """
+    for operation in WORKER_OPERATIONS:
+        handler = table.get(operation)
+        if getattr(handler, '_foammesh_worker', None) != operation:
+            raise RuntimeError(
+                f'{operation} must be dispatched to the mesh worker, not '
+                f'run in-process ({handler!r})')
+
+
+_assert_worker_isolation(DomainOperations().handlers())
+
+
+def _gmsh_runtime() -> dict:
+    """The WSL distribution and user Gmsh runs as, for a worker to inherit.
+
+    DP-816 detects them at start and keeps them in this process; a worker
+    starts without that state and would fall back to the defaults.
+    """
+    from foammesh.core.gmsh import launch_profiles
+
+    return dict(launch_profiles._shared_runtime)

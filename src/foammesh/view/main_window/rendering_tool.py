@@ -1182,7 +1182,10 @@ class RenderingTool(QObject):
         if path:
             if not path.lower().endswith('.png'):
                 path += '.png'
-            self._view.saveScreenshot(path, scale=2)
+            if self._view.saveScreenshot(path, scale=2) is False:
+                app.window.statusBar().showMessage(self.tr(
+                    'The viewport is not drawing, so there is nothing to '
+                    'save.'), 8000)
 
     def enable(self):
         self._ui.toolbar.setEnabled(True)

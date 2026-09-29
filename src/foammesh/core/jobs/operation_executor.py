@@ -61,6 +61,12 @@ class OperationSpec:
     #: turns the comparison off for a run that writes no mesh.
     expects_mesh_change: bool = True
     mesh_change_probes: tuple[Path, ...] = ()
+    #: Plan 35 CR5. How many ranks the run uses (a failed parallel run's
+    #: processor cases are deleted by the recovery that follows it), and the
+    #: silence before the [Keep waiting] / [Stop] prompt (``None``: the job
+    #: kind's default).
+    ranks: int = 1
+    idle_timeout: float | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,13 @@ class OperationExecutor:
             safe_name = spec.operation.replace('.', '-')
             log_path = session.storage_path / 'logs' / f'{safe_name}-{uuid4().hex[:12]}.log'
 
+        if spec.mutation:
+            # Plan 35 CR5 step 6. No new writer while an earlier run of this
+            # case is unresolved -- a crash, a lost WSL connection, a GUI
+            # that died mid-run. Resolving restores what it half wrote.
+            refused = await self._pass_recovery_gate(session, spec, cwd)
+            if refused is not None:
+                return refused
         before = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
         probed_before = (await self._probe_fingerprint(spec.mesh_change_probes)
                          if spec.mutation and spec.mesh_change_probes else None)
@@ -142,6 +155,10 @@ class OperationExecutor:
             Event.OPERATION_STARTED, operation=spec.operation,
             mutation=spec.mutation, recovery_id=(
                 recovery_point.recovery_id if recovery_point else None))
+        record_fields = {
+            'operation': spec.operation, 'ranks': int(spec.ranks or 1),
+            'recovery_id': recovery_point.recovery_id if recovery_point else None,
+        } if spec.mutation else None
         request = JobRequest(
             name=spec.operation,
             argv=tuple(str(item) for item in spec.argv),
@@ -155,6 +172,9 @@ class OperationExecutor:
                 item.path for item in spec.expected_artifacts
                 if not item.produced_by_parser),
             cleanup_argv=spec.cleanup_argv,
+            idle_timeout=spec.idle_timeout,
+            record_case=Path(session.case_path) if spec.mutation else None,
+            record_fields=record_fields,
         )
         job = await self.jobs.run(request, on_line=on_line)
         parsed = None
@@ -182,7 +202,17 @@ class OperationExecutor:
                               error_category=JobErrorCategory.VALIDATION)
 
         recovery_status = None
-        if recovery_point is not None:
+        run_records = None
+        if job.run_state is not None:
+            from .run_records import RunRecordStore
+            run_records = RunRecordStore(session.case_path)
+        if job.run_state == 'recovery_pending':
+            # The transport ended without the wrapper saying the run was
+            # over: the writer may still be alive, so nothing is restored
+            # until it is confirmed dead (plan 35 CR5 step 6).
+            job, recovery_status = await self._recover_lost_run(
+                session, spec, job, recovery_point)
+        elif recovery_point is not None:
             if job.status is JobStatus.DONE:
                 try:
                     await self._to_thread(self.recovery.mark_available, recovery_point)
@@ -199,8 +229,10 @@ class OperationExecutor:
                         f'recorded, so the previous mesh cannot be restored: {error}')
             else:
                 try:
+                    self._move_record(run_records, job, 'restoring')
                     await self._to_thread(self.recovery.restore, session.case_path, recovery_point)
                     recovery_status = 'restored'
+                    self._move_record(run_records, job, 'closed', resolution='restored')
                     session.state.bus.publish(
                         Event.ARTIFACT_RESTORED, operation=spec.operation,
                         recovery_id=recovery_point.recovery_id, job_id=job.job_id)
@@ -208,10 +240,20 @@ class OperationExecutor:
                         Event.OPERATION_RECOVERED, operation=spec.operation,
                         recovery_id=recovery_point.recovery_id, job_id=job.job_id)
                 except Exception as error:
+                    # The record stays at `restoring`: the next run's gate
+                    # tries again before anything else writes the mesh.
                     recovery_status = 'failed'
                     job = replace(job, status=JobStatus.FAILED,
                                   error=f'{job.error or "operation failed"}; recovery failed: {error}',
                                   error_category=JobErrorCategory.RECOVERY)
+        if job.run_state == 'exited' and recovery_status != 'failed':
+            self._move_record(
+                run_records, job, 'closed',
+                resolution='finished' if job.status is JobStatus.DONE else 'failed')
+        if job.run_state is not None and run_records is not None:
+            record = await self._to_thread(run_records.load, job.run_id or job.job_id)
+            if record is not None and record.get('state') != job.run_state:
+                job = replace(job, run_state=record.get('state'))
 
         self.jobs.record_result(job)
 
@@ -268,6 +310,88 @@ class OperationExecutor:
             spec.operation, job, parsed, before, after,
             recovery_point.recovery_id if recovery_point else None,
             recovery_status, entry.entry_id, artifact_payload, tuple(warnings))
+
+    # -- plan 35 CR5: run records and the recovery gate ----------------------
+
+    def _gate(self, session):
+        from .run_records import RecoveryGate
+        return RecoveryGate(session.case_path, recovery=self.recovery)
+
+    def _active_run_ids(self) -> tuple[str, ...]:
+        return tuple(getattr(self.jobs, 'active_job_ids', ()) or ())
+
+    async def _pass_recovery_gate(self, session, spec: OperationSpec,
+                                  cwd: Path) -> OperationExecution | None:
+        """Resolve earlier runs of this case, or refuse this one."""
+        from .run_records import run_directory
+        if not run_directory(session.case_path).is_dir():
+            return None
+        gate = self._gate(session)
+        verdict = await self._to_thread(gate.resolve, active_run_ids=self._active_run_ids())
+        if verdict.closed:
+            session.state.bus.publish(
+                Event.OPERATION_RECOVERED, operation=spec.operation,
+                recovery_id=None, job_id=None, runs=list(verdict.closed))
+        if not verdict.blocked:
+            return None
+        request = JobRequest(name=spec.operation, argv=tuple(str(item) for item in spec.argv),
+                             cwd=cwd, mutation=spec.mutation)
+        refusal = getattr(self.jobs, 'record_refusal', None)
+        if refusal is None:
+            raise RuntimeError(verdict.message)
+        job = refusal(request, verdict.message, exit={
+            'kind': 'recovery_pending', 'reason': verdict.message, 'signal': '',
+            'actions': ['stop_old_run', 'retry'], 'hint': '',
+            'read_only': verdict.read_only,
+            'runs': [record.get('run_id') for record in verdict.records]})
+        session.state.bus.publish(
+            Event.OPERATION_FAILED, operation=spec.operation, job_id=job.job_id,
+            result=job.to_dict(), recovery_status='pending', history_entry_id=None)
+        return OperationExecution(spec.operation, job, recovery_status='pending')
+
+    async def _recover_lost_run(self, session, spec: OperationSpec, job: JobResult,
+                                recovery_point) -> tuple[JobResult, str]:
+        gate = self._gate(session)
+        verdict = await self._to_thread(
+            gate.resolve, active_run_ids=self._active_run_ids(), wait_for_death=True)
+        run_id = job.run_id or job.job_id
+        record = gate.store.load(run_id) or {}
+        if record.get('state') == 'closed':
+            restored = recovery_point is not None and any(
+                str(note) == 'the previous mesh was restored'
+                for note in record.get('notes') or ())
+            if restored:
+                session.state.bus.publish(
+                    Event.ARTIFACT_RESTORED, operation=spec.operation,
+                    recovery_id=recovery_point.recovery_id, job_id=job.job_id)
+                session.state.bus.publish(
+                    Event.OPERATION_RECOVERED, operation=spec.operation,
+                    recovery_id=recovery_point.recovery_id, job_id=job.job_id)
+            notes = '; '.join(str(note) for note in record.get('notes') or ())
+            if notes and job.status is not JobStatus.DONE:
+                job = replace(job, error=f'{job.error or "operation failed"} ({notes})')
+            return replace(job, run_state='closed'), ('restored' if restored else 'closed')
+        message = verdict.message or 'the run could not be confirmed stopped'
+        return (replace(job, status=JobStatus.FAILED,
+                        error=f'{job.error or "operation failed"}; {message}',
+                        error_category=JobErrorCategory.RECOVERY,
+                        run_state=record.get('state') or job.run_state),
+                'pending')
+
+    @staticmethod
+    def _move_record(store, job: JobResult, state: str, **fields) -> None:
+        if store is None:
+            return
+        run_id = job.run_id or job.job_id
+        try:
+            record = store.load(run_id)
+            if record is None or record.get('state') in (state, 'closed'):
+                return
+            store.transition(run_id, state, **fields)
+        except Exception:  # noqa: BLE001 - the next gate resolves a stale record
+            import logging
+            logging.getLogger(__name__).exception(
+                'run record %s could not move to %s', run_id, state)
 
     async def _prepare_recovery(self, session, spec: OperationSpec) -> MeshRecoveryPoint | None:
         mesh = session.case_path / 'constant' / 'polyMesh'

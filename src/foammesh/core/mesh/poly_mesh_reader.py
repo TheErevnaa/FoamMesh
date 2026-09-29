@@ -11,7 +11,8 @@ from .poly_mesh_boundary import (
 )
 
 __all__ = [
-    'BoundaryPatch', 'OPTIONAL', 'PolyMesh', 'PolyMeshLoader',
+    'BoundaryPatch', 'MeshPreviewLoader', 'OPTIONAL', 'PolyMesh',
+    'PolyMeshLoader',
     'PolyMeshReadError', 'REQUIRED', 'Zone', 'face_areas', 'patch_area',
     'patch_polydata', 'read_poly_mesh', 'triangulate_faces',
 ]
@@ -24,4 +25,11 @@ def __getattr__(name: str):
         from foammesh.openfoam.poly_mesh.poly_mesh_loader import PolyMeshLoader
 
         return PolyMeshLoader
+    if name == 'MeshPreviewLoader':
+        # Plan 35 CR3: the viewport's loader, which builds the picture in a
+        # worker and never reads the volume in the window's process.
+        from foammesh.openfoam.poly_mesh.mesh_preview_loader import (
+            MeshPreviewLoader)
+
+        return MeshPreviewLoader
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

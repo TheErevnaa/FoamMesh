@@ -6,7 +6,8 @@ from typing import Optional
 
 from PySide6.QtCore import QObject
 
-from foammesh.rendering.actor_info import RegionMarkerActor
+from foammesh.rendering.actor_info import ActorInfo, RegionMarkerActor
+from foammesh.support import disposal
 from foammesh.support.mesh import Bounds
 from foammesh.app import app
 from foammesh.view.theming.patch_palette import slot_order
@@ -28,6 +29,25 @@ def _union(boundsList) -> Optional[Bounds]:
     return merged
 
 
+def _renderWindowOf(displayControl):
+    """``displayControl.view().renderWindow()``, or None for a stand-in."""
+    view = getattr(displayControl, 'view', None)
+    if not callable(view):
+        return None
+    try:
+        view = view()
+        renderWindow = getattr(view, 'renderWindow', None)
+        return renderWindow() if callable(renderWindow) else None
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _dispose(actorInfo, renderWindow):
+    dispose = getattr(actorInfo, 'dispose', None)
+    if callable(dispose):
+        dispose(renderWindow)
+
+
 class ActorGroup(Enum):
     GEOMETRY = auto()
     MESH = auto()
@@ -44,6 +64,8 @@ class ActorManager(QObject):
         # after that leaves the direction the user chose alone.
         self._framed = False
         self._displayControl = app.window.displayControl
+        self._disposed = False
+        disposal.track(self, 'ActorManager')
 
     def isEmpty(self):
         return not self._actorInfos
@@ -70,7 +92,13 @@ class ActorManager(QObject):
 
         if app.themeManager is not None and app.themeManager.tokens is not None:
             actorInfo.applyTheme(app.themeManager.tokens)
-        self._actorInfos[actorInfo.id()] = self._displayControl.add(actorInfo)
+        shown = self._displayControl.add(actorInfo)
+        self._actorInfos[actorInfo.id()] = shown
+        if isinstance(shown, ActorInfo) and shown is not actorInfo:
+            # Display Control kept the actor it already had for this id and
+            # took only the data from this one, which never reached a
+            # renderer: it has nothing on the GPU, only connections to drop.
+            _dispose(actorInfo, None)
 
     def update(self, id_, dataSet):
         self._actorInfos[id_].setDataSet(dataSet)
@@ -78,6 +106,30 @@ class ActorManager(QObject):
     def remove(self, key):
         if actorInfo := self._actorInfos.pop(key, None):
             self._displayControl.remove(actorInfo)
+            # Plan 35 CR3 step 6. Released here, on the GUI thread, against
+            # the window it was drawn in -- not by a destructor the cyclic
+            # collector runs on whichever thread trips it.
+            _dispose(actorInfo, self._renderWindow())
+
+    def _renderWindow(self):
+        """The VTK render window this manager's actors are drawn in, if any."""
+        return _renderWindowOf(self._displayControl)
+
+    def dispose(self):
+        """Take every actor out of the scene and release it, for good.
+
+        Plan 35 CR3 step 6. For a project close or a manager being replaced:
+        unlike `clear`, it does not repaint, because the scene it would
+        repaint is going away with it.
+        """
+        if self._disposed:
+            return
+        for key in tuple(self._actorInfos):
+            self.remove(key)
+        self._visibility = False
+        self._framed = False
+        self._disposed = True
+        disposal.untrack(self, 'ActorManager')
 
     def getBounds(self) -> Optional[Bounds]:
         """Union of every actor this manager holds, drawn or not.

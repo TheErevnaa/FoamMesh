@@ -234,6 +234,28 @@ def occ_solids(entry: dict) -> list[tuple[float, set, tuple, float]] | None:
     cad = Path(str(entry.get('cad_artifact') or ''))
     if not str(entry.get('cad_artifact') or '') or not cad.is_file():
         return None
+    from foammesh.core.geometry.cad import worker_client
+
+    if worker_client.in_worker():
+        return _occ_solids_here(entry, cad)
+    # Plan 35 CR7: OCCT measures the solids in a worker. A worker that
+    # crashed or could not start is "OCC cannot read it": the tessellated
+    # shells are measured instead, as they always were.
+    try:
+        with worker_client.call('cad.solids', {'entry': dict(entry)},
+                                label='CAD solids', source=cad) as answer:
+            found = answer.get('solids')
+    except Exception as error:  # noqa: BLE001 - the fallback is the answer
+        logger.warning('solids: OCC could not measure %s: %s', cad, error)
+        return None
+    if found is None:
+        return None
+    return [(float(volume), set(ids), tuple(bounds), float(area))
+            for volume, ids, bounds, area in found]
+
+
+def _occ_solids_here(entry: dict, cad: Path):
+    """:func:`occ_solids` with OCCT in this process: a worker's body."""
     try:
         from OCC.Core.Bnd import Bnd_Box
         from OCC.Core.BRepBndLib import brepbndlib

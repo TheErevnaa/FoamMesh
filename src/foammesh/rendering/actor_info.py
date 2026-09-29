@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import asyncio
+import logging
 import weakref
 from enum import Enum, auto
 from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QColor
 from PySide6.QtCore import QObject, Signal
-from vtkmodules.vtkCommonDataModel import vtkDataObject, vtkPlane
+from vtkmodules.vtkCommonDataModel import vtkDataObject, vtkPlane, vtkPolyData
 from vtkmodules.vtkFiltersCore import (
     vtkAppendPolyData, vtkClipPolyData, vtkThreshold, vtkPassThrough, vtkCutter,
     vtkFeatureEdges)
@@ -17,6 +19,8 @@ from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
 from vtkmodules.vtkRenderingCore import vtkPolyDataMapper, vtkDataSetMapper, vtkActor, vtkMapper
 from vtkmodules.vtkRenderingLOD import vtkQuadricLODActor
 
+from foammesh.support import disposal
+from foammesh.support.vtk_threads import vtk_run_in_thread
 from foammesh.support.mesh import Bounds
 from foammesh.support.colormap import qualityBandLut, sequentialRedLut
 from foammesh.app import app
@@ -264,6 +268,8 @@ class ActorInfo(QObject):
     #: painted once when the row was built, which happens *before* the palette
     #: is assigned, so they showed the pre-palette colour forever.
     colorChanged = Signal()
+    #: Plan 35 CR3 step 10. The outline computed on the VTK thread is in.
+    silhouetteChanged = Signal()
 
     def __init__(self, dataSet, id_, name, type_):
         super().__init__()
@@ -331,6 +337,12 @@ class ActorInfo(QObject):
         self._highlightColor = '#00a6d6'
         self._surfaceColor = '#b3c0cf'
         self._silhouetteColor = '#233040'
+        # Plan 35 CR3 step 10. The surface and outline a worker (or the VTK
+        # thread) already computed for the uncut data, drawn instead of this
+        # actor's own geometry and feature-edge filters -- which would
+        # otherwise run on the GUI thread at the first paint.
+        self._precomputedSurface = None
+        self._precomputedEdges = None
         self._highlightRole = None
         #: Slot in a categorical palette, or None for the neutral surface
         #: colour. Held as an index into a named family rather than as a colour
@@ -353,12 +365,52 @@ class ActorInfo(QObject):
                                       DisplayMode.SURFACE,
                                       True, False)
 
-        self._displayModeApplicator = {
-            DisplayMode.WIREFRAME: self._applyWireframeMode,
-            DisplayMode.SURFACE: self._applySurfaceMode,
-            DisplayMode.SURFACE_EDGE: self._applySurfaceEdgeMode
-        }
+        self._disposed = False
         _liveActors.add(self)
+        disposal.track(self, 'ActorInfo')
+
+    #: Plan 35 CR3 step 7. The applicators used to be held as a dict of
+    #: bound methods on the instance, so every actor referred to itself and
+    #: could only be freed by the cyclic collector -- on whatever thread
+    #: tripped it, with whatever OpenGL context was current there. Held by
+    #: name on the class, the actor carries no cycle of its own.
+    _DISPLAY_MODE_APPLICATORS = {
+        DisplayMode.WIREFRAME: '_applyWireframeMode',
+        DisplayMode.SURFACE: '_applySurfaceMode',
+        DisplayMode.SURFACE_EDGE: '_applySurfaceEdgeMode',
+    }
+
+    def _applyDisplayMode(self, mode):
+        getattr(self, self._DISPLAY_MODE_APPLICATORS[mode])()
+
+    def isDisposed(self) -> bool:
+        return self._disposed
+
+    def dispose(self, renderWindow=None):
+        """Release this actor's GPU resources and connections, on the GUI thread.
+
+        Plan 35 CR3 step 6. Called by whatever takes the actor out of the
+        scene, after its props have left the renderer, so that the OpenGL
+        buffers are released against the window they were drawn in rather
+        than by a destructor the collector runs on some other thread.
+        Idempotent. The actor must not be shown again afterwards.
+        """
+        if self._disposed:
+            return
+        self._disposed = True
+        _liveActors.discard(self)
+        disposal.untrack(self, 'ActorInfo')
+        disposal.disconnect_all(
+            self.sourceChanged, self.nameChanged, self.colorChanged,
+            self.silhouetteChanged)
+        self._precomputedSurface = None
+        self._precomputedEdges = None
+        disposal.release_graphics_resources(self.renderProps(), renderWindow)
+        # The pipeline itself is left intact: with the applicator cycle gone
+        # the actor holds no reference to itself, so once its owner drops it
+        # reference counting frees the filters here, on this thread. Tearing
+        # them down early would only turn a stray late caller -- a selection
+        # still holding the part -- into a crash instead of a no-op.
 
     def id(self):
         return self._id
@@ -396,8 +448,39 @@ class ActorInfo(QObject):
     def color(self):
         return self._properties.color
 
-    def setDataSet(self, dataSet):
+    def usePrecomputed(self, surface=None, edges=None):
+        """Draw ``surface`` and ``edges`` in place of this actor's own filters.
+
+        Plan 35 CR3 step 10. Both describe the *uncut, unfiltered* data: while
+        a clip, a slice or a quality threshold is on, the filters run as
+        before, and the precomputed parts come back when it is taken off.
+        """
+        self._precomputedSurface = surface
+        self._precomputedEdges = edges
+        self._wirePrecomputed()
+
+    def _precomputedActive(self) -> bool:
+        return (len(self._cutFilters) == 1
+                and isinstance(self._cellFilter, vtkPassThrough))
+
+    def _wirePrecomputed(self):
+        if self._precomputedEdges is not None and self._precomputedActive():
+            self._silhouetteMapper.SetInputData(self._precomputedEdges)
+        else:
+            self._silhouetteMapper.SetInputConnection(
+                self._silhouetteFilter.GetOutputPort())
+
+    def setDataSet(self, dataSet, *, like=None):
+        """New data under the same actor.
+
+        ``like`` is another actor for the same data whose precomputed surface
+        and outline (step 10) this one takes over; without it they are
+        dropped, since they described the old data.
+        """
         self._dataSet = dataSet
+        self._precomputedSurface = getattr(like, '_precomputedSurface', None)
+        self._precomputedEdges = getattr(like, '_precomputedEdges', None)
+        self._wirePrecomputed()
 
         self._cellFilter.SetInputData(dataSet)
 
@@ -613,7 +696,7 @@ class ActorInfo(QObject):
         if self._properties.highlighted:
             self._highlightOn()
         else:
-            self._displayModeApplicator[mode]()
+            self._applyDisplayMode(mode)
 
     def setCutEnabled(self, enabled):
         self._properties.cutEnabled = enabled
@@ -763,6 +846,7 @@ class ActorInfo(QObject):
     def _connectMapper(self, input_filter):
         self._mapper.SetInputConnection(input_filter.GetOutputPort())
         self._silhouetteFilter.SetInputConnection(input_filter.GetOutputPort())
+        self._wirePrecomputed()
 
     def getScalarRange(self, index: MeshQualityIndex) -> (float, float):
         return 0, 1
@@ -896,7 +980,7 @@ class ActorInfo(QObject):
         self._silhouette.GetProperty().SetLineWidth(HIGHLIGHT_SILHOUETTE_WIDTH)
 
     def _highlightOff(self):
-        self._displayModeApplicator[self._properties.displayMode]()
+        self._applyDisplayMode(self._properties.displayMode)
         self._actor.GetProperty().SetDiffuse(BASE_DIFFUSE)
         self._actor.GetProperty().SetAmbient(BASE_AMBIENT)
         # R5/R44. Give the part its own colour back -- the palette slot it was
@@ -945,7 +1029,23 @@ class MeshActor(ActorInfo):
         self._mapper.SetInputConnection(self._surfaceFilter.GetOutputPort())
         self._silhouetteFilter.SetInputConnection(
             self._surfaceFilter.GetOutputPort())
+        self._wirePrecomputed()
         self._invalidateLevelOfDetail()
+
+    def _wirePrecomputed(self):
+        """Step 10: the worker's exterior surface, while nothing cuts it.
+
+        Without it, the first paint ran ``vtkGeometryFilter`` over the whole
+        volume on the GUI thread.
+        """
+        super()._wirePrecomputed()
+        surfaceFilter = getattr(self, '_surfaceFilter', None)
+        if surfaceFilter is None:
+            return      # still in ActorInfo.__init__
+        if self._precomputedSurface is not None and self._precomputedActive():
+            self._mapper.SetInputData(self._precomputedSurface)
+        else:
+            self._mapper.SetInputConnection(surfaceFilter.GetOutputPort())
 
     def _invalidateLevelOfDetail(self):
         """Make the decimated copy follow what the volume now shows.
@@ -964,10 +1064,10 @@ class MeshActor(ActorInfo):
         if actor is not None:
             actor.Modified()
 
-    def setDataSet(self, dataSet):
+    def setDataSet(self, dataSet, *, like=None):
         # DP-814. A reloaded mesh is new data under the same actor.
         self._invalidateLevelOfDetail()
-        super().setDataSet(dataSet)
+        super().setDataSet(dataSet, like=like)
 
     def _createActor(self):
         """WP6.2. Level of detail, on the one actor that can be enormous.
@@ -1086,6 +1186,7 @@ class MeshActor(ActorInfo):
 
         self._cutFilters[0].RemoveAllInputConnections(0)
         self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
+        self._wirePrecomputed()
 
         self._mapper.ScalarVisibilityOff()
         # DP-714. The band's scale was lent for the colouring only.
@@ -1110,6 +1211,7 @@ class MeshActor(ActorInfo):
 
         self._cutFilters[0].RemoveAllInputConnections(0)
         self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
+        self._wirePrecomputed()
 
         self._mapper.ScalarVisibilityOn()
         # DP-714. A scale of its own on the band, not the shared table's 0-1
@@ -1228,6 +1330,52 @@ class GeometryActor(ActorInfo):
         super().__init__(dataSet, id_, name, ActorType.GEOMETRY)
 
         self.setOpacity(0.9)
+        self._silhouetteTask = None
+        self._computeSilhouetteLater()
+
+    def setDataSet(self, dataSet, *, like=None):
+        super().setDataSet(dataSet, like=like)
+        if self._precomputedEdges is None:
+            self._computeSilhouetteLater()
+
+    def _computeSilhouetteLater(self):
+        """Plan 35 CR3 step 10: the outline is computed on the VTK thread.
+
+        Until it is in, the outline draws nothing rather than running
+        ``vtkFeatureEdges`` over the whole surface at the first paint. With no
+        running event loop (a script, a synchronous test) the filter stays
+        wired and runs as it always did.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        data = self._dataSet
+        if data is None:
+            return
+        self._precomputedEdges = vtkPolyData()
+        self._wirePrecomputed()
+        self._silhouetteTask = loop.create_task(self._computeSilhouette(data))
+
+    async def _computeSilhouette(self, data):
+        from foammesh.core.mesh.mesh_preview import feature_edges
+
+        try:
+            edges = await vtk_run_in_thread(feature_edges, data)
+        except Exception:                                   # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                'outline of %s not computed', self._id)
+            edges = None
+        if self.isDisposed() or self._dataSet is not data:
+            return
+        if edges is None:
+            # Fall back to the filter: slower, but the outline is there.
+            self._precomputedEdges = None
+            self._wirePrecomputed()
+        else:
+            self._precomputedEdges = edges
+            self._wirePrecomputed()
+        self.silhouetteChanged.emit()
 
     def _initMapper(self) -> vtkPolyDataMapper:
         return vtkPolyDataMapper()

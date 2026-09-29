@@ -63,6 +63,21 @@ class ProjectState:
         self.bus.publish(Event.TRANSACTION_APPLIED, transaction=tx)
         return tx
 
+    def replace_document(self, content, *, action: str,
+                         source: Source = Source.SYSTEM) -> Transaction:
+        """Replace the whole document as one recorded, undoable change.
+
+        Plan 35 CR9: restoring unsaved changes after a crash is an ordinary
+        change set, so it is undoable and itself journalled.
+        """
+        snapshot = self._snapshot()
+        self._db.restore(content)
+        self.history.record(snapshot, action)
+        tx = self.log.append(Transaction(
+            action=action, source=source, status=TxStatus.APPLIED))
+        self.bus.publish(Event.TRANSACTION_APPLIED, transaction=tx)
+        return tx
+
     # ----- undo / redo -----------------------------------------------------
     def can_undo(self) -> bool:
         return self.history.can_undo()

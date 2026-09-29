@@ -44,6 +44,14 @@ def _replace_with_retry(source: Path, destination: Path) -> None:
             time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
 
+def _write_json_durably(path: Path, payload: dict) -> None:
+    temporary = path.with_name(path.name + '.tmp')
+    with temporary.open('w', encoding='utf-8', newline='\n') as output:
+        json.dump(payload, output, indent=2, sort_keys=True)
+        output.write('\n'); output.flush(); os.fsync(output.fileno())
+    _replace_with_retry(temporary, path)
+
+
 @dataclass(frozen=True)
 class MeshRecoveryPoint:
     recovery_id: str
@@ -103,24 +111,98 @@ class MeshRecoveryService:
             raise
         return MeshRecoveryPoint(recovery_id, root, backup, manifest)
 
+    #: Plan 35 CR5 step 7. The restore stages here and swaps in by rename.
+    STAGING_NAME = 'polyMesh.restoring'
+    #: Written beside the staging directory once its copy is complete and
+    #: verified; never inside it, so the restored mesh's fingerprint is the
+    #: snapshot's.
+    STAGING_MARKER = '.polyMesh.restoring.json'
+
     def restore(self, case_path: str | Path, point: MeshRecoveryPoint):
+        """Put the snapshot back, quietly and resumably.
+
+        Plan 35 CR5 step 7. The copy goes to ``constant/polyMesh.restoring``;
+        a marker beside it says the copy is complete and verified; then the
+        half-written mesh is moved aside and the staged one renamed in. A
+        crash at any point leaves either the old directory or the restored
+        one, plus enough on disk for the next call to finish the swap rather
+        than start over: a complete stage is reused, a partial one redone.
+        """
         case = Path(case_path)
         mesh = case / 'constant' / 'polyMesh'
-        staging = mesh.with_name(f'.polyMesh.restore-{point.recovery_id}')
+        staging = mesh.with_name(self.STAGING_NAME)
+        marker = mesh.with_name(self.STAGING_MARKER)
+        displaced = mesh.with_name(f'.polyMesh.displaced-{point.recovery_id}')
         if not point.mesh_backup.is_dir():
             raise FileNotFoundError(f'recovery mesh is missing: {point.mesh_backup}')
+        expected = self._backup_fingerprint(point)
         if not self.verify(point):
             raise ValueError(f'recovery mesh failed fingerprint verification: {point.recovery_id}')
-        try:
-            shutil.copytree(point.mesh_backup, staging, copy_function=shutil.copy2)
-            displaced = mesh.with_name(f'.polyMesh.displaced-{point.recovery_id}')
-            if mesh.exists():
-                _replace_with_retry(mesh, displaced)
-            _replace_with_retry(staging, mesh)
-            shutil.rmtree(displaced, ignore_errors=True)
-            self._mark(point.manifest, 'restored')
-        finally:
+        staged = self._staged_for(marker, point, expected)
+        if staged and not staging.is_dir():
+            # The swap happened; only the tidying was interrupted.
+            if self._fingerprint_or_none(mesh) == expected:
+                shutil.rmtree(displaced, ignore_errors=True)
+                marker.unlink(missing_ok=True)
+                self._mark(point.manifest, 'restored')
+                return
+            staged = False
+        if not staged:
             shutil.rmtree(staging, ignore_errors=True)
+            marker.unlink(missing_ok=True)
+            try:
+                shutil.copytree(point.mesh_backup, staging, copy_function=shutil.copy2)
+                if self._fingerprint_or_none(staging) != expected:
+                    raise ValueError(
+                        f'the staged recovery mesh does not match its snapshot: {point.recovery_id}')
+                _write_json_durably(marker, {
+                    'recovery_id': point.recovery_id, 'fingerprint': expected,
+                    'staged_at': _utc_now()})
+            except Exception:
+                shutil.rmtree(staging, ignore_errors=True)
+                marker.unlink(missing_ok=True)
+                raise
+        if mesh.exists():
+            shutil.rmtree(displaced, ignore_errors=True)
+            _replace_with_retry(mesh, displaced)
+        _replace_with_retry(staging, mesh)
+        shutil.rmtree(displaced, ignore_errors=True)
+        marker.unlink(missing_ok=True)
+        self._mark(point.manifest, 'restored')
+
+    @staticmethod
+    def restore_in_progress(case_path: str | Path) -> bool:
+        """A restore left something behind that the next one must finish."""
+        constant = Path(case_path) / 'constant'
+        return ((constant / MeshRecoveryService.STAGING_NAME).exists()
+                or (constant / MeshRecoveryService.STAGING_MARKER).exists())
+
+    @staticmethod
+    def _backup_fingerprint(point: MeshRecoveryPoint) -> str:
+        try:
+            payload = json.loads(point.manifest.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return ''
+        return str(payload.get('backup_fingerprint') or '') if isinstance(payload, dict) else ''
+
+    @staticmethod
+    def _fingerprint_or_none(path: Path) -> str | None:
+        if not path.is_dir():
+            return None
+        try:
+            return fingerprint_poly_mesh(path).digest
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _staged_for(marker: Path, point: MeshRecoveryPoint, expected: str) -> bool:
+        try:
+            payload = json.loads(marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return False
+        return (isinstance(payload, dict)
+                and payload.get('recovery_id') == point.recovery_id
+                and bool(expected) and payload.get('fingerprint') == expected)
 
     def list_points(self, case_path: str | Path) -> tuple[MeshRecoveryPoint, ...]:
         root = Path(case_path) / 'foammesh' / 'recovery'
@@ -133,6 +215,15 @@ class MeshRecoveryService:
             if manifest.is_file() and backup.is_dir():
                 points.append(MeshRecoveryPoint(item.name, item, backup, manifest))
         return tuple(points)
+
+    @staticmethod
+    def point_for(case_path: str | Path, recovery_id: str) -> MeshRecoveryPoint | None:
+        """The recovery point a run record names, if it is still on disk."""
+        if not recovery_id or '/' in recovery_id or '\\' in recovery_id:
+            return None
+        root = Path(case_path) / 'foammesh' / 'recovery' / recovery_id
+        point = MeshRecoveryPoint(recovery_id, root, root / 'polyMesh', root / 'manifest.json')
+        return point if point.manifest.is_file() and point.mesh_backup.is_dir() else None
 
     def manifest_payload(self, point: MeshRecoveryPoint) -> dict:
         """Return the manifest content, or an empty dict when unreadable."""

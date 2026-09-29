@@ -34,6 +34,8 @@ import re
 
 import numpy as np
 
+from foammesh.core.mesh import poly_mesh_ascii as _ascii
+
 
 class PolyMeshReadError(ValueError):
     """A polyMesh could not be read.
@@ -268,6 +270,13 @@ def _numbers(text: bytes, dtype) -> np.ndarray:
     same file in 0.87 s and returns a bit-identical array. It is also no
     longer deprecated, which ``fromstring`` has been since numpy 1.14.
     """
+    kind = {np.dtype(np.int64): 'label',
+            np.dtype(np.float64): 'scalar'}.get(np.dtype(dtype))
+    if kind is not None:
+        try:
+            return _ascii.scan(text, kind)
+        except _ascii.Irregular:
+            pass    # CR2b: read it token by token, exactly as before
     cleaned = text.replace(b'(', b' ').replace(b')', b' ')
     tokens = cleaned.split()
     if not tokens:
@@ -290,6 +299,19 @@ def _numbers(text: bytes, dtype) -> np.ndarray:
 
 
 def _read_points(mesh: Path) -> np.ndarray:
+    """``points`` as ``(n, 3)`` float64: vectorised, else token by token."""
+    fast = _stream_numbers(mesh, 'points', 'scalar', width=3)
+    if fast is None:
+        return _read_points_tokens(mesh)
+    values, count, filled, _trailing = fast
+    if filled != count * 3:
+        raise PolyMeshReadError(
+            'malformed_list',
+            f'points declares {count} entries but holds {filled / 3:g}')
+    return values.reshape(count, 3)
+
+
+def _read_points_tokens(mesh: Path) -> np.ndarray:
     _header, payload = _open_member(mesh, 'points')
     count, open_at = _leading_count(payload, 'points')
     values = _numbers(payload[open_at:], np.float64)
@@ -301,6 +323,19 @@ def _read_points(mesh: Path) -> np.ndarray:
 
 
 def _read_labels(mesh: Path, name: str) -> np.ndarray:
+    """A label list: vectorised, else token by token."""
+    fast = _stream_numbers(mesh, name, 'label')
+    if fast is None:
+        return _read_labels_tokens(mesh, name)
+    values, count, filled, _trailing = fast
+    if filled != count:
+        raise PolyMeshReadError(
+            'malformed_list',
+            f'{name} declares {count} entries but holds {filled}')
+    return values
+
+
+def _read_labels_tokens(mesh: Path, name: str) -> np.ndarray:
     _header, payload = _open_member(mesh, name)
     count, open_at = _leading_count(payload, name)
     values = _numbers(payload[open_at:], np.int64)
@@ -314,6 +349,18 @@ def _read_labels(mesh: Path, name: str) -> np.ndarray:
 def _read_faces(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(flat vertices, offsets)`` for a ``faceList``.
 
+    Vectorised when the list is written the way OpenFOAM writes one, else
+    token by token (:func:`_read_faces_tokens`).
+    """
+    fast = _stream_faces(mesh, 0)
+    if fast is not None:
+        return fast
+    return _read_faces_tokens(mesh)
+
+
+def _read_faces_tokens(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(flat vertices, offsets)`` for a ``faceList``, token by token.
+
     OpenFOAM also has a ``faceCompactList`` encoding. ``foamFormatConvert``
     does not turn one into the other, so it is refused by name rather than
     mis-read as a plain list.
@@ -326,6 +373,235 @@ def _read_faces(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
             'not decode; rewrite the mesh with a faceList encoding')
     count, open_at = _leading_count(payload, 'faces')
     flat = _numbers(payload[open_at:], np.int64)
+    return _faces_from_flat(flat, count)
+
+
+# --------------------------------------------------------------------------- #
+# The vectorised read (Plan 35 CR2b)
+# --------------------------------------------------------------------------- #
+#
+# Each reader above first tries a streamed, vectorised read of its list and
+# falls back to the token-by-token read -- unchanged since CR2 -- whenever the
+# vectorised one cannot be certain it returns what that read would: an odd
+# character, a comment near the list count, a face not written as
+# ``n(a b c)``, a header the first :data:`HEAD_BYTES` do not close, a
+# truncated gzip stream. Only a list whose body disagrees with its own count
+# is refused here directly, with the token read's reason and words: every
+# token was a plain number, so the two reads counted the same tokens.
+
+#: The lists that left the vectorised read, newest last, as ``(member, why)``.
+#: Tests assert that a mesh OpenFOAM wrote never lands here.
+FAST_FALLBACKS: list = []
+
+
+def _fell_back(name: str, error: BaseException) -> None:
+    FAST_FALLBACKS.append((name, f'{type(error).__name__}: {error}'))
+    del FAST_FALLBACKS[:-64]
+
+
+def _strip(data: bytes) -> bytes:
+    return _payload(data, 0)
+
+
+def _open_list(mesh: Path, name: str):
+    """``(stream, count, first, body_bytes)`` for a streamed read, or None.
+
+    ``first`` is what the head read holds past the list's opening paren; the
+    stream is positioned after it. None whenever the token read might see the
+    header or the count differently -- that read then does the refusing.
+    """
+    path = _member(mesh, name)
+    if path is None:
+        return None
+    stream = (gzip.open(path, 'rb') if path.suffix == '.gz'
+              else open(path, 'rb'))
+    try:
+        head = stream.read(HEAD_BYTES)
+        match = _FOAMFILE.search(head)
+        if match is None:
+            raise _ascii.Irregular('no FoamFile header in the head')
+        header = _parse_header(head, path)
+        if header.get('format', 'ascii') != 'ascii':
+            raise _ascii.Irregular('not ASCII')
+        if name == 'faces' and header.get(
+                'class', 'faceList') == 'faceCompactList':
+            raise _ascii.Irregular('faceCompactList')
+        open_at = _raw_list_open(head, match.end(), name)
+        # The count and the paren are certain only when no comment is open
+        # across either: then stripping the whole file strips this prefix
+        # exactly as stripping the prefix alone does.
+        prefix = head[match.end():open_at + 1]
+        stripped = _payload(prefix, 0)
+        if (stripped.find(b'(') != len(stripped) - 1
+                or b'/*' in _COMMENT_BLOCK.sub(b' ', prefix)):
+            raise _ascii.Irregular('a comment around the list count')
+        count, _open = _leading_count(stripped, name)
+        body = max(0, _uncompressed_size(path) - open_at - 1)
+        return stream, count, head[open_at + 1:], body
+    except Exception as error:      # the token read refuses it, or reads it
+        stream.close()
+        _fell_back(name, error)
+        return None
+
+
+class _Growing:
+    """A flat array appended to in place, grown rarely, trimmed once."""
+
+    def __init__(self, dtype, capacity: int):
+        self.array = np.empty(max(int(capacity), 16), dtype=dtype)
+        self.size = 0
+
+    def extend(self, values: np.ndarray) -> None:
+        end = self.size + values.size
+        if end > self.array.size:
+            self.array.resize(max(end, int(self.array.size * 1.25)),
+                              refcheck=False)
+        self.array[self.size:end] = values
+        self.size = end
+
+    def done(self) -> np.ndarray:
+        if self.array.size != self.size:
+            self.array.resize(self.size, refcheck=False)
+        return self.array
+
+
+def _stream_numbers(mesh: Path, name: str, kind: str, *, width: int = 1):
+    """``(values, count, filled, trailing)`` of a flat list, or None.
+
+    ``values`` holds the first ``count * width`` numbers; ``filled`` is how
+    many the list holds in all. ``trailing`` counts the numbers after the
+    last ``)``, None when there is no ``)``.
+    """
+    opened = _open_list(mesh, name)
+    if opened is None:
+        return None
+    stream, count, first, body = opened
+    parse = _ascii.scan_labels if kind == 'label' else _ascii.scan_scalars
+    try:
+        with stream:
+            wanted = count * width
+            # No list holds more numbers than half its bytes.
+            values = np.empty(min(wanted, body // 2 + 1),
+                              dtype=np.int64 if kind == 'label' else np.float64)
+            filled, trailing = 0, None
+            for piece in _ascii.pieces(stream, strip_comments=_strip,
+                                       first=first):
+                parsed = parse(piece)
+                end = filled + parsed.size
+                if end <= wanted:
+                    if end > values.size:
+                        values.resize(min(wanted, max(end, 2 * values.size)),
+                                      refcheck=False)
+                    values[filled:end] = parsed
+                filled = end
+                close = piece.rfind(b')')
+                if close >= 0:
+                    trailing = len(piece[close + 1:].split())
+                elif trailing is not None:
+                    trailing += int(parsed.size)
+    except Exception as error:
+        _fell_back(name, error)
+        return None
+    if filled == wanted and values.size != wanted:
+        values.resize(wanted, refcheck=False)
+    return values, count, filled, trailing
+
+
+def _skip_faces_stream(stream, first: bytes, faces: int) -> bytes:
+    """What follows the ``faces``-th ``)``: :func:`_skip_faces`, streamed."""
+    remaining = faces
+    data = first
+    while remaining > 0:
+        if not data:
+            data = stream.read(_ascii.BLOCK)
+            if not data:
+                raise _ascii.Irregular('faces ran out while skipping')
+        found = data.count(b')')
+        if found >= remaining:
+            marks = np.flatnonzero(np.frombuffer(data, dtype=np.uint8) == 0x29)
+            local = int(marks[remaining - 1]) + 1
+            if b'/' in data[:local]:
+                raise _ascii.Irregular('a comment among the skipped faces')
+            return data[local:]
+        if b'/' in data:
+            raise _ascii.Irregular('a comment among the skipped faces')
+        remaining -= found
+        data = b''
+    return data
+
+
+def _scan_faces(stream, first: bytes, count: int, body: int
+                ) -> tuple[np.ndarray, np.ndarray]:
+    """``(flat vertices, offsets)`` of ``count`` faces written ``n(a b c)``.
+
+    Each face's size is the label right before its ``(``. The sizes must
+    chain -- each next size sits one past the vertices of the last -- from
+    the first label to the last, which is the walk :func:`_faces_from_flat`
+    makes; anything else is :class:`~poly_mesh_ascii.Irregular`.
+    """
+    offsets = np.empty(count + 1, dtype=np.int64)
+    offsets[0] = 0
+    vertices = None
+    expected = seen = faces = 0
+    for piece in _ascii.pieces(stream, strip_comments=_strip, first=first):
+        values, heads = _ascii.scan_labels(piece, heads=True)
+        at = np.flatnonzero(heads)
+        if at.size:
+            sizes = values[at]
+            following = at + 1 + sizes
+            if (seen + int(at[0]) != expected
+                    or not np.array_equal(following[:-1], at[1:])):
+                raise _ascii.Irregular('a face size off the walk')
+            if faces + at.size > count:
+                raise _ascii.Irregular('more faces than declared')
+            offsets[faces + 1:faces + 1 + at.size] = sizes
+            faces += int(at.size)
+            expected = seen + int(following[-1])
+            kept = values[~heads]
+        else:
+            kept = values
+        if expected < seen + values.size:
+            raise _ascii.Irregular('a face without its size')
+        seen += int(values.size)
+        if vertices is None:
+            # Sized from the first piece's density; grown if that was low.
+            estimate = body * kept.size // max(1, len(piece))
+            vertices = _Growing(np.int64, estimate + estimate // 16)
+        vertices.extend(kept)
+    if faces != count or expected != seen:
+        raise _ascii.Irregular('the faces do not match their count')
+    np.cumsum(offsets[1:], out=offsets[1:])
+    flat = (vertices.done() if vertices is not None
+            else np.empty(0, dtype=np.int64))
+    return flat, offsets
+
+
+def _stream_faces(mesh: Path, face_base: int):
+    """``(flat vertices, offsets)`` from face ``face_base`` on, or None."""
+    opened = _open_list(mesh, 'faces')
+    if opened is None:
+        return None
+    stream, count, first, body = opened
+    try:
+        with stream:
+            if face_base > count:
+                raise _ascii.Irregular('the boundary starts past the faces')
+            if face_base:
+                first = _skip_faces_stream(stream, first, face_base)
+            return _scan_faces(stream, first, count - face_base, body)
+    except Exception as error:
+        _fell_back('faces', error)
+        return None
+
+
+def _faces_from_flat(flat: np.ndarray, count: int, *,
+                     declared: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """``(flat vertices, offsets)`` from the tokens of ``count`` faces.
+
+    ``declared`` is what the file's header said, when ``count`` is only the
+    tail of it (the boundary-only read), so a refusal names the file's number.
+    """
+    declared = count if declared is None else declared
 
     # Fast path. A hex- or tet-dominant mesh has one face size throughout, and
     # then the whole file is a reshape rather than a per-face walk. This is the
@@ -354,13 +630,15 @@ def _read_faces(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
         if size < 0 or position + 1 + size > total:
             raise PolyMeshReadError(
                 'malformed_list',
-                f'faces declares {count} entries but ran out at {len(heads)}')
+                f'faces declares {declared} entries but ran out at '
+                f'{declared - count + len(heads)}')
         heads.append(position)
         position += 1 + size
     if len(heads) != count:
         raise PolyMeshReadError(
             'malformed_list',
-            f'faces declares {count} entries but holds {len(heads)}')
+            f'faces declares {declared} entries but holds '
+            f'{declared - count + len(heads)}')
     heads = np.array(heads, dtype=np.int64)
     offsets = np.zeros(count + 1, dtype=np.int64)
     np.cumsum(flat[heads], out=offsets[1:])
@@ -518,6 +796,432 @@ def read_poly_mesh(path: str | Path, *,
         face_zones=_read_zones(mesh, 'faceZones'))
 
 
+# --------------------------------------------------------------------------- #
+# Headers only: what admission reads before anything is parsed (Plan 35 CR2)
+# --------------------------------------------------------------------------- #
+
+#: How much of each file the header read looks at. The FoamFile header and
+#: the list count sit in the first few hundred bytes of every file OpenFOAM
+#: or our writer produces; the rest is a generous margin for a long banner.
+HEAD_BYTES = 64 * 1024
+_NOTE_COUNT = re.compile(r'(nPoints|nCells|nFaces|nInternalFaces)\s*:\s*(\d+)')
+
+
+@dataclass(frozen=True)
+class MeshCounts:
+    """The sizes of a polyMesh, from its headers and list counts alone."""
+
+    path: Path
+    points: int
+    faces: int
+    internal_faces: int
+    cells: int | None
+    patches: tuple
+    file_bytes: dict
+    formats: dict
+
+    @property
+    def boundary_faces(self) -> int:
+        return int(sum(count for _name, count in self.patches))
+
+    def to_dict(self) -> dict:
+        return {'path': str(self.path), 'points': self.points,
+                'faces': self.faces, 'internal_faces': self.internal_faces,
+                'cells': self.cells, 'boundary_faces': self.boundary_faces,
+                'patches': [list(item) for item in self.patches],
+                'file_bytes': dict(self.file_bytes),
+                'formats': dict(self.formats)}
+
+
+def _uncompressed_size(path: Path) -> int:
+    """Size of a member once read: a ``.gz`` names it in its trailer."""
+    size = path.stat().st_size
+    if path.suffix != '.gz' or size < 4:
+        return size
+    with open(path, 'rb') as stream:
+        stream.seek(-4, 2)
+        # ISIZE is the size modulo 4 GiB; never report less than the file.
+        return max(size, int.from_bytes(stream.read(4), 'little'))
+
+
+def _read_head(path: Path, limit: int = HEAD_BYTES) -> bytes:
+    if path.suffix == '.gz':
+        with gzip.open(path, 'rb') as stream:
+            return stream.read(limit)
+    with open(path, 'rb') as stream:
+        return stream.read(limit)
+
+
+def _head_member(mesh: Path, name: str) -> tuple[Path, dict, bytes]:
+    """``(file, FoamFile header, stripped payload in the head)`` of a member."""
+    path = _member(mesh, name)
+    if path is None:
+        raise PolyMeshReadError(
+            'incomplete_poly_mesh', f'{mesh} is missing {name}', path=mesh)
+    raw = _read_head(path)
+    header = _parse_header(raw, path)
+    return path, header, _payload(raw, _FOAMFILE.search(raw).end())
+
+
+def _head_count(mesh: Path, name: str) -> tuple[Path, dict, int]:
+    path, header, payload = _head_member(mesh, name)
+    count, _open_at = _leading_count(payload, name)
+    return path, header, count
+
+
+def read_counts(path: str | Path, *,
+                layout_expectation: str = 'any') -> MeshCounts:
+    """Sizes of a polyMesh without parsing a single list.
+
+    Reads each file's FoamFile header and the count ahead of its list, and the
+    (small) ``boundary`` table. Admission estimates a worker's peak from this,
+    so it stays cheap on a mesh of any size: at most :data:`HEAD_BYTES` of
+    each list file is read.
+    """
+    mesh = _resolve(path, layout_expectation=layout_expectation)
+    sizes: dict[str, int] = {}
+    formats: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    cells = None
+    for name in ('points', 'faces', 'owner', 'neighbour'):
+        member, header, count = _head_count(mesh, name)
+        sizes[name] = _uncompressed_size(member)
+        formats[name] = header.get('format', 'ascii')
+        counts[name] = count
+        if name == 'owner':
+            note = dict(_NOTE_COUNT.findall(header.get('note', '')))
+            if 'nCells' in note:
+                cells = int(note['nCells'])
+    boundary = _member(mesh, 'boundary')
+    sizes['boundary'] = boundary.stat().st_size if boundary else 0
+    patches = tuple((item.name, item.n_faces) for item in _read_boundary(mesh))
+    return MeshCounts(
+        path=mesh, points=counts['points'], faces=counts['faces'],
+        internal_faces=counts['neighbour'], cells=cells, patches=patches,
+        file_bytes=sizes, formats=formats)
+
+
+# --------------------------------------------------------------------------- #
+# The boundary alone (Plan 35 CR2 step 4)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class BoundaryPolyMesh:
+    """The boundary faces of a polyMesh and the points they use.
+
+    Face ids are the file's own: face ``face_base + i`` is stored at row
+    ``i``, so a section's face ids and a hotspot's face ids mean what they
+    mean in a full read. Points are compacted to the ones the boundary uses,
+    in the file's order (``point_ids`` maps each back). Nothing measured on a
+    boundary depends on a point's number, only on its position and on the
+    order points appear in, which the compaction keeps.
+
+    Owner, neighbour and the internal faces are not read, so this is not a
+    volume mesh.
+    """
+
+    path: Path
+    points: np.ndarray            # (n_used_points, 3) float64
+    face_vertices: np.ndarray     # flat int64 into ``points``
+    face_offsets: np.ndarray      # (n_boundary_faces + 1,) int64
+    patches: tuple
+    face_base: int
+    total_face_count: int
+    point_ids: np.ndarray         # (n_used_points,) int64 ids in the file
+    total_point_count: int
+    boundary_only: bool = True
+
+    @property
+    def face_count(self) -> int:
+        return self.total_face_count
+
+    @property
+    def internal_face_count(self) -> int:
+        return self.face_base
+
+    def patch(self, name: str) -> BoundaryPatch:
+        for item in self.patches:
+            if item.name == name:
+                return item
+        raise KeyError(f'no such boundary patch: {name}')
+
+    def face(self, face_id: int) -> np.ndarray:
+        at = int(face_id) - self.face_base
+        return self.face_vertices[self.face_offsets[at]:self.face_offsets[at + 1]]
+
+    def patch_face_ids(self, patch) -> np.ndarray:
+        item = self.patch(patch) if isinstance(patch, str) else patch
+        return np.arange(item.start_face, item.end_face, dtype=np.int64)
+
+
+#: The scan steps through the internal faces this many bytes at a time, so
+#: its memory is one chunk however large the file is.
+_SCAN_CHUNK = 16 * 1024 * 1024
+
+
+class _CommentInList(Exception):
+    """A comment inside a list body: the byte scan cannot count past it."""
+
+
+def _open_raw(path: Path):
+    """``(buffer, stream)``: mapped when plain, decompressed when ``.gz``."""
+    if path.suffix == '.gz':
+        return _read_bytes(path), None
+    import mmap
+
+    stream = open(path, 'rb')
+    try:
+        if path.stat().st_size == 0:
+            return b'', stream
+        return mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ), stream
+    except BaseException:
+        stream.close()
+        raise
+
+
+def _close_raw(buffer, stream) -> None:
+    close = getattr(buffer, 'close', None)
+    if callable(close):
+        close()
+    if stream is not None:
+        stream.close()
+
+
+def _raw_list_open(head: bytes, start: int, hint: str) -> int:
+    """Offset of the list's opening paren, stepping over comments."""
+    position = start
+    while True:
+        paren = head.find(b'(', position)
+        if paren < 0:
+            raise PolyMeshReadError('malformed_list', f'{hint} has no list body')
+        block = head.find(b'/*', position, paren)
+        line = head.find(b'//', position, paren)
+        if block < 0 and line < 0:
+            return paren
+        if line < 0 or 0 <= block < line:
+            end = head.find(b'*/', block + 2)
+            if end < 0:
+                raise PolyMeshReadError(
+                    'malformed_list', f'{hint} has no list body')
+            position = end + 2
+        else:
+            end = head.find(b'\n', line)
+            position = len(head) if end < 0 else end + 1
+
+
+def _raw_member(mesh: Path, name: str):
+    """``(buffer, stream, header, list_open_at, count)`` for one list file."""
+    path = _member(mesh, name)
+    if path is None:
+        raise PolyMeshReadError(
+            'incomplete_poly_mesh', f'{mesh} is missing {name}', path=mesh)
+    buffer, stream = _open_raw(path)
+    try:
+        head = bytes(buffer[:HEAD_BYTES])
+        _parse_header(head, path)
+        header_end = _FOAMFILE.search(head).end()
+        count, _stripped_open = _leading_count(_payload(head, header_end), name)
+        open_at = _raw_list_open(head, header_end, name)
+        return buffer, stream, open_at, count
+    except BaseException:
+        _close_raw(buffer, stream)
+        raise
+
+
+def _skip_faces(buffer, start: int, faces: int, *, declared: int) -> int:
+    """Offset just past the ``faces``-th ``)`` at or after ``start``.
+
+    Every face in an ASCII ``faceList`` is ``n(a b c ...)`` -- one closing
+    paren each -- so counting parens counts faces without tokenising them.
+    """
+    if faces <= 0:
+        return start
+    remaining = faces
+    position = start
+    total = len(buffer)
+    carry = b''
+    while True:
+        if position >= total:
+            raise PolyMeshReadError(
+                'malformed_list',
+                f'faces declares {declared} entries but ran out at '
+                f'{faces - remaining}')
+        end = min(total, position + _SCAN_CHUNK)
+        chunk = bytes(buffer[position:end])
+        found = chunk.count(b')')
+        if found >= remaining:
+            marks = np.flatnonzero(np.frombuffer(chunk, dtype=np.uint8) == 0x29)
+            local = int(marks[remaining - 1]) + 1
+            chunk = chunk[:local]
+        if b'/*' in carry + chunk or b'//' in carry + chunk:
+            raise _CommentInList
+        if found >= remaining:
+            return position + len(chunk)
+        remaining -= found
+        carry = chunk[-1:]
+        position = end
+
+
+def _read_boundary_faces(mesh: Path, face_base: int
+                         ) -> tuple[np.ndarray, np.ndarray]:
+    """``(flat vertices, offsets)`` for the faces from ``face_base`` on."""
+    fast = _stream_faces(mesh, face_base)
+    if fast is not None:
+        return fast
+    buffer, stream, open_at, count = _raw_member(mesh, 'faces')
+    try:
+        try:
+            start = _skip_faces(buffer, open_at + 1, face_base, declared=count)
+        except _CommentInList:
+            start = None
+        if start is not None:
+            tail = _payload(bytes(buffer[start:]), 0)
+    finally:
+        _close_raw(buffer, stream)
+    if start is None:
+        # A comment inside the list: rare enough to afford the full read.
+        vertices, offsets = _read_faces(mesh)
+        lo = offsets[face_base]
+        return (np.ascontiguousarray(vertices[lo:]),
+                offsets[face_base:] - lo)
+    flat = _numbers(tail, np.int64)
+    return _faces_from_flat(flat, count - face_base, declared=count)
+
+
+def _read_points_chunked(mesh: Path) -> np.ndarray:
+    """``points``, tokenised a bounded chunk at a time.
+
+    Only one chunk's tokens exist at once rather than the whole file's --
+    which is most of what a full read costs. CR2b: vectorised first, kept
+    only where it provably equals this read -- the count holds and no number
+    follows the last ``)``, which this read never looks past.
+    """
+    fast = _stream_numbers(mesh, 'points', 'scalar', width=3)
+    if fast is not None:
+        values, count, filled, trailing = fast
+        if filled == count * 3 and trailing == 0:
+            return values.reshape(count, 3)
+        _fell_back('points', _ascii.Irregular('count or trailing numbers'))
+    buffer, stream, open_at, count = _raw_member(mesh, 'points')
+    fallback = False
+    try:
+        close_at = buffer.rfind(b')')
+        if close_at < open_at:
+            close_at = len(buffer)
+        values = np.empty(count * 3, dtype=np.float64)
+        filled = 0
+        position = open_at + 1
+        while position < close_at:
+            end = min(close_at, position + _SCAN_CHUNK)
+            if end < close_at:
+                newline = buffer.rfind(b'\n', position, end)
+                if newline > position:
+                    end = newline
+            chunk = bytes(buffer[position:end])
+            if b'/*' in chunk or b'//' in chunk:
+                fallback = True
+                break
+            parsed = _numbers(chunk, np.float64)
+            if filled + parsed.size > values.size:
+                filled += parsed.size
+                break
+            values[filled:filled + parsed.size] = parsed
+            filled += parsed.size
+            position = end
+    finally:
+        _close_raw(buffer, stream)
+    if fallback:
+        return _read_points(mesh)
+    if filled != count * 3:
+        raise PolyMeshReadError(
+            'malformed_list',
+            f'points declares {count} entries but holds {filled / 3:g}')
+    return values.reshape(count, 3)
+
+
+def read_poly_mesh_boundary(path: str | Path, *,
+                            layout_expectation: str = 'reconstructed'
+                            ) -> BoundaryPolyMesh:
+    """Read the boundary patches' faces and the points they use.
+
+    Plan 35 CR2 step 4. Fidelity measures the boundary against the reference,
+    so it needs neither the internal faces nor owner and neighbour. The faces
+    file is still *scanned* past the internal faces -- ASCII has no index --
+    but they are counted by their closing parens, never tokenised, so memory
+    follows the boundary rather than the file.
+
+    Refuses with :func:`read_poly_mesh`'s reason codes: the layout checks,
+    ``not_a_foam_file``, ``binary_format`` on any member,
+    ``compact_face_list``, ``malformed_list`` for points and faces,
+    ``malformed_boundary`` and ``inconsistent_mesh``. Owner and neighbour are
+    checked by header and count, not parsed, so a body that disagrees with
+    its own count is only caught by the full read.
+    """
+    mesh = _resolve(path, layout_expectation=layout_expectation)
+    headers = {}
+    for name in ('points', 'faces', 'owner', 'neighbour'):
+        member, header, payload = _head_member(mesh, name)
+        fmt = header.get('format', 'ascii')
+        if fmt != 'ascii':
+            raise PolyMeshReadError(
+                'binary_format',
+                f'{member} is written as {fmt}; convert the case to ASCII '
+                'with foamFormatConvert before qualification',
+                path=member)
+        if name == 'faces' and header.get(
+                'class', 'faceList') == 'faceCompactList':
+            raise PolyMeshReadError(
+                'compact_face_list',
+                f'{mesh / "faces"} uses faceCompactList, which this reader does '
+                'not decode; rewrite the mesh with a faceList encoding')
+        headers[name] = _leading_count(payload, name)[0]
+
+    # Refuse in the full reader's order -- points, then faces, then the
+    # boundary and the consistency checks -- so a mesh damaged in two places
+    # gets the same reason code from both readers.
+    points = _read_points_chunked(mesh)
+    face_count = headers['faces']
+    try:
+        patches = _read_boundary(mesh)
+        boundary_error = None
+    except PolyMeshReadError as error:
+        patches, boundary_error = (), error
+    starts = [item.start_face for item in patches if item.n_faces]
+    face_base = int(max(0, min([headers['neighbour'], face_count] + starts)))
+    vertices, offsets = _read_boundary_faces(mesh, face_base)
+    if boundary_error is not None:
+        raise boundary_error
+    if headers['owner'] != face_count:
+        raise PolyMeshReadError(
+            'inconsistent_mesh',
+            f'{mesh} has {face_count} faces but {headers["owner"]} owner '
+            'entries', path=mesh)
+    if headers['neighbour'] > face_count:
+        raise PolyMeshReadError(
+            'inconsistent_mesh',
+            f'{mesh} has more neighbour entries than faces', path=mesh)
+    for item in patches:
+        if item.end_face > face_count:
+            raise PolyMeshReadError(
+                'inconsistent_mesh',
+                f'patch {item.name} ends at face {item.end_face} of '
+                f'{face_count}', path=mesh)
+    if vertices.size and int(vertices.max()) >= len(points):
+        raise PolyMeshReadError(
+            'inconsistent_mesh',
+            f'{mesh} addresses point {int(vertices.max())} of {len(points)}',
+            path=mesh)
+    used = np.unique(vertices)
+    return BoundaryPolyMesh(
+        path=mesh,
+        points=np.ascontiguousarray(points[used]),
+        face_vertices=np.searchsorted(used, vertices).astype(np.int64),
+        face_offsets=np.asarray(offsets, dtype=np.int64),
+        patches=patches, face_base=face_base,
+        total_face_count=int(face_count), point_ids=used.astype(np.int64),
+        total_point_count=int(len(points)))
+
+
 @dataclass(frozen=True)
 class FaceZoneSurface:
     """One ``faceZone`` as a drawable surface, in its own point numbering.
@@ -657,7 +1361,10 @@ def triangulate_faces(mesh: PolyMesh, face_ids) -> tuple[np.ndarray, np.ndarray,
     """
     face_ids = np.ascontiguousarray(face_ids, dtype=np.int64)
     offsets, flat, points = mesh.face_offsets, mesh.face_vertices, mesh.points
-    sizes = offsets[face_ids + 1] - offsets[face_ids]
+    # A boundary-only mesh (Plan 35 CR2) stores its faces from `face_base`
+    # on, and keeps the face ids the file gave them.
+    local = face_ids - int(getattr(mesh, 'face_base', 0))
+    sizes = offsets[local + 1] - offsets[local]
 
     triangles: list[np.ndarray] = []
     sources: list[np.ndarray] = []
@@ -666,7 +1373,7 @@ def triangulate_faces(mesh: PolyMesh, face_ids) -> tuple[np.ndarray, np.ndarray,
 
     simple = np.flatnonzero(sizes == 3)
     if simple.size:
-        starts = offsets[face_ids[simple]]
+        starts = offsets[local[simple]]
         rows = np.stack([flat[starts], flat[starts + 1], flat[starts + 2]], axis=1)
         triangles.append(rows)
         sources.append(face_ids[simple])
@@ -680,7 +1387,8 @@ def triangulate_faces(mesh: PolyMesh, face_ids) -> tuple[np.ndarray, np.ndarray,
 
     for index in np.flatnonzero(sizes > 3):
         face_id = int(face_ids[index])
-        loop = flat[offsets[face_id]:offsets[face_id + 1]]
+        at = int(local[index])
+        loop = flat[offsets[at]:offsets[at + 1]]
         apexes.append(points[loop].mean(axis=0))
         apex_id = next_apex
         next_apex += 1
@@ -709,7 +1417,8 @@ def face_area_vectors(mesh: PolyMesh, face_ids) -> np.ndarray:
     face_ids = np.ascontiguousarray(face_ids, dtype=np.int64)
     vectors = np.zeros((face_ids.size, 3), dtype=np.float64)
     offsets, flat, points = mesh.face_offsets, mesh.face_vertices, mesh.points
-    for position, face_id in enumerate(face_ids):
+    base = int(getattr(mesh, 'face_base', 0))
+    for position, face_id in enumerate(face_ids - base):
         loop = points[flat[offsets[face_id]:offsets[face_id + 1]]]
         vectors[position] = 0.5 * np.cross(
             loop, np.roll(loop, -1, axis=0)).sum(axis=0)

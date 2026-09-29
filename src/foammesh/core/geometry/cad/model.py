@@ -12,6 +12,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+#: Plan 35 CR7. What a CAD import answers when it is read in another process.
+#: The major number is the contract: a reader refuses a major it does not
+#: know rather than guess at fields it has never seen.
+CAD_IMPORT_SCHEMA = 'cad_import/v1'
+CAD_IMPORT_MAJOR = 1
+
+
+class CadSchemaError(ValueError):
+    """A CAD import answer written under a contract this build cannot read."""
+
+
+def schema_major(schema) -> int:
+    """The major number of a ``cad_import/v<major>[.<minor>]`` tag."""
+    text = str(schema or '')
+    name, _slash, version = text.partition('/v')
+    if name != 'cad_import' or not version:
+        raise CadSchemaError(f'not a CAD import answer: {text!r}')
+    try:
+        return int(version.split('.', 1)[0])
+    except ValueError:
+        raise CadSchemaError(f'not a CAD import answer: {text!r}') from None
+
 
 @dataclass
 class CadFace:
@@ -87,3 +109,59 @@ class CadModel:
 
     def patch_names(self) -> list[str]:
         return [f.patch for b in self.bodies for f in b.faces]
+
+    # -- Plan 35 CR7: the model crosses a process boundary as JSON ---------- #
+
+    def to_json(self) -> dict:
+        """Every field of the model, as plain JSON, under the schema tag."""
+        return {
+            'schema': CAD_IMPORT_SCHEMA,
+            'source_format': self.source_format, 'unit': self.unit,
+            'declared_unit': self.declared_unit,
+            'bodies': [{
+                'id': body.id, 'name': body.name, 'color': body.color,
+                'solid': body.solid,
+                'faces': [{
+                    'id': face.id, 'patch_uuid': face.patch_uuid,
+                    'source_ref': dict(face.source_ref), 'name': face.name,
+                    'patch': face.patch, 'color': face.color,
+                    'planar': face.planar, 'area': face.area,
+                    'adjacent_ids': list(face.adjacent_ids),
+                    'interface_id': face.interface_id,
+                    'face_order': face.face_order,
+                } for face in body.faces],
+            } for body in self.bodies],
+        }
+
+    @classmethod
+    def from_json(cls, document: dict) -> 'CadModel':
+        """The model :meth:`to_json` wrote; refuses an unknown major."""
+        if not isinstance(document, dict):
+            raise CadSchemaError('a CAD model answer must be an object')
+        major = schema_major(document.get('schema'))
+        if major != CAD_IMPORT_MAJOR:
+            raise CadSchemaError(
+                f'CAD import answer {document.get("schema")!r} is a version '
+                f'this build cannot read (it reads v{CAD_IMPORT_MAJOR})')
+        bodies = []
+        for body in document.get('bodies') or ():
+            faces = [CadFace(
+                id=str(face['id']), patch_uuid=str(face['patch_uuid']),
+                source_ref=dict(face.get('source_ref') or {}),
+                name=str(face.get('name') or ''),
+                patch=str(face.get('patch') or ''),
+                color=str(face.get('color') or ''),
+                planar=face.get('planar'), area=face.get('area'),
+                adjacent_ids=tuple(str(item) for item in
+                                   face.get('adjacent_ids') or ()),
+                interface_id=str(face.get('interface_id') or ''),
+                face_order=int(face.get('face_order', -1)),
+            ) for face in body.get('faces') or ()]
+            bodies.append(CadBody(
+                id=str(body['id']), name=str(body.get('name') or ''),
+                faces=faces, color=str(body.get('color') or ''),
+                solid=body.get('solid')))
+        return cls(source_format=str(document.get('source_format') or ''),
+                   unit=str(document.get('unit') or 'mm'),
+                   declared_unit=str(document.get('declared_unit') or ''),
+                   bodies=bodies)

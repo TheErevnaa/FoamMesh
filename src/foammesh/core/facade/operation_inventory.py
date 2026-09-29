@@ -144,6 +144,10 @@ SUPPLEMENTAL_TO_OPERATION: dict[str, str] = {
     '_stepHelpAction': CLIENT_SHELL,
     '_stepDetailsAction': CLIENT_SHELL,
     'separator': CLIENT_SHELL,
+    # Plan 35 CR0: Help > "Open logs folder" and "Create crash report..."
+    # show files the diagnostics already wrote; neither touches the case.
+    '_openLogsAction': CLIENT_SHELL,
+    '_crashReportAction': CLIENT_SHELL,
 }
 
 

@@ -38,7 +38,19 @@ CAD_INSTALL_HINT = (
 
 
 def is_available() -> bool:
-    """True if pythonocc-core (OCC) is importable."""
+    """True if pythonocc-core (OCC) is installed.
+
+    Plan 35 CR7: the window never loads OCCT -- a worker reads every CAD
+    file -- so outside a worker this asks only whether the package is there,
+    and does not import it to find out. A worker, which is about to use it,
+    loads it.
+    """
+    if os.environ.get('FOAMMESH_WORKER') != '1':
+        return importlib.util.find_spec('OCC') is not None
+    return _importable()
+
+
+def _importable() -> bool:
     if importlib.util.find_spec('OCC') is None:
         return False
     _prepare_dll_search()
@@ -50,6 +62,10 @@ def is_available() -> bool:
 
 
 def require() -> None:
-    """Raise a clear error if OCCT is not installed."""
-    if not is_available():
+    """Raise a clear error if OCCT is not installed.
+
+    Called where OCCT is about to be used, so it loads it: an install that
+    is present but broken fails here with the hint, not deeper in a reader.
+    """
+    if not _importable():
         raise RuntimeError(CAD_INSTALL_HINT)

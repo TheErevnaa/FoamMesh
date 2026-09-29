@@ -158,26 +158,17 @@ class OpenFoamLaunchProfile:
         pid_name = f'.foammesh-openfoam-{token}.pid'
         exit_name = f'.foammesh-openfoam-{token}.exit'
         run = shlex.join((utility, *suffix))
-        grouped = 'setsid bash -c ' + shlex.quote('exec stdbuf -oL -eL ' + run)
-        script = (
-            f'{self.source_clause()} && '
-            f'cd {shlex.quote(runtime_cwd)} && '
-            f'rm -f {shlex.quote(pid_name)} {shlex.quote(exit_name)}; '
-            f'{grouped} & child=$!; '
-            f'echo "$child" > {shlex.quote(pid_name)}; '
-            f'wait "$child"; status=$?; '
-            f'rm -f {shlex.quote(pid_name)} {shlex.quote(exit_name)}; '
-            'exit "$status"'
-        )
+        # Plan 35 CR5. The wrapper reports the run, holds the lifetime pipe
+        # and acknowledges the exit only once no writer is left.
+        from foammesh.core.jobs.wsl_wrapper import cleanup_script as _cleanup
+        from foammesh.core.jobs.wsl_wrapper import wrapped_script
+        script = wrapped_script(
+            prelude=self.source_clause(), runtime_cwd=runtime_cwd, run=run,
+            pid_name=pid_name, token=token)
         prefix = self._wsl_prefix()
-        cleanup_script = (
-            f'cd {shlex.quote(runtime_cwd)} && '
-            f'if test -s {shlex.quote(pid_name)}; then '
-            f'pid=$(cat {shlex.quote(pid_name)}); '
-            'kill -TERM -- "-$pid" 2>/dev/null || true; '
-            'sleep 1; kill -KILL -- "-$pid" 2>/dev/null || true; '
-            f'rm -f {shlex.quote(pid_name)} {shlex.quote(exit_name)}; fi'
-        )
+        cleanup_script = _cleanup(
+            runtime_cwd=runtime_cwd, pid_name=pid_name,
+            extra_names=(exit_name,))
         return LaunchCommand(
             (*prefix, 'bash', '-c', script),
             (*prefix, 'bash', '-c', cleanup_script),

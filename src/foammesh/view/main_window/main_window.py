@@ -15,7 +15,7 @@ from typing import Optional
 from PySide6.QtWidgets import (QDialog, QLabel, QMainWindow, QFileDialog,
                                QMessageBox, QInputDialog, QVBoxLayout,
                                QTabWidget, QPlainTextEdit, QWidget)
-from PySide6.QtCore import Signal, QEvent, Qt, QTimer
+from PySide6.QtCore import Signal, QEvent, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence
 
 from analytics import Analytics
@@ -23,6 +23,7 @@ from app_properties import meshAppProperties
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.support.utils import getFit
+from foammesh.support import gc_policy
 from foammesh.db.configurations_schema import Shape, Step
 from widgets.async_dialog import asyncExec
 from widgets.async_message_box import AsyncMessageBox
@@ -60,6 +61,8 @@ from foammesh.view.widgets.mesh_import_dialog import MeshImportDialog
 from foammesh.view.menu.mesh_quality.mesh_quality_parameters_dialog import MeshQualityParametersDialog
 from foammesh.view.menu.help.about_dialog import AboutDialog
 from foammesh.view.menu.help.license_dialog import LicenseDialog
+from foammesh.support import lifecycle
+from .crash_notice import CrashNoticeBanner, CrashReportDialog
 from foammesh.view.menu.settings.preferences_dialog import PreferencesDialog
 from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.menu.mesh import MeshInfoDialog, QualityDashboardDialog, TransformDialog
@@ -74,6 +77,9 @@ from .mesh_composition import cell_count_text, composition_text
 from .mesh_manager import MeshManager
 from .step_manager import StepManager
 from .main_window_ui import Ui_MainWindow
+from .recovery_offer import offer_recovery
+from .wsl_health_bar import WslHealthBar, show_runtime_diagnostics
+from .retry_prompt import RetryPrompt
 from .three_region_shell import (
     install_three_region_shell, layout_worth_recording, reveal_output_band,
 )
@@ -262,6 +268,14 @@ class MainWindow(QMainWindow):
             app.events, app.jobManager,
             lambda: self.showOutputTab('console'), self)
         self.statusBar().addPermanentWidget(self._jobProgress)
+        # Plan 35 CR6. Up only while the WSL runtime is unreachable:
+        # [Retry connection] [Restart WSL runtime] [Open diagnostics].
+        self._wslHealthBar = self._installWslHealthBar()
+        # A run lost to the WSL transport or to memory offers [Retry] (and
+        # [Retry with fewer cores]) once, before its failure is reported.
+        client = getattr(app, 'facadeClient', None)
+        if client is not None and hasattr(client, 'retry_prompt'):
+            client.retry_prompt = RetryPrompt(self)
 
         #: Feature-line actors while the overlay is shown.
         self._featureActors = []
@@ -296,6 +310,9 @@ class MainWindow(QMainWindow):
         self._privacyConfigured = Analytics().configured
 
         self._installStepHelpActions()
+        self._installDiagnosticsActions()
+        #: Plan 35 CR0 step 6: the banner about a session that died, if any.
+        self._crashNotice = None
 
         self._setupShortcuts()
 
@@ -382,6 +399,35 @@ class MainWindow(QMainWindow):
 
     # -- WP7/WP8: the viewport's own controls ------------------------------ #
 
+    def _previewActionRequested(self, action: str):
+        """Plan 35 CR3. A button under the viewport's preview notice."""
+        manager = getattr(self, '_meshManager', None)
+        if manager is None:
+            return
+        if action == 'retry':
+            asyncio.create_task(manager.retryPreview())
+        elif action == 'load_volume':
+            asyncio.create_task(manager.loadFullVolume())
+        elif action == 'build_anyway' and self._confirmBuildPreviewAnyway():
+            asyncio.create_task(manager.buildPreviewAnyway())
+
+    def _confirmBuildPreviewAnyway(self) -> bool:
+        """"Build anyway" warns first: the worker may take most of the memory."""
+        from foammesh.support import resource_budget
+
+        total, _available = resource_budget.physical_memory()
+        confirmed = QMessageBox.warning(
+            self, self.tr('Build the preview anyway?'),
+            self.tr('The preview worker will be allowed up to {0} (90% of '
+                    'this computer\'s memory). Other programs may slow down '
+                    'or be paged out while it runs, and the worker is still '
+                    'stopped if it goes over. FoamMesh itself is not at '
+                    'risk.').format(resource_budget.format_bytes(
+                        int(total * 0.9))),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return confirmed == QMessageBox.StandardButton.Yes
+
     def _connectViewportControls(self):
         tool = self._renderingTool
         tool.sectionRequested.connect(self._quickSection)
@@ -400,6 +446,8 @@ class MainWindow(QMainWindow):
 
         self._displayControl.meshQualityInfo().statusMessage.connect(
             lambda text: self.statusBar().showMessage(text, 8000))
+        self._viewportOverlay.previewActionRequested.connect(
+            self._previewActionRequested)
 
         # F-44. Not `setChip` directly: what the chip counts is a question
         # about the mesh, and only the window can see both the mesh and the
@@ -441,6 +489,13 @@ class MainWindow(QMainWindow):
         self._ui.renderingView.actorHovered.connect(self._hoveredActorChanged)
         # Rule 3: nothing drops detail without saying so.
         self._ui.renderingView.detailReduced.connect(self._detailReduced)
+        # Plan 35 CR8: nor draws differently, nor stops drawing, silently.
+        view = self._ui.renderingView
+        for name, slot in (('renderNote', self._viewportRenderNote),
+                           ('viewportReset', self._viewportReset)):
+            signal = getattr(view, name, None)
+            if signal is not None and hasattr(signal, 'connect'):
+                signal.connect(slot)
 
     # -- WP5.2 / WP7.5 / WP8.3 --------------------------------------------- #
 
@@ -480,6 +535,15 @@ class MainWindow(QMainWindow):
         self._renderQualityActions[saved].setChecked(True)
         view.setRenderQuality(saved)
         group.triggered.connect(self._renderQualityChosen)
+        # Plan 35 CR8: in graphics safe mode the preset is not the user's;
+        # the saved choice stays and applies at the next normal start.
+        isSafeMode = getattr(view, 'isSafeMode', None)
+        if callable(isSafeMode) and isSafeMode() is True:
+            menu.setTitle(self.tr('Render &quality (safe mode)'))
+            menu.setEnabled(False)
+            menu.menuAction().setStatusTip(self.tr(
+                'Graphics safe mode draws with the simplest settings; your '
+                'choice applies again at the next normal start.'))
 
         entries = (
             (self.tr('Re&duce detail while moving'),
@@ -522,6 +586,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 self.tr('{0} is not available in this VTK build.').format(
                     action.text()), 6000)
+
+    def _viewportRenderNote(self, text: str):
+        if text:
+            self.statusBar().showMessage(text, 10000)
+
+    def _viewportReset(self, reason: str):
+        self.statusBar().showMessage(self.tr(
+            'The viewport stopped drawing ({0}). Use Recreate viewport to '
+            'draw it again.').format(reason), 15000)
 
     def _detailReduced(self, reduced: bool):
         if reduced:
@@ -1839,6 +1912,12 @@ class MainWindow(QMainWindow):
             self._capabilityStateUnsubscribe()
             self._capabilityStateUnsubscribe = None
         self._jobProgress.shutdown()
+        if self._wslHealthBar is not None:
+            self._wslHealthBar.dispose()
+            self._wslHealthBar = None
+        client = getattr(app, 'facadeClient', None)
+        if isinstance(getattr(client, 'retry_prompt', None), RetryPrompt):
+            client.retry_prompt = None
 
         super().closeEvent(event)
 
@@ -3000,7 +3079,9 @@ class MainWindow(QMainWindow):
     async def _runMeshTransformV13(self, operation):
         if app.project is None:
             return
-        utility = app.capabilities.utility('transformPoints').executable
+        # Plan 35 CR7: a cold runtime answers this on a worker thread.
+        utility = (await asyncio.to_thread(
+            app.capabilities.utility, 'transformPoints')).executable
         # The first transform of a session waits on a cold WSL `transformPoints
         # -help` probe -- measured at 2.6s -- before its dialog can be built.
         # Nothing said so, so the click was indistinguishable from a dead menu
@@ -3148,8 +3229,10 @@ class MainWindow(QMainWindow):
         if not self._actionSnapshot().has_mesh:
             await self._runSurfaceRepair()
             return
-        utilities = self._repairUtilities()
-        check_utility = app.capabilities.utility('checkMesh').executable
+        # Plan 35 CR7: probing a cold runtime waits; the window does not.
+        utilities = await asyncio.to_thread(self._repairUtilities)
+        check_utility = (await asyncio.to_thread(
+            app.capabilities.utility, 'checkMesh')).executable
         service = MeshRepairService(utilities, app.jobManager, check_utility=check_utility)
         operations = service.available_operations(app.project.path)
         if not operations:
@@ -3413,7 +3496,7 @@ class MainWindow(QMainWindow):
     async def _loadNativeMesh(self):
         if app.project is None:
             return
-        utilities = self._converterUtilities()
+        utilities = await asyncio.to_thread(self._converterUtilities)
         service = ConverterImportService(utilities, app.jobManager)
         dialog = MeshImportDialog(service.import_entries(), self)
         if await asyncExec(dialog) != dialog.DialogCode.Accepted:
@@ -3860,6 +3943,138 @@ class MainWindow(QMainWindow):
         self._dialog = AboutDialog(self)
         self._dialog.open()
 
+    #: Object names for the Plan 35 CR0 Help entries.
+    CRASH_REPORT_ACTION = 'actionCreateCrashReport'
+    OPEN_LOGS_ACTION = 'actionOpenLogsFolder'
+
+    def _installDiagnosticsActions(self):
+        """Help > "Open logs folder" and "Create crash report..." (Plan 35 CR0)."""
+        menu = getattr(self._ui, 'menuHelp', None)
+        if menu is None:
+            return
+        menu.addSeparator()
+        self._openLogsAction = QAction(self.tr('Open logs folder'), self)
+        self._openLogsAction.setObjectName(self.OPEN_LOGS_ACTION)
+        self._openLogsAction.triggered.connect(self._openLogsFolder)
+        self._crashReportAction = QAction(self.tr('Create crash report\u2026'), self)
+        self._crashReportAction.setObjectName(self.CRASH_REPORT_ACTION)
+        self._crashReportAction.setStatusTip(self.tr(
+            'Save the logs, crash dumps and system details to a zip on your '
+            'Desktop; nothing is sent'))
+        self._crashReportAction.triggered.connect(self._createCrashReport)
+        menu.addAction(self._openLogsAction)
+        menu.addAction(self._crashReportAction)
+
+    @staticmethod
+    def _logsFolder() -> Path:
+        directory = lifecycle.log_directory()
+        return Path(directory) if directory else Path(app.settings.settingsPath()) / 'logs'
+
+    def _openLogsFolder(self):
+        # The lifecycle log made the folder at start; nothing is created here.
+        folder = self._logsFolder()
+        if not folder.is_dir() or not QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(folder))):
+            self.statusBar().showMessage(
+                self.tr('Could not open {0}.').format(folder), 6000)
+
+    def showPreviousCrash(self, records):
+        """Plan 35 CR0 step 6: say, without a modal, that a session died."""
+        if not records:
+            return None
+        if self._crashNotice is not None:
+            self._crashNotice.dismiss()
+        banner = CrashNoticeBanner(records, self._ui.centralwidget)
+        banner.reportRequested.connect(self._createCrashReport)
+        banner.openLogsRequested.connect(self._openLogsFolder)
+        banner.safeModeRequested.connect(self._safeModeNextTime)
+        banner.destroyed.connect(lambda *_: setattr(self, '_crashNotice', None))
+        self._ui.verticalLayout_23.insertWidget(0, banner)
+        self._crashNotice = banner
+        return banner
+
+    def _safeModeNextTime(self):
+        """Plan 35 CR8: the crash notice's "Start in safe mode next time"."""
+        from foammesh.support import safe_mode
+
+        safe_mode.remember_next_start(self._logsFolder())
+        lifecycle.record('graphics safe mode chosen for the next start')
+        self.statusBar().showMessage(self.tr(
+            'FoamMesh will start in graphics safe mode next time.'), 8000)
+
+    def _glInformation(self) -> dict:
+        """The OpenGL vendor/renderer a view that has rendered reports."""
+        from foammesh.rendering import gl_health
+        from widgets.rendering.rendering_widget import RenderingWidget
+
+        # Plan 35 CR8: the strings each view read once it had a context,
+        # else the ones this or the last session recorded in the logs.
+        for widget in self.findChildren(RenderingWidget):
+            information = getattr(widget, 'glInformation', None)
+            info = information() if callable(information) else {}
+            if info:
+                return info
+        info = gl_health.recorded(lifecycle.log_directory())
+        if info:
+            return info
+        for widget in self.findChildren(RenderingWidget):
+            try:
+                window = widget.interactor().GetRenderWindow()
+                # Asking a window with no context yet would create one here.
+                if window is None or window.GetNeverRendered():
+                    continue
+                report = window.ReportCapabilities() or ''
+            except Exception:                              # noqa: BLE001
+                continue
+            info = {}
+            for line in report.splitlines():
+                key, _, value = line.partition(':')
+                key = key.strip().lower()
+                for name in ('vendor', 'renderer', 'version'):
+                    if key == f'opengl {name} string':
+                        info[name] = value.strip()
+            if info:
+                return info
+        return {}
+
+    @qasync.asyncSlot()
+    async def _createCrashReport(self):
+        """Help > Create crash report...: show the list, then write the zip."""
+        from foammesh.support import crash_report
+
+        caseRoot = self._captureManager.caseRoot()
+        self.statusBar().showMessage(self.tr('Collecting the crash report\u2026'))
+        try:
+            manifest = await asyncio.to_thread(
+                crash_report.collect, caseRoot, log_dir=self._logsFolder(),
+                version=meshAppProperties.version,
+                gl_info=self._glInformation())
+        except Exception as error:                         # noqa: BLE001
+            logger.warning('Could not collect a crash report', exc_info=True)
+            self.statusBar().clearMessage()
+            await AsyncMessageBox().warning(
+                self, self.tr('Crash report'),
+                self.tr('The crash report could not be collected: {0}').format(error))
+            return
+        self.statusBar().clearMessage()
+        destination = crash_report.default_destination()
+        dialog = CrashReportDialog(
+            manifest.describe(), destination,
+            crash_report._size_text(manifest.size), self)
+        self._dialog = dialog
+        if await asyncExec(dialog) != QDialog.DialogCode.Accepted:
+            return
+        try:
+            path = await asyncio.to_thread(crash_report.write, manifest, destination)
+        except OSError as error:
+            await AsyncMessageBox().warning(
+                self, self.tr('Crash report'),
+                self.tr('The crash report could not be saved: {0}').format(error))
+            return
+        logger.info('Crash report written to %s', path)
+        self.statusBar().showMessage(
+            self.tr('Crash report saved to {0}').format(path), 15000)
+
     def _openLicense(self):
         self._dialog = LicenseDialog(self)
         self._dialog.open()
@@ -4192,6 +4407,10 @@ class MainWindow(QMainWindow):
         # is already looking rather than in a panel they have to open.
         self._meshManager.meshSummaryChanged.connect(
             self._viewportOverlay.setMesh)
+        # Plan 35 CR3. A decimated, surface-only or unbuilt preview says so,
+        # with Try again / Build anyway / Load full volume under it.
+        self._meshManager.previewNoticeChanged.connect(
+            self._viewportOverlay.setPreviewNotice)
 
         self._geometryManager.load()
         self._stepManager.load()
@@ -4202,6 +4421,50 @@ class MainWindow(QMainWindow):
         self.refreshMeshVerdictSoon()
         self.refreshNamedViews()
         self._updateMenuStates()
+        self._offerRecovery()
+
+    def _installWslHealthBar(self):
+        health = getattr(app, 'wslHealth', None)
+        central = self.centralWidget()
+        layout = central.layout() if central is not None else None
+        if health is None or layout is None:
+            return None
+        try:
+            bar = WslHealthBar(health, app.events,
+                               on_diagnostics=self.showRuntimeDiagnostics,
+                               parent=layout.parentWidget())
+        except Exception:       # noqa: BLE001 - a missing banner must not stop the window
+            logger.exception('could not build the WSL health banner')
+            return None
+        layout.insertWidget(0, bar)
+        return bar
+
+    def showRuntimeDiagnostics(self):
+        """The runtime diagnostics window: profile, WSL health, shutdown."""
+        return show_runtime_diagnostics(
+            self, app.facadeClient, getattr(app, 'wslHealth', None))
+
+    def _offerRecovery(self):
+        """Plan 35 CR9. Unsaved changes a dead session left, and whether
+        this one's are being protected, as bars over the window."""
+        previous = getattr(self, '_autosaveBars', None)
+        if previous is not None:
+            previous.dispose()
+        autosave = getattr(app.project, 'autosave', None)
+        try:
+            self._autosaveBars = offer_recovery(
+                self, autosave() if callable(autosave) else None,
+                on_restored=self._unsavedChangesRestored,
+                on_save=self._ui.actionSave.trigger,
+                on_save_as=self._ui.actionSaveAs.trigger)
+        except Exception:       # noqa: BLE001 - never block opening a case
+            logger.exception('could not offer the unsaved changes')
+            self._autosaveBars = None
+
+    def _unsavedChangesRestored(self, _count, _filesRestored):
+        # The restore replaced the stored values (and any geometry) under the
+        # user: repaint the forms and reload the geometry from the store.
+        self._scheduleProjectReload()
 
     def _shouldDrawMeshOnOpen(self) -> bool:
         """Does this case have a mesh the viewport should be showing?
@@ -4226,6 +4489,10 @@ class MainWindow(QMainWindow):
         return self._hasMeshOnDisk()
 
     def _projectClosed(self):
+        bars = getattr(self, '_autosaveBars', None)
+        if bars is not None:
+            bars.dispose()
+            self._autosaveBars = None
         if hasattr(self, '_projectEventUnsubscribes'):
             for unsubscribe in self._projectEventUnsubscribes:
                 unsubscribe()
@@ -4240,6 +4507,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'{meshAppProperties.fullName}')
         self.setToolTip('')
         self._stepManager.unload()
+        # Plan 35 CR3. The closing case's actors are released here, on the
+        # GUI thread and against the viewport's own context, rather than
+        # left for the cyclic collector to destroy on whatever thread trips
+        # it once the managers below are dropped.
+        for manager in (getattr(self, '_geometryManager', None),
+                        getattr(self, '_meshManager', None)):
+            dispose = getattr(manager, 'dispose', None)
+            if callable(dispose):
+                dispose()
         # The actors go first: the toolbar readout is derived from what the
         # view is holding, so clearing it before the view leaves the closing
         # case's model extent on screen (R49).
@@ -4265,6 +4541,8 @@ class MainWindow(QMainWindow):
         self._lastFailedCellSets = {}
         self._geometryManager = None
         self._meshManager = None
+        # What the closing case left behind is reaped now, on this thread.
+        gc_policy.collect_full('project close')
 
         self._cellCountChanged(0)
         self._updateMenuStates()

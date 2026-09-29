@@ -13,6 +13,44 @@ import sys
 os.environ.setdefault('QT_API', 'pyside6')
 os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PySide6')
 
+
+def _subprocess_role(arguments):
+    """Plan 35 (D2): the same program is also the crash helper and the worker.
+
+    ``--crash-helper <pid>`` and ``--worker <op> ...`` are answered here,
+    before Qt or VTK is imported: neither role needs them, and the crash helper
+    must not be able to fail on a GL driver or a Qt plugin. Returns the exit
+    code, or ``None`` for a GUI start.
+    """
+    arguments = list(arguments)
+    if not arguments:
+        return None
+    if arguments[0] == '--crash-helper':
+        from foammesh.support import crash_helper
+        return crash_helper.main(arguments)
+    if arguments[0] == '--worker':
+        try:
+            from foammesh.workers import mesh_worker
+        except ImportError:
+            if sys.stderr is not None:
+                print('FoamMesh --worker: this build has no mesh worker '
+                      '(foammesh.workers.mesh_worker)', file=sys.stderr)
+            return 2
+        return mesh_worker.main(arguments[1:])
+    return None
+
+
+if __name__ == '__main__':
+    _role_exit_code = _subprocess_role(sys.argv[1:])
+    if _role_exit_code is not None:
+        raise SystemExit(_role_exit_code)
+    if sys.stderr is None:
+        # pythonw / a console-less start: native output would go to NUL. The
+        # packaged build's runtime hook has already done this; it is a no-op
+        # then.
+        from foammesh.support import native_capture
+        native_capture.install()
+
 import qasync
 from PySide6.QtWidgets import QApplication
 
@@ -31,7 +69,8 @@ from analytics.events import EVENT_LOOP_ERROR
 
 from foammesh.app import app
 from foammesh.core.case import startup_case_path
-from foammesh.support import lifecycle
+from foammesh.support import (
+    crash_helper, lifecycle, qt_messages, safe_mode, watchdog)
 from foammesh.view.main_window.main_window import MainWindow
 
 logger = logging.getLogger()
@@ -139,12 +178,33 @@ def main():
     # DP-550/551. Before anything native can fail: a fatal fault, a VTK
     # warning and the way this process ends are all written under the
     # application's log directory, and a session that died last time is named.
-    for dead in lifecycle.install(app.settings.settingsPath()):
+    dead_sessions = lifecycle.install(app.settings.settingsPath(),
+                                      version=meshAppProperties.version)
+    # Plan 35 CR0: the root log, thread and unraisable exceptions, native
+    # dumps from outside the process, and Qt's own messages -- all before the
+    # QApplication exists.
+    lifecycle.attach_root_log()
+    lifecycle.install_hooks()
+    for dead in dead_sessions:
         logger.warning(
-            'A previous FoamMesh session (pid %s) ended without a clean exit; '
+            'A previous FoamMesh session (pid %s) ended without a clean exit%s; '
             'last operations: %s. See %s.', dead.get('pid'),
+            f' ({dead["ended"]})' if dead.get('ended') else '',
             ' | '.join((dead.get('recent_operations') or [])[-5:]) or 'none',
             lifecycle.log_directory())
+    # Plan 35 CR8: graphics safe mode for this start -- asked for with
+    # --safe-mode, chosen on the last start's crash notice, or after two
+    # render-attributed deaths in a row. Decided before Qt reads QT_OPENGL.
+    graphics = safe_mode.decide(sys.argv, dead_sessions,
+                                lifecycle.log_directory())
+    safe_mode.apply_environment(graphics)
+    if graphics.active:
+        logger.warning('Graphics safe mode: %s', graphics.reason)
+        lifecycle.record(f'graphics safe mode: {graphics.reason}')
+    if crash_helper.start(lifecycle.log_directory()) is None:
+        logger.info('No crash helper this session; a native crash leaves '
+                    'faulthandler.log only.')
+    qt_messages.install()
     os.environ['LC_NUMERIC'] = 'C'
     _claim_windows_taskbar_identity()
     application = QApplication(sys.argv)
@@ -176,6 +236,15 @@ def main():
     app.applyLanguage()
 
     app.window = MainWindow()
+    # CR1: the GUI thread's heartbeat, and a status-bar note after a stall.
+    watchdog.start(lifecycle.watchdog_log_path(), app.window)
+    if dead_sessions:
+        # CR0 step 6: a non-modal banner naming the session that died.
+        app.window.showPreviousCrash(dead_sessions)
+    # Plan 35 CR3: freeze the start-up heap and steer the cyclic collector
+    # onto the GUI thread before any project object exists.
+    from foammesh.support import gc_policy
+    gc_policy.startup_complete()
 
     async def bootstrap():
         # First paint and event processing happen before environment probes,
@@ -192,6 +261,8 @@ def main():
         if found is not None:
             app.window.statusBar().showMessage(QApplication.translate(
                 'main', f'Using {found.describe()}.'), 10000)
+        # Plan 35 CR6: probe at start and every minute while idle, off-thread.
+        app.startWslHealth()
         mpi = await asyncio.to_thread(app.capabilities.utility, 'mpirun')
         if not mpi.available:
             message = QApplication.translate(
@@ -217,6 +288,8 @@ def main():
         loop.run_forever()
 
     lifecycle.record('event loop returned; exiting with code 0')
+    watchdog.stop()
+    crash_helper.stop()
     loop.close()
     Analytics().shutdown(final=True)
     return 0

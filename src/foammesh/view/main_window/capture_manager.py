@@ -61,7 +61,10 @@ class CaptureManager(QObject):
 
         ensure_captures_dir(root)
         image, sidecar = capture_paths(root, stamp or new_stamp())
-        self._view.saveScreenshot(str(image), scale=scale)
+        if self._view.saveScreenshot(str(image), scale=scale) is False:
+            # Plan 35 CR8: the view is not drawing (safe mode, a driver
+            # reset, a render hold); no image, so no record of one.
+            return None
         write_record(sidecar, self.buildRecord(image.name, label))
         self.captured.emit(str(image))
         return image

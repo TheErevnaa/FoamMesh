@@ -17,7 +17,7 @@ import logging
 import hashlib
 import json
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
@@ -46,6 +46,12 @@ BRANCH_PAGES: dict[str, dict] = {
 }
 
 _STATE_SEPARATOR = ' — '
+
+#: States in which a check has an answer, so an older "could not run" no
+#: longer describes it.
+_CHECK_ANSWERED = frozenset({
+    TaskState.PASSED, TaskState.WARNING, TaskState.COMPLETED,
+    TaskState.SKIPPED})
 
 _STATE_SUFFIX = {
     TaskState.LOCKED: 'locked',
@@ -170,6 +176,30 @@ class EngineBranchView(QWidget):
         self._stateNotice.setWordWrap(True)
         self._stateNotice.setVisible(False)
         layout.addWidget(self._stateNotice)
+
+        # Plan 35 CR2. A check now runs in a worker after the mesh is
+        # published, and its verdict lands later. While it runs the row reads
+        # "checking…" and this line says so with a way to stop it; a check
+        # that could not run says why here, and the task stays runnable.
+        self._checking: dict = {}
+        self._checkFailures: dict = {}
+        self._checkSubscription = None
+        check_row = QHBoxLayout()
+        self._checkNotice = QLabel(self)
+        self._checkNotice.setObjectName('engineBranchCheckNotice')
+        self._checkNotice.setWordWrap(True)
+        self._checkNotice.setVisible(False)
+        self._checkCancel = QPushButton(self.tr('Cancel check'), self)
+        self._checkCancel.setObjectName('engineBranchCheckCancel')
+        self._checkCancel.setAccessibleDescription(self.tr(
+            'Stop the mesh check running in the background. The mesh stays '
+            'published and the check can be run again.'))
+        self._checkCancel.setVisible(False)
+        self._checkCancel.clicked.connect(
+            lambda: self._cancel_running_stage())
+        check_row.addWidget(self._checkNotice, 1)
+        check_row.addWidget(self._checkCancel, 0)
+        layout.addLayout(check_row)
 
         self.tasks = QListWidget(self)
         self.tasks.setObjectName('engineBranchTaskStateModel')
@@ -390,10 +420,15 @@ class EngineBranchView(QWidget):
         # out loud, because the outline is the workflow's memory and a memory
         # that loses entries without saying so cannot be read as a record.
         self._setStateNotice('')
+        self._subscribeToChecks()
         try:
-            snapshot = query(
+            state_payload = query(
                 self._client, 'mesh.workflow.task_state',
-                {'engine_id': engine_id}).payload.get('state') or {}
+                {'engine_id': engine_id}).payload or {}
+            snapshot = state_payload.get('state') or {}
+            self._checking = dict(state_payload.get('checking') or {})
+            self._checkFailures = dict(
+                state_payload.get('check_failures') or {})
         except Exception:                                    # noqa: BLE001
             self._setStateNotice(self.tr(
                 'Saved task progress for this engine could not be read, so '
@@ -451,6 +486,11 @@ class EngineBranchView(QWidget):
             except Exception:
                 continue
             suffix = _STATE_SUFFIX.get(state, '')
+            if task_id in self._checking:
+                suffix = self.tr('checking…')
+            elif (task_id in self._checkFailures
+                  and state not in _CHECK_ANSWERED):
+                suffix = self.tr('check not run')
             base = item.text().split(_STATE_SEPARATOR)[0]
             item.setText(f'{base}{_STATE_SEPARATOR}{suffix}' if suffix else base)
             flags = item.flags()
@@ -458,6 +498,62 @@ class EngineBranchView(QWidget):
                 item.setFlags(flags & ~Qt.ItemFlag.ItemIsEnabled)
             else:
                 item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled)
+
+        self._showCheckNotice()
+
+    def _showCheckNotice(self) -> None:
+        """Say which checks are running, or why one could not (Plan 35 CR2)."""
+        titles = self.taskTitles()
+        if self._checking:
+            names = ', '.join(titles.get(task, task)
+                              for task in sorted(self._checking))
+            text = self.tr('Checking the mesh in the background: {0}. The '
+                           'mesh is published and usable meanwhile.').format(
+                               names)
+        elif self._checkFailures:
+            text = ' '.join(
+                self.tr('{0} could not run ({1}): {2} Run it again when '
+                        'ready.').format(
+                    titles.get(task, task),
+                    failure.get('reason') or failure.get('code') or 'error',
+                    failure.get('message') or '')
+                for task, failure in sorted(self._checkFailures.items()))
+        else:
+            text = ''
+        self._checkNotice.setText(text)
+        self._checkNotice.setVisible(bool(text))
+        self._checkCancel.setVisible(bool(self._checking))
+
+    def _subscribeToChecks(self) -> None:
+        """Repaint when a background check lands (Plan 35 CR2)."""
+        subscribe = getattr(self._client, 'subscribe', None)
+        if not callable(subscribe):
+            return
+        try:
+            session = self._client.session()
+        except Exception:                                    # noqa: BLE001
+            return
+        if self._checkSubscription is session:
+            return
+        from foammesh.core.project import Event
+
+        def landed(*_args, **_kwargs):
+            # Delivered from the loop; repaint from the Qt queue.
+            QTimer.singleShot(0, self._checksLanded)
+
+        try:
+            subscribe(Event.ARTIFACT_QUALITY_CHANGED, landed)
+        except Exception:                                    # noqa: BLE001
+            logger.debug('check results will show on the next refresh',
+                         exc_info=True)
+            return
+        self._checkSubscription = session
+
+    def _checksLanded(self) -> None:
+        try:
+            self.refresh_states()
+        except RuntimeError:
+            pass                           # the branch was deleted meanwhile
 
     def _refresh_page_status(self) -> None:
         """Tell the visible page that the graph moved under it.

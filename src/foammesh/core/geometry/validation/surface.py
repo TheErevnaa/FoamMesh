@@ -220,6 +220,20 @@ def tessellate_cad(cad_path: str | Path, deflection: float, *,
     # written into the reference as a reason string, so every CAD-backed case
     # reported "no reference for section" instead of failing loudly, and no
     # test caught it because every test substitutes `tessellator`.
+    from foammesh.core.geometry.cad import worker_client
+
+    if not worker_client.in_worker():
+        # Plan 35 CR7: OCCT re-facets the reference in a worker.
+        with worker_client.call(
+                'cad.tessellate_file',
+                {'cad_path': str(Path(cad_path).resolve()),
+                 'deflection': float(deflection),
+                 'angular_deflection_deg': float(angular_deflection_deg)},
+                label='CAD reference tessellation',
+                source=cad_path) as answer:
+            surface = answer['tessellation']
+            return worker_client.read_polydata(
+                surface['path'], surface['sha256'])
     from foammesh.core.geometry.cad.cad_importer import read_shape
     from foammesh.core.geometry.cad.tessellate import (
         TessellationParams, tessellate,

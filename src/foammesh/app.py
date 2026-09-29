@@ -53,12 +53,19 @@ class App(QObject):
 
         self._qApplication: Optional[QApplication] = None
         self._themeManager = None
-        self._jobManager = JobManager(self._events)
+        # Plan 35 CR6. Disabled until `startWslHealth`, which main() calls
+        # once the window is up; until then no job probes the runtime.
+        from foammesh.core.jobs.wsl_health import WslHealth
+        self._wslHealth = WslHealth()
+        self._wslHealth.subscribe(self._publishWslHealth)
+        self._wslHealth.on_recovered(self._afterWslRecovered)
+        self._jobManager = JobManager(self._events, health=self._wslHealth.for_argv)
         self._selectionService = SelectionService()
         self._capabilities = CapabilityRegistry()
         self._facade = FoamMeshFacade(capabilities=self._capabilities)
         self._caseSession = None
         self._facadeClient = DesktopFacadeClient(self._facade, lambda: self._caseSession)
+        self._facadeClient.on_action = self._wslHealth.note_user_action
 
     @property
     def settings(self) -> 'AppSettings':
@@ -190,6 +197,40 @@ class App(QObject):
         # Gmsh runs in the same distribution, so it follows the same setting.
         from foammesh.core.gmsh.launch_profiles import use_runtime
         use_runtime(runtime['wsl_distro'], runtime['wsl_user'])
+        # CR6: the health banner watches the distribution the runtime is in.
+        self._wslHealth.configure(runtime['wsl_distro'])
+
+    # -- plan 35 CR6: WSL health ------------------------------------------ #
+
+    @property
+    def wslHealth(self):
+        return self._wslHealth
+
+    def startWslHealth(self):
+        """Probe the runtime now and every minute while idle (needs the loop)."""
+        return self._wslHealth.start()
+
+    def _publishWslHealth(self, snapshot):
+        self._events.publish(Event.WSL_HEALTH_CHANGED, **snapshot)
+
+    async def _afterWslRecovered(self, _monitor):
+        """The runtime is back: forget what was probed and ask again, off-thread.
+
+        Clearing the caches is cheap and stays here, where the capability
+        listeners (Qt) may run; the re-probe itself -- a WSL round trip -- goes
+        to a worker thread.
+        """
+        import asyncio
+        import logging
+        self._capabilities.refresh()
+        forget = getattr(getattr(self._facade, 'domain', None), 'forget_runtime_probes', None)
+        if forget is not None:
+            forget()
+        try:
+            await asyncio.to_thread(self._capabilities.utility, 'mpirun')
+        except Exception:  # noqa: BLE001 - the next question asks again
+            logging.getLogger(__name__).warning(
+                'capability re-probe after WSL recovery failed', exc_info=True)
 
     def findOpenFoamRuntime(self):
         """Look through WSL for OpenFOAM 13 and Gmsh; blocking, so off the GUI thread.
@@ -355,6 +396,51 @@ class App(QObject):
             self._project.path, self._project.state(), storage_path=self._project.storagePath,
             jobs=self._jobManager)
         self._facade.attach(self._caseSession)
+        self._sweepRunRecords(self._project.path)
+
+    def _sweepRunRecords(self, case_path):
+        """Plan 35 CR5 step 6: resolve runs a previous session left open.
+
+        Off the GUI thread; the executor's gate repeats this before any run,
+        so this only gets the restore done before the user asks for one.
+        """
+        import asyncio
+        import logging
+        from foammesh.core.jobs.run_records import run_directory, sweep_case
+        logger = logging.getLogger(__name__)
+        if not run_directory(case_path).is_dir():
+            return
+        active = tuple(getattr(self._jobManager, 'active_job_ids', ()) or ())
+
+        def report(verdict):
+            if verdict.closed:
+                logger.info('recovered %d interrupted run(s) in %s: %s',
+                            len(verdict.closed), case_path, ', '.join(verdict.closed))
+            if verdict.blocked:
+                logger.warning('case %s: %s', case_path, verdict.message)
+            if verdict.closed or verdict.blocked:
+                self._events.publish(
+                    Event.OPERATION_RECOVERED, operation='run.sweep', recovery_id=None,
+                    job_id=None, runs=list(verdict.closed), gate=verdict.to_dict())
+
+        async def sweep():
+            try:
+                report(await asyncio.to_thread(sweep_case, case_path, active_run_ids=active))
+            except Exception:  # noqa: BLE001 - the executor's gate still guards runs
+                logger.exception('run-record sweep failed for %s', case_path)
+        try:
+            asyncio.get_running_loop().create_task(sweep())
+        except RuntimeError:
+            import threading
+
+            def run():
+                try:
+                    verdict = sweep_case(case_path, active_run_ids=active)
+                    if verdict.closed or verdict.blocked:
+                        logger.info('run-record sweep for %s: %s', case_path, verdict.to_dict())
+                except Exception:  # noqa: BLE001
+                    logger.exception('run-record sweep failed for %s', case_path)
+            threading.Thread(target=run, name='foammesh-run-sweep', daemon=True).start()
 
     def closeProject(self):
         closing = self._project.path if self._project else None

@@ -17,16 +17,18 @@ from foammesh.core.mesh.msh_scene import MshSceneError, read_msh_scene
 from foammesh.core.mesh.presentation import (
     ENCLOSURE_OPACITY, VOLUME_DEPTH_BIAS, artifact_kind, display_mode_name,
     enclosing_part_ids, hides_geometry, summary_text)
-from foammesh.core.mesh.poly_mesh_reader import PolyMeshLoader
+from foammesh.core.mesh.mesh_preview import estimated_cells
+from foammesh.core.mesh.poly_mesh_reader import MeshPreviewLoader
 from foammesh.core.run_result import GMSH_MSH, GMSH_SURFACE_MSH, POLY_MESH
 from foammesh.rendering.actor_info import ActorInfo, BoundaryActor, DisplayMode, MeshActor, MeshQualityIndex
 from foammesh.rendering.actor_info import ActorType
 from foammesh.view.main_window.actor_manager import ActorManager
 from foammesh.core.quality import extract_selected_cells
 from PySide6.QtGui import QColor
-from foammesh.view.facade_client import query
+from foammesh.view.facade_client import query_async
 from foammesh.core.quality.geometry_fidelity import live_distance
 from foammesh.support.colormap import deviationLut
+from foammesh.support import gc_policy
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,43 @@ logger = logging.getLogger(__name__)
 #: DP-714. How opaque the surfaces are while the poor cells are coloured:
 #: enough to keep the model's shape, little enough to see the cells inside.
 QUALITY_SEE_THROUGH_OPACITY = 0.3
+
+
+def _closeProgress(dialog):
+    """Close a load's progress dialog and let Qt delete it (Plan 35 F16).
+
+    Every load made a parented dialog and only closed it, so each one lived
+    on as a hidden child of the main window: one leaked per mesh load.
+    """
+    dialog.close()
+    deleteLater = getattr(dialog, 'deleteLater', None)
+    if callable(deleteLater):
+        deleteLater()
+
+
+def _disposeLoader(loader):
+    dispose = getattr(loader, 'dispose', None)
+    if callable(dispose):
+        dispose()
+
+
+def _previewOf(loader) -> dict:
+    """What a preview loader said besides the scene (Plan 35 CR3).
+
+    Read through ``getattr``: a stand-in loader that only returns a scene
+    says nothing more, and draws the way the old reader did.
+    """
+    return {'counts': getattr(loader, 'counts', None),
+            'patchFaces': dict(getattr(loader, 'patchFaces', None) or {}),
+            'precomputed': getattr(loader, 'precomputed', None) or {},
+            'outline': getattr(loader, 'outline', None),
+            'notice': getattr(loader, 'notice', None),
+            'shown': getattr(loader, 'shown', '')}
+
+
+def _swapScene():
+    """The old scene has been disposed; reap what it left, on this thread."""
+    gc_policy.collect_full('scene swap')
 
 
 class MeshManager(ActorManager):
@@ -46,6 +85,10 @@ class MeshManager(ActorManager):
     #: DP-96: emitted on every load and on every unload, so the line
     #: cannot outlive the mesh it describes the way the cell count did.
     meshSummaryChanged = Signal(str)
+    #: Plan 35 CR3. What to say about the picture: a decimated or surface-only
+    #: preview, or the outline drawn in place of one that was not built.
+    #: ``dict`` (see ``MeshPreviewLoader.notice``) or None to clear it.
+    previewNoticeChanged = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -96,6 +139,12 @@ class MeshManager(ActorManager):
         # refusal `read_msh_scene` exists to make.
         self._surfaceOnly = False
         self._summary = ''
+        # Plan 35 CR3. The counts of the mesh behind a surface preview: with
+        # no volume on screen, the cells and points come from the headers,
+        # and a decimated patch is not its mesh's face count.
+        self._previewCounts = None
+        self._patchFaces: dict[str, int] = {}
+        self._previewNotice = None
 
         self._name = 'Mesh'
 
@@ -192,10 +241,12 @@ class MeshManager(ActorManager):
             return 'ready'
 
         try:
-            result = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: query(
-                    app.facadeClient, 'quality.cell_fields',
-                    {'include_values': True}))
+            # Plan 35 CR2: the arrays are computed in a worker process, and
+            # awaited here on the loop rather than parsed in a thread of
+            # this one.
+            result = await query_async(
+                app.facadeClient, 'quality.cell_fields',
+                {'include_values': True})
         except Exception:                                          # noqa: BLE001
             logger.debug('per-cell quality fields unavailable', exc_info=True)
             return 'failed'
@@ -330,6 +381,7 @@ class MeshManager(ActorManager):
         # pass re-read as a volume would refuse, and the mesh a user was
         # looking at would come off the screen on a reload.
         self._surfaceOnly = bool(surface_only)
+        self._setPreview({})
 
         progressDialog = ProgressDialog(app.window, self.tr('Loading mesh'))
         progressDialog.setLabelText(self.tr('Loading mesh…'))
@@ -358,23 +410,33 @@ class MeshManager(ActorManager):
             self.cellCountChanged.emit(0, 0)
             return f'{Path(path).name}: {error}'
         finally:
-            progressDialog.close()
+            _closeProgress(progressDialog)
 
         if generation != self._load_generation:
             return ''
+        # Plan 35 CR3 step 5. `clear` disposes every actor of the old scene
+        # here, on the GUI thread, and the collection that follows reaps
+        # what it leaves before the new scene is built.
         self.clear()
+        _swapScene()
         self._visibility = True
         self._buildScene(scene.vtk_mesh, hidden)
         return ''
 
     async def load(self, time: int, root=None, artifact_id: str = '',
-                   stage: str = ''):
+                   stage: str = '', *, previewMode: str = 'auto',
+                   buildAnyway: bool = False):
         """Draw time ``time`` of the case at ``root`` (the project by default).
 
         ``root`` is a case directory -- the thing that holds ``constant/
         polyMesh`` -- not the polyMesh itself, because that is what the reader
         opens. It exists so a run's own result can be drawn without publishing
         it to the project first (F-37).
+
+        Plan 35 CR3. The picture is built in a worker (``MeshPreviewLoader``):
+        the boundary surface by default, the volume too below 200k cells or
+        when ``previewMode`` is ``'volume'`` ("Load full volume").
+        ``buildAnyway`` is the user overriding a refusal on memory.
         """
         assert time >= 0
 
@@ -424,27 +486,98 @@ class MeshManager(ActorManager):
         # Asked of the class: it needs no state of this manager.
         seeds = MeshManager._regionSeeds()
         options = {'regionSeeds': seeds} if seeds else {}
-        self._loader = PolyMeshLoader(self._root / 'case.foam', **options)
-        self._loader.progress.connect(progressDialog.setLabelText)
+        if previewMode != 'auto':
+            options['mode'] = previewMode
+        if buildAnyway:
+            options['buildAnyway'] = True
+        self._loader = MeshPreviewLoader(self._root / 'case.foam', **options)
+        loader = self._loader
+        loader.progress.connect(progressDialog.setLabelText)
 
         self._readStarted()
+        finished = False
         try:
-            vtkMesh = await self._loader.loadMesh(self._time)
+            vtkMesh = await loader.loadMesh(self._time)
+            preview = _previewOf(loader)
+            finished = True
         except Exception:
+            finished = True
             # DP-128. A read that failed leaves nothing to swap in, so the
             # scene that was standing in for it comes down.
             self.clear()
             raise
         finally:
             self._readFinished()
-            progressDialog.close()
+            _closeProgress(progressDialog)
+            # Plan 35 CR3. The reader caches a whole copy of the mesh; it
+            # goes as soon as the read is over. Not on a cancellation: the
+            # read may still be running on the VTK thread.
+            if finished:
+                _disposeLoader(loader)
+                if self._loader is loader:
+                    self._loader = None
         if generation != self._load_generation:
             # Superseded mid-read. Leave the scene alone: the load that
             # overtook this one owns what is on screen now.
             return
+        if previewMode == 'volume' and preview['shown'] == 'outline' \
+                and self._actorInfos:
+            # "Load full volume" refused: the surface on screen stays, and
+            # the notice says why the volume is not there.
+            notice = dict(preview['notice'] or {})
+            notice.update(kind='volume_refused', actions=[], patches=[])
+            self._previewNotice = notice
+            self.previewNoticeChanged.emit(notice)
+            return
+        # Plan 35 CR3 step 5 -- see `loadNative`.
         self.clear()
+        _swapScene()
         self._visibility = True
-        self._buildScene(vtkMesh, hidden)
+        self._setPreview(preview)
+        self._buildScene(vtkMesh, hidden, precomputed=preview['precomputed'],
+                         outline=preview['outline'])
+        self.previewNoticeChanged.emit(self._previewNotice)
+
+    def _setPreview(self, preview: dict):
+        self._previewCounts = preview.get('counts')
+        self._patchFaces = dict(preview.get('patchFaces') or {})
+        self._previewNotice = preview.get('notice')
+        if not preview:
+            self.previewNoticeChanged.emit(None)
+
+    def previewNotice(self):
+        """What the viewport says about its picture (Plan 35 CR3), or None."""
+        return self._previewNotice
+
+    def _previewCells(self) -> int:
+        return int(estimated_cells(self._previewCounts) or 0)
+
+    async def retryPreview(self):
+        """Build the preview again, the default way."""
+        if self._time is None or self._nativePath is not None:
+            return
+        await self.load(self._time, root=self._root,
+                        artifact_id=self._artifactId, stage=self._stage)
+
+    async def buildPreviewAnyway(self):
+        """Build the preview with the budget raised to 90% of the machine.
+
+        The caller has already warned the user: the worker may take most of
+        the memory there is, and the rest of the machine will page.
+        """
+        if self._time is None or self._nativePath is not None:
+            return
+        await self.load(self._time, root=self._root,
+                        artifact_id=self._artifactId, stage=self._stage,
+                        buildAnyway=True)
+
+    async def loadFullVolume(self):
+        """Read the volume too (up to 5 M cells / 1 GB), in the worker."""
+        if self._time is None or self._nativePath is not None:
+            return
+        await self.load(self._time, root=self._root,
+                        artifact_id=self._artifactId, stage=self._stage,
+                        previewMode='volume')
 
     @staticmethod
     def _regionSeeds() -> list:
@@ -498,7 +631,8 @@ class MeshManager(ActorManager):
         """The read barrier a mutating job awaits before it starts."""
         await self._readsIdle.wait()
 
-    def _buildScene(self, vtkMesh, hidden=frozenset()):
+    def _buildScene(self, vtkMesh, hidden=frozenset(), precomputed=None,
+                    outline=None):
         """Turn one loaded mesh into actors, whichever reader produced it.
 
         The polyMesh reader and the native ``.msh`` reader hand over the same
@@ -507,7 +641,22 @@ class MeshManager(ActorManager):
         selection. A native Gmsh mesh's physical groups arrive as the boundary
         entries here, which is what makes its patches pickable and hideable
         independently of the volume.
+
+        Plan 35 CR3. ``precomputed`` maps ``(region, category, name)`` to the
+        surface and feature edges the preview worker already computed for
+        that part, so the actor's own filters do not run on first paint
+        (step 10). ``outline`` is the bounding box drawn when no preview could
+        be built; it is not a patch.
         """
+        precomputed = precomputed or {}
+
+        def _adopt(actor, key):
+            parts = precomputed.get(key)
+            use = getattr(actor, 'usePrecomputed', None)
+            if parts and use is not None:
+                use(surface=parts.get('surface'), edges=parts.get('edges'))
+            return actor
+
         # DP-713. A new scene carries no deviation colouring, so neither
         # does what describes it.
         self._deviation = None
@@ -527,7 +676,8 @@ class MeshManager(ActorManager):
                 for bname, polyData in region['boundary'].items():
                     actor_id = f'{prefix}{bname}'
                     display = f'{rname}/{bname}' if rname else bname
-                    self.add(BoundaryActor(polyData, actor_id, display))
+                    self.add(_adopt(BoundaryActor(polyData, actor_id, display),
+                                    (rname, 'boundary', bname)))
                     patch_ids.append(actor_id)
                     # Not every reader hands over a vtkPolyData; one
                     # that cannot say where it is simply does not
@@ -551,7 +701,9 @@ class MeshManager(ActorManager):
                 # behind and nothing to bias away from it.
                 internal = region['internalMesh']
                 if internal is not None:
-                    internal_actor = MeshActor(internal, internal_id, display)
+                    internal_actor = _adopt(
+                        MeshActor(internal, internal_id, display),
+                        (rname, 'internalMesh', ''))
                     # DP-141. That same coincidence is also a depth fight: the
                     # volume's exterior surface and the patches are the same
                     # faces, reaching the renderer through two different
@@ -583,7 +735,9 @@ class MeshManager(ActorManager):
                         actor_type = (
                             BoundaryActor if category == 'faceZones'
                             else MeshActor)
-                        self.add(actor_type(data_set, actor_id, display))
+                        self.add(_adopt(
+                            actor_type(data_set, actor_id, display),
+                            (rname, category, zone_name)))
                         (region_part_ids if category == 'regions'
                          else zone_ids).append(actor_id)
                         region_ids[rname].append(actor_id)
@@ -591,6 +745,9 @@ class MeshManager(ActorManager):
         self._patchIds = patch_ids
         self._zoneIds = zone_ids
         self._regionPartIds = region_part_ids
+        if outline is not None:
+            self.add(BoundaryActor(outline, 'meshOutline',
+                                   self.tr('Mesh outline')))
         self._assignPalettes()
         self._fadeEnclosures(patch_bounds, volume_of)
         for key in set(hidden) & set(self._actorInfos):
@@ -645,8 +802,15 @@ class MeshManager(ActorManager):
         are the interface between the two volumes, which is interior. Only
         the patches are counted.
         """
+        if self._patchFaces and not self._patchIds:
+            # No preview was built: the counts come from the boundary file.
+            return int(sum(self._patchFaces.values()))
         total = 0
         for actor_id in self._patchIds:
+            if actor_id in self._patchFaces:
+                # CR3: a decimated patch is not its mesh's face count.
+                total += self._patchFaces[actor_id]
+                continue
             actorInfo = self._actorInfos.get(actor_id)
             if not isinstance(actorInfo, BoundaryActor):
                 continue
@@ -671,6 +835,8 @@ class MeshManager(ActorManager):
                 count = getattr(dataSet() if dataSet else None,
                                 'GetNumberOfPoints', None)
                 return int(count()) if count is not None else 0
+        if self._previewCounts:
+            return int(self._previewCounts.get('points') or 0)
         return 0
 
     def _presentArtifact(self):
@@ -714,6 +880,16 @@ class MeshManager(ActorManager):
             if hide is not None:
                 hide()
 
+    def dispose(self):
+        """Release the whole scene for good -- a project closing (Plan 35 CR3).
+
+        A load still in flight keeps its own loader and disposes it when its
+        read ends; bumping the generation makes it build nothing afterwards.
+        """
+        self._load_generation += 1
+        self._loader = None
+        super().dispose()
+
     def unload(self):
         # A failed-cell overlay belongs to a specific mesh/result pair; never
         # let it survive a case/mesh unload and reappear over different data.
@@ -729,6 +905,7 @@ class MeshManager(ActorManager):
         self._stage = ''
         self._surfaceOnly = False
         self._summary = ''
+        self._setPreview({})
         self.meshSummaryChanged.emit('')
         # R87. The toolbar kept the last number it was handed: `36,533 cells`
         # was still on screen after a Base Grid reset had deleted
@@ -779,7 +956,8 @@ class MeshManager(ActorManager):
             if isinstance(actorInfo, MeshActor):
                 return actorInfo.getNumberOfDisplayedCells()
 
-        return 0
+        # CR3: a surface preview has no volume to cut; all of it is shown.
+        return self._previewCells()
 
     def getNumberOfCells(self) -> int:
         """Every cell in the loaded volume, section plane or not.
@@ -801,7 +979,8 @@ class MeshManager(ActorManager):
                 count = getattr(actorInfo.dataSet(), 'GetNumberOfCells', None)
                 return int(count()) if count is not None else 0
 
-        return 0
+        # CR3: the volume of a surface preview is counted from its headers.
+        return self._previewCells()
 
     def meshPartIds(self) -> list[str]:
         """The parts of the mesh: its patches and its zones.

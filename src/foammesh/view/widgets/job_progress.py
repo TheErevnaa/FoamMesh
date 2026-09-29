@@ -26,6 +26,9 @@ class _ActiveJob:
     #: only how long it has been doing it. A surface check once ran for over
     #: seven hours showing nothing but a rising clock.
     stage: str = ''
+    #: Plan 35 CR5 step 1: seconds of silence when the manager asked
+    #: [Keep waiting] / [Stop]; ``None`` while output is flowing.
+    idle_seconds: float | None = None
 
 
 @dataclass
@@ -48,6 +51,17 @@ class JobProgressTracker:
         job = self._jobs.get(job_id)
         if job is not None and message:
             job.stage = str(message)
+
+    def on_idle(self, job_id: str, state: str, idle_seconds: float = 0.0):
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.idle_seconds = float(idle_seconds or 0.0) if state == 'idle' else None
+
+    @property
+    def idle(self) -> bool:
+        job_id = self.current_job_id
+        return bool(job_id and self._jobs[job_id].idle_seconds is not None)
 
     def on_finished(self, job_id: str):
         self._jobs.pop(job_id, None)
@@ -77,6 +91,9 @@ class JobProgressTracker:
             name = f'{name} — {job.stage}'
         if job.cancelling:
             name = f'{name} (cancelling…)'
+        elif job.idle_seconds is not None:
+            minutes = max(1, int(job.idle_seconds // 60))
+            name = f'{name} — no output for {minutes} min'
         others = len(self._jobs) - 1
         return f'{name} (+{others} more)' if others > 0 else name
 
@@ -109,11 +126,16 @@ class JobProgressWidget(QWidget):
         self._label = QLabel()
         self._elapsed = QLabel()
         self._cancel = QPushButton(self.tr('Cancel'))
+        # Plan 35 CR5 step 1: a silent job is asked about, never killed.
+        self._keepWaiting = QPushButton(self.tr('Keep waiting'))
+        self._keepWaiting.hide()
         self._showLog = QPushButton(self.tr('Show log'))
-        for widget in (self._label, self._elapsed, self._cancel, self._showLog):
+        for widget in (self._label, self._elapsed, self._keepWaiting, self._cancel,
+                       self._showLog):
             layout.addWidget(widget)
 
         self._cancel.clicked.connect(self._cancelCurrent)
+        self._keepWaiting.clicked.connect(self._keepWaitingCurrent)
         self._showLog.clicked.connect(show_log)
 
         self._timer = QTimer(self)
@@ -124,6 +146,7 @@ class JobProgressWidget(QWidget):
             events.subscribe(Event.JOB_STARTED, self._onStarted),
             events.subscribe(Event.JOB_PROGRESS, self._onProgress),
             events.subscribe(Event.JOB_CANCEL_REQUESTED, self._onCancelRequested),
+            events.subscribe(Event.JOB_IDLE, self._onIdle),
             events.subscribe(Event.JOB_FINISHED, self._onFinished),
             events.subscribe(Event.JOB_FAILED, self._onFinished),
             events.subscribe(Event.JOB_CANCELLED, self._onFinished),
@@ -147,6 +170,19 @@ class JobProgressWidget(QWidget):
 
     def _onCancelRequested(self, *, job_id, **_kwargs):
         self._tracker.on_cancel_requested(job_id)
+        self._refresh()
+
+    def _onIdle(self, *, job_id, state='idle', idle_seconds=0.0, **_kwargs):
+        self._tracker.on_idle(job_id, state, idle_seconds)
+        self._refresh()
+
+    def _keepWaitingCurrent(self):
+        job_id = self._tracker.current_job_id
+        if job_id is None:
+            return
+        keep = getattr(self._jobManager, 'keep_waiting', None)
+        if keep is None or not keep(job_id):
+            self._tracker.on_idle(job_id, 'kept_waiting')
         self._refresh()
 
     def _onFinished(self, *, job_id, **_kwargs):
@@ -184,4 +220,7 @@ class JobProgressWidget(QWidget):
         self._label.setText(self._tracker.label())
         self._elapsed.setText(self._tracker.format_elapsed(self._tracker.elapsed_seconds()))
         self._cancel.setEnabled(not self._tracker.cancelling)
+        idle = self._tracker.idle and not self._tracker.cancelling
+        self._keepWaiting.setVisible(idle)
+        self._cancel.setText(self.tr('Stop') if idle else self.tr('Cancel'))
         self.show()

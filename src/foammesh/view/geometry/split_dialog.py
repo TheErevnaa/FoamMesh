@@ -20,6 +20,7 @@ from foammesh.view.theming.status_colors import apply_color_swatch
 from foammesh.view.theming.vtk_theme import rgb
 from foammesh.view.theming.patch_palette import active_palette, slot_colour
 from foammesh.rendering.actor_info import applySurfaceMaterial
+from foammesh.support import disposal
 
 
 def regionPolyData(regionedData, regionId: int):
@@ -127,6 +128,12 @@ class SplitDialog(QDialog):
         self._view = self._ui.renderingView
 
         self._future: Optional[asyncio.Future] = None
+        #: Plan 35 CR3 step 9. What the fields held when the dialog closed.
+        #: The dialog deletes itself on close, and the page reads the angle
+        #: and the smallest piece after it has gone.
+        self._settled: Optional[tuple[float, float]] = None
+        self._disposed = False
+        disposal.track(self, 'SplitDialog')
 
         self._stlImporter = StlImporter()
 
@@ -369,6 +376,8 @@ class SplitDialog(QDialog):
 
     def featureAngle(self) -> float:
         """The angle the user settled on, in degrees."""
+        if self._settled is not None:
+            return self._settled[0]
         return float(self._ui.featureAngleText.text())
 
     def minAreaFraction(self) -> float:
@@ -377,7 +386,20 @@ class SplitDialog(QDialog):
         The field shows a percentage; the geometry artifact store, which
         makes the cut the meshers see, takes a fraction.
         """
+        if self._settled is not None:
+            return self._settled[1]
         return float(self._ui.minAreaText.text()) / 100
+
+    def _settle(self):
+        """Keep the two numbers the page reads once the dialog is gone."""
+        if self._settled is not None:
+            return
+        try:
+            self._settled = (self.featureAngle(), self.minAreaFraction())
+        except (ValueError, RuntimeError):
+            # A field left unparseable; the page is never asked for it,
+            # because only OK leads there and OK needs both.
+            self._settled = None
 
     def show(self) -> asyncio.Future:
         loop = asyncio.get_running_loop()
@@ -388,22 +410,56 @@ class SplitDialog(QDialog):
         return self._future
 
     def _okClicked(self):
-        if not self._future.done():
+        self._settle()
+        if self._future is not None and not self._future.done():
             volumes, surfaces = self._stlImporter.identifyVolumes()
             self._future.set_result((volumes, surfaces))
 
         self.close()
 
     def _cancelClicked(self):
-        if not self._future.cancelled():
+        if self._future is not None and not self._future.cancelled():
             self._future.cancel()
 
         self.close()
 
+    def dispose(self):
+        """Release the preview's actors on the GUI thread, once.
+
+        Plan 35 CR3 step 6 (F6). The preview is a second OpenGL context. Its
+        actors are released against it -- made current first, because the
+        main viewport's is the one usually current -- and taken out of its
+        renderer, before the view finalises the window.
+        """
+        if self._disposed:
+            return
+        self._disposed = True
+        disposal.untrack(self, 'SplitDialog')
+        if app.themeManager is not None:
+            try:
+                app.themeManager.themeChanged.disconnect(self._applyTheme)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+        actors = (self._edgeActor, self._regionActor, self._highlightActor)
+        renderWindow = getattr(self._view, 'renderWindow', None)
+        disposal.release_graphics_resources(
+            actors, renderWindow() if callable(renderWindow) else None)
+        removeActor = getattr(self._view, 'removeActor', None)
+        if callable(removeActor):
+            for actor in actors:
+                removeActor(actor)
+        self._regionedData = None
+
     def closeEvent(self, event):
-        if not self._future.done():
+        self._settle()
+        if self._future is not None and not self._future.done():
             self._future.cancel()
 
+        self.dispose()
+        # The view releases what is left on the GPU and then finalises.
         self._view.close()
 
         event.accept()
+        # F6. The dialog, and the render window inside it, used to live on
+        # as a hidden child of the page after every split.
+        self.deleteLater()

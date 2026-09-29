@@ -201,12 +201,17 @@ class DisplayControl(QObject):
     def add(self, actorInfo):
         if actorInfo.id() in self._items:
             item = self._items[actorInfo.id()]
-            item.actorInfo().setDataSet(actorInfo.dataSet())
+            # Plan 35 CR3 step 10: the new actor's precomputed surface and
+            # outline come across with its data.
+            item.actorInfo().setDataSet(actorInfo.dataSet(), like=actorInfo)
             item.setHidden(False)
 
             actorInfo = item.actorInfo()
         else:
             actorInfo.sourceChanged.connect(self._actorSourceUpdated)
+            silhouetteChanged = getattr(actorInfo, 'silhouetteChanged', None)
+            if silhouetteChanged is not None:
+                silhouetteChanged.connect(self.refreshView)
 
             item = DisplayItem(actorInfo)
             self._items[actorInfo.id()] = item

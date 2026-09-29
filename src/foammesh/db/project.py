@@ -247,6 +247,18 @@ class Project(QObject):
             except (OSError, ValueError):
                 logger.warning('could not read proposals', exc_info=True)
 
+    def autosave(self):
+        """Plan 35 CR9. This project's autosave journal, once a session attached it."""
+        return getattr(self._db, 'autosave', None)
+
     def close(self):
+        # An orderly close: unsaved change sets were saved or declined, so the
+        # journal drops them. An unanswered recovery offer is kept.
+        autosave = self.autosave()
+        if autosave is not None:
+            try:
+                autosave.close(discard=True)
+            except Exception:  # noqa: BLE001 - closing must not fail on the journal
+                logger.warning('could not close the autosave journal', exc_info=True)
         self._settings.releaseLock()
         self._externalBaseline = None

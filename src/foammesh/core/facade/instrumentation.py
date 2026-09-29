@@ -9,11 +9,16 @@ accepted desktop pause.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+
+from foammesh.support.heartbeat import set_last_op
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +27,33 @@ UNATTRIBUTED = 'an unnamed slice'
 OWNER_LOOP_MAX_MS = 20.0
 OWNER_LOOP_P95_MS = 8.0
 P95_MIN_SAMPLES = 20
+
+#: Plan 35 CR1 step 3: when set, every owner-loop slice is appended to this
+#: file as one JSON object per line, so a gate can hold the slices a journey
+#: produced to the I2 budget. Read at import; `record_slices_to` overrides it.
+SLICE_RECORD_ENV = 'FOAMMESH_SLICE_RECORD'
+_slice_record_path: str | None = os.environ.get(SLICE_RECORD_ENV) or None
+_slice_record_lock = threading.Lock()
+
+
+def record_slices_to(path) -> None:
+    """Start (a path) or stop (None) recording owner-loop slices."""
+    global _slice_record_path
+    _slice_record_path = str(path) if path else None
+
+
+def _record_slice(duration_ms: float, context: str | None) -> None:
+    path = _slice_record_path
+    if path is None:
+        return
+    line = json.dumps({'op': context or UNATTRIBUTED,
+                       'duration_ms': round(duration_ms, 3),
+                       'thread': threading.current_thread().name}) + '\n'
+    try:
+        with _slice_record_lock, open(path, 'a', encoding='utf-8') as stream:
+            stream.write(line)
+    except OSError:  # test instrumentation must never break the product
+        logger.debug('could not record slice to %s', path, exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -81,6 +113,8 @@ class OwnerLoopMonitor:
     def record(self, name: str, duration_ms: float, *,
                context: str | None = None) -> None:
         self._series.setdefault(name, _Series()).record(duration_ms)
+        if name == 'owner_loop_slice':
+            _record_slice(duration_ms, context)
         if name == 'owner_loop_slice' and duration_ms > self.budget_max_ms:
             violation = {'metric': name, 'duration_ms': round(duration_ms, 3),
                          'budget_ms': self.budget_max_ms,
@@ -127,6 +161,11 @@ class _Measurement:
         self._started = 0.0
 
     def __enter__(self):
+        if self._context:
+            # Plan 35 CR1: the crash helper reads what was running from the
+            # heartbeat block, so a hang dump or a death names the facade
+            # operation without asking the frozen process.
+            set_last_op(f'facade:{self._context}')
         self._started = self._monitor._clock()
         return self
 

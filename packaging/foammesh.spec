@@ -9,6 +9,11 @@ ROOT = SPEC_DIR.parent
 ICON_ICO = ROOT / 'src' / 'resources' / 'branding' / 'foammesh.ico'
 ICON_ICNS = ROOT / 'src' / 'resources' / 'branding' / 'foammesh.icns'
 VERSION_INFO = ROOT / 'packaging' / 'windows' / 'version_info.txt'
+RUNTIME_HOOK = SPEC_DIR / 'pyi_rth_foammesh_diagnostics.py'
+SRC = ROOT / 'src'
+
+sys.path.insert(0, str(SPEC_DIR))
+import version_resource  # noqa: E402  (packaging/version_resource.py)
 
 BYTECODE_SUFFIXES = frozenset({'.pyc', '.pyo'})
 
@@ -54,6 +59,47 @@ hiddenimports = [
     'vtkmodules.vtkRenderingOpenGL2', 'vtkmodules.vtkInteractionStyle',
 ]
 
+
+def crash_resilience_modules():
+    """Plan 35 CR10: the modules `FoamMesh.exe --crash-helper/--worker` run.
+
+    `main.py` reaches them only through an argv dispatch, and the runtime hook
+    imports `native_capture` by name, so static analysis may not see any of
+    them. They land with CR0/CR2; until then a missing one is reported here
+    and skipped, so the spec still builds. A release build sets
+    FOAMMESH_RELEASE_BUILD=1, and then a missing one stops the build: a 1.1.x
+    installer without the crash helper would collect no evidence (§7).
+    """
+    wanted = {
+        'foammesh.support.crash_helper': SRC / 'foammesh' / 'support' / 'crash_helper.py',
+        'foammesh.support.native_capture': SRC / 'foammesh' / 'support' / 'native_capture.py',
+    }
+    found = [name for name, path in wanted.items() if path.is_file()]
+    missing = [name for name, path in wanted.items() if not path.is_file()]
+    workers = SRC / 'foammesh' / 'workers'
+    if (workers / '__init__.py').is_file():
+        found.append('foammesh.workers')
+        found.extend(f'foammesh.workers.{module.stem}'
+                     for module in sorted(workers.glob('*.py'))
+                     if module.stem != '__init__')
+    else:
+        missing.append('foammesh.workers')
+    if missing:
+        message = ('foammesh.spec: crash-resilience modules not in the tree, '
+                   'so not collected: ' + ', '.join(missing))
+        if os.environ.get('FOAMMESH_RELEASE_BUILD') == '1':
+            raise SystemExit(message + ' (FOAMMESH_RELEASE_BUILD=1)')
+        print('WARNING: ' + message, file=sys.stderr)
+    return found
+
+
+hiddenimports += crash_resilience_modules()
+
+# The exe's version resource is the committed template plus the PySide6 and
+# VTK versions of this build (packaging/version_resource.py).
+BUILD_VERSION_INFO = (version_resource.write(VERSION_INFO, Path(workpath))
+                      if sys.platform == 'win32' else None)
+
 a = Analysis(
     [str(ROOT / 'src' / 'foammesh' / 'main.py')],
     pathex=[str(ROOT / 'src'), str(ROOT / 'vendor')],
@@ -62,7 +108,8 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # Runs before PyInstaller's own hooks and before main.py (Plan 35 CR10).
+    runtime_hooks=[str(RUNTIME_HOOK)],
     excludes=['PyQt5', 'PyQt6', 'IPython', 'pytest', 'sphinx', 'torch'],
     noarchive=False,
 )
@@ -76,12 +123,15 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # Plan 35 CR10 (F14): no UPX anywhere. UPX-packed Qt/VTK DLLs draw
+    # antivirus interference and odd loader faults, and a packed module makes
+    # a minidump harder to symbolise.
+    upx=False,
     console=False,
     icon=str(ICON_ICO) if sys.platform == 'win32' else None,
-    version=str(VERSION_INFO) if sys.platform == 'win32' else None,
+    version=str(BUILD_VERSION_INFO) if sys.platform == 'win32' else None,
 )
-bundle = COLLECT(exe, a.binaries, a.datas, strip=False, upx=True,
+bundle = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False,
                  upx_exclude=[], name='FoamMesh')
 if sys.platform == 'darwin':
     app = BUNDLE(

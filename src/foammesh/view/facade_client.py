@@ -31,6 +31,14 @@ class DesktopFacadeClient:
         self._facade = facade
         self._session_provider = session_provider
         self._actor = Actor(actor_id, ActorKind.HUMAN)
+        #: Plan 35 CR6. Called (never awaited) for every write the window
+        #: sends: the WSL health monitor probes on the next user action.
+        self.on_action: Callable | None = None
+        #: Plan 35 CR6. ``async (operation, result, offer) -> action | None``:
+        #: asked when a meshing run fails in a way that may be retried
+        #: (transport, out of memory). The window installs a prompt; without
+        #: one nothing is ever retried.
+        self.retry_prompt: Callable | None = None
 
     # -- identity ---------------------------------------------------------- #
 
@@ -93,6 +101,11 @@ class DesktopFacadeClient:
         # post-mortem needs is the last thing the user set in motion.
         if not self._is_query(operation):
             lifecycle.note_operation(operation)
+            if self.on_action is not None:
+                try:
+                    self.on_action()
+                except Exception:                            # noqa: BLE001
+                    pass
         return Command(operation, case_id, parameters, self._actor, CommandSource.GUI,
                        scope=scope, expected_revision=expected_revision)
 
@@ -217,6 +230,21 @@ class DesktopFacadeClient:
                 'use run_sync() or the asynchronous run().')
         return self._facade.execute_sync(self._command(operation, parameters or {}))
 
+    async def query_async(self, operation: str,
+                          parameters: dict | None = None) -> OperationResult:
+        """A read whose handler awaits -- a check run in a worker (Plan 35 CR2).
+
+        Same rule as :meth:`query`: only a query. It is awaited on the loop,
+        so the window keeps drawing while the worker measures.
+        """
+        kind = self._facade.operation_kind(operation)
+        if getattr(kind, 'value', str(kind)) != 'query':
+            raise RuntimeError(
+                f'{operation} is a {getattr(kind, "value", kind)}, not a query: '
+                'use the asynchronous run().')
+        return await self._facade.execute(
+            self._command(operation, parameters or {}))
+
     async def cancel_active_jobs(self) -> OperationResult:
         """Stop whatever this case is running, from any progress surface.
 
@@ -236,7 +264,41 @@ class DesktopFacadeClient:
         """
         result = await self._facade.execute(self._command(operation, parameters or {}))
         self._resync_external_baseline()
-        return result
+        return await self._offer_retry(operation, parameters or {}, result)
+
+    #: The runs a failure may offer [Retry] for (Plan 35 CR6).
+    RETRYABLE_OPERATIONS = frozenset({
+        'workflow.run_stage', 'workflow.run_pipeline', 'mesh.gmsh.run'})
+
+    async def _offer_retry(self, operation: str, parameters: dict,
+                           result: OperationResult) -> OperationResult:
+        """Plan 35 CR6. Ask once whether a retryable failure is run again.
+
+        The failed attempt's snapshot is already restored by the executor, so
+        the retry starts where the failed one did. The retry carries
+        ``retry_attempt`` and so offers nothing itself: a run is retried at
+        most once. Whatever the user chose, the result returned is the last
+        attempt's, and the usual failure reporting reads it.
+        """
+        prompt = self.retry_prompt
+        if prompt is None or operation not in self.RETRYABLE_OPERATIONS:
+            return result
+        if getattr(result, 'status', '') != 'failed':
+            return result
+        offer = (getattr(result, 'payload', None) or {}).get('retry')
+        if not isinstance(offer, dict) or not offer.get('actions'):
+            return result
+        from foammesh.core.jobs.retry import retry_parameters
+        try:
+            action = await prompt(operation, result, offer)
+        except Exception:                                   # noqa: BLE001
+            return result
+        if not action:
+            return result
+        retried = retry_parameters(parameters, action, offer)
+        again = await self._facade.execute(self._command(operation, retried))
+        self._resync_external_baseline()
+        return again
 
     # -- queries ----------------------------------------------------------- #
 
@@ -292,6 +354,22 @@ def query(client, operation: str, parameters: dict | None = None) -> OperationRe
     if reader is None:
         return client.run_sync(operation, parameters or {})
     return reader(operation, parameters or {})
+
+
+async def query_async(client, operation: str,
+                      parameters: dict | None = None) -> OperationResult:
+    """:func:`query` for a read that runs in a worker (Plan 35 CR2).
+
+    A client with ``query_async`` awaits it on the loop; a test double that
+    only answers synchronously is called in a thread, as the caller did
+    before.
+    """
+    import asyncio
+
+    reader = getattr(client, 'query_async', None)
+    if reader is not None:
+        return await reader(operation, parameters or {})
+    return await asyncio.to_thread(query, client, operation, parameters)
 
 
 class FailedResult:

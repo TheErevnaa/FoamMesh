@@ -225,9 +225,12 @@ class EngineTaskStateStore:
                         evidence=live)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix('.json.tmp')
-        temporary.write_text(
-            json.dumps(document, indent=2, sort_keys=True) + '\n',
-            encoding='utf-8')
+        # Plan 35 CR9: the bytes are on disk before the rename publishes them,
+        # so a crash leaves the old file or the new one, never an empty one.
+        with open(temporary, 'w', encoding='utf-8') as stream:
+            stream.write(json.dumps(document, indent=2, sort_keys=True) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, self.path)
         return document
 

@@ -241,6 +241,107 @@ def read_failure_cause(log) -> tuple[str, str]:
     return failure_cause(raw.decode('utf-8', errors='replace'))
 
 
+#: Plan 35 CR5 step 3. Signal numbers worth naming, by their POSIX names.
+SIGNAL_NAMES = {1: 'SIGHUP', 2: 'SIGINT', 4: 'SIGILL', 6: 'SIGABRT',
+                7: 'SIGBUS', 8: 'SIGFPE', 9: 'SIGKILL', 11: 'SIGSEGV',
+                13: 'SIGPIPE', 15: 'SIGTERM'}
+
+
+def exit_signal(returncode) -> int:
+    """The signal a return code reports, or 0.
+
+    Both conventions: a shell (which is what runs every mesher inside WSL)
+    reports a signal death as 128 + N, Python's ``subprocess`` as -N. 128
+    exactly is not a signal.
+    """
+    try:
+        code = int(returncode)
+    except (TypeError, ValueError):
+        return 0
+    number = -code if code < 0 else (code - 128 if code > 128 else 0)
+    return number if 0 < number <= 64 else 0
+
+
+def wsl_memory_limit(config_path=None) -> str:
+    """The ``memory`` value of ``%USERPROFILE%\\.wslconfig``, or ``''``."""
+    import os
+    path = Path(config_path) if config_path else (
+        Path(os.environ.get('USERPROFILE') or Path.home()) / '.wslconfig')
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+    section = ''
+    for raw in text.splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1].strip().lower()
+        elif section == 'wsl2' and '=' in line:
+            key, value = (part.strip() for part in line.split('=', 1))
+            if key.lower() == 'memory':
+                return value
+    return ''
+
+
+@dataclass(frozen=True)
+class ExitDecoding:
+    """How a mesher ended, in words, with what the user can do about it."""
+
+    kind: str
+    reason: str
+    signal: str = ''
+    actions: tuple[str, ...] = ()
+    hint: str = ''
+
+    def to_dict(self) -> dict:
+        return {'kind': self.kind, 'reason': self.reason, 'signal': self.signal,
+                'actions': list(self.actions), 'hint': self.hint}
+
+
+def decode_exit(returncode, *, transport_lost: bool = False, log_tail: str = '',
+                wslconfig=None) -> ExitDecoding:
+    """Plan 35 CR5 step 3: one decoder for both engines.
+
+    *transport_lost* means the WSL relay ended without the wrapper's
+    ``FOAMMESH_EXIT`` acknowledgement: ``wsl.exe``'s own code (1, or
+    ``0xffffffff``) is then not the mesher's, and saying "exited with code 1"
+    would be a guess dressed as a fact.
+    """
+    if transport_lost:
+        return ExitDecoding(
+            'transport', 'the connection to WSL was lost', actions=('retry',))
+    try:
+        code = int(returncode)
+    except (TypeError, ValueError):
+        return ExitDecoding('unknown', 'ended without a return code',
+                            actions=('retry',))
+    if code == 0:
+        return ExitDecoding('ok', '')
+    number = exit_signal(code)
+    name = SIGNAL_NAMES.get(number, f'signal {number}' if number else '')
+    if number == 11:
+        return ExitDecoding('segfault', 'crashed (segmentation fault)', name,
+                            ('retry',))
+    if number == 6:
+        cause = failure_cause(log_tail)[0] if log_tail else ''
+        reason = 'aborted' + (f': {cause}' if cause else '')
+        return ExitDecoding('abort', reason, name, ('retry',))
+    if number == 8:
+        return ExitDecoding('fpe', 'floating-point error', name, ('retry',))
+    if number == 9:
+        memory = wsl_memory_limit(wslconfig)
+        limit = (f'the WSL memory limit is {memory} (.wslconfig)' if memory
+                 else 'WSL has its default memory limit (no memory= in .wslconfig)')
+        return ExitDecoding(
+            'oom', f'killed, most likely out of memory in WSL; {limit}', name,
+            ('retry', 'raise_wsl_memory'),
+            'Raise WSL memory: set memory= under [wsl2] in %USERPROFILE%\\.wslconfig, '
+            'then restart WSL; or ask for a coarser mesh.')
+    if number:
+        return ExitDecoding('signal', f'killed by {name}', name, ('retry',))
+    return ExitDecoding('exit', f'exited with code {code}', actions=('retry',))
+
+
 def drawable_root(run_root) -> str:
     """The case root under ``run_root`` the polyMesh loader can open, or ''.
 

@@ -1,0 +1,3 @@
+# Microsoft vc_redist.x64.exe is placed here on the build machine and bundled
+# by FoamMesh.iss (Plan 35 CR10). It is a ~25 MB Microsoft binary: never commit it.
+vc_redist.x64.exe

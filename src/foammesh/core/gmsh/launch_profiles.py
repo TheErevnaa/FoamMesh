@@ -166,25 +166,13 @@ class GmshLaunchProfile:
         exports = ''.join(
             f'export {shlex.quote(key)}={shlex.quote(str(value))}; '
             for key, value in sorted(self.environment.items()))
-        grouped = 'setsid bash -c ' + shlex.quote('exec stdbuf -oL -eL ' + run)
-        script = (
-            f'cd {shlex.quote(runtime_cwd)} && '
-            f'{exports}'
-            f'rm -f {shlex.quote(pid_name)}; '
-            f'{grouped} & child=$!; '
-            f'echo "$child" > {shlex.quote(pid_name)}; '
-            f'wait "$child"; status=$?; '
-            f'rm -f {shlex.quote(pid_name)}; '
-            'exit "$status"'
-        )
-        cleanup = (
-            f'cd {shlex.quote(runtime_cwd)} && '
-            f'if test -s {shlex.quote(pid_name)}; then '
-            f'pid=$(cat {shlex.quote(pid_name)}); '
-            'kill -TERM -- "-$pid" 2>/dev/null || true; '
-            'sleep 1; kill -KILL -- "-$pid" 2>/dev/null || true; '
-            f'rm -f {shlex.quote(pid_name)}; fi'
-        )
+        # Plan 35 CR5. One wrapper for both engines: run report, lifetime
+        # pipe, heartbeat and an exit acknowledged only once no writer is left.
+        from foammesh.core.jobs.wsl_wrapper import cleanup_script, wrapped_script
+        script = wrapped_script(
+            prelude=exports.rstrip().rstrip(';'), runtime_cwd=runtime_cwd,
+            run=run, pid_name=pid_name, token=token)
+        cleanup = cleanup_script(runtime_cwd=runtime_cwd, pid_name=pid_name)
         prefix = self._wsl_prefix()
         return GmshLaunchCommand(
             (*prefix, 'bash', '-c', script),

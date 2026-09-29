@@ -189,8 +189,28 @@ _CONVERT_AND_CENSUS_TAIL = (
     '    gmsh.finalize()\n')
 
 
-def host_available() -> bool:
+def host_installed() -> bool:
+    """True where Gmsh's Python module is installed, found without loading it."""
     return 'gmsh' in sys.modules or importlib.util.find_spec('gmsh') is not None
+
+
+def host_available() -> bool:
+    """True where this process may run Gmsh's Python module itself.
+
+    Plan 35 CR7: only a worker (``FOAMMESH_WORKER=1``) may. Gmsh is native
+    code and the window does not load it; a window-side export goes through
+    the ``export.dataset`` worker, which takes this route when the module is
+    installed and the WSL runtime's otherwise.
+    """
+    return os.environ.get('FOAMMESH_WORKER') == '1' and host_installed()
+
+
+def _no_route_here():
+    """Refuse, outside a worker, a conversion only the host module can run."""
+    require()
+    raise RuntimeError(
+        "Gmsh export runs Gmsh's Python module only in a worker process, and "
+        'no WSL Gmsh runtime is configured to run it from here.')
 
 
 def runtime_profile():
@@ -204,7 +224,7 @@ def runtime_profile():
 
 
 def is_available() -> bool:
-    return host_available() or runtime_profile() is not None
+    return host_installed() or runtime_profile() is not None
 
 
 def unavailable_reason() -> str:
@@ -335,7 +355,7 @@ def convert_with_gmsh(input_mesh, dest) -> Path:
             gmsh.finalize()
     profile = runtime_profile()
     if profile is None:
-        require()
+        _no_route_here()
     return convert_in_runtime(profile, input_mesh, dest)
 
 
@@ -384,7 +404,7 @@ def convert_and_census(input_mesh, dest, *, timeout: float = 900,
         return answered
     profile = runtime_profile()
     if profile is None:
-        require()
+        _no_route_here()
     argv = profile.python_argv(
         _convert_and_census_script(save_all),
         profile.translate_host_path(Path(input_mesh).resolve()),

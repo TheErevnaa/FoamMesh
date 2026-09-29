@@ -59,6 +59,14 @@ class Event:
     JOB_FINISHED = 'job.finished'
     JOB_FAILED = 'job.failed'
     JOB_CANCELLED = 'job.cancelled'
+    #: Plan 35 CR5: a job has been silent past its kind's idle limit (or has
+    #: spoken again, or the user chose to keep waiting). Never a kill.
+    JOB_IDLE = 'job.idle'
+    #: Plan 35 CR6: a wrapped job's transport went silent and a probe decided
+    #: what that means (``state`` is the WSL health state).
+    JOB_TRANSPORT = 'job.transport'
+    #: Plan 35 CR6: the WSL runtime's health changed (the banner reads it).
+    WSL_HEALTH_CHANGED = 'wsl.health_changed'
     OPERATION_STARTED = 'operation.started'
     OPERATION_SUCCEEDED = 'operation.succeeded'
     OPERATION_FAILED = 'operation.failed'

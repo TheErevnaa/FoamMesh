@@ -78,3 +78,22 @@ class PreconditionFailedError(FacadeError):
 class PresentationUnavailableError(FacadeError):
     """A presentation command arrived with no attached desktop rendering session."""
     code = 'presentation_unavailable'
+
+
+class CheckUnavailableError(FacadeError):
+    """A check could not produce a result (Plan 35 CR2).
+
+    Its worker did not start, died, was cancelled or stopped at its deadline.
+    Nothing about the mesh changed: the check can be run again. ``details``
+    carries ``outcome`` (the worker's), ``reason`` and ``retryable``.
+    """
+    code = 'check_unavailable'
+
+
+class CheckOverBudgetError(CheckUnavailableError):
+    """A check was refused before its parse, or stopped at its memory cap.
+
+    ``details`` carries the estimate and the budget it was measured against,
+    so the refusal says how much was needed and how much was free.
+    """
+    code = 'over_budget'

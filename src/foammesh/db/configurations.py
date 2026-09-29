@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+from pathlib import Path
 
 import yaml
 
@@ -15,7 +16,8 @@ from .configurations_schema import (
     migrateDocument,
     schema,
 )
-from .file_db import writeConfigurations, readConfigurations, FileGroup, newFiles
+from .file_db import (writeConfigurations, readConfigurations, readSavedSeq,
+                      FileGroup, newFiles)
 
 
 FILE_NAME = 'configurations.h5'
@@ -58,6 +60,11 @@ class Configurations(SimpleDB):
 
         self._defaults = None
 
+        #: Plan 35 CR9. ``seq`` of the last change set the file on disk holds,
+        #: and the project's autosave journal once a session attaches one.
+        self.savedSeq = 0
+        self.autosave = None
+
     def create(self, path):
         self._path = path / FILE_NAME
         self.createData()
@@ -81,9 +88,14 @@ class Configurations(SimpleDB):
             migrateDocument(document), fillWithDefault=True)
         self._files = files
         Configurations._geometryNextKey = maxIds[FileGroup.GEOMETRY_POLY_DATA.value]
+        self.savedSeq = readSavedSeq(self._path)
 
     def save(self):
-        if self.isModified():
+        # A change set that left the document as it was still has a seq the
+        # file must cover, or it would be offered back after a crash.
+        autosave = self._ownAutosave()
+        if self.isModified() or (
+                autosave is not None and autosave.applied_seq > self.savedSeq):
             self._save()
 
     def saveAs(self, path):
@@ -154,24 +166,56 @@ class Configurations(SimpleDB):
 
         return db
 
+    def _ownAutosave(self):
+        """The autosave journal of the project this db is saved into, if any."""
+        autosave = self.autosave
+        if autosave is None or self._path is None:
+            return None
+        try:
+            if Path(self._path).resolve().parent != autosave.directory:
+                return None  # a copy saved elsewhere does not settle our journal
+        except OSError:
+            return None
+        return autosave
+
     def _save(self):
         """Replace the configuration store only after a complete new file exists.
 
         A partially written HDF5 file makes an in-place OpenFOAM case impossible
         to reopen.  Keeping the previous file until ``os.replace`` succeeds is
         the minimum recovery guarantee for all FoamMesh-owned case state.
+
+        Plan 35 CR9 save order: take ``seq`` = N *before* serialising (so the
+        content holds at least everything through N), write the temporary,
+        fsync, replace, fsync the directory, and only then tell the journal it
+        may compact through N. A crash anywhere before the replace leaves the
+        old file and its old ``saved_seq``; the journal still covers the rest.
         """
+        from foammesh.core.project.journal import fault_point, fsync_directory
+        autosave = self._ownAutosave()
+        savedSeq = autosave.applied_seq if autosave is not None else self.savedSeq
         temporary = self._path.with_suffix(f'{self._path.suffix}.tmp')
         try:
-            writeConfigurations(temporary, self.toYaml(), self._files)
+            writeConfigurations(temporary, self.toYaml(), self._files, savedSeq)
+            fault_point('save-temp-written', file=FILE_NAME)
             # Windows only permits fsync on a writable descriptor.
             with temporary.open('r+b') as saved:
                 os.fsync(saved.fileno())
+            fault_point('save-temp-fsynced', file=FILE_NAME)
             os.replace(temporary, self._path)
+            fault_point('save-replaced', file=FILE_NAME)
         finally:
             if temporary.exists():
                 temporary.unlink()
+        try:
+            fsync_directory(self._path.parent)
+        except OSError:
+            pass
+        fault_point('save-dir-fsynced', file=FILE_NAME)
         self._modified = False
+        if autosave is not None:
+            self.savedSeq = savedSeq
+            autosave.saved(savedSeq)
 
 
 defaultsDB = Configurations(schema)

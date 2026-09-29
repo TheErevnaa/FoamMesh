@@ -9,6 +9,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +36,10 @@ LOCK_FILE = 'facade.session.lock'
 LOCK_INFO_FILE = 'facade.session.lock.json'
 SESSION_METADATA_FILE = 'facade.session.json'
 FORCE_LOCK_PROBE_ENV = 'FOAMMESH_FORCE_LOCK_PROBE'
+#: CR4. How many events the in-memory window keeps (the journal keeps more).
+EVENT_WINDOW = 10_000
+#: CR4. The marker a lagging ``events_after`` consumer receives first.
+TRUNCATED_EVENT = 'events.truncated'
 
 
 def _now() -> str:
@@ -137,11 +142,19 @@ class CaseSession:
         self.field_claims = FieldClaimRegistry()
         self.jobs = JobManager(self.state.bus)
         self.journal: EventJournal | None = None
+        self.autosave = None  # Plan 35 CR9 autosave journal (core.project.journal)
+        self._owns_state = False
         self.change_sets: list[dict] = []
         self.read_only_reason: str | None = None
         self.presentation = None  # attached PresentationState when a desktop surface exists
         self._configuration_cache: tuple[int, dict] | None = None
-        self._events: list[dict] = []
+        # CR4 (F4). The in-memory event list is a bounded window, not a
+        # history: it held every line of solver output for the life of the
+        # session. `_events_dropped_through` is the sequence of the newest
+        # event evicted from the window, so a consumer behind it is told it
+        # missed events instead of silently skipping them.
+        self._events: deque[dict] = deque(maxlen=EVENT_WINDOW)
+        self._events_dropped_through = 0
         self._idempotency: dict[str, tuple[str, object]] = {}
         self._closed = False
         self._event_context: ContextVar[tuple[dict | None, str | None, str | None]] = (
@@ -153,7 +166,10 @@ class CaseSession:
             Event.ARTIFACT_GEOMETRY_CHANGED, Event.ARTIFACT_DICTIONARIES_CHANGED,
             Event.ARTIFACT_MESH_CHANGED,
             Event.ARTIFACT_QUALITY_CHANGED, Event.ARTIFACT_RESTORED,
-            Event.JOB_STARTED, Event.JOB_OUTPUT, Event.JOB_PROGRESS,
+            # CR4 (F4). JOB_OUTPUT is not recorded: the job's log file is the
+            # record of its output (JOB_STARTED names it), and live readers
+            # subscribe to the bus. A 100 MB log kept here twice was F4.
+            Event.JOB_STARTED, Event.JOB_PROGRESS,
             Event.JOB_CANCEL_REQUESTED, Event.JOB_FINISHED, Event.JOB_FAILED,
             Event.JOB_CANCELLED, Event.OPERATION_STARTED, Event.OPERATION_SUCCEEDED,
             Event.OPERATION_FAILED, Event.OPERATION_RECOVERED,
@@ -187,6 +203,7 @@ class CaseSession:
             raise FileNotFoundError(f'FoamMesh configuration does not exist: {config_path}')
         bus = EventBus()
         session = cls(case_path, storage_path, ProjectState(db, bus=bus))
+        session._owns_state = True
         session._probe_volume(read_only_on_lock)
         if not session.read_only:
             session._acquire_writer(read_only_on_lock)
@@ -326,7 +343,7 @@ class CaseSession:
 
     def events_after(self, sequence: int, *, limit: int = 1_000) -> list[dict]:
         if self.journal is None:
-            return [event for event in self._events if event['sequence'] > sequence][:limit]
+            return self._window_after(sequence, limit)
         self.journal.flush()
         earliest = self.journal.earliest_sequence()
         if earliest is not None and sequence < earliest - 1:
@@ -335,6 +352,36 @@ class CaseSession:
                 'latest_sequence': self.event_sequence, 'resync_required': True,
             })
         return self.journal.after(sequence, limit=limit)
+
+    def _window_after(self, sequence: int, limit: int) -> list[dict]:
+        """Events after ``sequence`` from the bounded in-memory window.
+
+        CR4. A consumer whose cursor predates the window gets one
+        ``events.truncated`` marker first. Its ``sequence`` is the newest
+        evicted event's, so a cursor that follows the returned sequences moves
+        past the gap and is told about it exactly once.
+        """
+        if limit <= 0:
+            return []
+        found: list[dict] = []
+        if sequence < self._events_dropped_through:
+            found.append({
+                'event': TRUNCATED_EVENT, 'sequence': self._events_dropped_through,
+                'truncated': True, 'resync_required': True,
+                'session_id': self.session_id, 'case_id': self.case_id,
+                'payload': {
+                    'after_sequence': sequence,
+                    'earliest_sequence': self._events_dropped_through + 1,
+                    'latest_sequence': self.event_sequence,
+                },
+            })
+        if self._events and self._events[-1]['sequence'] > sequence:
+            for event in self._events:
+                if event['sequence'] > sequence:
+                    found.append(event)
+                    if len(found) >= limit:
+                        break
+        return found[:limit]
 
     async def flush_events(self) -> int:
         return 0 if self.journal is None else await self.journal.flush_off_loop()
@@ -345,6 +392,10 @@ class CaseSession:
         self._closed = True
         if save and not self.read_only:
             self.state.db.save()
+        if self._owns_state and self.autosave is not None:
+            # An orderly close: this session's unsaved change sets were
+            # either saved above or declined, so they are not a crash.
+            self.autosave.close(discard=True)
         self._emit('case.closed', path=str(self.case_path))
         if self.journal is not None:
             self.journal.close()
@@ -421,12 +472,24 @@ class CaseSession:
 
     def _start_journal(self) -> None:
         self.journal = EventJournal(self.storage_path / JOURNAL_FILE_NAME, monitor=self.monitor)
+        self._start_autosave()
         self.event_sequence = self.journal.latest_sequence()
         if self.event_sequence:
             previous = self.journal.after(self.event_sequence - 1, limit=1)[0]['revisions']
             self.authored_revision = int(previous['authored_revision'])
             self.artifact_sequence = int(previous['artifact_sequence'])
             self.presentation_sequence = int(previous['presentation_sequence'])
+
+    def _start_autosave(self) -> None:
+        """Plan 35 CR9. Attach the project's autosave; never block the open."""
+        from foammesh.core.project.journal import Autosave
+        try:
+            self.autosave = Autosave.attach(self.state, self.storage_path)
+        except Exception:  # noqa: BLE001 - an unreadable journal must not stop the case
+            import logging
+            logging.getLogger(__name__).warning(
+                'autosave journal unavailable for %s', self.storage_path, exc_info=True)
+            self.autosave = None
 
     def _load_or_create_identity(self) -> None:
         """Keep the case ID durable while each open receives a new epoch."""
@@ -452,11 +515,24 @@ class CaseSession:
     def _record_change_set(self, kind: str, payload: dict) -> None:
         actor, source, correlation_id = self._event_context.get()
         transaction = payload.get('transaction')
+        # Plan 35 CR9. seq is assigned here, on the thread that applied the
+        # change and at the moment it applied, so seq order is apply order.
+        seq = None
+        if self.autosave is not None:
+            try:
+                seq = self.autosave.record(
+                    kind, action=getattr(transaction, 'action', ''),
+                    tx_id=getattr(transaction, 'tx_id', None),
+                    timestamp=getattr(transaction, 'timestamp', None))
+            except Exception:  # noqa: BLE001 - never fail the edit itself
+                import logging
+                logging.getLogger(__name__).exception('autosave could not journal a change set')
         self.change_sets.append({
             'change_set_id': correlation_id or str(uuid4()),
             'kind': kind, 'actor': actor, 'source': source,
             'authored_revision': self.authored_revision,
             'transaction_id': getattr(transaction, 'tx_id', None),
+            'seq': seq,
         })
 
     def _on_project_event(self, *, event: str, **payload) -> None:
@@ -478,6 +554,8 @@ class CaseSession:
                                session_id=self.session_id, case_id=self.case_id,
                                revisions=self.revisions, payload=payload,
                                actor=actor, source=source, correlation_id=correlation_id)
+        if len(self._events) == self._events.maxlen:
+            self._events_dropped_through = self._events[0]['sequence']
         self._events.append(envelope.to_dict())
         # Presentation events are memory-only; only durable facts reach the
         # reconnect journal (§6.10).

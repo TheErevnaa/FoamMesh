@@ -34,6 +34,8 @@ ROW_ICON = QSize(14, 14)
 #: tall window and still covered half of a short one.
 PARTS_HEIGHT_SHARE = 0.4
 PARTS_MIN_HEIGHT = 96
+#: Plan 35 CR3. Patches listed by name under an outline; the rest are counted.
+NOTICE_PATCHES = 12
 
 
 def _swatch(color: QColor) -> QPixmap:
@@ -256,6 +258,9 @@ class ViewportOverlay(QFrame):
     regionFilterChanged = Signal(list)
     #: DP-712. A part row was clicked: ``(key, additive)``.
     partSelectionRequested = Signal(str, bool)
+    #: Plan 35 CR3. A button under the preview notice: ``'retry'``,
+    #: ``'build_anyway'`` or ``'load_volume'``.
+    previewActionRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -315,6 +320,40 @@ class ViewportOverlay(QFrame):
         self._result.setObjectName('overlayResult')
         self._result.setVisible(False)
         layout.addWidget(self._result)
+
+        # Plan 35 CR3. What the picture is when it is not the whole mesh: a
+        # decimated or surface-only preview, or the outline and patch list
+        # drawn when no preview could be built -- with the way out.
+        self._notice = QWidget()
+        self._notice.setObjectName('overlayPreviewNotice')
+        noticeLayout = QVBoxLayout(self._notice)
+        noticeLayout.setContentsMargins(0, 0, 0, 0)
+        noticeLayout.setSpacing(GAP_TIGHT)
+        self._noticeText = QLabel()
+        self._noticeText.setObjectName('overlayPreviewText')
+        self._noticeText.setWordWrap(True)
+        self._noticePatches = QLabel()
+        self._noticePatches.setObjectName('overlayPreviewPatches')
+        self._noticePatches.setWordWrap(True)
+        noticeLayout.addWidget(self._noticeText)
+        noticeLayout.addWidget(self._noticePatches)
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        self._noticeButtons: dict[str, QPushButton] = {}
+        for action, label in (('retry', self.tr('Try again')),
+                              ('build_anyway', self.tr('Build anyway')),
+                              ('load_volume', self.tr('Load full volume'))):
+            button = QPushButton(label)
+            button.setObjectName(f'overlayPreview_{action}')
+            button.clicked.connect(
+                lambda _checked=False, a=action:
+                self.previewActionRequested.emit(a))
+            buttons.addWidget(button)
+            self._noticeButtons[action] = button
+        buttons.addStretch(1)
+        noticeLayout.addLayout(buttons)
+        self._notice.setVisible(False)
+        layout.addWidget(self._notice)
 
         self._body = QWidget()
         bodyLayout = QVBoxLayout(self._body)
@@ -460,6 +499,37 @@ class ViewportOverlay(QFrame):
 
     def resultText(self) -> str:
         return self._result.text()
+
+    def setPreviewNotice(self, notice):
+        """Say what the picture is when it is not the whole mesh (CR3).
+
+        ``notice`` is ``MeshManager.previewNotice()``: ``{'text', 'patches',
+        'actions'}``, or None to hide the line.
+        """
+        notice = notice or {}
+        text = str(notice.get('text') or '')
+        patches = list(notice.get('patches') or [])
+        actions = set(notice.get('actions') or [])
+        self._noticeText.setText(text)
+        self._noticeText.setToolTip(text)
+        lines = [self.tr('{0}: {1:,} faces').format(name, int(count))
+                 for name, count in patches[:NOTICE_PATCHES]]
+        if len(patches) > NOTICE_PATCHES:
+            lines.append(self.tr('and {0} more patches').format(
+                len(patches) - NOTICE_PATCHES))
+        self._noticePatches.setText('\n'.join(lines))
+        self._noticePatches.setVisible(bool(lines))
+        for action, button in self._noticeButtons.items():
+            button.setVisible(action in actions)
+        self._notice.setVisible(bool(text))
+        self.adjustSize()
+
+    def previewNoticeText(self) -> str:
+        return self._noticeText.text() if self._notice.isVisibleTo(self) else ''
+
+    def previewActions(self) -> list[str]:
+        return [action for action, button in self._noticeButtons.items()
+                if self._notice.isVisibleTo(self) and button.isVisibleTo(self)]
 
     def setChip(self, shown: int, total: int, noun: str = '',
                 detail: str = ''):
