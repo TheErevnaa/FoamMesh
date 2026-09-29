@@ -100,6 +100,33 @@
 - A timed-out runtime probe no longer leaves a `.pid` file in the folder the
   app was started from.
 
+### Crash resilience
+
+- **The window keeps going when a tool fails.** Mesh checks, the mesh
+  preview, CAD import and repair, and Gmsh/MED/UNV/CGNS export run in a
+  separate worker process with a memory cap. A worker that crashes or runs out
+  of memory fails that one task with a reason and a Retry; the window and the
+  mesh stay.
+- **Big meshes.** Above 200,000 cells the viewport shows the boundary surface
+  (simplified above 2 million triangles) and offers Load full volume. When a
+  preview would not fit in memory the outline and patch list are shown instead,
+  with Try again and Build anyway. Heavy tasks wait their turn rather than
+  running together, and a check too big for the machine is refused up front
+  with its estimated size. Reading a large mesh is about three times faster and
+  uses about a quarter of the memory.
+- **Lost WSL connection.** A job whose WSL connection drops says so, leaves no
+  OpenFOAM processes behind and restores the previous mesh; Retry runs it
+  again. A status bar shows when WSL stops answering and when it is back.
+- **Crash reports and recovery.** If FoamMesh ever does close unexpectedly it
+  writes a crash dump and a log, shows a banner at the next start, and offers
+  to restore unsaved edits from its autosave journal. A job interrupted by a
+  crash is recovered before a new one can start.
+- **Graphics.** A graphics driver reset leaves a placeholder with Recreate
+  viewport instead of closing the app; after two drawing crashes in a row
+  FoamMesh starts in a safe mode (`--safe-mode`).
+- **Installer.** The installer now asks for administrator rights, so it can
+  switch on Windows crash dumps for FoamMesh.
+
 ## Plan 22 — Gmsh replaces the SALOME pipeline — 2026-07-31
 
 - **The SALOME hybrid pipeline is gone.** Its code, tests, scripts, schema
