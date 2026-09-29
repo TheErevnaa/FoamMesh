@@ -1,6 +1,6 @@
 # FoamMesh Release Notes
 
-## Unreleased — region placement
+## 1.1.0 — 2026-09-26
 
 - **Detect the fluid regions.** Domain & regions asks how many fluid regions
   there are and whether the flow is external, then finds every space the
@@ -51,8 +51,6 @@
     (`allow_region_clash`).
   - Detection works on a voxel field and is approximate in very narrow
     passages; a region that runs through one may be proposed as two.
-
-## 1.1.0 — 2026-09-26
 
 - **Viewport.** A region picker and a selectable parts list show one region or
   several; Fit to selection frames only what is selected, and Back/Forward
