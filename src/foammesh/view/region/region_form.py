@@ -16,6 +16,7 @@ from widgets.rendering.point_widget import PointWidget
 from foammesh.app import app
 from foammesh.db.configurations_schema import RegionType
 from .region_form_ui import Ui_RegionForm
+from .seed_feedback import SeedFeedback
 
 
 class RegionForm(QWidget):
@@ -54,6 +55,11 @@ class RegionForm(QWidget):
         # boxes away from the numbers it was describing. One `m` closes the
         # row instead, after the last of them.
         place_unit(self._ui.z, 'm')
+
+        # DP-818. Whether the seed is in the fluid, said under the point as it
+        # moves. The page owns the stored glyph, so this line never takes it.
+        self._seedFeedback = SeedFeedback(self._ui.widget_6)
+        self._ui.formLayout_2.addRow('', self._seedFeedback)
 
         self.hide()
 
@@ -122,6 +128,7 @@ class RegionForm(QWidget):
 
         self._ui.name.setFocus()
         self._pointWidget.on()
+        self._beginSeedFeedback()
 
     def setupForEditing(self, id_):
         self._id = id_
@@ -138,10 +145,27 @@ class RegionForm(QWidget):
         self._ui.ok.setText(self.tr('Update'))
 
         self._pointWidget.on()
+        self._beginSeedFeedback()
 
     def cancel(self):
         self._pointWidget.off()
+        self._seedFeedback.end()
         self.canceled.emit()
+
+    def seedFeedback(self):
+        return self._seedFeedback
+
+    def _beginSeedFeedback(self):
+        self._seedFeedback.begin(None)
+        self._judgeSeed()
+
+    def _judgeSeed(self):
+        try:
+            point = (float(self._ui.x.text()), float(self._ui.y.text()),
+                     float(self._ui.z.text()))
+        except (TypeError, ValueError):
+            return
+        self._seedFeedback.judge(point)
 
     def _connectSignalsSlots(self):
         self._ui.x.editingFinished.connect(self._movePointWidget)
@@ -169,6 +193,8 @@ class RegionForm(QWidget):
         self._ui.x.setText('{:.6g}'.format(x))
         self._ui.y.setText('{:.6g}'.format(y))
         self._ui.z.setText('{:.6g}'.format(z))
+        # Typed or dragged, every new point is judged again.
+        self._judgeSeed()
 
     def _validate(self):
         self._ui.ok.setEnabled(self._ui.name.text().strip() != '')
@@ -222,6 +248,7 @@ class RegionForm(QWidget):
                     self.regionAdded.emit(db.remappedKey('region', id_))
 
                 self._pointWidget.off()
+                self._seedFeedback.end()
             except CONFLICT_ERRORS as error:
                 # Stay open: the user's entries are still here, and the only
                 # thing that changed is what the case looked like underneath.

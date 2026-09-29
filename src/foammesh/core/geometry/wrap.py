@@ -80,11 +80,11 @@ def wrap(polydata, *, resolution: int = 64, smallest_feature: float | None = Non
          regions_to_retain=None, mode: str = 'external', fluid_seeds=None,
          cancelled=None):
     from vtkmodules.all import (
-        vtkFlyingEdges3D, vtkImageDilateErode3D, vtkImageMathematics,
-        vtkImageThreshold, vtkImageThresholdConnectivity, vtkPoints,
-        vtkPolyDataConnectivityFilter, vtkQuadricDecimation, vtkSampleFunction,
+        vtkFlyingEdges3D, vtkImageDilateErode3D, vtkImageThresholdConnectivity,
+        vtkPoints, vtkPolyDataConnectivityFilter, vtkQuadricDecimation,
         vtkTriangleFilter, vtkWindowedSincPolyDataFilter)
-    from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+
+    from .occupancy import sampled_distance, wall_occupancy
 
     def checkpoint(stage):
         if cancelled is not None and cancelled():
@@ -156,26 +156,12 @@ def wrap(polydata, *, resolution: int = 64, smallest_feature: float | None = Non
                 details={'breach_locations': markers,
                          'opening_span': max(item['span'] for item in oversized),
                          'max_gap': gap})
-    implicit = vtkImplicitPolyDataDistance()
-    implicit.SetInput(polydata)
-    sample = vtkSampleFunction()
-    sample.SetImplicitFunction(implicit)
-    sample.SetModelBounds(*model_bounds)
-    sample.SetSampleDimensions(*dimensions)
-    sample.ComputeNormalsOff()
-    sample.Update()
+    # Plan 36 RP5: the distance-occupancy block is shared with the fluid-space
+    # field, which samples the same distance only near the surface.
+    sampled = sampled_distance(polydata, model_bounds, dimensions)
     checkpoint('distance_field')
-    absolute = vtkImageMathematics()
-    absolute.SetInputConnection(sample.GetOutputPort())
-    absolute.SetOperationToAbsoluteValue()
-    absolute.Update()
-    occupancy = vtkImageThreshold()
-    occupancy.SetInputConnection(absolute.GetOutputPort())
-    occupancy.ThresholdBetween(0.0, .75 * sizing.voxel_size)
-    occupancy.SetInValue(1)
-    occupancy.SetOutValue(0)
-    occupancy.SetOutputScalarTypeToUnsignedChar()
-    occupancy.Update()
+    occupancy = wall_occupancy(polydata, model_bounds, dimensions,
+                               .75 * sizing.voxel_size, sampled=sampled)
     checkpoint('occupancy')
     stages.extend([
         {'stage': 'distance_field', 'status': 'done',
@@ -187,7 +173,7 @@ def wrap(polydata, *, resolution: int = 64, smallest_feature: float | None = Non
         gap / (2 * sizing.voxel_size))))
     kernel = 2 * radius + 1
     dilate = vtkImageDilateErode3D()
-    dilate.SetInputConnection(occupancy.GetOutputPort())
+    dilate.SetInputData(occupancy)
     dilate.SetKernelSize(kernel, kernel, kernel)
     dilate.SetDilateValue(1)
     dilate.SetErodeValue(0)

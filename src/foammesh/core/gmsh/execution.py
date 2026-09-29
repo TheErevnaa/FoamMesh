@@ -614,6 +614,37 @@ def region_display_names(db) -> dict:
         label = field(row, 'name')
         if token and label:
             names[token] = label
+    names.update(typed_region_names(db))
+    return names
+
+
+def typed_region_names(db) -> dict:
+    """Prepared region UUID -> the name "how many regions?" applied to it.
+
+    DP-865. On Gmsh a region is a solid (Plan 36 RP11), and applying one
+    types the solid's volume control (``volumeType``) under the name the user
+    gave it. The tree's volume row was the only name this module read, and a
+    case built without the tree -- the facade, the CLI, the campaign --
+    has no such row, so MEASURED on jacketed_pipe and shell_and_tube the
+    zones published as ``Part_1_solid_1``/``_2`` while the regions applied
+    were ``fluid``/``jacket`` and ``shell``/``tube``. A typed control is the
+    region; its name is what the zone is called. An untyped control is a
+    sizing control and names nothing.
+    """
+    getter = getattr(db, 'getElements', None)
+    if getter is None:
+        return {}
+    try:
+        rows = dict(getter('gmsh/volumeControls') or {})
+    except Exception:  # noqa: BLE001 - a case without the list
+        return {}
+    from foammesh.core.mesh.cad_solids import typing_of
+
+    names: dict[str, str] = {}
+    for token, item in typing_of(rows).items():
+        label = str(item.get('name') or '').strip()
+        if token and label and item.get('type'):
+            names[token] = label
     return names
 
 
@@ -677,6 +708,34 @@ def volume_names(prepared_geometry, chosen: dict | None = None) -> dict:
         for index in indices:
             names[str(int(index) + 1)] = label
     return names
+
+
+def volume_types(prepared_geometry, types: dict | None,
+                 chosen: dict | None = None) -> dict:
+    """Published volume name -> ``{'type', 'region_type'}``, for the typed.
+
+    Plan 36 RP11. *types* maps a prepared ``region_uuid`` to ``fluid`` or
+    ``solid`` -- the Gmsh volume controls' ``volumeType``. The name is the one
+    ``volume_names`` publishes the region under, so the publisher's region
+    metadata (looked up by physical name) finds it. An untyped region is not
+    here and publishes as it always did.
+    """
+    if prepared_geometry is None or not types:
+        return {}
+    manifest = _group_manifest(prepared_geometry)
+    taken = _patch_labels(manifest)
+    out: dict[str, dict] = {}
+    for region in manifest.get('regions') or ():
+        if not isinstance(region, dict):
+            continue
+        token = str(region.get('region_uuid') or '').strip()
+        kind = str((types or {}).get(token) or '').strip()
+        if not token or not kind:
+            continue
+        label = _chosen_name(region, chosen, taken)
+        if label:
+            out[label] = {'type': kind, 'region_type': kind}
+    return out
 
 
 def volume_fallback_names(prepared_geometry,
@@ -925,6 +984,27 @@ def _global_surface_rows(prepared_geometry) -> list:
     return rows
 
 
+def surface_categories(prepared_geometry) -> dict:
+    """Solver patch name -> the prepared boundary category it publishes with.
+
+    DP-867. The publish step types a patch from this category (a group with
+    none is a wall); the runner, which reads "every eligible wall" off the
+    surface names alone, read an importer name such as ``face0`` as
+    unclassified -- so a STEP nobody had named had no eligible wall and grew
+    no layer, although every one of its faces publishes as ``wall``.
+    """
+    if prepared_geometry is None:
+        return {}
+    categories: dict[str, str] = {}
+    for group in _group_manifest(prepared_geometry).get('groups') or ():
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get('solver_name') or group.get('name') or '').strip()
+        if name:
+            categories[name] = str(group.get('category') or 'wall').strip()
+    return categories
+
+
 def surface_names(prepared_geometry) -> dict:
     """Imported surface index (as a string tag) -> solver patch name."""
     if prepared_geometry is None:
@@ -1012,6 +1092,10 @@ def build_job(intent: JobIntent, *, geometry, outputs: dict,
         'scopeSurfaces': scope_surface_map(prepared_geometry),
         'scopeVolumes': scope_volume_map(prepared_geometry),
         'surfaceNames': surface_names(prepared_geometry),
+        # DP-867. The category each patch publishes with, so "every eligible
+        # wall" is judged in the runner by what the patch *is*, not by what
+        # an importer name like `face0` fails to say.
+        'surfaceCategories': surface_categories(prepared_geometry),
         'volumeNames': volume_names(prepared_geometry, region_names),
         # DP-423. What to call a volume the maps above do not name, per
         # source, so an artifact that closed into eight volumes publishes

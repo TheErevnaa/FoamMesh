@@ -95,6 +95,16 @@ def boundary_category(name, category='') -> str:
     return 'unclassified'
 
 
+#: The names an importer gives a face nobody named: ``face0`` from a STEP,
+#: ``face_3`` from a Gmsh tag. They announce no category at all.
+_UNNAMED_FACE = re.compile(r'^face_?\d+$')
+
+
+def is_unnamed_face(name) -> bool:
+    """Whether *name* is an importer's placeholder rather than a user's word."""
+    return bool(_UNNAMED_FACE.match(str(name or '').strip().lower()))
+
+
 def is_mesh_constrained(category) -> bool:
     """Whether this category names a patch type the *mesh* has to earn."""
     return str(category or '').strip().lower() in MESH_CONSTRAINED_CATEGORIES
@@ -160,8 +170,19 @@ def eligible_wall_names(boundaries) -> tuple[str, ...]:
         # every other respect, meshed. The publication step substitutes
         # `wall` for a mesh-constrained category (DP-445), so that is what
         # these surfaces are, and this is where the page has to agree.
-        if publishable_category(
-                boundary_category(name, category)) == LAYER_CATEGORY:
+        judged = boundary_category(name, category)
+        # DP-867. An importer's `face<N>` with no stored category is a
+        # surface nobody has told us anything about, and it publishes as a
+        # wall (a patch without a category is typed `wall`). MEASURED on the
+        # Plan 36 campaign: cad/elbow.step, faces face0..face2, refused
+        # "all eligible walls" because every face read as unclassified. An
+        # inlet, an outlet or an interface says so by its category or its
+        # name and is still left out; any other unrecognised name stays
+        # unclassified, as before.
+        if (judged == 'unclassified' and not str(category or '').strip()
+                and is_unnamed_face(name)):
+            judged = LAYER_CATEGORY
+        if publishable_category(judged) == LAYER_CATEGORY:
             names.append(name)
     return tuple(names)
 

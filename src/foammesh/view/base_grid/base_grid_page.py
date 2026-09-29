@@ -15,9 +15,9 @@ from foammesh.app import app
 from foammesh.db.configurations_schema import (
     BaseGridSizingMode, BoundaryPatchType, GeometryType, Shape, CFDType,
     schema)
+from foammesh.core.mesh.domain_box import domain_box
 from foammesh.core.mesh.sizing import (background_estimate,
-                                       derive_background_counts,
-                                       stand_off_bounds)
+                                       derive_background_counts)
 from foammesh.rendering.vtk_loader import hexPolyData, polyDataToFeatureActor
 from foammesh.support import field_complaint
 from foammesh.view.length_readout import format_lengths
@@ -507,19 +507,13 @@ class BaseGridPage(StepPage):
                 self._boundingHex6 = None
         geometry = (self._getHex6ById(self._boundingHex6)
                     if self._boundingHex6 else None)
-        if geometry:
-            x1, y1, z1 = geometry.vector('point1')
-            x2, y2, z2 = geometry.vector('point2')
-        else:
-            x1, x2, y1, y2, z1, z2 = self._standOff(
-                app.window.geometryManager.getBounds().toTuple())
-        self._updateBoundingBox(x1, x2, y1, y2, z1, z2)
+        self._updateBoundingBox(*self._resolvedBox(geometry))
 
-    def _standOff(self, bounds):
-        """Push the derived block off the geometry (R167).
+    def _resolvedBox(self, hex6=None):
+        """The block this page shows: a chosen Hex6, else the standoff block.
 
-        A Hex6 the user modelled is left alone -- that block is theirs. This
-        is only the box the page derives when there is none, and the same
+        R167. A Hex6 the user modelled is left alone -- that block is theirs.
+        Otherwise the page derives the block from the geometry, and the same
         margin goes on all six faces so a thin geometry gets a real standoff
         on its thin axis too, rather than a fraction of nothing.
 
@@ -530,10 +524,27 @@ class BaseGridPage(StepPage):
         actually meshed went back to flush -- which is the one thing the
         setting exists to prevent, and the save that Generate asks for on an
         untitled case put the user on that path every first run.
+
+        Plan 36 RP1. The rule itself is `domain_box`, which answers for every
+        reader of the box -- this page, the launch gate, Domain & Regions --
+        so they cannot disagree about it. The page passes what it shows but
+        has not saved: the Hex6 picked in its combo box, or none, and the
+        standoff in its spin box.
         """
+        corners = None if not hex6 else (hex6.vector('point1'),
+                                         hex6.vector('point2'))
+        # DP-821. The surfaces' extent, not the seed glyphs'.
+        manager = app.window.geometryManager
+        extent = (None if corners else getattr(
+            manager, 'getSurfaceBounds', manager.getBounds)().toTuple())
         widget = getattr(self, '_standoff', None)
-        return stand_off_bounds(
-            bounds, 0.0 if widget is None else widget.value())
+        try:
+            db = app.facadeClient.checkout()
+        except Exception:  # noqa: BLE001 - no case yet: the page's own choices
+            db = None
+        return domain_box(db, None, extent, hex6=corners,
+                          standoff=0.0 if widget is None else widget.value()
+                          ).bounds
 
     def _standoffChanged(self, _value=None):
         """Move the block, and everything the page says about it."""
@@ -740,7 +751,9 @@ class BaseGridPage(StepPage):
         if bounds is None:
             return []
         try:
-            geometry = app.window.geometryManager.getBounds().toTuple()
+            manager = app.window.geometryManager
+            geometry = getattr(manager, 'getSurfaceBounds',
+                               manager.getBounds)().toTuple()
         except Exception:                                    # noqa: BLE001
             return []
         if geometry is None or len(tuple(geometry)) != 6:
@@ -818,14 +831,11 @@ class BaseGridPage(StepPage):
                     self.tr('There is no Hex6 named {0}.').format(name))
                 return
             self._boundingHex6 = gId
-            x1, y1, z1 = geometry.vector('point1')
-            x2, y2, z2 = geometry.vector('point2')
         else:
             self._boundingHex6 = None
-            x1, x2, y1, y2, z1, z2 = self._standOff(
-                app.window.geometryManager.getBounds().toTuple())
+            geometry = None
 
-        self._updateBoundingBox(x1, x2, y1, y2, z1, z2)
+        self._updateBoundingBox(*self._resolvedBox(geometry))
 
     def _boundingHex6Changed(self, name):
         if not self._ui.useHex6.isChecked():
@@ -840,10 +850,7 @@ class BaseGridPage(StepPage):
 
         self._boundingHex6 = gId
 
-        x1, y1, z1 = geometry.vector('point1')
-        x2, y2, z2 = geometry.vector('point2')
-
-        self._updateBoundingBox(x1, x2, y1, y2, z1, z2)
+        self._updateBoundingBox(*self._resolvedBox(geometry))
 
     def _updateCellX(self):
         count = int(self._ui.numCellsX.text())
@@ -919,8 +926,10 @@ class BaseGridPage(StepPage):
         # DP-576. The raw geometry extent: the case builder applies the saved
         # bounding Hex6 and standoff itself, for every frontend alike, so
         # handing over this page's already stood-off box would apply the
-        # standoff twice.
-        bounds = app.window.geometryManager.getBounds().toTuple()
+        # standoff twice. DP-821: the surfaces' extent, not the seed glyphs'.
+        manager = app.window.geometryManager
+        bounds = getattr(manager, 'getSurfaceBounds',
+                         manager.getBounds)().toTuple()
         try:
             await app.facadeClient.run(
                 'workflow.generate_dictionaries', {'bbox': list(bounds)})
@@ -1049,10 +1058,8 @@ class BaseGridPage(StepPage):
         else:
             self._boundingHex6 = None
             self._ui.useHex6.setChecked(False)
-            x1, x2, y1, y2, z1, z2 = self._standOff(
-                app.window.geometryManager.getBounds().toTuple())
 
-        self._updateBoundingBox(x1, x2, y1, y2, z1, z2)
+        self._updateBoundingBox(*self._resolvedBox(geometry))
 
         self._ui.useHex6.toggled.connect(self._useHex6Toggled)
         self._ui.boundingHex6.currentTextChanged.connect(self._boundingHex6Changed)

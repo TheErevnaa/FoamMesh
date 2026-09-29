@@ -1203,6 +1203,13 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'Element size inside this volume. Auto uses the '
                          'global target size.',
     },
+    # Plan 36 RP11.
+    'gmsh.volume_controls.controls/{id}/volume_type': {
+        'title': 'Type',
+        'documentation': 'Whether this solid is a fluid or a solid region. '
+                         'Published as the region type of its cell zone. Blank: '
+                         'not typed yet (published as fluid).',
+    },
     'gmsh.periodic_pairs.controls/{id}/match_tolerance': {
         'documentation': 'How far apart two points may be after the '
                          'transform and still be matched as one periodic '

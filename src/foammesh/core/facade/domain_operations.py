@@ -25,6 +25,7 @@ from pathlib import Path
 from foammesh.core.jobs import ExpectedArtifact, OperationContext, OperationSpec
 from foammesh.openfoam.decomposition import DecompositionSettings
 from foammesh.core.project import Event
+from foammesh.core.mesh import detection_record  # RP13 #3
 
 from .commands import Command
 from .errors import (CapabilityUnavailableError, FacadeError,
@@ -882,13 +883,17 @@ def _ensure_prepared_geometry(session, *, producer: str,
     )
 
     store = PreparedGeometryStore(session.case_path)
-    readiness = prepare_readiness(store)
+    # DP-860. The engine is named so a surface only snappy can mesh (regions
+    # sharing a face in one STL) is refused on the Gmsh route before the job.
+    from foammesh.core.engine import configured_engine_id
+    engine_id = configured_engine_id(session.state.db)
+    readiness = prepare_readiness(store, engine_id=engine_id)
     if not readiness['can_prepare']:
         return None
     if (require_domain and not readiness['prepared']
             and readiness.get('bounds_domain') is False):
         raise ValidationFailedError(
-            domain_refusal(store) or (
+            domain_refusal(store, engine_id=engine_id) or (
                 'the imported surfaces cannot bound a volume, so there is no '
                 'domain to mesh'),
             details={'geometry_topology': readiness.get('topology'),
@@ -955,6 +960,10 @@ class DomainOperations:
             'geometry.readiness': self._geometry_readiness,
             'geometry.fluid_seed.suggest': self._geometry_fluid_seed_suggest,
             'geometry.fluid_seed.check': self._geometry_fluid_seed_check,
+            'geometry.fluid_regions.detect': self._geometry_fluid_regions_detect,
+            'geometry.fluid_regions.apply': self._geometry_fluid_regions_apply,
+            'geometry.fluid_regions.offer': self._geometry_fluid_regions_offer,
+            'geometry.fluid_regions.seeds': self._geometry_fluid_regions_seeds,
             'quality.tolerance.get': self._quality_tolerance_get,
             'quality.tolerance.set': self._quality_tolerance_set,
             'geometry.preparation.decide': self._geometry_preparation_decide,
@@ -1878,9 +1887,44 @@ class DomainOperations:
         API seeing the same warnings the GUI does (§9 parity).
         """
         warnings = self._derivation_warnings(session, engine_id)
-        for task_id, texts in self._boundary_coverage_warnings(session).items():
-            warnings[task_id] = list(warnings.get(task_id) or ()) + list(texts)
+        for source in (self._boundary_coverage_warnings(session),
+                       self._run_warnings(session, engine_id)):
+            for task_id, texts in source.items():
+                warnings[task_id] = (list(warnings.get(task_id) or ())
+                                     + list(texts))
         return warnings
+
+    @staticmethod
+    def _run_warnings(session: CaseSession, engine_id: str) -> dict:
+        """DP-817: why a task that ran reads "finished with warnings".
+
+        The recorder keeps the texts a run warned with in the evidence of the
+        task it left at WARNING. Only a task still at WARNING is reported:
+        a later clean run replaces the evidence along with the state.
+        """
+        try:
+            from foammesh.core.engine.contracts import TaskState
+            from foammesh.core.engine.registry import ENGINE_REGISTRY
+            from foammesh.core.workflow.task_state_store import (
+                EngineTaskStateStore,
+            )
+
+            store = EngineTaskStateStore(
+                session.case_path,
+                ENGINE_REGISTRY.get(engine_id).workflow_descriptor())
+            graph = store.load_result().graph
+            evidence = store.evidence()
+            found = {}
+            for task_id, record in evidence.items():
+                texts = [str(text) for text in
+                         (dict(record or {}).get('warnings') or ())]
+                if texts and graph.state(task_id) is TaskState.WARNING:
+                    found[task_id] = ['The last run warned: ' + text
+                                      for text in texts]
+            return found
+        except Exception:                                    # noqa: BLE001
+            # The warning channel must never break the page it warns on.
+            return {}
 
     def _boundary_coverage_warnings(self, session: CaseSession) -> dict:
         """Plan 28 WP5: one boundary is not a CFD case.
@@ -2407,9 +2451,16 @@ class DomainOperations:
         # stays "locked by prerequisites" behind a mesh that already exists.
         # QA is only claimed when checkMesh really ran; a runtime without it
         # leaves the task to be run rather than marking it passed.
-        warning = bool(warning)
+        # DP-817. Each warning belongs to the task that raised it: the element
+        # gate's to compute, a checkMesh that did not accept the mesh to QA.
+        # Both used to be one flag over every task the run covered.
+        warning_for = {'gmsh.compute'} if warning else set()
+        reasons = []
         if check.get('ran') and check.get('status') != 'accepted':
-            warning = True
+            warning_for.add('gmsh.qa')
+            reasons.append('checkMesh did not accept the mesh: {0}'.format(
+                check.get('status') or 'no verdict'))
+        warning = bool(warning_for)
         # R119/R158. The compute task is recorded as *waived*, not passed, when
         # its own gate refused and a human overrode it. The run used to record
         # PASSED regardless, so the outline painted the plain COMPLETED tick
@@ -2418,6 +2469,7 @@ class DomainOperations:
         waived = () if accepted else ('gmsh.compute',)
         payload['task_state'] = self._record_engine_run_success(
             session, command, warning=warning, waived=waived,
+            warning_for=tuple(sorted(warning_for)), reasons=tuple(reasons),
             configured=_job_configured_tasks(record),
             exclude=() if check.get('ran') else ('gmsh.qa',))
         return self._artifact_result(session, command, payload,
@@ -3062,7 +3114,9 @@ class DomainOperations:
                                    *, warning: bool = False,
                                    exclude: tuple = (),
                                    configured=(),
-                                   waived: tuple = ()) -> dict | None:
+                                   waived: tuple = (),
+                                   warning_for=None,
+                                   reasons=()) -> dict | None:
         """Advance the tasks this engine's atomic run actually performed.
 
         Bounded by what the engine declares it does, not by which tasks happen
@@ -3082,8 +3136,16 @@ class DomainOperations:
                 # rather than everything: silence is not evidence.
                 return None
             covered = tuple(task for task in covered if task not in exclude)
+            # DP-817. What the warning is about, when it is not about every
+            # task the run covered, and what it said. Passed only when there
+            # is something to say, so a store that predates them still works.
+            attribution = {}
+            if warning and warning_for is not None:
+                attribution['warning_for'] = tuple(warning_for)
+            if reasons:
+                attribution['reasons'] = tuple(reasons)
             return store.record_atomic_run_success(
-                covered, warning=warning,
+                covered, warning=warning, **attribution,
                 # DP-228. The optional tasks the job this run consumed carried
                 # settings for. The graph answers the same question from a page
                 # save that may have been refused, so it is not asked.
@@ -3102,8 +3164,8 @@ class DomainOperations:
             return None
 
     def _record_stage_run_success(self, session: CaseSession, command: Command,
-                                  task_id: str | None, *, warning: bool = False
-                                  ) -> dict | None:
+                                  task_id: str | None, *, warning: bool = False,
+                                  reasons=()) -> dict | None:
         """Advance the task a ``workflow.run_stage`` call just performed.
 
         The legacy step pages run stages one at a time and never touch the
@@ -3118,7 +3180,10 @@ class DomainOperations:
 
         try:
             _engine_id, store = self._task_state_store(session, command)
-            return store.record_stage_chain_success(task_id, warning=warning)
+            # DP-817. The warning's text, passed only when there is one.
+            extra = {'reasons': tuple(reasons)} if reasons else {}
+            return store.record_stage_chain_success(
+                task_id, warning=warning, **extra)
         except (TaskStateError, LookupError, OSError, ValueError):
             return None
 
@@ -3212,8 +3277,15 @@ class DomainOperations:
             try:
                 for gate in gates:
                     self._run_check_task(session, command, gate, store)
+                attribution = {}
+                if (recorded.get('warning')
+                        and recorded.get('warning_for') is not None):
+                    attribution['warning_for'] = tuple(recorded['warning_for'])
+                if recorded.get('warning_reasons'):
+                    attribution['reasons'] = tuple(recorded['warning_reasons'])
                 progressed = store.record_atomic_run_success(
-                    covered, warning=bool(recorded.get('warning')))
+                    covered, warning=bool(recorded.get('warning')),
+                    **attribution)
             except (TaskStateError, LookupError, OSError, ValueError,
                     FacadeError):
                 return recorded
@@ -3221,10 +3293,37 @@ class DomainOperations:
                 progressed.get('advanced', ()))
             progressed['gates_run'] = list(recorded.get('gates_run', ())) + gates
             progressed['warning'] = recorded.get('warning')
+            for key in ('warning_for', 'warning_reasons'):
+                if key in recorded:
+                    progressed[key] = recorded[key]
             if progressed.get('blocked') == blocked:
                 return progressed
             recorded = progressed
         return recorded
+
+    @staticmethod
+    def _gmsh_volume_types(session: CaseSession, prepared) -> dict:
+        """Plan 36 RP11: each typed solid's type, by its published name."""
+        from foammesh.core.gmsh.execution import (
+            region_display_names, volume_types,
+        )
+        from foammesh.core.mesh.cad_solids import typing_of
+
+        db = getattr(session.state, 'db', None)
+        try:
+            rows = dict(db.getElements('gmsh/volumeControls') or {})
+        except Exception:  # noqa: BLE001 - a case without the list
+            return {}
+        types = {token: item['type'] for token, item in typing_of(rows).items()
+                 if item.get('type') and item.get('included', True)}
+        if not types:
+            return {}
+        chosen = region_display_names(db)
+        for source in (prepared, getattr(prepared, 'reference', None)):
+            found = volume_types(source, types, chosen) if source else {}
+            if found:
+                return found
+        return {}
 
     def _publish_gmsh_result(self, session: CaseSession, record, prepared) -> dict:
         """Publish one Gmsh mesh as constant/polyMesh, atomically."""
@@ -3238,6 +3337,7 @@ class DomainOperations:
                 categories={**_gmsh_patch_categories(prepared),
                             **_job_edge_categories(record)},
                 identities=_gmsh_patch_identities(prepared),
+                region_metadata=self._gmsh_volume_types(session, prepared),
                 periodic_pairs=_job_periodic_pairs(record),
                 extrusion=_job_extrusion(record),
                 source_fingerprint=record.document.get('job_digest', ''))
@@ -5990,8 +6090,10 @@ runTimeModifiable true;
         # DP-354. Before anything on this path asks the runtime a question.
         await self._warm_utility_probes()
         feature_payload = None
+        seed_warnings: list[str] = []
         if definition.stage in {'castellation', 'snappyHexMesh'}:
-            self._validate_fluid_seed(session)
+            seed_warnings = await self._snappy_seed_gate(
+                session, allow_region_clash=self._allows_region_clash(command))
             # Snappy consumes ``.eMesh`` edges that only ``surfaceFeatures``
             # produces. Extract them on demand so a single staged stage is
             # runnable on a fresh case and after a batch pipeline run alike.
@@ -6002,6 +6104,7 @@ runTimeModifiable true;
             session, command, engine, definition)
         if feature_payload is not None:
             payload['surface_features'] = feature_payload
+        payload.update(self._region_warnings_payload(seed_warnings))
         if execution.succeeded:
             # The implicit surfaceFeatures ran and succeeded too, so the tree
             # records it before the stage that consumed its edges.
@@ -6010,7 +6113,8 @@ runTimeModifiable true;
                     session, command, 'snappy.surface_features')
             payload['task_state'] = self._record_stage_run_success(
                 session, command, getattr(definition, 'task_id', None),
-                warning=bool(execution.warnings))
+                warning=bool(execution.warnings),
+                reasons=tuple(execution.warnings))
             if (getattr(definition, 'mutation', True)
                     and not payload.get('left_decomposed')):
                 # The tree route runs snappy one stage at a time and used to
@@ -6038,7 +6142,8 @@ runTimeModifiable true;
         return OperationResult(
             'accepted' if execution.succeeded else 'failed', command.operation,
             session.revisions, invalidated_outputs=('quality',),
-            warnings=execution.warnings, payload=payload)
+            warnings=tuple(seed_warnings) + tuple(execution.warnings or ()),
+            payload=payload)
 
     @staticmethod
     def _stage_failure(stage: str, job: Mapping) -> dict:
@@ -6492,6 +6597,16 @@ runTimeModifiable true;
                             else Event.ARTIFACT_MESH_CHANGED),
             invalidated_outputs=('mesh', 'quality') if feature_stage else ('quality',),
             cleanup_argv=launch.cleanup_argv,
+            # DP-817. DP-113's "changed nothing" check compares the mesh this
+            # stage writes. surfaceFeatures writes no mesh, and a parallel
+            # stage writes the processor meshes, not constant/polyMesh; both
+            # were told they had changed nothing on every run.
+            expects_mesh_change=not feature_stage,
+            mesh_change_probes=tuple(
+                processor / 'constant' / 'polyMesh'
+                for processor in sorted(
+                    session.case_path.glob('processor[0-9]*'))
+            ) if ranks > 1 else (),
         ), on_line=command.parameters.get('on_line'))
         payload = execution.to_payload()
         payload.update({
@@ -6824,6 +6939,10 @@ runTimeModifiable true;
                 f'current Snappy dictionaries could not be generated: {error}'
             ) from error
         self._preflight_snappy_inputs(session, 'surfaceFeatures')
+        # DP-851. The same seed gate the stage route asks, against the
+        # blockMeshDict just rewritten above, before any node launches.
+        seed_warnings = await self._snappy_seed_gate(
+            session, allow_region_clash=self._allows_region_clash(command))
         configuration = _resource_policy(session.configuration())
         mode = ResourceMode(str(command.parameters.get(
             'mode') or configuration['mode']))
@@ -7005,11 +7124,13 @@ runTimeModifiable true;
                 return OperationResult(
                     'failed', command.operation, session.revisions,
                     invalidated_outputs=('quality', 'exports'),
+                    warnings=tuple(seed_warnings),
                     payload={'allocation': allocation.to_dict(),
                              'dag': dag.to_dict(), 'executions': executions,
                              'checkpoints': checkpoints,
                              'failed_node': node.node_id,
                              'run_id': self._run_manifest_id(record),
+                             **self._region_warnings_payload(seed_warnings),
                              # One failure shape, whichever engine wrote it
                              # (Plan 30 F-03). `RunResultHandle.from_payload`
                              # is the reader; the finisher no longer has to
@@ -7064,9 +7185,19 @@ runTimeModifiable true;
         quality_verdict = verdict_from_report(
             QualityReport.from_dict(quality_report) if quality_report else None)
         not_clean = quality_verdict.get('verdict') not in ('pass', None)
+        # DP-817. The checkMesh verdict judges the finished mesh, so it is the
+        # QA task's warning. It was handed to every task the run covered, and
+        # surface features, castellation, snap and layers all read "finished
+        # with warnings" for a verdict none of them produced.
+        qa_warning = (
+            ('checkMesh verdict: {0}. {1}'.format(
+                quality_verdict.get('verdict'),
+                quality_verdict.get('reason') or '').strip(),)
+            if not_clean else ())
         try:
             recorded = self._record_engine_run_success(
                 session, command, warning=not_clean,
+                warning_for=('snappy.qa',), reasons=qa_warning,
                 exclude=('snappy.layers',) if layers_skipped else ())
         except FacadeError:
             # The mesh is on disk and published; a tree that cannot be told
@@ -7075,6 +7206,8 @@ runTimeModifiable true;
             recorded = None
         if recorded is not None:
             recorded['warning'] = not_clean
+            recorded['warning_for'] = ['snappy.qa']
+            recorded['warning_reasons'] = list(qa_warning)
         task_state = self._advance_pipeline_gates(session, command, recorded)
         self._close_run_manifest(
             record, status='succeeded',
@@ -7085,7 +7218,9 @@ runTimeModifiable true;
         return OperationResult(
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('quality', 'exports'),
+            warnings=tuple(seed_warnings),
             payload={'allocation': allocation.to_dict(), 'dag': dag.to_dict(),
+                     **self._region_warnings_payload(seed_warnings),
                      'run_manifest': record.document if record else {},
                      'executions': executions,
                      'qualification_mode': mode.value,
@@ -7169,6 +7304,11 @@ runTimeModifiable true;
             return self._read_result(session, command, {
                 'point': None, 'inside': False, 'source': 'none',
                 'reason': 'this case has no staged geometry to search'})
+        # Plan 36 RP7: the deepest point of the largest enclosed space, when
+        # the domain can be labelled; the lattice below is the fallback.
+        delegated = self._suggest_from_fluid_spaces(session, surface)
+        if delegated is not None:
+            return self._read_result(session, command, delegated)
         bounds = surface.GetBounds()
         candidates = self._seed_candidates(bounds)
         centre = list(candidates[0])
@@ -7189,6 +7329,72 @@ runTimeModifiable true;
             'point': centre, 'inside': False, 'source': 'bounding_box_centre',
             'reason': 'no interior point was found — the surface is probably '
                       'open, so place the seed yourself'})
+
+    #: Seconds a synchronous suggestion waits for a detection that is not
+    #: cached before it falls back to the lattice ("over budget", RP7 point
+    #: 3). MEASURED: the annulus labels in 1.1 s at 0.9 M voxels.
+    SUGGEST_DETECTION_SECONDS = 5.0
+
+    def _suggest_from_fluid_spaces(self, session: CaseSession, surface):
+        """The fluid-space suggestion payload, or ``None`` to fall back.
+
+        The answer comes from the cache when a detection has run; otherwise
+        the labelling runs on the VTK worker thread -- never on this one,
+        which is the GUI thread in the desktop -- within a budget. The seed
+        is then judged by the same probe the launch gate uses, so a point
+        offered here cannot be refused there.
+        """
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.fluid_spaces import FluidSpacesCancelled
+        from foammesh.core.mesh.sizing import validate_fluid_seed
+
+        try:
+            inputs = self._fluid_space_inputs(session)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        if inputs is None:
+            return None
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        options = self._fluid_space_options(session, base_cell)
+        try:
+            field = fluid_regions.cached_detection(surfaces, box, **options)
+            if field is None:
+                field = fluid_regions.detect_blocking(
+                    surfaces, box, timeout=self.SUGGEST_DETECTION_SECONDS,
+                    **options)
+        except (TimeoutError, FluidSpacesCancelled, ValueError, RuntimeError,
+                MemoryError):
+            return None
+        faces = self._mesh_faces(session, _geometry_bounds)
+        finest = self._finest_cell(session, base_cell)
+        for space in field.enclosed:
+            # RP13 #4: too thin for the finest cell the case refines to.
+            if fluid_regions.too_thin(space, finest):
+                continue
+            # RP13 #2 / DP-862: never offered on a face of the mesh.
+            point = self._off_faces(faces, field, space.seed, space.id)
+            try:
+                probe = validate_fluid_seed(surface, point)
+                if not probe.get('valid') and not probe.get('on_surface'):
+                    # A nested multiregion assembly reads an inner space as
+                    # outside by ray parity (DP-391); a component decides.
+                    components = [validate_fluid_seed(part, point)
+                                  for part in surfaces]
+                    valid = [item for item in components if item.get('valid')]
+                    if valid and not any(item.get('on_surface')
+                                         for item in components):
+                        probe = valid[0]
+            except (ValueError, RuntimeError):
+                return None
+            if not probe.get('valid'):
+                return None
+            return {'point': point, 'inside': True, 'source': 'fluid_spaces',
+                    'distance_to_surface': probe.get('distance_to_surface'),
+                    'reason': 'the deepest point of the largest enclosed space',
+                    'space': {'id': int(space.id),
+                              'volume': float(space.volume),
+                              'depth': float(space.depth)}}
+        return None
 
     def _geometry_fluid_seed_check(self, session: CaseSession,
                                    command: Command) -> OperationResult:
@@ -7227,12 +7433,912 @@ runTimeModifiable true;
         # external-flow seed, which the launch gate accepts, so the page
         # must not call it invalid.
         external = False
-        if not probe.get('valid') and not probe.get('on_surface'):
+        # RP13 #5: in the hull of an L-shaped domain but off its blocks there
+        # are no background cells -- neither inside nor external flow.
+        outside_domain = self._outside_domain_shape(session, point, surface)
+        if (not probe.get('valid') and not probe.get('on_surface')
+                and not outside_domain):
             domain = self._background_domain_bounds(session.case_path)
             external = bool(domain is not None
                             and self._point_inside_bounds(point, domain))
         return self._read_result(session, command, dict(
-            probe, known=True, point=point, external=external))
+            probe, known=True, point=point, external=external,
+            outside_domain=outside_domain))
+
+    @staticmethod
+    def _domain_shape(session: CaseSession, surface):
+        """RP13 #5: the `DomainBox` of a domain that is not a cuboid, or ``None``."""
+        from foammesh.core.mesh import fluid_regions
+
+        try:
+            bounds = surface.GetBounds() if surface is not None else None
+            box = fluid_regions.detection_box(
+                getattr(session.state, 'db', None), session.case_path, bounds)
+        except Exception:  # noqa: BLE001 - an unreadable domain is a box
+            return None
+        return getattr(box, 'domain', None)
+
+    def _outside_domain_shape(self, session: CaseSession, point,
+                              surface) -> bool:
+        """True when *point* is in the domain's hull but off every block."""
+        shape = self._domain_shape(session, surface)
+        if shape is None:
+            return False
+        bounds = shape.bounds
+        inside_hull = all(bounds[2 * axis] <= float(point[axis])
+                          <= bounds[2 * axis + 1] for axis in range(3))
+        return inside_hull and not shape.contains(point)
+
+    # -- Plan 36 RP7: fluid regions from the labelled domain ---------------- #
+
+    @staticmethod
+    def _fluid_space_inputs(session: CaseSession):
+        """``(surfaces, geometry_bounds, box, base_cell)``, or ``None``.
+
+        The surfaces are the staged artifacts -- the set the launch gate
+        judges seeds against -- and the box is the background mesh's (RP1).
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.mesh import fluid_regions
+
+        store = GeometryArtifactStore(session.case_path)
+        surfaces = [store._polydata(entry) for entry in store.entries()]
+        surfaces = [surface for surface in surfaces
+                    if surface is not None and surface.GetNumberOfCells()]
+        geometry_bounds = fluid_regions.union_bounds(surfaces)
+        if geometry_bounds is None:
+            return None
+        db = getattr(session.state, 'db', None)
+        box = fluid_regions.detection_box(
+            db, session.case_path, geometry_bounds)
+        if box is None:
+            return None
+        return (surfaces, geometry_bounds, box,
+                fluid_regions.base_cell_size(db, box))
+
+    @staticmethod
+    def _fluid_space_options(session: CaseSession, base_cell, resolution=None):
+        from foammesh.core.mesh import fluid_regions
+
+        options = {'cache_dir': fluid_regions.cache_dir(session.case_path)}
+        if resolution is not None:
+            options['h'] = float(resolution)
+        else:
+            options['base_cell'] = base_cell
+        return options
+
+    @staticmethod
+    def _detection_parameters(command: Command):
+        parameters = command.parameters
+        try:
+            count = int(parameters.get('count', 1))
+        except (TypeError, ValueError):
+            raise ValidationFailedError('count must be a whole number') from None
+        if count < 1:
+            raise ValidationFailedError('count must be at least 1',
+                                        details={'count': count})
+        external = bool(parameters.get('external', False))
+        resolution = parameters.get('resolution')
+        if resolution is not None:
+            try:
+                resolution = float(resolution)
+            except (TypeError, ValueError):
+                raise ValidationFailedError(
+                    'resolution must be a length in metres') from None
+            if not (resolution > 0 and resolution < float('inf')):
+                raise ValidationFailedError(
+                    'resolution must be a positive length',
+                    details={'resolution': resolution})
+        return count, external, resolution
+
+    async def _detect_fluid_spaces(self, session: CaseSession, command: Command,
+                                   inputs, resolution=None):
+        """Label the domain on the VTK worker thread, as a cancellable job."""
+        import asyncio
+        from foammesh.core.geometry.diagnostics import budget as budget_module
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.fluid_spaces import FluidSpacesCancelled
+        from foammesh.support.vtk_threads import vtk_run_in_thread
+
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        job_id = str(command.parameters.get('job_id') or
+                     f'fluid-regions-{uuid.uuid4().hex[:12]}')
+        loop = asyncio.get_running_loop()
+        bus = session.state.bus
+
+        def progress(stage, fraction):
+            # Called on the worker thread; the bus belongs to the loop.
+            loop.call_soon_threadsafe(lambda: bus.publish(
+                Event.JOB_PROGRESS, job_id=job_id, name=command.operation,
+                stage=stage, fraction=fraction,
+                message=f'detecting fluid spaces: {stage}'))
+
+        budget = budget_module.budget_from_settings(command.operation)
+        budget_module.register(job_id, budget)
+        bus.publish(Event.JOB_STARTED, job_id=job_id, name=command.operation,
+                    argv=[], cwd=str(session.case_path), mutation=False,
+                    environment_fingerprint='in-process',
+                    message='detecting fluid spaces')
+        try:
+            field = await vtk_run_in_thread(
+                fluid_regions.run_detection, surfaces, box,
+                cancelled=lambda: bool(budget.cancelled), progress=progress,
+                **self._fluid_space_options(session, base_cell, resolution))
+        except FluidSpacesCancelled as error:
+            bus.publish(Event.JOB_CANCELLED, job_id=job_id,
+                        name=command.operation)
+            raise PreconditionFailedError(
+                'fluid-space detection was cancelled',
+                details={'error': 'detection_cancelled',
+                         'job_id': job_id}) from error
+        except (ValueError, RuntimeError, MemoryError) as error:
+            bus.publish(Event.JOB_FAILED, job_id=job_id,
+                        name=command.operation, error=str(error))
+            raise PreconditionFailedError(
+                f'fluid-space detection failed: {error}',
+                details={'error': 'detection_failed'}) from error
+        finally:
+            budget_module.unregister(job_id)
+        bus.publish(Event.JOB_FINISHED, job_id=job_id, name=command.operation,
+                    returncode=0)
+        return field
+
+    async def _geometry_fluid_regions_detect(self, session: CaseSession,
+                                             command: Command) -> OperationResult:
+        """How many fluid regions? Label the domain and propose ``count``.
+
+        Plan 36 RP7. The result is ``spaces`` (id, volume, depth, seed,
+        outside, too_thin, bounds), ``proposed`` (``count`` ids, the outside
+        first when ``external``), ``found_enclosed``, ``mismatch`` (``null``
+        or ``{asked, found, reason}``), ``h``, ``voxels`` and ``elapsed``.
+        The field is cached beside the case, so asking again -- from the GUI
+        or the CLI -- answers from the file.
+
+        RP13 #7: every answer carries ``case_id`` and ``request_id`` (the
+        caller's, or the command's id), so a caller drops one that arrives
+        after its editor or case closed, or after a newer request.
+        """
+        from foammesh.core.mesh import cad_solids, fluid_regions
+
+        count, external, resolution = self._detection_parameters(command)
+        tags = self._detection_tags(session, command)
+        # Plan 36 RP11. On Gmsh every solid is a region, so the answer is the
+        # solids (`source: 'solids'`, `seed: null`, each row carrying the
+        # `region_uuid` apply takes). Only a Gmsh case with no closed solid
+        # labels the domain like snappy, and says so.
+        tail = {'source': 'fluid_spaces'}
+        if self._regions_are_solids(session):
+            found, typing = await self._gmsh_solids(session)
+            if found.solids:
+                # DP-915: with the far-field box on, the cut subtracts every
+                # solid; the fluid is the space around them, not a solid.
+                payload = cad_solids.propose(
+                    found, count, typing, external=external,
+                    farfield=cad_solids.farfield_enabled(session.state.db))
+                # RP13 #3: the solids answered are kept under an id an apply
+                # by ids must name, fingerprinted by the solid topology.
+                payload.update(self._keep_detection(
+                    session, source=detection_record.SOLIDS,
+                    fingerprint=detection_record.solid_fingerprint(found),
+                    external=external, spaces=payload['spaces']))
+                return self._read_result(session, command,
+                                         {**payload, **tags})
+            tail.update({'fallback': 'no_closed_solids',
+                         'open_regions': list(found.open_regions),
+                         'not_solids': list(found.not_solids)})
+        inputs = self._fluid_space_inputs(session)
+        if inputs is None:
+            return self._read_result(
+                session, command,
+                {**fluid_regions.empty_proposal(count), **tail,
+                 'detection_id': None, **tags})
+        field = await self._detect_fluid_spaces(
+            session, command, inputs, resolution)
+        _surfaces, geometry_bounds, box, base_cell = inputs
+        payload = {**fluid_regions.propose(
+            field, count, external=external, base_cell=base_cell,
+            geometry_bounds=geometry_bounds, box=box,
+            finest=self._finest_cell(session, base_cell)), **tail}
+        # RP13 #2 / DP-862: a voxel centre can sit exactly on a base-grid
+        # face; every seed detect offers is moved off the mesh's faces.
+        self._seeds_off_faces(session, field, payload['spaces'],
+                              geometry_bounds)
+        # RP13 #3: the labelled answer is kept under an id an apply by ids
+        # must name, fingerprinted by the surfaces' content and the box.
+        payload.update(self._keep_detection(
+            session, source=detection_record.VOXELS,
+            fingerprint=detection_record.voxel_fingerprint(
+                field.surface_key, box),
+            box=box, h=field.h, external=external, field_key=field.key,
+            spaces=payload['spaces']))
+        return self._read_result(session, command, {**payload, **tags})
+
+    @staticmethod
+    def _detection_tags(session: CaseSession, command: Command) -> dict:
+        """RP13 #7: the case and request a detection answers."""
+        request = (command.parameters or {}).get('request_id')
+        return {'case_id': str(session.case_id),
+                'request_id': str(request or command.command_id)}
+
+    @staticmethod
+    def _finest_cell(session: CaseSession, base_cell):
+        """base / 2^maxLevel: what a thin space is judged against (RP13 #4)."""
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.face_clearance import max_refinement_level
+
+        try:
+            level = max_refinement_level(getattr(session.state, 'db', None))
+        except Exception:  # noqa: BLE001 - no levels: the base cell stands
+            level = 0
+        return fluid_regions.finest_cell(base_cell, level)
+
+    @staticmethod
+    def _mesh_faces(session: CaseSession, geometry_bounds):
+        """``(grid, max_level)`` of the mesh the case will cut, RP13 #2."""
+        from foammesh.core.mesh.face_clearance import (
+            background_grid, max_refinement_level,
+        )
+
+        db = getattr(session.state, 'db', None)
+        try:
+            return (background_grid(db, geometry_bounds),
+                    max_refinement_level(db))
+        except Exception:  # noqa: BLE001 - no grid: nothing to keep off
+            return None, 0
+
+    @staticmethod
+    def _off_faces(faces, field, seed, space_id) -> list:
+        """*seed* moved off every mesh face, if it stays in its space.
+
+        RP13 #2 / DP-862. The move is a third of the finest cell; a space
+        too thin to take it keeps the voxel centre, which is then the
+        launch gate's to judge.
+        """
+        from foammesh.core.mesh.face_clearance import nudge_off_faces
+
+        grid, level = faces
+        point = tuple(float(value) for value in seed)
+        moved = nudge_off_faces(point, grid, level)
+        if moved != point and field is not None:
+            found = field.space_at(moved)
+            if found is None or int(found.label) != int(space_id):
+                moved = point
+        return [float(value) for value in moved]
+
+    def _seeds_off_faces(self, session: CaseSession, field, rows,
+                         geometry_bounds) -> None:
+        """Every detected row's seed, moved off the mesh faces (DP-862)."""
+        faces = self._mesh_faces(session, geometry_bounds)
+        if faces[0] is None:
+            return
+        for row in rows:
+            if row.get('seed') is not None:
+                row['seed'] = self._off_faces(faces, field, row['seed'],
+                                              row['id'])
+
+    @staticmethod
+    def _keep_detection(session: CaseSession, **record) -> dict:
+        """RP13 #3: keep a detection beside the cache; its id for the payload."""
+        from foammesh.core.mesh import fluid_regions
+
+        kept = detection_record.write(
+            fluid_regions.cache_dir(session.case_path),
+            case_id=session.case_id, **record)
+        return {'detection_id': kept['detection_id']}
+
+    async def _kept_detection(self, session: CaseSession, parameters,
+                              current_fingerprint, result_present=None):
+        """The record an apply by ids names, if it still describes the case.
+
+        RP13 #3. *current_fingerprint* is awaited only once a record is
+        found; a stale or unknown id is refused as ``detection_stale``.
+        """
+        from foammesh.core.mesh import fluid_regions
+
+        identifier = str(parameters.get('detection_id') or '').strip()
+        if not identifier:
+            raise ValidationFailedError(
+                'an apply by ids must name the detection it applies: give '
+                'the detection_id detect answered',
+                details={'error': detection_record.DETECTION_ID_REQUIRED})
+        cache = fluid_regions.cache_dir(session.case_path)
+        record = detection_record.read(cache, identifier)
+        fingerprint = None
+        if record is not None:
+            fingerprint = await current_fingerprint(record)
+        try:
+            return detection_record.check(
+                cache, identifier, case_id=session.case_id,
+                fingerprint=fingerprint, result_present=result_present)
+        except detection_record.DetectionStale as stale:
+            raise PreconditionFailedError(
+                str(stale), details={
+                    'error': detection_record.DETECTION_STALE,
+                    'reason': stale.reason,
+                    'detection_id': identifier}) from None
+
+    #: Where the offer of the fluid-region question is noted (D7). The cache
+    #: folder is outside the case fingerprint, so noting it is not an edit.
+    FLUID_REGIONS_OFFERED = 'region_detection_offered'
+
+    def _geometry_fluid_regions_offer(self, session: CaseSession,
+                                      command: Command) -> OperationResult:
+        """Should "How many fluid regions?" open by itself? (Plan 36 D7.)
+
+        Once per case: while the case has no regions and at least one staged
+        surface is closed -- an open surface has no enclosed space to find,
+        and the Detect button stays for everything else. ``record`` notes the
+        offer when the answer is yes, so the next visit does not ask again.
+        The note is a marker in the case's cache folder, beside the detection
+        field: not configuration, not history, not an external edit.
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.mesh import fluid_regions
+
+        marker = (fluid_regions.cache_dir(session.case_path)
+                  / self.FLUID_REGIONS_OFFERED)
+        db = getattr(session.state, 'db', None)
+        try:
+            regions = db.getElements('region') if db is not None else {}
+        except Exception:  # noqa: BLE001 - a case without the section
+            regions = {}
+        entries = GeometryArtifactStore(session.case_path).entries()
+        if marker.exists():
+            reason = 'offered'
+        elif getattr(session, 'read_only', False):
+            reason = 'read_only'
+        elif regions:
+            reason = 'has_regions'
+        elif not entries:
+            reason = 'no_surface'
+        elif not any((entry.get('diagnostics') or {}).get('watertight')
+                     for entry in entries):
+            reason = 'open_surface'
+        else:
+            reason = None
+        offer = reason is None
+        if offer and command.parameters.get('record'):
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text('offered\n', encoding='utf-8')
+            except OSError:
+                # Not noting it means it may open once more; never an error.
+                pass
+        return self._read_result(session, command, {
+            'offer': offer, 'reason': reason or 'first_visit'})
+
+    def _geometry_fluid_regions_seeds(self, session: CaseSession,
+                                      command: Command) -> OperationResult:
+        """Which space each region's seed is in (Plan 36 RP8, the table).
+
+        Read from the cached labelling only -- the one detection or a launch
+        left beside the case -- so it is cheap on the GUI thread and never
+        starts a labelling. ``labelled`` is ``False`` without one. Each
+        region (by key) gets ``name``, ``type``, ``space`` (``None`` on a
+        wall or off the box), ``volume``, ``outside``, ``same_as`` (the
+        first region, in id order, already seeded in that space) and
+        ``clash`` (a Fluid and a Solid seed share the space).
+        """
+        from foammesh.core.mesh import fluid_regions
+
+        empty = {'labelled': False, 'regions': {}}
+        db = getattr(session.state, 'db', None)
+        try:
+            regions = dict(db.getElements('region') or {}) if db else {}
+        except Exception:  # noqa: BLE001 - a case without the section
+            regions = {}
+        if not regions:
+            return self._read_result(session, command, empty)
+        inputs = self._fluid_space_inputs(session)
+        if inputs is None:
+            return self._read_result(session, command, empty)
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        field = fluid_regions.cached_detection(
+            surfaces, box, **self._fluid_space_options(session, base_cell))
+        if field is None:
+            return self._read_result(session, command, empty)
+
+        def order(key):
+            text = str(key)
+            return (0, int(text), '') if text.isdigit() else (1, 0, text)
+
+        rows, members = {}, {}
+        for key in sorted(regions, key=order):
+            region = regions[key]
+            row = {'name': self._region_label(key, region),
+                   'type': self._region_type(region), 'space': None,
+                   'volume': None, 'outside': False, 'same_as': None,
+                   'clash': False}
+            try:
+                point = tuple(float(value) for value in region.vector('point'))
+                found = field.space_at(point)
+            except Exception:  # noqa: BLE001 - an unreadable seed is no space
+                found = None
+            if found is not None and int(found.label) != 0:
+                space_id = int(found.label)
+                space = field.space(space_id)
+                row['space'] = space_id
+                if space is not None:
+                    row['volume'] = float(space.volume)
+                    row['outside'] = bool(space.outside)
+                group = members.setdefault(space_id, [])
+                if group:
+                    row['same_as'] = rows[group[0]]['name']
+                group.append(str(key))
+            rows[str(key)] = row
+        for group in members.values():
+            if len({rows[key]['type'] for key in group}) > 1:
+                for key in group:
+                    rows[key]['clash'] = True
+        return self._read_result(session, command,
+                                 {'labelled': True, 'regions': rows})
+
+    async def _geometry_fluid_regions_apply(self, session: CaseSession,
+                                            command: Command) -> OperationResult:
+        """Write the accepted regions in one transaction: one undo removes all.
+
+        ``regions`` is ``[{name?, type?, point}]`` -- what the GUI's Accept
+        all sends after the user renamed or retyped a row. ``ids`` picks
+        spaces of a detection instead, which is the CLI's second call; it
+        must name the ``detection_id`` detect answered, and is refused as
+        ``detection_stale`` when the geometry or the box changed since, or
+        the labelled result is gone (RP13 #3).
+
+        The regions are added to the ones the case has; a new seed in a
+        space an existing region already holds is refused, naming it.
+        ``replace`` first drops the existing regions of the types applied.
+        """
+        from foammesh.core.facade.facade import _source as commit_source
+        from foammesh.core.facade.field_adapters import build_entity_adapters
+        from foammesh.core.facade.fields import REGISTRY
+        from foammesh.db.configurations_schema import RegionType
+
+        session.require_writable()
+        if self._regions_are_solids(session):
+            # Plan 36 RP11: Gmsh reads no seed; its regions are the solids.
+            return await self._apply_gmsh_solids(session, command)
+        parameters = command.parameters
+        default_type = str(parameters.get('type') or RegionType.FLUID.value)
+        allowed = {item.value for item in RegionType}
+        if default_type not in allowed:
+            raise ValidationFailedError(
+                'type must be one of: ' + ', '.join(sorted(allowed)))
+        rows = parameters.get('regions')
+        if rows is None:
+            ids = parameters.get('ids')
+            if isinstance(ids, str):
+                ids = [part for part in ids.split(',') if part.strip()]
+            try:
+                ids = [int(value) for value in ids or ()]
+            except (TypeError, ValueError):
+                raise ValidationFailedError(
+                    'ids must be whole numbers') from None
+            if not ids:
+                raise ValidationFailedError(
+                    'give the regions to write, or the ids of detected spaces')
+            field, rows = await self._detected_seeds(session, parameters, ids)
+        elif parameters.get('detection_id'):
+            # The GUI names the detection its rows came from: refused when
+            # the geometry or the box changed while the review was open.
+            _record, field = await self._voxel_detection(session, parameters)
+        else:
+            field = self._labelled_field(session, command)
+        if not isinstance(rows, list) or not rows:
+            raise ValidationFailedError('regions must be a non-empty list')
+
+        adapter = build_entity_adapters(REGISTRY.collections)['regions.items']
+        storage = adapter.storage_path
+        data = session.state.checkout()
+        if parameters.get('replace'):
+            # RP13 #3: replace the regions of the types applied, not all.
+            applied = {str(row.get('type') or default_type).lower()
+                       for row in rows if isinstance(row, Mapping)}
+            for key, element in list(
+                    (data.getElements(storage) or {}).items()):
+                if self._region_type(element) in applied:
+                    data.removeElement(storage, key)
+        held = self._held_spaces(data, storage, field)
+        taken = set()
+        for element in (data.getElements(storage) or {}).values():
+            try:
+                taken.add(str(element.value('name')))
+            except Exception:  # noqa: BLE001 - a row without a name
+                pass
+        written = []
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, Mapping):
+                raise ValidationFailedError('each region must be an object')
+            try:
+                point = [float(value) for value in row.get('point')]
+            except (TypeError, ValueError):
+                point = []
+            if len(point) != 3 or not all(
+                    value == value and abs(value) != float('inf')
+                    for value in point):
+                raise ValidationFailedError(
+                    'point must be three finite coordinates',
+                    details={'region': index})
+            kind = str(row.get('type') or default_type)
+            name = str(row.get('name') or '').strip()
+            if not name:
+                # DP-868: an unnamed region is named after its type.
+                prefix = ('solid' if kind.strip().lower() == 'solid'
+                          else 'fluid')
+                number = len(taken) + 1
+                while f'{prefix}_{number}' in taken:
+                    number += 1
+                name = f'{prefix}_{number}'
+            if name in taken:
+                raise ValidationFailedError(
+                    'a region with that name already exists',
+                    details={'name': name})
+            taken.add(name)
+            holder = self._space_holder(field, held, point)
+            if holder is not None:
+                # RP13 #3: one space, one seed; appending never doubles it.
+                raise ValidationFailedError(
+                    f'region "{holder[1]}" already holds that space: '
+                    'replace it, or pick another space',
+                    details={'error': 'space_taken', 'region': index,
+                             'space': holder[0], 'held_by': holder[1]})
+            normalized = adapter.normalize_patch({
+                'name': name, 'type': kind, 'point.x': point[0],
+                'point.y': point[1], 'point.z': point[2]})
+            key, _element = data.addNewElement(storage)
+            for relative_path, value in normalized.items():
+                data.setValue(f'{storage}/{key}/{relative_path}', value,
+                              relative_path)
+            written.append((key, name, kind, point, row.get('space')))
+        transaction = session.state.commit(
+            data, action='create fluid regions',
+            source=commit_source(command.source), target='regions.items',
+            reason=f'actor={command.actor.id}')
+        regions = [{'id': str(data.remappedKey(storage, key)), 'name': name,
+                    'type': kind, 'point': point,
+                    **({} if space is None else {'space': int(space)})}
+                   for key, name, kind, point, space in written]
+        changed = tuple(f'regions.items/{row["id"]}' for row in regions)
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            changed_fields=changed,
+            invalidated_outputs=('mesh.base_grid', 'quality'),
+            payload={'regions': regions,
+                     'transaction_id': getattr(transaction, 'tx_id', None)})
+
+    # -- Plan 36 RP13 #3: which detection an apply applies ------------------ #
+
+    async def _detected_seeds(self, session: CaseSession, parameters, ids):
+        """``(field, rows)`` for the ids of a kept, still-current detection."""
+        record, field = await self._voxel_detection(session, parameters)
+        spaces = {int(row['id']): row for row in record.get('spaces') or ()}
+        rows = []
+        for space_id in ids:
+            row = spaces.get(space_id)
+            if row is None or row.get('seed') is None:
+                raise ValidationFailedError(
+                    'no detected space has that id',
+                    details={'id': space_id, 'spaces': sorted(spaces)})
+            rows.append({'point': list(row['seed']), 'space': space_id})
+        return field, rows
+
+    async def _voxel_detection(self, session: CaseSession, parameters):
+        """``(record, field)`` of the named detection, if still current."""
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.fluid_spaces import _cached
+        from foammesh.support.vtk_threads import vtk_run_in_thread
+
+        inputs = self._fluid_space_inputs(session)
+        if inputs is None:
+            raise PreconditionFailedError(
+                'this case has no staged geometry to detect spaces in')
+        surfaces, _geometry_bounds, box, _base_cell = inputs
+        cache = fluid_regions.cache_dir(session.case_path)
+
+        async def current(_record):
+            key = await vtk_run_in_thread(fluid_regions.surface_key, surfaces)
+            return detection_record.voxel_fingerprint(key, box)
+
+        def present(record):
+            key = record.get('field_key')
+            return bool(key) and _cached(key, cache) is not None
+
+        record = await self._kept_detection(session, parameters, current,
+                                            present)
+        if record.get('source') != detection_record.VOXELS:
+            raise PreconditionFailedError(
+                'that detection answered solids, not labelled spaces; '
+                'detect again', details={
+                    'error': detection_record.DETECTION_STALE,
+                    'reason': detection_record.UNKNOWN,
+                    'detection_id': record.get('detection_id')})
+        return record, _cached(record['field_key'], cache)
+
+    def _labelled_field(self, session: CaseSession, command: Command):
+        """The cached field for the case as it is, or ``None``: never labels."""
+        from foammesh.core.mesh import fluid_regions
+
+        inputs = self._fluid_space_inputs(session)
+        if inputs is None:
+            return None
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        resolution = command.parameters.get('resolution')
+        try:
+            resolution = None if resolution is None else float(resolution)
+        except (TypeError, ValueError):
+            resolution = None
+        return fluid_regions.cached_detection(
+            surfaces, box,
+            **self._fluid_space_options(session, base_cell, resolution))
+
+    def _held_spaces(self, data, storage, field) -> dict:
+        """``space id -> region name`` for the regions *data* already has."""
+        held: dict = {}
+        if field is None:
+            return held
+        for key, element in (data.getElements(storage) or {}).items():
+            try:
+                point = tuple(float(value)
+                              for value in element.vector('point'))
+                found = field.space_at(point)
+            except Exception:  # noqa: BLE001 - an unreadable seed holds none
+                continue
+            if found is not None and int(found.label) != 0:
+                held.setdefault(int(found.label),
+                                self._region_label(key, element))
+        return held
+
+    @staticmethod
+    def _space_holder(field, held, point):
+        """``(space, region name)`` when *point* is in a held space."""
+        if field is None or not held:
+            return None
+        found = field.space_at(tuple(point))
+        if found is None or int(found.label) == 0:
+            return None
+        name = held.get(int(found.label))
+        return None if name is None else (int(found.label), name)
+
+    # -- Plan 36 RP11: Gmsh regions are the solids -------------------------- #
+
+    def _regions_are_solids(self, session: CaseSession) -> bool:
+        """Whether the case's engine meshes each solid as its own region."""
+        from foammesh.core.engine.registry import ENGINE_REGISTRY
+
+        engine_id = self._engine_id(session)
+        if engine_id not in ENGINE_REGISTRY.ids():
+            return False
+        return bool(getattr(ENGINE_REGISTRY.get(engine_id),
+                            'regions_are_solids', False))
+
+    @staticmethod
+    def _gmsh_typing(db) -> dict:
+        """``region_uuid`` -> the typing the Gmsh volume controls hold."""
+        from foammesh.core.mesh.cad_solids import typing_of
+
+        try:
+            rows = dict(db.getElements('gmsh/volumeControls') or {})
+        except Exception:  # noqa: BLE001 - a case without the list
+            rows = {}
+        return typing_of(rows)
+
+    async def _gmsh_solids(self, session: CaseSession):
+        """``(CaseSolids, typing)``, measured on the VTK worker thread."""
+        from foammesh.core.mesh import cad_solids
+        from foammesh.support.vtk_threads import vtk_run_in_thread
+
+        found = await vtk_run_in_thread(cad_solids.case_solids,
+                                        session.case_path)
+        return found, self._gmsh_typing(session.state.db)
+
+    async def _apply_gmsh_solids(self, session: CaseSession,
+                                 command: Command) -> OperationResult:
+        """Type the accepted solids, in one transaction: one undo reverts all.
+
+        Plan 36 RP11. Gmsh meshes the solids the geometry has, so accepting a
+        candidate writes no point: it types the solid, keyed by its
+        ``region_uuid`` -- the identity the import minted and every Gmsh
+        volume control scopes to -- never by its position in a list.
+
+        ``solids`` is ``[{region_uuid, name?, type?}]`` (type ``fluid``,
+        ``solid`` or ``excluded``); ``ids`` picks solids of the detection
+        instead (its ``spaces[].id``, largest first), and must name that
+        detection's ``detection_id`` (RP13 #3). Each solid's volume
+        control -- the first row scoping it, or a new one -- gets
+        ``volumeType``; ``excluded`` clears ``included``. An exclusion already
+        there is kept: accepting a candidate never re-includes a solid the
+        user took out (it is listed in ``kept_excluded``). A ``name`` renames
+        the control and the tree's volume row for that solid, which is the
+        name the cell zone publishes under (DP-419).
+        """
+        from foammesh.core.facade.facade import _source as commit_source
+        from foammesh.core.facade.field_adapters import build_entity_adapters
+        from foammesh.core.facade.fields import REGISTRY
+        from foammesh.core.mesh import cad_solids
+
+        parameters = command.parameters
+        if parameters.get('regions') is not None:
+            raise ValidationFailedError(
+                'Gmsh reads no seed point: its regions are the solids. Give '
+                '`solids` (by region_uuid) or the `ids` detection answered.',
+                details={'engine': 'gmsh', 'error': 'gmsh_takes_solids'})
+        if parameters.get('replace'):
+            raise ValidationFailedError(
+                'replace does not apply on Gmsh: a solid cannot be removed '
+                'by typing; exclude it instead.',
+                details={'engine': 'gmsh'})
+        default_type = str(parameters.get('type') or cad_solids.FLUID)
+        if default_type not in cad_solids.TYPES:
+            raise ValidationFailedError(
+                'type must be one of: ' + ', '.join(cad_solids.TYPES))
+        found, _typing = await self._gmsh_solids(session)
+        if not found.solids:
+            raise PreconditionFailedError(
+                'this Gmsh case has no closed solid to type: Gmsh does not '
+                'read seed points, so a labelled space cannot become a '
+                'region here',
+                details={'error': 'no_closed_solids',
+                         'open_regions': list(found.open_regions),
+                         'not_solids': list(found.not_solids)})
+        if cad_solids.farfield_cuts(
+                found, cad_solids.farfield_enabled(session.state.db)):
+            # DP-915: the far-field cut consumes every imported solid, so a
+            # control scoped to one is refused by the runner. Refuse here.
+            names = [solid.name for solid in found.solids]
+            raise PreconditionFailedError(
+                'the far-field box is on, so the run cuts '
+                + ', '.join(f"'{name}'" for name in names)
+                + ' out of the box: '
+                + ('that solid is' if len(names) == 1 else 'those solids are')
+                + ' the obstacle, and the fluid is the space around '
+                + ('it' if len(names) == 1 else 'them')
+                + ', which the run builds itself. There is no solid to type; '
+                  'turn the far-field box off to mesh the solids instead.',
+                details={'error': 'farfield_cuts_solids', 'engine': 'gmsh',
+                         'solids': [solid.region_uuid
+                                    for solid in found.solids],
+                         'names': names})
+        by_uuid = found.by_uuid()
+        rows = parameters.get('solids')
+        if rows is None:
+            ids = parameters.get('ids')
+            if isinstance(ids, str):
+                ids = [part for part in ids.split(',') if part.strip()]
+            try:
+                ids = [int(value) for value in ids or ()]
+            except (TypeError, ValueError):
+                raise ValidationFailedError(
+                    'ids must be whole numbers') from None
+            if not ids:
+                raise ValidationFailedError(
+                    'give the solids to type, or the ids detection answered')
+
+            async def current(_record):
+                return detection_record.solid_fingerprint(found)
+
+            # RP13 #3: the ids are the numbers of one detection, bound to the
+            # solid topology it answered from.
+            record = await self._kept_detection(session, parameters, current)
+            if record.get('source') != detection_record.SOLIDS:
+                raise PreconditionFailedError(
+                    'that detection answered labelled spaces, not solids; '
+                    'detect again', details={
+                        'error': detection_record.DETECTION_STALE,
+                        'reason': detection_record.UNKNOWN,
+                        'detection_id': record.get('detection_id')})
+            spaces = {int(space['id']): space
+                      for space in record.get('spaces') or ()
+                      if space.get('region_uuid')}
+            rows = []
+            for space_id in ids:
+                if space_id not in spaces:
+                    raise ValidationFailedError(
+                        'no detected solid has that id',
+                        details={'id': space_id, 'spaces': sorted(spaces)})
+                rows.append({'region_uuid': spaces[space_id]['region_uuid'],
+                             'space': space_id})
+        if not isinstance(rows, list) or not rows:
+            raise ValidationFailedError('solids must be a non-empty list')
+
+        adapter = build_entity_adapters(REGISTRY.collections)[
+            'gmsh.volume_controls.controls']
+        storage = adapter.storage_path
+        data = session.state.checkout()
+        typing = self._gmsh_typing(data)
+        names = {str(item.get('name') or ''): token
+                 for token, item in typing.items() if item.get('name')}
+        seen: set = set()
+        written, kept_excluded = [], []
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, Mapping):
+                raise ValidationFailedError('each solid must be an object')
+            token = str(row.get('region_uuid') or '').strip()
+            solid = by_uuid.get(token)
+            if solid is None:
+                raise ValidationFailedError(
+                    'no solid of this case has that region_uuid',
+                    details={'solid': index, 'region_uuid': token,
+                             'solids': sorted(by_uuid)})
+            if token in seen:
+                raise ValidationFailedError(
+                    'a solid is listed twice', details={'region_uuid': token})
+            seen.add(token)
+            kind = str(row.get('type') or default_type)
+            if kind not in cad_solids.TYPES:
+                raise ValidationFailedError(
+                    'type must be one of: ' + ', '.join(cad_solids.TYPES),
+                    details={'solid': index})
+            name = str(row.get('name') or '').strip()
+            if name and names.get(name, token) != token:
+                raise ValidationFailedError(
+                    'another volume control already has that name',
+                    details={'name': name})
+            current = typing.get(token)
+            patch = {}
+            if kind == cad_solids.EXCLUDED:
+                patch['included'] = False
+            else:
+                patch['volume_type'] = kind
+            if kind == cad_solids.EXCLUDED:
+                included = False
+            else:
+                included = bool(current.get('included', True)) \
+                    if current else True
+                if not included:
+                    kept_excluded.append(token)
+            if name:
+                patch['name'] = name
+            if current is None:
+                patch = {'name': name or solid.name, 'enabled': True,
+                         'scope_token': token, 'included': included,
+                         **patch}
+                key, _element = data.addNewElement(storage)
+            else:
+                key = current['control']
+            for relative_path, value in adapter.normalize_patch(
+                    patch).items():
+                data.setValue(f'{storage}/{key}/{relative_path}', value,
+                              relative_path)
+            if name:
+                names[name] = token
+                self._rename_tree_volume(data, token, name)
+            written.append((key, token, name or (current or {}).get('name')
+                            or solid.name, kind, included, row.get('space')))
+        transaction = session.state.commit(
+            data, action='type solids',
+            source=commit_source(command.source),
+            target='gmsh.volume_controls.controls',
+            reason=f'actor={command.actor.id}')
+        solids = [{'control': str(data.remappedKey(storage, key)),
+                   'region_uuid': token, 'name': name, 'type': kind,
+                   'included': included,
+                   **({} if space is None else {'space': int(space)})}
+                  for key, token, name, kind, included, space in written]
+        changed = tuple(f'gmsh.volume_controls.controls/{row["control"]}'
+                        for row in solids)
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            changed_fields=changed,
+            invalidated_outputs=('mesh', 'quality', 'exports'),
+            payload={'engine': 'gmsh', 'solids': solids,
+                     'kept_excluded': kept_excluded,
+                     'transaction_id': getattr(transaction, 'tx_id', None)})
+
+    @staticmethod
+    def _rename_tree_volume(data, token: str, name: str) -> None:
+        """Rename the tree's volume row for *token*, where the tree has one."""
+        try:
+            rows = dict(data.getElements('geometry') or {})
+        except Exception:  # noqa: BLE001 - a case without a tree
+            return
+        for key, row in rows.items():
+            try:
+                kind = row.value('gType')
+                owner = row.value('regionUuid')
+            except Exception:  # noqa: BLE001 - a row without the leaf
+                continue
+            if str(getattr(kind, 'value', kind)) == 'volume' \
+                    and str(owner or '') == token:
+                data.setValue(f'geometry/{key}/name', name, 'name')
 
     @staticmethod
     def _region_label(key, region) -> str:
@@ -7243,8 +8349,14 @@ runTimeModifiable true;
             name = None
         return str(name) if name else f'region {key}'
 
-    def _validate_fluid_seed(self, session: CaseSession) -> None:
+    def _validate_fluid_seed(self, session: CaseSession, *,
+                             allow_region_clash=False) -> list[str]:
         """Reject a surface/off-domain locationInMesh before launching snappy.
+
+        Returns the warnings the launch should carry (Plan 36 RP8): two seeds
+        of one type in one space, which snappy meshes once as one region. A
+        Fluid and a Solid seed in one space is refused instead -- snappy
+        cannot keep both -- naming both regions.
 
         DP-574: a seed outside every closed body is an external-flow seed and
         is accepted when it lies inside the background mesh box; every seed
@@ -7282,11 +8394,28 @@ runTimeModifiable true;
         store = GeometryArtifactStore(session.case_path)
         entries = store.entries()
         if not entries:  # legacy DB-only geometry has no immutable artifact to probe
-            return
+            return []
         regions = session.state.db.getElements('region')
         if not regions:
             raise PreconditionFailedError('a fluid region seed is required')
         assembled_surface = self._assembled_surface(session)
+        # RP13 #5: a seed in the hull of a domain that is not a cuboid, off
+        # every block, has no background cell for snappy to start from.
+        shape = self._domain_shape(session, assembled_surface)
+        for key, region in (regions.items() if shape is not None else ()):
+            point = [float(value) for value in region.vector('point')]
+            if shape.contains(point):
+                continue
+            label = self._region_label(key, region)
+            raise PreconditionFailedError(
+                f'{label} seed is outside the domain: the background blocks '
+                'do not cover that point, so blockMesh makes no cells there '
+                'and snappy cannot find one to start from. Move it into one '
+                'of the blocks.',
+                details={'error': 'invalid_fluid_seed',
+                         'reason': 'outside_domain', 'region': label,
+                         'point': point,
+                         'domain_bounds': list(shape.bounds)})
         for key, region in regions.items():
             point = region.vector('point')
             label = self._region_label(key, region)
@@ -7336,9 +8465,13 @@ runTimeModifiable true;
                     'background mesh box '
                     f'{self._describe_bounds(domain)}; move it inside the '
                     'box, around the body', details=details)
+        warnings = self._same_space_warnings(
+            session, regions, allow_region_clash=allow_region_clash)
+        warnings.extend(self._face_seed_warnings(
+            session, regions, assembled_surface))
         domain = self._background_domain_bounds(session.case_path)
         if domain is None:
-            return
+            return warnings
         for key, region in regions.items():
             point = region.vector('point')
             if not self._point_inside_bounds(point, domain):
@@ -7350,6 +8483,272 @@ runTimeModifiable true;
                     details={'error': 'invalid_fluid_seed', 'region': label,
                              'point': list(point),
                              'background_bounds': domain})
+        return warnings
+
+    #: How long the launch gate waits for a fluid-space field it has to label
+    #: itself. The launch primes the cache off the main thread first, so this
+    #: is only reached by a synchronous caller.
+    SEED_SPACE_SECONDS = 10.0
+
+    @staticmethod
+    def _region_type(region) -> str:
+        try:
+            kind = region.value('type')
+        except Exception:  # noqa: BLE001 - a row without a type is a fluid
+            kind = None
+        kind = getattr(kind, 'value', kind)
+        return str(kind).lower() if kind else 'fluid'
+
+    def _seed_space_field(self, session: CaseSession, inputs):
+        """The fluid-space field for the launch gate, or ``None``.
+
+        From a cache when there is one; otherwise labelled on the VTK worker
+        thread, never on the main thread. A field that cannot be had leaves
+        the seeds to the other checks rather than blocking the launch.
+        """
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.fluid_spaces import FluidSpacesCancelled
+
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        options = self._fluid_space_options(session, base_cell)
+        field = fluid_regions.cached_detection(surfaces, box, **options)
+        if field is not None:
+            return field
+        try:
+            return fluid_regions.detect_blocking(
+                surfaces, box, timeout=self.SEED_SPACE_SECONDS, **options)
+        except (TimeoutError, FluidSpacesCancelled, ValueError, RuntimeError,
+                MemoryError):
+            return None
+        except Exception:  # noqa: BLE001 - an unlabellable geometry is judged
+            return None    # by the per-seed checks alone
+
+    def _face_seed_warnings(self, session: CaseSession, regions,
+                            surface) -> list[str]:
+        """Plan 36 RP13 #2: a seed on a face of the mesh snappy will cut.
+
+        snappy looks for the cell holding each seed; on a face it finds two
+        or none. The gizmo and detect keep seeds off the faces, but a typed
+        point or an older case can still sit on one: the launch says so.
+        """
+        from foammesh.core.mesh.face_clearance import (
+            MIN_CLEARANCE, seed_face_clearance,
+        )
+
+        try:
+            bounds = surface.GetBounds() if surface is not None else None
+        except Exception:  # noqa: BLE001 - an advisory check, never a gate
+            bounds = None
+        grid, level = self._mesh_faces(session, bounds)
+        if grid is None:
+            return []
+        warnings = []
+        for key, region in regions.items():
+            try:
+                point = [float(value) for value in region.vector('point')]
+                clearance = seed_face_clearance(point, grid, level)
+            except Exception:  # noqa: BLE001 - the checks above judge it
+                continue
+            if clearance is None or clearance.relative >= MIN_CLEARANCE:
+                continue
+            label = self._region_label(key, region)
+            warnings.append(
+                f'{label} seed lies on a face of the mesh (along '
+                f'{"xyz"[clearance.axis]}, {clearance.relative:.3g} of a '
+                f'{clearance.cell:.4g} m cell from it); snappy may not find '
+                'the cell it is in. Nudge the seed off the face.')
+        return warnings
+
+    @staticmethod
+    def _allows_region_clash(command: Command) -> bool:
+        """RP13 #1: the launch's override of a confirmed fluid/solid clash."""
+        try:
+            return bool((command.parameters or {}).get('allow_region_clash'))
+        except AttributeError:
+            return False
+
+    def _seed_space_finer(self, session: CaseSession, inputs, field):
+        """RP13 #1: the gate's field again at h/2, or ``None``.
+
+        From a cache when the launch primed it; otherwise labelled on the VTK
+        worker within `fluid_regions.RECHECK_SECONDS`. Past that, or when the
+        voxel cap leaves no finer resolution, the conflicts stay unresolved.
+        """
+        import time
+
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.core.mesh.fluid_spaces import FluidSpacesCancelled
+
+        surfaces, _geometry_bounds, box, _base_cell = inputs
+        finer_h = fluid_regions.recheck_h(field)
+        if finer_h is None:
+            return None
+        options = {'cache_dir': fluid_regions.cache_dir(session.case_path),
+                   'h': finer_h}
+        cached = fluid_regions.cached_detection(surfaces, box, **options)
+        if cached is not None:
+            return cached
+        seconds = fluid_regions.RECHECK_SECONDS
+        deadline = time.monotonic() + seconds
+        try:
+            return fluid_regions.detect_blocking(
+                surfaces, box, timeout=seconds,
+                cancelled=lambda: time.monotonic() > deadline, **options)
+        except (TimeoutError, FluidSpacesCancelled, ValueError, RuntimeError,
+                MemoryError):
+            return None
+        except Exception:  # noqa: BLE001 - an unlabellable geometry stays
+            return None    # unresolved: a warning, never a refusal
+
+    #: RP13 #1: why a conflict is not confirmed, as the launch says it.
+    _CONFLICT_DOUBT = {
+        'approximate': 'the voxel check is approximate: at half the voxel '
+                       'size the spaces differ or the passage between the '
+                       'seeds is under two voxels wide',
+        'unresolved': 'the voxel check is unresolved: the finer check did '
+                      'not finish in time',
+    }
+
+    def _same_space_warnings(self, session: CaseSession, regions, *,
+                             allow_region_clash=False) -> list[str]:
+        """Plan 36 RP8 (F5): two region seeds in one space.
+
+        snappy keeps a space once, as the region whose seed it met first. Two
+        seeds of one type there is a region that will not exist -- a warning.
+        A Fluid and a Solid seed there cannot both be honoured: refused,
+        naming both, before snappy silently meshes one of them.
+
+        RP13 #1: the voxels only approximate the connectivity. Every conflict
+        is graded against a second field at h/2 (`graded_conflicts`); only a
+        ``confirmed`` clash refuses, and ``allow_region_clash`` overrides
+        even that. An approximate or unresolved one -- including two seeds
+        only the finer field joins through a narrow neck (DP-861) -- warns.
+        """
+        from foammesh.core.mesh import fluid_regions
+
+        if len(regions) < 2:
+            return []
+        inputs = self._fluid_space_inputs(session)
+        if inputs is None:
+            return []
+        field = self._seed_space_field(session, inputs)
+        if field is None:
+            return []
+        finer = self._seed_space_finer(session, inputs, field)
+        seeds = []
+        for key, region in regions.items():
+            try:
+                point = [float(value) for value in region.vector('point')]
+            except Exception:  # noqa: BLE001 - the loop above refuses it
+                continue
+            seeds.append((self._region_label(key, region),
+                          self._region_type(region), point))
+        warnings = []
+        for group in fluid_regions.graded_conflicts(field, seeds, finer):
+            named = ' and '.join(
+                f'{label} ({kind})'
+                for label, kind in zip(group['regions'], group['types']))
+            where = ('the space around the geometry' if group['outside']
+                     else 'one enclosed space')
+            confirmed = group['confidence'] == fluid_regions.CONFIRMED
+            doubt = self._CONFLICT_DOUBT.get(group['confidence'], '')
+            if group['clash'] and confirmed and not allow_region_clash:
+                raise PreconditionFailedError(
+                    f'{named} are seeded in {where}; snappy keeps a space '
+                    'as one region, so a fluid and a solid cannot share it. '
+                    'Move one seed into its own space.',
+                    details={'error': 'region_space_clash',
+                             'regions': group['regions'],
+                             'types': group['types'],
+                             'space': group['space'],
+                             'outside': group['outside'],
+                             'confidence': group['confidence']})
+            if group['clash'] and confirmed:
+                warnings.append(
+                    f'{named} are seeded in {where}; a fluid and a solid '
+                    'cannot share it, and the launch goes ahead only because '
+                    'allow_region_clash was given. snappy will keep one.')
+            elif group['clash']:
+                warnings.append(
+                    f'{named} may be seeded in {where} ({doubt}). If they '
+                    'are, snappy keeps it as one region and a fluid and a '
+                    'solid cannot share it. Check the passage between the '
+                    'seeds, or move one seed.')
+            elif confirmed:
+                first = group['regions'][0]
+                warnings.append(
+                    f'{named} are seeded in {where}; snappy meshes it once, '
+                    f'as {first}, so the others will not exist. Move or '
+                    'remove the extra seeds.')
+            else:
+                first = group['regions'][0]
+                warnings.append(
+                    f'{named} may be seeded in {where} ({doubt}). If they '
+                    f'are, snappy meshes it once, as {first}, and the others '
+                    'will not exist. Check the passage between the seeds.')
+        return warnings
+
+    async def _snappy_seed_gate(self, session: CaseSession, *,
+                                allow_region_clash=False) -> list[str]:
+        """The seed checks every snappy launch passes, whichever route.
+
+        DP-851. ``workflow.run_stage`` primed the fluid spaces and asked
+        :meth:`_validate_fluid_seed`; ``workflow.run_pipeline`` asked neither,
+        so "Run to end" launched snappy with a seed on a wall, off the box, or
+        a fluid and a solid in one space, and never said two seeds shared a
+        space. Both routes ask here now. Refusals raise; the returned list is
+        the warnings the launch carries, as ``warnings`` and as
+        ``payload['region_warnings']``.
+        """
+        await self._prime_seed_spaces(session)
+        return list(self._validate_fluid_seed(
+            session, allow_region_clash=allow_region_clash) or ())
+
+    @staticmethod
+    def _region_warnings_payload(seed_warnings) -> dict:
+        """``{'region_warnings': [...]}`` when there are any, else ``{}``."""
+        return {'region_warnings': list(seed_warnings)} if seed_warnings else {}
+
+    async def _prime_seed_spaces(self, session: CaseSession) -> None:
+        """Label the fluid spaces off the main thread before the launch gate.
+
+        The gate is synchronous; with the field cached here it answers from
+        memory instead of waiting on the worker thread.
+        """
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.support.vtk_threads import vtk_run_in_thread
+
+        try:
+            regions = session.state.db.getElements('region')
+            if not regions or len(regions) < 2:
+                return
+            inputs = self._fluid_space_inputs(session)
+        except Exception:  # noqa: BLE001 - the gate reports what is wrong
+            return
+        if inputs is None:
+            return
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        try:
+            field = await vtk_run_in_thread(
+                fluid_regions.run_detection, surfaces, box,
+                **self._fluid_space_options(session, base_cell))
+        except Exception:  # noqa: BLE001 - priming is best effort; the gate
+            return         # reports a geometry it cannot judge
+        # RP13 #1: the h/2 re-check, on the VTK worker, within its budget;
+        # a run that is stopped leaves the gate's conflicts unresolved.
+        finer_h = fluid_regions.recheck_h(field)
+        if finer_h is None:
+            return
+        import time
+
+        deadline = time.monotonic() + fluid_regions.RECHECK_SECONDS
+        try:
+            await vtk_run_in_thread(
+                fluid_regions.run_detection, surfaces, box, h=finer_h,
+                cache_dir=fluid_regions.cache_dir(session.case_path),
+                cancelled=lambda: time.monotonic() > deadline)
+        except Exception:  # noqa: BLE001 - past the budget: unresolved
+            return
 
     @staticmethod
     def _background_domain_bounds(case_path) -> list[float] | None:
@@ -7357,40 +8756,13 @@ runTimeModifiable true;
 
         ``[xmin, xmax, ymin, ymax, zmin, zmax]`` in metres (vertices times
         ``scale``), or ``None`` when no dictionary has been written or it
-        cannot be read. The vertex hull is exact for the derived single block
-        and a close enough bound for authored blocks (curved edges aside).
+        cannot be read. Plan 36 RP1: the reading lives with the other sources
+        of the same box, in `foammesh.core.mesh.domain_box`, where it is the
+        last one tried.
         """
-        path = Path(case_path) / 'system' / 'blockMeshDict'
-        try:
-            text = path.read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            return None
-        text = re.sub(r'//[^\n]*', '', text)
-        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        scale = 1.0
-        match = re.search(r'(?:^|[;\s])(?:scale|convertToMeters)\s+'
-                          r'([-+0-9.eE]+)\s*;', text)
-        if match:
-            try:
-                scale = float(match.group(1))
-            except ValueError:
-                return None
-        match = re.search(r'\bvertices\s*\((.*?)\)\s*;', text, flags=re.S)
-        if not match:
-            return None
-        number = r'([-+0-9.eE]+)'
-        points = re.findall(
-            rf'\(\s*{number}\s+{number}\s+{number}\s*\)', match.group(1))
-        if not points:
-            return None
-        try:
-            coords = [[float(value) * scale for value in point]
-                      for point in points]
-        except ValueError:
-            return None
-        return [bound for axis in range(3) for bound in (
-            min(point[axis] for point in coords),
-            max(point[axis] for point in coords))]
+        from foammesh.core.mesh.domain_box import written_domain_box
+        box = written_domain_box(case_path)
+        return None if box is None else list(box.metres())
 
     @staticmethod
     def _point_inside_bounds(point, bounds) -> bool:
@@ -7628,9 +9000,40 @@ runTimeModifiable true;
         payload['profile_source'] = profile.source
         parsed = execution.parsed if isinstance(execution.parsed, dict) else {}
         verdict = parsed.get('result') if isinstance(parsed.get('result'), dict) else {}
+        # DP-869. checkMesh's own tally is not the acceptance rule. The
+        # profile runs `-allGeometry`, whose concave-cell test has no angle
+        # limit, while the quality policy lets snappy keep cells up to
+        # `maxConcave 80`. MEASURED on the Plan 36 campaign: 10 of 11 snappy
+        # meshes ended `Failed 1 mesh checks` on concave cells alone -- 16,321
+        # cells, every one at a refinement-level transition and 16,317 of them
+        # split-hex polyhedra; plain checkMesh called all four re-checked
+        # meshes `Mesh OK`. The parser already grades that finding advisory
+        # and the mesh runnable; refusing here made `foammesh check` exit 1
+        # and stopped every automation recipe on a runnable mesh. A mesh with
+        # only advisory findings is accepted as a blemish -- the Gmsh gate's
+        # rule -- and says so; a blocking finding still refuses.
         mesh_accepted = (
-            verdict.get('mesh_ok') is True
-            and verdict.get('incomplete') is False)
+            verdict.get('incomplete') is False
+            and (verdict.get('mesh_ok') is True
+                 or verdict.get('runnable') is True))
+        blemish_warnings: tuple[str, ...] = ()
+        if mesh_accepted and verdict.get('mesh_ok') is not True:
+            from types import SimpleNamespace
+
+            from foammesh.core.quality.verdict import (
+                failed_check_line, failed_check_names)
+            line = failed_check_line(
+                verdict.get('failed_checks'),
+                failed_check_names(SimpleNamespace(**verdict)))
+            payload['quality_blemish'] = {
+                'failed_checks': verdict.get('failed_checks'),
+                'advisory': list(verdict.get('advisory_findings') or ()),
+                'line': line,
+            }
+            blemish_warnings = (
+                f'{line or "checkMesh reported advisory findings"}; every '
+                'finding is advisory, so the mesh is runnable and accepted '
+                'as a blemish.',)
         # Plan 30 F-05. **Accept anyway** on a snappy mesh lands here: snappy
         # publishes as it goes, so the mesh checkMesh judged is the mesh on
         # disk and there is nothing to re-mesh -- only a decision to record
@@ -7649,7 +9052,8 @@ runTimeModifiable true;
             else 'failed',
             command.operation,
             session.revisions, invalidated_outputs=('quality',),
-            warnings=tuple(execution.warnings) + tuple(profile_warnings),
+            warnings=(tuple(execution.warnings) + tuple(profile_warnings)
+                      + blemish_warnings),
             payload=payload)
 
     def _accept_checked_mesh(self, session: CaseSession, command: Command,
@@ -7801,10 +9205,14 @@ runTimeModifiable true;
             if name == terminal:
                 outcome = produced
         verdict = compose_verdict(entries)
+        # DP-869. A route that passed on a blemish advances its row as a
+        # warning, never as a clean pass.
+        blemished = [str(entry['blemish']) for entry in entries
+                     if entry.get('blemish')]
         record = {
             'schema_version': 1, 'route': route, 'target_solver': target,
             'engine_id': engine, 'required': list(required),
-            'checks': entries, 'verdict': verdict,
+            'checks': entries, 'verdict': verdict, 'blemish': blemished,
             'mesh_identity': entries[-1].get('mesh_identity', '')
             if entries else '',
         }
@@ -7820,7 +9228,7 @@ runTimeModifiable true;
                     str(name) for name in missing)}}
         else:
             payload['task_state'] = self._record_qa_run(
-                session, command, warning=verdict != PASSED,
+                session, command, warning=verdict != PASSED or bool(blemished),
                 waived='quality_override' in payload)
         warnings = tuple(outcome.warnings) if outcome is not None else ()
         return OperationResult(
@@ -7861,6 +9269,11 @@ runTimeModifiable true;
             'mesh_identity': self._route_check_identity(session, check),
             'detail': self._route_check_detail(session, check),
         }
+        # DP-869. Accepted with advisory findings only: the check passed the
+        # policy, and the row must still say it was not clean.
+        blemish = (produced.payload or {}).get('quality_blemish')
+        if produced.status == 'accepted' and blemish:
+            entry['blemish'] = str(blemish.get('line') or 'advisory findings')
         return entry, produced
 
     def _native_route_entry(self, session: CaseSession) -> dict:
@@ -7888,12 +9301,17 @@ runTimeModifiable true;
         gate = str(report.get('gate_verdict')
                    or report.get('verdict') or '').lower()
         entry.update({
-            'verdict': 'passed' if gate == 'pass' else 'failed',
+            # DP-910. A blemish is inside the allowance the user authored
+            # and publishes on its own (`core.gmsh.quality`), so the route
+            # does not call it failed; it carries the blemish instead.
+            'verdict': 'passed' if gate in ('pass', 'blemish') else 'failed',
             'native_verdict': gate,
             'mesh_identity': str(report.get('subject_mesh_fingerprint')
                                  or report.get('report_fingerprint') or ''),
             'detail': self._native_route_detail(report) or gate,
         })
+        if gate == 'blemish':
+            entry['blemish'] = entry['detail'] or 'Gmsh element gate: blemish'
         return entry
 
     @staticmethod

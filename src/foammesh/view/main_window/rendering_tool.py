@@ -15,7 +15,8 @@ from widgets.rendering.ruler_widget import RulerWidget
 from foammesh.app import app
 from foammesh.view.main_window.main_window_ui import Ui_MainWindow
 from foammesh.view.theming.icons import load_themed_icon
-from foammesh.view.theming.status_colors import apply_color_swatch
+from foammesh.view.theming.status_colors import (
+    apply_color_swatch, hide_menu_indicator)
 from foammesh.view.display_control import view_modes
 from foammesh.view.main_window.mesh_lines_control import MeshLinesButton
 from foammesh.view.length_readout import format_extent
@@ -1305,8 +1306,7 @@ class RenderingTool(QObject):
         button.setMinimumSize(BUTTON_SIZE)
         button.setMaximumSize(BUTTON_SIZE)
         button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        button.setStyleSheet(
-            'QToolButton::menu-indicator { image: none; width: 0px; }')
+        hide_menu_indicator(button)
         menu = QMenu(button)
         menu.addAction(self.tr('Top colour…'), ui.bg2.click)
         menu.addAction(self.tr('Bottom colour…'), ui.bg1.click)

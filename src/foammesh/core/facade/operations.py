@@ -216,6 +216,70 @@ def _geometry_operations() -> list[OperationDescriptor]:
         OperationDescriptor('geometry.fluid_seed.check',
                             'Check a fluid seed against the geometry', 'case',
                             ImpactClass.READ),
+        # Plan 36 RP7. "How many fluid regions?" answered from the spaces the
+        # surfaces cut the domain box into (RP5). Detection reports progress
+        # and can be cancelled as a job, but writes nothing; `apply` writes
+        # the regions the user accepted, as one undoable change.
+        OperationDescriptor('geometry.fluid_regions.detect',
+                            'Detect the fluid spaces of the domain', 'case',
+                            ImpactClass.READ,
+                            summary='Label every connected space the surfaces '
+                                    'cut the domain box into, and propose '
+                                    '`count` region seeds.',
+                            parameters_schema={
+                                'type': 'object', 'properties': {
+                                    'count': {'type': 'integer', 'minimum': 1},
+                                    'external': {'type': 'boolean'},
+                                    'resolution': {'type': 'number',
+                                                   'exclusiveMinimum': 0},
+                                    'job_id': {'type': 'string'},
+                                    'request_id': {'type': 'string'}},
+                                'required': ['count']}),
+        OperationDescriptor('geometry.fluid_regions.apply',
+                            'Create the proposed fluid regions', 'case',
+                            ImpactClass.REVERSIBLE_EDIT, reversible=True,
+                            recovery='undo',
+                            summary='Write the accepted regions in one '
+                                    'transaction. snappy: name, type and '
+                                    'seed. Gmsh (RP11): the solids, typed by '
+                                    'region_uuid.',
+                            parameters_schema={
+                                'type': 'object', 'properties': {
+                                    'regions': {'type': 'array'},
+                                    'solids': {'type': 'array'},
+                                    'ids': {'type': 'array',
+                                            'items': {'type': 'integer'}},
+                                    # RP13 #3: the detection the ids number.
+                                    'detection_id': {'type': 'string'},
+                                    'external': {'type': 'boolean'},
+                                    'resolution': {'type': 'number'},
+                                    'type': {'type': 'string',
+                                             'enum': ['fluid', 'solid',
+                                                      'excluded']},
+                                    'replace': {'type': 'boolean'}}}),
+        # Plan 36 RP7 (D7). Whether the "How many fluid regions?" panel opens
+        # by itself: once per case, while the case has no regions and a
+        # closed surface. `record` notes the offer in the case's cache
+        # folder -- beside the detection field, outside the case's
+        # fingerprint and history -- so the question is not asked twice.
+        OperationDescriptor('geometry.fluid_regions.offer',
+                            'Whether to ask how many fluid regions', 'case',
+                            ImpactClass.READ,
+                            summary='Answer whether the fluid-region question '
+                                    'should open by itself, and optionally '
+                                    'note that it was asked.',
+                            parameters_schema={
+                                'type': 'object', 'properties': {
+                                    'record': {'type': 'boolean'}}}),
+        # Plan 36 RP8. Which space each region's seed sits in, read from the
+        # last labelling of the domain (detection or a launch). Never labels:
+        # without a labelling it says so, and the regions table waits.
+        OperationDescriptor('geometry.fluid_regions.seeds',
+                            'Which space each region seed is in', 'case',
+                            ImpactClass.READ,
+                            summary='For every region: its space, the '
+                                    "space's volume, and the region that "
+                                    'already holds that space, if any.'),
         OperationDescriptor('geometry.rename',
                             'Rename a geometry and its boundary patch', 'case',
                             ImpactClass.REVERSIBLE_EDIT, reversible=True),

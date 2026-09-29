@@ -264,7 +264,7 @@ class EngineTaskStateStore:
                 'workflow_reset_notice': loaded.notice()}
 
     def record_stage_success(self, task_id: str, *,
-                             warning: bool = False) -> dict:
+                             warning: bool = False, reasons=()) -> dict:
         """Advance exactly the one task a stage run performed.
 
         Plan 23 §8.4. A stage is evidence for itself and nothing else: a
@@ -274,7 +274,8 @@ class EngineTaskStateStore:
         """
         self.descriptor.task(task_id)
         return self._record(
-            [task_id], warning=warning, evidence={'kind': 'stage'})
+            [task_id], warning=warning, evidence={'kind': 'stage'},
+            reasons=reasons)
 
     def stage_chain(self, task_id: str) -> list[str]:
         """The tasks a successful run of ``task_id``'s stage physically implies.
@@ -317,7 +318,8 @@ class EngineTaskStateStore:
                 if task.task_id in wanted]
 
     def record_stage_chain_success(self, task_id: str, *,
-                                   warning: bool = False) -> dict:
+                                   warning: bool = False,
+                                   reasons=()) -> dict:
         """Advance a stage task together with the chain its success proves.
 
         Used by ``workflow.run_stage``, which the legacy step pages call:
@@ -337,12 +339,13 @@ class EngineTaskStateStore:
         # the mirror image of R184 and no better.
         return self._record(
             chain, warning=warning, warning_for={task_id},
-            performed={task_id},
+            performed={task_id}, reasons=reasons,
             evidence={'kind': 'stage', 'stage_task': task_id})
 
     def record_atomic_run_success(self, task_ids, *,
                                   warning: bool = False,
-                                  waived=(), configured=()) -> dict:
+                                  waived=(), configured=(),
+                                  warning_for=None, reasons=()) -> dict:
         """Advance the tasks one atomic engine run actually performed.
 
         Some engines do several tasks in one invocation -- ``mesh.gmsh.run``
@@ -362,6 +365,12 @@ class EngineTaskStateStore:
         was refused as locked leaves its task READY, and DP-35 grades a READY
         optional task as unused. The job the runner consumed can answer it, so
         that is what the caller reads and hands here.
+
+        ``warning_for`` names the tasks the run's warning is about (DP-817).
+        It defaults to every task the run performed, which is right only when
+        the warning really is about all of them: a checkMesh verdict judges
+        the finished mesh and belongs to the QA task, not to the surface
+        features, castellation, snap and layers stages that ran before it.
         """
         performed = set(task_ids)
         known = {task.task_id for task in self.descriptor.ordered_tasks()}
@@ -388,8 +397,11 @@ class EngineTaskStateStore:
         ordered = [task.task_id for task in self.descriptor.ordered_tasks()
                    if task.task_id in wanted]
         return self._record(
-            ordered, warning=warning, warning_for=performed,
+            ordered, warning=warning,
+            warning_for=(performed if warning_for is None
+                         else set(warning_for) & performed),
             performed=performed, evidence={'kind': 'atomic_run'},
+            reasons=reasons,
             configured=configured, waived=frozenset(waived))
 
     def record_check_result(self, task_id: str, *, evidence: dict,
@@ -414,7 +426,8 @@ class EngineTaskStateStore:
 
     def _record(self, task_ids, *, warning: bool, evidence: dict,
                 complete: bool = False, warning_for=None, performed=None,
-                configured=frozenset(), waived=frozenset()) -> dict:
+                configured=frozenset(), waived=frozenset(),
+                reasons=()) -> dict:
         """Advance the named tasks, stopping cleanly and keeping what advanced.
 
         The previous recorder raised into a caller that swallowed the exception
@@ -436,18 +449,41 @@ class EngineTaskStateStore:
         configured. It is not the same claim as ``performed``: a warning still
         belongs to the stage that raised it, so a task named here and nowhere
         else is recorded PASSED and not WARNING.
+
+        DP-817. A task this run performed that already holds a run result
+        (PASSED or WARNING) has that result replaced by this run's. It used to
+        be filed as ``already recorded``, so a WARNING outlived every clean
+        rerun of the stage that raised it and the outline kept a warning
+        nothing on disk could explain. A task the run merely implies keeps
+        its result: nothing about it was measured again.
+
+        ``reasons`` are the warning texts, kept in the evidence of each task
+        this run leaves at WARNING so the page can say what the warning was.
         """
+        reasons = [str(text) for text in (reasons or ()) if str(text).strip()]
         performed = set(task_ids) if performed is None else set(performed)
         configured = frozenset(configured)
         loaded = self.load_result()
         graph = loaded.graph
         advanced: list[str] = []
+        warned: set[str] = set()
         skipped: list[dict] = []
         blocked: dict | None = None
 
         for task_id in task_ids:
             task = self.descriptor.task(task_id)
             state = graph.state(task_id)
+            warns = warning and (warning_for is None or task_id in warning_for)
+            rerun = (state in {TaskState.PASSED, TaskState.WARNING}
+                     and task_id in performed and task_id not in waived
+                     and not complete
+                     and not (state is TaskState.PASSED and not warns))
+            if rerun:
+                graph.restate(task_id, warning=warns)
+                advanced.append(task_id)
+                if warns:
+                    warned.add(task_id)
+                continue
             # A waived task is never "already recorded": the previous run left
             # it PASSED, which is exactly the record R119/R158 says is wrong.
             # Nor is a skipped task this run performed (R184): the skip is the
@@ -523,8 +559,9 @@ class EngineTaskStateStore:
                 else:
                     if state is not TaskState.CONFIGURED:
                         graph.configure(task_id)
-                    graph.finish(task_id, warning=warning and (
-                        warning_for is None or task_id in warning_for))
+                    graph.finish(task_id, warning=warns)
+                    if warns:
+                        warned.add(task_id)
             except ValueError as error:
                 blocked = {'task_id': task_id, 'reason': str(error),
                            'state': state.value}
@@ -532,7 +569,9 @@ class EngineTaskStateStore:
             advanced.append(task_id)
 
         document = self.save(graph, evidence={
-            task_id: dict(evidence) for task_id in advanced})
+            task_id: (dict(evidence, warnings=list(reasons))
+                      if task_id in warned and reasons else dict(evidence))
+            for task_id in advanced})
         return {'tasks': document['tasks'], 'advanced': advanced,
                 'skipped': skipped, 'blocked': blocked,
                 'evidence': dict(evidence),

@@ -2064,8 +2064,13 @@ class StepManager(QObject):
         used to hand over the hidden legacy page's cached, already stood-off
         box, so the same project wrote a different blockMeshDict here than
         from the CLI or the facade.
+
+        DP-821. The surfaces' extent: the seed glyphs are held by the same
+        manager, and a seed off the geometry grew the written block.
         """
-        bounds = app.window.geometryManager.getBounds().toTuple()
+        manager = app.window.geometryManager
+        bounds = getattr(manager, 'getSurfaceBounds',
+                         manager.getBounds)().toTuple()
         values = [float(value) for value in bounds]
         if (len(values) != 6
                 or any(math.isnan(v) or math.isinf(v) for v in values)

@@ -12,6 +12,7 @@ import shutil
 from typing import Iterable, Mapping
 
 from foammesh.core.engine.contracts import PreparedGeometryRef
+from foammesh.core.quantities import count_text
 
 from . import domain_topology
 from .store import (GeometryArtifactStore, is_cad_entry,
@@ -113,6 +114,32 @@ def domain_topology_report(entries) -> dict:
     return report
 
 
+def _gmsh_shared_face_refusal(topology) -> str | None:
+    """Why Gmsh cannot take a one-surface multi-region STL, or ``None``.
+
+    DP-860. The host classifier reads a surface whose regions share a face as
+    the regions it bounds, each closed on its own, and snappyHexMesh meshes
+    it as it is -- MEASURED in the Plan 36 campaign on jacketed_pipe,
+    coaxial_ducts, finned_plate_duct and baffled_chamber, each into exactly
+    the regions detection proposed. The Gmsh runner builds its volumes from
+    the surfaces ``classifySurfaces`` cuts, and a face written into one file
+    for two regions is not a surface it can hand to both (DP-368/DP-369), so
+    that route is still refused -- here, before WSL is booted (DP-366), and
+    not by the runner halfway through the job.
+    """
+    split = (topology or {}).get('shared_face_regions') or ()
+    if not split:
+        return None
+    first = split[0]
+    source = first.get('source') or 'the import'
+    return (f'{source} holds {count_text(int(first.get("regions", 0)), "region")} '
+            f'that share {count_text(int(first.get("shared_faces", 0)), "face")} '
+            'in one surface. snappyHexMesh meshes that as it is; Gmsh needs '
+            'each region as a closed shell of its own, so import the regions '
+            'as separate STL files or as a STEP of solids, or mesh this '
+            'geometry with snappyHexMesh.')
+
+
 def prepare_readiness(store, *, engine_id: str | None = None) -> dict:
     """Whether the case is ready to mesh, and if not, whether it can be.
 
@@ -122,6 +149,11 @@ def prepare_readiness(store, *, engine_id: str | None = None) -> dict:
     until the user had done it by hand, so the same case was ready in one
     engine and blocked in the other, and the Prepare step meant two
     different things depending on which branch of the outline you were in.
+
+    DP-860. *engine_id* is read for one geometry only: a single surface whose
+    regions share a face. snappyHexMesh meshes it and the Gmsh runner cannot
+    (:func:`_gmsh_shared_face_refusal`), so the Gmsh run seam passes its id
+    and is refused before the job; every other answer is the same for both.
     """
     entries = store.source.entries()
     try:
@@ -137,6 +169,10 @@ def prepare_readiness(store, *, engine_id: str | None = None) -> dict:
         blocked = topology.get('refusal') or (
             'the imported surfaces cannot bound a volume, so there is no '
             'domain to mesh')
+    elif entries and engine_id == 'gmsh' and bounds:
+        gmsh_refusal = _gmsh_shared_face_refusal(topology)
+        if gmsh_refusal:
+            bounds, blocked = False, gmsh_refusal
     return {
         'prepared': current is not None,
         'revision_id': current.reference.revision_id if current else None,
@@ -219,7 +255,7 @@ def ensure_prepared(store, *, producer: str, boundary_categories=None,
         boundary_categories=boundary_categories, fluid_seed=fluid_seed)
 
 
-def domain_refusal(store) -> str | None:
+def domain_refusal(store, *, engine_id: str | None = None) -> str | None:
     """Why these surfaces cannot bound a domain, or ``None`` if they can.
 
     Plan 31 CP-04 (C31-06). Measured before this existed: Gmsh refused an
@@ -234,7 +270,7 @@ def domain_refusal(store) -> str | None:
     is recorded on the revision; re-deciding it here would undo the
     acknowledgement.
     """
-    readiness = prepare_readiness(store)
+    readiness = prepare_readiness(store, engine_id=engine_id)
     if readiness['prepared'] or not readiness['can_prepare']:
         return None
     if readiness.get('bounds_domain') is False:

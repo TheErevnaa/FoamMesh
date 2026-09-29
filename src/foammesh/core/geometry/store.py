@@ -686,6 +686,11 @@ class GeometryArtifactStore:
                     'solid_index': body_index,
                 },
                 'boundary_patch_uuids': body_patch_uuids,
+                # DP-900. Whether OCCT found a closed solid here: a STEP
+                # holding one planar face still becomes a body, and counting
+                # it as a volume let a 3D run through on a plate.
+                **({'solid': bool(body.solid)}
+                   if body.solid is not None else {}),
             })
         revision_record = {
             'revision': 1, 'kind': 'imported', 'parent_revision': None,

@@ -562,8 +562,7 @@ class ChildControlPanel(QGroupBox):
         # own. The dialog is reused, and one opened on a rotational pair would
         # otherwise still be showing rotation rows over a coincident one.
         dialog.applyRelevance()
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.add_child()
+        self._run_editor(dialog, self.add_child)
 
     def fresh_value(self, key: str, descriptor):
         """The value a new row's *key* starts from (DP-595 hook)."""
@@ -576,8 +575,21 @@ class ChildControlPanel(QGroupBox):
         self._load_selected()
         dialog = self.editor_dialog()
         dialog.applyRelevance()
+        self._run_editor(dialog, self.apply_selected)
+
+    def _run_editor(self, dialog, accepted) -> None:
+        """Show the editor, and call *accepted* if it closes on OK.
+
+        Plan 36 RP2. Every panel edits its row in a modal dialog, and that
+        stays the rule: the collections these tables hold are edited as forms
+        and nothing else on screen means anything while one is open. A panel
+        whose row is placed *in the viewport* -- a region's seed -- cannot use
+        a modal dialog, because Qt refuses the viewport every mouse event
+        while `exec()` runs. Such a panel overrides this to show the same
+        dialog without blocking and to call *accepted* when OK is pressed.
+        """
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.apply_selected()
+            accepted()
 
     # -- data -------------------------------------------------------------- #
 

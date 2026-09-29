@@ -560,6 +560,9 @@ CONTROLS = _register(
                 'mesh.setTransfiniteVolume', native_kind=API),
     GmshControl('gmsh/volumeControls/{id}/priority', DERIVATION, 'volume.order',
                 'gmsh.volumes.v1', native_kind=API),
+    # Plan 36 RP11. Read while publishing: the cell zone's region type.
+    GmshControl('gmsh/volumeControls/{id}/volumeType', PUBLISH,
+                'cellZones.region_type', native_kind=NONE),
 
     # -- periodic pairs ------------------------------------------------------ #
     GmshControl('gmsh/periodicPairs/{id}/name', DERIVATION, 'periodic.name',

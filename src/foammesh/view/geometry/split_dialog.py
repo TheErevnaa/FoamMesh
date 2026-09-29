@@ -18,8 +18,8 @@ from foammesh.app import app
 from foammesh.view.theming.metrics import FORM_MARGIN, place_unit
 from foammesh.view.theming.status_colors import apply_color_swatch
 from foammesh.view.theming.vtk_theme import rgb
-
-from foammesh.support.colormap import getLookupTable
+from foammesh.view.theming.patch_palette import active_palette, slot_colour
+from foammesh.rendering.actor_info import applySurfaceMaterial
 
 
 def regionPolyData(regionedData, regionId: int):
@@ -72,9 +72,54 @@ class SegmentItem(QTreeWidgetItem):
         parent.setItemWidget(self, 1, widget)
 
 
+def rankSegments(segments, regionedData=None) -> dict:
+    """Each preview segment's position in the order its patch is written.
+
+    DP-819. The store numbers the pieces of each file largest first, ties by
+    first triangle, and the pieces reach the case -- and take their palette
+    slots -- in that order, file after file. The preview ranks its segments
+    the same way, so segment and patch land on the same slot. Without the
+    region data (nothing to read files or first triangles from) the ranking
+    falls back to area alone.
+    """
+    areas = {}
+    for position, (region, area) in enumerate(segments):
+        try:
+            region = int(region)
+        except (TypeError, ValueError):
+            region = position
+        areas[region] = float(area)
+    files, firsts = {}, {}
+    try:
+        import numpy as np
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        cells = regionedData.GetCellData()
+        regionIds = vtk_to_numpy(cells.GetArray('RegionId')).astype(np.int64)
+        fileArray = cells.GetArray('fIndex')
+        fileIds = (vtk_to_numpy(fileArray).astype(np.int64)
+                   if fileArray is not None else np.zeros_like(regionIds))
+        for region in areas:
+            where = np.flatnonzero(regionIds == region)
+            if where.size:
+                firsts[region] = int(where[0])
+                files[region] = int(fileIds[where[0]])
+    except Exception:  # noqa: BLE001 - a stand-in or empty preview
+        files, firsts = {}, {}
+    order = sorted(areas, key=lambda region: (
+        files.get(region, 0), -areas[region], firsts.get(region, region), region))
+    return {region: rank for rank, region in enumerate(order)}
+
+
 class SplitDialog(QDialog):
-    def __init__(self, parent, files: [Path], angle):
+    def __init__(self, parent, files: [Path], angle, firstSlot: int = 0):
         super().__init__(parent)
+
+        #: DP-819. The palette slot the first new patch will take in the main
+        #: window: one past the surfaces the case already holds.
+        self._firstSlot = int(firstSlot or 0)
+        self._segments = []
+        self._ranks = {}
 
         self._ui = Ui_SplitDialog()
         self._ui.setupUi(self)
@@ -122,11 +167,14 @@ class SplitDialog(QDialog):
         self._regionMapper.SelectColorArray('RegionId')
         self._regionMapper.SetScalarModeToUseCellData()
         self._regionMapper.SetColorModeToMapScalars()
-        lut = getLookupTable('rainbow')
-        self._regionMapper.SetLookupTable(lut)
+        # DP-819. One table entry per segment, filled from the patch palette
+        # in `_applyPalette`; the rainbow scale this replaced is not what the
+        # patch list or the viewport draw with.
+        self._regionMapper.SetLookupTable(vtkLookupTable())
 
         self._regionActor = vtkActor()
         self._regionActor.SetMapper(self._regionMapper)
+        applySurfaceMaterial(self._regionActor.GetProperty())
         self._regionActor.GetProperty().SetOpacity(1)
         self._regionActor.GetProperty().SetRepresentationToSurface()
         self._regionActor.GetProperty().EdgeVisibilityOff()
@@ -179,6 +227,8 @@ class SplitDialog(QDialog):
             return
         self._edgeActor.GetProperty().SetColor(
             *rgb(app.themeManager.tokens.value('foreground.primary')))
+        # The patches follow the theme too, as they do in the main window.
+        self._applyPalette()
         self._view.refresh()
 
     def _connectSignalsSlots(self):
@@ -250,6 +300,8 @@ class SplitDialog(QDialog):
 
         segments, regionedData, edges = self._stlImporter.split(angle, minArea)
         self._regionedData = regionedData
+        self._segments = list(segments)
+        self._ranks = rankSegments(self._segments, regionedData)
 
         self._edgeMapper.RemoveAllInputs()
         self._edgeMapper.SetInputData(edges)
@@ -257,8 +309,7 @@ class SplitDialog(QDialog):
 
         self._regionMapper.RemoveAllInputs()
         self._regionMapper.SetInputData(regionedData)
-        self._regionMapper.SetScalarRange(0, len(segments)-1)
-        self._regionMapper.Update()
+        self._applyPalette()
 
         self._ui.numSegments.setText(f'{len(segments) :,}')
 
@@ -274,20 +325,47 @@ class SplitDialog(QDialog):
 
         self._view.refresh()
 
+    def paletteSlot(self, region) -> int:
+        """The main-window palette slot the patch from ``region`` takes."""
+        return self._firstSlot + self._ranks.get(int(region), int(region))
+
+    def _palette(self):
+        tokens = None
+        if app.themeManager is not None:
+            tokens = app.themeManager.tokens
+        return active_palette(tokens)
+
     def _getColor(self, value):
-        minValue, maxValue = self._regionMapper.GetScalarRange()
-        lut: vtkLookupTable = self._regionMapper.GetLookupTable()
-        lut.SetRange(minValue, maxValue)
+        """The colour segment ``value`` wears in the table and the preview.
 
-        rgb = [0, 0, 0]
-        if value < minValue:
-            value = minValue
-        elif value > maxValue:
-            value = maxValue
+        DP-819. The same patch-palette slot the geometry row's swatch and the
+        viewport actor read, not a scale of its own.
+        """
+        count = max(1, len(self._segments))
+        region = min(max(int(round(value)), 0), count - 1)
+        return QColor(slot_colour(self._palette(), self.paletteSlot(region)))
 
-        lut.GetColor(value, rgb)
-
-        return QColor.fromRgbF(rgb[0], rgb[1], rgb[2])
+    def _applyPalette(self):
+        """Fill the preview's lookup table, one entry per segment."""
+        count = max(1, len(self._segments))
+        lut = vtkLookupTable()
+        lut.SetNumberOfTableValues(count)
+        for region in range(count):
+            colour = self._getColor(region)
+            lut.SetTableValue(region, colour.redF(), colour.greenF(),
+                              colour.blueF(), 1.0)
+        # Each integer region id sits in the middle of its own entry.
+        lut.SetTableRange(-0.5, count - 0.5)
+        lut.Build()
+        self._regionMapper.SetLookupTable(lut)
+        self._regionMapper.SetScalarRange(-0.5, count - 0.5)
+        self._regionMapper.Update()
+        tree = self._ui.segments
+        for row in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(row)
+            widget = getattr(item, '_colorWidget', None)
+            if widget is not None:
+                apply_color_swatch(widget, self._getColor(int(item.text(0))))
 
     def featureAngle(self) -> float:
         """The angle the user settled on, in degrees."""

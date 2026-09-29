@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout,
 from foammesh.app import app
 from foammesh.core.facade.errors import FacadeError
 from foammesh.core.geometry.features.manifest import DEFAULT_FEATURE_ANGLE_DEG
+from foammesh.db.configurations_schema import GeometryType
 from foammesh.view.facade_client import FailedResult, query, submit
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, UnitLabel
 from widgets.fit_to_text import FlowLayout, fit_to_text
@@ -161,7 +162,9 @@ class BoundaryOperations:
         # the old name. geometry.rename moves both. A patch with no row of its
         # own - one produced by a merge or a feature split - has only the
         # manifest to move, so that path stays.
-        geometry_id = self._geometryIdNamed(before)
+        # DP-820. A patch reached from a tree row knows which row: rename
+        # that one, rather than whichever row happens to carry the old name.
+        geometry_id = patch.get('tree_id') or self._geometryIdNamed(before)
         if geometry_id is not None:
             return self._runPatchEdit(
                 'geometry.rename',
@@ -380,18 +383,66 @@ class BoundaryActions(QWidget, BoundaryOperations):
     def _selectedPatches(self):
         """The manifest rows behind the geometry rows the tree has selected.
 
-        Keyed by geometry id and not by name: a rename moves the name in both
-        stores, and a selection read between the write and the redraw would
-        otherwise match nothing.
+        DP-820. These were looked up by matching the tree row's key against
+        the manifest row's ``geometry_id``. The two are different ids: the
+        tree key is the row's key in the project, and ``geometry_id`` is the
+        artifact store's id for the imported file, which every piece of one
+        split shares. So nothing the tree selected ever matched, and Rename,
+        Merge and Split merged on the list's context menu did nothing.
+
+        A tree row carries the boundary it stands for as ``patchUuid``
+        (DP-383), so that is what is matched now. Each patch returned also
+        carries ``tree_id``, the row it was reached from, so a rename goes to
+        exactly that row. A row stamped before ``patchUuid`` existed falls
+        back to its name; a volume row stands for no single boundary and
+        matches nothing.
         """
-        byId = {}
+        byUuid, byName, byId = {}, {}, {}
         for patch in self._patches:
+            if patch.get('patch_uuid'):
+                byUuid.setdefault(str(patch['patch_uuid']), patch)
+            if patch.get('name'):
+                # A name two boundaries carry identifies neither of them.
+                name = str(patch['name'])
+                byName[name] = None if name in byName else patch
             byId.setdefault(str(patch.get('geometry_id')), patch)
+        keys = [str(key) for key in self._selectedIds()]
+        rows = self._treeRows(keys)
         out = []
-        for key in self._selectedIds():
-            patch = byId.get(str(key))
+        for key in keys:
+            row = rows.get(key)
+            patch = None
+            if row is not None:
+                if row.get('gType') == GeometryType.VOLUME.value:
+                    continue
+                uuid = row.get('patchUuid')
+                if uuid:
+                    patch = byUuid.get(str(uuid))
+                if patch is None and row.get('name'):
+                    patch = byName.get(str(row.get('name')))
+            if patch is None:
+                patch = byId.get(key)
             if patch is not None:
-                out.append(patch)
+                out.append({**patch, 'tree_id': key})
+        return out
+
+    @staticmethod
+    def _treeRows(keys):
+        """``{key: {name, gType, patchUuid}}`` for the tree rows asked about."""
+        if (not keys or app.facadeClient is None
+                or not app.facadeClient.has_case()):
+            return {}
+        out = {}
+        try:
+            db = app.facadeClient.checkout()
+            for key in keys:
+                if not db.hasElement('geometry', key):
+                    continue
+                element = db.getElement('geometry', key)
+                out[key] = {field: element.value(field)
+                            for field in ('name', 'gType', 'patchUuid')}
+        except (FacadeError, KeyError, TypeError, ValueError):
+            return out
         return out
 
     def refresh(self):

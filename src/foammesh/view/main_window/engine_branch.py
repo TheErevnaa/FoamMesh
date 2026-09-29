@@ -811,7 +811,8 @@ class EngineBranchView(QWidget):
             released()
             payload = getattr(result, 'payload', {}) or {}
             if getattr(result, 'status', '') == 'accepted':
-                self._report_run(self.tr('%s completed.') % stage)
+                self._report_run(self._with_region_warnings(
+                    self.tr('%s completed.') % stage, payload))
             elif self._was_cancelled(payload):
                 self._report_cancelled_stage(stage)
             elif is_check and isinstance(payload.get('parsed'), dict):
@@ -1140,6 +1141,9 @@ class EngineBranchView(QWidget):
                     self.tr('Stage run'), payload, result,
                     self.tr('The stage could not run.'), stage=stage)
         self._publish_verdict(payload)
+        if accepted and payload.get('region_warnings'):
+            self._report_run(self._with_region_warnings(
+                self.tr('%s completed.') % stage, payload))
         if accepted:
             # DP-763. `Run & Proceed` on a stage page comes here, and the
             # stage's mesh stayed on disk: the viewport kept the STL through
@@ -1241,6 +1245,25 @@ class EngineBranchView(QWidget):
                 statusbar.showMessage(
                     self.tr('The mesh was written but could not be drawn: %s')
                     % error, 10000)
+
+    def _with_region_warnings(self, message: str, payload: dict) -> str:
+        """``message``, followed by what the launch said about the seeds.
+
+        Plan 36 RP8. Two seeds of one type in one space are let through at
+        launch -- snappy meshes the space once -- and the facade says so in
+        ``region_warnings``. Nothing read that key, so the run finished with
+        the strip saying only "completed". The sentence goes on the strip
+        and, whole, into the Console, where it outlives the strip.
+        """
+        warnings = [str(item) for item in (payload or {}).get(
+            'region_warnings') or () if str(item).strip()]
+        if not warnings:
+            return message
+        console = self._console()
+        if console is not None:
+            for warning in warnings:
+                console.append(self.tr('Regions: %s') % warning)
+        return ' '.join([message] + warnings)
 
     def _report_run(self, message: str, *, failed: bool = False,
                     log: str = '') -> None:

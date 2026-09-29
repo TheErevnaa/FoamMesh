@@ -275,6 +275,231 @@ def read_tessellation(paths, *, labels=None):
 
 
 # --------------------------------------------------------------------------- #
+# Regions that share a face (DP-860)
+# --------------------------------------------------------------------------- #
+
+def _sub(left, right):
+    return (left[0] - right[0], left[1] - right[1], left[2] - right[2])
+
+
+def _crossed(left, right):
+    return (left[1] * right[2] - left[2] * right[1],
+            left[2] * right[0] - left[0] * right[2],
+            left[0] * right[1] - left[1] * right[0])
+
+
+def _dotted(left, right):
+    return left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+
+
+def _edge_key(first, second):
+    return (first, second) if first <= second else (second, first)
+
+
+def _oriented_volume(triangles, coordinates) -> float:
+    total = 0.0
+    for first, second, third in triangles:
+        total += _dotted(coordinates[first],
+                         _crossed(coordinates[second], coordinates[third]))
+    return total / 6.0
+
+
+def shared_face_regions(triangles, coordinates):
+    """The closed regions a surface with shared faces bounds, or ``None``.
+
+    DP-860. A multi-region STL -- a CHT jacket around a pipe, two ducts one
+    inside the other, two chambers either side of a baffle -- carries the
+    face the regions share either once or once per region. Either way the
+    edges on that face are used by more than two triangles, the connected
+    surface is one component, and the closure test (every edge used by
+    exactly two triangles) refused all four committed fixtures as "not
+    closed" although snappyHexMesh, forced past the gate, meshed each into
+    exactly the regions detection proposed.
+
+    The question is not whether the union closes but whether every region it
+    bounds does. This answers it the way a volume mesher reads the surface:
+    a coincident copy of a triangle is one face, and around every edge the
+    faces are ordered by angle, so the space on one side of a face continues,
+    across each of its edges, onto the angularly next face. Walking that
+    relation partitions the two sides of every face into cells, and each cell
+    comes back as its own shell -- closed by construction, every edge used
+    exactly twice.
+
+    ``None`` unless the answer is two or more bounded regions: an edge used
+    by one triangle (a hole or a free fin), a face with the same region on
+    both sides (a fin), two faces at the same angle about an edge (folded
+    sheets), a degenerate face, or a surface that bounds one region only.
+    Each of those is left to the ordinary refusal, which names it in the
+    terms it was measured in. Genuinely open surfaces are therefore still
+    refused.
+
+    Returns ``(regions, shared)``: one triangle list per bounded region, its
+    faces not shared with another region listed first (the classifier takes
+    its containment reference point from the first triangle, and a point on a
+    shared face lies on both regions), and the number of faces shared.
+    """
+    import math
+
+    faces, seen = [], set()
+    for triangle in triangles:
+        key = tuple(sorted(triangle))
+        if len(set(key)) < 3 or key in seen:
+            if len(set(key)) < 3:
+                return None
+            continue
+        seen.add(key)
+        faces.append(tuple(triangle))
+    if len(faces) < 4:
+        return None
+
+    around: dict = {}
+    for index, face in enumerate(faces):
+        for corner in range(3):
+            key = _edge_key(face[corner], face[(corner + 1) % 3])
+            around.setdefault(key, []).append(index)
+    if any(len(users) < 2 for users in around.values()):
+        return None
+    if all(len(users) == 2 for users in around.values()):
+        return None
+
+    normals = []
+    for face in faces:
+        one, two, three = (coordinates[node] for node in face)
+        normal = _crossed(_sub(two, one), _sub(three, one))
+        if _dotted(normal, normal) <= 0.0:
+            return None
+        normals.append(normal)
+
+    # Sides: 2*i is the side the normal points to, 2*i + 1 the other.
+    parent = list(range(2 * len(faces)))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def side(index, sign):
+        return 2 * index + (0 if sign > 0 else 1)
+
+    for (first, second), users in around.items():
+        start, end = coordinates[first], coordinates[second]
+        axis = _sub(end, start)
+        length = math.sqrt(_dotted(axis, axis))
+        if length <= 0.0:
+            return None
+        axis = tuple(value / length for value in axis)
+        spokes = []
+        for index in users:
+            third = next(node for node in faces[index]
+                         if node != first and node != second)
+            offset = _sub(coordinates[third], start)
+            along = _dotted(offset, axis)
+            spoke = tuple(offset[k] - along * axis[k] for k in range(3))
+            if _dotted(spoke, spoke) <= 0.0:
+                return None
+            turn = _dotted(normals[index], _crossed(axis, spoke))
+            spokes.append((index, spoke, 1 if turn > 0.0 else -1))
+        reference = spokes[0][1]
+        scale = math.sqrt(_dotted(reference, reference))
+        across = _crossed(axis, reference)
+        ordered = sorted(
+            (math.atan2(_dotted(spoke, across) / scale,
+                        _dotted(spoke, reference) / scale), index, sense)
+            for index, spoke, sense in spokes)
+        for position in range(1, len(ordered)):
+            if ordered[position][0] - ordered[position - 1][0] < 1e-9:
+                return None
+        count = len(ordered)
+        for position, (_angle, index, sense) in enumerate(ordered):
+            for sign in (1, -1):
+                heading = sense * sign
+                _next_angle, neighbour, neighbour_sense = ordered[
+                    (position + heading) % count]
+                parent[find(side(index, sign))] = find(
+                    side(neighbour, -heading * neighbour_sense))
+
+    cells: dict = {}
+    for index in range(len(faces)):
+        for sign in (1, -1):
+            root = find(side(index, sign))
+            cells.setdefault(root, []).append((index, sign))
+    for members in cells.values():
+        if len({index for index, _sign in members}) != len(members):
+            return None  # a fin: one region on both sides of a face
+
+    def outward(index, sign):
+        # The region lies on side `sign`; its outward normal is the other.
+        first, second, third = faces[index]
+        return (first, second, third) if sign < 0 else (first, third, second)
+
+    bounded, unbounded = [], []
+    for members in cells.values():
+        oriented = [outward(index, sign) for index, sign in members]
+        volume = _oriented_volume(oriented, coordinates)
+        (bounded if volume > 0.0 else unbounded).append(members)
+    if len(unbounded) != 1 or len(bounded) < 2:
+        return None
+
+    envelope = {index: sign for index, sign in unbounded[0]}
+    senses = set(envelope.values())
+    # How the file itself is wound, read off the faces nothing else shares:
+    # every one outward (+1 on the outside), every one inward, or mixed.
+    flip_all = senses == {-1}
+    mixed = len(senses) > 1
+    uses: dict = {}
+    for members in bounded:
+        for index, _sign in members:
+            uses[index] = uses.get(index, 0) + 1
+    regions = []
+    for members in bounded:
+        own, shared = [], []
+        for index, sign in members:
+            if index in envelope and mixed:
+                face = faces[index]  # the file's winding, disagreements kept
+            else:
+                face = outward(index, sign)
+                if flip_all:
+                    face = (face[0], face[2], face[1])
+            (shared if uses[index] > 1 else own).append(face)
+        regions.append(own + shared)
+    return regions, sum(1 for used in uses.values() if used > 1)
+
+
+def _separate_shared_face_regions(surfaces, triangles, coordinates, sources):
+    """Each shared-face component split into its regions, one source apiece.
+
+    Each region is given a source of its own -- ``<file> (region N)`` -- so
+    the classifier's conjugate-assembly split (DP-456, one source one body)
+    reads them apart and holds each to its own closure proof, and the shell
+    names it derives stay the file's stem.
+    """
+    out_surfaces: list = []
+    out_triangles: dict = {}
+    out_sources: dict = {}
+    split: list = []
+    for tag in surfaces:
+        owned = triangles.get(tag, ())
+        found = shared_face_regions(owned, coordinates)
+        if found is None:
+            fresh = len(out_surfaces) + 1
+            out_surfaces.append(fresh)
+            out_triangles[fresh] = list(owned)
+            out_sources[fresh] = sources.get(tag, '')
+            continue
+        regions, shared = found
+        origin = sources.get(tag, '')
+        split.append({'source': origin, 'regions': len(regions),
+                      'shared_faces': shared})
+        for number, region in enumerate(regions, start=1):
+            fresh = len(out_surfaces) + 1
+            out_surfaces.append(fresh)
+            out_triangles[fresh] = region
+            out_sources[fresh] = f'{origin} (region {number})'
+    return out_surfaces, out_triangles, out_sources, split
+
+
+# --------------------------------------------------------------------------- #
 # The report
 # --------------------------------------------------------------------------- #
 
@@ -320,6 +545,11 @@ def classify_files(paths, *, roles=None, seed=None, labels=None) -> dict:
             'the import produced no triangles, so there is no surface to '
             'bound a domain')
         return report
+    # DP-860. A face two regions share is not a hole in either of them.
+    surfaces, triangles, sources, shared = _separate_shared_face_regions(
+        surfaces, triangles, coordinates, sources)
+    if shared:
+        report['shared_face_regions'] = shared
     try:
         resolved = topology.resolve_topology(
             surfaces, triangles, coordinates, sources=sources, roles=roles,
@@ -420,6 +650,20 @@ def classify_entries(entries) -> dict:
     counted = False
     for entry in entries or ():
         path = entry_path(entry)
+        if entry and entry.get('cad_artifact') and not entry.get(
+                'cad_superseded_by'):
+            # DP-859. A STEP import stores two files: `cad_artifact`, the
+            # solid model Gmsh is handed, and `artifact`, a tessellation for
+            # the viewport. Reading only `artifact` classified the CAD entry
+            # as a triangulated surface -- the opposite of this function's
+            # own contract -- and a two-solid STEP, whose shared face is
+            # tessellated once per solid, was refused as "not closed" before
+            # Gmsh was asked. MEASURED on `jacketed_pipe.step`: 180
+            # non-manifold edges, refused; forced past the gate it meshed to
+            # two cell zones and checkMesh OK. A wrapped or split entry keeps
+            # the STEP for provenance only and is judged as the surface it
+            # became (`store.is_cad_entry`).
+            path = str(entry['cad_artifact'])
         if not path:
             continue
         if Path(path).suffix.lower() not in TESSELLATED_SUFFIXES:
@@ -435,6 +679,13 @@ def classify_entries(entries) -> dict:
                 for index, region in enumerate(regions):
                     name = ''
                     if isinstance(region, dict):
+                        # DP-900. A body OCCT found no solid in -- a lone
+                        # planar face, an open shell -- is recorded as a
+                        # region for its patches but bounds no volume. An
+                        # import that never asked carries no `solid` key
+                        # and is still counted, as before.
+                        if region.get('solid') is False:
+                            continue
                         name = str(region.get('name') or '').strip()
                     solids.append(name or f'solid {index + 1}')
         if Path(path).suffix.lower() in TESSELLATED_SUFFIXES:

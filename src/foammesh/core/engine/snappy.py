@@ -379,6 +379,8 @@ class SnappyMeshingEngine:
     mixes_cad_and_surfaces = True
     #: DP-641. An NCC pair is written for OpenFOAM's non-conformal coupling.
     builds_non_conformal_interfaces = True
+    #: Plan 36 RP11. A snappy region is the space a seed point picks out.
+    regions_are_solids = False
 
     @property
     def descriptor(self) -> EngineDescriptor:

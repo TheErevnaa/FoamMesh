@@ -105,6 +105,24 @@ class VolumeControlPanel(ChildControlPanel):
         return True
 
 
+def _app():
+    from foammesh.app import app
+
+    return app
+
+
+def _geometryKey(case_path):
+    """What the staged geometry is: re-measured when any artifact changes."""
+    try:
+        from foammesh.core.geometry import GeometryArtifactStore
+
+        return tuple((str(entry.get('geometry_id')), str(entry.get('artifact')),
+                      str(entry.get('cad_artifact') or ''))
+                     for entry in GeometryArtifactStore(case_path).entries())
+    except Exception:                            # noqa: BLE001 - no geometry
+        return None
+
+
 def _positive(value) -> float | None:
     try:
         number = float(value)
@@ -178,9 +196,106 @@ class GmshVolumeControlsPage(GmshTaskPage):
         self.panel.setAccessibleDescription(self.tr(self.INCLUDED_NOTE))
         layout.addWidget(self.panel)
 
+        # Plan 36 RP11. On Gmsh every solid is a region: while this step is
+        # up each is drawn as a translucent volume in its region colour, and
+        # listed here with its type and volume. Read-only; typing a solid is
+        # the Included column and `geometry.fluid_regions.apply`.
+        solids = QLabel(self)
+        solids.setObjectName('gmshSolidsSummary')
+        solids.setWordWrap(True)
+        solids.setVisible(False)
+        self._solidsLabel = solids
+        layout.addWidget(solids)
+        self._solidVolumes = None
+
     def refresh(self) -> None:
         super().refresh()
         self._moveProseBehindHelp()
+        self._retypeSolids()
+
+    # -- Plan 36 RP11: the solids, drawn ------------------------------------ #
+
+    def solidVolumes(self):
+        """The solids' viewport volumes, made on first use."""
+        if self._solidVolumes is None:
+            from foammesh.rendering.solid_volumes import SolidVolumes
+
+            window = getattr(_app(), 'window', None)
+            display = getattr(window, 'displayControl', None)
+            self._solidVolumes = SolidVolumes(display, self)
+            self._solidVolumes.solidsReady.connect(self._solidsReady)
+        return self._solidVolumes
+
+    def _solidTyping(self) -> dict:
+        from foammesh.core.mesh.cad_solids import typing_of
+
+        try:
+            db = self._client.session().state.db
+            return typing_of(dict(db.getElements('gmsh/volumeControls') or {}))
+        except Exception:                        # noqa: BLE001 - no case yet
+            return {}
+
+    def _retypeSolids(self) -> None:
+        volumes = self._solidVolumes
+        if volumes is None:
+            return
+        volumes.setTyping(self._solidTyping())
+        self._listSolids()
+
+    def _listSolids(self) -> None:
+        volumes = self._solidVolumes
+        lines = volumes.lines() if volumes is not None else []
+        heading = self.tr('Solids (each is a region):')
+        if lines and self._farfieldCuts(volumes):
+            # DP-915: the far-field box cuts every solid out; they are the
+            # obstacle, and the fluid is the space around them.
+            heading = self.tr(
+                'Solids (the far-field box cuts them out: they are the '
+                'obstacle, and the fluid is the space around them):')
+        self._solidsLabel.setText(
+            heading + '\n' + '\n'.join(lines) if lines else '')
+        self._solidsLabel.setVisible(bool(lines))
+
+    def _farfieldCuts(self, volumes) -> bool:
+        from foammesh.core.mesh.cad_solids import (
+            CaseSolids, farfield_cuts, farfield_enabled,
+        )
+
+        try:
+            db = self._client.session().state.db
+            solids = list(volumes.solids())
+        except Exception:                        # noqa: BLE001 - no case yet
+            return False
+        return farfield_cuts(CaseSolids(solids=solids), farfield_enabled(db))
+
+    def _solidsReady(self) -> None:
+        self._retypeSolids()
+
+    def showSolids(self, shown: bool) -> None:
+        """Draw (or put away) every solid of the case as its region."""
+        if not shown:
+            if self._solidVolumes is not None:
+                self._solidVolumes.hide()
+            return
+        try:
+            case_path = self._client.case_path
+        except Exception:                        # noqa: BLE001 - no case yet
+            return
+        volumes = self.solidVolumes()
+        volumes.setTyping(self._solidTyping())
+        volumes.request(case_path, key=_geometryKey(case_path))
+        volumes.show()
+        self._listSolids()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not event.spontaneous():
+            self.showSolids(True)
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        if not event.spontaneous():
+            self.showSolids(False)
 
     def _moveProseBehindHelp(self) -> None:
         """The Included sentence, through the help control DP-230 built."""

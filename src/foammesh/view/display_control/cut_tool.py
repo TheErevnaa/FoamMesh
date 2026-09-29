@@ -17,10 +17,10 @@ from vtkmodules.vtkCommonDataModel import vtkPlane
 
 from foammesh.app import app
 from foammesh.rendering.actor_info import CutMode
-from foammesh.rendering.plane_widget import PlaneWidget
+from foammesh.rendering.plane_widget import AXIS_NORMAL, PlaneWidget
 from foammesh.support.mesh import Bounds
 
-from .section_panel import MAX_PLANES, CutType, SectionPanel
+from .section_panel import MAX_PLANES, CutType, SectionPanel, SectionPlaneState
 
 
 #: Above this many displayed cells a live re-cut on every mouse move stops
@@ -83,10 +83,78 @@ def _holds(bounds, point) -> bool:
                for axis in range(3))
 
 
+class SectionSnapshot:
+    """Everything the section controls hold, frozen, to be handed back later.
+
+    Plan 36 RP9. It answers the same questions a `SectionPanel` does, so
+    `SectionPanel.adoptFrom` takes it back without a second copy of the
+    rules for what a section is.
+    """
+
+    def __init__(self, planes, active, cutType, crinkle, live, dragAxis,
+                 locked, gizmos):
+        self._planes = [SectionPlaneState(plane.enabled, list(plane.origin),
+                                          list(plane.normal))
+                        for plane in planes]
+        self._active = active
+        self._cutType = cutType
+        self._crinkle = bool(crinkle)
+        self._live = bool(live)
+        self._dragAxis = dragAxis
+        self._locked = bool(locked)
+        self._gizmos = list(gizmos)
+
+    @classmethod
+    def of(cls, panel):
+        return cls(panel.planes(), panel.activeIndex(), panel.cutType(),
+                   panel.isCrinkle(), panel.isLive(), panel.dragAxis(),
+                   panel.isLocked(), panel.gizmoIndexes())
+
+    def planes(self):
+        return self._planes
+
+    def activeIndex(self):
+        return self._active
+
+    def cutType(self):
+        return self._cutType
+
+    def isCrinkle(self):
+        return self._crinkle
+
+    def isLive(self):
+        return self._live
+
+    def dragAxis(self):
+        return self._dragAxis
+
+    def isLocked(self):
+        return self._locked
+
+    def gizmoIndexes(self):
+        return list(self._gizmos)
+
+    def key(self):
+        """A plain value to compare two snapshots by."""
+        return (tuple((plane.enabled, tuple(plane.origin), tuple(plane.normal))
+                      for plane in self._planes),
+                self._active, self._cutType, self._crinkle, self._live,
+                self._dragAxis, self._locked, tuple(self._gizmos))
+
+
+def nearestAxis(direction) -> int:
+    """The world axis (0, 1, 2) *direction* runs along most."""
+    return max(range(3), key=lambda axis: abs(direction[axis]))
+
+
 class CutTool(QObject):
     #: Emitted whenever the applied section changes, so anything mirroring the
     #: section (the viewport overlay) can follow without owning the state.
     sectionApplied = Signal()
+    #: Plan 36 RP9. The seed's section plane was pushed to this origin.
+    seedSectionPushed = Signal(tuple)
+    #: Plan 36 RP9. A push of the seed's section plane was let go.
+    seedSectionReleased = Signal()
 
     def __init__(self, ui):
         super().__init__()
@@ -102,6 +170,9 @@ class CutTool(QObject):
         self._option = None
         self._planeWidgets = [PlaneWidget(self._view) for _ in range(MAX_PLANES)]
         self._mirrors = []
+        #: Plan 36 RP9. While a region seed is placed on a section: what the
+        #: controls held before (to be given back) and the plane's normal.
+        self._seedSection = None
 
         self._header.setContents(ui.cut)
 
@@ -211,6 +282,92 @@ class CutTool(QObject):
         for widget in self._planeWidgets:
             widget.applyTheme(tokens)
 
+    # -- Plan 36 RP9: one plane through a region's seed --------------------- #
+
+    #: The plane the seed is placed on is plane 1; the others are lowered.
+    SEED_PLANE = 0
+
+    def viewDirection(self):
+        """The direction the camera looks along, or ``None`` with no view."""
+        renderer = getattr(self._view, 'renderer', None)
+        renderer = renderer() if callable(renderer) else None
+        if renderer is None:
+            return None
+        return tuple(renderer.GetActiveCamera().GetDirectionOfProjection())
+
+    def isSeedSectionActive(self) -> bool:
+        return self._seedSection is not None
+
+    def seedSectionPlane(self):
+        """``(origin, normal)`` of the seed's plane, or ``None``."""
+        if self._seedSection is None:
+            return None
+        plane = self._panel.planes()[self.SEED_PLANE]
+        return tuple(plane.origin), tuple(self._seedSection[1])
+
+    def beginSeedSection(self, point, axis: int) -> bool:
+        """Raise one plane through *point*, normal to world *axis*, cutting.
+
+        What the section controls held is kept, and `endSeedSection` gives
+        it back exactly. The plane is the only one raised; its handle is
+        shown and moves along the normal only, and the lock is the user's
+        (a locked plane still takes a Ctrl+drag, DP-735). The normal points
+        away from the camera, so the half between the viewer and the seed
+        is the half taken away. False, and nothing changes, with nothing on
+        screen to cut.
+        """
+        if self._seedSection is not None:
+            self.endSeedSection()
+        snapshot = SectionSnapshot.of(self._panel)
+        option = self._option
+        if self._bounds is None and not self.updateBounds():
+            return False
+        direction = self.viewDirection() or (0.0, 0.0, 1.0)
+        normal = [0.0, 0.0, 0.0]
+        normal[axis] = -1.0 if direction[axis] < 0 else 1.0
+        # On the model's middle across the plane, so the plane's own origin
+        # handle does not sit under the seed's ball.
+        origin = [float(value) for value in self._bounds.center()]
+        origin[axis] = float(point[axis])
+        planes = [SectionPlaneState() for _ in range(MAX_PLANES)]
+        planes[self.SEED_PLANE] = SectionPlaneState(True, origin, normal)
+        wanted = SectionSnapshot(
+            planes, self.SEED_PLANE, CutType.CLIP, False, True, AXIS_NORMAL,
+            snapshot.isLocked(), [self.SEED_PLANE])
+        self._seedSection = (snapshot, tuple(normal), option)
+        self._panel.adoptFrom(wanted)
+        self._apply()
+        return True
+
+    def moveSeedSection(self, point) -> None:
+        """Carry the seed's plane to *point* along its normal (a typed move)."""
+        if self._seedSection is None:
+            return
+        normal = self._seedSection[1]
+        axis = nearestAxis(normal)
+        plane = self._panel.planes()[self.SEED_PLANE]
+        if plane.origin[axis] == float(point[axis]):
+            return
+        origin = list(plane.origin)
+        origin[axis] = float(point[axis])
+        self._panel.setPlaneGeometry(self.SEED_PLANE, origin, normal)
+        self._apply()
+
+    def endSeedSection(self) -> None:
+        """Give the section controls back exactly as they were."""
+        if self._seedSection is None:
+            return
+        snapshot, _normal, option = self._seedSection
+        self._seedSection = None
+        self._panel.adoptFrom(snapshot)
+        self._panel.setDegradedNote('')
+        # The cut that was on screen, not a re-reading of the controls: a
+        # section edited with Live off and not yet applied stays unapplied.
+        if option is None:
+            self._apply((snapshot.cutType(), snapshot.isCrinkle(), []))
+        else:
+            self._apply((option[0], snapshot.isCrinkle(), option[1]))
+
     # -- wiring ------------------------------------------------------------ #
 
     def _connectSignalsSlots(self):
@@ -262,7 +419,15 @@ class CutTool(QObject):
         self._view.refresh()
 
     def _handleMoved(self, index, origin, normal):
+        seedPlane = (self._seedSection is not None
+                     and index == self.SEED_PLANE)
+        if seedPlane:
+            # RP9. The seed's plane is pushed, never turned.
+            normal = self._seedSection[1]
+            self._planeWidgets[index].setNormal(normal)
         self._panel.setPlaneGeometry(index, origin, normal)
+        if seedPlane:
+            self.seedSectionPushed.emit(tuple(origin))
         self._syncPanels()
         if self._panel.isLive():
             if self._displayedCells() <= LIVE_CELL_BUDGET:
@@ -275,6 +440,8 @@ class CutTool(QObject):
     def _dragFinished(self):
         if self._panel.isLive():
             self._apply()
+        if self._seedSection is not None:
+            self.seedSectionReleased.emit()
 
     def _displayedCells(self):
         manager = getattr(app.window, 'meshManager', None)
@@ -308,10 +475,16 @@ class CutTool(QObject):
             planes.append(plane)
         return planes
 
-    def _apply(self):
-        cutType = self._panel.cutType()
-        mode = CutMode.CRINKLE if self._panel.isCrinkle() else CutMode.SMOOTH
-        planes = self._vtkPlanes()
+    def _apply(self, restore=None):
+        """Cut with the controls; *restore* is ``(cutType, crinkle, planes)``
+        to put back instead (RP9: the cut that was on screen)."""
+        if restore is None:
+            cutType = self._panel.cutType()
+            crinkle = self._panel.isCrinkle()
+            planes = self._vtkPlanes()
+        else:
+            cutType, crinkle, planes = restore
+        mode = CutMode.CRINKLE if crinkle else CutMode.SMOOTH
 
         managers = [getattr(app.window, name, None)
                     for name in ('geometryManager', 'meshManager')]

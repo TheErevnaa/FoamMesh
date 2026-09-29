@@ -170,6 +170,26 @@ class EngineWorkflowGraph:
         self._refresh_ready()
         return TaskTransition(task_id, before, after)
 
+    def restate(self, task_id: str, *, warning: bool = False) -> TaskTransition:
+        """Replace a finished stage's result with the result of its rerun.
+
+        DP-817. A stage that has run again has a new result, and the old one
+        is no longer evidence of anything. ``finish`` cannot say so, because
+        it only leaves RUNNING or CONFIGURED, and reaching those from PASSED
+        goes through ``configure``, which stales every descendant. A rerun
+        that reproduces the mesh its descendants were built on has not made
+        them stale. So this moves between PASSED and WARNING and nothing else:
+        no other state is a stage result, and no descendant is touched.
+        """
+        before = self._state[task_id]
+        if before not in {TaskState.PASSED, TaskState.WARNING}:
+            raise ValueError(
+                f'task has no run result to replace: {task_id}')
+        after = TaskState.WARNING if warning else TaskState.PASSED
+        self._state[task_id] = after
+        self._refresh_ready()
+        return TaskTransition(task_id, before, after)
+
     def fail(self, task_id: str) -> TaskTransition:
         before = self._state[task_id]
         if before is not TaskState.RUNNING:

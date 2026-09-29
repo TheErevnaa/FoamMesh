@@ -37,6 +37,9 @@ REQUIRED_TOKENS = frozenset({
     # surface colour, so a multi-zone mesh read as one undifferentiated solid.
     # A separate hue family keeps a zone from ever being mistaken for a patch.
     'viewport.zone.1', 'viewport.zone.2', 'viewport.zone.3', 'viewport.zone.4',
+    # Plan 36 RP8: a case's fluid and solid regions take zone colours too, and
+    # eight covers the regions a case realistically has before it cycles.
+    'viewport.zone.5', 'viewport.zone.6', 'viewport.zone.7', 'viewport.zone.8',
 })
 
 #: Ordered categorical palette handed to boundary patches. Six is past the
@@ -47,7 +50,7 @@ PATCH_TOKENS = tuple(f'viewport.patch.{index}' for index in range(1, 7))
 
 #: The zone palette. Deliberately a different hue family from the patch palette
 #: so that "which of these is a zone" is answerable without reading the tree.
-ZONE_TOKENS = tuple(f'viewport.zone.{index}' for index in range(1, 5))
+ZONE_TOKENS = tuple(f'viewport.zone.{index}' for index in range(1, 9))
 
 #: Named palette families addressable by :meth:`ActorInfo.setPaletteIndex`.
 PALETTE_FAMILIES = {'patch': PATCH_TOKENS, 'zone': ZONE_TOKENS}

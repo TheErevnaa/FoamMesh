@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from foammesh.core.facade import (
@@ -94,6 +95,53 @@ def cmd_op(args) -> int:
     return 0
 
 
+def cmd_fluid_regions(args) -> int:
+    """Plan 36 RP7: detect the fluid spaces, then write the chosen ones.
+
+    ``fluid-regions detect CASE --count 2 [--external]`` prints what
+    ``geometry.fluid_regions.detect`` returns -- the JSON the facade hands the
+    GUI, including its ``detection_id`` -- and ``fluid-regions apply CASE
+    --ids 2,3 --detection-id ID`` writes those spaces' seeds as regions in one
+    undoable change. The id binds the ids to that detection: an apply after
+    the geometry or the box changed is refused as ``detection_stale``
+    (Plan 36 RP13 #3).
+    """
+    parameters = {}
+    if args.external:
+        parameters['external'] = True
+    if args.resolution is not None:
+        parameters['resolution'] = args.resolution
+    if args.action == 'detect':
+        parameters['count'] = args.count
+        operation = 'geometry.fluid_regions.detect'
+    else:
+        if not args.ids:
+            raise SystemExit('fluid-regions apply needs --ids, e.g. --ids 2,3')
+        parameters['ids'] = [int(value) for value in args.ids.split(',')
+                             if value.strip()]
+        if args.detection_id:
+            parameters['detection_id'] = args.detection_id
+        if args.type:
+            parameters['type'] = args.type
+        if args.replace:
+            parameters['replace'] = True
+        operation = 'geometry.fluid_regions.apply'
+    from foammesh.core.facade import FacadeError
+    try:
+        result = execute_case_operation(args.case, operation, parameters)
+    except FacadeError as error:
+        # RP13 #3: a refusal says what it is -- ``error: detection_stale``
+        # -- then why, and exits non-zero.
+        details = dict(getattr(error, 'details', None) or {})
+        print(f'error: {details.get("error") or error.code}: {error}',
+              file=sys.stderr)
+        if details:
+            print(json.dumps(details, sort_keys=True), file=sys.stderr)
+        return 2
+    _emit(result.to_dict())
+    return 0
+
+
 def cmd_snapshot(args) -> int:
     facade, session = _open(args.case)
     try:
@@ -161,6 +209,29 @@ def add_facade_commands(sub: argparse._SubParsersAction) -> None:
     op.add_argument('case'); op.add_argument('operation')
     op.add_argument('--parameters', help='JSON parameters object', default=None)
     op.set_defaults(func=cmd_op)
+
+    fr = sub.add_parser(
+        'fluid-regions',
+        help='detect the fluid spaces of a case and create regions in them')
+    fr.add_argument('action', choices=('detect', 'apply'))
+    fr.add_argument('case')
+    fr.add_argument('--count', type=int, default=1,
+                    help='how many fluid regions are wanted (detect)')
+    fr.add_argument('--external', action='store_true',
+                    help='offer the space outside the geometry first')
+    fr.add_argument('--resolution', type=float, default=None,
+                    help='voxel size in metres (default: half a base cell)')
+    fr.add_argument('--ids', default=None,
+                    help='comma-separated space ids to create regions in (apply)')
+    fr.add_argument('--detection-id', default=None,
+                    help='the detection_id detect printed; binds --ids to '
+                         'that detection (apply)')
+    fr.add_argument('--type', choices=('fluid', 'solid'), default=None,
+                    help='region type for apply (default fluid)')
+    fr.add_argument('--replace', action='store_true',
+                    help='replace the existing regions of the type applied '
+                         '(apply; default adds to them)')
+    fr.set_defaults(func=cmd_fluid_regions)
 
     sn = sub.add_parser('snapshot', help='print the facade snapshot for a case')
     sn.add_argument('case'); sn.set_defaults(func=cmd_snapshot)

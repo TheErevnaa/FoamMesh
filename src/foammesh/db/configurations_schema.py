@@ -1105,6 +1105,11 @@ gmshVolumeControl = {
     # "solid" here published exactly the same cell zone as "fluid". Excluding
     # a volume is what `included` does, and that one is real.
     'included': BoolType(True),
+    # Plan 36 RP11. What this solid is -- fluid or solid -- as "how many
+    # fluid regions?" typed it. Unlike the removed `regionType` it is read:
+    # the Gmsh publish passes it as the cell zone's region type, and the
+    # solids view and detection answer from it. None: nobody typed it.
+    'volumeType': EnumType(RegionType).setOptional().setDefault(None),
     'targetSize': FloatType().setOptional().setDefault(None).setLowLimit(0, False),
     'transfinite': BoolType(False),
     'priority': IntType().setRange(0, 100).setDefault(0),

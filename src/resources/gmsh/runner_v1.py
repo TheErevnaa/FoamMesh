@@ -5098,8 +5098,12 @@ class GmshRun:
             # things depending on which side of the seam is looking.
             mode = MODE_ALL_WALLS if not wanted else 'selected'
         if mode == MODE_ALL_WALLS:
+            # DP-867. Judged by the category each patch publishes with,
+            # which the job carries; a name alone (`face0`) says nothing.
+            categories = self.job.get('surfaceCategories') or {}
+            names = [self.surface_patch_name(tag)[0] for tag in surfaces]
             wanted = set(eligible_wall_names(
-                self.surface_patch_name(tag)[0] for tag in surfaces))
+                (name, categories.get(name, '')) for name in names))
             if not wanted:
                 self.warnings.append(
                     'every eligible wall was asked for and this import names '

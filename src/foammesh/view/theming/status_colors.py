@@ -54,3 +54,15 @@ def swatch_color(widget) -> QColor | None:
             color = QColor(value.strip())
             return color if color.isValid() else None
     return None
+
+
+def hide_menu_indicator(button) -> None:
+    """Draw no menu arrow on a popup tool button (DP-815, moved here by DP-852).
+
+    The application stylesheet already hides the indicator on every
+    ``QToolButton``; the button's own rule keeps that true before a theme is
+    applied and under any stylesheet that does not, so the gradient it is
+    painted with fills the whole face.
+    """
+    button.setStyleSheet(
+        'QToolButton::menu-indicator { image: none; width: 0px; }')

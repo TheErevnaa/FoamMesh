@@ -84,6 +84,9 @@ class PartData:
     name: str = ''
     color: str = ''
     faces: list[FaceData] = field(default_factory=list)
+    #: DP-900. Whether the part is (or holds) a closed solid. ``None`` where
+    #: nobody asked OCCT, which every reader treats as "not measured".
+    solid: bool | None = None
 
 
 def build_model_from_parts(parts: list[PartData], source_format: str,
@@ -101,7 +104,8 @@ def build_model_from_parts(parts: list[PartData], source_format: str,
         ]
         bodies.append(CadBody(id=f'body{i}',
                               name=part.name or f'Body {i + 1}',
-                              color=part.color, faces=faces))
+                              color=part.color, faces=faces,
+                              solid=part.solid))
     # DP-92. The adjacency and the interface twin are answers about the whole
     # document, and the walk that measured them numbered the faces before
     # they were cut into bodies. Resolving them here, once every id exists,
@@ -405,8 +409,11 @@ def _split_into_solids(shape, ordered, shape_tool, color_tool, label,
         solid_exp.Next()
 
     if len(solids) < 2:
+        # DP-900. A free shape with no solid in it -- a lone face, an open
+        # shell -- is a part, but not a volume.
         return [PartData(name=base_name, color=base_color,
-                         faces=[data for _face, data in ordered])]
+                         faces=[data for _face, data in ordered],
+                         solid=bool(solids))]
 
     buckets: list[list] = [[] for _ in solids]
     loose: list = []
@@ -432,10 +439,11 @@ def _split_into_solids(shape, ordered, shape_tool, color_tool, label,
         except Exception as error:  # noqa: BLE001 - OCCT raises many kinds
             logger.debug('CAD solid %d has no XDE label: %s', index, error)
         parts.append(PartData(name=name or f'{base_name} solid {index + 1}',
-                              color=color or base_color, faces=bucket))
+                              color=color or base_color, faces=bucket,
+                              solid=True))
     if loose:
         parts.append(PartData(name=f'{base_name} loose faces',
-                              color=base_color, faces=loose))
+                              color=base_color, faces=loose, solid=False))
     return parts
 
 
@@ -450,7 +458,7 @@ def build_model(shape, source_format: str, unit_name: str | None = None,
     walked: list = []
     solid_exp = TopExp_Explorer(shape, TopAbs_SOLID)
     while solid_exp.More():
-        part = PartData()
+        part = PartData(solid=True)
         face_exp = TopExp_Explorer(solid_exp.Current(), TopAbs_FACE)
         while face_exp.More():
             data = FaceData(order=len(walked))
@@ -460,7 +468,7 @@ def build_model(shape, source_format: str, unit_name: str | None = None,
         parts.append(part)
         solid_exp.Next()
     if not parts:
-        part = PartData()
+        part = PartData(solid=False)
         face_exp = TopExp_Explorer(shape, TopAbs_FACE)
         while face_exp.More():
             data = FaceData(order=len(walked))

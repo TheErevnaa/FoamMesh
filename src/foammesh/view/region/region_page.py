@@ -158,6 +158,8 @@ class RegionPage(StepPage):
             self._syncCards()
 
         app.window.meshManager.unload()
+        # DP-818. The seed glyphs are drawn while this page is up.
+        self._showMarkers(True)
 
     def _syncCards(self):
         """Put a card back for every region the database still holds (R148).
@@ -188,6 +190,7 @@ class RegionPage(StepPage):
     async def hide(self):
         self._form.cancel()
         self._ui.regionValidationMessage.hide()
+        self._showMarkers(False)
 
         return True
 
@@ -346,6 +349,14 @@ class RegionPage(StepPage):
         suppress = getattr(manager, 'suppressRegionMarker', None)
         if suppress is not None:
             suppress(id_)
+
+    @staticmethod
+    def _showMarkers(shown):
+        """DP-818. Show the seed glyphs on this page and nowhere else."""
+        manager = getattr(app.window, 'geometryManager', None) if app.window else None
+        setShown = getattr(manager, 'setRegionMarkersShown', None)
+        if setShown is not None:
+            setShown(shown)
 
     @staticmethod
     def _refreshMarkers():

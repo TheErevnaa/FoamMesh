@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QColor
 
 from foammesh.support.simple_db.simple_db import Element
 
@@ -13,7 +14,7 @@ from foammesh.core.selection import (
 from foammesh.rendering.actor_info import GeometryActor, RegionMarkerActor
 from foammesh.rendering.vtk_loader import (hexPolyData, cylinderPolyData, spherePolyData, polygonPolyData,
                                            planePolyData, diskPolyData, openPlatePolyData)
-from foammesh.view.main_window.actor_manager import ActorManager
+from foammesh.view.main_window.actor_manager import ActorManager, _union
 
 
 #: The three open searchable surfaces, by the value stored in the database.
@@ -65,16 +66,81 @@ def platePolyData(shape, volume):
         return polygonPolyData([(x1, y1, z2), (x1, y2, z2), (x2, y2, z2), (x2, y1, z2)])
 
 
+#: DP-818. Colours a seed wears when the theme cannot be read, by verdict.
+_SEED_FALLBACK_COLOURS = {
+    'inside': '#2e9d60',
+    'outside': '#d64545',
+    'on_surface': '#d64545',
+    'unknown': '#d9a21b',
+    'open_to_outside': '#d64545',
+}
+_SEED_STATUS_TOKENS = {
+    'inside': 'status.success',
+    'outside': 'status.error',
+    'on_surface': 'status.error',
+    'unknown': 'status.warning',
+    # Plan 36 RP6: the classifier says inside, but the space the seed is in
+    # reaches the domain boundary -- the surface leaks.
+    'open_to_outside': 'status.error',
+}
+
+#: DP-818. What the geometry fades to while a seed is being placed: enough to
+#: see a point sitting in a hole through the wall around it, enough left to
+#: see where the wall is.
+SEED_PLACING_OPACITY = 0.25
+
+
+def seedColour(verdict) -> str:
+    """The themed colour for a seed verdict: green in, red out."""
+    token = _SEED_STATUS_TOKENS.get(verdict, 'status.warning')
+    try:
+        tokens = app.themeManager.tokens if app.themeManager else None
+        if tokens is not None:
+            value = tokens.value(token)
+            if value:
+                return str(value)
+    except Exception:                                         # noqa: BLE001
+        pass
+    return _SEED_FALLBACK_COLOURS.get(verdict, '#d9a21b')
+
+
+def _caseId():
+    """The open case's id, or ``None`` (Plan 36 RP13 #7: the region volume
+    jobs are tagged with it, and an answer for a closed case is dropped)."""
+    try:
+        case = app.facadeClient.case_id
+    except Exception:                                         # noqa: BLE001
+        return None
+    return None if case is None else str(case)
+
+
 class GeometryManager(ActorManager):
     #: The region whose form is open, if any. Its glyph is not drawn.
     _suppressedRegion = None
+    #: DP-818. Seed glyphs are a Domain & Regions landmark, drawn while that
+    #: page is shown and nowhere else.
+    _regionMarkersShown = False
 
     selectedActorsChanged = Signal(list)
+    #: Plan 36 RP6. The space of the seed being placed is known now (the
+    #: labelling job came back), so what the form says about it can change.
+    seedSpaceChanged = Signal()
 
     def __init__(self):
         super().__init__()
         self._findingHighlight = None
         self._selectionHiddenActors = set()
+        #: DP-818. The inside/outside test, built once per geometry state.
+        self._seedClassifier = None
+        self._seedClassifierKey = None
+        #: DP-818. The live seed being placed, and the opacities the geometry
+        #: had before it was faded for placing it.
+        self._seedPreview = None
+        self._fadedOpacities = None
+        #: Plan 36 RP6. The labelled spaces and their volumes, built once
+        #: per geometry and domain; the fade the walls are at now.
+        self._regionVolumes = None
+        self._seedFade = SEED_PLACING_OPACITY
 
         self._displayControl.selectedActorsChanged.connect(self.selectedActorsChanged)
         self.selectedActorsChanged.connect(
@@ -118,6 +184,12 @@ class GeometryManager(ActorManager):
 
     def clear(self):
         self.clearFindingHighlight()
+        self._clearSeedPreview()
+        # The actors whose opacity was saved are about to go.
+        self._fadedOpacities = None
+        if self._regionVolumes is not None:
+            self._regionVolumes.end()
+            self._regionVolumes.reset()
         app.selectionService.remove_owner('geometry-db')
         super().clear()
 
@@ -213,6 +285,18 @@ class GeometryManager(ActorManager):
         self._suppressedRegion = suppressed
         self.reloadRegions()
 
+    def getSurfaceBounds(self):
+        """The extent of the model itself, without the region seed glyphs.
+
+        DP-821. `getBounds` is every actor this manager holds, and the seed
+        glyphs are held here too, so a seed placed off the geometry -- an
+        external-flow seed, or a mistyped one -- grew the box the Base Grid
+        page derived by the seed's distance plus the glyph's radius. The
+        block that is written is derived from the surfaces alone.
+        """
+        return _union(info.bounds() for info in self._actorInfos.values()
+                      if not isinstance(info, RegionMarkerActor))
+
     def reloadRegions(self):
         """Rebuild the region seed markers from what the database now holds.
 
@@ -272,7 +356,370 @@ class GeometryManager(ActorManager):
         if marker.id() in self._actorInfos:
             self.remove(marker.id())
         self.add(marker)
+        # DP-818. Green in the fluid, red in a hole or beyond the wall, so a
+        # seed in the wrong space is visible without opening its form.
+        marker.setColor(QColor(seedColour(self.classifySeed(point))))
+        marker.setVisible(self._regionMarkersShown)
         return marker.id()
+
+    # -- DP-818: where a seed is, and whether it is in the fluid -------------
+
+    def _seedComponents(self):
+        """The closed parts a seed is judged against, with a cache key.
+
+        Plan 36 RP3. The choice itself is core's ``seed_components``, the one
+        the headless fluid-space field makes too, so the viewport and a
+        launch never judge a seed against different parts.
+        """
+        from foammesh.core.mesh.seed_classifier import seed_components
+
+        surfaces = {gId: info.dataSet() for gId, info in self._actorInfos.items()
+                    if isinstance(info, GeometryActor)}
+        if not surfaces:
+            return [], ()
+        try:
+            db = app.facadeClient.checkout()
+            geometries = db.getElements('geometry') or {}
+        except Exception:                                     # noqa: BLE001
+            db, geometries = None, {}
+        try:
+            boundingHex6 = db.getValue('baseGrid/boundingHex6') if db else None
+        except Exception:                                     # noqa: BLE001
+            boundingHex6 = None
+        return seed_components(surfaces, geometries, bounding_hex6=boundingHex6)
+
+    def seedClassifier(self):
+        """The inside/outside test for the loaded geometry, built once.
+
+        Built again only when a surface is added, removed or changed, so a
+        form can ask it on every keystroke without re-reading the model.
+        """
+        from foammesh.core.mesh.seed_classifier import SeedClassifier
+
+        components, key = self._seedComponents()
+        if self._seedClassifier is None or key != self._seedClassifierKey:
+            try:
+                self._seedClassifier = SeedClassifier(components)
+            except Exception:                                 # noqa: BLE001
+                self._seedClassifier = SeedClassifier([])
+            self._seedClassifierKey = key
+        return self._seedClassifier
+
+    def classifySeed(self, point) -> str:
+        """'inside', 'outside', 'on_surface' or 'unknown' for *point*."""
+        return self.seedClassifier().classify(point)
+
+    def setRegionMarkersShown(self, shown: bool):
+        """Show the seed glyphs while Domain & Regions is up, hide them after."""
+        shown = bool(shown)
+        if shown == self._regionMarkersShown:
+            return
+        self._regionMarkersShown = shown
+        for key, info in self._actorInfos.items():
+            if isinstance(info, RegionMarkerActor):
+                info.setVisible(shown and key not in self._selectionHiddenActors)
+        self._displayControl.refreshView()
+
+    def regionMarkersShown(self) -> bool:
+        return self._regionMarkersShown
+
+    def previewSeed(self, point):
+        """Draw the seed being placed, coloured by where it is.
+
+        Plan 36 RP3: the seed is a handle the user drags (``SeedGizmo``), one
+        per placement, moved rather than rebuilt as the point changes.
+        *point* ``None`` takes it away. Answers the verdict, so the form's
+        status line and the handle cannot disagree.
+        """
+        if point is None:
+            self._clearSeedPreview()
+            return None
+        try:
+            centre = tuple(float(component) for component in point)
+        except (TypeError, ValueError):
+            self._clearSeedPreview()
+            return None
+        if len(centre) != 3:
+            self._clearSeedPreview()
+            return None
+        verdict = self.classifySeed(centre)
+        # Plan 36 RP6. Only visibilities change here: the space's actor was
+        # built when the labelling job came back.
+        volumes = self._regionVolumes
+        spaceChanged = False
+        if volumes is not None and volumes.isActive():
+            spaceChanged = volumes.place(centre)
+            space = volumes.editedSpace()
+            if (verdict == 'inside' and space is not None and space.label
+                    and space.outside and not volumes.externalFlow()):
+                verdict = 'open_to_outside'
+            faded = self._fadeForVolumes(volumes.anyShown())
+            spaceChanged = spaceChanged or faded
+        colour = seedColour(verdict)
+        gizmo = self._seedPreview
+        if gizmo is None:
+            from foammesh.rendering.seed_gizmo import SeedGizmo
+
+            view = getattr(self._displayControl, 'view', None)
+            gizmo = SeedGizmo(view() if callable(view) else None, centre)
+            self._seedPreview = gizmo
+            gizmo.setColour(colour)
+            # Plan 36 RP10: the shape says it too, not the colour alone.
+            gizmo.setVerdict(verdict)
+            if volumes is not None and volumes.isActive():
+                volumes.setHandle(gizmo)
+            self._displayControl.refreshView()
+            return verdict
+        if gizmo.position() != centre:
+            # The gizmo's own move draws the frame; the volumes' visibilities
+            # were switched above, so they land in that same frame.
+            gizmo.setPosition(centre)                 # draws itself
+        elif spaceChanged:
+            self._displayControl.refreshView()
+        if gizmo.colour() != colour:
+            # A drag frame has already been drawn; only a verdict that
+            # changed on it costs a second one.
+            gizmo.setColour(colour)
+            gizmo.setVerdict(verdict)
+            self._displayControl.refreshView()
+        elif gizmo.verdict() != verdict:
+            gizmo.setVerdict(verdict)
+            self._displayControl.refreshView()
+        return verdict
+
+    def seedPreview(self):
+        """The seed handle being placed, or ``None``."""
+        return self._seedPreview
+
+    # -- Plan 36 RP6: the space a seed will mesh -----------------------------
+
+    def regionVolumes(self):
+        """The labelled spaces and their volume actors (built on first use)."""
+        if self._regionVolumes is None:
+            from foammesh.rendering.region_volume_actor import RegionVolumes
+
+            self._regionVolumes = RegionVolumes(self._displayControl)
+            self._regionVolumes.spacesReady.connect(self._regionSpacesReady)
+            # RP13 #7: the surfaces come after the spaces, on demand.
+            self._regionVolumes.surfacesReady.connect(
+                self._regionSpacesReady)
+        return self._regionVolumes
+
+    def beginRegionVolumes(self, region_id, box) -> bool:
+        """A region's form opened on the domain *box*: label it, show spaces.
+
+        The labelling runs on the VTK worker thread and is cached beside the
+        case, so this returns at once; the spaces appear when it comes back.
+        Every other region's space is drawn at the stored opacity, the one
+        being edited at the edited opacity. Answers False when there is
+        nothing to label.
+        """
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.rendering.region_volume_actor import (
+            nextRegionColour, regionColours)
+
+        volumes = self.regionVolumes()
+        components, key = self._seedComponents()
+        if not components or box is None:
+            volumes.end()
+            return False
+        try:
+            baseCell = min(abs(float(size)) for size in self.getCellSize())
+        except Exception:                                     # noqa: BLE001
+            baseCell = None
+        try:
+            cacheDir = fluid_regions.cache_dir(app.facadeClient.case_root)
+        except Exception:                                     # noqa: BLE001
+            cacheDir = None
+        edited = None if region_id is None else str(region_id)
+        try:
+            regions = app.facadeClient.checkout().getElements('region') or {}
+        except Exception:                                     # noqa: BLE001
+            regions = {}
+        ids, points = [], {}
+        for rid, region in regions.items():
+            try:
+                if region.value('gType') is not None:
+                    continue
+            except (LookupError, TypeError):
+                pass
+            ids.append(str(rid))
+            try:
+                points[str(rid)] = tuple(region.vector('point'))
+            except (LookupError, TypeError, ValueError):
+                pass
+        colours = regionColours(ids)
+        stored = [(colours[rid], point) for rid, point in points.items()
+                  if rid != edited]
+        editedColour = (colours[edited] if edited in colours
+                        else nextRegionColour(ids))
+        volumes.request(components, box, base_cell=baseCell,
+                        cache_dir=cacheDir,
+                        key=(key, None if cacheDir is None else str(cacheDir)),
+                        case=_caseId())
+        volumes.begin(stored, editedColour)
+        if self._seedPreview is not None:
+            volumes.setHandle(self._seedPreview)
+            volumes.place(self._seedPreview.position())
+        self._fadeForVolumes(volumes.anyShown())
+        self._displayControl.refreshView()
+        return True
+
+    def endRegionVolumes(self) -> None:
+        """The form closed: every space is hidden; the field is kept."""
+        if self._regionVolumes is not None and self._regionVolumes.isActive():
+            self._regionVolumes.end()
+            self._fadeForVolumes(False)
+            self._displayControl.refreshView()
+
+    def setExternalFlow(self, external: bool) -> None:
+        """With external flow, the space round the body is a region too."""
+        self.regionVolumes().setExternalFlow(external)
+
+    def showRegionCandidates(self, candidates, box=None) -> bool:
+        """Plan 36 RP7. Draw the spaces "how many fluid regions?" lists.
+
+        *candidates* are the detection panel's rows; each ticked one is
+        drawn in its colour, found by its seed in this viewport's own
+        labelling of *box* -- requested here, on the worker thread, when
+        there is none for these inputs yet. ``[]`` hides them again.
+        """
+        from foammesh.core.mesh import fluid_regions
+
+        volumes = self.regionVolumes()
+        candidates = list(candidates or ())
+        if candidates and box is not None:
+            components, key = self._seedComponents()
+            if components:
+                try:
+                    baseCell = min(abs(float(size))
+                                   for size in self.getCellSize())
+                except Exception:                             # noqa: BLE001
+                    baseCell = None
+                try:
+                    cacheDir = fluid_regions.cache_dir(
+                        app.facadeClient.case_root)
+                except Exception:                             # noqa: BLE001
+                    cacheDir = None
+                volumes.request(
+                    components, box, base_cell=baseCell, cache_dir=cacheDir,
+                    key=(key, None if cacheDir is None else str(cacheDir)),
+                    case=_caseId())
+        return volumes.showCandidates(candidates)
+
+    def seedSpace(self) -> dict:
+        """What is known about the space of the seed being placed.
+
+        ``working``: the labelling job is still running. ``space``: RP5's
+        ``SpaceAt`` for the seed (``None`` unknown or off the domain).
+        ``name``: 'Fluid space N', by rank among the enclosed spaces.
+        ``inExtent``: the seed is within the model's own extent -- a core
+        or a hole rather than beyond the surface. ``inCore``: DP-923, the
+        seed is in outside space the surface wraps -- an open core, a bore,
+        a hollow -- which the extent alone cannot tell from a point beside
+        an elbow in its bounding box. ``external``: external
+        flow is on. ``note``: RP13 #7, a space drawn as its box or not at
+        all (past the triangle budget), else ``None``.
+        """
+        volumes = self._regionVolumes
+        if volumes is None or not volumes.isActive():
+            return {'active': False}
+        space = volumes.editedSpace()
+        inExtent = False
+        gizmo = self._seedPreview
+        if gizmo is not None:
+            try:
+                x1, x2, y1, y2, z1, z2 = self.getSurfaceBounds().toTuple()
+                x, y, z = gizmo.position()
+                inExtent = (x1 <= x <= x2 and y1 <= y <= y2
+                            and z1 <= z <= z2)
+            except Exception:                                 # noqa: BLE001
+                inExtent = False
+        inCore = False
+        if gizmo is not None and space is not None and space.outside:
+            from foammesh.core.mesh.fluid_regions import wrapped_at
+            try:
+                inCore = wrapped_at(volumes.field(), gizmo.position())
+            except Exception:                                 # noqa: BLE001
+                inCore = False
+        return {'active': True, 'working': volumes.isWorking(),
+                'space': space,
+                'name': volumes.spaceName(space.label) if space else None,
+                'inExtent': inExtent, 'inCore': inCore,
+                'external': volumes.externalFlow(),
+                'error': volumes.error(), 'note': volumes.statusNote()}
+
+    def _regionSpacesReady(self):
+        volumes = self._regionVolumes
+        if volumes is None or not volumes.isActive():
+            return
+        if self._seedPreview is not None:
+            volumes.place(self._seedPreview.position())
+        self._fadeForVolumes(volumes.anyShown())
+        self._displayControl.refreshView()
+        self.seedSpaceChanged.emit()
+
+    def _fadeForVolumes(self, shown: bool) -> bool:
+        """Walls to 0.15 while a volume is shown, back to 0.25 after."""
+        from foammesh.rendering.region_volume_actor import VOLUME_WALL_OPACITY
+
+        target = VOLUME_WALL_OPACITY if shown else SEED_PLACING_OPACITY
+        if self._fadedOpacities is None or target == self._seedFade:
+            return False
+        self._seedFade = target
+        for gId, opacity in self._fadedOpacities.items():
+            info = self._actorInfos.get(gId)
+            if info is not None:
+                info.setOpacity(min(float(opacity if opacity is not None
+                                          else 1.0), target))
+        return True
+
+    def _clearSeedPreview(self):
+        if self._seedPreview is not None:
+            gizmo, self._seedPreview = self._seedPreview, None
+            if self._regionVolumes is not None:
+                # The busy ring lives in the handle's renderer.
+                self._regionVolumes.setHandle(None)
+            gizmo.close()
+            gizmo.deleteLater()
+
+    def fadeGeometryForSeed(self, on: bool):
+        """See through the walls while a seed is placed, then put them back.
+
+        A seed in the core of a pipe is hidden by the pipe. The surfaces are
+        faded through the same per-part opacity the Display Control sets, and
+        each part gets back exactly the opacity it had -- including one the
+        user chose -- when the form closes.
+        """
+        if on:
+            if self._fadedOpacities is not None:
+                return
+            self._seedFade = SEED_PLACING_OPACITY
+            self._fadedOpacities = {}
+            for gId, info in self._actorInfos.items():
+                if not isinstance(info, GeometryActor):
+                    continue
+                opacity = info.properties().opacity
+                self._fadedOpacities[gId] = opacity
+                info.setOpacity(min(float(opacity if opacity is not None
+                                          else 1.0), SEED_PLACING_OPACITY))
+        else:
+            if self._fadedOpacities is None:
+                return
+            for gId, opacity in self._fadedOpacities.items():
+                info = self._actorInfos.get(gId)
+                if info is not None:
+                    info.setOpacity(opacity)
+            self._fadedOpacities = None
+            self._seedFade = SEED_PLACING_OPACITY
+        refreshTransparency = getattr(
+            self._displayControl, 'refreshTransparency', None)
+        if refreshTransparency is not None:
+            refreshTransparency()
+        self._displayControl.refreshView()
+
+    def geometryFaded(self) -> bool:
+        return self._fadedOpacities is not None
 
     def _assignPalettes(self):
         """Give each geometry surface its own colour.
@@ -294,6 +741,16 @@ class GeometryManager(ActorManager):
         # the viewport overlay picked up while they were being added one at a
         # time are a step behind. Say so once, at the end.
         self._displayControl.partsChanged.emit()
+
+    def nextPaletteSlot(self) -> int:
+        """The palette slot the next surface written to the case will take.
+
+        DP-819. Slots go out in id order and a new row always gets a larger
+        id, so the next surface takes the slot after every surface on screen.
+        The split preview starts its colours here to match.
+        """
+        return sum(1 for info in self._actorInfos.values()
+                   if isinstance(info, GeometryActor))
 
     def addGeometry(self, gId, geometry, volume):
         self._add(gId, geometry, volume)
@@ -391,7 +848,10 @@ class GeometryManager(ActorManager):
             if actor_id in self._actorInfos:
                 self._actorInfos[actor_id].setVisible(True)
         for actor_id, actor_info in self._actorInfos.items():
-            actor_info.setVisible(actor_id not in hidden)
+            actor_info.setVisible(
+                actor_id not in hidden
+                and (self._regionMarkersShown
+                     or not isinstance(actor_info, RegionMarkerActor)))
             actor_info.setHighlightRole(roles.get(actor_id))
         self._selectionHiddenActors = hidden
         self._displayControl.refreshView()

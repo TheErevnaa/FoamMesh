@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject
 from foammesh.rendering.actor_info import RegionMarkerActor
 from foammesh.support.mesh import Bounds
 from foammesh.app import app
+from foammesh.view.theming.patch_palette import slot_order
 
 
 def _union(boundsList) -> Optional[Bounds]:
@@ -123,7 +124,8 @@ class ActorManager(QObject):
         ``keys`` narrows the assignment to a named subset, which is how zones
         get their own palette without competing with the patches for slots.
         """
-        selected = sorted(
+        # DP-819. In id order, not text order: as text `10` came before `2`.
+        selected = slot_order(
             key for key, info in self._actorInfos.items()
             if isinstance(info, types) and (keys is None or key in keys))
         for index, key in enumerate(selected):

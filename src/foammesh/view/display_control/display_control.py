@@ -324,6 +324,10 @@ class DisplayControl(QObject):
     def refreshView(self):
         self._view.refresh()
 
+    def view(self) -> RenderingWidget:
+        """The viewport, for a handle that takes its own mouse events."""
+        return self._view
+
     def addOverlay(self, actor):
         """Add a transient viewport actor without exposing it in Display Control."""
         self._view.addActor(actor)
@@ -722,6 +726,14 @@ class DisplayControl(QObject):
     def _visibilityChanged(self):
         self.visibilityChanged.emit(*self.visibilitySummary())
         self._view.refresh()
+
+    def refreshTransparency(self):
+        """Re-decide depth peeling after a caller changed an actor's opacity.
+
+        DP-818. Fading the geometry while a region seed is placed sets the
+        same per-actor opacity this control does, and needs the same answer.
+        """
+        self._updateTransparency()
 
     def _updateTransparency(self):
         """Turn depth peeling on exactly while something translucent is drawn.

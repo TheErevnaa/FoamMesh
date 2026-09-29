@@ -50,6 +50,17 @@ class OperationSpec:
     artifact_event: str = Event.ARTIFACT_MESH_CHANGED
     invalidated_outputs: tuple[str, ...] = ()
     cleanup_argv: tuple[str, ...] = ()
+    #: DP-817. Whether a successful run is expected to change a mesh, and
+    #: which one. DP-113 compares ``constant/polyMesh`` before and after, which
+    #: is only the mesh a serial meshing stage writes: ``surfaceFeatures``
+    #: writes edge files and no mesh at all, and a parallel stage writes the
+    #: processor meshes and leaves the case root for ``reconstructPar``. Both
+    #: were warned about on every run, and the warning set the stage's task to
+    #: WARNING. ``mesh_change_probes`` names the mesh directories the run
+    #: writes (empty means ``constant/polyMesh``); ``expects_mesh_change``
+    #: turns the comparison off for a run that writes no mesh.
+    expects_mesh_change: bool = True
+    mesh_change_probes: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,6 +135,8 @@ class OperationExecutor:
             log_path = session.storage_path / 'logs' / f'{safe_name}-{uuid4().hex[:12]}.log'
 
         before = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
+        probed_before = (await self._probe_fingerprint(spec.mesh_change_probes)
+                         if spec.mutation and spec.mesh_change_probes else None)
         recovery_point = await self._prepare_recovery(session, spec)
         session.state.bus.publish(
             Event.OPERATION_STARTED, operation=spec.operation,
@@ -203,8 +216,14 @@ class OperationExecutor:
         self.jobs.record_result(job)
 
         after = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
+        changed_before, changed_after = before, after
+        if spec.mesh_change_probes:
+            changed_before = probed_before
+            changed_after = await self._probe_fingerprint(spec.mesh_change_probes)
         if (job.status is JobStatus.DONE and spec.mutation
-                and before is not None and before == after):
+                and spec.expects_mesh_change
+                and changed_before is not None
+                and changed_before == changed_after):
             # DP-113. MEASURED on `two_solid_block`: castellation, snap and
             # layers each reported 91,562 cells, 31,920 boundary faces and
             # 129,402 points, and the outline ticked all three. The only mesh
@@ -267,6 +286,23 @@ class OperationExecutor:
             return value.digest
         except (OSError, ValueError):
             return None
+
+    @staticmethod
+    async def _probe_fingerprint(meshes) -> str | None:
+        """One digest over several mesh directories, or ``None`` if any is
+        missing or unreadable -- an unknown fingerprint claims nothing."""
+        digests = []
+        for mesh in meshes:
+            mesh = Path(mesh)
+            if not mesh.is_dir():
+                return None
+            try:
+                value = await OperationExecutor._to_thread(
+                    fingerprint_poly_mesh, mesh)
+            except (OSError, ValueError):
+                return None
+            digests.append(f'{mesh.as_posix()}={value.digest}')
+        return '|'.join(digests) if digests else None
 
     @staticmethod
     async def _to_thread(function, /, *args, **kwargs):

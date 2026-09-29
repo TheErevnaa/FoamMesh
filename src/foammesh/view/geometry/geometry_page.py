@@ -1000,8 +1000,12 @@ class GeometryPage(StepPage):
                 return
         if surfaceFiles:
             if splitAngle is not None:
+                # DP-819. The pieces take palette slots after every surface
+                # already in the case (and any CAD faces this import writes
+                # first), so the preview starts its colours there too.
                 splitDialog = SplitDialog(
-                    self._widget, surfaceFiles, splitAngle)
+                    self._widget, surfaceFiles, splitAngle,
+                    firstSlot=self._nextPaletteSlot(volumes, surfaces))
                 try:
                     await splitDialog.show()
                 except asyncio.exceptions.CancelledError:
@@ -1189,6 +1193,14 @@ class GeometryPage(StepPage):
             volumes.extend(fileVolumes)
             surfaces.extend(fileSurfaces)
         return volumes, surfaces
+
+    def _nextPaletteSlot(self, volumes, surfaces) -> int:
+        """The slot the first piece of a split will take in the main window."""
+        try:
+            onScreen = int(self._geometryManager.nextPaletteSlot())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            onScreen = 0
+        return onScreen + sum(len(volume) for volume in volumes) + len(surfaces)
 
     async def _splitThroughStore(self, files, unit, angle, minAreaFraction):
         """Persist each surface, cut it in the artifact store, load the pieces.

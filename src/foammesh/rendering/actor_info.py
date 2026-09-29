@@ -21,6 +21,7 @@ from foammesh.support.mesh import Bounds
 from foammesh.support.colormap import qualityBandLut, sequentialRedLut
 from foammesh.app import app
 from foammesh.view.theming.tokens import PALETTE_FAMILIES, PATCH_TOKENS
+from foammesh.view.theming.patch_palette import palette_colours, slot_colour
 from foammesh.view.theming.vtk_theme import rgb
 
 
@@ -47,6 +48,20 @@ BASE_SPECULAR_POWER = 30
 #: sets opacity, colour and width for every actor (see `setMeshLineStyle`).
 EDGE_OPACITY = 0.6
 HIGHLIGHT_EDGE_OPACITY = 0.45
+
+
+def applySurfaceMaterial(prop) -> None:
+    """Light a surface the way the main viewport lights every part.
+
+    DP-819. The split-by-angle preview kept VTK's defaults -- diffuse 1, no
+    ambient, no specular -- so a patch drawn there in the very colour it
+    wears in the viewport still shaded to a different tone.
+    """
+    prop.SetInterpolationToPhong()
+    prop.SetDiffuse(BASE_DIFFUSE)
+    prop.SetAmbient(BASE_AMBIENT)
+    prop.SetSpecular(BASE_SPECULAR)
+    prop.SetSpecularPower(BASE_SPECULAR_POWER)
 
 
 @dataclass(frozen=True)
@@ -284,11 +299,7 @@ class ActorInfo(QObject):
         self._actor.SetMapper(self._mapper)
         self._actor.SetObjectName(self._id)
         prop = self._actor.GetProperty()
-        prop.SetInterpolationToPhong()
-        prop.SetDiffuse(BASE_DIFFUSE)
-        prop.SetAmbient(BASE_AMBIENT)
-        prop.SetSpecular(BASE_SPECULAR)
-        prop.SetSpecularPower(BASE_SPECULAR_POWER)
+        applySurfaceMaterial(prop)
 
         # The outline follows the same pipeline output as the surface, so a
         # clip, a slice or a quality threshold reshapes both together.
@@ -647,8 +658,8 @@ class ActorInfo(QObject):
         self._surfaceColor = tokens.value('viewport.surface')
         self._silhouetteColor = tokens.value('viewport.silhouette')
         self._paletteColors = {
-            family: tuple(tokens.value(name) for name in names)
-            for family, names in PALETTE_FAMILIES.items()
+            family: palette_colours(tokens, family)
+            for family in PALETTE_FAMILIES
         }
         self._applySurfaceColor()
         if self._properties.highlighted:
@@ -662,9 +673,8 @@ class ActorInfo(QObject):
         """The themed colour this actor should wear when it has not been set."""
         families = getattr(self, '_paletteColors', None) or {}
         colors = families.get(getattr(self, '_paletteFamily', 'patch'), ())
-        if self._paletteIndex is None or not colors:
-            return self._surfaceColor
-        return colors[self._paletteIndex % len(colors)]
+        # DP-819. The split preview reads the same slot the same way.
+        return slot_colour(colors, self._paletteIndex) or self._surfaceColor
 
     def _currentSurfaceColor(self) -> QColor:
         """The colour this actor wears when nothing is highlighting it."""

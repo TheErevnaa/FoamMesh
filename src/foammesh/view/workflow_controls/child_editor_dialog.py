@@ -21,8 +21,8 @@ import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QScrollArea,
-    QVBoxLayout, QWidget,
+    QBoxLayout, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from foammesh.core.gmsh import fields as _gmsh_fields
@@ -285,6 +285,11 @@ class ChildEditorDialog(QDialog):
     The editors belong to the panel and are only *shown* here: the panel reads
     their values after the dialog closes, so a headless caller can set them and
     commit without a dialog ever existing.
+
+    Plan 36 RP2. Modal is the default and every panel but one keeps it. A
+    panel whose row is placed in the viewport shows the same form docked in
+    its own column (`showDocked`) or as a tool window (`showFloating`), so
+    the viewport stays live while the form is open.
     """
 
     def __init__(self, title: str, editors: dict, parent=None,
@@ -299,6 +304,8 @@ class ChildEditorDialog(QDialog):
         self._annotations = dict(annotations or {})
         self._form = None
         self._rowKeys: list = []
+        #: DP-922. The x/y/z row of each vector, stacked when docked.
+        self._vectorRows: list = []
 
         outer = QVBoxLayout(self)
         form_host = QWidget(self)
@@ -360,6 +367,47 @@ class ChildEditorDialog(QDialog):
         outer.addWidget(self.buttons)
 
         self._connectRelevance()
+
+    # -- Plan 36 RP2: shown without blocking the viewport ------------------ #
+
+    def showDocked(self, host) -> None:
+        """Show the form inside *host*, a widget with a layout, not modal.
+
+        DP-922 (Plan 36 RP12 live pass). Docked, the form is as narrow as the
+        settings column it sits in: each vector's X, Y and Z go one under
+        the other, so three number boxes side by side no longer make the
+        form -- and the column -- wider than the window gives it.
+        """
+        self.setModal(False)
+        self.setCompact(True)
+        if self.isWindow() or self.parent() is not host:
+            self.setParent(host, Qt.WindowType.Widget)
+            host.layout().addWidget(self)
+        host.show()
+        self.show()
+
+    def showFloating(self, owner) -> None:
+        """Show the form as a tool window over *owner*, not modal."""
+        self.setModal(False)
+        self.setCompact(False)
+        if not self.isWindow() or self.parent() is not owner:
+            self.setParent(owner, Qt.WindowType.Tool)
+        self.show()
+        self.raise_()
+
+    def isDocked(self) -> bool:
+        return not self.isWindow()
+
+    def setCompact(self, compact: bool) -> None:
+        """DP-922. Stack each vector's components (docked) or line them up."""
+        direction = (QBoxLayout.Direction.TopToBottom if compact
+                     else QBoxLayout.Direction.LeftToRight)
+        for row in self._vectorRows:
+            row.setDirection(direction)
+        self._compact = bool(compact)
+
+    def isCompact(self) -> bool:
+        return bool(getattr(self, '_compact', False))
 
     # -- show only the fields the chosen kind actually has ------------------ #
 
@@ -458,10 +506,16 @@ class ChildEditorDialog(QDialog):
         row = QHBoxLayout(host)
         row.setContentsMargins(0, 0, 0, 0)
         unit = ''
+        pair = None
         for key in keys:
             editor = self._editors[key]
             axis = _COMPONENT.match(str(key)).group('axis')
-            caption = QLabel(axis.upper(), host)
+            # DP-922. Each component is a caption-and-box pair of its own, so
+            # a docked form can stack the pairs (`setCompact`).
+            pair = QWidget(host)
+            pairRow = QHBoxLayout(pair)
+            pairRow.setContentsMargins(0, 0, 0, 0)
+            caption = QLabel(axis.upper(), pair)
             caption.setBuddy(editor.editor)
             # The component label is the only thing naming this box, so it is
             # what a screen reader must read out with the quantity.
@@ -469,9 +523,11 @@ class ChildEditorDialog(QDialog):
                 str(getattr(editor.descriptor, 'title', '') or '').strip()
                 or f'{humanise(_COMPONENT.match(str(key)).group("base"))} '
                    f'{axis.upper()}')
-            row.addWidget(caption)
-            row.addWidget(editor.editor, 1)
+            pairRow.addWidget(caption)
+            pairRow.addWidget(editor.editor, 1)
+            row.addWidget(pair, 1)
             unit = unit or (editor.descriptor.unit or '')
-        if unit:
-            row.addWidget(QLabel(unit, host))
+        if unit and pair is not None:
+            pair.layout().addWidget(QLabel(unit, pair))
+        self._vectorRows.append(row)
         return host

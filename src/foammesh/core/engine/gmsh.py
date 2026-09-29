@@ -378,6 +378,9 @@ class GmshMeshingEngine:
     mixes_cad_and_surfaces = False
     #: DP-641. Gmsh has no non-conformal coupling to build an NCC pair with.
     builds_non_conformal_interfaces = False
+    #: Plan 36 RP11. Each solid is meshed as its own volume, so a region is a
+    #: solid: detection answers from the solids and accepting types them.
+    regions_are_solids = True
 
     def __init__(self, *, profile=None, runtime_probe=None):
         self._profile = profile

@@ -127,6 +127,12 @@ class MeshingEngine(Protocol):
     #: (DP-641), so the Geometry page disables the choice for it.
     builds_non_conformal_interfaces: bool = True
 
+    #: Plan 36 RP11. Whether this engine's regions are the solids of the
+    #: geometry (Gmsh meshes each solid as its own volume) rather than spaces
+    #: a seed point picks out of the domain (snappy). It decides what fluid-
+    #: region detection answers from and what accepting a candidate writes.
+    regions_are_solids: bool = False
+
     #: What one whole-mesh run of this engine performs, in order.
     ATOMIC_RUN_TASKS: tuple = ()
 

@@ -52,6 +52,9 @@ class CadBody:
     name: str = ''
     faces: list[CadFace] = field(default_factory=list)
     color: str = ''
+    #: DP-900. True for a closed solid, False for faces or an open shell
+    #: that bound nothing, None where OCCT was not asked.
+    solid: bool | None = None
 
     @property
     def n_faces(self) -> int:

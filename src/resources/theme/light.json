@@ -14,6 +14,8 @@
     "viewport.patch.1": "#6a9fd4", "viewport.patch.2": "#e0a458", "viewport.patch.3": "#78b489",
     "viewport.patch.4": "#cc8592", "viewport.patch.5": "#9d8fc7", "viewport.patch.6": "#7fb3bd",
     "viewport.zone.1": "#7d6b5d", "viewport.zone.2": "#5d7d6b",
-    "viewport.zone.3": "#6b5d7d", "viewport.zone.4": "#7d5d5d"
+    "viewport.zone.3": "#6b5d7d", "viewport.zone.4": "#7d5d5d",
+    "viewport.zone.5": "#5d6b7d", "viewport.zone.6": "#5d7d7d",
+    "viewport.zone.7": "#7d7d5d", "viewport.zone.8": "#7d5d73"
   }
 }
