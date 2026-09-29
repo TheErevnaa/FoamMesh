@@ -290,6 +290,9 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as error:
         print(f'mesh_worker: cannot read {args_path}: {error}', file=sys.stderr)
         return EXIT_FAILED
+    if not isinstance(args, dict) or not args.get('result_path'):
+        print(f'mesh_worker: {args_path} names no result_path', file=sys.stderr)
+        return EXIT_FAILED
     if args.get('wait_for_go') and not _wait_for_go():
         return EXIT_PARENT_GONE
     result_path = Path(args['result_path'])

@@ -27,7 +27,7 @@ def _subprocess_role(arguments):
         return None
     if arguments[0] == '--crash-helper':
         from foammesh.support import crash_helper
-        return crash_helper.main(arguments)
+        return _run_role(lambda: crash_helper.main(arguments), 1)
     if arguments[0] == '--worker':
         try:
             from foammesh.workers import mesh_worker
@@ -36,8 +36,28 @@ def _subprocess_role(arguments):
                 print('FoamMesh --worker: this build has no mesh worker '
                       '(foammesh.workers.mesh_worker)', file=sys.stderr)
             return 2
-        return mesh_worker.main(arguments[1:])
+        return _run_role(lambda: mesh_worker.main(arguments[1:]), 2)
     return None
+
+
+def _run_role(body, failed_code):
+    """Run a subprocess role; an error it does not catch becomes an exit code.
+
+    The packaged build has no console: an exception escaping to the
+    bootloader opens a modal "Unhandled exception in script" dialog, and the
+    helper or worker then waits for a click instead of exiting -- a hang its
+    parent can only end by timing out.
+    """
+    try:
+        return body()
+    except SystemExit:
+        raise
+    except BaseException:                                   # noqa: BLE001
+        if sys.stderr is not None:
+            import traceback
+
+            traceback.print_exc()
+        return failed_code
 
 
 if __name__ == '__main__':
