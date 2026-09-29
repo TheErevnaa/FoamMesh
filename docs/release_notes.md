@@ -1,5 +1,57 @@
 # FoamMesh Release Notes
 
+## Unreleased — region placement
+
+- **Detect the fluid regions.** Domain & regions asks how many fluid regions
+  there are and whether the flow is external, then finds every space the
+  surfaces close off. Each space is listed with its volume, its distance to the
+  nearest wall and a colour; tick the ones to keep, rename or retype them, and
+  Accept all applies them in one undo step. When the count asked for is not
+  what the geometry holds, the panel says so and offers the count it found, or
+  the outside as external flow. A thin closed space is listed and flagged, not
+  dropped.
+- **The domain box is drawn.** The snappy domain box is resolved once from the
+  base grid and drawn on Domain & regions, so detection and the mesh work on
+  the same box. A domain made of several blocks (an L shape) is judged block by
+  block.
+- **A region is a volume you can see.** While a region is edited, the space its
+  seed will mesh is drawn as a translucent volume in the region's colour, and
+  each region is labelled in the view with its name and volume.
+- **Drag the seed.** The regions editor no longer blocks the viewport. A
+  region's seed is a handle: drag an axis arrow, a plane or the centre;
+  Alt+Arrow nudges it one step (Shift for ten), Ctrl+Z undoes a move, and the
+  readout says whether the seed is inside the space it names. The seed casts
+  shadows on the walls behind it and can be placed on a section plane. A
+  snapped or detected seed never lands on a mesh face.
+- **Two seeds in one space are caught.** A launch refuses two regions whose
+  seeds sit in the same space when a finer check confirms it; a case the
+  detection cannot settle is a warning, not a block.
+- **On Gmsh, the solids are the regions.** A CAD model's solids are drawn in
+  their region colours on the Volume controls step and listed with their type
+  and volume; each included solid is meshed as its own cell zone named after
+  its region. A two-solid STEP (a pipe inside a jacket) meshes as a
+  conjugate-heat-transfer case with no seeds to place. With the far-field box
+  on, the solids are shown as the obstacle the box cuts out.
+- **Fixes.**
+  - A single STL whose regions share faces (a pipe inside a jacket) is read as
+    those regions instead of being refused as not closed, on snappy; Gmsh
+    names the remedy.
+  - Concave cells alone no longer fail a snappy mesh; they are reported as an
+    advisory note and the mesh is runnable.
+  - Gmsh boundary layers on all eligible walls include the faces a STEP import
+    left unnamed; an unnamed solid region is named `solid_N`.
+  - A whole-pipeline run passes the same seed check as a single-stage run.
+  - External flow round a closed body no longer reports a false count
+    mismatch, and a base grid flush with a round body no longer splits the
+    outside into pockets.
+  - The regions table, the detection review and the docked region editor fit
+    the settings column under the theme.
+- **Known limitations.**
+  - Overriding a region clash is available from the command line only
+    (`allow_region_clash`).
+  - Detection works on a voxel field and is approximate in very narrow
+    passages; a region that runs through one may be proposed as two.
+
 ## 1.1.0 — 2026-09-26
 
 - **Viewport.** A region picker and a selectable parts list show one region or
