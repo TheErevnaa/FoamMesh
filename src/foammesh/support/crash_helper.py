@@ -97,7 +97,8 @@ def default_dump_directory() -> Path:
 def describe_exit_code(code: int) -> str:
     code &= 0xFFFFFFFF
     name = EXIT_CODES.get(code)
-    text = f'0x{code:08X}' if code > 0xFFFF else str(code)
+    # A hex prefix, not a multiplication: kept apart from the digits (DP-179).
+    text = '0x' + format(code, '08X') if code > 0xFFFF else str(code)
     return f'{text} ({name})' if name else text
 
 

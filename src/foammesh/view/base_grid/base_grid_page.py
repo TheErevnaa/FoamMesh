@@ -12,6 +12,7 @@ from widgets.async_message_box import AsyncMessageBox
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.app import app
+from foammesh.view.outside_task import modal
 from foammesh.db.configurations_schema import (
     BaseGridSizingMode, BoundaryPatchType, GeometryType, Shape, CFDType,
     schema)
@@ -124,20 +125,38 @@ class BaseGridPage(StepPage):
         ui.formLayout.addRow(self.tr('Standoff of largest span'),
                              unit_cell(self._standoff, 'fraction'))
 
+        # Plan 37 UF12. A ratio (largest cell over smallest, never below 1)
+        # and the side the small cells go on, per axis. The single signed
+        # number this replaces asked the user for a reciprocal to move them.
         self._grading = {}
+        self._gradingFine = {}
         for axis in 'xyz':
             box = CompactDoubleSpinBox(ui.groupBox_2)
             box.setObjectName(f'baseGridGrading{axis.upper()}')
             box.setDecimals(4)
-            box.setRange(1e-4, 1e4)
+            box.setRange(1.0, 1e4)
             box.setValue(1.0)
             box.setToolTip(self.tr(
-                'simpleGrading ratio along this axis: the last cell divided by '
-                'the first. 1 is a uniform block.'))
+                'The largest cell divided by the smallest along this axis, '
+                'never below 1. 1 is a uniform block.'))
             self._grading[axis] = box
             ui.formLayout.addRow(
-                self.tr('Grading {0}').format(axis.upper()),
+                self.tr('Grading ratio {0}').format(axis.upper()),
                 unit_cell(box, 'ratio'))
+            fine = QComboBox(ui.groupBox_2)
+            fine.setObjectName(f'baseGridGradingFine{axis.upper()}')
+            for value, label in (('start', '− side (start)'),
+                                 ('end', '+ side (end)'),
+                                 ('centre', 'Centre'),
+                                 ('both_edges', 'Both edges')):
+                fine.addItem(self.tr(label), value)
+            fine.setToolTip(self.tr(
+                'Where the small cells go along this axis. Centre and Both '
+                'edges grade each half by the ratio and need at least four '
+                'cells.'))
+            self._gradingFine[axis] = fine
+            ui.formLayout.addRow(
+                self.tr('Fine cells at {0}').format(axis.upper()), fine)
 
         self._boundaryTypes = {}
         # D3. Six near-identical rows -- ``xMin type`` .. ``zMax type``, all
@@ -405,6 +424,8 @@ class BaseGridPage(StepPage):
         }
         for axis, box in self._grading.items():
             patch[f'meshing.base_grid.grading.{axis}'] = box.value()
+        for axis, combo in self._gradingFine.items():
+            patch[f'meshing.base_grid.grading_fine.{axis}'] =                 combo.currentData()
         for name, combo in self._boundaryTypes.items():
             patch[f'meshing.base_grid.boundary_types.{_faceField(name)}'] = \
                 combo.currentData()
@@ -413,7 +434,8 @@ class BaseGridPage(StepPage):
             return True
         except FacadeError as error:
             message = error.details.get('error', str(error))
-            QMessageBox.warning(self._widget, self.tr("Input error"), message)
+            await modal(QMessageBox.warning,
+                        self._widget, self.tr("Input error"), message)
             return False
 
     def _outputPath(self):
@@ -588,6 +610,11 @@ class BaseGridPage(StepPage):
         for axis, box in self._grading.items():
             box.setValue(float(
                 client.field_value(f'meshing.base_grid.grading.{axis}')))
+        for axis, combo in self._gradingFine.items():
+            stored = client.field_value(
+                f'meshing.base_grid.grading_fine.{axis}')
+            combo.setCurrentIndex(max(0, combo.findData(
+                str(getattr(stored, 'value', stored) or 'start'))))
         for name, combo in self._boundaryTypes.items():
             stored = client.field_value(
                 f'meshing.base_grid.boundary_types.{_faceField(name)}')

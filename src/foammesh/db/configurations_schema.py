@@ -173,6 +173,26 @@ class GmshSealedCavityPolicy(Enum):
     REFUSE = 'refuse'
 
 
+class FarfieldShape(Enum):
+    """The closed primitive a farfield is (Plan 37 UF13, section 4.4).
+
+    One authored specification, consumed by every engine adapter
+    (``core/mesh/farfield_spec.py``). ``box`` is the padded box every project
+    held before UF13, so it is the default an older document migrates to.
+    """
+    BOX = 'box'
+    SPHERE = 'sphere'
+    CYLINDER = 'cylinder'
+
+
+class FarfieldCentreMode(Enum):
+    """Where a farfield is centred: on the model, or where the user says."""
+    #: The centre of the imported model's bounding box, re-read every run.
+    AUTO = 'auto'
+    #: The ``centre`` vector, in metres.
+    EXPLICIT = 'explicit'
+
+
 class GmshRecombinationAlgorithm(Enum):
     """How Gmsh turns the surface triangles into quadrangles.
 
@@ -432,6 +452,30 @@ class BaseGridSizingMode(Enum):
     TARGET_SIZE = 'target_size'
 
 
+class GradingFine(Enum):
+    """Plan 37 UF12: which side of one direction the small cells go on.
+
+    blockMesh states a grading as last cell over first, so ``4`` puts the
+    small cells at the *start* of the direction -- MEASURED on OpenFOAM 13
+    (first width 0.0565, last 0.226 on a unit edge of eight cells). The ratio
+    is always the largest cell over the smallest and this names the side, so
+    nobody has to type a reciprocal to move the small cells.
+    """
+    START = 'start'
+    END = 'end'
+    CENTRE = 'centre'
+    BOTH_EDGES = 'both_edges'
+
+
+class BlockGradingFine(Enum):
+    """`GradingFine` for an authored block, plus the typed segment text."""
+    START = 'start'
+    END = 'end'
+    CENTRE = 'centre'
+    BOTH_EDGES = 'both_edges'
+    CUSTOM_PROFILE = 'custom_profile'
+
+
 class RefinementRegionMode(Enum):
     """The ``mode`` of one ``refinementRegions`` entry in Foundation 13.
 
@@ -649,6 +693,18 @@ class OptionalToggle(Enum):
     OFF = 'off'
 
 
+class FeatureSubsetBox(Enum):
+    """Which side of a box ``surfaceFeatures`` keeps feature edges on.
+
+    Plan 37 UF19. v13 reads ``insideBox`` and ``outsideBox`` as an ``if`` /
+    ``else if`` (surfaceFeatures.C:255-274), so a dictionary with both keeps
+    the inside box and silently ignores the other. One choice, one key.
+    """
+    NONE = 'none'
+    INSIDE_BOX = 'insideBox'
+    OUTSIDE_BOX = 'outsideBox'
+
+
 class BoundaryPatchType(Enum):
     """The ``type`` of a background-mesh face in ``blockMeshDict``."""
     PATCH = 'patch'
@@ -688,16 +744,26 @@ backgroundBlock = {
     'numCellsX': IntType().setLowLimit(1).setDefault(10),
     'numCellsY': IntType().setLowLimit(1).setDefault(10),
     'numCellsZ': IntType().setLowLimit(1).setDefault(10),
+    # Plan 37 UF12 (DP-1033). blockMesh states a ratio as last cell over
+    # first, so a ratio above one already packs the cells at the *start*; the
+    # retired "toward start" switch wrote the reciprocal and put them at the
+    # end. A side is chosen now, with a ratio that is always largest over
+    # smallest. Start and End follow the block's own vertex order. Custom
+    # profile hands the direction to the typed text; any other choice makes
+    # that text a display of the preset, regenerated from it. Each direction
+    # is its side, its ratio and its text, in the order the editor shows.
+    'gradingXFine': EnumType(BlockGradingFine).setDefault(
+        BlockGradingFine.CUSTOM_PROFILE),
+    'gradingXRatio': FloatType().setLowLimit(1).setDefault(1),
     'gradingX': TextType().setDefault('1'),
+    'gradingYFine': EnumType(BlockGradingFine).setDefault(
+        BlockGradingFine.CUSTOM_PROFILE),
+    'gradingYRatio': FloatType().setLowLimit(1).setDefault(1),
     'gradingY': TextType().setDefault('1'),
+    'gradingZFine': EnumType(BlockGradingFine).setDefault(
+        BlockGradingFine.CUSTOM_PROFILE),
+    'gradingZRatio': FloatType().setLowLimit(1).setDefault(1),
     'gradingZ': TextType().setDefault('1'),
-    # blockMesh states an expansion ratio as last cell over first, so packing
-    # cells at the *start* of an axis means typing a reciprocal. That is where
-    # a graded boundary layer ends up on the wrong wall, so the direction is a
-    # control rather than an arithmetic exercise.
-    'gradingXTowardStart': BoolType(False),
-    'gradingYTowardStart': BoolType(False),
-    'gradingZTowardStart': BoolType(False),
     'zone': TextType().setOptional(),
 }
 
@@ -782,6 +848,17 @@ region = {
     'name': TextType(),
     'type': EnumType(RegionType),
     'point': VectorComposite().schema()
+}
+
+#: Plan 37 UF16. One ``outsidePoints`` entry: a point, in metres, whose
+#: connected space snappyHexMesh removes at castellation. Foundation 13
+#: (``refinementParameters.C``) reads the list with ``dimLength`` and keeps a
+#: space that also holds a region seed -- the seed wins -- so an exclude
+#: point is a statement about a space, checked before the run rather than
+#: left for OpenFOAM to ignore (``core/mesh/exclude_points.py``).
+excludePoint = {
+    'name': TextType(),
+    'point': VectorComposite().schema(),
 }
 
 surfaceRefinement = {
@@ -1411,6 +1488,25 @@ schema = {
             'sealedCavities': EnumType(
                 GmshSealedCavityPolicy).setDefault(
                     GmshSealedCavityPolicy.DISCARD),
+            # Plan 37 UF13. The shared farfield specification: this section
+            # is its one store, for every engine (see
+            # `core/mesh/farfield_spec.py`). Every leaf below defaults to
+            # the padded box above, so a project saved before UF13 opens as
+            # the box it always meshed, with no version bump. Lengths are
+            # metres; `padding` stays the box's size.
+            'shape': EnumType(FarfieldShape).setDefault(FarfieldShape.BOX),
+            'centreMode': EnumType(FarfieldCentreMode).setDefault(
+                FarfieldCentreMode.AUTO),
+            'centre': VectorComposite().setDefault(0.0, 0.0, 0.0).schema(),
+            # Sphere and cylinder. Containment is checked against the model
+            # before any boolean, so a radius too small is refused with the
+            # radius that would fit, never clipped.
+            'radius': FloatType().setLowLimit(0, False).setDefault(1.0),
+            # Cylinder only: cap to cap, centred on `centre`.
+            'length': FloatType().setLowLimit(0, False).setDefault(2.0),
+            # Cylinder only: the direction, normalised when read; zero is
+            # refused. Any direction, not just the coordinate axes.
+            'axis': VectorComposite().setDefault(1.0, 0.0, 0.0).schema(),
         },
         'parallel': {
             # One by default, to match the default volume algorithm. Gmsh's
@@ -1673,12 +1769,25 @@ schema = {
         # derived, so a project that never touches this writes what it wrote.
         'standoff': FloatType().setLowLimit(0).setDefault(0),
         # Per-axis ``simpleGrading``.  One means uniform, which is what the
-        # background block was hard-coded to before these existed.
+        # background block was hard-coded to before these existed. Plan 37
+        # UF12: the ratio is the largest cell over the smallest, so it is
+        # never below one, and ``gradingFine`` says which side the small
+        # cells go on (see `GradingFine`).
         'grading': {
-            'x': FloatType().setLowLimit(0, False).setDefault(1),
-            'y': FloatType().setLowLimit(0, False).setDefault(1),
-            'z': FloatType().setLowLimit(0, False).setDefault(1),
+            'x': FloatType().setLowLimit(1).setDefault(1),
+            'y': FloatType().setLowLimit(1).setDefault(1),
+            'z': FloatType().setLowLimit(1).setDefault(1),
         },
+        'gradingFine': {
+            'x': EnumType(GradingFine).setDefault(GradingFine.START),
+            'y': EnumType(GradingFine).setDefault(GradingFine.START),
+            'z': EnumType(GradingFine).setDefault(GradingFine.START),
+        },
+        # Plan 37 UF12. What the grading migration changed on screen in this
+        # project, said once and cleared when the user dismisses it. Empty
+        # when nothing was changed -- including every project that never
+        # graded anything.
+        'gradingNotice': TextType().setOptional(),
         # The ``type`` given to each face of the background block.  snappy
         # keeps these patches for whatever the geometry does not cover, so a
         # domain that is a wind tunnel wall or a symmetry plane needs to say so
@@ -1763,6 +1872,10 @@ schema = {
         # ``refinementVolumes/<id>/bands`` list has no facade operation, so
         # no workflow page could author it.
         'volumeBands': IntKeyList(featureBand),
+        # Plan 37 UF16. Authored on Domain & regions beside the seeds, but
+        # read at castellation: editing one stales the castellated mesh, not
+        # the background grid. Empty writes nothing and hashes nothing.
+        'excludePoints': IntKeyList(excludePoint),
     },
     'snap': {
         'nSmoothPatch': IntType().setLowLimit(0).setDefault(0),
@@ -1794,6 +1907,12 @@ schema = {
         # keys that used to sit here commented out live in the ``layer``
         # schema above, which is what ThicknessForm reads and writes.
         'layers': IntKeyList(layer),
+        # Plan 37 UF2 (DP-1028). Whether the case has already been given its
+        # "Walls" layer group by the snappy layers page. The page defaults a
+        # group once per case; without a record of that, deleting the last
+        # group left an empty list the next refresh filled again. Not a mesh
+        # input: nothing the writer reads, so writing it stales nothing.
+        'defaulted': BoolType(False),
         'nGrow': IntType().setLowLimit(0).setDefault(0),
         'featureAngle': FloatType().setRange(0, 180).setDefault(60),
         # v13 medialAxisMeshMover defaults this to featureAngle/2; carrying it
@@ -1825,6 +1944,19 @@ schema = {
             OptionalToggle.DEFAULT),
         'additionalReporting': EnumType(OptionalToggle).setDefault(
             OptionalToggle.DEFAULT),
+        # Plan 37 UF15. How far a face merged over one cell's layer faces may
+        # bend. OpenFOAM 13 reads it with ``lookupOrDefault("concaveAngle",
+        # unitDegrees, 90)`` (layerParameters.C:129-131); unset keeps that 90.
+        # This is the addLayersControls key, not the ESI snapControls one of
+        # the same name that the ``snap`` block above rightly lacks.
+        'concaveAngle': FloatType().setRange(0, 180).setOptional()
+        .setDefault(None),
+        # Plan 37 UF15. Whether layer addition merges the faces a cell has on
+        # one patch. Three states because v13 reads three
+        # (layerParameters.C:117-126): absent merges only on patches that are
+        # being given layers, true merges everywhere, false nowhere.
+        'mergeFaces': EnumType(OptionalToggle).setDefault(
+            OptionalToggle.DEFAULT),
         # ``nOuterIter`` is an ESI key; Foundation 13 does not read it, so
         # there is no control for it here.
         'meshShrinker': EnumType(MeshShrinker).setDefault(
@@ -1855,6 +1987,14 @@ schema = {
         'nSmoothScale': IntType().setLowLimit(0).setDefault(4),
         'errorReduction': FloatType().setLowLimit(0, False)
         .setHighLimit(1, False).setDefault(0.75),
+        # Plan 37 UF15, correcting DP-213. OpenFOAM 13 does read this:
+        # ``meshCheck::checkMesh`` (src/meshCheck/checkMesh.C:78-83) looks it
+        # up only when it is present and otherwise skips the check, and
+        # polyMeshCheckQuality.C:1734 aborts the run on a value outside
+        # [0, 1]. Unset, it is not written and the check stays off, which is
+        # what every existing project has.
+        'minFaceFlatness': FloatType().setRange(0, 1).setOptional()
+        .setDefault(None),
         'mergeTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
         # The thresholds snappy falls back to while adding layers, when the
         # strict ones cannot be met.  Only maxNonOrtho has ever been written;
@@ -1878,6 +2018,12 @@ schema = {
             'minFaceWeight': FloatType().setHighLimit(0.5).setOptional()
             .setDefault(None),
             'minVolRatio': FloatType().setHighLimit(1).setOptional()
+            .setDefault(None),
+            # Plan 37 UF15. Unlike every limit above, this one is not
+            # inherited from the strict block: checkMesh.C:78-83 asks
+            # ``dict.found("minFaceFlatness")`` without recursion, so a relaxed
+            # block without its own value runs no flatness check at all.
+            'minFaceFlatness': FloatType().setRange(0, 1).setOptional()
             .setDefault(None),
         }
     },
@@ -1926,6 +2072,17 @@ schema = {
         # so any value but the default aborts the check. Measured: exit 1,
         # "Unknown write type obj".
         'writeSurfaces': BoolType(False),
+        # Plan 37 UF18. The three switches every run has always carried,
+        # now the user's to turn off. Defaults on, so a project that never
+        # touches them runs `-allTopology -allGeometry -writeSets` exactly
+        # as before. MEASURED on v13 (plans/evidence/plan37/
+        # uf18-v13-checkmesh-sets.md): -writeSets writes every failing set
+        # into <instance>/polyMesh/sets and the point sets (unusedPoints,
+        # shortEdges, ...) as points under postProcessing/checkMesh; it
+        # never writes a face surface -- that is -writeSurfaces alone.
+        'allTopology': BoolType(True),
+        'allGeometry': BoolType(True),
+        'writeSets': BoolType(True),
     },
     # Plan 31 (surface_features.rest). Everything v13's ``surfaceFeatures``
     # reads beyond ``surfaces`` and ``includedAngle``, which were the only two
@@ -1942,14 +2099,13 @@ schema = {
     #                      clean closed-manifold sphere, reproduced three
     #                      times. A control that crashes the utility is worse
     #                      than no control.
-    #   subsetFeatures/{insideBox,outsideBox,plane}
-    #                   -- each needs a spatial picker in the viewport; a
-    #                      typed-in bounding box is a trap.
-    #   addFeatures     -- reads an ``extendedFeatureEdgeMesh`` from
-    #                      constant/, which nothing in this product produces.
-    #                      (Note: v13 reads only ``name`` from it. There is no
-    #                      ``flip`` key; that one is ESI's.)
     #   files, baffles  -- name external surfaces this product does not stage.
+    #
+    # Plan 37 UF19 added ``subsetFeatures{insideBox,outsideBox,plane}`` and
+    # ``addFeatures`` (last block below), with the validation that makes a
+    # typed-in box safe: v13 extracts zero edges from an inverted box and
+    # exits 0, so the writer refuses one instead. (v13's addFeatures reads
+    # only ``name``; the ``flip`` key some documentation shows is ESI's.)
     'surfaceFeatures': {
         # L112. Extract from the geometry alone, ignoring the surface's own
         # region boundaries, so a tessellation split into patches does not
@@ -1984,6 +2140,27 @@ schema = {
         # `write_vtk` rather than `write_v_t_k`; the dictionary key the
         # writer emits is v13's own `writeVTK`.
         'writeVtk': BoolType(False),
+        # Plan 37 UF19. subsetFeatures box and plane (surfaceFeatures.C:
+        # 245-321). The box keeps an edge whose MIDPOINT it contains
+        # (surfaceFeatures.C:1503, selectBox); the plane keeps an edge whose
+        # segment CROSSES it (:1523, selectCutEdges). Coordinates are in the
+        # staged surface file's own frame: the utility reads the triSurface
+        # raw, without snappyHexMeshDict's geometry ``scale``. Nothing is
+        # written while ``subsetBox`` is none and ``subsetPlane`` is off, so
+        # the coordinates below are inert until switched on.
+        'subsetBox': EnumType(FeatureSubsetBox).setDefault(
+            FeatureSubsetBox.NONE),
+        'subsetBoxMin': VectorComposite().setDefault(0, 0, 0).schema(),
+        'subsetBoxMax': VectorComposite().setDefault(1, 1, 1).schema(),
+        'subsetPlane': BoolType(False),
+        'subsetPlanePoint': VectorComposite().setDefault(0, 0, 0).schema(),
+        'subsetPlaneNormal': VectorComposite().setDefault(1, 0, 0).schema(),
+        # Plan 37 UF19. addFeatures (surfaceFeatures.C:363-385): an OpenFOAM
+        # ``extendedFeatureEdgeMesh`` file added -- after the subset, so it
+        # is never filtered -- to the first surface's feature set. The writer
+        # copies it into the case under a content-hashed name, so a changed
+        # file is a changed dictionary and a stale extraction.
+        'addFeaturesFile': TextType().setOptional(),
     },
     'snappyAdvanced': {
         # C31-11. ``snappyHexMesh.C:715`` reads ``keepPatches`` off the top
@@ -2164,11 +2341,21 @@ def migrateDocument(document):
         implicit = str(stored) == FeatureSnapType.IMPLICIT.value
         snap.setdefault('implicitFeatureSnap', implicit)
         snap.setdefault('explicitFeatureSnap', not implicit)
+    baseGrid = document.get('baseGrid')
+    if isinstance(baseGrid, dict):
+        _migrateGrading(baseGrid)
     addLayers = document.get('addLayers')
     if isinstance(addLayers, dict) and 'minMedianAxisAngle' in addLayers:
         retired = addLayers.pop('minMedianAxisAngle')
         addLayers.setdefault('minMedialAxisAngle', retired)
     layers = addLayers.get('layers') if isinstance(addLayers, dict) else None
+    if isinstance(addLayers, dict) and 'defaulted' not in addLayers             and isinstance(layers, dict) and layers:
+        # Plan 37 UF2 (DP-1028). A case saved before the flag existed that
+        # already holds a layer group has had its say, whether the page made
+        # the group or the user did: it counts as defaulted, so deleting its
+        # last group does not summon a new one. A case with none is still
+        # offered the default, once.
+        addLayers['defaulted'] = True
     if isinstance(layers, dict):
         # DP-599. A stack value saved at or below zero would refuse to load;
         # it opens as the default instead.
@@ -2186,3 +2373,94 @@ def migrateDocument(document):
                 LayerPolicy.GROW.value if count >= 1
                 else LayerPolicy.FREEZE.value)
     return document
+
+
+def _migrateGrading(baseGrid):
+    """Plan 37 UF12 (DP-1033): a grading saved as a signed ratio, read as a side.
+
+    Every project writes the ``blockMeshDict`` it wrote before; only what the
+    page shows changes, and ``gradingNotice`` says so once.
+
+    * The default block: a ratio of one or above is Start at that ratio (the
+      direction it always wrote); a ratio below one is End at its reciprocal.
+    * An authored block: the ratio it *wrote* -- the reciprocal, where the
+      retired "toward start" switch was on -- is Start above one, End at the
+      reciprocal below one, and Start at one (uniform). The text beside it is
+      rewritten to the token the preset renders, which is the token that was
+      written. A segmented profile stays a Custom profile with its text
+      untouched: the switch never reached one, and is dropped. Text that does
+      not parse stays a Custom profile, for the validator to refuse as before.
+    """
+    from foammesh.openfoam import background_mesh as bm
+
+    notes = []
+    grading = baseGrid.get('grading')
+    if 'gradingFine' not in baseGrid and isinstance(grading, dict):
+        fine = {}
+        for axis in 'xyz':
+            raw = grading.get(axis)
+            try:
+                value = float(str(raw).strip())
+            except (TypeError, ValueError):
+                continue
+            if 0 < value < 1:
+                # Fifteen figures, so the twelve-figure reciprocal the
+                # writer renders from it is the number that was stored.
+                grading[axis] = f'{1.0 / value:.15g}'
+                fine[axis] = GradingFine.END.value
+                notes.append(
+                    f'Grading {axis.upper()} of the background block was '
+                    f'stored as {str(raw).strip()}, a ratio below one: it now '
+                    f'reads ratio {grading[axis]} with Fine cells at End. '
+                    'The small cells are where they were.')
+        if fine:
+            baseGrid['gradingFine'] = {
+                axis: fine.get(axis, GradingFine.START.value) for axis in 'xyz'}
+    blocks = baseGrid.get('blocks')
+    if isinstance(blocks, dict):
+        for key, block in blocks.items():
+            if not isinstance(block, dict):
+                continue
+            label = str(block.get('name') or '').strip() or f'Block {key}'
+            for axis in 'XYZ':
+                flag = block.pop(f'grading{axis}TowardStart', None)
+                if f'grading{axis}Fine' in block:
+                    continue
+                flagged = str(getattr(flag, 'value', flag)).strip().lower() \
+                    in {'true', '1', 'yes'}
+                custom = BlockGradingFine.CUSTOM_PROFILE.value
+                try:
+                    spec = bm.parse_grading(block.get(f'grading{axis}'))
+                except bm.BackgroundMeshError:
+                    block[f'grading{axis}Fine'] = custom
+                    continue
+                if spec.segments:
+                    block[f'grading{axis}Fine'] = custom
+                    if flagged:
+                        notes.append(
+                            f'{label}, {axis}: the "toward start" switch was '
+                            'on a segmented profile, which it never changed. '
+                            'The profile is kept as typed.')
+                    continue
+                written = spec.ratio
+                if written <= 0:
+                    block[f'grading{axis}Fine'] = custom
+                    continue
+                if flagged:
+                    written = 1.0 / written
+                if written < 1:
+                    side, ratio = BlockGradingFine.END.value, 1.0 / written
+                else:
+                    side, ratio = BlockGradingFine.START.value, written
+                block[f'grading{axis}Fine'] = side
+                block[f'grading{axis}Ratio'] = f'{ratio:.12g}'
+                block[f'grading{axis}'] = bm.preset_grading(
+                    side, ratio).render()
+                if flagged and ratio != 1:
+                    notes.append(
+                        f'{label}, {axis}: "toward start" was on, which put '
+                        'the small cells at the end. They are still at the '
+                        'end, and Fine cells at now says End; choose Start '
+                        'to move them.')
+    if notes and not str(baseGrid.get('gradingNotice') or '').strip():
+        baseGrid['gradingNotice'] = ' '.join(notes)

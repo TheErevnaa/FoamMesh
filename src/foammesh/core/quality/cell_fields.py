@@ -262,6 +262,147 @@ def compute_cell_fields(mesh) -> dict[str, np.ndarray]:
     }
 
 
+class _FaceSubset:
+    """The faces ``faces`` of ``mesh`` as a compact mesh for
+    :func:`_face_geometry` and :func:`_skewness` (local face ids)."""
+
+    def __init__(self, mesh, faces: np.ndarray):
+        offsets = np.asarray(mesh.face_offsets, dtype=np.int64)
+        sizes = (offsets[faces + 1] - offsets[faces]).astype(np.int64)
+        local = np.zeros(faces.size + 1, dtype=np.int64)
+        np.cumsum(sizes, out=local[1:])
+        start = np.repeat(offsets[faces] - local[:-1], sizes)
+        start += np.arange(int(local[-1]), dtype=np.int64)
+        self.points = mesh.points
+        self.face_vertices = np.asarray(mesh.face_vertices)[start]
+        self.face_offsets = local
+
+
+def subset_cells(mesh, cells) -> np.ndarray:
+    """``cells`` and every cell sharing a face with one of them (sorted):
+    what :func:`compute_cell_fields` computes the geometry of for them."""
+    owner, neighbour = mesh.owner, mesh.neighbour
+    internal = int(neighbour.size)
+    kept = np.zeros(mesh.cell_count, dtype=bool)
+    kept[np.asarray(cells, dtype=np.int64)] = True
+    touching = kept[owner[:internal]] | kept[neighbour]
+    grown = kept.copy()
+    grown[owner[:internal][touching]] = True
+    grown[neighbour[touching]] = True
+    return np.flatnonzero(grown)
+
+
+def compute_cell_fields_for(mesh, cells) -> dict[str, np.ndarray]:
+    """The four arrays for ``cells`` only, as full-length arrays (zero for
+    every other cell). The values for ``cells`` equal
+    :func:`compute_cell_fields`'s: their geometry and their face neighbours'
+    is computed exactly as there, from only the faces of those cells, so
+    the memory follows the cells asked for rather than the whole mesh."""
+    cell_count = mesh.cell_count
+    out = {name: np.zeros(cell_count, dtype=np.float64)
+           for name in FIELD_NAMES}
+    cells = np.unique(np.asarray(cells, dtype=np.int64))
+    if not cell_count or not cells.size:
+        return out
+    owner = np.asarray(mesh.owner, dtype=np.int64)
+    neighbour = np.asarray(mesh.neighbour, dtype=np.int64)
+    internal = int(neighbour.size)
+
+    # the kept cells, their face neighbours, and every face of either
+    grown = subset_cells(mesh, cells)
+    inside = np.zeros(cell_count, dtype=bool)
+    inside[grown] = True
+    touching = inside[owner]
+    touching[:internal] |= inside[neighbour]
+    faces = np.flatnonzero(touching)
+    del inside, touching
+    local = np.full(cell_count, -1, dtype=np.int64)
+    local[grown] = np.arange(grown.size, dtype=np.int64)
+    owner_local = local[owner[faces]]
+    neighbour_local = np.full(faces.size, -1, dtype=np.int64)
+    is_internal = faces < internal
+    neighbour_local[is_internal] = local[neighbour[faces[is_internal]]]
+    del local
+
+    sub = _FaceSubset(mesh, faces)
+    face_centre, face_area = _face_geometry(sub)
+    magnitude = np.linalg.norm(face_area, axis=1)
+
+    # cell centre and volume of the grown cells (_cell_geometry, on the
+    # faces of those cells only -- each grown cell has all of its faces)
+    count = int(grown.size)
+    estimate = np.zeros((count, 3), dtype=np.float64)
+    seen = np.zeros(count, dtype=np.float64)
+    volume = np.zeros(count, dtype=np.float64)
+    moment = np.zeros((count, 3), dtype=np.float64)
+    sides = []
+    for side, sign in ((owner_local, 1.0), (neighbour_local, -1.0)):
+        which = np.flatnonzero(side >= 0)
+        sides.append((side[which], which, sign))
+        np.add.at(estimate, side[which], face_centre[which])
+        np.add.at(seen, side[which], 1.0)
+    estimate /= np.maximum(seen, 1.0)[:, None]
+    for owners, which, sign in sides:
+        height = face_centre[which] - estimate[owners]
+        pyramid = sign * (np.einsum('ij,ij->i', face_area[which],
+                                    height) / 3.0)
+        np.add.at(volume, owners, pyramid)
+        np.add.at(moment, owners,
+                  (estimate[owners] + 0.75 * height) * pyramid[:, None])
+    centre = np.where(np.abs(volume)[:, None] > _TINY,
+                      moment / np.where(np.abs(volume) > _TINY,
+                                        volume, 1.0)[:, None],
+                      estimate)
+
+    area_sum = np.zeros(count, dtype=np.float64)
+    for owners, which, _sign in sides:
+        np.add.at(area_sum, owners, magnitude[which])
+    aspect = (1.0 / 6.0) * area_sum / np.cbrt(
+        np.maximum(np.abs(volume), _TINY)) ** 2
+    aspect[np.abs(volume) <= _TINY] = 0.0
+
+    # only the kept cells' faces are judged
+    is_kept = np.zeros(count, dtype=bool)
+    is_kept[np.searchsorted(grown, cells)] = True
+    non_ortho = np.zeros(count, dtype=np.float64)
+    skewness = np.zeros(count, dtype=np.float64)
+    inner = np.flatnonzero((faces < internal) & (
+        is_kept[np.maximum(owner_local, 0)] & (owner_local >= 0)
+        | is_kept[np.maximum(neighbour_local, 0)] & (neighbour_local >= 0)))
+    if inner.size:
+        own, nei = owner_local[inner], neighbour_local[inner]
+        separation = centre[nei] - centre[own]
+        distance = np.linalg.norm(separation, axis=1)
+        cosine = np.einsum('ij,ij->i', face_area[inner], separation) / (
+            np.maximum(magnitude[inner], _TINY)
+            * np.maximum(distance, _TINY))
+        angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+        skew = _skewness(sub, inner, face_centre, face_area, centre[own],
+                         separation)
+        for side in (own, nei):
+            np.maximum.at(non_ortho, side, angle)
+            np.maximum.at(skewness, side, skew)
+    boundary = np.flatnonzero((faces >= internal) & (owner_local >= 0)
+                              & is_kept[np.maximum(owner_local, 0)])
+    if boundary.size:
+        owners = owner_local[boundary]
+        offset = face_centre[boundary] - centre[owners]
+        unit = face_area[boundary] / np.maximum(
+            magnitude[boundary], _TINY)[:, None]
+        along = unit * np.einsum('ij,ij->i', unit, offset)[:, None]
+        skew = _skewness(sub, boundary, face_centre, face_area,
+                         centre[owners], along,
+                         precomputed_vector=offset - along)
+        np.maximum.at(skewness, owners, skew)
+
+    take = np.searchsorted(grown, cells)
+    for name, values in (('cellAspectRatio', aspect),
+                         ('nonOrthoAngle', non_ortho),
+                         ('skewness', skewness), ('cellVolume', volume)):
+        out[name][cells] = values[take]
+    return out
+
+
 def summarise(fields: dict[str, np.ndarray]) -> dict:
     """Min/max/mean per array, for the assertion that the picture matches the log."""
     summary = {}

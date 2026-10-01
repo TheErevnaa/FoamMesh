@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.core.geometry.diagnostics.budget import BudgetPolicy
+from foammesh.core.jobs import stage_snapshots
 from foammesh.core.naming import humanise_option
 from foammesh.core.quality.qualification import QualificationMode
 from foammesh.view.theming.metrics import (
@@ -42,6 +43,12 @@ _MODE_NOTES = {
     QualificationMode.REPORT_ONLY: 'Geometry checks are run and reported, and block nothing.',
     QualificationMode.ENFORCING: 'A failing geometry check can stop a meshing run or an export.',
 }
+
+
+#: What the GiB boxes accept (UF5): a quota below 1 GiB keeps next to
+#: nothing, and a reserve above 1 TiB would refuse every copy on most disks.
+QUOTA_RANGE_GIB = (1.0, 100000.0)
+RESERVE_RANGE_GIB = (0.0, 1024.0)
 
 
 def _note(text: str = '') -> QLabel:
@@ -130,6 +137,7 @@ class PreferencesDialog(QDialog):
         form.addRow(self.tr('WSL user'), self.userEdit)
         form.addRow(self.tr('OpenFOAM 13 bashrc'), self.bashrcEdit)
         form.addRow(self.tr('Stage time limit'), unit_cell(self.stageTimeout, 's', page))
+        self._diskRows(page, form)
         if self._findRuntime is not None:
             self.findRuntimeButton = QPushButton(self.tr('Find automatically'), page)
             self.findRuntimeButton.setObjectName('preferencesFindRuntime')
@@ -143,6 +151,82 @@ class PreferencesDialog(QDialog):
         form.addRow(_note(self.tr(
             'The OpenFOAM 13 environment is checked again as soon as these are applied.')))
         return page
+
+    def _diskRows(self, page, form) -> None:
+        """The stage snapshot quota and the free-space reserve, in GiB (UF5)."""
+        self._policy = self._readPolicy()
+        gib = float(stage_snapshots.GIB)
+        self.snapshotQuota = CompactDoubleSpinBox(page)
+        self.snapshotQuota.setObjectName('preferencesSnapshotQuota')
+        self.snapshotQuota.setDecimals(1)
+        self.snapshotQuota.setRange(QUOTA_RANGE_GIB[0], QUOTA_RANGE_GIB[1])
+        self.snapshotQuota.setValue(self._policy.quota_bytes / gib)
+        self.snapshotQuota.setToolTip(self.tr(
+            'The most disk space one case may use for its kept stage '
+            'snapshots, the current mesh, the restore point and the stage '
+            'inputs together. A stage snapshot that would go past it is not '
+            'kept; re-running a later stage then regenerates that stage '
+            'first.'))
+        self.diskReserve = CompactDoubleSpinBox(page)
+        self.diskReserve.setObjectName('preferencesDiskReserve')
+        self.diskReserve.setDecimals(1)
+        self.diskReserve.setRange(RESERVE_RANGE_GIB[0], RESERVE_RANGE_GIB[1])
+        self.diskReserve.setValue(self._policy.reserve_bytes / gib)
+        self.diskReserve.setToolTip(self.tr(
+            'Free space always left on the disk that holds the case, so '
+            'meshing never fills it. A stage snapshot is not kept, and an '
+            'unlock or a run that must keep a copy is refused, when writing '
+            'it would leave less than this free.'))
+        form.addRow(self.tr('Stage snapshot quota'),
+                    unit_cell(self.snapshotQuota, 'GiB', page))
+        form.addRow(self.tr('Free space kept on the disk'),
+                    unit_cell(self.diskReserve, 'GiB', page))
+
+    def _readPolicy(self):
+        reader = getattr(self._settings, '_get', None)
+        if not callable(reader):
+            return stage_snapshots.load_policy()
+        try:
+            quota = reader(stage_snapshots._SettingKey(stage_snapshots.QUOTA_SETTING),
+                           stage_snapshots.DEFAULT_QUOTA_BYTES)
+            reserve = reader(stage_snapshots._SettingKey(stage_snapshots.RESERVE_SETTING),
+                             stage_snapshots.DEFAULT_RESERVE_BYTES)
+            return stage_snapshots.AdmissionPolicy(max(0, int(quota)),
+                                                   max(0, int(reserve)))
+        except (TypeError, ValueError):
+            return stage_snapshots.AdmissionPolicy()
+
+    def _diskValues(self):
+        gib = stage_snapshots.GIB
+        return stage_snapshots.AdmissionPolicy(
+            int(round(self.snapshotQuota.value() * gib)),
+            int(round(self.diskReserve.value() * gib)))
+
+    def _diskRefusal(self, policy) -> str:
+        low, high = QUOTA_RANGE_GIB
+        if not low <= policy.quota_bytes / stage_snapshots.GIB <= high:
+            return self.tr('Enter a stage snapshot quota between {0} and {1} '
+                           'GiB.').format(low, high)
+        low, high = RESERVE_RANGE_GIB
+        if not low <= policy.reserve_bytes / stage_snapshots.GIB <= high:
+            return self.tr('Enter a free-space reserve between {0} and {1} '
+                           'GiB.').format(low, high)
+        return ''
+
+    def _writePolicy(self, policy) -> None:
+        if policy == self._policy:
+            return
+        writer = getattr(self._settings, '_set', None)
+        if callable(writer):
+            # The application's own store: a second instance writing the
+            # same file would be overwritten by this one's next save.
+            writer(stage_snapshots._SettingKey(stage_snapshots.QUOTA_SETTING),
+                   int(policy.quota_bytes))
+            writer(stage_snapshots._SettingKey(stage_snapshots.RESERVE_SETTING),
+                   int(policy.reserve_bytes))
+        else:
+            stage_snapshots.save_policy(policy)
+        self._policy = policy
 
     def _diagnosticsPage(self) -> QWidget:
         page = QWidget()
@@ -253,7 +337,8 @@ class PreferencesDialog(QDialog):
     def apply(self) -> bool:
         """Write every page; return False, and say why, if one is refused."""
         runtime = self._runtimeValues()
-        refusal = self._refusal(runtime)
+        policy = self._diskValues()
+        refusal = self._refusal(runtime) or self._diskRefusal(policy)
         self.problem.setText(refusal)
         self.problem.setVisible(bool(refusal))
         if refusal:
@@ -271,6 +356,7 @@ class PreferencesDialog(QDialog):
             self._runtime = dict(runtime)
             if self._applyRuntime is not None:
                 self._applyRuntime()
+        self._writePolicy(policy)
 
         self._settings.updateDiagnosticBudget(
             BudgetPolicy(self.budgetPolicy.currentData()),

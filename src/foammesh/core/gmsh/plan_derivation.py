@@ -489,10 +489,30 @@ class Farfield:
     #: Plan 31 CP-08 item 7. What the cut should do with a pocket it leaves
     #: inside the geometry: ``discard``, ``keep`` or ``refuse``.
     sealed_cavities: str = 'discard'
+    #: Plan 37 UF13. The rest of the shared farfield specification
+    #: (``core/mesh/farfield_spec.py``): the primitive's shape and where it
+    #: sits. Lengths in metres; the axis is a direction.
+    shape: str = 'box'
+    centre_mode: str = 'auto'
+    centre: tuple = (0.0, 0.0, 0.0)
+    radius: float = 1.0
+    length: float = 2.0
+    axis: tuple = (1.0, 0.0, 0.0)
+
+    def spec(self):
+        from foammesh.core.mesh.farfield_spec import FarfieldSpec
+
+        return FarfieldSpec(
+            enabled=self.enabled, shape=self.shape,
+            centre_mode=self.centre_mode, centre=tuple(self.centre),
+            padding=self.padding, radius=self.radius, length=self.length,
+            axis=tuple(self.axis), sealed_cavities=self.sealed_cavities)
 
     def to_dict(self) -> dict:
-        return {'enabled': self.enabled, 'padding': self.padding,
-                'sealedCavities': self.sealed_cavities}
+        # Plan 37 UF13. The padded box writes exactly the three keys it
+        # always wrote, so the job digest of a pre-UF13 project -- and so
+        # its cached mesh -- does not change because the store grew.
+        return self.spec().job_dict()
 
 
 @dataclass(frozen=True)
@@ -1172,11 +1192,24 @@ def derive_algorithms(values: dict,
 SEALED_CAVITY_POLICIES = ('discard', 'keep', 'refuse')
 
 
-def derive_farfield(values: dict) -> Farfield:
+def derive_farfield(values: dict, bbox=None) -> Farfield:
+    """The farfield the job asks for, refused here when it cannot be built.
+
+    Plan 37 UF13. The shape and its dimensions are read through the shared
+    specification, so an invalid one (a zero radius, a zero axis) is refused
+    with the leaf it is about, before a run directory exists. With the model
+    bounds in hand, a sphere or cylinder that does not contain every body
+    with clearance is refused too -- the runner checks again against the
+    bounds the CAD kernel reports, but a user should not wait for WSL to be
+    told a radius is too small.
+    """
+    from foammesh.core.mesh.farfield_spec import FarfieldSpec, primitives
+
     values = dict(values or {})
     enabled = bool(values.get('enabled', False))
     padding = float(values.get('padding', 2.0) or 0.0)
-    if enabled and padding <= 0:
+    shape = _enum(values.get('shape'), 'box')
+    if enabled and shape == 'box' and padding <= 0:
         raise PlanDerivationError(
             'the farfield padding must be greater than zero; a box the size '
             'of the geometry has no room for flow around it')
@@ -1185,7 +1218,66 @@ def derive_farfield(values: dict) -> Farfield:
         raise PlanDerivationError(
             f'unknown sealed-cavity policy {policy!r}; expected one of '
             + ', '.join(SEALED_CAVITY_POLICIES))
-    return Farfield(enabled=enabled, padding=padding, sealed_cavities=policy)
+    spec = FarfieldSpec.from_values(dict(values, enabled=enabled))
+    if enabled:
+        problems = spec.problems()
+        if problems:
+            raise PlanDerivationError(problems[0])
+        bounds = _bounds_of(bbox)
+        if bounds is not None:
+            try:
+                spec.resolve(bounds)
+            except primitives().FarfieldError as error:
+                raise PlanDerivationError(str(error)) from error
+    return Farfield(enabled=enabled, padding=padding, sealed_cavities=policy,
+                    shape=spec.shape, centre_mode=spec.centre_mode,
+                    centre=tuple(spec.centre), radius=spec.radius,
+                    length=spec.length, axis=tuple(spec.axis))
+
+
+def _bounds_of(bbox):
+    """``bbox`` in Gmsh order, or ``None`` when there is none to check."""
+    if bbox is None:
+        return None
+    try:
+        return tuple(float(getattr(bbox, key)) for key in (
+            'xmin', 'ymin', 'zmin', 'xmax', 'ymax', 'zmax'))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def farfield_role_conflicts(rows, farfield: Farfield) -> tuple[str, ...]:
+    """Volume roles the farfield cut cannot keep, one sentence each.
+
+    Plan 37 UF13. The cut subtracts every imported solid from the primitive
+    (``occ.cut`` with the tool removed), so what is left is the fluid around
+    the bodies and none of the bodies themselves. A volume typed ``solid``
+    (a CHT region) or ``fluid`` names a body that will not exist, and a run
+    would publish a mesh without the region the case was typed for. An
+    excluded body is consistent with the cut -- it was going to be left out
+    -- and a sizing-only control is refused by the runner's scope check
+    after the cut, as before.
+    """
+    if not farfield.enabled:
+        return ()
+    conflicts = []
+    for index, row in enumerate(rows or ()):
+        row = dict(row or {})
+        if not bool(row.get('enabled', True)):
+            continue
+        if not bool(row.get('included', True)):
+            continue
+        kind = _enum(row.get('volumeType'), '')
+        if kind not in ('fluid', 'solid'):
+            continue
+        name = str(row.get('name') or f'volume-{index}')
+        conflicts.append(
+            f'volume {name!r} is typed {kind}, but the farfield '
+            f'{farfield.shape} cuts every imported solid out of the domain, '
+            'so no body survives to carry that type. Turn the farfield off '
+            'to mesh the bodies as regions, or clear the type to mesh the '
+            'flow around them')
+    return tuple(conflicts)
 
 
 def resolve_parallel_threads(resource_policy, *, requested: int = 0) -> int:
@@ -1503,7 +1595,15 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     curves = derive_curve_controls(_rows(native.get('curveControls')))
     volumes = derive_volume_controls(_rows(native.get('volumeControls')))
     periodic = derive_periodic_pairs(_rows(native.get('periodicPairs')))
-    farfield = derive_farfield(native.get('farfield'))
+    # Plan 37 UF13. Containment is only asked of a volume route: the planar
+    # route below drops the farfield outright.
+    farfield = derive_farfield(
+        native.get('farfield'),
+        None if dimensionality.planar else bbox)
+    conflicts = farfield_role_conflicts(
+        _rows(native.get('volumeControls')), farfield)
+    if conflicts and not dimensionality.planar:
+        raise PlanDerivationError('; '.join(conflicts))
 
     if dimensionality.planar:
         # FC-E. Two controls in this job are about a volume Gmsh will not
@@ -1526,9 +1626,10 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
             farfield = Farfield()
             dimensionality = replace(dimensionality, warnings=(
                 *dimensionality.warnings,
-                'the farfield box is a solid cut against imported solids, so '
-                'it cannot be built for a two-dimensional section. The '
-                'farfield request was dropped.'))
+                f'the farfield {farfield.shape} is a solid cut against '
+                'imported solids, so it cannot be built for a '
+                'two-dimensional section. The farfield request was '
+                'dropped.'))
 
     warnings = (
         *sizing.warnings, *healing.warnings, *layers.warnings,

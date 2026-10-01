@@ -53,6 +53,8 @@ SINGLE_BOUNDARY_NOTE = 'One boundary only: split by angle to add inlets.'
 SINGLE_BOUNDARY_DETAIL = (
     'The whole surface is one boundary, so no inlet or outlet can be '
     'applied to it. Split by angle before meshing.')
+#: `_renameTarget`'s answer for a volume row, which this Rename refuses.
+VOLUME_ROW = object()
 
 
 class BoundaryOperations:
@@ -396,8 +398,14 @@ class BoundaryActions(QWidget, BoundaryOperations):
         exactly that row. A row stamped before ``patchUuid`` existed falls
         back to its name; a volume row stands for no single boundary and
         matches nothing.
+
+        Plan 37 UF1 (DP-1024). The last fallback compared the tree row's key
+        with the manifest's ``geometry_id`` -- the same two different ids
+        DP-820 describes, so it never matched. It now compares the artifact
+        id the row carries as ``geometryId`` and takes the boundary only when
+        that file holds exactly one.
         """
-        byUuid, byName, byId = {}, {}, {}
+        byUuid, byName, byArtifact = {}, {}, {}
         for patch in self._patches:
             if patch.get('patch_uuid'):
                 byUuid.setdefault(str(patch['patch_uuid']), patch)
@@ -405,7 +413,9 @@ class BoundaryActions(QWidget, BoundaryOperations):
                 # A name two boundaries carry identifies neither of them.
                 name = str(patch['name'])
                 byName[name] = None if name in byName else patch
-            byId.setdefault(str(patch.get('geometry_id')), patch)
+            if patch.get('geometry_id'):
+                byArtifact.setdefault(str(patch['geometry_id']),
+                                      []).append(patch)
         keys = [str(key) for key in self._selectedIds()]
         rows = self._treeRows(keys)
         out = []
@@ -420,15 +430,19 @@ class BoundaryActions(QWidget, BoundaryOperations):
                     patch = byUuid.get(str(uuid))
                 if patch is None and row.get('name'):
                     patch = byName.get(str(row.get('name')))
-            if patch is None:
-                patch = byId.get(key)
+                if patch is None and row.get('geometryId'):
+                    pieces = byArtifact.get(str(row.get('geometryId')), [])
+                    # A file cut into several boundaries does not say which
+                    # of them this row is.
+                    if len(pieces) == 1:
+                        patch = pieces[0]
             if patch is not None:
                 out.append({**patch, 'tree_id': key})
         return out
 
     @staticmethod
     def _treeRows(keys):
-        """``{key: {name, gType, patchUuid}}`` for the tree rows asked about."""
+        """``{key: {name, gType, patchUuid, geometryId}}`` for these rows."""
         if (not keys or app.facadeClient is None
                 or not app.facadeClient.has_case()):
             return {}
@@ -440,7 +454,8 @@ class BoundaryActions(QWidget, BoundaryOperations):
                     continue
                 element = db.getElement('geometry', key)
                 out[key] = {field: element.value(field)
-                            for field in ('name', 'gType', 'patchUuid')}
+                            for field in ('name', 'gType', 'patchUuid',
+                                          'geometryId')}
         except (FacadeError, KeyError, TypeError, ValueError):
             return out
         return out
@@ -461,12 +476,66 @@ class BoundaryActions(QWidget, BoundaryOperations):
 
     # -- the operations ---------------------------------------------------- #
 
-    def _renameSelected(self):
+    def _renameTarget(self):
+        """``(patch, None)`` for the one row to rename, or ``(None, why)``.
+
+        Plan 37 UF1 (DP-1024). Rename used to need the row to match exactly
+        one boundary in the patch manifest, and said so only in a note under
+        the list that was elided to a few words -- so to the user Rename
+        opened nothing. A primitive from the Add dialog has no manifest
+        boundary at all, and a row imported since the list was last read had
+        none it knew of. Neither needs one: ``geometry.rename`` renames the
+        tree row, and moves the manifest name too when there is one. So a
+        row that matches no boundary is renamed by its own id, and the only
+        refusals left are the ones the user can act on.
+        """
+        if app.facadeClient is None or not app.facadeClient.has_case():
+            return None, self.tr('No case is open, so there is nothing to '
+                                 'rename.')
+        keys = [str(key) for key in self._selectedIds()]
+        if not keys:
+            return None, self.tr(
+                'No row is selected in the geometry list. Select the one '
+                'row to rename, then choose Rename again.')
+        if len(keys) > 1:
+            return None, self.tr(
+                '{0} rows are selected. Rename works on one row at a time: '
+                'select just the row to rename.').format(len(keys))
+        key = keys[0]
+        row = self._treeRows(keys).get(key)
+        if row is None:
+            return None, self.tr(
+                'The selected row (id {0}) is no longer in the case, so '
+                'there is nothing to rename. Another edit may have removed '
+                'or replaced it.').format(key)
+        if row.get('gType') == GeometryType.VOLUME.value:
+            # Intended (DP-820 audit): this Rename names boundaries. A volume
+            # is renamed in View/edit, where its dialog owns the name.
+            return None, VOLUME_ROW
         chosen = self._selectedPatches()
-        if len(chosen) != 1:
-            self._say(self.tr('Select one boundary to rename.'))
+        if len(chosen) == 1:
+            # Plan 37 UF20 (F1). The rename is of this row, so the name it
+            # replaces -- and the one the dialog offers -- is the name the row
+            # shows. The manifest boundary can carry another: an imported
+            # STL's is the solid's name, which is also the volume's, and the
+            # dialog offered ``sphere`` for the row ``sphere_surface``.
+            shown = str(row.get('name') or '')
+            return {**chosen[0], 'name': shown or chosen[0].get('name')}, None
+        return {'name': str(row.get('name') or ''), 'tree_id': key}, None
+
+    def _renameSelected(self):
+        patch, why = self._renameTarget()
+        if why is VOLUME_ROW:
+            # Kept as the note the DP-820 audit pins: the row is a volume,
+            # and the note says where a volume is renamed.
+            self._say(self.tr('Select one boundary to rename.'),
+                      self.tr('The selected row is a volume. Rename a '
+                              'volume in View/edit; Rename here names '
+                              'boundaries.'))
             return None
-        patch = chosen[0]
+        if patch is None:
+            QMessageBox.information(self, self.tr('Rename'), why)
+            return None
         name, accepted = QInputDialog.getText(
             self, self.tr('Rename boundary'), self.tr('Boundary name'),
             text=str(patch.get('name') or ''))

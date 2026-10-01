@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QHBoxLayout, QHeaderView, QLabel,
 from PySide6.QtCore import Signal
 
 from foammesh.app import app
+from foammesh.view.outside_task import modal
 from foammesh.core.quantities import count_text
 from foammesh.db.configurations_schema import CFDType, Shape, GeometryType
 from foammesh.view.step_page import StepPage
@@ -19,7 +20,7 @@ from widgets.async_message_box import AsyncMessageBox
 from .geometry import RESERVED_NAMES
 from .geometry_add_dialog import GeometryAddDialog
 from .geometry_import_dialog import ImportDialog, parseFeatureAngle
-from .geometry_list import GeometryList
+from .geometry_list import GeometryList, isFarfield
 from .split_dialog import SplitDialog
 from .stl_utility import StlImporter
 from .surface_dialog import SurfaceDialog
@@ -224,6 +225,12 @@ class GeometryPage(StepPage):
         self._advancedFolder = None
         self._lockBanner = None
         self._splitInterfaces = None
+        #: Plan 37: Geometry > Farfield... -- the entry, its open dialog, the
+        #: row menu and what it draws in the viewport.
+        self._farfieldButton = None
+        self._farfieldDialog = None
+        self._farfieldMenu = None
+        self._farfieldActors = ()
 
         self._connectSignalsSlots()
 
@@ -244,10 +251,13 @@ class GeometryPage(StepPage):
             self._ensureBoundaryActions()
             self._ensureCadPanel()
             self._updateNextStepAvailable()
+        self._ensureFarfieldButton()
 
         app.window.meshManager.unload()
+        self._showFarfieldOverlay(True)
 
     async def hide(self):
+        self._showFarfieldOverlay(False)
         return True
 
     def load(self):
@@ -258,6 +268,7 @@ class GeometryPage(StepPage):
         self._ensureCadPanel()
         self._ensureInterfacePairPanel()
         self._ensureSplitInterfacesButton()
+        self._ensureFarfieldButton()
 
         # Whatever selected the geometry - a viewport pick, the display
         # control, an operation - the tree shows it.
@@ -295,6 +306,8 @@ class GeometryPage(StepPage):
         found = []
 
         def walk(item):
+            if isFarfield(item):
+                return
             if item.isSelected():
                 found.append(str(item.gId()))
             for index in range(item.childCount()):
@@ -569,7 +582,8 @@ class GeometryPage(StepPage):
                     'actions': [{'action': 'cad.retessellate',
                                  'params': settings}]})
         except (RuntimeError, OSError, ValueError, FacadeError) as ex:
-            QMessageBox.warning(
+            await modal(
+                QMessageBox.warning,
                 self._widget, self.tr('Re-tessellate'), str(ex))
             return
         self._ensureCadPanel()
@@ -668,6 +682,9 @@ class GeometryPage(StepPage):
         """
         if not item.isSelected():
             self._ui.geometryList.setCurrentItem(item)
+        if isFarfield(item):
+            self._openFarfield()
+            return
         if self._locked:
             # R71. The locked page used to swallow the gesture: the row still
             # highlighted and still looked editable, so the user repeated the
@@ -685,6 +702,15 @@ class GeometryPage(StepPage):
             self._openEditDialog()
 
     def _executeContextMenu(self, pos):
+        try:
+            hit = self._ui.geometryList.itemAt(pos)
+        except (AttributeError, TypeError):
+            hit = None
+        if isFarfield(hit):
+            self._ui.geometryList.setCurrentItem(hit)
+            self._farfieldContextMenu().exec(
+                self._ui.geometryList.mapToGlobal(pos))
+            return
         if not self._list.selectedItems():
             return
 
@@ -755,6 +781,230 @@ class GeometryPage(StepPage):
             layout.insertWidget(layout.indexOf(button), self._splitInterfaces)
         self._splitInterfaces.setVisible(self._bodyCount() > 1)
 
+    # -- Geometry > Farfield... (Plan 37) ----------------------------------- #
+
+    def _ensureFarfieldButton(self):
+        """Mount Farfield... beside Add, and say what it will do.
+
+        The farfield is not one of Add's shapes (DP-668 keeps those as
+        refinement and zone shapes): it is the one ``gmsh/farfield`` record
+        both engines build as the outer boundary, so it has its own entry,
+        which reads Edit farfield... once there is one. It sits in the same
+        button row as Import and Add, so the page's lock greys it with them.
+        """
+        button = getattr(self._ui, 'add', None)
+        if button is None:
+            return
+        layout = button.parentWidget().layout()
+        if layout is None:
+            # Isolated widget tests do not build the generated page.
+            return
+        if self._farfieldButton is None:
+            self._farfieldButton = QPushButton(
+                self.tr('Farfield\u2026'), button.parentWidget())
+            self._farfieldButton.setObjectName('geometryFarfield')
+            self._farfieldButton.clicked.connect(self._openFarfield)
+            layout.insertWidget(layout.indexOf(button) + 1,
+                                self._farfieldButton)
+        self._updateFarfieldEntry()
+
+    def farfieldButton(self):
+        return self._farfieldButton
+
+    @staticmethod
+    def _farfieldEngine() -> str:
+        from .farfield_dialog import engine_of
+
+        return engine_of(app.facadeClient)
+
+    def _updateFarfieldEntry(self):
+        """Label, availability and tooltip of the entry, from the case."""
+        button = self._farfieldButton
+        if button is None:
+            return
+        from .farfield_dialog import UNSELECTED
+        from .geometry_list import readFarfield
+
+        try:
+            spec = readFarfield(app.facadeClient.checkout())
+        except Exception:                                    # noqa: BLE001
+            spec = None
+        button.setText(self.tr('Edit farfield\u2026') if spec is not None
+                       else self.tr('Farfield\u2026'))
+        engine = self._farfieldEngine()
+        if engine in ('', UNSELECTED):
+            button.setEnabled(False)
+            button.setToolTip(self.tr(
+                'Choose a meshing engine first: the farfield is built by the '
+                'engine that meshes the case'))
+            return
+        button.setEnabled(True)
+        button.setToolTip(self.tr(
+            'The outer boundary of an external-flow domain: a box, sphere or '
+            'cylinder around the geometry, with the bodies cut out of it'))
+
+    def _modelBounds(self):
+        """The model's extent in Gmsh order, or ``None`` with no geometry."""
+        from foammesh.core.mesh import snappy_farfield
+
+        manager = self._geometryManager or getattr(
+            getattr(app, 'window', None), 'geometryManager', None)
+        surfaces = getattr(manager, 'getSurfaceBounds', None)
+        try:
+            extent = surfaces() if surfaces is not None else None
+            return (None if extent is None
+                    else snappy_farfield.gmsh_bounds(extent.toTuple()))
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def _geometryKind(self) -> str:
+        from foammesh.core.mesh import farfield_spec
+
+        if self._cadEntries():
+            return farfield_spec.CAD
+        try:
+            count = app.facadeClient.checkout().elementCount('geometry')
+        except Exception:                                    # noqa: BLE001
+            count = 0
+        return farfield_spec.TESSELLATED if count else farfield_spec.CAD
+
+    def _openFarfield(self):
+        """Open the farfield editor -- unless the page is locked or no
+        engine is chosen, which is said rather than swallowed."""
+        from .farfield_dialog import UNSELECTED, FarfieldDialog
+
+        if self._locked:
+            QMessageBox.warning(
+                self._widget, self.tr('Geometry locked'),
+                self.tr('The farfield is part of the prepared geometry, so it '
+                        'can no longer be changed here. Edit geometry\u2026 '
+                        'at the top of this page unlocks the step; unlocking '
+                        'discards the prepared geometry and everything meshed '
+                        'from it.'))
+            return None
+        engine = self._farfieldEngine()
+        if engine in ('', UNSELECTED):
+            return None
+        if self._farfieldDialog is not None:
+            self._farfieldDialog.raise_()
+            return self._farfieldDialog
+        dialog = FarfieldDialog(
+            app.facadeClient, self._widget, bounds=self._modelBounds(),
+            engine=engine, geometry_kind=self._geometryKind())
+        dialog.farfieldChanged.connect(self._farfieldEdited)
+        dialog.finished.connect(self._farfieldDialogClosed)
+        self._farfieldDialog = dialog
+        dialog.open()
+        return dialog
+
+    def farfieldDialog(self):
+        return self._farfieldDialog
+
+    def _farfieldDialogClosed(self, _result=None):
+        dialog, self._farfieldDialog = self._farfieldDialog, None
+        if dialog is not None:
+            dialog.deleteLater()
+
+    def _farfieldEdited(self):
+        """The record changed: the row, the entry and the drawing follow."""
+        refresh = getattr(self._list, 'refreshFarfield', None)
+        if refresh is not None:
+            refresh()
+        self._updateFarfieldEntry()
+        self._showFarfieldOverlay(True)
+
+    def _farfieldContextMenu(self):
+        if self._farfieldMenu is None:
+            menu = QMenu(self._widget)
+            menu.setObjectName('geometryFarfieldMenu')
+            farfieldEdit = QAction(self.tr('Edit farfield\u2026'), menu)
+            farfieldEdit.setObjectName('geometryFarfieldEdit')
+            farfieldEdit.triggered.connect(self._openFarfield)
+            farfieldRemove = QAction(self.tr('Remove farfield'), menu)
+            farfieldRemove.setObjectName('geometryFarfieldRemove')
+            farfieldRemove.setToolTip(self.tr(
+                'Switch the farfield off; its shape and size are kept for '
+                'when it is switched on again'))
+            farfieldRemove.triggered.connect(self._removeFarfield)
+            menu.addAction(farfieldEdit)
+            menu.addAction(farfieldRemove)
+            self._farfieldMenu = menu
+        remove = self._farfieldMenu.findChild(QAction, 'geometryFarfieldRemove')
+        remove.setVisible(not self._locked)
+        return self._farfieldMenu
+
+    @qasync.asyncSlot()
+    async def _removeFarfield(self):
+        await self.removeFarfield()
+
+    async def removeFarfield(self) -> bool:
+        """Remove on the Farfield row: the farfield is switched off."""
+        from foammesh.core.facade.domain_operations import TaskLockedError
+        from foammesh.core.facade.errors import FacadeError
+        from .farfield_dialog import lock_text, switch_off
+
+        if self._locked:
+            return False
+        try:
+            await switch_off(app.facadeClient)
+        except TaskLockedError as error:
+            await modal(
+                QMessageBox.warning,
+                self._widget, self.tr('Farfield locked'),
+                self.tr(lock_text(error)))
+            return False
+        except FacadeError as error:
+            await modal(
+                QMessageBox.warning,
+                self._widget, self.tr('Farfield'),
+                self.tr('The farfield was not switched off: {0}').format(error))
+            return False
+        self._farfieldEdited()
+        return True
+
+    def _showFarfieldOverlay(self, shown: bool) -> None:
+        """Draw the farfield in the viewport while this page is up.
+
+        The actors are UF14's (``farfield_actor``), resolved around the
+        surfaces' extent the way a run resolves them, and labelled with the
+        patch names the chosen engine writes.
+        """
+        display = getattr(getattr(app, 'window', None), 'displayControl', None)
+        if display is None:
+            self._farfieldActors = ()
+            return
+        for actor in self._farfieldActors:
+            try:
+                display.removeOverlay(actor)
+            except Exception:                                # noqa: BLE001
+                pass
+        self._farfieldActors = ()
+        if not shown:
+            return
+        from foammesh.core.mesh import snappy_farfield
+        from foammesh.rendering.farfield_actor import (
+            farfieldActor, farfieldLabelActor)
+
+        try:
+            spec = snappy_farfield.active(app.facadeClient.checkout())
+        except Exception:                                    # noqa: BLE001
+            return
+        bounds = self._modelBounds()
+        if spec is None or bounds is None:
+            return
+        try:
+            primitive = spec.resolve(bounds)
+        except ValueError:
+            return
+        engine = self._farfieldEngine() or 'snappy'
+        self._farfieldActors = (farfieldActor(primitive),
+                                farfieldLabelActor(primitive, engine))
+        for actor in self._farfieldActors:
+            display.addOverlay(actor)
+
+    def farfieldActors(self):
+        return self._farfieldActors
+
     @staticmethod
     def _bodyCount() -> int:
         """How many imported bodies the case holds."""
@@ -783,7 +1033,8 @@ class GeometryPage(StepPage):
             preview = await app.facadeClient.run(
                 'geometry.split_interfaces', {'preview': True})
         except FacadeError as ex:
-            QMessageBox.warning(
+            await modal(
+                QMessageBox.warning,
                 self._widget, self.tr('Interface split failed'), str(ex))
             return
         found = preview.payload.get('interfaces') or ()
@@ -806,7 +1057,8 @@ class GeometryPage(StepPage):
         try:
             await app.facadeClient.run('geometry.split_interfaces', {})
         except FacadeError as ex:
-            QMessageBox.warning(
+            await modal(
+                QMessageBox.warning,
                 self._widget, self.tr('Interface split failed'), str(ex))
             return
         self._reloadFromDatabase()
@@ -965,7 +1217,8 @@ class GeometryPage(StepPage):
             try:
                 splitAngle = parseFeatureAngle(angleText)
             except ValueError as ex:
-                QMessageBox.warning(
+                await modal(
+                    QMessageBox.warning,
                     self._widget, self.tr('Import geometry'), str(ex))
                 return
 
@@ -995,7 +1248,8 @@ class GeometryPage(StepPage):
                 volumes, surfaces = await self._importThroughStore(
                     cadFiles, unit, tessellation=tessellation)
             except (RuntimeError, OSError, ValueError, FacadeError) as ex:
-                QMessageBox.warning(
+                await modal(
+                    QMessageBox.warning,
                     self._widget, self.tr('Geometry loading error'), str(ex))
                 return
         if surfaceFiles:
@@ -1020,7 +1274,8 @@ class GeometryPage(StepPage):
                         surfaceFiles, unit, splitDialog.featureAngle(),
                         splitDialog.minAreaFraction())
                 except (RuntimeError, OSError, ValueError, FacadeError) as ex:
-                    QMessageBox.warning(
+                    await modal(
+                        QMessageBox.warning,
                         self._widget, self.tr('Geometry loading error'), str(ex))
                     return
             else:
@@ -1033,7 +1288,8 @@ class GeometryPage(StepPage):
                     meshVolumes, meshSurfaces = await self._importThroughStore(
                         surfaceFiles, unit)
                 except (RuntimeError, OSError, ValueError, FacadeError) as ex:
-                    QMessageBox.warning(
+                    await modal(
+                        QMessageBox.warning,
                         self._widget, self.tr('Geometry loading error'), str(ex))
                     return
             volumes = [*volumes, *meshVolumes]
@@ -1124,7 +1380,8 @@ class GeometryPage(StepPage):
         except (RuntimeError, OSError, ValueError, FacadeError) as ex:
             # RuntimeError alone let a rejected artifact import or an
             # unreadable file abort the import with nothing said.
-            QMessageBox.warning(
+            await modal(
+                QMessageBox.warning,
                 self._widget, self.tr('Geometry loading error'), str(ex))
 
     @staticmethod
@@ -1233,7 +1490,8 @@ class GeometryPage(StepPage):
                     {'geometry_id': geometryId, 'angle_deg': angle,
                      'min_area_fraction': minAreaFraction})
             except ValidationFailedError as ex:
-                QMessageBox.warning(
+                await modal(
+                    QMessageBox.warning,
                     self._widget, self.tr('Feature angle split'), str(ex))
             else:
                 payload = split.payload
@@ -1267,7 +1525,17 @@ class GeometryPage(StepPage):
         # An import may have brought the first solid model into the case, and
         # the deflection controls exist only while there is one to re-facet.
         self._ensureCadPanel()
+        # Plan 37 UF1 (DP-1024). The boundary operations match tree rows
+        # against the patch manifest they read. Read only when the page
+        # loaded, that list knew nothing of what an import, a split dialog or
+        # a re-tessellate had just written, so Rename on a new row opened
+        # nothing. Every rebuild of the tree re-reads it too.
+        self._refreshBoundaries()
         self._updateNextStepAvailable()
+
+    def _refreshBoundaries(self):
+        if self._boundaries is not None:
+            self._boundaries.refresh()
 
     def _addVolume(self, gId):
         db = app.facadeClient.checkout()
@@ -1315,6 +1583,7 @@ class GeometryPage(StepPage):
         if self._geometryManager is not None:
             self._geometryManager.load()
         self._list.load()
+        self._refreshBoundaries()
         self._updateNextStepAvailable()
 
     def _addGeometry(self, gId, geometry, volume=None):
@@ -1353,6 +1622,8 @@ class GeometryPage(StepPage):
         self._ui.geometryButtons.setEnabled(True)
         if self._boundaries is not None:
             self._boundaries.setEnabled(True)
+        # The farfield entry has a condition of its own (an engine chosen).
+        self._updateFarfieldEntry()
         if self._lockBanner is not None:
             self._lockBanner.setVisible(False)
 

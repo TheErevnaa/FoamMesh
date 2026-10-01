@@ -346,6 +346,16 @@ def checkmesh_readout(document: Mapping | None) -> Readout:
             rows.append(ReadoutRow(
                 label, 'pass' if result.get('mesh_ok') else 'unrated',
                 _number(result[key], spec)))
+    # Plan 37 F-2. A snappy mesh in more pieces than its seeds ask for: the
+    # count beside the metrics, and the sentence -- cause and what to do --
+    # as the caveat, where the page shows it in the warning style.
+    retained = result.get('retained')
+    split = isinstance(retained, dict) and bool(retained.get('split'))
+    if split:
+        rows.append(ReadoutRow(
+            'regions', 'fail',
+            f"{int(retained['regions']):,} "
+            f"({int(retained.get('expected') or 1):,} expected)"))
     severity = str(result.get('severity') or 'unrated')
     failed = int(result.get('failed_checks') or 0)
     headline = (f'{severity} — {failed} failed mesh check'
@@ -360,6 +370,8 @@ def checkmesh_readout(document: Mapping | None) -> Readout:
     elif result.get('incomplete'):
         caveat = ('The checkMesh log was truncated, so this is an incomplete '
                   'reading rather than a pass.')
+    elif split:
+        caveat = str(retained.get('message') or '')
     return Readout('checkmesh', severity, headline, tuple(rows), caveat,
                    len(rows), len(rows))
 

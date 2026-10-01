@@ -36,6 +36,7 @@ from .meshing_method_branch import (
     MeshingMethodBranch, row_tasks)
 from widgets.async_message_box import AsyncMessageBox
 from foammesh.view.facade_client import FailedResult, query, submit
+from foammesh.view.outside_task import say
 
 from .run_narration import describe_start
 
@@ -66,7 +67,7 @@ async def record_transition(branch, task_id: str, transition: str) -> None:
     await recorder(task_id, transition)
 
 
-async def commit_page_edits(page) -> bool:
+async def commit_page_edits(page, branch=None) -> bool:
     """Write what the page is holding, and wait to be told whether it landed.
 
     DP-254. The press used to call `page.apply()` and read `is_dirty` on the
@@ -81,15 +82,62 @@ async def commit_page_edits(page) -> bool:
     an answer (DP-227). A stand-in with only `apply` has no facade behind it,
     `submit` runs its write synchronously, and the flag it reports next is
     already the new one.
-    """
-    if not getattr(page, 'is_dirty', False):
-        return True
-    saver = getattr(page, 'save', None)
-    if saver is None:
-        page.apply()
-        return not getattr(page, 'is_dirty', False)
-    return bool(await saver())
 
+    Plan 37 UF3 DP-1034/DP-1035. Landing the patch is not the end of the
+    save: the page announces it with `updateRequested`, and the branch
+    answers with a scheduled `configure` that nobody awaited, so the settle
+    after this read the task as still PASSED and moved on without meshing.
+    The table rows the page hosts are writes of their own, also scheduled.
+    So this waits for the page's row writes first (a refused one stops the
+    press, the table has said why), then the page's own patch, then every
+    transition those sent -- and only then does the press read a state.
+    """
+    settle_children = getattr(page, 'settle_child_writes', None)
+    if settle_children is not None and not await settle_children():
+        return False
+    if getattr(page, 'is_dirty', False):
+        saver = getattr(page, 'save', None)
+        if saver is None:
+            page.apply()
+            if getattr(page, 'is_dirty', False):
+                return False
+        elif not await saver():
+            return False
+    landed = getattr(branch, 'transitions_landed', None)
+    if landed is not None:
+        await landed()
+    return True
+
+
+
+def _one_press_at_a_time(press):
+    """Let a second press of the same control join the first one.
+
+    Plan 37 UF3 DP-1034. DP-240's guard holds the controls dead once a run
+    starts, but the save and the transitions before it are awaited too, and a
+    second press in that window started a second save, a second configure and
+    then a second run of the same stage. A press that arrives while one is in
+    flight now waits for that one and does nothing of its own: it is the same
+    request, made twice.
+    """
+    import asyncio
+    import functools
+
+    @functools.wraps(press)
+    async def shared(self, *args, **kwargs):
+        request = self.__dict__.get('_proceedRequest')
+        if request is not None and not request.done():
+            await asyncio.shield(request)
+            return None
+        request = asyncio.ensure_future(press(self, *args, **kwargs))
+        self.__dict__['_proceedRequest'] = request
+        try:
+            return await request
+        finally:
+            if self.__dict__.get('_proceedRequest') is request:
+                self.__dict__['_proceedRequest'] = None
+
+    return shared
 
 
 def unpublished_mesh_reason(payload: dict) -> str:
@@ -152,8 +200,16 @@ class StepControlButtons(QObject):
     def isCancelClicked(self):
         return self._cancelClicked
 
+    def _restoreCancel(self) -> None:
+        """Put Cancel back to the word it had before it was pressed."""
+        text = getattr(self, '_cancelText', None)
+        if text is not None:
+            self._buttons[ButtonID.CANCEL].setText(text)
+            self._cancelText = None
+
     def showButton(self, id_, enabled=True):
         self._cancelClicked = False
+        self._restoreCancel()
 
         for i, button in self._buttons.items():
             if i == id_ and i not in self._retired:
@@ -164,6 +220,7 @@ class StepControlButtons(QObject):
 
     def hideAll(self):
         self._cancelClicked = False
+        self._restoreCancel()
         for button in self._buttons.values():
             button.hide()
 
@@ -182,6 +239,17 @@ class StepControlButtons(QObject):
 
     def _onCancelButtonClicked(self):
         self._cancelClicked = True
+        # Plan 37 UF20 follow-up, MEASURED live (BUDGETS.md section 3): the
+        # footer Cancel on a Gmsh run stayed enabled and nothing read
+        # "cancelling" until the run had ended, 2.42 s later (budget 1 s).
+        # Taken at once, and painted before the cancel is sent.
+        button = self._buttons[ButtonID.CANCEL]
+        if getattr(self, '_cancelText', None) is None:
+            self._cancelText = button.text()
+        button.setEnabled(False)
+        button.setText(self.tr('Cancelling…'))
+        if button.isVisible():
+            button.repaint()
         self.cancelButtonClicked.emit()
 
 
@@ -285,6 +353,10 @@ class StepManager(QObject):
             if self._needsGeneratedDictionaries(engine_id)
         }
         self._methodBranch.pageRequested.connect(self._showBranchPage)
+        # DP-1084. A lock that changes under a shown legacy page reaches it.
+        locksChanged = getattr(self._methodBranch, 'resultLocksChanged', None)
+        if locksChanged is not None:
+            locksChanged.connect(self.refreshResultLock)
         # R104/R162. See `_acceptExportTask`: an export that succeeded is the
         # event that finishes the workflow, and it was going nowhere.
         exported = getattr(self._pages[Step.EXPORT], 'exported', None)
@@ -330,8 +402,7 @@ class StepManager(QObject):
         banner.setTextFormat(Qt.TextFormat.RichText)
         banner.setOpenExternalLinks(False)
         banner.setVisible(False)
-        banner.linkActivated.connect(
-            lambda _link: self._navigation.requestBranch(METHOD_TOKEN))
+        banner.linkActivated.connect(self._onBannerLink)
         layout.insertWidget(0, banner)
         self._prerequisiteBanner = banner
 
@@ -352,19 +423,75 @@ class StepManager(QObject):
     def _engineChosen(self) -> bool:
         return self._engineId() != 'unselected'
 
+    def _onBannerLink(self, link: str) -> None:
+        link = str(link or '')
+        if link.startswith('#unlock:'):
+            branch = self._methodBranch.branch
+            if branch is not None:
+                branch.requestUnlock(link[len('#unlock:'):])
+            return
+        self._navigation.requestBranch(METHOD_TOKEN)
+
+    def _resultLockedTask(self, step) -> str | None:
+        """The task a legacy snappy page stands for, when its result is locked.
+
+        Plan 37 UF5 DP-1043. The branch pages make themselves read-only;
+        the legacy step pages are Designer forms that know nothing of the
+        lock, so the banner above them says it -- and the facade refuses
+        their save either way (DP-1040).
+        """
+        task_id = self._SNAPPY_STEP_TASKS.get(step)
+        branch = self._methodBranch.branch
+        if task_id is None or branch is None or branch.engine_id != 'snappy':
+            return None
+        locked = getattr(branch, 'resultLocked', None)
+        try:
+            return task_id if callable(locked) and locked(task_id) else None
+        except Exception:                                    # noqa: BLE001
+            return None
+
     def _updatePrerequisiteBanner(self, step) -> None:
         banner = getattr(self, '_prerequisiteBanner', None)
         if banner is None:
             return
         blocked = (step in self._ENGINE_SPECIFIC_STEPS
                    and not self._engineChosen())
+        locked = None if blocked else self._resultLockedTask(step)
         if blocked:
             banner.setText(self.tr(
                 'This page belongs to a specific meshing engine, and no '
                 'engine has been chosen yet. Its settings cannot be written '
                 'until you pick one on '
                 '<a href="#method">Mesh setup</a>.'))
-        banner.setVisible(blocked)
+        elif locked:
+            banner.setText(self.tr(
+                'Locked: the mesh on disk was made from these settings, so '
+                'they cannot be saved. Opening this step does not bring back '
+                'its own mesh — the mesh on screen is still the latest '
+                'result. <a href="#unlock:{0}">Unlock and discard later '
+                'results…</a>').format(locked))
+        banner.setVisible(bool(blocked or locked))
+        self._applyResultLock(step, bool(locked))
+
+    def _applyResultLock(self, step, locked: bool) -> None:
+        """Plan 37 UF5 DP-1063. A locked legacy page is read-only, not only
+        captioned: its editors -- the Domain & Regions seed, which the
+        viewport drags -- would otherwise open, take a placement and have the
+        save refused. Only what this lock disabled is enabled again."""
+        page = (getattr(self, '_pages', None) or {}).get(step)
+        if page is None or not hasattr(page, 'lock'):
+            return
+        held = getattr(self, '_resultLockedPages', None)
+        if held is None:
+            held = self._resultLockedPages = set()
+        if locked:
+            page.lock()
+            held.add(step)
+        elif step in held:
+            held.discard(step)
+            stepLockHeld = getattr(self, '_stepLockHeld', None)
+            if not (callable(stepLockHeld) and stepLockHeld(step)):
+                page.unlock()
 
     def load(self, *, preserveCurrentPage: bool = False):
         self._contentStack.show()
@@ -646,8 +773,35 @@ class StepManager(QObject):
         page = self._pages.get(step)
         if page is None or self._stepLockHeld(step):
             return
-        page.unlock()
+        # Plan 37 UF5 DP-1084. The job ending is not the result lock ending:
+        # a page the published result holds read-only stays so.
+        if step not in (getattr(self, '_resultLockedPages', None) or ()):
+            page.unlock()
         self._updateControlButtons(step)
+
+    def _heldByResultLock(self) -> set:
+        return set(getattr(self, '_resultLockedPages', None) or ())
+
+    def refreshResultLock(self) -> None:
+        """Plan 37 UF5 DP-1084. Re-read the result lock for the shown page.
+
+        The banner and the read-only state were applied only when a legacy
+        page was opened. An unlock from the outline, or a run that published
+        the stage while its page was on screen, changed the lock underneath
+        and left the page as it was: editable under a lock the facade then
+        refused, or read-only after it was unlocked. Pages this lock holds
+        that are no longer shown are released when it no longer applies.
+        """
+        if getattr(self, '_externalMeshMode', False):
+            return
+        stack = getattr(self, '_contentStack', None)
+        widget = stack.currentWidget() if hasattr(stack, 'currentWidget') else None
+        step, _page = self._legacyPageFor(widget)
+        for held in self._heldByResultLock() - {step}:
+            if not self._resultLockedTask(held):
+                self._applyResultLock(held, False)
+        if step is not None:
+            self._updatePrerequisiteBanner(step)
 
     def retranslatePages(self):
         for page in self._pages.values():
@@ -861,7 +1015,10 @@ class StepManager(QObject):
     def _setWorkingStep(self, step):
         if self._externalMeshMode:
             return
-        self._pages[step].unlock()
+        # DP-1084. Moving the working step onto a page does not lift the
+        # result lock that holds it read-only.
+        if step not in (getattr(self, '_resultLockedPages', None) or ()):
+            self._pages[step].unlock()
         self._navigation.setWorkingStep(step)
         self._workingStep = step
 
@@ -986,7 +1143,7 @@ class StepManager(QObject):
             return
 
         self._sceneVisible = False
-        hidden = await self._pages[prev].hide()
+        hidden = await self._saveLegacyPage(prev, self._pages[prev].hide)
         if self._routeSuperseded(generation):
             return
         if not hidden:
@@ -1304,6 +1461,7 @@ class StepManager(QObject):
                 runToEnd.setEnabled(True)
 
     @qasync.asyncSlot()
+    @_one_press_at_a_time
     async def _wizardProceed(self):
         """Settle the current task, then advance to the next one that is open.
 
@@ -1380,7 +1538,7 @@ class StepManager(QObject):
                     'The import and healing settings were not saved, so the '
                     'geometry was not prepared with them.'), 8000)
                 return
-            if not await page.save():
+            if not await self._saveLegacyPage(step, page.save):
                 self._ui.statusbar.showMessage(
                     self.tr('Resolve the validation errors before proceeding.'),
                     5000)
@@ -1452,7 +1610,7 @@ class StepManager(QObject):
         branch = self._methodBranch.branch
         if widget is branch and branch is not None:
             task_page = branch.stack.currentWidget()
-            if not await commit_page_edits(task_page):
+            if not await commit_page_edits(task_page, branch):
                 # DP-254. A press that will not move says why. It used to
                 # return here without a word, which read as a dead button.
                 self._ui.statusbar.showMessage(
@@ -1563,15 +1721,23 @@ class StepManager(QObject):
                 5000)
             return
         token, label = blocked
-        answer = QMessageBox.question(
-            app.window, self.tr('Nothing to proceed to'),
-            self.tr('"{0}" is still locked, so there is no next task to '
-                    'open.\n\nOpen it anyway to see what it is waiting '
-                    'for?').format(label),
-            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Open)
-        if answer == QMessageBox.StandardButton.Open and token:
-            self._navigation.requestBranch(token)
+
+        def offer() -> None:
+            answer = QMessageBox.question(
+                app.window, self.tr('Nothing to proceed to'),
+                self.tr('"{0}" is still locked, so there is no next task to '
+                        'open.\n\nOpen it anyway to see what it is waiting '
+                        'for?').format(label),
+                QMessageBox.StandardButton.Open
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Open)
+            if answer == QMessageBox.StandardButton.Open and token:
+                self._navigation.requestBranch(token)
+
+        # Plan 37 UF20 follow-up: Proceed's task is current here, and a box
+        # opened inside it has asyncio refuse (and drop) the tasks its nested
+        # loop steps. The offer is opened on the loop's next turn instead.
+        say(offer)
 
     def _reportBlockedTask(self, branch, task_id: str) -> None:
         """Name the prerequisite that is holding this task shut (A8)."""
@@ -1590,14 +1756,21 @@ class StepManager(QObject):
                 self.tr('Finish the earlier tasks before this one.'), 5000)
             return
         names = ', '.join(titles.get(dep, dep) for dep in blocking)
-        answer = QMessageBox.question(
-            app.window, self.tr('Earlier task unfinished'),
-            self.tr('"{0}" is waiting on {1}.\n\nOpen the first one now?')
-            .format(titles.get(task_id, task_id), names),
-            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Open)
-        if answer == QMessageBox.StandardButton.Open:
-            self._navigation.requestBranch(TASK_TOKEN_PREFIX + blocking[0])
+
+        def offer() -> None:
+            answer = QMessageBox.question(
+                app.window, self.tr('Earlier task unfinished'),
+                self.tr('"{0}" is waiting on {1}.\n\nOpen the first one now?')
+                .format(titles.get(task_id, task_id), names),
+                QMessageBox.StandardButton.Open
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Open)
+            if answer == QMessageBox.StandardButton.Open:
+                self._navigation.requestBranch(
+                    TASK_TOKEN_PREFIX + blocking[0])
+
+        # Opened with no task current, as `_reportNoNextTask`'s is.
+        say(offer)
 
     #: Legacy snappy step pages and the tree task each one owns.
     _SNAPPY_STEP_TASKS = {
@@ -1804,9 +1977,19 @@ class StepManager(QObject):
                 continue
             if task_id != head:
                 title = str(branch.task_info(task_id).get('title') or task_id)
+                # Plan 37 UF4 DP-1025: and what to press once it is fixed,
+                # named by the label the footer button carries on this row.
+                try:
+                    label = self._methodBranch.proceedLabel(
+                        TASK_TOKEN_PREFIX + head)[0]
+                except Exception:                           # noqa: BLE001
+                    label = ''
+                label = str(label or self.tr('Proceed'))
                 self._ui.statusbar.showMessage(
                     self.tr('This step did not finish: {0} could not be '
-                            'completed.').format(title), 8000)
+                            'completed. The message shown says why; fix '
+                            'that, then press "{1}" again.').format(
+                                title, label), 8000)
             return False
         return True
 
@@ -1882,6 +2065,49 @@ class StepManager(QObject):
             await record_transition(branch, task_id, 'accept')
         branch.refresh_states()
         return branch.is_accepted(task_id)
+
+    def _configurationFingerprint(self):
+        """A digest of the authored configuration, or None if unreadable."""
+        import hashlib
+        import json
+        client = getattr(app, 'facadeClient', None)
+        reader = getattr(client, 'configuration', None)
+        if reader is None:
+            return None
+        try:
+            text = json.dumps(reader(), sort_keys=True, default=str)
+        except Exception:                                    # noqa: BLE001
+            return None
+        return hashlib.sha1(text.encode('utf-8')).hexdigest()
+
+    async def _saveLegacyPage(self, step, save) -> bool:
+        """Save a legacy step page, and tell its task if the settings moved.
+
+        Plan 37 UF3 DP-1036. The legacy snappy pages -- Base grid,
+        Castellation, Snap, Boundary layer, Region -- commit their own
+        working copies and sent no transition at all. A task that had
+        already run stayed PASSED, `_settleLegacyTask` found it accepted and
+        walked on, and the mesh on screen was the one made from the settings
+        before the edit. The page cannot say whether its save changed
+        anything, so the configuration is compared across it: a save that
+        changed nothing keeps the result, one that did configures the task,
+        which stales it and everything after it, so Proceed meshes again.
+        """
+        task_id = self._SNAPPY_STEP_TASKS.get(step)
+        branch = getattr(getattr(self, '_methodBranch', None), 'branch', None)
+        watched = (task_id is not None and branch is not None
+                   and getattr(branch, 'engine_id', None) == 'snappy')
+        before = self._configurationFingerprint() if watched else None
+        saved = await save()
+        if not saved or before is None:
+            return saved
+        after = self._configurationFingerprint()
+        if after is None or after == before:
+            return saved
+        if branch.is_accepted(task_id):
+            await record_transition(branch, task_id, 'configure')
+            branch.refresh_states()
+        return saved
 
     async def _settleLegacyTask(self, step, page) -> bool:
         """Advance the tree task a legacy snappy step page stands for.
@@ -2241,7 +2467,14 @@ class StepManager(QObject):
             # quality or died before it wrote anything. A refusal that
             # happened before any run started has no run id, and changes
             # nothing about the mesh on disk, so it leaves the viewport alone.
-            if built or handle.run_id:
+            # Plan 37 UF20 follow-up: so does the user's own cancel of a
+            # Gmsh run -- it stops before the publisher, the only writer of
+            # the case mesh -- which used to clear the viewport over an
+            # accepted mesh still on disk.
+            cancelled = self._userCancelled(payload)
+            if cancelled and self._caseMeshUntouched(payload):
+                pass
+            elif built or handle.run_id:
                 await self._drawFinishedMesh(handle)
             unpublished = unpublished_mesh_reason(payload)
             if result.status == 'accepted' and unpublished:
@@ -2260,6 +2493,8 @@ class StepManager(QObject):
                 await AsyncMessageBox().information(
                     self._contentStack, self.tr('Process completed'),
                     self.tr('The %s pipeline completed.') % name)
+            elif cancelled:
+                await self._reportPipelineCancelled(name, payload, handle)
             else:
                 await self._reportPipelineFailure(
                     name, str(payload.get('reason') or ''), built=built,
@@ -2408,6 +2643,58 @@ class StepManager(QObject):
         if offer is not None:
             offer(message, previous)
 
+    @staticmethod
+    def _userCancelled(payload: dict) -> bool:
+        """Whether this run ended because the user stopped it.
+
+        The Gmsh compute says so in ``cancelled``; a snappy node's job
+        carries ``status='cancelled'`` and the facade's cancel sentence.
+        """
+        if payload.get('cancelled'):
+            return True
+        if str((payload.get('job') or {}).get('status') or '') == 'cancelled':
+            return True
+        return (str(payload.get('reason') or '')
+                == 'the run was cancelled before it finished')
+
+    @staticmethod
+    def _caseMeshUntouched(payload: dict) -> bool:
+        """Whether a cancelled run left the case mesh as it was.
+
+        ``cancelled`` is set only by the Gmsh compute, which stops before the
+        publisher -- the one writer of the case mesh -- so whatever the case
+        held is still there and still what the viewport should show. A snappy
+        stage rewrites the case mesh in place, so its cancel is not this.
+        """
+        return bool(payload.get('cancelled'))
+
+    async def _reportPipelineCancelled(self, engine: str, payload: dict,
+                                       handle) -> None:
+        """Say the user's own cancel landed, worded as a cancel.
+
+        Plan 37 UF20 follow-up, MEASURED live (BUDGETS.md section 3): a
+        cancelled Gmsh run was reported in a box titled "Gmsh pipeline did
+        not run" -- the heading for a run that was refused -- over a viewport
+        cleared although the accepted mesh was still on disk.
+        """
+        headline = self.tr('{0} run cancelled').format(engine)
+        detail = self.tr('The run was cancelled before it finished, as you '
+                         'asked.')
+        if self._caseMeshUntouched(payload):
+            detail = '{0} {1}'.format(detail, self.tr(
+                'The case mesh is unchanged.'))
+        console = app.consoleView
+        if console is not None:
+            console.append('{0}: {1}'.format(headline, detail))
+        self._ui.statusbar.showMessage(detail, 10000)
+        status = getattr(getattr(app, 'window', None), 'showRunStatus', None)
+        if callable(status):
+            status(self.tr('{0} · cancelled · {1}').format(
+                getattr(handle, 'run_id', '') or engine, detail),
+                log=str(payload.get('log') or ''))
+        await AsyncMessageBox().information(
+            self._contentStack, headline, detail)
+
     async def _reportPipelineFailure(self, engine: str, reason: str,
                                      *, built: bool = False, log: str = '',
                                      details: str = '') -> None:
@@ -2448,11 +2735,30 @@ class StepManager(QObject):
             extra['informativeText'] = self.tr('Log: %s') % log
         if details.strip():
             extra['detailedText'] = details.strip()
+        # Plan 37 UF20 follow-up (DP-1130 path), MEASURED on GU3: a footer
+        # run refused for boundary layers with nothing ticked left the run
+        # strip reading "Meshing on a single worker." in the running state,
+        # Cancel and all, for a run that never started. The plan's line is
+        # replaced with the refusal -- unless the draw already put up its own
+        # line or offer, which is about this run too.
+        window = getattr(app, 'window', None)
+        strip = getattr(window, '_runStatusStrip', None)
+        status = getattr(window, 'showRunStatus', None)
+        if callable(status) and getattr(strip, 'state', 'running') in (
+                'running', 'cancelling'):
+            status('{0}: {1}'.format(headline, detail), failed=True, log=log)
         await AsyncMessageBox().warning(
             self._contentStack, headline, detail, **extra)
 
     @qasync.asyncSlot()
     async def _cancelFinishSteps(self):
+        # The footer Cancel is the one a Gmsh run offers on the page; the
+        # run strip's Cancel is the same request, so the strip says it was
+        # taken too rather than still reading "running".
+        strip = getattr(getattr(app, 'window', None), '_runStatusStrip', None)
+        mark = getattr(strip, 'markCancelling', None)
+        if callable(mark) and getattr(strip, 'state', '') == 'running':
+            mark()
         await app.facadeClient.cancel_active_job()
 
     @qasync.asyncSlot()

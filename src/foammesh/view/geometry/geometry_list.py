@@ -136,6 +136,76 @@ class GeometryItem(QTreeWidgetItem):
         self.setGeometry(self._geometry)
 
 
+class FarfieldItem(QTreeWidgetItem):
+    """The farfield, as one row of the geometry tree.
+
+    Plan 37 (Geometry > Farfield...). Not a geometry element: the farfield is
+    the one ``gmsh/farfield`` record both engines read, and this row is how
+    the page says it is on and what shape it is. It carries no geometry id,
+    so nothing that acts on geometry rows -- the boundary operations, the
+    selection service, Remove of a surface -- ever receives it; the page's
+    own menu edits it or switches it off.
+    """
+
+    def __init__(self, spec):
+        super().__init__()
+        self._spec = spec
+        self.setSpec(spec)
+
+    def gId(self):
+        return ''
+
+    def geometry(self):
+        return None
+
+    def spec(self):
+        return self._spec
+
+    def isVolume(self):
+        return False
+
+    def isSurface(self):
+        return False
+
+    def setSpec(self, spec):
+        from foammesh.core.mesh import farfield_spec
+
+        self._spec = spec
+        name = QCoreApplication.translate('GeometryPage', 'Farfield ({0})').format(
+            QCoreApplication.translate('GeometryPage', spec.shape))
+        kind = QCoreApplication.translate('GeometryPage', 'Outer boundary')
+        self.setText(Column.NAME_COLUMN, name)
+        self.setText(Column.TYPE_COLUMN, kind)
+        tip = QCoreApplication.translate(
+            'GeometryPage', '{0}: a {1} around the geometry, with the bodies '
+            'cut out of it. Double-click to edit it.').format(
+                farfield_spec.ROLE_TITLE, spec.shape)
+        self.setToolTip(Column.NAME_COLUMN, tip)
+        self.setToolTip(Column.TYPE_COLUMN, tip)
+
+    def retranslate(self):
+        self.setSpec(self._spec)
+
+
+def isFarfield(item) -> bool:
+    return isinstance(item, FarfieldItem)
+
+
+def readFarfield(db):
+    """The case's farfield spec when it is on, else ``None``.
+
+    Read-only and forgiving: a double of the database without the farfield
+    record (older unit fakes) has no farfield rather than an error.
+    """
+    from foammesh.core.mesh import farfield_spec
+
+    try:
+        spec = farfield_spec.read(db)
+    except Exception:                                        # noqa: BLE001
+        return None
+    return spec if spec.enabled else None
+
+
 class GeometryList(QObject):
     selectedItemsChanged = Signal()
 
@@ -145,6 +215,7 @@ class GeometryList(QObject):
         self._tree = tree
         self._items = None
         self._swatches = {}
+        self._farfield = None
         self._setupColourColumn()
         self._applyTheme()
         if app.themeManager is not None:
@@ -288,7 +359,9 @@ class GeometryList(QObject):
         # opened. An id never changes under an edit, so this order does not
         # either; it is also the order the split produced, which is the order
         # the user watched appear.
-        geometries = app.facadeClient.checkout().getElements('geometry')
+        self._farfield = None
+        db = app.facadeClient.checkout()
+        geometries = db.getElements('geometry')
         for gId, geometry in sorted(geometries.items(),
                                     key=lambda item: int(item[0])):
             if gId not in self._items:
@@ -296,7 +369,35 @@ class GeometryList(QObject):
                 if volume and volume not in self._items:
                     self.add(volume, geometries[volume])
                 self.add(gId, geometry)
+        self._showFarfield(readFarfield(db))
 
+    # -- the farfield row -------------------------------------------------- #
+
+    def _showFarfield(self, spec):
+        """One Farfield row, first in the tree, while the farfield is on."""
+        if spec is None:
+            if self._farfield is not None:
+                index = self._tree.indexOfTopLevelItem(self._farfield)
+                if index > -1:
+                    self._tree.takeTopLevelItem(index)
+                self._farfield = None
+            return
+        if self._farfield is None:
+            self._farfield = FarfieldItem(spec)
+            self._farfield.setIcon(Column.NAME_COLUMN, self.volumeIcon)
+            self._tree.insertTopLevelItem(0, self._farfield)
+        else:
+            self._farfield.setSpec(spec)
+
+    def refreshFarfield(self):
+        """Re-read the farfield record (after the dialog or Remove wrote it)."""
+        self._showFarfield(readFarfield(app.facadeClient.checkout()))
+
+    def farfieldItem(self):
+        return self._farfield
+
+    def farfieldSelected(self) -> bool:
+        return self._farfield is not None and self._farfield.isSelected()
 
     def add(self, gId, geometry):
         item = GeometryItem(gId, geometry)
@@ -340,12 +441,15 @@ class GeometryList(QObject):
         self._tree.clear()
         self._items = {}
         self._swatches = {}
-        
+        self._farfield = None
+
     def selectedIDs(self):
-        return [str(item.gId()) for item in self._tree.selectedItems()]
+        return [str(item.gId()) for item in self.selectedItems()]
 
     def selectedItems(self):
-        return self._tree.selectedItems()
+        """The selected geometry rows; the farfield row is not one."""
+        return [item for item in self._tree.selectedItems()
+                if not isFarfield(item)]
 
     def rowIDs(self):
         """The geometry ids the tree is showing, or `None` before it loads.
@@ -380,6 +484,8 @@ class GeometryList(QObject):
     def retranslate(self):
         for item in self._items.values():
             item.retranslate()
+        if self._farfield is not None:
+            self._farfield.retranslate()
 
     def _connectSignalsSlots(self):
         self._tree.itemSelectionChanged.connect(self._correctSelection)
@@ -387,7 +493,9 @@ class GeometryList(QObject):
     def _correctSelection(self):
         if len(self._tree.selectedItems()) > 1:
             for item in self._tree.selectedItems():
-                if item.isVolume():
+                # The farfield is edited on its own: selected with geometry
+                # rows it would be half of an operation it takes no part in.
+                if item.isVolume() or isFarfield(item):
                     item.setSelected(False)
 
         self.selectedItemsChanged.emit()

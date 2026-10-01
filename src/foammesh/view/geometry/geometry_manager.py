@@ -136,6 +136,8 @@ class GeometryManager(ActorManager):
         #: DP-818. The live seed being placed, and the opacities the geometry
         #: had before it was faded for placing it.
         self._seedPreview = None
+        #: Plan 37 UF16. The exclude point being placed: a handle of its own.
+        self._excludePreview = None
         self._fadedOpacities = None
         #: Plan 36 RP6. The labelled spaces and their volumes, built once
         #: per geometry and domain; the fade the walls are at now.
@@ -185,6 +187,7 @@ class GeometryManager(ActorManager):
     def clear(self):
         self.clearFindingHighlight()
         self._clearSeedPreview()
+        self._clearExcludePreview()
         # The actors whose opacity was saved are about to go.
         self._fadedOpacities = None
         if self._regionVolumes is not None:
@@ -192,6 +195,31 @@ class GeometryManager(ActorManager):
             self._regionVolumes.reset()
         app.selectionService.remove_owner('geometry-db')
         super().clear()
+
+    def dispose(self):
+        """Release the actors and the one global that still holds this manager.
+
+        Plan 35 CR3 disposes the closing case's managers so that nothing is
+        left for the cyclic collector. The selection service is app-wide and
+        outlives every case, and `__init__` handed it a bound method of this
+        manager as its renderer -- so a disposed manager stayed reachable
+        from it until the next case bound a new one, or, after the last case,
+        until interpreter finalization collected a QObject whose module and
+        type objects had already been torn down: an access violation at exit
+        (MEASURED: every test file that builds a manager and never replaces it
+        exited 3221225477 after all its tests passed). The binding is taken
+        back only if it is still this manager's, so disposing an old manager
+        after a new one has bound cannot blank the new one's highlights.
+        """
+        super().dispose()
+        service = app.selectionService
+        if getattr(service, '_renderer', None) == self._applySelectionState:
+            service.bind_renderer(None)
+        try:
+            self._displayControl.selectedActorsChanged.disconnect(
+                self.selectedActorsChanged)
+        except (RuntimeError, TypeError, AttributeError):
+            pass                    # never connected, or a stub without it
 
     def subSurfaces(self, gId):
         return app.facadeClient.checkout().getElements(
@@ -315,8 +343,11 @@ class GeometryManager(ActorManager):
         regions = []
         bounds = None
         measured = False
-        for region_id, region in app.facadeClient.checkout().getElements(
-                'region').items():
+        # One checkout serves the seeds and the exclude points: a reload is
+        # a read of the region side of the store, not two whole copies of it
+        # (DP-397 counts every checkout a refresh asks for).
+        db = app.facadeClient.checkout()
+        for region_id, region in db.getElements('region').items():
             try:
                 if region.value('gType') is not None:
                     continue
@@ -336,7 +367,49 @@ class GeometryManager(ActorManager):
                 (marker,) if marker is not None else (),
                 SelectionStatus.VALID, owner='geometry-db'))
         app.selectionService.synchronize(kept + regions, owner='geometry-db')
+        self._reloadExcludeMarkers(bounds if measured else None, db)
         self.applyToDisplay()
+
+    def _reloadExcludeMarkers(self, bounds=None, db=None):
+        """Plan 37 UF16. Draw every stored exclude point with the seeds.
+
+        A cube in the warning colour, shown and hidden with the seed glyphs
+        (it is a `RegionMarkerActor`, so it never grows the base-grid box
+        either, DP-821).
+        """
+        from foammesh.rendering.actor_info import ExcludeMarkerActor
+        from foammesh.rendering.seed_gizmo import excludeColour
+
+        for key in [key for key in tuple(self._actorInfos)
+                    if str(key).startswith('exclude:')]:
+            self.remove(key)
+        try:
+            if db is None:
+                db = app.facadeClient.checkout()
+            rows = db.getElements('castellation/excludePoints')
+        except Exception:                                     # noqa: BLE001
+            return
+        rows = dict(rows or {})
+        if not rows:
+            return
+        if bounds is None:
+            try:
+                bounds = self.getBounds()
+            except (AttributeError, TypeError, ValueError):
+                return          # a scene that cannot be measured draws none
+        colour = QColor(excludeColour())
+        for point_id, row in rows.items():
+            try:
+                point = row.vector('point')
+                name = row.value('name')
+            except (LookupError, TypeError, ValueError, AttributeError):
+                continue
+            marker = ExcludeMarkerActor.build(point_id, name, point, bounds)
+            if marker is None:
+                continue
+            self.add(marker)
+            marker.setColor(colour)
+            marker.setVisible(self._regionMarkersShown)
 
     def _addRegionMarker(self, region_id, region, bounds):
         """Draw one region seed, and answer with the actor id it took.
@@ -490,6 +563,56 @@ class GeometryManager(ActorManager):
     def seedPreview(self):
         """The seed handle being placed, or ``None``."""
         return self._seedPreview
+
+    # -- Plan 37 UF16: the exclude point being placed ------------------------
+
+    def previewExclude(self, point):
+        """Draw the exclude point being placed; ``None`` takes it away.
+
+        The same draggable handle as a seed's, as a cube in the warning
+        colour (`SeedGizmo` role ``exclude``), moved rather than rebuilt as
+        the point changes. Its shape is crossed only on a wall, where v13
+        ignores it. Answers the inside/outside verdict of the point.
+        """
+        if point is None:
+            self._clearExcludePreview()
+            return None
+        try:
+            centre = tuple(float(component) for component in point)
+        except (TypeError, ValueError):
+            self._clearExcludePreview()
+            return None
+        if len(centre) != 3:
+            self._clearExcludePreview()
+            return None
+        verdict = self.classifySeed(centre)
+        gizmo = self._excludePreview
+        if gizmo is None:
+            from foammesh.rendering.seed_gizmo import EXCLUDE, SeedGizmo
+
+            view = getattr(self._displayControl, 'view', None)
+            gizmo = SeedGizmo(view() if callable(view) else None, centre,
+                              role=EXCLUDE)
+            self._excludePreview = gizmo
+            gizmo.setVerdict(verdict)
+            self._displayControl.refreshView()
+            return verdict
+        if gizmo.position() != centre:
+            gizmo.setPosition(centre)                 # draws itself
+        if gizmo.verdict() != verdict:
+            gizmo.setVerdict(verdict)
+            self._displayControl.refreshView()
+        return verdict
+
+    def excludePreview(self):
+        """The exclude-point handle being placed, or ``None``."""
+        return self._excludePreview
+
+    def _clearExcludePreview(self):
+        if self._excludePreview is not None:
+            gizmo, self._excludePreview = self._excludePreview, None
+            gizmo.close()
+            gizmo.deleteLater()
 
     # -- Plan 36 RP6: the space a seed will mesh -----------------------------
 

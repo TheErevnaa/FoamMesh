@@ -191,7 +191,10 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                 'castellation/refinementSurfaces',
                 'castellation/refinementVolumes',
                 'castellation/featureBands',
-                'castellation/volumeBands'),  # DP-586
+                'castellation/volumeBands',  # DP-586
+                # Plan 37 UF16. Authored on Domain & regions, read here:
+                # the castellated mesh is what an exclude point changes.
+                'castellation/excludePoints'),
             artifacts=(_POLY_MESH,), run_gated=True),
         WorkflowTask(
             'snappy.snap', 'Snap', 50,
@@ -234,6 +237,8 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                 'addLayers/nSmoothDisplacement',
                 'addLayers/detectExtrusionIsland',
                 'addLayers/additionalReporting', 'addLayers/meshShrinker',
+                # Plan 37 UF15.
+                'addLayers/concaveAngle', 'addLayers/mergeFaces',
             ) + _collection_fields('addLayers/layers'),
             artifacts=(_POLY_MESH,), run_gated=True),
         # GF2, MQ and RA are siblings: each depends only on the final mesh, so
@@ -264,6 +269,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                 'meshQuality/minVolCollapseRatio', 'meshQuality/minArea',
                 'meshQuality/minTwist', 'meshQuality/minDeterminant',
                 'meshQuality/minFaceWeight', 'meshQuality/minVolRatio',
+                'meshQuality/minFaceFlatness',              # Plan 37 UF15
                 'meshQuality/nSmoothScale', 'meshQuality/errorReduction',
                 'meshQuality/mergeTolerance',
                 'meshQuality/relaxed/maxNonOrtho',
@@ -275,7 +281,8 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                 'meshQuality/relaxed/minArea', 'meshQuality/relaxed/minTwist',
                 'meshQuality/relaxed/minDeterminant',
                 'meshQuality/relaxed/minFaceWeight',
-                'meshQuality/relaxed/minVolRatio'),
+                'meshQuality/relaxed/minVolRatio',
+                'meshQuality/relaxed/minFaceFlatness'),     # Plan 37 UF15
             artifacts=(_QUALITY,), accepts_override=True, run_gated=True,
             invalidates=('common.summary', 'common.export')),
         WorkflowTask(

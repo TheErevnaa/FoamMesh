@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget, QMessageBox
+from PySide6.QtWidgets import QLabel, QWidget, QMessageBox
 import qasync
 
 from foammesh.support.simple_db.simple_schema import ValidationError
@@ -14,6 +14,8 @@ from foammesh.view.theming.metrics import place_unit
 from widgets.rendering.point_widget import PointWidget
 
 from foammesh.app import app
+from foammesh.view.outside_task import modal
+from foammesh.core.facade.domain_operations import TaskLockedError
 from foammesh.db.configurations_schema import RegionType
 from .region_form_ui import Ui_RegionForm
 from .seed_feedback import SeedFeedback
@@ -60,6 +62,16 @@ class RegionForm(QWidget):
         # moves. The page owns the stored glyph, so this line never takes it.
         self._seedFeedback = SeedFeedback(self._ui.widget_6)
         self._ui.formLayout_2.addRow('', self._seedFeedback)
+
+        # Plan 37 UF5 DP-1082. A region edit on a locked case is refused by
+        # the facade; the refusal escaped this slot unhandled, so OK did
+        # nothing visible. It is said here, under the fields it refused.
+        self._lockNotice = QLabel(self._ui.widget_6)
+        self._lockNotice.setObjectName('regionFormLockNotice')
+        self._lockNotice.setWordWrap(True)
+        self._lockNotice.setProperty('foammeshStatus', 'error')
+        self._lockNotice.hide()
+        self._ui.formLayout_2.addRow('', self._lockNotice)
 
         self.hide()
 
@@ -116,8 +128,24 @@ class RegionForm(QWidget):
     def owner(self):
         return self._owner
 
+    def lockNotice(self) -> QLabel:
+        return self._lockNotice
+
+    def _showLocked(self, error) -> None:
+        details = getattr(error, 'details', None) or {}
+        titles = [str(title) for title in (details.get('titles') or ())]
+        what = ', '.join(titles) if titles else self.tr('A meshing step')
+        self._lockNotice.setText(self.tr(
+            'Not saved: {0} {1} locked, because the mesh on disk was made '
+            'from these regions. Unlock the step (right-click it in the '
+            'workflow) to change them; the results after it are '
+            'discarded.').format(
+                what, self.tr('is') if len(titles) <= 1 else self.tr('are')))
+        self._lockNotice.show()
+
     def setupForAdding(self):
         self._id = None
+        self._lockNotice.hide()
         db = app.facadeClient.checkout()
         self._dbElement = db.newElement('region')
 
@@ -132,6 +160,7 @@ class RegionForm(QWidget):
 
     def setupForEditing(self, id_):
         self._id = id_
+        self._lockNotice.hide()
         self._dbElement = app.facadeClient.checkout(f'region/{id_}')
 
         self._ui.regionForm.setTitle(self.tr('Edit region'))
@@ -208,7 +237,8 @@ class RegionForm(QWidget):
             name = self._ui.name.text()
             if app.facadeClient.checkout().getElements(
                     'region', lambda i, e: e['name'] == name and i != self._id):
-                QMessageBox.warning(self, self.tr('Input error'), self.tr('Region "{0}" already exists.').format(name))
+                await modal(QMessageBox.warning, self, self.tr('Input error'),
+                            self.tr('Region "{0}" already exists.').format(name))
                 return
 
             try:
@@ -222,8 +252,8 @@ class RegionForm(QWidget):
                 return
 
             if not self._pointWidget.bounds().includes((float(x), float(y), float(z))):
-                QMessageBox.warning(self, self.tr('Input error'),
-                                        self.tr('The point is outside the bounding box.'))
+                await modal(QMessageBox.warning, self, self.tr('Input error'),
+                            self.tr('The point is outside the bounding box.'))
                 return
 
             try:
@@ -249,10 +279,17 @@ class RegionForm(QWidget):
 
                 self._pointWidget.off()
                 self._seedFeedback.end()
+                self._lockNotice.hide()
+            except TaskLockedError as error:
+                # Stay open with the entries: unlocking and pressing OK
+                # again is the way through.
+                self._showLocked(error)
             except CONFLICT_ERRORS as error:
                 # Stay open: the user's entries are still here, and the only
                 # thing that changed is what the case looked like underneath.
-                QMessageBox.warning(
+                await modal(
+                    QMessageBox.warning,
                     self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                QMessageBox.warning(self, self.tr("Input error"), e.toMessage())
+                await modal(QMessageBox.warning,
+                            self, self.tr("Input error"), e.toMessage())

@@ -256,6 +256,47 @@ def _leading_count(payload: bytes, path_hint: str) -> tuple[int, int]:
     return int(head[-1]), open_at
 
 
+#: ``N{v}``: OpenFOAM's short form of a list whose entries are all ``v``.
+#: v13 writes the owner of a one-cell mesh as ``6{0}`` and an unrefined
+#: ``cellLevel`` as ``8{0}`` (Plan 37 UF10a, DP-1050).
+_UNIFORM = re.compile(rb'\A\s*(\d+)\s*\{([^{}]*)\}')
+#: A binary empty list is its count alone: v13 writes ``0`` and no parens.
+_BARE_EMPTY = re.compile(rb'\A\s*0\s*\Z')
+
+
+def _uniform_list(payload: bytes) -> tuple[int, bytes] | None:
+    """``(count, value)`` of a list written ``N{v}``, else None."""
+    match = _UNIFORM.match(payload)
+    if match is None:
+        return None
+    return int(match.group(1)), match.group(2).strip()
+
+
+def _list_count(payload: bytes, path_hint: str) -> int:
+    """The entry count of a list in any form OpenFOAM writes it."""
+    uniform = _uniform_list(payload)
+    if uniform is not None:
+        return uniform[0]
+    if _BARE_EMPTY.match(payload):
+        return 0
+    return _leading_count(payload, path_hint)[0]
+
+
+def _uniform_values(value: bytes, dtype, width: int, count: int,
+                    hint: str) -> np.ndarray:
+    """The ``count`` entries of ``N{value}`` as a flat array."""
+    tokens = value.replace(b'(', b' ').replace(b')', b' ').split()
+    cast = int if np.issubdtype(dtype, np.integer) else float
+    try:
+        entry = [cast(token) for token in tokens]
+    except ValueError:
+        entry = []
+    if len(entry) != width:
+        raise PolyMeshReadError(
+            'malformed_list', f'{hint} has an unreadable uniform value')
+    return np.tile(np.asarray(entry, dtype=dtype), count)
+
+
 def _numbers(text: bytes, dtype) -> np.ndarray:
     """Parse a whitespace/paren separated numeric list.
 
@@ -313,6 +354,11 @@ def _read_points(mesh: Path) -> np.ndarray:
 
 def _read_points_tokens(mesh: Path) -> np.ndarray:
     _header, payload = _open_member(mesh, 'points')
+    uniform = _uniform_list(payload)
+    if uniform is not None:
+        count, value = uniform
+        return _uniform_values(value, np.float64, 3, count,
+                               'points').reshape(count, 3)
     count, open_at = _leading_count(payload, 'points')
     values = _numbers(payload[open_at:], np.float64)
     if values.size != count * 3:
@@ -337,6 +383,10 @@ def _read_labels(mesh: Path, name: str) -> np.ndarray:
 
 def _read_labels_tokens(mesh: Path, name: str) -> np.ndarray:
     _header, payload = _open_member(mesh, name)
+    uniform = _uniform_list(payload)
+    if uniform is not None:
+        count, value = uniform
+        return _uniform_values(value, np.int64, 1, count, name)
     count, open_at = _leading_count(payload, name)
     values = _numbers(payload[open_at:], np.int64)
     if values.size != count:
@@ -647,8 +697,22 @@ def _faces_from_flat(flat: np.ndarray, count: int, *,
     return flat[keep], offsets
 
 
-def _read_boundary(mesh: Path) -> tuple[BoundaryPatch, ...]:
-    _header, payload = _open_member(mesh, 'boundary')
+def _read_boundary(mesh: Path, *,
+                   any_format: bool = False) -> tuple[BoundaryPatch, ...]:
+    """The patch table. ``any_format``: OpenFOAM writes ``boundary`` as text
+    even under a ``format binary`` header, so a reader that decodes binary
+    reads it regardless (Plan 37 UF10a)."""
+    if any_format:
+        path = _member(mesh, 'boundary')
+        if path is None:
+            raise PolyMeshReadError(
+                'incomplete_poly_mesh', f'{mesh} is missing boundary',
+                path=mesh)
+        raw = _read_bytes(path)
+        _parse_header(raw, path)
+        payload = _payload(raw, _FOAMFILE.search(raw).end())
+    else:
+        _header, payload = _open_member(mesh, 'boundary')
     count, open_at = _leading_count(payload, 'boundary')
     patches = []
     for name, body in _NAMED_DICT.findall(payload[open_at:]):
@@ -865,8 +929,7 @@ def _head_member(mesh: Path, name: str) -> tuple[Path, dict, bytes]:
 
 def _head_count(mesh: Path, name: str) -> tuple[Path, dict, int]:
     path, header, payload = _head_member(mesh, name)
-    count, _open_at = _leading_count(payload, name)
-    return path, header, count
+    return path, header, _list_count(payload, name)
 
 
 def read_counts(path: str | Path, *,
@@ -885,6 +948,9 @@ def read_counts(path: str | Path, *,
     cells = None
     for name in ('points', 'faces', 'owner', 'neighbour'):
         member, header, count = _head_count(mesh, name)
+        if name == 'faces' and header.get('class') == 'faceCompactList':
+            # The first list is the offsets, one longer than the faces.
+            count = max(count - 1, 0)
         sizes[name] = _uncompressed_size(member)
         formats[name] = header.get('format', 'ascii')
         counts[name] = count
@@ -894,7 +960,7 @@ def read_counts(path: str | Path, *,
                 cells = int(note['nCells'])
     boundary = _member(mesh, 'boundary')
     sizes['boundary'] = boundary.stat().st_size if boundary else 0
-    patches = tuple((item.name, item.n_faces) for item in _read_boundary(mesh))
+    patches = tuple((item.name, item.n_faces) for item in _read_boundary(mesh, any_format=True))
     return MeshCounts(
         path=mesh, points=counts['points'], faces=counts['faces'],
         internal_faces=counts['neighbour'], cells=cells, patches=patches,
@@ -1174,7 +1240,7 @@ def read_poly_mesh_boundary(path: str | Path, *,
                 'compact_face_list',
                 f'{mesh / "faces"} uses faceCompactList, which this reader does '
                 'not decode; rewrite the mesh with a faceList encoding')
-        headers[name] = _leading_count(payload, name)[0]
+        headers[name] = _list_count(payload, name)
 
     # Refuse in the full reader's order -- points, then faces, then the
     # boundary and the consistency checks -- so a mesh damaged in two places

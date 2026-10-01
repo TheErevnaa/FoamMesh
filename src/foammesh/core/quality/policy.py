@@ -87,9 +87,23 @@ EDITABLE_LIMITS: tuple[str, ...] = (
     'minDeterminant',
     'minFaceWeight',
     'minVolRatio',
+    # Plan 37 UF15. The one limit with no shipped value: see OPTIONAL_LIMITS.
+    'minFaceFlatness',
     'nSmoothScale',
     'errorReduction',
 )
+
+#: Plan 37 UF15. Strict limits OpenFOAM ships no value for. OpenFOAM 13 runs
+#: the flatness check only when the key is present (src/meshCheck/checkMesh.C
+#: 78-83), so an empty editor box stores nothing, writes nothing and leaves
+#: the check off -- the dictionary every existing project already wrote.
+OPTIONAL_LIMITS: tuple[str, ...] = ('minFaceFlatness',)
+
+#: Relaxed limits snappyHexMesh does not inherit from the strict block. Every
+#: other relaxed limit is looked up recursively, so an empty relaxed box means
+#: the strict value governs; ``minFaceFlatness`` is found without recursion,
+#: so an empty relaxed box means no flatness check in the relaxed phase.
+NOT_INHERITED_BY_RELAXED: tuple[str, ...] = ('minFaceFlatness',)
 
 #: ``mergeTolerance`` sits beside the quality block in the same dictionary and
 #: in the same editors, but it is not a quality limit and is not relaxed.

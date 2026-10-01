@@ -191,7 +191,7 @@ class GmshVolumeControlsPage(GmshTaskPage):
             self._client, 'gmsh.volume_controls.controls',
             self.tr('Volume controls'), columns=self.COLUMNS, parent=self,
             headings=self.HEADINGS, stretch='scope_token')
-        self.panel.childrenChanged.connect(self.refresh)
+        self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         self.panel.setToolTip(self.tr(self.INCLUDED_NOTE))
         self.panel.setAccessibleDescription(self.tr(self.INCLUDED_NOTE))
         layout.addWidget(self.panel)
@@ -246,27 +246,34 @@ class GmshVolumeControlsPage(GmshTaskPage):
         volumes = self._solidVolumes
         lines = volumes.lines() if volumes is not None else []
         heading = self.tr('Solids (each is a region):')
-        if lines and self._farfieldCuts(volumes):
-            # DP-915: the far-field box cuts every solid out; they are the
-            # obstacle, and the fluid is the space around them.
+        shape = self._farfieldCuts(volumes) if lines else ''
+        if shape:
+            # DP-915: the far field cuts every solid out; they are the
+            # obstacle, and the fluid is the space around them. Plan 37
+            # UF13: it names the far field's shape, not always the box.
             heading = self.tr(
-                'Solids (the far-field box cuts them out: they are the '
-                'obstacle, and the fluid is the space around them):')
+                'Solids (the far-field {0} cuts them out: they are the '
+                'obstacle, and the fluid is the space around them):'
+            ).format(shape)
         self._solidsLabel.setText(
             heading + '\n' + '\n'.join(lines) if lines else '')
         self._solidsLabel.setVisible(bool(lines))
 
-    def _farfieldCuts(self, volumes) -> bool:
+    def _farfieldCuts(self, volumes) -> str:
+        """The far field's shape when it cuts every solid out, else ``''``."""
         from foammesh.core.mesh.cad_solids import (
-            CaseSolids, farfield_cuts, farfield_enabled,
+            CaseSolids, farfield_cuts, farfield_enabled, shape_of,
         )
 
         try:
             db = self._client.session().state.db
             solids = list(volumes.solids())
         except Exception:                        # noqa: BLE001 - no case yet
-            return False
-        return farfield_cuts(CaseSolids(solids=solids), farfield_enabled(db))
+            return ''
+        farfield = farfield_enabled(db)
+        if not farfield_cuts(CaseSolids(solids=solids), farfield):
+            return ''
+        return shape_of(farfield)
 
     def _solidsReady(self) -> None:
         self._retypeSolids()

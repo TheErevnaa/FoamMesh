@@ -7,8 +7,10 @@
   viewport reliably, and the start after one is a safe-mode start.
 * ``glGetError`` straight from ``opengl32.dll``: VTK's Python wrapping has no
   way to ask, and a context the driver reset reports GL_CONTEXT_LOST there.
-* The face budget: depth peeling redraws the scene once per peel, so above a
-  million visible faces translucency is blended in draw order instead.
+* The face budget: depth peeling redraws the scene once per peel, so above
+  the GPU's peeling budget (``gpu_profile``: a million faces on an integrated
+  GPU or before the GPU is known, scaled with a discrete card's memory)
+  translucency is blended in draw order instead.
 
 No Qt here; the rendering widget owns the reactions.
 """
@@ -25,7 +27,8 @@ logger = logging.getLogger(__name__)
 GL_INFO_FILE = 'gl_info.json'
 #: The oldest OpenGL VTK's OpenGL2 backend is written for.
 MINIMUM_VERSION = (3, 2)
-#: Visible faces above which translucent parts are no longer depth-peeled.
+#: Visible faces above which translucent parts are no longer depth-peeled,
+#: while the GPU is not known; :func:`face_budget` scales it to the GPU.
 FACE_BUDGET = 1_000_000
 
 GL_OUT_OF_MEMORY = 0x0505
@@ -214,12 +217,22 @@ def visible_faces(renderer) -> int:
     return total
 
 
-def peeling_decision(translucent: bool, faces: int, preset) -> tuple[bool, str]:
+def face_budget() -> int:
+    """Visible faces the GPU in use depth-peels (``gpu_profile``)."""
+    try:
+        from foammesh.rendering import gpu_profile
+        return int(gpu_profile.display_budget().peeling_faces)
+    except Exception:                                      # noqa: BLE001
+        return FACE_BUDGET
+
+
+def peeling_decision(translucent: bool, faces: int, preset,
+                     budget: int | None = None) -> tuple[bool, str]:
     """``(peel, note)``: whether to depth-peel, and what to tell the user."""
     from foammesh.rendering import render_style
 
     if not translucent or not render_style.quality(preset).peeling:
         return False, ''
-    if faces > FACE_BUDGET:
+    if faces > (face_budget() if budget is None else int(budget)):
         return False, PEELING_NOTE.format(int(faces))
     return True, ''

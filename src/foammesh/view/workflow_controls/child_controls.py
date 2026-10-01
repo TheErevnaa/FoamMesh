@@ -166,6 +166,9 @@ class ChildControlPanel(QGroupBox):
     """Table of child items plus an editor form for the selected row."""
 
     childrenChanged = Signal()
+    #: Plan 37 UF3 DP-1035. A row was created, changed or removed and the
+    #: facade took it: the hosting task's settings have changed.
+    editCommitted = Signal()
     #: FIELD-04. The prepared boundary the selected row refines, as the stable
     #: reference the catalogue knows it by -- empty when the row names none.
     #: W-O2, Plan 33 section 6 check 9: this used to say that a page owning a
@@ -599,6 +602,10 @@ class ChildControlPanel(QGroupBox):
     def refresh(self) -> None:
         if self._live:
             self.refreshChoices()
+        # DP-1029. The selection is a group, not a position: the rows are
+        # rebuilt by position below, so the key selected before is re-selected
+        # after, wherever it has moved to.
+        selected = self.selected_key()
         self._rows = self._read_rows()
         self.table.setRowCount(len(self._rows))
         for index, row in enumerate(self._rows):
@@ -615,6 +622,11 @@ class ChildControlPanel(QGroupBox):
                     item.setForeground(QColor('#ff5f56'))
                     item.setToolTip(scope_problem)
                     item.setStatusTip(scope_problem)
+                if column == 0:
+                    # DP-1029. The row's key rides on its own item, so what
+                    # Remove and Edit act on is read off the row selected.
+                    item.setData(Qt.ItemDataRole.UserRole,
+                                 row.get('__key__', index))
                 self.table.setItem(index, column, item)
         empty = not self._rows
         self.table.setAccessibleDescription(
@@ -624,7 +636,12 @@ class ChildControlPanel(QGroupBox):
         self._updateScopeReadiness()
         self._fit_headings()
         self._fit_table_height()
-        if self._rows and not self.table.selectedItems():
+        keys = [row.get('__key__', index)
+                for index, row in enumerate(self._rows)]
+        if selected is not None and selected in keys:
+            self.table.clearSelection()
+            self.table.selectRow(keys.index(selected))
+        elif self._rows and not self.table.selectedItems():
             self.table.selectRow(0)
 
     def _scope_fields(self) -> tuple:
@@ -788,15 +805,33 @@ class ChildControlPanel(QGroupBox):
                 row[relative_id] = node
         return row
 
+    def _selected_index(self) -> int:
+        """The row the user selected, or -1.
+
+        DP-1029. Read from the selection model, not ``currentRow()``: the
+        focused row and the selected row part company whenever the rows move
+        under a selection, and Remove used to delete the focused one.
+        """
+        model = self.table.selectionModel()
+        rows = model.selectedRows() if model is not None else []
+        if not rows:
+            return -1
+        index = rows[0].row()
+        return index if 0 <= index < len(self._rows) else -1
+
     def selected_key(self):
-        index = self.table.currentRow()
-        if index < 0 or index >= len(self._rows):
+        index = self._selected_index()
+        if index < 0:
             return None
-        return self._rows[index].get('__key__', index)
+        item = self.table.item(index, 0)
+        key = (item.data(Qt.ItemDataRole.UserRole)
+               if item is not None else None)
+        return key if key is not None else self._rows[index].get(
+            '__key__', index)
 
     def _load_selected(self) -> None:
-        index = self.table.currentRow()
-        if index < 0 or index >= len(self._rows):
+        index = self._selected_index()
+        if index < 0:
             return
         row = self._rows[index]
         for key, editor in self._editors.items():
@@ -918,17 +953,91 @@ class ChildControlPanel(QGroupBox):
         # run on the GUI thread. `ran` keeps the original order: the warning,
         # or the table refresh followed by childrenChanged, both after the
         # facade has answered.
+        write = self._open_write()
+
         def ran(result) -> None:
             if getattr(result, 'status', 'accepted') != 'accepted':
-                QMessageBox.warning(
-                    self, self.tr('Operation failed'),
-                    str(getattr(result, 'message', '')
-                        or self.tr('The facade rejected the change.')))
+                self._close_write(write, False, result)
                 return
             self.refresh()
             self.childrenChanged.emit()
+            self._close_write(write, True)
 
-        submit(self._client, operation, parameters, then=ran)
+        self._track_write(write, submit(self._client, operation, parameters,
+                                        then=ran))
+
+    # -- Plan 37 UF3 DP-1035: the row writes the workflow has to hear of --
+
+    def _open_write(self):
+        """Start tracking one row write; the handle `_close_write` takes.
+
+        A row write is scheduled (C31-12), so Proceed pressed a moment after
+        Add would save the page, settle the task and move on while the row
+        was still on its way -- and the task it changes would never hear of
+        it. The handle is what `settle_writes` waits on.
+        """
+        import asyncio
+        try:
+            future = asyncio.get_running_loop().create_future()
+        except RuntimeError:
+            future = None
+        write = {'future': future, 'closed': False}
+        pending = self.__dict__.setdefault('_pending_writes', [])
+        pending.append(write)
+        return write
+
+    def _track_write(self, write, task) -> None:
+        """Close `write` as failed if its scheduled command is cancelled."""
+        if task is not None and hasattr(task, 'add_done_callback'):
+            task.add_done_callback(
+                lambda done: self._close_write(write, False)
+                if done.cancelled() else None)
+
+    def _close_write(self, write, ok: bool, result=None) -> None:
+        """Finish one row write: say a refusal, announce a committed row.
+
+        A committed row is a change to the task's settings, so the page that
+        hosts this table is told and records it as one (`child_edit_committed`
+        -- the same news a saved field sends). Idempotent: the cancelled-task
+        callback and the answer may both arrive.
+        """
+        if write is None or write['closed']:
+            return
+        write['closed'] = True
+        pending = self.__dict__.get('_pending_writes') or []
+        if write in pending:
+            pending.remove(write)
+        if not ok and result is not None:
+            QMessageBox.warning(
+                self, self.tr('Operation failed'),
+                str(getattr(result, 'message', '')
+                    or self.tr('The facade rejected the change.')))
+        if ok:
+            self.editCommitted.emit()
+            host = self.parent()
+            while host is not None and not hasattr(host,
+                                                   'child_edit_committed'):
+                host = host.parent()
+            if host is not None:
+                host.child_edit_committed(self)
+        future = write['future']
+        if future is not None and not future.done():
+            future.set_result(bool(ok))
+
+    async def settle_writes(self) -> bool:
+        """Wait for the row writes in flight; False if one was refused.
+
+        Only the writes pending when this is called are waited on, and a
+        refusal already reported to the user does not hold up a later press.
+        """
+        import asyncio
+        pending = [write['future'] for write in
+                   list(self.__dict__.get('_pending_writes') or ())
+                   if write['future'] is not None]
+        if not pending:
+            return True
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        return all(result is True for result in results)
 
     #: Collections scoped to volume regions rather than surface groups.
     #: Engines register their own volume-scoped collection ids here.

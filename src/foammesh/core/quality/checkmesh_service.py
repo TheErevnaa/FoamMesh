@@ -254,8 +254,8 @@ def checkmesh_request(db=None, case_path: str | Path | None = None,
             return fallback
         return fallback if raw is None or raw == '' else raw
 
-    def flag(path: str) -> bool:
-        raw = value(path, False)
+    def flag(path: str, default: bool = False) -> bool:
+        raw = value(path, default)
         if isinstance(raw, str):
             return raw.strip().lower() in ('true', '1', 'yes', 'on')
         return bool(raw)
@@ -273,6 +273,11 @@ def checkmesh_request(db=None, case_path: str | Path | None = None,
         wants_mesh_quality = False
 
     request = CheckMeshRequest(
+        # Plan 37 UF18. On by default: the command line every run has always
+        # carried, now switchable.
+        extended_topology=flag('meshCheck/allTopology', True),
+        extended_geometry=flag('meshCheck/allGeometry', True),
+        write_sets=flag('meshCheck/writeSets', True),
         write_surfaces=flag('meshCheck/writeSurfaces'),
         non_orth_threshold=number('meshCheck/nonOrthThreshold',
                                   DEFAULT_NON_ORTH_THRESHOLD),

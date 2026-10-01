@@ -53,6 +53,24 @@ FINGERPRINTS: tuple[str, ...] = (
 )
 
 
+#: Plan 37 UF15. The snappyHexMesh stage each staged fingerprint names, as
+#: the engine descriptor spells it (``WorkflowTask.engine_stage``), so an
+#: engine-specific invalidation can find the task whose result it stales.
+MESH_STAGE_ENGINE_STAGES: dict[str, str] = {
+    'mesh.base_grid': 'blockMesh',
+    'mesh.surface_features': 'surfaceFeatures',
+    'mesh.castellated': 'castellation',
+    'mesh.snapped': 'snap',
+    'mesh.layers': 'layers',
+}
+
+
+def earliest_stage(fingerprints) -> str | None:
+    """The first meshing stage among ``fingerprints``, or ``None``."""
+    named = set(fingerprints or ())
+    return next((stage for stage in MESH_STAGE_ORDER if stage in named), None)
+
+
 def stage_closure(fingerprint: str) -> tuple[str, ...]:
     """The fingerprints staling ``fingerprint`` also stales.
 
@@ -216,8 +234,10 @@ GROUP_METADATA: dict[str, dict] = {
         # is a different problem, not merely a different discretisation.
         'invalidates': stales('mesh', 'quality', 'exports'),
         'ui_location': 'workflow.gmsh.describe_geometry',
-        'applies_when': ('mesh.engine == gmsh',),
-        'units': {'padding': 'diagonals'},
+        # Plan 37 UF14: snappyHexMesh reads the same record as its outer
+        # boundary, so the one engine that ignores it is none at all.
+        'applies_when': ('mesh.engine != unselected',),
+        'units': {'padding': 'diagonals', 'radius': 'm', 'length': 'm'},
     },
     'gmsh/parallel': {
         # Not just wall clock: HXT partitions the domain by thread count, so
@@ -344,12 +364,22 @@ GROUP_METADATA: dict[str, dict] = {
         'units': {'resolve_feature_angle': 'deg', 'max_load_unbalance': 'fraction',
                   'planar_angle': 'deg'},
     },
+    # Plan 37 UF16. The exclude points sit under `castellation` because
+    # castellation is the stage that reads them (`outsidePoints`), and they
+    # are authored on Domain & regions beside the seeds they answer to.
+    # Editing one stales the castellated mesh onward, never the base grid.
+    'castellation/excludePoints': {
+        'invalidates': stales('mesh.castellated', 'quality'),
+        'ui_location': 'workflow.region',
+        'units': {'point': 'm'},
+    },
     'snap': {
         'invalidates': stales('mesh.snapped', 'quality'),
         'ui_location': 'workflow.snap',
         # ``concaveAngle`` and ``minAreaRatio`` are ESI snapControls keys.
         # Foundation 13 does not read either, the controls were removed, and
-        # these two entries described nothing.
+        # these two entries described nothing. (Plan 37 UF15: Foundation 13
+        # does read a ``concaveAngle`` -- in addLayersControls, below.)
         'units': {},
     },
     'addLayers': {
@@ -367,7 +397,9 @@ GROUP_METADATA: dict[str, dict] = {
         'units': {'feature_angle': 'deg', 'min_medial_axis_angle': 'deg',
                   'slip_feature_angle': 'deg',
                   'max_face_thickness_ratio': 'fraction',
-                  'max_thickness_to_medial_ratio': 'fraction'},
+                  'max_thickness_to_medial_ratio': 'fraction',
+                  # Plan 37 UF15: read with ``unitDegrees``.
+                  'concave_angle': 'deg'},
     },
     'snappyGeometry': {
         # Plan 31. These change what snappyHexMesh is told about the staged
@@ -401,9 +433,18 @@ GROUP_METADATA: dict[str, dict] = {
         'ui_location': 'workflow.castellation',
     },
     'meshQuality': {
-        # Quality thresholds gate the checkMesh report; they do not by
-        # themselves invalidate the mesh geometry already produced.
+        # Quality thresholds gate the checkMesh report; on an engine that
+        # does not mesh against them they do not invalidate the mesh already
+        # produced.
         'invalidates': ('quality',),
+        # Plan 37 UF15. snappyHexMesh does mesh against them: OpenFOAM 13's
+        # snap motion smoother and addLayers both read meshQualityControls
+        # and revert a step that breaches one. So on the snappy route an
+        # edit makes the snapped mesh onward stale, and Gmsh -- which never
+        # reads snappy's meshQualityControls -- keeps the quality-only rule.
+        'invalidates_by_engine': {
+            'snappy': stales('mesh.snapped', 'quality'),
+        },
         'ui_location': 'workflow.quality',
         # DP-170. Two of these are angles and two are not. OpenFOAM 13
         # says so itself: `src/meshCheck/checkMesh.C` reads maxNonOrtho
@@ -478,6 +519,28 @@ FIELD_OVERRIDES: dict[str, dict] = {
     'quality.thresholds.min_face_weight':
         {'title': 'Min face interpolation weight'},
     'quality.thresholds.min_vol_ratio': {'title': 'Min volume ratio'},
+    # Plan 37 UF15. DP-213 hid this row as "not consumed by Foundation 13";
+    # it is -- src/meshCheck/checkMesh.C:78-83 -- and the evidence is in
+    # plans/evidence/plan37/uf15-v13-controls.md, including the measured
+    # quirk the documentation below warns about.
+    'quality.thresholds.min_face_flatness': {
+        'title': 'Min face flatness',
+        'documentation': (
+            'Rejects a snapping or layer step that leaves a face less flat '
+            'than this, between 0 and 1. Empty leaves the check off, which '
+            'is the OpenFOAM default. OpenFOAM 13 refuses a value outside 0 '
+            'to 1. As measured in OpenFOAM 13, snappyHexMesh flags no face '
+            'at any value below 1, and at 1 it flags faces through rounding '
+            'alone, so 1 is the only value that changes the mesh.'),
+    },
+    'quality.thresholds.relaxed.min_face_flatness': {
+        'documentation': (
+            'The flatness limit used once layer addition switches to the '
+            'relaxed limits. Unlike the other relaxed limits it does not '
+            'inherit the strict value: OpenFOAM 13 looks for it in the '
+            'relaxed block alone, so empty means no flatness check in the '
+            'relaxed phase. Between 0 and 1.'),
+    },
     'quality.thresholds.n_smooth_scale': {'title': 'Smoothing iterations'},
     # Plan 31 -- the geometry-entry options. Every key named here was read
     # out of the OpenFOAM 13 source, not from documentation; the file and line
@@ -628,14 +691,81 @@ FIELD_OVERRIDES: dict[str, dict] = {
         # the import conversion, like the Gmsh target size beside it.
         'unit': 'm',
     },
+    # Plan 37 UF12. The ratio is always the largest cell over the smallest,
+    # and the side the small cells go on is its own control, so nobody types
+    # a reciprocal to move them.
     'meshing.base_grid.grading.x': {
-        'title': 'Grading X',
+        'title': 'Grading ratio X',
+        'documentation': (
+            'Largest cell divided by the smallest along X, never below 1; 1 is '
+            'uniform. Fine cells at, beside it, says which side the small '
+            'cells go on. MEASURED on OpenFOAM 13, ratio 4 over eight cells '
+            'of a unit edge: 0.0565 at the fine side, 0.226 at the other.'),
     },
+    'meshing.base_grid.grading_fine.x': {
+        'title': 'Fine cells at X',
+        'documentation': (
+            'Where the small cells go along X. Minus side (start) is the '
+            'low-X face; plus side (end) the high-X face; Centre puts them '
+            'in the middle and Both edges at both faces, each half graded by '
+            'the ratio. MEASURED on OpenFOAM 13, ratio 4 over eight cells: '
+            'Centre 0.220 at the faces and 0.055 in the middle, Both edges '
+            'the reverse. A two-sided choice needs at least four cells, two '
+            'per half, and an odd count gives the larger half to the second.'),
+    },
+    # Plan 37 UF12. The ratio is always the largest cell over the smallest,
+    # and the side the small cells go on is its own control, so nobody types
+    # a reciprocal to move them.
     'meshing.base_grid.grading.y': {
-        'title': 'Grading Y',
+        'title': 'Grading ratio Y',
+        'documentation': (
+            'Largest cell divided by the smallest along Y, never below 1; 1 is '
+            'uniform. Fine cells at, beside it, says which side the small '
+            'cells go on. MEASURED on OpenFOAM 13, ratio 4 over eight cells '
+            'of a unit edge: 0.0565 at the fine side, 0.226 at the other.'),
     },
+    'meshing.base_grid.grading_fine.y': {
+        'title': 'Fine cells at Y',
+        'documentation': (
+            'Where the small cells go along Y. Minus side (start) is the '
+            'low-Y face; plus side (end) the high-Y face; Centre puts them '
+            'in the middle and Both edges at both faces, each half graded by '
+            'the ratio. MEASURED on OpenFOAM 13, ratio 4 over eight cells: '
+            'Centre 0.220 at the faces and 0.055 in the middle, Both edges '
+            'the reverse. A two-sided choice needs at least four cells, two '
+            'per half, and an odd count gives the larger half to the second.'),
+    },
+    # Plan 37 UF12. The ratio is always the largest cell over the smallest,
+    # and the side the small cells go on is its own control, so nobody types
+    # a reciprocal to move them.
     'meshing.base_grid.grading.z': {
-        'title': 'Grading Z',
+        'title': 'Grading ratio Z',
+        'documentation': (
+            'Largest cell divided by the smallest along Z, never below 1; 1 is '
+            'uniform. Fine cells at, beside it, says which side the small '
+            'cells go on. MEASURED on OpenFOAM 13, ratio 4 over eight cells '
+            'of a unit edge: 0.0565 at the fine side, 0.226 at the other.'),
+    },
+    'meshing.base_grid.grading_fine.z': {
+        'title': 'Fine cells at Z',
+        'documentation': (
+            'Where the small cells go along Z. Minus side (start) is the '
+            'low-Z face; plus side (end) the high-Z face; Centre puts them '
+            'in the middle and Both edges at both faces, each half graded by '
+            'the ratio. MEASURED on OpenFOAM 13, ratio 4 over eight cells: '
+            'Centre 0.220 at the faces and 0.055 in the middle, Both edges '
+            'the reverse. A two-sided choice needs at least four cells, two '
+            'per half, and an odd count gives the larger half to the second.'),
+    },
+    'meshing.base_grid.grading_notice': {
+        'title': 'Grading note',
+        'documentation': (
+            'What reading this project with the Fine cells at control changed '
+            'on screen. The written mesh did not change. A record of the '
+            'migration, so it is read-only; dismissing it on the page puts it '
+            'away for this user on this machine.'),
+        'read_only': True,
+        'invalidates': (),
     },
     # FS-B. The six background faces carry three coupled fields each, and
     # the schema generates the same title for all three -- 'X Min' over a
@@ -812,19 +942,37 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'title': 'Cells X',
         'documentation': 'Cells along the block local X direction.',
     },
+    # Plan 37 UF12 (DP-1033). "Fine end of X is the start" wrote the
+    # reciprocal, which put the small cells at the END: blockMesh's ratio is
+    # last cell over first. A side and a ratio replace it.
     'base_grid.blocks/{id}/grading_x': {
+        'title': 'Grading X',
         'documentation': (
-            'Expansion along the block local X direction: a plain ratio '
-            'of last cell to first (4), or a segmented profile written the '
-            'way blockMeshDict writes one — (0.2 0.3 4) (0.6 0.4 1) '
-            '(0.2 0.3 0.25), whose length and cell fractions each add up to 1.'),
+            'The block local X direction as blockMeshDict writes it. With '
+            'Fine cells at on Custom profile this text is the grading: a '
+            'plain ratio of last cell to first (4 puts the small cells at '
+            'the start), or a segmented profile — (0.2 0.3 4) (0.6 0.4 1) '
+            '(0.2 0.3 0.25) — whose length and cell fractions each add up to '
+            '1. With any other choice it shows what that choice writes, and '
+            'typing in it switches back to Custom profile.'),
     },
-    'base_grid.blocks/{id}/grading_x_toward_start': {
-        'title': 'Fine end of X is the start',
+    'base_grid.blocks/{id}/grading_x_fine': {
+        'title': 'Fine cells at X',
         'documentation': (
-            'Take the reciprocal of the ratio, so the small cells sit at the '
-            'start of the direction instead of the end. Inverting it by hand '
-            'is where the direction usually gets flipped.'),
+            'Where the small cells go along this block local X direction. '
+            'Start and End follow the block own vertex order — from its '
+            'first vertex toward the next along X — not the world axes, so '
+            'a block turned round needs the opposite choice to meet its '
+            'neighbour. Centre and Both edges grade each half by the ratio '
+            'and need at least four cells. Custom profile writes the text in '
+            'Grading X as typed.'),
+    },
+    'base_grid.blocks/{id}/grading_x_ratio': {
+        'title': 'Grading ratio X',
+        'documentation': (
+            'Largest cell divided by the smallest along this block local X '
+            'direction, never below 1. Used unless Fine cells at is Custom '
+            'profile.'),
     },
     # DP-204. The label said Num cells Y and a column beside it said
     # cells, so the box named its quantity twice and abbreviated it
@@ -834,19 +982,37 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'title': 'Cells Y',
         'documentation': 'Cells along the block local Y direction.',
     },
+    # Plan 37 UF12 (DP-1033). "Fine end of Y is the start" wrote the
+    # reciprocal, which put the small cells at the END: blockMesh's ratio is
+    # last cell over first. A side and a ratio replace it.
     'base_grid.blocks/{id}/grading_y': {
+        'title': 'Grading Y',
         'documentation': (
-            'Expansion along the block local Y direction: a plain ratio '
-            'of last cell to first (4), or a segmented profile written the '
-            'way blockMeshDict writes one — (0.2 0.3 4) (0.6 0.4 1) '
-            '(0.2 0.3 0.25), whose length and cell fractions each add up to 1.'),
+            'The block local Y direction as blockMeshDict writes it. With '
+            'Fine cells at on Custom profile this text is the grading: a '
+            'plain ratio of last cell to first (4 puts the small cells at '
+            'the start), or a segmented profile — (0.2 0.3 4) (0.6 0.4 1) '
+            '(0.2 0.3 0.25) — whose length and cell fractions each add up to '
+            '1. With any other choice it shows what that choice writes, and '
+            'typing in it switches back to Custom profile.'),
     },
-    'base_grid.blocks/{id}/grading_y_toward_start': {
-        'title': 'Fine end of Y is the start',
+    'base_grid.blocks/{id}/grading_y_fine': {
+        'title': 'Fine cells at Y',
         'documentation': (
-            'Take the reciprocal of the ratio, so the small cells sit at the '
-            'start of the direction instead of the end. Inverting it by hand '
-            'is where the direction usually gets flipped.'),
+            'Where the small cells go along this block local Y direction. '
+            'Start and End follow the block own vertex order — from its '
+            'first vertex toward the next along Y — not the world axes, so '
+            'a block turned round needs the opposite choice to meet its '
+            'neighbour. Centre and Both edges grade each half by the ratio '
+            'and need at least four cells. Custom profile writes the text in '
+            'Grading Y as typed.'),
+    },
+    'base_grid.blocks/{id}/grading_y_ratio': {
+        'title': 'Grading ratio Y',
+        'documentation': (
+            'Largest cell divided by the smallest along this block local Y '
+            'direction, never below 1. Used unless Fine cells at is Custom '
+            'profile.'),
     },
     # DP-204. The label said Num cells Z and a column beside it said
     # cells, so the box named its quantity twice and abbreviated it
@@ -856,19 +1022,37 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'title': 'Cells Z',
         'documentation': 'Cells along the block local Z direction.',
     },
+    # Plan 37 UF12 (DP-1033). "Fine end of Z is the start" wrote the
+    # reciprocal, which put the small cells at the END: blockMesh's ratio is
+    # last cell over first. A side and a ratio replace it.
     'base_grid.blocks/{id}/grading_z': {
+        'title': 'Grading Z',
         'documentation': (
-            'Expansion along the block local Z direction: a plain ratio '
-            'of last cell to first (4), or a segmented profile written the '
-            'way blockMeshDict writes one — (0.2 0.3 4) (0.6 0.4 1) '
-            '(0.2 0.3 0.25), whose length and cell fractions each add up to 1.'),
+            'The block local Z direction as blockMeshDict writes it. With '
+            'Fine cells at on Custom profile this text is the grading: a '
+            'plain ratio of last cell to first (4 puts the small cells at '
+            'the start), or a segmented profile — (0.2 0.3 4) (0.6 0.4 1) '
+            '(0.2 0.3 0.25) — whose length and cell fractions each add up to '
+            '1. With any other choice it shows what that choice writes, and '
+            'typing in it switches back to Custom profile.'),
     },
-    'base_grid.blocks/{id}/grading_z_toward_start': {
-        'title': 'Fine end of Z is the start',
+    'base_grid.blocks/{id}/grading_z_fine': {
+        'title': 'Fine cells at Z',
         'documentation': (
-            'Take the reciprocal of the ratio, so the small cells sit at the '
-            'start of the direction instead of the end. Inverting it by hand '
-            'is where the direction usually gets flipped.'),
+            'Where the small cells go along this block local Z direction. '
+            'Start and End follow the block own vertex order — from its '
+            'first vertex toward the next along Z — not the world axes, so '
+            'a block turned round needs the opposite choice to meet its '
+            'neighbour. Centre and Both edges grade each half by the ratio '
+            'and need at least four cells. Custom profile writes the text in '
+            'Grading Z as typed.'),
+    },
+    'base_grid.blocks/{id}/grading_z_ratio': {
+        'title': 'Grading ratio Z',
+        'documentation': (
+            'Largest cell divided by the smallest along this block local Z '
+            'direction, never below 1. Used unless Fine cells at is Custom '
+            'profile.'),
     },
     'base_grid.blocks/{id}/zone': {
         'documentation': (
@@ -962,6 +1146,18 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'buffer helps layer addition converge near '
                          'features. OpenFOAM writes it as nGrow.',
     },
+    # Plan 37 UF2 (DP-1028). Bookkeeping: whether the snappy layers page has
+    # already given this case its default "Walls" group. The mesher never
+    # reads it; it keeps the layer stage's invalidation because it is only
+    # ever written beside a layer group being created or removed, which
+    # stales that stage anyway.
+    'meshing.layers.defaulted': {
+        'title': 'Default layer group made',
+        'documentation': 'Set once the Boundary layers step has given the '
+                         'case its default wall group, or a group has been '
+                         'removed, so a group the user deletes is not made '
+                         'again. The mesher never reads it.',
+    },
     'meshing.layers.feature_angle': {
         'documentation': 'Angle above which layer growth stops at a feature edge.',
         'unit': 'deg',
@@ -989,6 +1185,26 @@ FIELD_OVERRIDES: dict[str, dict] = {
     },
     'meshing.layers.n_smooth_displacement': {
         'title': 'Displacement smoothing iterations',
+    },
+    # Plan 37 UF15. addLayersControls keys OpenFOAM 13 reads in
+    # layerParameters.C; measured effect in
+    # plans/evidence/plan37/uf15-v13-controls.md.
+    'meshing.layers.concave_angle': {
+        'title': 'Max concavity of a merged layer face',
+        'documentation': (
+            'When layer addition merges the faces a cell has on one patch, '
+            'the merged face may not turn concave by more than this angle. '
+            'Empty uses the OpenFOAM default of 90 degrees. A larger angle '
+            'merges more faces; a smaller one fewer.'),
+    },
+    'meshing.layers.merge_faces': {
+        'title': 'Merge layer faces on one cell',
+        'documentation': (
+            'Whether layer addition merges the faces a cell has on one '
+            'patch into one face. Default, which is OpenFOAM\'s own rule, '
+            'merges them only on patches that are being given layers; On '
+            'merges them on every '
+            'patch; Off never merges them, which keeps more, smaller faces.'),
     },
     'meshing.layers.n_smooth_normals': {
         'title': 'Interior normal smoothing iterations',
@@ -1248,12 +1464,85 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # DP-608 (field audit 0924 gmsh-sizing D12). The farfield switch sits
     # among the healing switches on the Preparation panel and was titled
     # "Enabled", which said nothing about what it turns on.
+    # Plan 37 UF13: the switch now encloses in a box, sphere or cylinder, so
+    # the title no longer says box.
     'gmsh.describe_geometry.enabled': {
-        'title': 'Enclose in farfield box',
-        'documentation': 'Build an external-flow domain: a box around the '
-                         'geometry, grown by Padding on every side, with the '
-                         'solids cut out of it. Needs CAD (STEP/IGES); a '
-                         'tessellated import is refused.',
+        'title': 'Enclose in farfield',
+        'documentation': 'Build an external-flow domain: a box, sphere or '
+                         'cylinder around the geometry (a box grown by '
+                         'Padding on every side by default), with the solids '
+                         'cut out of it. Gmsh needs CAD (STEP/IGES) and '
+                         'refuses a tessellated import; snappyHexMesh takes '
+                         'either.',
+    },
+    # Plan 37 UF13 (section 4.4). The shared farfield specification: one
+    # authored primitive every engine builds (`core/mesh/farfield_spec.py`).
+    'gmsh.describe_geometry.shape': {
+        'title': 'Farfield shape',
+        'documentation': 'Box, sphere or cylinder. The shape is cut against '
+                         'the solids. On Gmsh its faces publish as '
+                         'far_field_xMin .. far_field_zMax (box), far_field '
+                         '(sphere), or far_field_side, far_field_inlet and '
+                         'far_field_outlet (cylinder, the caps ordered along '
+                         'the axis); on snappyHexMesh the whole shape is one '
+                         'patch, far_field. Those are names, not boundary '
+                         'conditions.',
+    },
+    'gmsh.describe_geometry.centre_mode': {
+        'title': 'Farfield centre',
+        'documentation': 'Auto centres the farfield on the bounding box of '
+                         'the imported geometry, re-read on every run; '
+                         'Explicit uses the centre below.',
+    },
+    **{
+        f'gmsh.describe_geometry.centre.{axis}': {
+            'title': f'Farfield centre {axis.upper()}',
+            'documentation': f'{axis.upper()} of the farfield centre, in '
+                             f'metres. For a cylinder it is the midpoint '
+                             f'between the two caps.',
+            'unit': 'm',
+            'applies_when': ('mesh.engine != unselected',
+                             'gmsh.describe_geometry.centre_mode == explicit'),
+        }
+        for axis in 'xyz'
+    },
+    'gmsh.describe_geometry.padding': {
+        'documentation': 'Box only: the gap added on every side of the '
+                         'geometry, as a multiple of its bounding-box '
+                         'diagonal.',
+        'applies_when': ('mesh.engine != unselected',
+                         'gmsh.describe_geometry.shape == box'),
+    },
+    'gmsh.describe_geometry.radius': {
+        'title': 'Farfield radius',
+        'documentation': 'Sphere or cylinder radius, in metres. It must hold '
+                         'every body with clearance; a radius too small is '
+                         'refused before meshing with the radius that would '
+                         'fit, never clipped.',
+        'unit': 'm',
+        'applies_when': ('mesh.engine != unselected',
+                         'gmsh.describe_geometry.shape != box'),
+    },
+    'gmsh.describe_geometry.length': {
+        'title': 'Cylinder length',
+        'documentation': 'Cap to cap, in metres, centred on the farfield '
+                         'centre. It must hold every body with clearance '
+                         'along the axis.',
+        'unit': 'm',
+        'applies_when': ('mesh.engine != unselected',
+                         'gmsh.describe_geometry.shape == cylinder'),
+    },
+    **{
+        f'gmsh.describe_geometry.axis.{axis}': {
+            'title': f'Cylinder axis {axis.upper()}',
+            'documentation': f'{axis.upper()} of the cylinder axis direction. '
+                             f'Any direction; only the direction is read, '
+                             f'not the length, and a zero axis is refused. '
+                             f'The inlet cap is at the negative end.',
+            'applies_when': ('mesh.engine != unselected',
+                             'gmsh.describe_geometry.shape == cylinder'),
+        }
+        for axis in 'xyz'
     },
     # DP-613 (field audit 0924 gmsh-sizing D10).
     'gmsh.describe_geometry.remove_duplicate_nodes': {
@@ -1361,6 +1650,28 @@ FIELD_OVERRIDES: dict[str, dict] = {
     'regions.items/{id}/point.x': {'unit': 'm'},
     'regions.items/{id}/point.y': {'unit': 'm'},
     'regions.items/{id}/point.z': {'unit': 'm'},
+    # Plan 37 UF16.
+    'meshing.castellation.exclude_points/{id}/name': {
+        'title': 'Exclude point',
+        'documentation': 'A name for the space this point removes, shown '
+                         'beside its marker in the viewport.',
+    },
+    'meshing.castellation.exclude_points/{id}/point.x': {
+        'documentation': 'X of a point inside a space to remove from the '
+                         'mesh (snappyHexMesh outsidePoints). A space that '
+                         'also holds a region seed is kept: the seed wins.',
+        'unit': 'm',
+    },
+    'meshing.castellation.exclude_points/{id}/point.y': {
+        'documentation': 'Y of a point inside a space to remove from the '
+                         'mesh (snappyHexMesh outsidePoints).',
+        'unit': 'm',
+    },
+    'meshing.castellation.exclude_points/{id}/point.z': {
+        'documentation': 'Z of a point inside a space to remove from the '
+                         'mesh (snappyHexMesh outsidePoints).',
+        'unit': 'm',
+    },
     'meshing.castellation.volume_refinements/{id}/distance': {'unit': 'm'},
     'meshing.castellation.feature_bands/{id}/group_name': {
         'title': 'Surface refinement group',
@@ -1506,9 +1817,39 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'Runs checkMesh with -writeSurfaces, which '
                          'reconstructs the faceSets and cellSets of the '
                          'problem faces and writes them under '
-                         'postProcessing/checkMesh/. Separate from the sets '
-                         'themselves, which are always written into '
-                         'constant/polyMesh/sets.',
+                         'postProcessing/checkMesh/, where the viewport '
+                         'can highlight them. Separate from Write failed '
+                         'sets, which writes the sets into '
+                         'constant/polyMesh/sets and never a face surface.',
+    },
+    # Plan 37 UF18. The three switches every run carried and no one could
+    # reach; on by default, so the command line is unchanged until a user
+    # turns one off. MEASURED on v13: plans/evidence/plan37/
+    # uf18-v13-checkmesh-sets.md.
+    'quality.check.all_topology': {
+        'title': 'Run every topology check',
+        'documentation': 'Runs checkMesh with -allTopology: the extra '
+                         'topology checks, such as the upper-triangular face '
+                         'order and the points shared by separate regions. '
+                         'Off runs only the standard topology checks.',
+    },
+    'quality.check.all_geometry': {
+        'title': 'Run every geometry check',
+        'documentation': 'Runs checkMesh with -allGeometry: the extra '
+                         'geometry checks, such as face warpage, concave '
+                         'cells, short edges and near points. Off runs only '
+                         'the standard geometry checks, which can change the '
+                         'verdict on the same mesh.',
+    },
+    'quality.check.write_sets': {
+        'title': 'Write failed sets',
+        'documentation': 'Runs checkMesh with -writeSets, which writes every '
+                         'failing face, cell and point set into '
+                         'constant/polyMesh/sets and the point sets (unused '
+                         'points, short edges, near points) under '
+                         'postProcessing/checkMesh/, where the viewport can '
+                         'highlight them. It writes no face surface: that is '
+                         'Write the problem faces as a surface.',
     },
 
     # Plan 31 (surface_features.rest). Verified against v13's
@@ -1595,6 +1936,71 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'title': 'Write the extracted edges as VTK',
         'documentation': 'Writes the feature edges, and any closeness or '
                          'proximity fields asked for above, as VTK.',
+    },
+    # Plan 37 UF19. subsetFeatures box/plane and addFeatures; the v13
+    # behaviour is pinned in plans/evidence/plan37/uf19-v13-surface-features.md.
+    'meshing.surface_features.subset_box': {
+        'title': 'Keep feature edges in a box',
+        'documentation': 'Inside box keeps only the feature edges whose '
+                         'midpoint is inside the box; Outside box keeps only '
+                         'those whose midpoint is outside it. None, the '
+                         'default, keeps every edge. Coordinates are in the '
+                         'surface file\'s own frame: surfaceFeatures does not '
+                         'apply the geometry scale snappyHexMesh uses. A box '
+                         'whose minimum is above its maximum is refused — '
+                         'OpenFOAM 13 would keep no edges and not say so.',
+    },
+    **{
+        f'meshing.surface_features.subset_box_{end}.{axis}': {
+            'title': f'Box {label} {axis.upper()}',
+            'documentation': f'The {label} {axis.upper()} corner of the '
+                             f'feature subset box, in the surface file\'s '
+                             f'frame.',
+            'unit': 'm',
+            'applies_when': ('meshing.surface_features.subset_box != none',),
+        }
+        for end, label in (('min', 'minimum'), ('max', 'maximum'))
+        for axis in 'xyz'
+    },
+    'meshing.surface_features.subset_plane': {
+        'title': 'Keep feature edges crossing a plane',
+        'documentation': 'Keeps only the feature edges that cross the plane '
+                         'through the point below with the normal below; '
+                         'an edge lying beside the plane is dropped. Applied '
+                         'after the box and the open / non-manifold edge '
+                         'switches, as OpenFOAM 13 applies it.',
+    },
+    **{
+        f'meshing.surface_features.subset_plane_point.{axis}': {
+            'title': f'Plane point {axis.upper()}',
+            'documentation': f'{axis.upper()} of a point on the subset plane, '
+                             f'in the surface file\'s frame.',
+            'unit': 'm',
+            'applies_when': ('meshing.surface_features.subset_plane == true',),
+        }
+        for axis in 'xyz'
+    },
+    **{
+        f'meshing.surface_features.subset_plane_normal.{axis}': {
+            'title': f'Plane normal {axis.upper()}',
+            'documentation': f'{axis.upper()} of the subset plane\'s normal. '
+                             f'Its length does not matter, but it cannot be '
+                             f'zero: OpenFOAM 13 stops on a zero normal.',
+            'applies_when': ('meshing.surface_features.subset_plane == true',),
+        }
+        for axis in 'xyz'
+    },
+    'meshing.surface_features.add_features_file': {
+        'title': 'Add feature edges from file',
+        'documentation': 'An OpenFOAM extendedFeatureEdgeMesh file whose '
+                         'edges are added to the first surface\'s feature '
+                         'set, after the subset (so they are never filtered '
+                         'out). It is copied into the case under a name '
+                         'carrying its content hash: editing or deleting the '
+                         'file makes feature extraction, and every mesh '
+                         'built on it, out of date. A .eMesh is not '
+                         'accepted; OpenFOAM 13 cannot read one there. '
+                         'Empty, the default, adds nothing.',
     },
 
     'mesh.execution.decomposition_weight_field': {

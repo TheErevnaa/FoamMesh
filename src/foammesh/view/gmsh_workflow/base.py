@@ -377,7 +377,19 @@ class GmshTaskPage(EngineTaskPage):
                         (str(item).strip() for item in candidates) if name)
         return bool(values.get(self.LAYER_GATE_FIELDS[0])), patches
 
-    def assemblyLayerRefusal(self, *, enabled=None, patches=None) -> str:
+    #: Plan 37 F3d. Which way the stored selection is read.
+    LAYER_MODE_FIELD = 'gmsh.boundary_layers.patch_mode'
+
+    def layerModeOnFile(self) -> str:
+        """The stored patch mode, or ``''`` for a case that predates it."""
+        try:
+            values = self._client.field_values((self.LAYER_MODE_FIELD,))
+        except Exception:                        # noqa: BLE001 - advisory only
+            return ''
+        return str(values.get(self.LAYER_MODE_FIELD) or '')
+
+    def assemblyLayerRefusal(self, *, enabled=None, patches=None,
+                             patch_mode=None) -> str:
         """The sentence the run would refuse with, or `''` if it would not.
 
         DP-115. `core.gmsh.execution` asks exactly this question -- layers on,
@@ -409,8 +421,13 @@ class GmshTaskPage(EngineTaskPage):
             stored_enabled, stored_patches = self.layerSelectionOnFile()
             enabled = stored_enabled if enabled is None else enabled
             patches = stored_patches if patches is None else patches
+        if patch_mode is None:
+            # Plan 37 F3d. "Selected" with nothing ticked is refused by the
+            # runner on any geometry; the mode says whether empty means that.
+            patch_mode = self.layerModeOnFile()
         return layer_selection_refusal(
-            self.preparedRevision(), enabled, tuple(patches or ()))
+            self.preparedRevision(), enabled, tuple(patches or ()),
+            patch_mode)
 
     def runAllRefusal(self) -> str:
         """DP-123. The pre-flight, asked of the button that starts the run.

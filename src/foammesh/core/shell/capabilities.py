@@ -137,6 +137,14 @@ def _run_cleanup(command) -> None:
         pass
 
 
+def _profile_place(profile) -> str:
+    """Where a launch profile looks for OpenFOAM, in words (Plan 37 F2)."""
+    distribution = str(getattr(profile, 'distribution', '') or '')
+    if distribution:
+        return f'WSL distro {distribution}'
+    return f'runtime {getattr(profile, "profile_id", "") or "native-path"}'
+
+
 class CapabilityRegistry:
     """Probe executables once per environment rather than failing after a click."""
 
@@ -377,11 +385,12 @@ class CapabilityRegistry:
                     self._resolved_profiles[name] = profile
                     return Capability(
                         name, True, path, profile_id=profile.profile_id)
+                # Plan 37 F2. Say where it was looked for: "the qualified
+                # runtime" did not tell a user which WSL distro to fix.
                 failures.append(
-                    f'{profile.profile_id}: {name} is not installed in the '
-                    'qualified runtime')
+                    f'{name} was not found in {_profile_place(profile)}')
                 continue
-            failures.append(f'{profile.profile_id}: {health.reason}')
+            failures.append(f'{_profile_place(profile)}: {health.reason}')
         return Capability(
             name, False, None,
             '; '.join(failures) or

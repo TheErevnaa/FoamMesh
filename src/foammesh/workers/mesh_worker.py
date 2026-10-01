@@ -52,6 +52,11 @@ OPERATIONS = {
 }
 #: Plan 35 CR3: the viewport's mesh preview (``core.mesh.mesh_preview``).
 PREVIEW_OPERATIONS = ('mesh.preview', 'mesh.volume')
+#: Plan 37 UF10: an exact section (``core.section.worker_section``).
+SECTION_OPERATIONS = ('mesh.section', 'mesh.section_batch')
+#: Plan 37 UF18: checkMesh's written sets, parsed for the viewport
+#: (``core.quality.check_artifacts``) -- never in the window's process.
+CHECK_HIGHLIGHT_OPERATIONS = ('quality.check_highlights',)
 #: Test and support operations: they exercise the transport, never a case.
 DIAGNOSTIC_OPERATIONS = ('diag.allocate', 'diag.crash', 'diag.sleep',
                          'diag.echo')
@@ -213,6 +218,16 @@ def run_operation(operation: str, args: dict) -> dict:
         from foammesh.core.mesh.mesh_preview import build_preview
 
         return build_preview(operation, args)
+    if operation in SECTION_OPERATIONS:
+        from foammesh.core.section import worker_section
+
+        if operation == 'mesh.section_batch':        # UF11 Compare
+            return worker_section.run_batch(args)
+        return worker_section.run(args)
+    if operation in CHECK_HIGHLIGHT_OPERATIONS:
+        from foammesh.core.quality import check_artifacts
+
+        return check_artifacts.run(args)
     method = OPERATIONS.get(operation)
     if method is None:
         raise KeyError(f'the mesh worker does not run {operation!r}')
@@ -258,7 +273,7 @@ def _failure(operation: str, error: BaseException) -> dict:
                         details=dict(error.details or {}))
     elif isinstance(error, PolyMeshReadError):
         document.update(reason=error.reason)
-    elif type(error).__name__ == 'PreviewRefused':
+    elif type(error).__name__ in ('PreviewRefused', 'SectionRefused'):
         document.update(reason=error.reason, details=dict(error.details))
     else:
         document.update(reason='worker_error')

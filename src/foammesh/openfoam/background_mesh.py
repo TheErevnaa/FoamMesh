@@ -97,28 +97,74 @@ def _as_float(value, what: str) -> float:
     return result
 
 
+#: Plan 37 UF12. Where the small cells of one direction go. Start and end are
+#: the block's *local* direction -- vertex 0 towards vertex 1 for x, 0 towards
+#: 3 for y, 0 towards 4 for z -- which on a rotated custom block need not be
+#: world minus and plus.
+FINE_START = 'start'
+FINE_END = 'end'
+FINE_CENTRE = 'centre'
+FINE_BOTH_EDGES = 'both_edges'
+#: A custom block only: the typed text is the grading, written as typed.
+FINE_CUSTOM_PROFILE = 'custom_profile'
+FINE_PRESETS = (FINE_START, FINE_END, FINE_CENTRE, FINE_BOTH_EDGES)
+TWO_SIDED = (FINE_CENTRE, FINE_BOTH_EDGES)
+
+
 @dataclass(frozen=True)
 class GradingSpec:
     """One edge direction's expansion, either a ratio or a segmented profile.
 
     ``ratio`` is blockMesh's own convention: the size of the last cell divided
-    by the size of the first, along the block's local axis direction. A value
-    below one therefore packs cells at the *start* of that axis and above one
-    at the end -- which is why :attr:`toward_start` exists: "fine at the wall"
-    is the request a user actually has, and expressing it as a reciprocal by
-    hand is where the direction gets inverted.
+    by the size of the first, along the block's local axis direction. MEASURED
+    on OpenFOAM 13 (Plan 37 section 2.2): five cells at ratio 4 gave a first
+    cell 0.089 wide and a last cell 0.356 wide. A ratio above one therefore
+    puts the small cells at the *start* of the axis, and a ratio below one at
+    the end.
+
+    :attr:`reverse` turns the direction round: a scalar becomes its
+    reciprocal, and a segmented profile is reversed segment by segment with
+    each segment's ratio reciprocated (DP-1032). It applies to a stored
+    :attr:`literal` as well, so the literal can never bypass a direction
+    change. Reversing twice restores the profile.
     """
 
     ratio: float = 1.0
     #: ``(lengthFraction, cellFraction, ratio)`` triples. Empty means a plain
     #: single-segment grading.
     segments: tuple[tuple[float, float, float], ...] = ()
-    toward_start: bool = False
-    #: The text the project stored, when it stored one. Rendered verbatim so
-    #: a byte-stable writer stays byte-stable.
+    reverse: bool = False
+    #: The text the project stored, when it stored one. Rendered verbatim
+    #: while nothing asks for it to be turned round, so a byte-stable writer
+    #: stays byte-stable.
     literal: str | None = None
 
+    def reversed(self) -> 'GradingSpec':
+        """The same profile read from the other end of the direction."""
+        return GradingSpec(self.ratio, self.segments, not self.reverse,
+                           self.literal)
+
+    def resolved(self) -> 'GradingSpec':
+        """The profile blockMesh reads: literal parsed, reversal applied."""
+        base = self
+        if self.literal is not None:
+            base = parse_grading(_strip_group(self.literal))
+        ratio, segments = base.ratio, base.segments
+        if self.reverse:
+            if segments:
+                segments = tuple(
+                    (a, b, 1.0 / c if c else c)
+                    for a, b, c in reversed(segments))
+            elif ratio:
+                ratio = 1.0 / ratio
+        return GradingSpec(ratio, segments)
+
     def validate(self, what: str) -> tuple[str, ...]:
+        if self.literal is not None or self.reverse:
+            try:
+                return self.resolved().validate(what)
+            except BackgroundMeshError as error:
+                return (f'{what}: {error}',)
         problems: list[str] = []
         if self.segments:
             length = sum(item[0] for item in self.segments)
@@ -159,20 +205,213 @@ class GradingSpec:
         direction, and then two more it has no axes for. The list has to
         close around the segments of the direction they belong to.
         """
-        if self.literal is not None:
+        if self.literal is not None and not self.reverse:
             return self.literal
-        if self.segments:
+        spec = self.resolved() if (self.reverse or self.literal) else self
+        if spec.segments:
             segments = ' '.join(
-                f'({_g(a)} {_g(b)} {_g(c)})' for a, b, c in self.segments)
+                f'({_g(a)} {_g(b)} {_g(c)})' for a, b, c in spec.segments)
             return f'({segments})'
-        ratio = 1.0 / self.ratio if self.toward_start else self.ratio
-        return _g(ratio)
+        return _g(spec.ratio)
 
 
 def _g(value: float) -> str:
     """A number rendered the way the dictionary writer renders one."""
     text = f'{float(value):g}'
     return text
+
+
+def _exact(value: float) -> str:
+    """A number to twelve significant figures, for a generated reciprocal.
+
+    ``_g`` keeps six, which is the precision the custom-block writer has
+    always used and must keep using for its bytes to stay the same. The
+    default block renders the ratio as it was typed, so a reciprocal written
+    beside it carries enough figures that ``1 / (1 / q)`` prints as ``q``.
+    """
+    return f'{float(value):.12g}'
+
+
+def _strip_group(text: str) -> str:
+    """``((a b c) (d e f))`` -> ``(a b c) (d e f)``: one direction's group."""
+    raw = str(text).strip()
+    if raw.startswith('(') and raw.endswith(')') and raw.count('(') > 1:
+        depth = 0
+        for index, character in enumerate(raw):
+            depth += character == '('
+            depth -= character == ')'
+            if depth == 0 and index < len(raw) - 1:
+                return raw          # two groups side by side, not one
+        return raw[1:-1].strip()
+    return raw
+
+
+# -- the four "Fine cells at" presets (Plan 37 UF12) ------------------------ #
+
+def preset_grading(fine: str, ratio) -> GradingSpec:
+    """One direction graded by *ratio* (largest cell / smallest), fine at *fine*.
+
+    ============  =============================================
+    start         ``r`` -- blockMesh's last/first above one
+    end           ``1/r``
+    centre        ``((0.5 0.5 1/r) (0.5 0.5 r))``
+    both_edges    ``((0.5 0.5 r) (0.5 0.5 1/r))``
+    ============  =============================================
+
+    A ratio of one is uniform whichever side is named, and renders ``1``.
+    """
+    r = _as_float(ratio, 'grading ratio')
+    if r < 1:
+        raise BackgroundMeshError(
+            f'grading ratio {r:g} is below 1; it is the largest cell divided '
+            'by the smallest, and the side the small cells go on is chosen '
+            'separately')
+    fine = str(getattr(fine, 'value', fine) or FINE_START)
+    if fine not in FINE_PRESETS:
+        raise BackgroundMeshError(f'no grading preset named {fine!r}')
+    if r == 1:
+        return GradingSpec(1.0)
+    if fine == FINE_START:
+        return GradingSpec(r)
+    if fine == FINE_END:
+        return GradingSpec(r, reverse=True)
+    if fine == FINE_BOTH_EDGES:
+        return GradingSpec(1.0, ((0.5, 0.5, r), (0.5, 0.5, 1.0 / r)))
+    return GradingSpec(1.0, ((0.5, 0.5, 1.0 / r), (0.5, 0.5, r)))
+
+
+def preset_text(fine, ratio_text) -> str:
+    """The default block's direction token for *fine* and the typed ratio.
+
+    The ratio is written exactly as it was typed wherever it appears
+    unchanged, so a Start direction -- and every uniform one -- is the byte
+    the default block has always written.
+    """
+    typed = str(ratio_text).strip()
+    r = _as_float(typed, 'grading ratio')
+    preset_grading(fine, r)              # refuses a ratio below one
+    fine = str(getattr(fine, 'value', fine) or FINE_START)
+    if r == 1 or fine == FINE_START:
+        return typed
+    inverse = _exact(1.0 / r)
+    if fine == FINE_END:
+        return inverse
+    if fine == FINE_CENTRE:
+        return f'((0.5 0.5 {inverse}) (0.5 0.5 {typed}))'
+    return f'((0.5 0.5 {typed}) (0.5 0.5 {inverse}))'
+
+
+def segment_cells(count: int, segments) -> tuple[int, ...]:
+    """How many cells blockMesh gives each segment of a direction of *count*.
+
+    Read off OpenFOAM 13 ``lineDivide.C``: with at least as many cells as
+    segments, each takes ``label(cellFraction * count + 0.5)`` and the
+    difference from *count* is added to the first of the segments with the
+    largest cell fraction. With fewer cells than segments the edge is divided
+    uniformly and the profile is not used at all -- returned here as ``()``.
+    """
+    count = int(count)
+    fractions = [float(item[1]) for item in segments]
+    total = sum(fractions) or 1.0
+    fractions = [item / total for item in fractions]
+    if not fractions or count < len(fractions):
+        return ()
+    cells = [int(item * count + 0.5) for item in fractions]
+    difference = count - sum(cells)
+    if difference:
+        largest = fractions.index(max(fractions))
+        cells[largest] += difference
+    return tuple(cells)
+
+
+def two_sided_split(count: int) -> tuple[int, int]:
+    """The two halves of a Centre or Both-edges direction of *count* cells."""
+    cells = segment_cells(count, ((0.5, 0.5, 1.0), (0.5, 0.5, 1.0)))
+    return cells if cells else (count, 0)       # type: ignore[return-value]
+
+
+def grading_cell_problems(count, spec: GradingSpec, what: str) -> tuple[str, ...]:
+    """A graded profile too short to honour, refused rather than written.
+
+    A segment given one cell is one flat cell whatever its ratio says, and a
+    direction with fewer cells than segments is divided uniformly: blockMesh
+    accepts both and quietly writes something the request did not ask for.
+    """
+    try:
+        count = int(count)
+        resolved = spec.resolved()
+    except (TypeError, ValueError):
+        return ()
+    graded = [abs(item[2] - 1.0) > 1e-12 for item in resolved.segments]
+    if not resolved.segments or not any(graded):
+        return ()
+    cells = segment_cells(count, resolved.segments)
+    short = (not cells) or any(
+        grading and n < 2 for grading, n in zip(graded, cells))
+    if not short:
+        return ()
+    needed = 2 * len(resolved.segments)
+    split = ' + '.join(str(n) for n in cells) if cells else 'none'
+    return (f'{what}: too few cells for this grading — {count} cells split '
+            f'{split} between its {len(resolved.segments)} parts, and a part '
+            'with one cell cannot grade; give it at least '
+            f'{needed} cells or a ratio of 1',)
+
+
+def achieved_ratio(count, spec: GradingSpec) -> float:
+    """The largest cell divided by the smallest, as blockMesh will write it."""
+    from foammesh.core.mesh.face_clearance import axis_faces
+
+    faces = axis_faces(int(count), spec)
+    widths = [b - a for a, b in zip(faces, faces[1:]) if b - a > 0]
+    return max(widths) / min(widths) if widths else 1.0
+
+
+def grading_summary(count, fine, ratio, axis: str = '') -> str:
+    """One sentence on what a side and ratio will write over *count* cells.
+
+    Plan 37 UF12. *count* may be ``None`` when a target size decides it. A
+    two-sided grading halves the direction the way blockMesh
+    does (``lineDivide.C``: an odd count gives the extra cell to the second
+    half), so the split and the ratio actually reached are stated rather
+    than left for the user to find in the mesh. Empty for a uniform one.
+    """
+    fine = str(getattr(fine, 'value', fine) or FINE_START)
+    what = f'{axis}: ' if axis else ''
+    try:
+        spec = preset_grading(fine, ratio)
+        count = None if count in (None, '') else int(count)
+    except (BackgroundMeshError, TypeError, ValueError) as error:
+        return f'{what}{error}'
+    r = float(spec.ratio if not spec.segments else spec.segments[0][2])
+    if not spec.segments and r == 1:
+        return ''
+    if count is None and fine not in (FINE_START, FINE_END):
+        # Sized by a target cell size: the count, and so the split, is only
+        # known when the case is written.
+        where = 'in the middle' if fine == FINE_CENTRE else 'at both edges'
+        return (f'{what}small cells {where}, each half graded '
+                f'{_g(max(r, 1 / r))}; the split follows the cell count the '
+                'target size gives.')
+    problems = grading_cell_problems(count, spec, axis or 'this direction')
+    if problems:
+        return problems[0]
+    if fine in (FINE_START, FINE_END):
+        side = ('start (the minus side)' if fine == FINE_START
+                else 'end (the plus side)')
+        return (f'{what}small cells at the {side}; the largest cell is '
+                f'{_g(max(r, 1 / r))} times the smallest.')
+    first, second = two_sided_split(count)
+    reached = achieved_ratio(count, spec)
+    where = 'in the middle' if fine == FINE_CENTRE else 'at both edges'
+    sentence = (f'{what}small cells {where}; {count} cells split '
+                f'{first} + {second}, each half graded '
+                f'{_g(max(r, 1 / r))}, largest cell {_g(round(reached, 3))} '
+                'times the smallest.')
+    if first != second:
+        sentence += (' An odd count gives the second half the extra cell, '
+                     'so the halves do not meet at one size.')
+    return sentence
 
 
 @dataclass(frozen=True)
@@ -364,6 +603,17 @@ class BackgroundTopology:
                         'every direction needs at least one')
             for index, spec in enumerate(block.grading):
                 found.extend(spec.validate(f'block {number} grading {index + 1}'))
+            # Plan 37 UF12: a profile too short for its cells is refused,
+            # rather than written as the flat direction blockMesh would make.
+            for axis, spec in enumerate(self.direction_gradings(block)):
+                if spec is None:
+                    continue
+                try:
+                    n = block.count(axis)
+                except (TypeError, ValueError):
+                    continue
+                found.extend(grading_cell_problems(
+                    n, spec, f'block {number} grading {"xyz"[axis]}'))
             jacobians = self.corner_jacobians(block)
             bad = [i for i, value in enumerate(jacobians) if value <= 0]
             if bad:
@@ -379,21 +629,57 @@ class BackgroundTopology:
         found.extend(self._boundary_problems())
         return tuple(found)
 
+    @staticmethod
+    def direction_gradings(block: Block) -> tuple:
+        """The three per-direction gradings of a ``simpleGrading`` block.
+
+        ``(None, None, None)`` for an ``edgeGrading`` block, whose four edges
+        of a direction may differ, and for a literal that cannot be read.
+        """
+        if block.grading_literal is not None:
+            return split_directions(block.grading_literal)
+        if len(block.grading) == 3:
+            return tuple(block.grading)
+        if not block.grading:
+            return (GradingSpec(), GradingSpec(), GradingSpec())
+        return (None, None, None)
+
     def _interface_problems(self) -> tuple[str, ...]:
-        """Shared edges must agree on how many cells they carry."""
+        """Shared edges must agree on how many cells they carry, and where.
+
+        Plan 37 UF12. Start and end are each block's own: a neighbour turned
+        round has its local axis running the other way along the shared edge,
+        so the same "Fine cells at" choice on both sides grades that edge in
+        opposite directions. MEASURED live on OpenFOAM 13: blockMesh refuses
+        it -- "Inconsistent point locations between block pair 0 and 1,
+        probably due to inconsistent grading" -- naming vertices, not the
+        choice to change. The edge is compared here in world order instead.
+        """
+        from foammesh.core.mesh.face_clearance import axis_faces
+
         found: list[str] = []
         seen: dict[frozenset, tuple[int, int]] = {}
+        spacing: dict[frozenset, tuple[int, tuple[float, ...]]] = {}
         for number, block in enumerate(self.blocks, start=1):
             if len(block.vertices) != 8:
                 continue
+            gradings = self.direction_gradings(block)
             for axis, pairs in enumerate(BLOCK_EDGES):
                 try:
                     n = block.count(axis)
                 except (TypeError, ValueError):
                     continue
+                faces = None
+                if gradings[axis] is not None:
+                    try:
+                        faces = axis_faces(n, gradings[axis])
+                    except (BackgroundMeshError, TypeError, ValueError,
+                            ZeroDivisionError):
+                        faces = None
                 for local_a, local_b in pairs:
-                    key = frozenset(
-                        (block.vertices[local_a], block.vertices[local_b]))
+                    first, second = (block.vertices[local_a],
+                                     block.vertices[local_b])
+                    key = frozenset((first, second))
                     if len(key) != 2:
                         continue
                     previous = seen.get(key)
@@ -406,6 +692,29 @@ class BackgroundTopology:
                             f'between vertices {a} and {b} but divide it into '
                             f'{previous[1]} and {n} cells; blockMesh needs '
                             'the subdivisions on a shared face to match')
+                        continue
+                    if faces is None:
+                        continue
+                    # The edge's face fractions from its lower-numbered
+                    # vertex to its higher, whichever way the block runs.
+                    along = (faces if first < second
+                             else tuple(1.0 - f for f in reversed(faces)))
+                    earlier = spacing.get(key)
+                    if earlier is None:
+                        spacing[key] = (number, along)
+                        continue
+                    widths = [b - a for a, b in zip(along, along[1:])]
+                    tolerance = 1e-3 * min(widths) if widths else 0.0
+                    if any(abs(p - q) > tolerance
+                           for p, q in zip(earlier[1], along)):
+                        a, b = sorted(key)
+                        found.append(
+                            f'blocks {earlier[0]} and {number} share the edge '
+                            f'between vertices {a} and {b} but grade it '
+                            'differently, so blockMesh cannot join them. '
+                            "Start and end follow each block's own vertex "
+                            'order: a block turned round needs the opposite '
+                            'side (End instead of Start) to match')
         return tuple(dict.fromkeys(found))
 
     def face_owners(self) -> dict[frozenset, list[tuple[int, str]]]:
@@ -557,19 +866,20 @@ class BackgroundTopology:
 # Authoring
 # --------------------------------------------------------------------------- #
 
-def parse_grading(text, *, toward_start: bool = False) -> GradingSpec:
+def parse_grading(text, *, reverse: bool = False) -> GradingSpec:
     """One grading direction, from what a project stored.
 
     Accepts a plain ratio (``4``), or a segmented profile written the way
     ``blockMeshDict`` writes one -- ``(0.2 0.3 4) (0.6 0.4 1) (0.2 0.3 0.25)``
-    -- so the richer form does not need a second field to live in.
+    -- so the richer form does not need a second field to live in. The
+    bracketed form a direction takes inside ``simpleGrading`` --
+    ``((0.5 0.5 4) (0.5 0.5 0.25))`` -- is read the same way.
     """
-    raw = '' if text is None else str(text).strip()
+    raw = '' if text is None else _strip_group(str(text).strip())
     if not raw:
-        return GradingSpec(1.0, toward_start=toward_start)
+        return GradingSpec(1.0, reverse=reverse)
     if '(' not in raw:
-        return GradingSpec(_as_float(raw, 'grading ratio'),
-                           toward_start=toward_start)
+        return GradingSpec(_as_float(raw, 'grading ratio'), reverse=reverse)
     segments: list[tuple[float, float, float]] = []
     depth = 0
     current: list[str] = []
@@ -598,7 +908,45 @@ def parse_grading(text, *, toward_start: bool = False) -> GradingSpec:
         raise BackgroundMeshError('unbalanced brackets in the grading')
     if not segments:
         raise BackgroundMeshError('the grading names no segments')
-    return GradingSpec(1.0, tuple(segments), toward_start=toward_start)
+    return GradingSpec(1.0, tuple(segments), reverse=reverse)
+
+
+def split_directions(literal) -> tuple:
+    """The three directions of a ``simpleGrading`` text such as ``2 1 (..)``.
+
+    Each is a `GradingSpec` carrying its own text as the literal, so it
+    renders byte for byte and still reverses; an unreadable direction, or a
+    text that is not three directions, gives ``None`` in its place.
+    """
+    text = str(literal or '').strip()
+    if text.startswith('(') and text.endswith(')') and text.count('(') == 1:
+        text = text[1:-1]
+    tokens: list[str] = []
+    depth = 0
+    current = ''
+    for character in text:
+        if character == '(':
+            depth += 1
+        if character == ')':
+            depth -= 1
+        if character.isspace() and depth == 0:
+            if current:
+                tokens.append(current)
+                current = ''
+            continue
+        current += character
+    if current:
+        tokens.append(current)
+    if len(tokens) != 3:
+        return (None, None, None)
+    gradings = []
+    for token in tokens:
+        try:
+            parse_grading(token)
+            gradings.append(GradingSpec(literal=token))
+        except BackgroundMeshError:
+            gradings.append(None)
+    return tuple(gradings)
 
 
 def parse_points(text) -> tuple[tuple[float, float, float], ...]:
@@ -693,6 +1041,23 @@ def _read(item, name, default=None):
     return getattr(value, 'value', value)
 
 
+def block_grading(item, axis: str) -> GradingSpec:
+    """One direction of one authored block, from whichever control governs it.
+
+    Plan 37 UF12: exactly one authority at a time. With "Fine cells at" set
+    to a side, the side and the ratio are the grading and the text beside
+    them is only a display of it; with Custom profile, the typed text is the
+    grading, written as typed. A record that names no side -- one built
+    before the choice existed, or by a caller that only ever typed text --
+    is a custom profile.
+    """
+    fine = _read(item, f'grading{axis}Fine', FINE_CUSTOM_PROFILE)
+    fine = str(getattr(fine, 'value', fine) or FINE_CUSTOM_PROFILE)
+    if fine in FINE_PRESETS:
+        return preset_grading(fine, _read(item, f'grading{axis}Ratio', 1))
+    return parse_grading(_read(item, f'grading{axis}'))
+
+
 def from_records(base_grid, *, scale=1) -> 'BackgroundTopology | None':
     """Build an authored multiblock topology, or ``None`` if none was authored.
 
@@ -716,12 +1081,7 @@ def from_records(base_grid, *, scale=1) -> 'BackgroundTopology | None':
         indices = parse_indices(_read(item, 'vertices'), expected=8)
         counts = (_read(item, 'numCellsX', 1), _read(item, 'numCellsY', 1),
                   _read(item, 'numCellsZ', 1))
-        grading = tuple(
-            parse_grading(
-                _read(item, f'grading{axis}'),
-                toward_start=bool(_read(item, f'grading{axis}TowardStart',
-                                        False)))
-            for axis in 'XYZ')
+        grading = tuple(block_grading(item, axis) for axis in 'XYZ')
         blocks.append(Block(indices, counts, grading,
                             zone=str(_read(item, 'zone', '') or '').strip()))
 

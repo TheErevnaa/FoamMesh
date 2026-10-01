@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 
 from foammesh.core.jobs.retry import RETRY, RETRY_FEWER_CORES
+from foammesh.core.quantities import count_text
 
 
 def retry_text(result, offer: dict) -> tuple[str, str]:
@@ -23,8 +24,8 @@ def retry_text(result, offer: dict) -> tuple[str, str]:
         detail = ('The run was stopped because the computer ran out of memory. '
                   'It can be run again from where it started')
         if RETRY_FEWER_CORES in (offer.get('actions') or ()):
-            detail += (f", or on {offer.get('fewer_cores')} core(s) instead of "
-                       f"{offer.get('ranks')}, which needs less memory")
+            detail += (f", or on {count_text(offer.get('fewer_cores') or 0, 'core')}"
+                       f" instead of {offer.get('ranks')}, which needs less memory")
         detail += '.'
     else:
         detail = ('The connection to the WSL runtime was lost while the run was '

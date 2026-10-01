@@ -149,7 +149,7 @@ class GmshSizeFieldsPage(GmshTaskPage):
         layout.addWidget(self._buildEdgeSection())
 
         for panel in self.scopePanels():
-            panel.childrenChanged.connect(self.refresh)
+            panel.childrenChanged.connect(self.refresh_keeping_edits)
             panel.selectedSurfaceChanged.connect(
                 lambda reference, source=panel: self._scopeSelected(source))
 

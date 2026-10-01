@@ -436,7 +436,11 @@ class CastellationPage(StepPage):
             await AsyncMessageBox().information(self._widget, self.tr('Complete'),
                                                 self.tr('Castellation refinement is completed.'))
 
-        self._enableEdit()
+        # Plan 37 UF5 DP-1084. A run that published this stage locks the
+        # page while it runs (the step manager re-reads the lock when the
+        # stage completes); the editors stay shut under that lock.
+        if not self._locked:
+            self._enableEdit()
         self._ui.castellationCancel.hide()
 
         self.updateWorkingStatus()

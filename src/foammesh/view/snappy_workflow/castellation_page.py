@@ -8,7 +8,7 @@ here, which is the same editor the Gmsh size fields and curve controls use.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QMessageBox
+from PySide6.QtWidgets import QLabel
 
 from foammesh.view.facade_client import submit
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
@@ -49,13 +49,13 @@ class RefinementGroupPanel(ChildControlPanel):
     def _run(self, operation: str, parameters: dict) -> None:
         """The inherited write, followed by the binding it implies."""
         kind = operation.rsplit('.', 1)[-1]
+        # Plan 37 UF3 DP-1035. Tracked from the press to the binding that
+        # follows it, so Proceed waits for both and the task hears of them.
+        write = self._open_write()
 
         def ran(result) -> None:
             if getattr(result, 'status', 'accepted') != 'accepted':
-                QMessageBox.warning(
-                    self, self.tr('Operation failed'),
-                    str(getattr(result, 'message', '')
-                        or self.tr('The facade rejected the change.')))
+                self._close_write(write, False, result)
                 return
             payload = getattr(result, 'payload', None) or {}
             group = (payload.get('entity_id') if kind == 'create'
@@ -64,6 +64,7 @@ class RefinementGroupPanel(ChildControlPanel):
             def finished() -> None:
                 self.refresh()
                 self.childrenChanged.emit()
+                self._close_write(write, True)
 
             if kind == 'remove':
                 unbind_group(self._client, self._kind,
@@ -71,7 +72,8 @@ class RefinementGroupPanel(ChildControlPanel):
             else:
                 self.membership.commit(group, then=finished)
 
-        submit(self._client, operation, parameters, then=ran)
+        self._track_write(write, submit(self._client, operation, parameters,
+                                        then=ran))
 
 
 class SnappyCastellationPage(SnappyTaskPage):
@@ -115,7 +117,7 @@ class SnappyCastellationPage(SnappyTaskPage):
             'Splits base grid cells near a surface. Each level halves the '
             'cell size there, so a level costs roughly eight times the cells '
             'of the one before it.'))
-        self.surface_panel.childrenChanged.connect(self.refresh)
+        self.surface_panel.childrenChanged.connect(self.refresh_keeping_edits)
         layout.insertWidget(0, self.surface_panel)
 
         self.surface_panel.childrenChanged.connect(self.sync_band_groups)
@@ -128,7 +130,7 @@ class SnappyCastellationPage(SnappyTaskPage):
             'Splits base grid cells inside a named region rather than near a '
             'surface. A wake or a gap is resolved where no surface runs '
             'through it.'))
-        self.volume_panel.childrenChanged.connect(self.refresh)
+        self.volume_panel.childrenChanged.connect(self.refresh_keeping_edits)
         layout.insertWidget(1, self.volume_panel)
 
         self.band_panel = ChildControlPanel(
@@ -140,7 +142,7 @@ class SnappyCastellationPage(SnappyTaskPage):
             'distance: one row per step, each reaching further and refining '
             'less. A group with no bands keeps the single level on its '
             'surface refinement row.'))
-        self.band_panel.childrenChanged.connect(self.refresh)
+        self.band_panel.childrenChanged.connect(self.refresh_keeping_edits)
         layout.insertWidget(2, self.band_panel)
 
         # DP-586 (field audit 0924 snappy-front D13). The volume distance
@@ -154,7 +156,7 @@ class SnappyCastellationPage(SnappyTaskPage):
             'reaching further and refining less. A group with no bands keeps '
             'its single distance and level; a group in another mode ignores '
             'its bands.'))
-        self.volume_band_panel.childrenChanged.connect(self.refresh)
+        self.volume_band_panel.childrenChanged.connect(self.refresh_keeping_edits)
         self.volume_panel.childrenChanged.connect(self.sync_volume_band_groups)
         layout.insertWidget(3, self.volume_band_panel)
 

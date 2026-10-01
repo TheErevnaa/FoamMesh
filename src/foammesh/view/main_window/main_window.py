@@ -103,6 +103,7 @@ from foammesh.core.geometry.diagnostics.repair import (
     REPAIR_BANDS, TESSELLATED_ACTIONS, apply_action, write_surface,
 )
 from foammesh.view.facade_client import query, submit
+from foammesh.view.outside_task import modal
 
 from .run_narration import describe_cancellation, describe_start
 from .run_status_strip import RunStatusStrip
@@ -1056,8 +1057,52 @@ class MainWindow(QMainWindow):
                 return
         description = handle.describe() if handle is not None else ''
         self._offeredResult = None
+        self._historicalResult = None
         self._viewportOverlay.setResult(description)
         self.showRunStatus(description)
+
+    #: Plan 37 I2. The run line as it read before an unlock labelled the mesh
+    #: historical, or None while no such label is up.
+    _historicalResult = None
+
+    def showHistoricalResult(self, stage: str, revision: int = 0) -> None:
+        """Label the mesh on screen as the output an unlock kept (I2).
+
+        After "Unlock and discard later results" the viewport still draws
+        the mesh on disk, and that mesh is the previous result: none of the
+        edits about to be made on the unlocked step are in it. Plan 37 I2
+        forbids showing it as though they were, and a page notice is not
+        where the mesh is. So the run line over the picture says so, until a
+        run publishes (:meth:`clearHistoricalResult`) or the unlock is
+        undone.
+        """
+        manager = getattr(self, '_meshManager', None)
+        empty = getattr(manager, 'isEmpty', None)
+        if callable(empty) and empty():
+            return
+        if self._historicalResult is None:
+            self._historicalResult = self._viewportOverlay.resultText()
+        label = self.tr('Previous mesh — edits to {0} not applied').format(
+            stage)
+        if revision:
+            label = f'{label} · {self.tr("revision {0}").format(int(revision))}'
+        self._viewportOverlay.setResult(label)
+
+    def clearHistoricalResult(self, restore: bool = False) -> None:
+        """Take the historical label down (I2).
+
+        ``restore`` puts back the run line it covered, for an undo that made
+        that run's mesh current again. Without it the line is left empty for
+        the run that has just published to name.
+        """
+        previous = self._historicalResult
+        if previous is None:
+            return
+        self._historicalResult = None
+        self._viewportOverlay.setResult(previous if restore else '')
+
+    def historicalResultShown(self) -> bool:
+        return self._historicalResult is not None
 
     def offerSurfacePass(self, handle) -> bool:
         """Say a run kept its surface mesh, and draw it only if asked.
@@ -1106,6 +1151,7 @@ class MainWindow(QMainWindow):
             self.showRunStatus(message, failed=True)
             return False
         self._offeredResult = handle
+        self._historicalResult = None
         self._viewportOverlay.setResult(message)
         strip.showOffer(
             f'{message} {self.tr("The case still holds")} '
@@ -1128,6 +1174,7 @@ class MainWindow(QMainWindow):
         # result of the run that just failed.
         description = (f'{self.tr("Showing earlier result")} · '
                        f'{handle.describe()}')
+        self._historicalResult = None
         self._viewportOverlay.setResult(description)
         self.showRunStatus(description)
 
@@ -2730,7 +2777,12 @@ class MainWindow(QMainWindow):
         if operation == 'mesh.run.accept':
             run_id = run_id or await self._candidateRunId()
             if not run_id:
-                QMessageBox.warning(
+                # Plan 37 UF20 follow-up: every box a coroutine here opens
+                # is opened with no task current (`outside_task`), so its
+                # nested loop does not refuse -- and drop -- the tasks it
+                # steps.
+                await modal(
+                    QMessageBox.warning,
                     self, self.tr('Not accepted'),
                     self.tr('This case holds no meshing run to accept. Run '
                             'the mesh again and accept the result of that '
@@ -2753,14 +2805,16 @@ class MainWindow(QMainWindow):
                 lambda **event: console.append(event.get('line', '')))
             result = await app.facadeClient.run(operation, parameters)
         except Exception as error:                           # noqa: BLE001
-            QMessageBox.warning(self, self.tr('Not accepted'), str(error))
+            await modal(QMessageBox.warning,
+                        self, self.tr('Not accepted'), str(error))
             return
         finally:
             if unsubscribe is not None:
                 unsubscribe()
         payload = getattr(result, 'payload', {}) or {}
         if getattr(result, 'status', '') != 'accepted':
-            QMessageBox.warning(
+            await modal(
+                QMessageBox.warning,
                 self, self.tr('Not accepted'),
                 str(payload.get('reason') or self.tr('The mesh was refused.')))
             return
@@ -3100,7 +3154,8 @@ class MainWindow(QMainWindow):
             fields_present = self._caseHasResultFields(app.project.path)
             field_support = '-rotateFields' in help_result.output
             if fields_present and operation != 'rotate':
-                proceed = QMessageBox.warning(
+                proceed = await modal(
+                    QMessageBox.warning,
                     self, self.tr('Existing result fields'),
                     self.tr('This case contains result fields. The selected transform changes mesh points '
                             'but does not transform those fields. Continue?'),
@@ -3240,7 +3295,8 @@ class MainWindow(QMainWindow):
                 self.tr('No configured mesh repair utility is available for this case.'), 6000)
             return
         labels = [operation.label for operation in operations]
-        selected, accepted = QInputDialog.getItem(
+        selected, accepted = await modal(
+            QInputDialog.getItem,
             self, self.tr('Mesh repair'), self.tr('Repair operation'), labels, 0, False)
         if not accepted:
             return
@@ -3248,16 +3304,19 @@ class MainWindow(QMainWindow):
         cell_set = None
         subset_destination = None
         if operation is RepairOperation.SUBSET_CELLS:
-            cell_set, accepted = QInputDialog.getText(
+            cell_set, accepted = await modal(
+                QInputDialog.getText,
                 self, self.tr('Subset mesh'), self.tr('Existing cell-set name'))
             if not accepted:
                 return
-            parent = QFileDialog.getExistingDirectory(
+            parent = await modal(
+                QFileDialog.getExistingDirectory,
                 self, self.tr('Select parent for subset case'), app.settings.getRecentLocation(),
                 QFileDialog.Option.ShowDirsOnly)
             if not parent:
                 return
-            name, accepted = QInputDialog.getText(
+            name, accepted = await modal(
+                QInputDialog.getText,
                 self, self.tr('Subset mesh'), self.tr('New subset case directory name'),
                 text=f'{app.project.name()}-subset')
             if not accepted or not name.strip():
@@ -3278,7 +3337,8 @@ class MainWindow(QMainWindow):
             warning += self.tr('\nConfiguration: {0}').format(preview.configuration_path)
         if operation is RepairOperation.SUBSET_CELLS:
             warning = self.tr('This destructive operation runs only in a new copied case.')
-        confirmation = QMessageBox.question(
+        confirmation = await modal(
+            QMessageBox.question,
             self, self.tr('Run mesh repair'), warning,
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -3348,7 +3408,8 @@ class MainWindow(QMainWindow):
                 except (FacadeError, OSError, ValueError, RuntimeError, CaseConflictError):
                     pass
         if completed.payload.get('copied_from') is not None:
-            QMessageBox.information(
+            await modal(
+                QMessageBox.information,
                 self, self.tr('Subset case created'),
                 summary + '\n' + self.tr('New case: {0}').format(
                     completed.payload['case_path']))
@@ -3372,7 +3433,8 @@ class MainWindow(QMainWindow):
             self._updateMenuStates()
             return
         payload = points[-1]
-        confirmation = QMessageBox.question(
+        confirmation = await modal(
+            QMessageBox.question,
             self, self.tr('Restore previous mesh'),
             self.tr('Replace the current mesh with the recovery copy saved before '
                     '"{0}" ({1})?\nThis is an artifact restore, not Undo; the '
@@ -3409,7 +3471,8 @@ class MainWindow(QMainWindow):
                 self.tr('No imported surface geometry is available for repair.'), 6000)
             return
         labels = [f"{geometry.value('name')} [{g_id}]" for g_id, geometry in surfaces.items()]
-        selected, accepted = QInputDialog.getItem(
+        selected, accepted = await modal(
+            QInputDialog.getItem,
             self, self.tr('Geometry repair'), self.tr('Surface'), labels, 0, False)
         if not accepted:
             return
@@ -3423,7 +3486,8 @@ class MainWindow(QMainWindow):
         labels = [
             f'{name}  —  {REPAIR_BANDS[TESSELLATED_ACTIONS[name].band][0]}'
             for name in operations]
-        operation_label, accepted = QInputDialog.getItem(
+        operation_label, accepted = await modal(
+            QInputDialog.getItem,
             self, self.tr('Geometry repair'), self.tr('Operation'),
             labels, 0, False)
         if not accepted:
@@ -3431,7 +3495,8 @@ class MainWindow(QMainWindow):
         operation = operations[labels.index(operation_label)]
         hole_size = 1e6
         if operation == 'tess.fill_holes':
-            hole_size, accepted = QInputDialog.getDouble(
+            hole_size, accepted = await modal(
+                QInputDialog.getDouble,
                 self, self.tr('Fill surface holes'),
                 self.tr('Maximum hole size (m)'),
                 1e6, 1e-12, 1e18, 6)
@@ -3458,7 +3523,8 @@ class MainWindow(QMainWindow):
                 after_counts.get('non_manifold_edges', 0),
                 before_counts.get('duplicate_points', 0),
                 after_counts.get('duplicate_points', 0))
-        choice = QMessageBox.question(
+        choice = await modal(
+            QMessageBox.question,
             self, self.tr('Geometry repair preview'), summary,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
             QMessageBox.StandardButton.Cancel,
@@ -3466,7 +3532,8 @@ class MainWindow(QMainWindow):
         if choice == QMessageBox.StandardButton.Cancel:
             return
         if choice == QMessageBox.StandardButton.No:
-            path, _ = QFileDialog.getSaveFileName(
+            path, _ = await modal(
+                QFileDialog.getSaveFileName,
                 self, self.tr('Save repaired geometry copy'),
                 str(app.project.path / f"{surfaces[g_id].value('name')}-repaired.stl"),
                 self.tr('STL surface (*.stl);;OBJ surface (*.obj)'))
@@ -3509,11 +3576,13 @@ class MainWindow(QMainWindow):
             return
 
         fmt = ConverterFormat(entry.entry_id)
-        source, _ = QFileDialog.getOpenFileName(
+        source, _ = await modal(
+            QFileDialog.getOpenFileName,
             self, self.tr('Select {0}').format(fmt.label), app.settings.getRecentLocation(), fmt.file_filter())
         if not source:
             return
-        confirmation = QMessageBox.question(
+        confirmation = await modal(
+            QMessageBox.question,
             self, self.tr('Convert and replace mesh'),
             self.tr('Convert this file into the current case? The current mesh will be retained as a recovery copy.'),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
@@ -3576,7 +3645,8 @@ class MainWindow(QMainWindow):
         }
 
     async def _loadNativeMeshFromCase(self):
-        source = QFileDialog.getExistingDirectory(
+        source = await modal(
+            QFileDialog.getExistingDirectory,
             self, self.tr('Select OpenFOAM mesh case'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not source:
@@ -3613,12 +3683,14 @@ class MainWindow(QMainWindow):
         self._updateMenuStates()
 
     async def _importNativeMeshIntoCopy(self, source):
-        parent = QFileDialog.getExistingDirectory(
+        parent = await modal(
+            QFileDialog.getExistingDirectory,
             self, self.tr('Select parent for new case copy'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
-        name, accepted = QInputDialog.getText(
+        name, accepted = await modal(
+            QInputDialog.getText,
             self, self.tr('Import into new case copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-imported')
         if not accepted or not name.strip():
@@ -3630,7 +3702,8 @@ class MainWindow(QMainWindow):
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
             await AsyncMessageBox().warning(self, self.tr('Mesh import error'), str(error))
             return
-        open_copy = QMessageBox.question(
+        open_copy = await modal(
+            QMessageBox.question,
             self, self.tr('Import complete'),
             self.tr('Imported the mesh into {0}. Open that case now?').format(
                 result.payload['target_case']),
@@ -3651,12 +3724,14 @@ class MainWindow(QMainWindow):
             await self._relocateScratchCase()
             return
         await app.facadeClient.run('case.save')
-        parent = QFileDialog.getExistingDirectory(
+        parent = await modal(
+            QFileDialog.getExistingDirectory,
             self, self.tr('Select copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
-        name, accepted = QInputDialog.getText(
+        name, accepted = await modal(
+            QInputDialog.getText,
             self, self.tr('Save project as'), self.tr('New case directory name'),
             text=f'{app.project.name()}-copy')
         if not accepted or not name.strip():
@@ -3667,7 +3742,8 @@ class MainWindow(QMainWindow):
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
             await AsyncMessageBox().warning(self, self.tr('Copy error'), str(error))
             return
-        open_copy = QMessageBox.question(
+        open_copy = await modal(
+            QMessageBox.question,
             self, self.tr('Copy complete'), self.tr('Open the copied case now?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -3764,12 +3840,14 @@ class MainWindow(QMainWindow):
                     'keep it before {0}.').format(what))
 
     async def _saveConflictCopy(self):
-        parent = QFileDialog.getExistingDirectory(
+        parent = await modal(
+            QFileDialog.getExistingDirectory,
             self, self.tr('Select save copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return False
-        name, accepted = QInputDialog.getText(
+        name, accepted = await modal(
+            QInputDialog.getText,
             self, self.tr('Save copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-conflict-copy')
         if not accepted or not name.strip():
@@ -4201,7 +4279,8 @@ class MainWindow(QMainWindow):
                 await AsyncMessageBox().warning(self, self.tr('Save state error'), str(error))
                 return
             progressDialog.close()
-            open_copy = QMessageBox.question(
+            open_copy = await modal(
+                QMessageBox.question,
                 self, self.tr('State copy complete'),
                 self.tr('FoamMesh state was saved without native artifacts. Open it now?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -4323,6 +4402,21 @@ class MainWindow(QMainWindow):
 
         return True
 
+    def _cancelSectionJobs(self, reason):
+        tool = self._displayControl.cutTool()
+        cancel = getattr(tool, 'cancelSectionJobs', None)
+        if cancel is not None:
+            cancel(reason)
+
+    def _sectionRemeshEvent(self, **_payload):
+        # Any rewrite of the mesh stops a section worker still cutting it.
+        self._cancelSectionJobs('remesh')
+
+    def _sectionUnlockEvent(self, **payload):
+        # `mesh.workflow.unlock` publishes a quality change for its task.
+        if payload.get('operation') == 'mesh.workflow.unlock':
+            self._cancelSectionJobs('unlock')
+
     def _projectOpened(self):
         self._recentFilesMenu.updateRecentest(app.project.path)
         # MEASURED 2026-09-03: the start-up prompt "Open a case or create a
@@ -4388,6 +4482,13 @@ class MainWindow(QMainWindow):
             app.events.subscribe(
                 Event.ARTIFACT_QUALITY_CHANGED,
                 lambda **_payload: self.refreshMeshVerdictSoon()),
+        ] + [
+            # Plan 37 UF10. A section worker cutting a mesh that is being
+            # remeshed or unlocked is stopped and its answer taken down.
+            app.events.subscribe(
+                Event.ARTIFACT_MESH_CHANGED, self._sectionRemeshEvent),
+            app.events.subscribe(
+                Event.ARTIFACT_QUALITY_CHANGED, self._sectionUnlockEvent),
         ]
 
         self._updateWindowTitle()
@@ -4524,6 +4625,7 @@ class MainWindow(QMainWindow):
         self._consoleView.clear()
         self._viewportOverlay.setParts([])
         # The run line named a mesh from the case that is closing.
+        self._historicalResult = None
         self._viewportOverlay.setResult('')
         self._viewportOverlay.setMesh('')
         # GEO-05. So did the run strip, and nothing here ever cleared it, so

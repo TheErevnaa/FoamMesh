@@ -14,14 +14,22 @@ dialog stays as a shortcut; this is the page that location always named.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDoubleSpinBox, QScrollArea
+from PySide6.QtWidgets import (
+    QDoubleSpinBox, QGroupBox, QLabel, QListWidget, QListWidgetItem,
+    QScrollArea, QVBoxLayout,
+)
 
 from foammesh.view.workflow_controls.checkmesh_findings import (
     CheckMeshFindings,
 )
 from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
+
+logger = logging.getLogger(__name__)
 
 #: The values snappyHexMesh judges every candidate cell against, derived from
 #: the one quality policy rather than listed again here.
@@ -63,6 +71,10 @@ CHECK_MESH_FIELDS = (
     'quality.check.user_defined_checks',
     'quality.check.skip_topology',
     'quality.check.write_surfaces',
+    # Plan 37 UF18. The three switches every run carried, now the user's.
+    'quality.check.all_topology',
+    'quality.check.all_geometry',
+    'quality.check.write_sets',
 )
 
 
@@ -88,9 +100,10 @@ class SnappyQaPage(EngineTaskPage):
         'you already have. Judging against the mesher\'s own limits writes '
         'system/meshQualityDict from the mesher limits below and needs the '
         'case dictionaries generated again before it takes effect. The '
-        'problem faces are always written as sets into '
-        'constant/polyMesh/sets, which is what the viewport highlights; the '
-        'surface is the extra copy, under postProcessing/checkMesh. '
+        'failed sets are written into constant/polyMesh/sets, with the '
+        'point sets under postProcessing/checkMesh; the problem faces reach '
+        'postProcessing/checkMesh only as a surface, and those two are what '
+        'the check highlights draw. '
         'Every candidate cell is judged against the quality limits. '
         'snappyHexMesh reverts a snap or a layer insertion that would breach '
         'one, so they decide what the mesher is allowed to produce rather '
@@ -108,8 +121,11 @@ class SnappyQaPage(EngineTaskPage):
         layout.addWidget(self._findings)
         self._check = self.adoptPanel(_CheckMeshGroup(self._client, self))
         layout.addWidget(self._check)
+        # Plan 37 UF18: what the check wrote, drawn over the mesh on demand.
+        self._highlights = CheckHighlightsPanel(self._client)
+        layout.addWidget(self._highlights)
         self._quality = self.adoptPanel(
-            _MeshQualityGroup(self._client, self))
+            _MeshQualityGroup(self._client, self, engine_id=self.engine_id))
         layout.addWidget(self._quality)
 
     def renders_field(self, field_id: str) -> bool:
@@ -171,9 +187,10 @@ class SnappyQaPage(EngineTaskPage):
         learn what the warning was about was to open the checkMesh log.
         """
         super().refresh_status()
-        findings = getattr(self, '_findings', None)
-        if findings is not None:
-            findings.refresh()
+        for name in ('_findings', '_highlights'):
+            panel = getattr(self, name, None)
+            if panel is not None:
+                panel.refresh()
 
 
 class _CheckMeshGroup(FieldGroupPage):
@@ -222,10 +239,40 @@ class _MeshQualityGroup(FieldGroupPage):
                'to. A change takes effect when Snap and Layers run again; '
                'the mesh you have was made with the values set when it ran.')
     caveat = ''
+    #: Plan 37 UF15. Said before the edit, not after it: on snappy a limit is
+    #: a meshing input, so changing one stales Snap onward and Proceed meshes
+    #: again from Snap. Gmsh does not mesh against these, so it is not said
+    #: there.
+    RERUN_NOTE = 'Changing a limit re-runs the mesh from Snap'
+
+    def __init__(self, facade_client, parent=None, *, engine_id='snappy'):
+        # `build()` runs inside the base constructor, so the engine is known
+        # before it.
+        self._engine_id = str(engine_id or '').strip().lower()
+        self._rerunNote = None
+        super().__init__(facade_client, parent)
 
     def build(self) -> None:
         super().build()
         self._widenNumericEditors()
+        self._addRerunNote()
+
+    def _addRerunNote(self) -> None:
+        """Name the cost of an edit above the limits, on snappy only."""
+        if self._engine_id != 'snappy':
+            self._rerunNote = None
+            return
+        note = QLabel(self.tr(self.RERUN_NOTE), self._form)
+        note.setObjectName('meshQualityRerunNote')
+        note.setWordWrap(True)
+        note.setProperty('foammeshStatus', 'info')
+        self._form.layout().insertRow(0, note)
+        self._rerunNote = note
+
+    def rerun_note(self) -> str:
+        """The note's words when it is shown, '' when it is not."""
+        note = self._rerunNote
+        return note.text() if note is not None else ''
 
     def _widenNumericEditors(self) -> None:
         """Give every limit room for the whole number it can hold.
@@ -256,3 +303,229 @@ class _MeshQualityGroup(FieldGroupPage):
         if scroll is not None:
             scroll.setHorizontalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+
+class CheckHighlightsPanel(QGroupBox):
+    """The sets and surfaces the last checkMesh wrote, one toggle each.
+
+    Plan 37 UF18. ``-writeSets`` and ``-writeSurfaces`` wrote files nobody
+    in the product could see. Each output of the newest kept check is a row:
+    ticking it asks the mesh worker for its geometry
+    (``quality.check_highlights``) and draws it over the mesh -- point sets
+    as points, face and cell sets as surfaces, each labelled with its check.
+    A row whose output cannot be drawn (not written, not legacy VTK, over the
+    size budget, or from a mesh that has since changed) is disabled and says
+    why. Nothing is parsed in this process.
+
+    *overlay* is what takes the actors -- ``DisplayControl`` in the window,
+    with ``addOverlay`` / ``removeOverlay``; left out, the window's own is
+    looked up when a row is first ticked.
+    """
+
+    def __init__(self, facade_client, parent=None, *, overlay=None):
+        super().__init__(parent)
+        self._client = facade_client
+        self._overlay = overlay
+        self._layer = None
+        self._revision = ''
+        self._rows: dict[str, dict] = {}
+        self._filling = False
+        # DP-1104: shown only where checkMesh is the check (not the SU2
+        # route) and only once a check has written its outputs.
+        self._routeAllowed = True
+        self._hasCheck = False
+        self.setObjectName('checkHighlights')
+        self.setTitle(self.tr('Highlights from the last check'))
+        self.setAccessibleName('Highlights from the last check')
+        inner = QVBoxLayout(self)
+        self._note = QLabel()
+        self._note.setObjectName('checkHighlightsNote')
+        self._note.setWordWrap(True)
+        inner.addWidget(self._note)
+        self._list = QListWidget()
+        self._list.setObjectName('checkHighlightsList')
+        self._list.setAccessibleName('Check outputs to draw')
+        self._list.itemChanged.connect(self._onItemChanged)
+        inner.addWidget(self._list)
+        self.refresh()
+
+    # -- what there is ------------------------------------------------------ #
+
+    def manifest(self) -> dict:
+        from foammesh.view.facade_client import query
+
+        try:
+            payload = query(self._client, 'quality.check_artifacts').payload
+        except Exception:                                    # noqa: BLE001
+            logger.debug('check outputs unavailable', exc_info=True)
+            return {}
+        return dict(payload or {})
+
+    def refresh(self) -> None:
+        from foammesh.core.quality.check_artifacts import highlight_rows
+
+        manifest = self.manifest()
+        revision = str(manifest.get('revision') or '')
+        rows = highlight_rows(manifest)
+        if revision != self._revision or manifest.get('stale'):
+            # Another check, or the mesh moved under this one: nothing drawn
+            # from the old one may stay on screen.
+            self._clearLayer()
+        self._revision = revision
+        shown = set(self._layer.shown()) if self._layer is not None else set()
+        self._rows = {row['name']: row for row in rows}
+        self._filling = True
+        try:
+            self._list.clear()
+            for row in rows:
+                item = QListWidgetItem(row['label'] if row['enabled'] else
+                                       f"{row['label']}\n{row['reason']}")
+                item.setData(Qt.ItemDataRole.UserRole, row['name'])
+                item.setToolTip(row['reason'] or row['note'] or row['label'])
+                if row['enabled']:
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled
+                                  | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked
+                                       if row['name'] in shown
+                                       else Qt.CheckState.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self._list.addItem(item)
+        finally:
+            self._filling = False
+        self._list.setVisible(bool(rows))
+        self._note.setText(self._summary(manifest, rows))
+        # DP-1104. Before any check the box held one standing sentence on
+        # the default screen; it waits for something to show instead.
+        self._hasCheck = bool(manifest)
+        self.setVisible(self._routeAllowed and self._hasCheck)
+
+    def setRouteAllowed(self, allowed: bool) -> None:
+        """Whether the target's route checks with checkMesh at all."""
+        self._routeAllowed = bool(allowed)
+        self.setVisible(self._routeAllowed and self._hasCheck)
+
+    def _summary(self, manifest: dict, rows: list[dict]) -> str:
+        if not manifest:
+            return self.tr('Run checkMesh with Write failed sets on to list '
+                           'what it flags here.')
+        if manifest.get('stale'):
+            return self.tr('The mesh has changed since this check; run the '
+                           'check again to draw what it finds now.')
+        if not rows:
+            return self.tr('The last check wrote no failed sets.')
+        return self.tr('Tick an output to draw it over the mesh.')
+
+    def rows(self) -> dict[str, dict]:
+        return dict(self._rows)
+
+    def item(self, name: str):
+        for index in range(self._list.count()):
+            item = self._list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == name:
+                return item
+        return None
+
+    # -- drawing ------------------------------------------------------------ #
+
+    def _target(self):
+        if self._overlay is not None:
+            return self._overlay
+        target = getattr(self.window(), 'displayControl', None)
+        if target is None:
+            try:
+                from foammesh.app import app
+                target = getattr(getattr(app, 'window', None),
+                                 'displayControl', None)
+            except Exception:                                # noqa: BLE001
+                target = None
+        return target
+
+    def _ensureLayer(self):
+        if self._layer is None:
+            target = self._target()
+            if target is None or not hasattr(target, 'addOverlay'):
+                return None
+            from foammesh.rendering.check_highlights import (
+                CheckHighlightLayer,
+            )
+            self._layer = CheckHighlightLayer(
+                add=target.addOverlay, remove=target.removeOverlay,
+                revision=self._revision)
+        return self._layer
+
+    def _clearLayer(self) -> None:
+        if self._layer is not None:
+            self._layer.clear()
+
+    def _onItemChanged(self, item) -> None:
+        if self._filling:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        wanted = item.checkState() == Qt.CheckState.Checked
+        coroutine = self.setShown(name, wanted)
+        try:
+            asyncio.ensure_future(coroutine)
+        except RuntimeError:
+            coroutine.close()
+            self._refuse(name, self.tr('no event loop is running'))
+
+    async def setShown(self, name: str, wanted: bool) -> list[dict]:
+        """Draw or take away one output; returns what was refused."""
+        from foammesh.view.facade_client import query_async
+
+        if not wanted:
+            if self._layer is not None:
+                self._layer.hide(name)
+            return []
+        layer = self._ensureLayer()
+        if layer is None:
+            return self._refuse(name, self.tr('there is no viewport to draw '
+                                              'it in'))
+        revision = self._revision
+        try:
+            result = await query_async(
+                self._client, 'quality.check_highlights',
+                {'names': [name], 'revision': revision})
+        except Exception as error:                           # noqa: BLE001
+            return self._refuse(name, str(error) or type(error).__name__)
+        payload = dict(result.payload or {})
+        if (str(payload.get('revision') or revision) != self._revision
+                or not self._isChecked(name)):
+            # A newer check landed, or the row was unticked, while the
+            # worker read: what came back is no longer wanted.
+            return []
+        refused = layer.show(payload)
+        for one in refused:
+            self._refuse(one.get('name') or name,
+                         one.get('message') or one.get('reason') or '')
+        return refused
+
+    def _isChecked(self, name: str) -> bool:
+        item = self.item(name)
+        return (item is not None
+                and item.checkState() == Qt.CheckState.Checked)
+
+    def _refuse(self, name: str, message: str) -> list[dict]:
+        item = self.item(name)
+        if item is not None:
+            self._filling = True
+            try:
+                item.setCheckState(Qt.CheckState.Unchecked)
+            finally:
+                self._filling = False
+        self._note.setText(self.tr('{0} was not drawn: {1}').format(
+            name, message))
+        return [{'name': name, 'message': message}]
+
+    def clear(self) -> None:
+        """Take every highlight off the viewport."""
+        self._clearLayer()
+        self._filling = True
+        try:
+            for index in range(self._list.count()):
+                item = self._list.item(index)
+                if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self._filling = False

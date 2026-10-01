@@ -27,6 +27,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
                                QLabel, QPlainTextEdit, QPushButton, QVBoxLayout)
 
+from foammesh.core.quantities import count_text
 from foammesh.view.theming.metrics import GAP, apply_bar_metrics
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,9 @@ class ChangesDialog(QDialog):
         body = describe_changes(entries)
         if dropped:
             body += '\n\n' + self.tr(
-                '{0} further record(s) were damaged and cannot be restored.').format(dropped)
+                '{0} damaged and cannot be restored.').format(
+                    count_text(dropped, 'further record was',
+                               'further records were'))
         self.text.setPlainText(body)
         layout.addWidget(self.text, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
@@ -124,10 +127,11 @@ class RecoveryOfferBar(_Bar):
         offer = autosave.pending_recovery()
         count = offer.count if offer is not None else 0
         self._text.setText(self.tr(
-            'FoamMesh stopped before this case was saved. {0} unsaved '
-            'change(s) were kept.').format(count))
+            'FoamMesh stopped before this case was saved. {0} kept.').format(
+                count_text(count, 'unsaved change was', 'unsaved changes were')))
         self.restoreButton = self._button(
-            self.tr('Restore unsaved changes ({0} edits)').format(count),
+            self.tr('Restore unsaved changes ({0})').format(
+                count_text(count, 'edit')),
             'recoveryRestore', self._restore)
         self.discardButton = self._button(
             self.tr('Open last saved'), 'recoveryDiscard', self._discard)

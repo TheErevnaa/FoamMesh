@@ -250,6 +250,7 @@ def domain_box(db, case_path=None, geometry_bounds=None, *,
     from foammesh.core.mesh.sizing import stand_off_bounds
 
     scale = 1.0
+    builder = None
     if db is not None:
         builder = _builder(db, geometry_bounds)
         scale = _scale(builder)
@@ -267,8 +268,15 @@ def domain_box(db, case_path=None, geometry_bounds=None, *,
             return DomainBox(corners, HEX6, scale)
     if geometry_bounds is not None:
         margin = 0.0 if standoff in (None, _STORED) else standoff
-        return DomainBox(tuple(float(value) for value in stand_off_bounds(
-            geometry_bounds, margin)), GEOMETRY, scale)
+        bounds = tuple(float(value) for value in stand_off_bounds(
+            geometry_bounds, margin))
+        # Plan 37 UF14. The derived block grows to hold the farfield, by the
+        # writer's own rule, so the box drawn is the block written.
+        enclosing = (None if builder is None
+                     else builder.farfield_block(bounds))
+        if enclosing is not None:
+            bounds = tuple(float(value) for value in enclosing)
+        return DomainBox(bounds, GEOMETRY, scale)
     if case_path is not None:
         return written_domain_box(case_path)
     return None

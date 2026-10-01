@@ -108,6 +108,17 @@ class CheckMeshResult:
     runnable: bool | None = None
     #: One line for a status bar or a console: what this mesh is.
     verdict: str = ''
+    #: Plan 37 F-2. The connected cell regions checkMesh counted
+    #: (``Number of regions: N``), or ``None`` when the log did not say.
+    regions: int | None = None
+    #: The cell count of each region checkMesh wrote as a set
+    #: (``-writeSets``), largest first; empty when it wrote none.
+    region_cells: list[int] = field(default_factory=list)
+    #: ``Total volume`` from the cell-volume check, in the mesh's units.
+    total_volume: float | None = None
+    #: The retained-region judgement a snappy run attaches
+    #: (``core/quality/retained_regions.assess``), or ``None``.
+    retained: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -142,6 +153,10 @@ class CheckMeshResult:
             'advisory_findings': list(self.advisory_findings),
             'runnable': self.runnable,
             'verdict': self.verdict,
+            'regions': self.regions,
+            'region_cells': list(self.region_cells),
+            'total_volume': self.total_volume,
+            'retained': dict(self.retained) if self.retained else None,
             'quality_grade': self.quality_grade,
             'quality_indicators': self.quality_indicators(),
         }
@@ -326,6 +341,16 @@ def parse_checkmesh(log: str) -> CheckMeshResult:
     result.min_face_area = _search_float(rf'\bMinimum face area\s*=\s*{_FLOAT}', log)
     result.min_cell_volume = _search_float(rf'\bMin volume\s*=\s*{_FLOAT}', log)
     result.max_cell_volume = _search_float(rf'\bMax volume\s*=\s*{_FLOAT}', log)
+    # Plan 37 F-2. "   *Number of regions: 1182" when the mesh is in pieces,
+    # "    Number of regions: 1 (OK)." when it is one. With -writeSets each
+    # region is then written as a set, which is where the sizes come from.
+    result.regions = _search_int(rf'\bNumber of regions:\s*{_INT}', log)
+    result.region_cells = sorted(
+        (int(count) for count in re.findall(
+            r'Writing region \d+\b.*?\bwith\s+(\d+)\s+cells\b', log)),
+        reverse=True)
+    result.total_volume = _search_float(
+        rf'\bTotal volume\s*=\s*{_FLOAT}', log)
 
     for attribute, label in (
             ('determinant', r'Cell determinant \(wellposedness\)'),

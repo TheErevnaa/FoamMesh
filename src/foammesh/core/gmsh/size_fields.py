@@ -568,10 +568,19 @@ def _expression_field(row, name, control_id, bbox, warnings) -> SizeField:
         estimate = cost(expression, bbox)
     except ExpressionError as error:
         raise SizeFieldError(f'size field {name!r}: {error}') from error
-    if estimate.estimated_elements > 5_000_000:
+    # a warning, not a refusal: said when the mesh would take more than
+    # half the RAM that is free (the cost refuses what the RAM cannot hold)
+    from foammesh.support import resource_budget
+
+    needed = resource_budget.mesher_memory_needed(
+        'gmsh', estimate.estimated_elements)
+    if resource_budget.mesher_memory_refusal(
+            'gmsh', 2 * estimate.estimated_elements) is not None:
         warnings.append(
             f'size field {name!r} asks for roughly '
-            f'{estimate.estimated_elements:,} elements')
+            f'{estimate.estimated_elements:,} elements, about '
+            f'{resource_budget.format_bytes(needed)} of RAM for Gmsh, more '
+            'than half of what is free')
     return SizeField(
         control_id=control_id, name=name, field_type='math_eval',
         order=int(row.get('priority', 0) or 0), expression=expression,

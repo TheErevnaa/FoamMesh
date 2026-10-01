@@ -353,6 +353,23 @@ def discard_processor_directories(case_path) -> list[str]:
     return removed
 
 
+def mirror_confirms_dead(linux: dict) -> bool:
+    """Does the wrapper's Linux mirror say no writer of the run is left?
+
+    Two lines prove it: ``exited`` with an ``rc`` (the wrapper writes it only
+    once its group and session are empty), and the lifetime-pipe watcher's
+    ``killed-on-transport-loss`` with ``confirmed_dead: true`` (written only
+    after KILL, when nothing of the group or session answered). Anything
+    else -- ``running``, ``confirmed_dead: false``, no mirror -- proves
+    nothing, and the writer may still be alive.
+    """
+    if not isinstance(linux, dict):
+        return False
+    if linux.get('state') == 'exited' and linux.get('rc') is not None:
+        return True
+    return linux.get('confirmed_dead') is True
+
+
 class RecoveryGate:
     """Resolve every open run record of a case, or say why it cannot be."""
 
@@ -376,13 +393,18 @@ class RecoveryGate:
                    if record.get('run_id') not in set(active_run_ids)]
         return GateVerdict(blocked=bool(records), records=records)
 
-    def resolve(self, *, active_run_ids=(), wait_for_death: bool = False) -> GateVerdict:
-        """Sweep: close what can be closed, restore what must be restored."""
+    def resolve(self, *, active_run_ids=(), wait_for_death: bool = False,
+                run_ids=None) -> GateVerdict:
+        """Sweep: close what can be closed, restore what must be restored.
+
+        *run_ids*, when given, limits the sweep to those records.
+        """
         verdict = GateVerdict()
         active = set(active_run_ids)
+        only = None if run_ids is None else {str(item) for item in run_ids}
         for record in self.store.open_records():
             run_id = str(record['run_id'])
-            if run_id in active:
+            if run_id in active or (only is not None and run_id not in only):
                 continue
             try:
                 outcome = self._resolve_one(record, wait_for_death=wait_for_death)
@@ -444,10 +466,15 @@ class RecoveryGate:
         deadline = time.monotonic() + (self.confirm_seconds if wait else 0)
         while True:
             # The wrapper writes `exited` into the Linux mirror only once its
-            # group and session are empty: that is a confirmation on its own.
+            # group and session are empty, and the watcher writes
+            # `confirmed_dead: true` only when nothing answered after KILL:
+            # each is a confirmation on its own.
             linux = self.store.linux_record(str(record['run_id']))
-            if linux.get('state') == 'exited' and linux.get('rc') is not None:
-                return Liveness('dead', detail=f'the wrapper reported rc {linux.get("rc")}')
+            if mirror_confirms_dead(linux):
+                if linux.get('state') == 'exited':
+                    return Liveness('dead', detail=f'the wrapper reported rc {linux.get("rc")}')
+                return Liveness('dead', detail=(
+                    f'the wrapper watcher confirmed it dead ({linux.get("state")})'))
             liveness = self.probe(record)
             if liveness.state != 'alive' or time.monotonic() >= deadline:
                 return liveness
@@ -483,7 +510,12 @@ class RecoveryGate:
             notes.append('its recovery snapshot is gone; nothing was restored')
         else:
             notes.append('there was no earlier mesh to restore')
-        if int(record.get('ranks') or 1) > 1:
+        if record.get('staging'):
+            # Plan 37 UF17: the run wrote into a staging copy, not
+            # into the case. The live processor cases are the source it was
+            # protecting; its own transaction discards the stage.
+            notes.append('it ran on a staging copy; the case was not touched')
+        elif int(record.get('ranks') or 1) > 1:
             removed = discard_processor_directories(self.case_path)
             if removed:
                 notes.append(f'{len(removed)} processor directories were removed')

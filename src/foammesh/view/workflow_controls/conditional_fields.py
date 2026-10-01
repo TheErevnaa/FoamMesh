@@ -36,14 +36,22 @@ from __future__ import annotations
 from foammesh.core.facade import applicability
 
 
-def refresh_applicability(client, editors, pending=None) -> dict:
+def refresh_applicability(client, editors, pending=None, *,
+                          overrides=None) -> dict:
     """Judge every editor, take the inactive ones away, clean the patch.
 
     Returns ``{field_id: reason}`` for the fields that do not apply, which is
     what a page needs to say "3 settings on this page are inactive" without
     asking each editor again.
+
+    ``overrides`` is ``{field_id: value}`` judged in place of the stored
+    value: a choice made on the page but not applied yet. Plan 37 UF13: the
+    Gmsh panel offers a sphere's radius as soon as the shape is chosen, not
+    after Apply. With none given the stored values are judged, as before.
     """
     values, titles = condition_context(client, editors)
+    if overrides:
+        values.update(overrides)
     inactive: dict[str, str] = {}
     for field_id, editor in editors.items():
         clauses = getattr(editor.descriptor, 'applies_when', ()) or ()

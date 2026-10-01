@@ -108,6 +108,16 @@ CONTROLS = _register(
     SnappyControl('baseGrid/grading/x', WRITER, BLOCK_BLOCKS, 'simpleGrading'),
     SnappyControl('baseGrid/grading/y', WRITER, BLOCK_BLOCKS, 'simpleGrading'),
     SnappyControl('baseGrid/grading/z', WRITER, BLOCK_BLOCKS, 'simpleGrading'),
+    SnappyControl(
+        'baseGrid/gradingFine/x', DERIVATION,
+        note='which side of the axis gets the small cells; decides whether the '
+             'ratio above is written as r, 1/r or a two-segment profile'),
+    SnappyControl('baseGrid/gradingFine/y', DERIVATION),
+    SnappyControl('baseGrid/gradingFine/z', DERIVATION),
+    SnappyControl(
+        'baseGrid/gradingNotice', GATE,
+        note='the one-time note that a migrated project keeps its old fine '
+             'end; a record for the page, never written'),
     SnappyControl('baseGrid/boundaryTypes/xMin', WRITER, BLOCK_BOUNDARY, 'type'),
     SnappyControl('baseGrid/boundaryTypes/xMax', WRITER, BLOCK_BOUNDARY, 'type'),
     SnappyControl('baseGrid/boundaryTypes/yMin', WRITER, BLOCK_BOUNDARY, 'type'),
@@ -207,6 +217,11 @@ CONTROLS = _register(
                   'refinementRegions',
                   note='the levels ramp of a distance-mode volume group; empty '
                        'leaves the group with its single distance and level'),
+    # Plan 37 UF16
+    SnappyControl('castellation/excludePoints', WRITER, CASTELLATED,
+                  'outsidePoints',
+                  note='the spaces removed at castellation; refinementParameters'
+                       '.C reads the list in metres. Empty writes nothing'),
 
     # -- snapping -------------------------------------------------------- #
     SnappyControl('snap/nSmoothPatch', WRITER, SNAP, 'nSmoothPatch'),
@@ -229,6 +244,10 @@ CONTROLS = _register(
 
     # -- layers ---------------------------------------------------------- #
     SnappyControl('addLayers/layers', WRITER, LAYERS, 'layers'),
+    SnappyControl(
+        'addLayers/defaulted', GATE,
+        note='set once the first-setup wall targets were proposed, so a user '
+             'who removes them is never re-proposed; never written'),
     SnappyControl('addLayers/nGrow', WRITER, LAYERS, 'nGrow'),
     SnappyControl('addLayers/featureAngle', WRITER, LAYERS, 'featureAngle'),
     SnappyControl('addLayers/slipFeatureAngle', WRITER, LAYERS,
@@ -263,6 +282,13 @@ CONTROLS = _register(
     SnappyControl('addLayers/additionalReporting', WRITER, LAYERS,
                   'additionalReporting',
                   note='left unwritten while it is DEFAULT'),
+    # Plan 37 UF15. Both read by layerParameters.C (129-131 and 117-126).
+    SnappyControl('addLayers/concaveAngle', WRITER, LAYERS, 'concaveAngle',
+                  note='left unwritten while it is unset; v13 then uses 90 '
+                       'degrees'),
+    SnappyControl('addLayers/mergeFaces', WRITER, LAYERS, 'mergeFaces',
+                  note='left unwritten while it is DEFAULT; v13 then merges '
+                       'only on patches being given layers'),
     SnappyControl(
         'addLayers/meshShrinker', WRITER, LAYERS, 'meshShrinker',
         note='displacementMedialAxis is the only mover v13 registers'),
@@ -289,6 +315,12 @@ CONTROLS = _register(
     SnappyControl('meshQuality/nSmoothScale', WRITER, QUALITY, 'nSmoothScale'),
     SnappyControl('meshQuality/errorReduction', WRITER, QUALITY,
                   'errorReduction'),
+    # Plan 37 UF15. Read by libmeshCheck (checkMesh.C:78-83), which the Plan
+    # 29 key oracle did not scan -- hence DP-213's wrong "not consumed".
+    SnappyControl('meshQuality/minFaceFlatness', WRITER, QUALITY,
+                  'minFaceFlatness',
+                  note='left unwritten while it is unset; v13 then skips the '
+                       'flatness check'),
     SnappyControl('meshQuality/mergeTolerance', WRITER, SNAPPY,
                   'mergeTolerance',
                   note='a top-level key, not part of meshQualityControls'),
@@ -320,6 +352,11 @@ CONTROLS = _register(
                   'minFaceWeight'),
     SnappyControl('meshQuality/relaxed/minVolRatio', WRITER, QUALITY_RELAXED,
                   'minVolRatio'),
+    SnappyControl('meshQuality/relaxed/minFaceFlatness', WRITER,
+                  QUALITY_RELAXED, 'minFaceFlatness',
+                  note='left unwritten while it is unset; not inherited from '
+                       'the strict block, so the relaxed phase then skips '
+                       'the flatness check'),
 
     # -- diagnostics ----------------------------------------------------- #
     # Both are lists of words, so several controls share one keyword; the

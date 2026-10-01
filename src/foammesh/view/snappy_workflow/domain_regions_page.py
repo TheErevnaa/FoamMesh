@@ -26,11 +26,14 @@ from PySide6.QtWidgets import (
 
 from foammesh.app import app
 from foammesh.core.mesh.domain_box import domain_box
+from foammesh.core.mesh.presentation import count_text
 from foammesh.db.configurations_schema import Step
 from foammesh.rendering.domain_box_actor import domainBoxActor
+from foammesh.rendering.farfield_actor import farfieldActor, farfieldLabelActor
 from foammesh.rendering.region_labels import regionLabelActors
 from foammesh.view.facade_client import query
 from foammesh.view.region.seed_feedback import SeedFeedback
+from foammesh.view.theming.metrics import MARGIN_TIGHT
 from foammesh.view.theming.patch_palette import region_zone_colours
 from foammesh.view.theming.status_colors import set_status
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
@@ -217,12 +220,14 @@ class RegionSeedPanel(ChildControlPanel):
     _changedElsewhere = Signal()
     _caseSwitched = Signal()
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, facade_client, collection_id: str, title: str,
+                 *args, **kwargs):
         # Built with no parent (DP-312): the dialog it is shown in adopts it.
         self.seedFeedback = SeedFeedback()
         annotations = dict(kwargs.pop('annotations', None) or {})
         annotations.setdefault('point.z', self.seedFeedback)
-        super().__init__(*args, annotations=annotations, **kwargs)
+        super().__init__(facade_client, collection_id, title, *args,
+                         annotations=annotations, **kwargs)
         self._watched = []
         self._placingRegion = None
         self._editorAccepted = None
@@ -305,10 +310,15 @@ class RegionSeedPanel(ChildControlPanel):
 
     def _describe(self) -> None:
         """Plan 36 RP10. Names and descriptions a screen reader reads."""
-        self.table.setAccessibleDescription(self.tr(
+        described = self.tr(
             'One row per region: its name, type and seed point. A chip in '
             "the region's colour marks each row; the tooltip says its "
-            'space and volume.'))
+            'space and volume.')
+        # Plan 33 FORM-03: an empty table's description carries the empty
+        # state, as every other child table's does.
+        if not self._rows:
+            described = f'{self._emptyDescription} {described}'
+        self.table.setAccessibleDescription(described)
         self._detect.setAccessibleName(self.tr('Detect regions'))
         self._detect.setAccessibleDescription(self._detect.toolTip())
         self._merge.setAccessibleName(self.tr('Merge regions'))
@@ -840,7 +850,8 @@ class RegionSeedPanel(ChildControlPanel):
         bar.setObjectName('regionsChangedElsewhere')
         bar.setFrameShape(QFrame.Shape.StyledPanel)
         row = QHBoxLayout(bar)
-        row.setContentsMargins(4, 2, 4, 2)
+        row.setContentsMargins(MARGIN_TIGHT, MARGIN_TIGHT,
+                               MARGIN_TIGHT, MARGIN_TIGHT)
         label = QLabel(self.tr('Regions changed elsewhere'), bar)
         label.setWordWrap(True)
         set_status(label, 'warning')
@@ -849,12 +860,12 @@ class RegionSeedPanel(ChildControlPanel):
         reload_.setObjectName('regionsReload')
         reload_.setToolTip(self.tr(
             'Close the editor without saving and show the regions as they '
-            'are stored now.'))
+            'are stored now'))
         reload_.clicked.connect(self.reloadElsewhere)
         keep = QPushButton(self.tr('Keep mine'), bar)
         keep.setObjectName('regionsKeepMine')
         keep.setToolTip(self.tr(
-            'Go on editing; OK writes this region over what changed.'))
+            'Go on editing; OK writes this region over what changed'))
         keep.clicked.connect(self.keepMine)
         row.addWidget(reload_)
         row.addWidget(keep)
@@ -1034,9 +1045,12 @@ class RegionSeedPanel(ChildControlPanel):
             except Exception:  # noqa: BLE001 - the note still says it
                 pass
         count = len(written or ())
+        # DP-135/DP-217: the menu path is spelled with the one arrow, bound
+        # to its names by no-break spaces so it never wraps on the arrow.
         self._say(self.tr(
-            'Added %d region(s). Ctrl+Z (Edit > Undo create fluid regions) '
-            'takes them all back.') % count)
+            'Added %s. Ctrl+Z (Edit → Undo create fluid '
+            'regions) takes them all back.')
+            % count_text(count, 'region', 'regions'))
 
     # -- Plan 36 RP10: Adjust and Merge ------------------------------------- #
 
@@ -1231,6 +1245,7 @@ class RegionSeedPanel(ChildControlPanel):
         # `ChildControlPanel.__init__` refreshes before this panel's own
         # parts exist; `__init__` decorates once they do.
         if getattr(self, '_seedWarning', None) is not None:
+            self._describe()
             self._decorateRows()
 
     def seedSpaces(self) -> dict:
@@ -1294,6 +1309,349 @@ class RegionSeedPanel(ChildControlPanel):
         self._showSavedLabels()
 
 
+class ExcludePointPanel(ChildControlPanel):
+    """Plan 37 UF16. The exclude points: spaces snappyHexMesh removes.
+
+    Each row is one ``outsidePoints`` entry, in metres. The editor is docked
+    under the table and not modal, like a region's, because the point is
+    placed in the viewport: while it is open the point is drawn as the
+    exclude handle (`SeedGizmo` role ``exclude`` -- a cube in the warning
+    colour whose readout says "Exclude"), typing X, Y or Z moves it, and
+    dragging it writes them.
+
+    Under the table the preflight says what v13 would do with the points
+    held (``core/mesh/exclude_points``): one off the domain, on its wall or
+    on a region seed is an error, because v13 skips it silently and keeps
+    everything; with region seeds present it warns that every space nobody
+    seeded is kept too (live S1).
+    """
+
+    #: True while the editor is open, False when it closes.
+    editingChanged = Signal(bool)
+    DOCK_MIN_WIDTH = RegionSeedPanel.DOCK_MIN_WIDTH
+    POINT_KEYS = RegionSeedPanel.POINT_KEYS
+    POINT_DIGITS = RegionSeedPanel.POINT_DIGITS
+
+    def _cell_text(self, key: str, value) -> tuple[str, str]:
+        """Coordinates to six significant figures, as a region's (DP-920)."""
+        if key in self.POINT_KEYS and not isinstance(value, bool):
+            try:
+                text = format(float(value), f'.{self.POINT_DIGITS}g')
+            except (TypeError, ValueError):
+                text = None
+            if text is not None:
+                stored = str(value)
+                return text, (stored if stored != text else '')
+        return super()._cell_text(key, value)
+
+    def __init__(self, facade_client, collection_id: str, title: str,
+                 *args, **kwargs):
+        self._openDialog = None
+        self._editorAccepted = None
+        self._gizmo = None
+        self._watched = []
+        self._bounds = None
+        self._domain = None
+        self._report = None
+        self._findings = None
+        super().__init__(facade_client, collection_id, title, *args,
+                         **kwargs)
+        layout = self.layout()
+        self._findings = QLabel(self)
+        self._findings.setObjectName('excludePointFindings')
+        self._findings.setWordWrap(True)
+        self._findings.setVisible(False)
+        self._findings.setAccessibleName(self.tr('Exclude point findings'))
+        layout.insertWidget(layout.indexOf(self.table) + 1, self._findings)
+        # DP-1083. A write refused because the step is locked is said here,
+        # under the table, instead of in a bare "Operation failed" box.
+        self._lockNotice = QLabel(self)
+        self._lockNotice.setObjectName('excludePointLockNotice')
+        self._lockNotice.setWordWrap(True)
+        self._lockNotice.setVisible(False)
+        set_status(self._lockNotice, 'error')
+        layout.insertWidget(layout.indexOf(self._findings) + 1, self._lockNotice)
+        self._dock = QFrame(self)
+        self._dock.setObjectName('excludeEditorDock')
+        self._dock.setFrameShape(QFrame.Shape.StyledPanel)
+        dockLayout = QVBoxLayout(self._dock)
+        dockLayout.setContentsMargins(0, 0, 0, 0)
+        self._dock.setVisible(False)
+        layout.addWidget(self._dock)
+        described = self.tr(
+            'Points in spaces to remove from the mesh. Every space holding '
+            'one is removed, unless a region seed is in the same space.')
+        self.table.setToolTip(described)
+        self._add.setAccessibleName(self.tr('Add exclude point'))
+        self._add.setToolTip(self.tr(
+            'Place a point in a space the mesh should remove — a closed '
+            'pocket, or the outside of an internal-flow part'))
+        self._edit.setAccessibleName(self.tr('Edit exclude point'))
+        self._remove.setAccessibleName(self.tr('Remove exclude point'))
+        self._showFindings()
+
+    # -- what the preflight says -------------------------------------------- #
+
+    def setBoundsProvider(self, provider) -> None:
+        """*provider* answers the box an exclude point is dragged in."""
+        self._bounds = provider
+
+    def setDomainProvider(self, provider) -> None:
+        """*provider* answers the `DomainBox` the points are judged against."""
+        self._domain = provider
+        self._showFindings()
+
+    def _points(self) -> list:
+        points = []
+        for index, row in enumerate(self._rows):
+            try:
+                point = tuple(float(row[key]) for key in self.POINT_KEYS)
+            except (KeyError, TypeError, ValueError):
+                continue
+            name = str(row.get('name') or '').strip()
+            points.append((name or self.tr('exclude %s') % (index + 1), point))
+        return points
+
+    def _seeds(self) -> list:
+        try:
+            regions = dict(self._client.configuration().get('region') or {})
+        except Exception:  # noqa: BLE001 - no case open
+            return []
+        seeds = []
+        for key, row in regions.items():
+            if not isinstance(row, dict) or row.get('gType') is not None:
+                continue
+            point = row.get('point')
+            try:
+                xyz = tuple(float(point[axis]) for axis in 'xyz')
+            except (KeyError, TypeError, ValueError):
+                continue
+            seeds.append((str(row.get('name') or key), 'fluid', xyz))
+        return seeds
+
+    def findings(self):
+        """The preflight `Report` for the points the table holds."""
+        from foammesh.core.mesh.exclude_points import preflight
+
+        domain = None
+        if self._domain is not None:
+            try:
+                domain = self._domain()
+            except Exception:  # noqa: BLE001 - no case, no domain check
+                domain = None
+        return preflight(self._points(), seeds=self._seeds(), domain=domain)
+
+    def findingsLabel(self):
+        return self._findings
+
+    # -- a write refused because the step is locked (DP-1083) --------------- #
+
+    def lockNotice(self) -> QLabel:
+        return self._lockNotice
+
+    @staticmethod
+    def _lockRefusal(result):
+        """The lock refusal's details when *result* is one, else ``None``."""
+        from foammesh.core.facade.domain_operations import TaskLockedError
+
+        error = getattr(result, 'error', None)
+        payload = getattr(result, 'payload', None)
+        if isinstance(error, TaskLockedError):
+            return dict(getattr(error, 'details', None) or {})
+        if isinstance(payload, dict) and payload.get('unlock_operation'):
+            return dict(payload)
+        return None
+
+    def _close_write(self, write, ok: bool, result=None) -> None:
+        details = (self._lockRefusal(result)
+                   if not ok and result is not None else None)
+        if details is not None and write is not None and not write['closed']:
+            titles = [str(title) for title in (details.get('titles') or ())]
+            what = ', '.join(titles) or self.tr('A meshing step')
+            self._lockNotice.setText(self.tr(
+                'Not saved: {0} {1} locked, because the mesh on disk was made '
+                'from these points. Unlock the step (right-click it in the '
+                'workflow) to change them; the results after it are '
+                'discarded.').format(
+                    what, self.tr('is') if len(titles) <= 1 else self.tr('are')))
+            self._lockNotice.setAccessibleDescription(self._lockNotice.text())
+            self._lockNotice.setVisible(True)
+            super()._close_write(write, False, None)
+            return
+        if ok:
+            self._lockNotice.setVisible(False)
+        super()._close_write(write, ok, result)
+
+    def findingsText(self) -> str:
+        """What is said under the table, or ``''``."""
+        if self._findings is None or self._findings.isHidden():
+            return ''
+        return self._findings.text()
+
+    def _showFindings(self) -> None:
+        if self._findings is None:
+            return
+        report = self.findings() if self._rows else None
+        self._report = report
+        if report is None or not report.findings:
+            self._findings.setText('')
+            self._findings.setVisible(False)
+            return
+        lines = [finding.message for finding in report.errors]
+        lines += [finding.message for finding in report.warnings]
+        self._findings.setText('\n'.join(lines))
+        set_status(self._findings, 'error' if report.errors else 'warning')
+        self._findings.setAccessibleDescription(self._findings.text())
+        self._findings.setVisible(True)
+
+    def refresh(self) -> None:
+        super().refresh()
+        self._showFindings()
+
+    # -- the editor stays open beside a live viewport ----------------------- #
+
+    def isEditing(self) -> bool:
+        return self._openDialog is not None
+
+    def excludeGizmo(self):
+        """The handle the open editor's point is dragged by, or ``None``."""
+        return self._gizmo
+
+    def open_add_dialog(self) -> None:
+        if not self.isEditing():
+            super().open_add_dialog()
+
+    def open_edit_dialog(self, *args) -> None:
+        if not self.isEditing():
+            super().open_edit_dialog(*args)
+
+    def _run_editor(self, dialog, accepted) -> None:
+        self._editorAccepted = accepted
+        self._openDialog = dialog
+        dialog.finished.connect(self._finishEditor)
+        self._setEditing(True)
+        try:
+            for key in self.POINT_KEYS:
+                editor = self.editor(key)
+                if editor is not None:
+                    editor.valueChanged.connect(self._placePoint)
+                    self._watched.append(editor)
+            self._placePoint()
+            if self.width() >= self.DOCK_MIN_WIDTH:
+                dialog.showDocked(self._dock)
+            else:
+                self._dock.setVisible(False)
+                dialog.showFloating(self.window())
+        except Exception:
+            self._closeEditor()
+            raise
+
+    def _finishEditor(self, result) -> None:
+        accepted = self._editorAccepted
+        self._closeEditor()
+        if result == QDialog.DialogCode.Accepted and accepted is not None:
+            accepted()
+
+    def cancelEditor(self) -> None:
+        dialog = self._openDialog
+        if dialog is not None:
+            dialog.reject()
+
+    def _closeEditor(self) -> None:
+        dialog, self._openDialog = self._openDialog, None
+        self._editorAccepted = None
+        if dialog is not None:
+            try:
+                dialog.finished.disconnect(self._finishEditor)
+            except (RuntimeError, TypeError):
+                pass
+        for editor in self._watched:
+            try:
+                editor.valueChanged.disconnect(self._placePoint)
+            except (RuntimeError, TypeError):
+                pass
+        self._watched = []
+        self._unlinkGizmo()
+        preview = getattr(_geometryManager(), 'previewExclude', None)
+        if preview is not None:
+            preview(None)
+        try:
+            self._dock.setVisible(False)
+        except RuntimeError:
+            return
+        self._setEditing(False)
+
+    def _setEditing(self, editing: bool) -> None:
+        for widget in (self.table, self._add, self._edit, self._remove):
+            widget.setEnabled(not editing)
+        if not editing:
+            self._edit.setEnabled(bool(self._rows))
+            self._remove.setEnabled(bool(self._rows))
+        self.editingChanged.emit(bool(editing))
+
+    def _point(self):
+        values = []
+        for key in self.POINT_KEYS:
+            editor = self.editor(key)
+            if editor is None:
+                return None
+            try:
+                values.append(float(editor.value()))
+            except (TypeError, ValueError):
+                return None
+        return tuple(values)
+
+    def _placePoint(self, *_args) -> None:
+        point = self._point()
+        manager = _geometryManager()
+        preview = getattr(manager, 'previewExclude', None)
+        if point is None or preview is None:
+            return
+        preview(point)
+        handle = getattr(manager, 'excludePreview', None)
+        gizmo = handle() if handle is not None else None
+        if gizmo is self._gizmo or not hasattr(gizmo, 'pointMoved'):
+            return
+        self._unlinkGizmo()
+        self._gizmo = gizmo
+        gizmo.pointMoved.connect(self._gizmoMoved)
+        bounds = None
+        if self._bounds is not None:
+            try:
+                bounds = self._bounds()
+            except Exception:  # noqa: BLE001 - no case, no box
+                bounds = None
+        gizmo.setBounds(bounds)
+        step = None
+        cellSize = getattr(manager, 'getCellSize', None)
+        if cellSize is not None:
+            try:
+                step = cellSize()
+            except Exception:  # noqa: BLE001 - no base grid yet
+                step = None
+        gizmo.setStep(step)
+        # Like a seed, an exclude point on a mesh face is perturbed into
+        # whichever cell v13 finds (live S11): kept off every face.
+        grid, level = RegionSeedPanel._backgroundFaces()
+        gizmo.setSnapOrigin(grid.origin if grid is not None else None)
+        gizmo.setFaceGuard(grid, level)
+
+    def _unlinkGizmo(self) -> None:
+        gizmo, self._gizmo = self._gizmo, None
+        if gizmo is None:
+            return
+        try:
+            gizmo.pointMoved.disconnect(self._gizmoMoved)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _gizmoMoved(self, point) -> None:
+        for key, value in zip(self.POINT_KEYS, point):
+            editor = self.editor(key)
+            if editor is not None:
+                editor.set_value(value)
+
+
 class SnappyDomainRegionsPage(SnappyTaskPage):
     """The material points that say which side of the surface is meshed."""
 
@@ -1341,7 +1699,9 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         'a region in each one you keep; one Undo takes them all back. A '
         'seed can be dragged in the view, nudged with Alt and an arrow key '
         'and cut to on a Section plane (Alt+O); Ctrl+Z undoes a placement '
-        'while the editor is open.')
+        'while the editor is open. Exclude points name spaces to remove: '
+        'every space holding one is taken out of the mesh, unless a region '
+        'seed is in the same space.')
 
     def build_sections(self, layout) -> None:
         # Plan 33 OF-02. The table opens the column. The two sentences that
@@ -1352,7 +1712,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self.panel = RegionSeedPanel(
             self._client, 'regions.items', self.tr('Regions'),
             columns=self.COLUMNS, parent=self, stretch='name')
-        self.panel.childrenChanged.connect(self.refresh)
+        self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         # DP-818. The glyphs follow the table: added, moved or deleted.
         self.panel.childrenChanged.connect(self._reloadSeedMarkers)
         # Plan 36 RP2. The open editor is the only thing that edits here.
@@ -1360,27 +1720,51 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         # Plan 36 RP3. A dragged seed stays in the box drawn around it (RP1).
         self.panel.setSeedBoundsProvider(self._seedBounds)
         layout.insertWidget(0, self.panel)
+        # Plan 37 UF16. The spaces to remove, under the seeds that keep.
+        self.excludePanel = ExcludePointPanel(
+            self._client, 'meshing.castellation.exclude_points',
+            self.tr('Exclude points'), columns=self.COLUMNS[:1] + self.COLUMNS[2:],
+            parent=self, stretch='name')
+        self.excludePanel.setBoundsProvider(self._seedBounds)
+        self.excludePanel.setDomainProvider(lambda: self.domainBox())
+        self.excludePanel.childrenChanged.connect(self._reloadSeedMarkers)
+        self.excludePanel.editingChanged.connect(self._lockForExclude)
+        # A region added or moved can put a seed on an exclude point.
+        self.panel.childrenChanged.connect(self.excludePanel.refresh)
+        layout.insertWidget(1, self.excludePanel)
+        # Plan 37 UF14. With a farfield the seeds live inside it, not in the
+        # block: say so, and which patch it becomes. Hidden without one.
+        self.farfieldNote = QLabel(self)
+        self.farfieldNote.setObjectName('farfieldNote')
+        self.farfieldNote.setWordWrap(True)
+        self.farfieldNote.hide()
+        layout.insertWidget(2, self.farfieldNote)
 
     #: Plan 36 RP2. What each control's enabled state was before an editor
     #: opened, so closing it gives back exactly that -- a Run button shut for
     #: a reason stays shut.
     _lockedControls = None
 
-    def _pageControls(self):
+    def _pageControls(self, editing=None):
+        editing = self.panel if editing is None else editing
         layout = self._body_layout
         for index in range(layout.count()):
             widget = layout.itemAt(index).widget()
-            if widget is not None and widget is not self.panel:
+            if widget is not None and widget is not editing:
                 yield widget
         yield from (self._preview, self._update, self._revert, self._runStage)
 
-    def _lockWhileEditing(self, editing: bool) -> None:
+    def _lockForExclude(self, editing: bool) -> None:
+        """Plan 37 UF16. The exclude editor locks the page, regions too."""
+        self._lockWhileEditing(editing, self.excludePanel)
+
+    def _lockWhileEditing(self, editing: bool, panel=None) -> None:
         """Disable the rest of the page while a region is being placed."""
         if editing:
             if self._lockedControls is not None:
                 return
             self._lockedControls = [(widget, widget.isEnabled())
-                                    for widget in self._pageControls()]
+                                    for widget in self._pageControls(panel)]
             for widget, _enabled in self._lockedControls:
                 widget.setEnabled(False)
             return
@@ -1449,6 +1833,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         if self._domainBoxActor is not None:
             display.removeOverlay(self._domainBoxActor)
             self._domainBoxActor = None
+        self._showFarfield(display, False)
         if not shown:
             return
         box = self.domainBox()
@@ -1458,6 +1843,72 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self._domainBoxActor = domainBoxActor(
             box.bounds, blocks=None if box.cuboid else box.outlines())
         display.addOverlay(self._domainBoxActor)
+        self._showFarfield(display, True)
+
+    #: Plan 37 UF14. The farfield's skin and its label while this page is up.
+    _farfieldActors = ()
+
+    @staticmethod
+    def farfield():
+        """The resolved farfield, or ``None`` (none, no case, or unbuildable).
+
+        Resolved around the surfaces' extent from the viewport, the extent a
+        run hands the case builder, so what is drawn is what is written.
+        """
+        from foammesh.core.mesh import snappy_farfield
+
+        try:
+            db = app.facadeClient.checkout()
+        except Exception:  # noqa: BLE001 - no case open yet
+            return None
+        spec = snappy_farfield.active(db)
+        if spec is None:
+            return None
+        surfaces = getattr(_geometryManager(), 'getSurfaceBounds', None)
+        extent = surfaces() if surfaces is not None else None
+        if extent is None:
+            return None
+        try:
+            return snappy_farfield.resolve(spec, extent.toTuple())
+        except ValueError:
+            return None
+
+    def _showFarfield(self, display, shown: bool) -> None:
+        """The farfield drawn apart from the block, and labelled (UF14)."""
+        for actor in self._farfieldActors:
+            try:
+                display.removeOverlay(actor)
+            except Exception:  # noqa: BLE001 - the view has gone
+                pass
+        self._farfieldActors = ()
+        if not shown:
+            return
+        farfield = self.farfield()
+        if farfield is None:
+            return
+        self._farfieldActors = (farfieldActor(farfield.primitive),
+                                farfieldLabelActor(farfield.primitive))
+        for actor in self._farfieldActors:
+            display.addOverlay(actor)
+
+    def _sayFarfield(self) -> None:
+        """Plan 37 UF14. The outer boundary, its patch and what a seed means."""
+        note = getattr(self, 'farfieldNote', None)
+        if note is None:
+            return
+        from foammesh.core.mesh import snappy_farfield
+
+        try:
+            text = snappy_farfield.support_text(self._client.checkout())
+        except Exception:  # noqa: BLE001 - no case open yet
+            text = ''
+        if text:
+            # Plan 37. Where the farfield is changed, now that it has an
+            # entry of its own on the Geometry page.
+            text = ' '.join((text, self.tr(
+                'It is changed from Edit farfield… on the Geometry page.')))
+        note.setText(text)
+        note.setVisible(bool(text))
 
     def showEvent(self, event) -> None:
         """DP-818. The seed glyphs are drawn while this page is up."""
@@ -1501,6 +1952,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
     def refresh(self) -> None:
         super().refresh()
         self._moveProseBehindHelp()
+        self._sayFarfield()
 
     def reload_values(self) -> None:
         super().reload_values()

@@ -159,9 +159,21 @@ class FieldDescriptor:
     invalidates: tuple[str, ...] = ()
     ui_location: str = ''
     documentation: str = ''
+    #: Plan 37 UF15. ``((engine id, fingerprints), ...)`` for an engine on
+    #: which the field stales something other than ``invalidates``; an
+    #: engine not named here gets ``invalidates``.
+    invalidates_by_engine: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    def invalidates_for(self, engine_id=None) -> tuple[str, ...]:
+        """What an edit stales on ``engine_id``'s route (Plan 37 UF15)."""
+        engine = str(engine_id or '').strip().lower()
+        for name, fingerprints in self.invalidates_by_engine:
+            if name == engine:
+                return fingerprints
+        return self.invalidates
 
     def to_dict(self) -> dict:
-        return {
+        document = {
             'id': self.id, 'title': self.title, 'value_type': self.value_type.value,
             'unit': self.unit, 'default': self.default,
             'minimum': self.minimum, 'maximum': self.maximum,
@@ -173,6 +185,13 @@ class FieldDescriptor:
             'invalidates': list(self.invalidates),
             'ui_location': self.ui_location, 'documentation': self.documentation,
         }
+        # Only where there is one, so every other field's record is the one
+        # it was before Plan 37 UF15.
+        if self.invalidates_by_engine:
+            document['invalidates_by_engine'] = {
+                name: list(fingerprints)
+                for name, fingerprints in self.invalidates_by_engine}
+        return document
 
     def json_schema(self) -> dict:
         node: dict = {'title': self.title}
@@ -236,6 +255,11 @@ def _build_descriptor(path: str, primitive: PrimitiveType) -> FieldDescriptor:
     override = FIELD_OVERRIDES.get(field_id, {})
     invalidates = tuple(override.get('invalidates', group_meta.get(
         'invalidates', DEFAULT_INVALIDATION)))
+    by_engine = override.get('invalidates_by_engine',
+                             group_meta.get('invalidates_by_engine', {}))
+    invalidates_by_engine = tuple(
+        (str(engine), tuple(fingerprints))
+        for engine, fingerprints in sorted(dict(by_engine or {}).items()))
     ui_location = override.get('ui_location', group_meta.get('ui_location', ''))
     documentation = override.get('documentation', '')
     unit = override.get('unit', group_meta.get('units', {}).get(field_id.rsplit('.', 1)[-1]))
@@ -251,7 +275,8 @@ def _build_descriptor(path: str, primitive: PrimitiveType) -> FieldDescriptor:
         exclusive_minimum=exclusive_min, exclusive_maximum=exclusive_max,
         enum=enum_options, read_only=read_only,
         required=primitive.isRequired(), applies_when=applies_when,
-        invalidates=invalidates, ui_location=ui_location, documentation=documentation)
+        invalidates=invalidates, ui_location=ui_location, documentation=documentation,
+        invalidates_by_engine=invalidates_by_engine)
 
 
 def _group_metadata(path: str) -> dict:
@@ -452,6 +477,8 @@ def _collection_id(path: str) -> str:
             'meshing.castellation.volume_refinement_bands',
         'castellation/featureBands': 'meshing.castellation.feature_bands',
         'castellation/volumeBands': 'meshing.castellation.volume_bands',  # DP-586
+        # Plan 37 UF16
+        'castellation/excludePoints': 'meshing.castellation.exclude_points',
         'addLayers/layers': 'meshing.layers.groups',
         'interfacePairs': 'geometry.interface_pairs',
         'gmsh/sizeFields': 'gmsh.size_fields.controls',

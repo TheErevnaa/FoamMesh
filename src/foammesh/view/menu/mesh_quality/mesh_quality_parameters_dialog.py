@@ -23,6 +23,8 @@ from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.app import app
 from foammesh.core.facade.fields import REGISTRY
 from foammesh.core.quality.policy import (
+    NOT_INHERITED_BY_RELAXED,
+    OPTIONAL_LIMITS,
     RELAXABLE_LIMITS,
     RELAXED_WITH_DEFAULT,
     STORAGE_ROOT,
@@ -43,11 +45,16 @@ class MeshQualityParametersDialog(QDialog):
         super().__init__(parent)
         self._ui = Ui_MeshQualityParametersDialog()
         self._ui.setupUi(self)
-        # DP-213. Taken out of the form, and now said so here rather
-        # than only in the accountability generator: `minFaceFlatness`
-        # and `minTriangleTwist` are not consumed by Foundation 13
-        # snappy mesh quality, so neither row ever reaches a reader.
-        self._ui.formLayout.removeRow(self._ui.minFaceFlatness)
+        # DP-213 took two rows out of the form as "not consumed by
+        # Foundation 13 snappy mesh quality". That was right for
+        # `minTriangleTwist`, which v13 has no key for, so its row stays
+        # out. It was wrong for `minFaceFlatness`: v13's
+        # `meshCheck::checkMesh` (src/meshCheck/checkMesh.C:78-83) runs the
+        # flatness check whenever the key is present. The Plan 29 key oracle
+        # scanned libsnappyHexMesh and not libmeshCheck, which is where the
+        # lookup lives. Plan 37 UF15 measured it (evidence in
+        # plans/evidence/plan37/uf15-v13-controls.md) and the row is back,
+        # bound through the quality policy like every other limit.
         self._ui.formLayout.removeRow(self._ui.minTriangleTwist)
 
         #: Storage path (relative to ``meshQuality``) -> the box editing it.
@@ -134,11 +141,22 @@ class MeshQualityParametersDialog(QDialog):
             return None
         edit = QLineEdit(self)
         edit.setObjectName(f'{name}Relaxed')
-        edit.setPlaceholderText(self.tr('same as strict'))
-        edit.setToolTip(self.tr(
-            'Limit used only in the phases snappyHexMesh is allowed to '
-            'relax, layer addition above all. Leave empty and the strict '
-            'limit governs there too.'))
+        if name in NOT_INHERITED_BY_RELAXED:
+            # Plan 37 UF15. OpenFOAM 13 finds this key in the relaxed block
+            # without looking at the strict one, so "same as strict" would
+            # be a promise the mesher does not keep.
+            edit.setPlaceholderText(self.tr('off'))
+            edit.setToolTip(self.tr(
+                'Limit used only in the phases snappyHexMesh is allowed to '
+                'relax, layer addition above all. This one does not inherit '
+                'the strict value: leave it empty and there is no such '
+                'check in those phases.'))
+        else:
+            edit.setPlaceholderText(self.tr('same as strict'))
+            edit.setToolTip(self.tr(
+                'Limit used only in the phases snappyHexMesh is allowed to '
+                'relax, layer addition above all. Leave empty and the strict '
+                'limit governs there too.'))
         form.insertRow(row + 1, title, edit)
         return edit
 
@@ -174,6 +192,10 @@ class MeshQualityParametersDialog(QDialog):
                     # Unset means "the strict limit governs here too", which
                     # is snappyHexMesh's own rule, so an empty box clears the
                     # key rather than writing a value.
+                    value = value.strip() or None
+                elif path in OPTIONAL_LIMITS:
+                    # Plan 37 UF15. No shipped value: empty stores nothing,
+                    # so the key is not written and the check stays off.
                     value = value.strip() or None
                 self._dbElement.setValue(path, value, self._titles[path])
 

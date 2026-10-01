@@ -6,6 +6,7 @@
 import logging
 import math
 import platform
+import threading
 import time
 from typing import Optional
 
@@ -32,7 +33,9 @@ from vtkmodules.vtkRenderingCore import vtkActor, vtkRenderer, vtkPropPicker, vt
 from foammesh.support import disposal, heartbeat, lifecycle, safe_mode
 from foammesh.support.vtk_threads import isRenderingHold
 
-from foammesh.rendering import gl_health, render_style
+from foammesh.rendering import (
+    gl_health, gpu_profile, interaction_lod, render_style)
+from foammesh.view.theming.metrics import apply_prose_measure
 from foammesh.view.theming.vtk_theme import apply_vtk_theme
 from app_properties import meshAppProperties
 from foammesh.core.branding import watermark_geometry
@@ -96,10 +99,26 @@ def _sameModel(old, new) -> bool:
 #: the mesh does not make the readout flicker, short enough to feel immediate.
 HOVER_DWELL_TIME = 180
 
-#: Frames per second VTK aims for while the camera is moving, versus at rest.
-#: Asking for 15 during interaction is what lets LOD actors shed detail.
+#: VTK's own interactive frame rate (the interactor's default). It is no
+#: longer asked for: at 15 the style and every 3D widget made
+#: ``vtkQuadricLODActor`` (the volume's MeshActor) build its decimated copy on
+#: the GUI thread at the first moving frame -- MEASURED 1.29 s for 20 M quads
+#: on this machine's iGPU, and 1.0 s more for the frame on release -- and
+#: rebuild it after every cut. Drags use ``interaction_lod`` instead.
 INTERACTIVE_UPDATE_RATE = 15.0
 STILL_UPDATE_RATE = 0.0001
+
+
+def _holdRenderRate(widget) -> None:
+    """Keep VTK's requested frame rate at the still rate for every frame."""
+    interactor = getattr(widget, '_Iren', None)
+    if interactor is not None:
+        interactor.SetDesiredUpdateRate(STILL_UPDATE_RATE)
+        interactor.SetStillUpdateRate(STILL_UPDATE_RATE)
+    widget.GetRenderWindow().SetDesiredUpdateRate(STILL_UPDATE_RATE)
+#: Quiet time after the last frame before the reduced copies are made, so a
+#: scene being built part by part is reduced once, when it is complete.
+INTERACTION_DETAIL_DELAY = 750
 
 #: Pixels one cube-axis label needs before the next one starts touching it.
 #: Measured against the default `%-#6.3g` format at twelve points: "-0.0123"
@@ -387,24 +406,25 @@ class ViewportPlaceholder(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         layout = QVBoxLayout(self)
         layout.addStretch(1)
+        # DP-220. The heading, the paragraph under it and the button start
+        # at one edge, as on the empty-case page: centred, every wrapped
+        # line of the explanation began at a different place.
+        ranged = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         self._title = QLabel(self)
         self._title.setObjectName('viewportPlaceholderTitle')
-        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setAlignment(ranged)
         self._title.setWordWrap(True)
-        font = self._title.font()
-        font.setBold(True)
-        self._title.setFont(font)
         self._detail = QLabel(self)
         self._detail.setObjectName('viewportPlaceholderDetail')
-        self._detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._detail.setAlignment(ranged)
         self._detail.setWordWrap(True)
+        apply_prose_measure(self._detail)
         self._detail.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._button = QPushButton(self)
         self._button.setObjectName('viewportPlaceholderAction')
         self._button.clicked.connect(self.actionRequested)
         row = QHBoxLayout()
-        row.addStretch(1)
         row.addWidget(self._button)
         row.addStretch(1)
         layout.addWidget(self._title)
@@ -472,6 +492,9 @@ class RenderingWidget(QWidget):
     #: True while the viewport is showing less than the full mesh to stay
     #: responsive. Nothing may drop detail without saying so.
     detailReduced = Signal(bool)
+    #: 2026-10-01. A reduced copy made in the worker thread, for the GUI
+    #: thread to put in the scene (queued across threads).
+    _interactionDetailMade = Signal(object, object)
     #: DP-696. The camera history gained or lost an entry. Back and Forward
     #: used to be refreshed only by the handful of callers that remembered to
     #: ask, so a view preset recorded history the Back button never showed.
@@ -526,6 +549,7 @@ class RenderingWidget(QWidget):
         self._widget.SetInteractorStyle(self._style)
         self._widget.renderGuard = self._guardedRender
         self._watchRenderWindow(self._widget.GetRenderWindow())
+        _holdRenderRate(self._widget)
 
         self._depthPeeling = False
         #: Plan 35 CR8 step 2. Translucency wanted, peeling dropped (budget).
@@ -554,6 +578,19 @@ class RenderingWidget(QWidget):
 
         self._renderer = vtkRenderer()
         self._widget.GetRenderWindow().AddRenderer(self._renderer)
+
+        # 2026-10-01. Reduced copies of the large parts, made off the GUI
+        # thread and drawn only while the camera is dragged (interaction_lod).
+        self._interactionDetail = interaction_lod.InteractionDetail(
+            self._renderer)
+        self._interactionDetailBuilding = False
+        self._interactionDetailTried = False
+        self._interactionDetailTimer = QTimer(self)
+        self._interactionDetailTimer.setSingleShot(True)
+        self._interactionDetailTimer.setInterval(INTERACTION_DETAIL_DELAY)
+        self._interactionDetailTimer.timeout.connect(
+            self._prepareInteractionDetail)
+        self._interactionDetailMade.connect(self._installInteractionDetail)
         # self._style.SetDefaultRenderer(self._renderer)
 
         self._renderer.GradientBackgroundOn()
@@ -594,6 +631,10 @@ class RenderingWidget(QWidget):
         self._style.AddObserver(vtkCommand.MouseMoveEvent, self._mouseMoveEvent)
         self._style.AddObserver(
             vtkCommand.StartInteractionEvent, self._cameraInteractionStarted)
+        self._style.AddObserver(
+            vtkCommand.InteractionEvent, self._cameraMoving)
+        self._style.AddObserver(
+            vtkCommand.EndInteractionEvent, self._cameraInteractionEnded)
 
         # Every embedded/temporary viewport participates in live theme changes,
         # not only the main-window instance.
@@ -791,6 +832,7 @@ class RenderingWidget(QWidget):
             return False
         if not self._glChecked:
             self._checkGl(window)
+        self._scheduleInteractionDetail()
         return True
 
     def _renderOperation(self):
@@ -894,6 +936,7 @@ class RenderingWidget(QWidget):
         window.SetMultiSamples(0 if self._safeMode else MULTI_SAMPLES)
         widget.SetInteractorStyle(self._style)
         widget.renderGuard = self._guardedRender
+        _holdRenderRate(widget)
         window.AddRenderer(self._renderer)
         self._watchRenderWindow(window)
         self._widget = widget
@@ -961,8 +1004,13 @@ class RenderingWidget(QWidget):
     def renderNoteText(self) -> str:
         return self._renderNoteText
 
-    def _setRenderNote(self, text: str) -> None:
-        text = str(text or '')
+    def _setRenderNote(self, text: str, part: str = 'scene') -> None:
+        """Set one part of the note; the parts are joined, so the GPU note
+        (which stays) and the scene's peeling note do not clear each other."""
+        parts = self.__dict__.setdefault('_renderNoteParts', {})
+        parts[part] = str(text or '')
+        text = ' '.join(parts[key] for key in ('gl', 'gpu', 'scene')
+                        if parts.get(key))
         if text != self._renderNoteText:
             self._renderNoteText = text
             if text:
@@ -975,8 +1023,26 @@ class RenderingWidget(QWidget):
         if not info:
             return
         self._glChecked = True
+        # 2026-10-01. Which GPU drew it, and so how much to ask of it: the
+        # display budgets (preview triangles, peeling, interaction detail)
+        # follow the adapter actually in use, whatever its vendor.
+        try:
+            if 'gpu_memory_bytes' not in info and window.IsCurrent():
+                memory = gpu_profile.gl_memory_bytes()
+                if memory:
+                    info['gpu_memory_bytes'] = memory
+        except Exception:                                  # noqa: BLE001
+            pass
+        profile = gpu_profile.set_current(info)
+        info['tier'] = profile.tier
+        if profile.gpu_memory_bytes:
+            info['gpu_memory_bytes'] = profile.gpu_memory_bytes
         self._glInfo = info
         gl_health.record(info)
+        hint = gpu_profile.switch_hint(profile)
+        if hint:
+            logger.warning('Viewport GPU: %s', hint)
+            self._setRenderNote(hint, part='gpu')
         reason = gl_health.weak_reason(info)
         if not reason:
             return
@@ -993,7 +1059,8 @@ class RenderingWidget(QWidget):
         self._requestedQuality = requested
         self._setRenderNote(self.tr(
             '{0} The viewport now draws with the simplest settings, and '
-            'FoamMesh will start in graphics safe mode next time.').format(reason))
+            'FoamMesh will start in graphics safe mode next time.').format(reason),
+            part='gl')
 
     def dispose(self):
         """Take this view apart on the GUI thread, ahead of `Finalize`.
@@ -1016,6 +1083,8 @@ class RenderingWidget(QWidget):
             except (RuntimeError, TypeError):
                 pass
         self._hoverTimer.stop()
+        self._interactionDetailTimer.stop()
+        _quietly(self._interactionDetail.clear)
         widget = self._widget
         # Plan 35 CR8. The interactor widget's guard is a bound method of
         # this view: a cycle the collector would otherwise have to break.
@@ -1159,7 +1228,7 @@ class RenderingWidget(QWidget):
     def _applyPeeling(self, enabled: bool) -> bool:
         """Set the translucency state; True if the drawing changed.
 
-        Plan 35 CR8 step 2: above `gl_health.FACE_BUDGET` visible faces
+        Plan 35 CR8 step 2: above `gl_health.face_budget()` visible faces
         the scene is not depth-peeled (each peel redraws all of it), and
         the view says so through `renderNote`.
         """
@@ -1269,25 +1338,105 @@ class RenderingWidget(QWidget):
         A silently decimated mesh that a user reads as the real one is the same
         class of defect as a verdict that grades an unmeasured mesh a pass, so
         this emits rather than acting invisibly.
+
+        2026-10-01. On, every large part gets a reduced copy for drags,
+        whatever the scene's size; off, only a scene above the GPU's budget
+        does (``interaction_lod``). The copies are made in a worker thread.
+        The render rate is no longer raised for a drag: that made
+        ``vtkQuadricLODActor`` build its own copy of the volume on the GUI
+        thread at the first moving frame -- seconds on a large mesh.
         """
         enabled = bool(enabled)
         if enabled == self._interactiveDecimation:
             return
         self._interactiveDecimation = enabled
+        self._interactionDetail.forced = enabled
+        # vtkRenderWindow has no still rate of its own (the interactor
+        # holds it): calling one raised AttributeError, so this menu
+        # entry failed every time it was ticked.
         window = self._widget.GetRenderWindow()
-        window.SetStillUpdateRate(STILL_UPDATE_RATE)
-        # The interactor is what raises the desired rate during a drag and
-        # drops it again at rest; setting it on the window alone would either
-        # decimate every frame or none. `vtkQuadricLODActor` reads the rate the
-        # window is currently asking for and picks its representation from it.
         interactor = self._widget._Iren
         if interactor is not None:
-            interactor.SetDesiredUpdateRate(
-                INTERACTIVE_UPDATE_RATE if enabled else STILL_UPDATE_RATE)
+            interactor.SetDesiredUpdateRate(STILL_UPDATE_RATE)
             interactor.SetStillUpdateRate(STILL_UPDATE_RATE)
-        window.SetDesiredUpdateRate(
-            INTERACTIVE_UPDATE_RATE if enabled else STILL_UPDATE_RATE)
+        window.SetDesiredUpdateRate(STILL_UPDATE_RATE)
         self.detailReduced.emit(enabled)
+        self._scheduleInteractionDetail()
+
+    # -- 2026-10-01: reduced copies while the camera moves ------------------ #
+
+    def interactionDetail(self):
+        """The reduced copies drawn while the camera moves (interaction_lod)."""
+        return self._interactionDetail
+
+    def _scheduleInteractionDetail(self) -> None:
+        if self._disposed or self._interactionDetail.active():
+            return
+        timer = self.__dict__.get('_interactionDetailTimer')
+        if timer is not None:
+            timer.start()
+
+    def _prepareInteractionDetail(self) -> bool:
+        """Start making the copies the scene lacks; True if a job started."""
+        if self._disposed or self._interactionDetailBuilding:
+            return False
+        if self._interactionDetail.active():
+            self._scheduleInteractionDetail()
+            return False
+        try:
+            jobs = self._interactionDetail.jobs()
+        except Exception:                                   # noqa: BLE001
+            logger.exception('Planning the interaction detail')
+            return False
+        if not jobs:
+            return False
+        self._interactionDetailBuilding = True
+        made = self._interactionDetailMade
+
+        def work():
+            for job in jobs:
+                try:
+                    reduced = job.run()
+                except Exception:                           # noqa: BLE001
+                    logger.exception('Reducing a part for interaction')
+                    continue
+                made.emit(job, reduced)
+            made.emit(None, None)
+
+        threading.Thread(target=work, name='foammesh-interaction-detail',
+                         daemon=True).start()
+        return True
+
+    def _installInteractionDetail(self, job, reduced) -> None:
+        if job is None:
+            self._interactionDetailBuilding = False
+            return
+        if self._disposed:
+            return
+        try:
+            self._interactionDetail.install(job, reduced)
+        except Exception:                                   # noqa: BLE001
+            logger.exception('Adding a reduced copy to the scene')
+
+    def _cameraMoving(self, obj, event):
+        """The first moving frame of a drag: draw the reduced copies."""
+        if self._interactionDetailTried:
+            return
+        self._interactionDetailTried = True
+        try:
+            swapped = self._interactionDetail.begin()
+        except Exception:                                   # noqa: BLE001
+            logger.exception('Swapping in the interaction detail')
+            swapped = 0
+        if swapped:
+            self.detailReduced.emit(True)
+
+    def _cameraInteractionEnded(self, obj, event):
+        """Full detail back before the frame the style draws at release."""
+        self._interactionDetailTried = False
+        if self._interactionDetail.end():
+            self.detailReduced.emit(False)
+        self._scheduleInteractionDetail()
 
     def usesInteractiveDecimation(self) -> bool:
         return self._interactiveDecimation

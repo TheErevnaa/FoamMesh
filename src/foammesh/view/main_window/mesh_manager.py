@@ -164,6 +164,11 @@ class MeshManager(ActorManager):
         """The .msh currently drawn, or None when the scene came from a case."""
         return self._nativePath
 
+    def caseRoot(self):
+        """The case directory the drawn mesh was read from, or None (Plan 37
+        UF10: the section worker cuts that case's polyMesh)."""
+        return None if self._nativePath is not None else self._root
+
     def ownsArtifact(self, artifact_id) -> bool:
         """Whether ``artifact_id`` names what is currently displayed.
 

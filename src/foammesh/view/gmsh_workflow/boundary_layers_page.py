@@ -11,6 +11,7 @@ from foammesh.core.geometry.boundary_roles import (
     LAYER_ROLES, defaulted_targets_sentence)
 from foammesh.core.gmsh.layer_targets import (
     MODE_ALL_WALLS, boundary_category, eligible_wall_names, normalise_mode)
+from foammesh.core.gmsh.execution import nothing_chosen_layer_refusal
 from foammesh.view.theming.metrics import apply_form_metrics
 from foammesh.view.theming.status_colors import apply_color_swatch
 
@@ -259,6 +260,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         editor = self._editors.get(self.PATCH_MODE_FIELD)
         if editor is not None:
             editor.valueChanged.connect(self._onPatchModeChanged)
+            self.describeModeChoices(editor)
         self.updatePatchSelector()
         # The editors are rebuilt on every refresh, so the live hook is
         # reconnected here rather than once at construction.
@@ -392,6 +394,42 @@ class GmshBoundaryLayersPage(GmshTaskPage):
                 names.append(name)
         return names
 
+    def patchesWereSet(self) -> bool:
+        """Whether the case has an answer for the list, empty or not.
+
+        DP-1031. The stored field is None until something writes it, and ''
+        once a user unticks every surface and presses Update. Both used to
+        read as "empty", so the walls were proposed over the user's choice
+        on the refresh that Update itself triggers. A pending edit counts as
+        an answer too.
+        """
+        if self.PATCH_FIELD in getattr(self, '_pending', {}):
+            return True
+        try:
+            raw = self._client.field_values((self.PATCH_FIELD,)).get(
+                self.PATCH_FIELD)
+        except Exception:                                   # noqa: BLE001
+            return False
+        return raw is not None
+
+    def describeModeChoices(self, editor) -> None:
+        """DP-1031. Say at the choice that it locks the list below."""
+        combo = getattr(editor, 'editor', None)
+        if combo is None or not hasattr(combo, 'findData'):
+            return
+        index = combo.findData(MODE_ALL_WALLS)
+        if index < 0:
+            index = combo.findText(self.tr('All eligible walls'))
+        if index >= 0:
+            combo.setItemData(index, self.lockedListText(),
+                              Qt.ItemDataRole.ToolTipRole)
+
+    def lockedListText(self) -> str:
+        return str(self.tr(
+            'The list is locked: every eligible wall is ticked, and the run '
+            'reads them off the geometry it imports. Choose Selected to tick '
+            'or untick surfaces yourself.'))
+
     def writeSelection(self, names) -> None:
         """Put a selection into the field the runner actually reads."""
         editor = self._editors.get(self.PATCH_FIELD)
@@ -435,6 +473,9 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             # prepared geometry cannot answer to it.
             self.writeSelection([])
             selected = []
+            withdrawn = True
+        else:
+            withdrawn = False
         proposed = []
         if mode == MODE_ALL_WALLS:
             # The choice is the answer, so the names are only a record of it.
@@ -446,7 +487,11 @@ class GmshBoundaryLayersPage(GmshTaskPage):
                 self.rememberProposal(walls, known)
                 self.storeProposal()
                 selected = self.selectedPatches()
-        elif patches and not selected:
+        elif patches and not selected and (
+                withdrawn or not self.patchesWereSet()):
+            # DP-1031. Only a list nobody has answered is proposed for. An
+            # empty list a user stored is their answer: nothing grows, and
+            # the note below says the run will be refused.
             proposed = self.proposedSelection(patches, regions)
             if proposed:
                 self.writeSelection(proposed)
@@ -572,6 +617,9 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         box.setAccessibleName(str(self.tr('Grow layers on %s')) % name)
         box.setChecked(checked)
         box.setEnabled(not locked)
+        if locked:
+            # DP-1031. A disabled box with no reason read as a broken list.
+            box.setToolTip(self.lockedListText())
         box.toggled.connect(
             lambda state, key=name: self._onPatchToggled(key, state))
         line.addWidget(box, 1)
@@ -618,9 +666,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
                      if box.isChecked())
         text = str(self.tr('%d of %d surfaces chosen')) % (chosen, total)
         if mode == MODE_ALL_WALLS:
-            text += ' ' + self.tr(
-                'The run reads them off the geometry it imports, so this '
-                'list follows the geometry rather than the other way round.')
+            text += ' ' + self.lockedListText()
         self._selectedCount.setText(text)
         # W-O1. A count of a list that has no rows counts nothing: on a case
         # with no prepared geometry this read "0 of 0 surfaces chosen" over
@@ -962,8 +1008,15 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         # beside it.
         selected = self.selectedPatches()
         refusal = self.assemblyLayerRefusal(enabled=self.layersEnabled(),
-                                            patches=selected)
+                                            patches=selected,
+                                            patch_mode=self.patchMode())
         self.setAssemblyRefusal(refusal)
+        if refusal and refusal == nothing_chosen_layer_refusal():
+            # Plan 37 F3d. The patch note already says nothing is ticked and
+            # the run will be refused; the buttons now hold to it, and the
+            # same sentence is not said twice.
+            self._assemblyNote.setVisible(False)
+            return
         regions = self.preparedRegions()
         spanning = self.spanningSelection(selected)
         if refusal and not (regions and selected and not spanning):

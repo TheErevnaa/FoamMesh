@@ -45,7 +45,7 @@ class GmshPeriodicPage(GmshTaskPage):
             self._client, 'gmsh.periodic_pairs.controls',
             self.tr('Periodic pairs'), columns=self.COLUMNS, parent=self,
             headings=self.HEADINGS)
-        self.panel.childrenChanged.connect(self.refresh)
+        self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         self.panel.setToolTip(self.tr(self.TRANSFORM_NOTE))
         self.panel.setAccessibleDescription(self.tr(self.TRANSFORM_NOTE))
         layout.addWidget(self.panel)

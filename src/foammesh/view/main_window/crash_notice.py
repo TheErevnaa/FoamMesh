@@ -23,6 +23,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
                                QLabel, QPlainTextEdit, QPushButton, QVBoxLayout)
 
+from foammesh.view.theming.metrics import FORM_MARGIN, MARGIN_TIGHT
+
 
 def _when(record: dict) -> str:
     text = record.get('ended_at') or ''
@@ -116,7 +118,8 @@ class CrashNoticeBanner(QFrame):
         self.safeModeButton.clicked.connect(self._safeModeChosen)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setContentsMargins(FORM_MARGIN, MARGIN_TIGHT, FORM_MARGIN,
+                                  MARGIN_TIGHT)
         layout.addWidget(self.message, 1)
         for button in (self.safeModeButton, self.reportButton, self.logsButton,
                        self.dismissButton):
@@ -152,7 +155,7 @@ class CrashReportDialog(QDialog):
         intro = QLabel(self.tr(
             'The report is a zip file saved to {0}. It holds the files below '
             '({1}); no mesh or geometry is included, and nothing is sent '
-            'anywhere -- attach it to a message yourself if you want to share '
+            'anywhere. Attach it to a message yourself if you want to share '
             'it.').format(destination, total_text), self)
         intro.setWordWrap(True)
         self.contents = QPlainTextEdit('\n'.join(lines), self)

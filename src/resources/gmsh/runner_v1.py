@@ -50,6 +50,7 @@ try:
     from layer_targets import (
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
+    import farfield_primitives
 except ImportError:  # pragma: no cover - exercised only by the module loader
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from shell_topology import ShellTopologyError, resolve_topology
@@ -57,6 +58,7 @@ except ImportError:  # pragma: no cover - exercised only by the module loader
     from layer_targets import (
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
+    import farfield_primitives
 
 SCHEMA_VERSION = 1
 RUNNER_VERSION = 'gmsh-runner-v1'
@@ -2345,7 +2347,7 @@ class GmshRun:
         return degenerate, opened, shared
 
     def build_farfield(self):
-        """Wrap the imported solids in a box and cut them out of it.
+        """Wrap the imported solids in a box, sphere or cylinder; cut them out.
 
         Plan 30 WP12, section 4.1. The assembly fixtures ship a
         ``_farfield.stl`` beside every model because nothing in the product
@@ -2366,18 +2368,30 @@ class GmshRun:
         because nothing prepared them: ``far_field_xMin`` and its five
         siblings, spelled so the publisher's category rule reads them as a far
         field rather than defaulting them to walls.
+
+        Plan 37 UF13. The primitive may also be a sphere or a cylinder, from
+        the shared farfield specification (``farfield_primitives``). It is
+        resolved against the bounds the CAD kernel reports and refused --
+        before anything is added to the model -- when it does not contain
+        every body with clearance. Its faces are named by where they are: a
+        boolean renumbers every face, so the sphere's one face is
+        ``far_field`` and the cylinder's are ``far_field_side``,
+        ``far_field_inlet`` and ``far_field_outlet``, the caps ordered along
+        the axis. The box is built, classified and named exactly as before.
         """
         farfield = self.intent.get('farfield') or {}
         if not farfield.get('enabled'):
             return False
         gmsh = self.gmsh
         padding = float(farfield.get('padding', 2.0) or 0.0)
+        shape = str(farfield.get('shape') or farfield_primitives.BOX
+                    ).strip().lower()
         if self.tessellated:
-            reason = ('a farfield box is cut out of the imported solids by '
-                      'the CAD kernel, and a tessellated import has no solid '
-                      'to cut; supply the geometry as STEP, or supply the '
-                      'farfield as a surface of its own')
-            self.warnings.append(f'no farfield box was built: {reason}')
+            reason = (f'a farfield {shape} is cut out of the imported solids '
+                      'by the CAD kernel, and a tessellated import has no '
+                      'solid to cut; supply the geometry as STEP, or supply '
+                      'the farfield as a surface of its own')
+            self.warnings.append(f'no farfield {shape} was built: {reason}')
             self.ledger.record('gmsh/farfield/enabled', True, False,
                                applied=False, note=reason)
             return False
@@ -2385,50 +2399,63 @@ class GmshRun:
         bodies = gmsh.model.getEntities(3)
         before = gmsh.model.getBoundingBox(-1, -1)
         diagonal = math.dist(before[0:3], before[3:6])
-        standoff = padding * diagonal
-        origin = [before[index] - standoff for index in range(3)]
-        span = [before[index + 3] - before[index] + 2 * standoff
-                for index in range(3)]
+        try:
+            primitive = farfield_primitives.resolve(farfield, before)
+        except farfield_primitives.FarfieldError as error:
+            # Refused before the model is touched: nothing was added, and
+            # the imported solids are exactly as they were read.
+            raise MeshFailure(f'no farfield {shape} was built: {error}'
+                              ) from error
         signatures = {tag: self.surface_signature(tag)
                       for _dim, tag in gmsh.model.getEntities(2)}
 
-        box = gmsh.model.occ.addBox(*origin, *span)
+        tool = self.add_farfield_primitive(primitive)
         try:
-            gmsh.model.occ.cut([(3, box)], list(bodies),
+            gmsh.model.occ.cut([(3, tool)], list(bodies),
                                removeObject=True, removeTool=True)
             gmsh.model.occ.synchronize()
         except Exception as error:
             raise MeshFailure(
-                f'the farfield box could not be cut against the geometry: '
-                f'{error}') from error
+                f'the farfield {shape} could not be cut against the '
+                f'geometry: {error}') from error
         volumes = gmsh.model.getEntities(3)
         if not volumes:
             raise MeshFailure(
-                'cutting the farfield box against '
+                f'cutting the farfield {shape} against '
                 f'{count_text(len(bodies), "solid")} left no volume at all; '
-                'the box was consumed by the cut, '
-                'which happens when a solid is larger than the padding '
+                f'the {shape} was consumed by the cut, '
+                'which happens when a solid is larger than the farfield '
                 'allows for')
-        domain, sealed = self.classify_cut_volumes(volumes, origin, span,
-                                                   diagonal)
+        if shape == farfield_primitives.BOX:
+            origin, span = primitive['origin'], primitive['span']
+            domain, sealed = self.classify_cut_volumes(volumes, origin, span,
+                                                       diagonal)
+        else:
+            domain, sealed = self.classify_cut_volumes_by(
+                volumes,
+                lambda face: self.primitive_face_name(primitive, face)
+                is not None)
         if not domain:
+            side, remedy = (('a side', 'increase the padding')
+                            if shape == farfield_primitives.BOX
+                            else ('a face', f'enlarge the {shape}'))
             raise MeshFailure(
-                'cutting the farfield box against '
+                f'cutting the farfield {shape} against '
                 f'{count_text(len(bodies), "solid")} left '
                 f'{count_text(len(volumes), "volume")}, none of them bounded '
-                'by a side of the generated box, so none of them is the external '
-                'domain. A solid reaching outside the padding is the usual '
-                'cause; increase the padding or supply the domain as its '
-                'own surface.')
+                f'by {side} of the generated {shape}, so none of them is the '
+                f'external domain. A solid reaching outside the farfield is '
+                f'the usual cause; {remedy} or supply the domain as its own '
+                'surface.')
         if len(domain) > 1:
             raise MeshFailure(
-                'cutting the farfield box against '
+                f'cutting the farfield {shape} against '
                 f'{count_text(len(bodies), "solid")} '
                 f'split the external domain into {len(domain)} separate '
-                'volumes, each touching the generated box. Meshing one of '
-                'them would silently drop the rest of the flow region, so '
+                f'volumes, each touching the generated {shape}. Meshing one '
+                'of them would silently drop the rest of the flow region, so '
                 'the run stops here: the usual cause is a solid that spans '
-                'the box, or overlapping and open solids.')
+                f'the {shape}, or overlapping and open solids.')
         sealed_policy = str((self.intent.get('farfield') or {}).get(
             'sealedCavities', 'discard') or 'discard').strip().lower()
         volumes = self.apply_cavity_policy(domain, sealed, sealed_policy)
@@ -2453,35 +2480,153 @@ class GmshRun:
         self.retarget_entities('farfield-cut',
                                _successors_of(self.surface_origin))
         self.retarget_entities('farfield-cut', {}, dimensions=(3,))
-        self.name_farfield_faces(box_faces, origin, span, diagonal)
+        if shape == farfield_primitives.BOX:
+            self.name_farfield_faces(box_faces, origin, span, diagonal)
+        else:
+            self.name_primitive_faces(box_faces, primitive)
 
-        self.ledger.record('gmsh/farfield/enabled', True, True,
-                           note=f'{count_text(len(bodies), "solid")} cut out '
-                                f'of a box {padding:g} '
-                                f'{agreeing(padding, "diagonal")} larger on '
-                                'each side')
-        self.ledger.record('gmsh/farfield/padding', padding, padding,
-                           note=f'{standoff:.6g} m on each side')
+        self.record_farfield(primitive, bodies, padding)
         self.statistics['farfield'] = {
-            'padding': padding,
-            'standoff': standoff,
+            'shape': shape,
+            # Only the box reads a padding; a sphere or a cylinder is sized by
+            # its radius and length, which ``primitive`` carries.
+            'padding': padding if shape == farfield_primitives.BOX else None,
+            'standoff': primitive.get('standoff'),
+            'primitive': {key: value for key, value in primitive.items()
+                          if key not in ('shape',)},
+            'primitiveVolume': primitive['volume'],
+            'clearance': primitive['clearance'],
             'boundingBox': list(gmsh.model.getBoundingBox(-1, -1)),
             'bodies': len(bodies),
             'domainVolumes': len(domain),
-            'domainIdentifiedBy': 'faces lying on a side of the generated box',
+            'domainIdentifiedBy': (
+                'faces lying on a side of the generated box'
+                if shape == farfield_primitives.BOX
+                else f'faces lying on the generated {shape}'),
             'sealedCavities': len(sealed),
             'sealedCavityPolicy': sealed_policy,
             'sealedCavityVolumes': [round(mass, 12) for mass, _tag in sealed],
             'volumes': len(volumes),
             'bodyFaces': inherited,
             'boxFaces': len(box_faces),
+            'primitiveFaces': len(box_faces),
             'patches': sorted(self.generated_names.values()),
         }
+        if shape != farfield_primitives.BOX:
+            # ``boxFaces`` is the box's own count, kept for the readers of the
+            # box statistics; a sphere or a cylinder has no box faces, so it
+            # reports ``primitiveFaces`` alone. The box keeps both keys, in
+            # the same order, so its statistics are unchanged.
+            del self.statistics['farfield']['boxFaces']
+        detail = ({'standoff_m': round(primitive['standoff'], 6)}
+                  if shape == farfield_primitives.BOX
+                  else {'clearance_m': round(primitive['clearance'], 6)})
         self.reporter.emit(
             'progress', 'import', 0.12,
-            f'built a farfield box around {count_text(len(bodies), "solid")}',
-            {'standoff_m': round(standoff, 6)})
+            f'built a farfield {shape} around '
+            f'{count_text(len(bodies), "solid")}', detail)
         return True
+
+    def add_farfield_primitive(self, primitive):
+        """Add the resolved primitive to the OCC model; return its tag."""
+        occ = self.gmsh.model.occ
+        shape = primitive['shape']
+        if shape == farfield_primitives.BOX:
+            return occ.addBox(*primitive['origin'], *primitive['span'])
+        if shape == farfield_primitives.SPHERE:
+            return occ.addSphere(*primitive['centre'], primitive['radius'])
+        length = primitive['length']
+        return occ.addCylinder(*primitive['base'],
+                               *(item * length for item in primitive['axis']),
+                               primitive['radius'])
+
+    def record_farfield(self, primitive, bodies, padding):
+        """The ledger lines: what was asked for and what was built."""
+        shape = primitive['shape']
+        solids = count_text(len(bodies), 'solid')
+        if shape == farfield_primitives.BOX:
+            standoff = primitive['standoff']
+            self.ledger.record('gmsh/farfield/enabled', True, True,
+                               note=f'{solids} cut out '
+                                    f'of a box {padding:g} '
+                                    f'{agreeing(padding, "diagonal")} larger '
+                                    'on each side')
+            self.ledger.record('gmsh/farfield/padding', padding, padding,
+                               note=f'{standoff:.6g} m on each side')
+        else:
+            self.ledger.record('gmsh/farfield/enabled', True, True,
+                               note=f'{solids} cut out of a {shape} of '
+                                    f'{primitive["volume"]:.6g} m^3, '
+                                    f'{primitive["clearance"]:.6g} m clear '
+                                    'of the geometry')
+            self.ledger.record('gmsh/farfield/radius', primitive['radius'],
+                               primitive['radius'], note='m')
+        self.ledger.record('gmsh/farfield/shape', shape, shape)
+        farfield = self.intent.get('farfield') or {}
+        mode = str(farfield.get('centreMode') or 'auto')
+        self.ledger.record('gmsh/farfield/centreMode', mode, mode,
+                           note=('the bounding-box centre' if mode == 'auto'
+                                 else 'as authored'))
+        if shape == farfield_primitives.CYLINDER:
+            self.ledger.record('gmsh/farfield/length', primitive['length'],
+                               primitive['length'], note='m')
+            self.ledger.record('gmsh/farfield/axis', farfield.get('axis'),
+                               [round(item, 12) for item in primitive['axis']],
+                               note='normalised to a unit direction')
+
+    def face_point(self, tag):
+        """A point on surface ``tag`` itself.
+
+        The centre of mass of a curved face lies off it -- a sphere's is its
+        centre -- so the face is sampled at the middle of its own
+        parametrisation instead. Falls back to the centre of mass where the
+        kernel cannot say.
+        """
+        gmsh = self.gmsh
+        try:
+            low, high = gmsh.model.getParametrizationBounds(2, int(tag))
+            middle = [(float(low[index]) + float(high[index])) / 2.0
+                      for index in range(2)]
+            point = gmsh.model.getValue(2, int(tag), middle)
+            if len(point) >= 3:
+                return tuple(float(item) for item in point[:3])
+        except Exception:                                    # noqa: BLE001
+            pass
+        return tuple(gmsh.model.occ.getCenterOfMass(2, int(tag)))
+
+    def primitive_face_name(self, primitive, tag):
+        """The outer patch face ``tag`` is on, or ``None`` for a body face."""
+        return farfield_primitives.classify_point(primitive,
+                                                  self.face_point(tag))
+
+    def classify_cut_volumes_by(self, volumes, on_primitive):
+        """``classify_cut_volumes`` for a sphere or a cylinder.
+
+        The same rule: the external domain is the volume the primitive
+        bounds, and a volume bounded only by body faces is sealed inside the
+        geometry. Returns ``(domain, sealed)``, each a list of ``(mass, tag)``.
+        """
+        domain, sealed = [], []
+        for _dim, tag in volumes:
+            faces = [int(face) for _face_dim, face
+                     in self.gmsh.model.getBoundary([(3, int(tag))],
+                                                    oriented=False)]
+            entry = (float(self.gmsh.model.occ.getMass(3, int(tag))), int(tag))
+            (domain if any(on_primitive(abs(face)) for face in faces)
+             else sealed).append(entry)
+        return domain, sealed
+
+    def name_primitive_faces(self, faces, primitive):
+        """Name the sphere's or cylinder's faces by where each one lies."""
+        for tag, _centre in faces:
+            name = self.primitive_face_name(primitive, tag)
+            if name is not None:
+                self.generated_names[int(tag)] = name
+                continue
+            self.warnings.append(
+                f'surface {tag} appeared during the farfield cut and lies '
+                f'on no face of the {primitive["shape"]}; it publishes '
+                'unnamed')
 
     def classify_cut_volumes(self, volumes, origin, span, diagonal):
         """Split what the cut left into the external domain and the cavities.
@@ -3884,6 +4029,27 @@ class GmshRun:
                      'the number of surfaces that took them')
         return accepted
 
+    def unscoped_volume_warning(self, name):
+        """Why a volume control sized nothing, and what to do about it.
+
+        Plan 37 UF13. This said "has no resolvable volume scope and was
+        skipped", which names the runner's bookkeeping rather than the case.
+        With a farfield on, the usual cause is the cut itself: every imported
+        volume is consumed and the fluid around the bodies is a new volume no
+        control was scoped to.
+        """
+        farfield = self.statistics.get('farfield') or {}
+        shape = farfield.get('shape')
+        if shape:
+            return (f'volume control {name!r} was skipped: the farfield '
+                    f'{shape} cut the volume it is scoped to out of the '
+                    'domain, so there is nothing left for it to act on. '
+                    'Remove the control, or turn the farfield off to mesh '
+                    'that volume.')
+        return (f'volume control {name!r} was skipped: the volume it is '
+                'scoped to is not in the imported geometry. Choose its volume '
+                'again on the Volume controls page, or remove the control.')
+
     def apply_volume_controls(self):
         """Per-volume sizing, structure and exclusion.
 
@@ -3904,9 +4070,7 @@ class GmshRun:
             name = row['name']
             volumes = self.scope_volumes.get(row['scopeToken'])
             if not volumes:
-                self.warnings.append(
-                    f'volume control {name!r} has no resolvable volume scope '
-                    'and was skipped')
+                self.warnings.append(self.unscoped_volume_warning(name))
                 self.ledger.record(f'volumeControl:{name}', row['scopeToken'],
                                    None, applied=False,
                                    note='scope did not resolve')

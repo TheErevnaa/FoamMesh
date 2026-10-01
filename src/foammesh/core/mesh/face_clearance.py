@@ -11,7 +11,7 @@ The faces a seed can land on are:
 
 * the base grid's own faces, along each block axis, where blockMesh puts them
   for that block's cell count and grading (``simpleGrading`` ratios and
-  segmented profiles, and ``toward_start``);
+  segmented profiles, and a reversed direction);
 * every face castellation adds, at any refinement level up to the case's
   highest surface or region level: a level-``L`` cell splits its parent in
   half along each axis, so its faces sit at ``m / 2**L`` of a base cell.
@@ -70,32 +70,36 @@ def axis_faces(count: int, grading=None) -> tuple[float, ...]:
     """The face fractions blockMesh uses along one axis of one block.
 
     *grading* is a `background_mesh.GradingSpec`, a plain ratio, or ``None``
-    for uniform. Segment cell counts follow blockMesh's rounding: each
-    segment takes ``round(cellFraction * count)`` and the last the remainder.
+    for uniform. A spec is read as blockMesh reads it -- its literal parsed
+    and any reversal applied (``GradingSpec.resolved``) -- and segment cell
+    counts follow blockMesh's own allocation (``segment_cells``, read off
+    OpenFOAM 13 ``lineDivide.C``): each segment rounds its share, and the
+    difference goes to the first of the largest. The rule this replaced gave
+    the difference to the last segment, which put a Centre direction of seven
+    cells at (4, 3) where blockMesh builds (3, 4).
     """
+    from foammesh.openfoam.background_mesh import segment_cells
+
     count = max(1, int(count))
     if grading is None:
         return tuple(_geometric(count, 1.0))
     if isinstance(grading, (int, float)):
         return tuple(_geometric(count, float(grading)))
+    resolved = getattr(grading, 'resolved', None)
+    if callable(resolved):
+        grading = resolved()
     segments = tuple(getattr(grading, 'segments', ()) or ())
-    toward_start = bool(getattr(grading, 'toward_start', False))
     if not segments:
         ratio = float(getattr(grading, 'ratio', 1.0) or 1.0)
-        if toward_start and ratio > 0:
-            ratio = 1.0 / ratio
         return tuple(_geometric(count, ratio))
+    allocation = segment_cells(count, segments)
+    if not allocation:
+        # Fewer cells than segments: blockMesh divides the edge uniformly.
+        return tuple(_geometric(count, 1.0))
     length_total = sum(float(item[0]) for item in segments) or 1.0
     faces = [0.0]
-    used = 0
     start = 0.0
-    for index, (length, cells, ratio) in enumerate(segments):
-        if index == len(segments) - 1:
-            divisions = count - used
-        else:
-            divisions = int(float(cells) * count + 0.5)
-            divisions = max(0, min(divisions, count - used))
-        used += divisions
+    for divisions, (length, _cells, ratio) in zip(allocation, segments):
         span = float(length) / length_total
         if divisions > 0:
             for fraction in _geometric(divisions, float(ratio))[1:]:
@@ -106,39 +110,14 @@ def axis_faces(count: int, grading=None) -> tuple[float, ...]:
 
 
 def _literal_gradings(literal) -> list:
-    """The three directions of a ``simpleGrading`` text such as ``2 1 (..)``."""
-    from foammesh.openfoam.background_mesh import parse_grading
+    """The three directions of a ``simpleGrading`` text such as ``2 1 (..)``.
 
-    text = str(literal or '').strip()
-    if text.startswith('(') and text.endswith(')') and text.count('(') == 1:
-        text = text[1:-1]
-    tokens: list[str] = []
-    depth = 0
-    current = ''
-    for character in text:
-        if character == '(':
-            depth += 1
-        if character == ')':
-            depth -= 1
-        if character.isspace() and depth == 0:
-            if current:
-                tokens.append(current)
-                current = ''
-            continue
-        current += character
-    if current:
-        tokens.append(current)
-    if len(tokens) != 3:
-        return [None, None, None]
-    gradings = []
-    for token in tokens:
-        if token.startswith('(') and token.endswith(')') and token.count('(') > 1:
-            token = token[1:-1]
-        try:
-            gradings.append(parse_grading(token))
-        except Exception:  # noqa: BLE001 - an unreadable direction is uniform
-            gradings.append(None)
-    return gradings
+    Each direction's bracketed group -- ``((0.5 0.5 0.25) (0.5 0.5 4))`` for
+    a Centre direction -- is read as the segments it holds.
+    """
+    from foammesh.openfoam.background_mesh import split_directions
+
+    return list(split_directions(literal))
 
 
 # -- the grid --------------------------------------------------------------- #

@@ -480,8 +480,19 @@ def align_unit_column(layouts) -> int:
         label.setColumnWidth(0)
     width = max((label.sizeHint().width() for label in units if label.text()),
                 default=0)
+    # Plan 37 UF19. Only the visibility this function takes away is its to
+    # give back. Showing every unit whenever the column had a width re-showed
+    # the unit of a row hidden because its setting does not apply: the
+    # surface features page drew three stray "m" labels, 297 px wide, where
+    # the subset plane's point sits while the plane is off.
     for label in units:
-        label.setVisible(bool(width))
+        if not width:
+            if not label.isHidden():
+                label.setProperty('foammeshUnitColumnHid', True)
+                label.setVisible(False)
+        elif label.property('foammeshUnitColumnHid'):
+            label.setProperty('foammeshUnitColumnHid', False)
+            label.setVisible(True)
         label.setColumnWidth(width)
     return width
 

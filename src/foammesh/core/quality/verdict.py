@@ -136,7 +136,7 @@ def verdict_from_report(report: Any) -> dict:
     detail = (_detail(worst) if worst
               else f'mesh grades {result.quality_grade}')
 
-    return {
+    out = {
         'verdict': verdict,
         'measure': measure,
         'detail': detail,
@@ -161,6 +161,13 @@ def verdict_from_report(report: Any) -> dict:
         'failedCheckNames': names,
         'failedCheckLine': failed_check_line(failed_checks, names),
     }
+    # Plan 37 F-2. A snappy mesh in more pieces than its seeds ask for is
+    # carried as its own fact, with the sentence the QA page and the summary
+    # say; only when it is split, so an ordinary verdict is unchanged.
+    retained = getattr(result, 'retained', None)
+    if isinstance(retained, dict) and retained.get('split'):
+        out['retainedRegions'] = dict(retained)
+    return out
 
 
 def layer_shortfall_line(coverage) -> str:

@@ -26,7 +26,9 @@ import numpy as np
 from foammesh.core.export.poly_mesh_writer import (
     FoamPolyMeshWriter, PolyMeshWriteError,
 )
-from foammesh.core.gmsh.layer_targets import publishable_category
+from foammesh.core.gmsh.layer_targets import (
+    boundary_category, publishable_category,
+)
 from foammesh.core.mesh.census import MSH_HIGHER_ORDER_VOLUME_TYPES
 from foammesh.core.quantities import agreeing, aligned, count_text
 from foammesh.core.mesh.connectivity import (
@@ -833,6 +835,13 @@ def _patch_metadata(boundary_blocks, physical_names, supplied):
                 f'physical surface {patch_id} has no name in the Gmsh mesh'
                 if not declared else
                 f'{name} is not declared in the prepared group manifest')
+        if 'category' not in item and boundary_category(name) == 'far_field':
+            # The runner builds the farfield and names its outer faces
+            # ``far_field``, ``far_field_side``, ``far_field_xMin`` ...; the
+            # prepared manifest never saw them, so the name is the category.
+            # Defaulted to ``wall``, a solver would read the outer boundary
+            # of an external flow as a no-slip surface (Plan 37 UF20).
+            item['category'] = 'far_field'
         if 'category' not in item:
             item['category'] = 'wall'
             item.setdefault('identity_origin', 'fabricated')

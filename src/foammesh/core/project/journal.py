@@ -121,6 +121,12 @@ def fault_point(name: str, **context) -> None:
                 os.fsync(output.fileno())
         except OSError:
             pass
+    if sys.platform == 'win32':
+        # os._exit is ExitProcess, which runs every DLL's detach while the
+        # main thread may still be inside HDF5 -- under load that teardown
+        # dies 0xC0000005 instead of 86 (DP-1108).  TerminateProcess skips
+        # it, which is also what a real crash does.
+        os.kill(os.getpid(), FAULT_EXIT_CODE)
     os._exit(FAULT_EXIT_CODE)
 
 

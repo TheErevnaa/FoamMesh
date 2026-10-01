@@ -18,8 +18,11 @@ CALCULATION_VERSION = 'gmsh.sizing.v1'
 #: 8k-47k cells, which meshes in seconds and passes checkMesh on all fifteen.
 DEFAULT_DIAGONAL_DIVISOR = 40.0
 
-#: Refuse to ask Gmsh for a mesh this large; it is a runaway, not a request.
-MAXIMUM_ELEMENT_ESTIMATE = 50_000_000
+#: No fixed element cap (2026-10-01: a mesh may go beyond 150 M cells when
+#: the RAM holds it). A size is refused only when the mesh it asks for needs
+#: more RAM than is free (``resource_budget.mesher_memory_refusal``). This
+#: only keeps a runaway estimate a finite integer.
+ESTIMATE_CEILING = 10 ** 15
 
 #: Plan 30 WP12. The Gmsh field each combiner choice becomes. The runner used
 #: to hard-code ``Min``, so a user asking a size field to *coarsen* a region
@@ -146,12 +149,15 @@ def derive_global_sizing(values: dict, bbox=None) -> GlobalSizing:
 
     if diagonal is not None:
         estimate = _element_estimate(diagonal, target * factor)
-        if estimate > MAXIMUM_ELEMENT_ESTIMATE:
+        from foammesh.support.resource_budget import mesher_memory_refusal
+
+        refusal = mesher_memory_refusal('gmsh', estimate)
+        if refusal is not None:
             raise SizingError(
                 f'a target size of {target * factor:.6g} m across a '
                 f'{diagonal:.6g} m domain asks for roughly {estimate:,} '
-                'elements; increase the target size or refine locally with a '
-                'size field')
+                f'elements: {refusal}; increase the target size or refine '
+                'locally with a size field')
 
     combiner = str(getattr(values.get('fieldCombiner', 'min'),
                            'value', values.get('fieldCombiner', 'min'))
@@ -215,6 +221,6 @@ def _element_estimate(diagonal: float, size: float) -> int:
     Only ever used to reject a runaway, so an order of magnitude is enough.
     """
     if size <= 0:
-        return MAXIMUM_ELEMENT_ESTIMATE + 1
+        return ESTIMATE_CEILING
     per_edge = diagonal / size
-    return int(min(per_edge ** 3 * 6, float(MAXIMUM_ELEMENT_ESTIMATE) * 10))
+    return int(min(per_edge ** 3 * 6, float(ESTIMATE_CEILING)))

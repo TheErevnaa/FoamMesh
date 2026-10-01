@@ -32,6 +32,28 @@ from .snappy_controls import (
 from .target import FoamTarget, DEFAULT_TARGET, mesh_quality_controls
 
 
+_DEFAULT_MESH_QUALITY: dict | None = None
+
+
+def _default_mesh_quality() -> dict:
+    """The ``meshQuality`` section of a new project, as the fingerprints read
+    it (Plan 37 UF15: the snap fingerprint carries the limits only when they
+    differ from these)."""
+    global _DEFAULT_MESH_QUALITY
+    if _DEFAULT_MESH_QUALITY is None:
+        import yaml
+        from foammesh.db.configurations import Configurations
+        from foammesh.db.configurations_schema import schema
+
+        fresh = Configurations(schema)
+        fresh.createData()
+        document = yaml.safe_load(fresh.toYaml())
+        _DEFAULT_MESH_QUALITY = (
+            dict(document.get('meshQuality', {}) or {})
+            if isinstance(document, dict) else {})
+    return _DEFAULT_MESH_QUALITY
+
+
 @dataclass(frozen=True)
 class DictionaryManifest:
     files: tuple[dict[str, object], ...]
@@ -88,6 +110,9 @@ class CaseBuilder:
         #: rather than guessed from the CPU ceiling, so the dictionary never
         #: claims a rank count no launcher agreed to.
         self.requested_ranks: int | None = None
+        #: Plan 37 UF19. The case the dictionaries are for, once a caller has
+        #: named one. A relative ``addFeaturesFile`` resolves against it.
+        self.case_dir: Path | None = None
 
     # -- generation warnings ------------------------------------------------
     def warn(self, code: str, message: str, *, field_id: str = '',
@@ -182,10 +207,18 @@ class CaseBuilder:
         except Exception:
             return {}
 
-    def stage_input_sha256(self, stage: str) -> str:
-        """Fingerprint only the fields capable of changing one stage."""
+    def stage_input_sha256(self, stage: str, *, narrow: bool = True) -> str:
+        """Fingerprint only the fields capable of changing one stage.
+
+        ``narrow=False`` is the surfaceFeatures fingerprint as it was recorded
+        before Plan 37 UF20 (every refinement-surface field), which
+        :meth:`_stage_is_current` still accepts so a run recorded then is not
+        made stale by the narrowing alone.
+        """
         document = self._configuration_document()
         geometry = document.get('geometry', {})
+        refinement_surfaces = (
+            document.get('castellation', {}).get('refinementSurfaces', {}))
 
         def geometry_fields(*extra: str) -> dict:
             names = (
@@ -214,24 +247,38 @@ class CaseBuilder:
         castellation_geometry = geometry_fields('castellationGroup')
         layer_geometry = geometry_fields(
             'castellationGroup', 'layerGroup', 'slaveLayerGroup')
+        # Plan 37 UF16. An exclude point changes which cells castellation
+        # keeps, so the list is in the castellation payloads -- and left out
+        # while empty, so a project without one keeps the fingerprint it
+        # already recorded.
+        castellation = dict(document.get('castellation', {}) or {})
+        if not castellation.get('excludePoints'):
+            castellation.pop('excludePoints', None)
         payloads = {
             'blockMesh': {
                 'baseGrid': document.get('baseGrid', {}),
             },
             'surfaceFeatures': {
+                # Plan 37 UF20. Only what surfaceFeaturesDict reads from a
+                # refinement row: its includedAngle. The whole row used to go
+                # in, so editing a refinement *level* on an unlocked
+                # Castellation made the extraction upstream of it stale, and
+                # Castellate & Proceed refused -- "upstream mesh stages are
+                # stale and must be rerun first: surfaceFeatures" -- while the
+                # outline showed Surface features passed and locked.
                 'refinementSurfaces': (
-                    document.get('castellation', {})
-                    .get('refinementSurfaces', {})),
+                    self._feature_angles(refinement_surfaces)
+                    if narrow else refinement_surfaces),
                 'surfaces': self.surfaces,
             },
             'castellation': {
-                'castellation': document.get('castellation', {}),
+                'castellation': castellation,
                 'geometry': castellation_geometry,
                 'region': document.get('region', {}),
                 'surfaces': self.surfaces,
             },
             'snappyHexMesh': {
-                'castellation': document.get('castellation', {}),
+                'castellation': castellation,
                 'snap': document.get('snap', {}),
                 'addLayers': document.get('addLayers', {}),
                 'meshQuality': document.get('meshQuality', {}),
@@ -255,10 +302,64 @@ class CaseBuilder:
         }
         if stage not in payloads:
             raise ValueError(f'unknown stage fingerprint: {stage}')
+        if stage == 'snap':
+            # Plan 37 UF15. The snap motion smoother reads
+            # meshQualityControls and reverts a displacement that breaches
+            # one, so the limits are a snap input as much as `snap` is: an
+            # edit has to make a recorded snap stale, or Proceed carried on
+            # from a snapped mesh made with the old limits. Only when they
+            # differ from the shipped ones, so a run recorded before this at
+            # the defaults keeps the fingerprint it recorded.
+            quality = document.get('meshQuality', {})
+            if quality != _default_mesh_quality():
+                payloads[stage]['meshQuality'] = quality
+        if stage == 'surfaceFeatures':
+            # DP-1056. The payload above predates every surfaceFeatures
+            # option, so changing a filter, a subset box or an added feature
+            # file left the extraction -- and every mesh snapped to its edges
+            # -- reading as current. The options go in as the dictionary
+            # renders them, and only when there are any, so a project that
+            # never touched them keeps the fingerprint it already recorded.
+            options = self._surface_feature_option_fingerprint()
+            if options:
+                payloads[stage]['options'] = options
+        if stage in ('blockMesh', 'castellation', 'snappyHexMesh'):
+            # Plan 37 UF14. The farfield's shape, dimensions, transform and
+            # role, and the geometry extent an auto centre follows -- the
+            # derived block grows with it, and castellation cuts along it.
+            # Only when there is one, so every other project keeps the
+            # fingerprint it already recorded.
+            from foammesh.core.mesh import snappy_farfield
+
+            spec = snappy_farfield.active(self.db)
+            if spec is not None:
+                payloads[stage]['farfield'] = spec.fingerprint(
+                    snappy_farfield.geometry_revision(self.bbox))
         encoded = json.dumps(
             payloads[stage], sort_keys=True, separators=(',', ':'),
             ensure_ascii=False, default=str).encode('utf-8')
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _feature_angles(refinement_surfaces) -> dict:
+        """``{row: includedAngle}`` -- the part of the refinement-surface rows
+        surfaceFeaturesDict reads (see :meth:`_surface_angle`)."""
+        if not isinstance(refinement_surfaces, dict):
+            return refinement_surfaces
+        return {
+            str(key): (row.get('includedAngle')
+                       if isinstance(row, dict) else row)
+            for key, row in refinement_surfaces.items()}
+
+    def _stage_is_current(self, stage: str, record: dict) -> bool:
+        """Whether the recorded run of ``stage`` still matches its inputs."""
+        recorded = record.get('input_sha256')
+        if recorded == self.stage_input_sha256(stage):
+            return True
+        # Plan 37 UF20. A run recorded before the surfaceFeatures fingerprint
+        # was narrowed carries the wide one; unchanged inputs still match it.
+        return (stage == 'surfaceFeatures' and
+                recorded == self.stage_input_sha256(stage, narrow=False))
 
     @staticmethod
     def _bbox_tuple(bbox) -> tuple[float, float, float, float, float, float]:
@@ -277,7 +378,14 @@ class CaseBuilder:
         """
         selected = self._bounding_hex6_key()
         if selected is None:
-            return self._stood_off_bbox()
+            stood_off = self._stood_off_bbox()
+            # Plan 37 UF14. A derived block grows to hold the farfield; with
+            # none this is the stood-off box, the same object as before.
+            enclosing = self.farfield_block(stood_off)
+            if enclosing is None:
+                return stood_off
+            from foammesh.core.geometry import BBox
+            return BBox(*enclosing)
         geometry = self._collection_item('geometry', selected)
         try:
             from foammesh.core.geometry import BBox
@@ -340,6 +448,150 @@ class CaseBuilder:
         from foammesh.core.geometry import BBox
         from foammesh.core.mesh.sizing import stand_off_bounds
         return BBox(*stand_off_bounds(self._bbox_tuple(self.bbox), standoff))
+
+    # -- Plan 37 UF14: the farfield as the outer boundary ---------------- #
+
+    def _farfield(self):
+        """The resolved farfield, or ``None`` when the project has none.
+
+        Plan 37 UF14. The one specification Gmsh also reads
+        (``core/mesh/farfield_spec``), resolved around the geometry extent
+        this builder was given. A spec that cannot be built, or a primitive
+        that does not hold every body with clearance, is refused with the
+        dimensions that would -- never clipped or ignored.
+        """
+        from foammesh.core.mesh import snappy_farfield
+
+        spec = snappy_farfield.active(self.db)
+        if spec is None:
+            return None
+        try:
+            return snappy_farfield.resolve(spec, self.bbox)
+        except ValueError as error:
+            raise ValueError(f'farfield: {error}') from None
+
+    def _farfield_boundaries(self) -> list[dict]:
+        """The farfield patch, declared the way the block's faces are.
+
+        Plan 37 UF14. It reproduces no imported surface, so without this the
+        patch identity join met ``far_field`` as a patch nothing declared and
+        called it fabricated. Empty with no farfield (or one that cannot be
+        built, which the dictionary writer refuses).
+        """
+        try:
+            farfield = self._farfield()
+        except ValueError:
+            return []
+        if farfield is None:
+            return []
+        from foammesh.core.mesh import snappy_farfield
+
+        return [{'name': snappy_farfield.PATCH, 'type': 'patch',
+                 'group': '', 'role': snappy_farfield.CATEGORY,
+                 'naming': 'generated', 'origin': 'farfield',
+                 'block_face': f'farfield {farfield.shape}'}]
+
+    def _farfield_cell(self, bounds) -> float | None:
+        """The background cell edge a block of *bounds* would get, quietly.
+
+        The same rule as `_background_cell_counts`, without its warnings,
+        because the block is sized from it while the block is being found.
+        """
+        mode = self._enum_value(self._v('baseGrid/sizingMode', 'counts'))
+        spans = [float(bounds[2 * axis + 1]) - float(bounds[2 * axis])
+                 for axis in range(3)]
+        try:
+            if mode == 'target_size':
+                stored = self._v('baseGrid/targetCellSize')
+                if stored is not None and str(stored).strip() != '':
+                    return float(stored)
+                from foammesh.core.mesh.sizing import auto_target_cell_size
+                return auto_target_cell_size(tuple(bounds))
+            counts = (self._int('baseGrid/numCellsX', 10),
+                      self._int('baseGrid/numCellsY', 10),
+                      self._int('baseGrid/numCellsZ', 10))
+            return max(span / max(1, int(count))
+                       for span, count in zip(spans, counts))
+        except (TypeError, ValueError):
+            return None
+
+    def farfield_block(self, base):
+        """*base* grown to hold the farfield, or ``None`` with no farfield.
+
+        Plan 37 UF14. Only a block derived from the geometry grows; the
+        clearance is a fraction of the farfield and at least one and a half
+        background cells, and the cell depends on the block, so the block is
+        found by a few fixed-point steps. Never raises: a farfield that cannot
+        be built leaves the block alone, and the dictionary writer says why.
+        """
+        if base is None:
+            return None
+        try:
+            farfield = self._farfield()
+        except ValueError:
+            return None
+        if farfield is None:
+            return None
+        from foammesh.core.mesh import snappy_farfield
+
+        base = tuple(float(value) for value in (
+            base.to_tuple() if hasattr(base, 'to_tuple') else base))
+        block = snappy_farfield.enclosing_bounds(base, farfield.primitive)
+        for _step in range(6):
+            grown = snappy_farfield.enclosing_bounds(
+                base, farfield.primitive, self._farfield_cell(block))
+            if all(abs(a - b) <= 1e-12 * max(1.0, abs(a))
+                   for a, b in zip(grown, block)):
+                break
+            block = grown
+        return tuple(float(f'{value:.12g}') for value in block)
+
+    def _farfield_checks(self, farfield, seeds, excludes) -> None:
+        """Refuse what the farfield makes certainly wrong; warn of the rest.
+
+        The exact checks only: a seed outside or on the farfield, an authored
+        block that does not hold it. A seed inside a body needs the surfaces
+        and is the launch preflight's (``snappy_farfield.preflight``).
+        """
+        from foammesh.core.mesh import snappy_farfield
+        from foammesh.core.mesh.domain_box import BLOCKS, HEX6, domain_box
+
+        errors = [finding.message for finding in snappy_farfield.exact_findings(
+            farfield, seeds=seeds, excludes=excludes)
+            if finding.severity == snappy_farfield.ERROR]
+        if errors:
+            raise ValueError('; '.join(errors))
+        for finding in snappy_farfield.exact_findings(
+                farfield, excludes=excludes):
+            self.warn(finding.code, finding.message,
+                      field_id='meshing.castellation.exclude_points')
+        try:
+            box = domain_box(self.db, geometry_bounds=(
+                None if self.bbox is None else self.bbox.to_tuple()))
+        except Exception:  # noqa: BLE001 - no box, no enclosure check
+            box = None
+        cell = None
+        if box is not None:
+            cell = self._farfield_cell(box.bounds)
+            if box.source in (BLOCKS, HEX6):
+                problem = snappy_farfield.enclosure_problem(
+                    farfield.primitive, box.bounds, cell)
+                if problem:
+                    raise ValueError(problem)
+        if snappy_farfield.cells_across(
+                farfield.primitive, cell) < snappy_farfield.FEW_CELLS_ACROSS:
+            self.warn(
+                snappy_farfield.COARSE,
+                f'only {snappy_farfield.cells_across(farfield.primitive, cell):.3g} '
+                f'background cells span the farfield {farfield.shape}; the '
+                'block grew to hold it, so each cell is larger. Raise the '
+                'cell counts or type a target cell size',
+                field_id='meshing.base_grid.target_cell_size',
+                requested=snappy_farfield.FEW_CELLS_ACROSS)
+        note = snappy_farfield.naming_note(farfield.shape)
+        if note:
+            self.warn('farfield.one_patch', note,
+                      field_id='gmsh.farfield.shape', severity='info')
 
     def _prepared_groups(self) -> tuple[dict, ...]:
         groups = []
@@ -689,8 +941,16 @@ class CaseBuilder:
             # patch. Each is now a control, and each still defaults to what
             # was hard-coded, so a project that never opens the page writes
             # the same file it wrote before.
+            # Plan 37 UF12: the ratio is the largest cell over the smallest
+            # and the side is chosen beside it. Start (and every ratio of
+            # one) writes the ratio exactly as typed, so the default is
+            # the byte it always was.
             grading = ' '.join(
-                self._number(f'baseGrid/grading/{axis}', 1) for axis in 'xyz')
+                background_mesh.preset_text(
+                    self._v(f'baseGrid/gradingFine/{axis}', None)
+                    or background_mesh.FINE_START,
+                    self._number(f'baseGrid/grading/{axis}', 1))
+                for axis in 'xyz')
             authored = background_mesh.single_block(
                 [[b.xmin, b.ymin, b.zmin], [b.xmax, b.ymin, b.zmin],
                  [b.xmax, b.ymax, b.zmin], [b.xmin, b.ymax, b.zmin],
@@ -826,11 +1086,20 @@ class CaseBuilder:
         if trim:
             shared['trimFeatures'] = trim
 
+        # Plan 37 UF19. v13 applies the box, then the edge switches, then
+        # the plane (surfaceFeatures.C:245-321); the entry lists them in that
+        # order so the dictionary reads the way the utility runs.
         subset = {}
+        box = self._surface_feature_subset_box()
+        if box is not None:
+            subset[box[0]] = box[1]
         if not flag('keepNonManifoldEdges', True):
             subset['nonManifoldEdges'] = False
         if not flag('keepOpenEdges', True):
             subset['openEdges'] = False
+        plane = self._surface_feature_subset_plane()
+        if plane is not None:
+            subset['plane'] = plane
         if subset:
             shared['subsetFeatures'] = subset
 
@@ -869,20 +1138,261 @@ class CaseBuilder:
         if flag('writeVtk', False):
             shared['writeVTK'] = True
 
-        if not shared and not closeness:
-            return
         for entry in d.values():
             entry.update(shared)
             if closeness:
                 entry.setdefault('closeness', {}).update(closeness)
 
+        added = self._added_features_name()
+        if added is not None:
+            first, entry = next(iter(d.items()))
+            # DP-1057: v13 loads constant/extendedFeatureEdgeMesh/<name>
+            # verbatim; it appends no extension, so the name is the file's.
+            entry['addFeatures'] = {
+                'name': f'{added}.extendedFeatureEdgeMesh'}
+            if len(d) > 1:
+                self.warn(
+                    'surfaceFeatures.addFeatures.first_surface',
+                    f'the added feature edges join the feature set of '
+                    f'{first} only: surfaceFeatures adds them per extraction '
+                    f'entry, and adding them to every surface would snap '
+                    f'each one to the same extra edges',
+                    field_id='surfaceFeatures/addFeaturesFile',
+                    requested=str(self._v('surfaceFeatures/addFeaturesFile',
+                                          '')),
+                    applied=first, severity='info')
+
+    # -- Plan 37 UF19: subsetFeatures box/plane and addFeatures ---------------
+
+    #: The prefix of an added feature file's copy in
+    #: ``constant/extendedFeatureEdgeMesh``. surfaceFeatures writes its own
+    #: output there as ``<surface>.extendedFeatureEdgeMesh``; a user file
+    #: under that name would be overwritten by the first run and then added
+    #: to itself by the second, doubling every edge.
+    ADDED_FEATURES_PREFIX = 'foammeshAdded_'
+
+    @staticmethod
+    def _foam_number(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else repr(value)
+
+    def _surface_feature_vector(self, key: str, default) -> tuple:
+        values = []
+        for axis, fallback in zip('xyz', default):
+            raw = self._v(f'surfaceFeatures/{key}/{axis}', fallback)
+            try:
+                number = float(str(raw).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f'surfaceFeatures {key} {axis} is {raw!r}, which is not '
+                    f'a number') from None
+            if not math.isfinite(number):
+                raise ValueError(
+                    f'surfaceFeatures {key} {axis} is {raw!r}, which is not '
+                    f'a finite number')
+            values.append(number)
+        return tuple(values)
+
+    def _vector_text(self, vector) -> str:
+        return '(' + ' '.join(self._foam_number(v) for v in vector) + ')'
+
+    def _warn_unscaled_frame(self, what: str) -> None:
+        """Say which frame the subset is in when the two frames differ."""
+        scale = self._v('snappyGeometry/scale', None)
+        try:
+            scaled = (scale is not None and str(scale).strip() != ''
+                      and abs(float(scale) - 1.0) > 1e-12)
+        except (TypeError, ValueError):
+            scaled = False
+        if not scaled or any(
+                w.get('code') == 'surfaceFeatures.subset.unscaled_frame'
+                for w in self.warnings):
+            return
+        self.warn(
+            'surfaceFeatures.subset.unscaled_frame',
+            f'the feature subset {what} is in the staged surface file\'s own '
+            f'coordinates: surfaceFeatures reads the file as it is, without '
+            f'the geometry scale {scale} snappyHexMesh applies',
+            field_id='surfaceFeatures/subsetBox',
+            requested=str(scale), applied='unscaled', severity='warning')
+
+    def _surface_feature_subset_box(self):
+        """``(key, '(min) (max)')`` for the chosen box, or ``None``.
+
+        MEASURED on v13 (unit cube, includedAngle 150): an inverted box exits
+        0 having kept zero of twelve edges. That is refused here. A flat box
+        is legal -- it keeps the edges whose midpoints lie on it -- and is
+        warned about, because it is far more often a typo than a choice.
+        """
+        kind = str(self._enum_value(
+            self._v('surfaceFeatures/subsetBox', 'none')) or 'none')
+        if kind not in ('insideBox', 'outsideBox'):
+            return None
+        low = self._surface_feature_vector('subsetBoxMin', (0, 0, 0))
+        high = self._surface_feature_vector('subsetBoxMax', (1, 1, 1))
+        inverted = [axis for axis, a, b in zip('xyz', low, high) if a > b]
+        if inverted:
+            raise ValueError(
+                f'the surfaceFeatures {kind} is inverted in '
+                f'{", ".join(inverted)}: its minimum is above its maximum, '
+                f'and OpenFOAM 13 would keep no feature edges at all without '
+                f'saying so')
+        text = f'{self._vector_text(low)} {self._vector_text(high)}'
+        flat = [axis for axis, a, b in zip('xyz', low, high) if a == b]
+        if flat:
+            self.warn(
+                'surfaceFeatures.subset.flat_box',
+                f'the surfaceFeatures {kind} has no thickness in '
+                f'{", ".join(flat)}, so it keeps only the edges whose '
+                f'midpoints lie exactly on it',
+                field_id='surfaceFeatures/subsetBoxMax',
+                requested=text, applied=text, severity='warning')
+        self._warn_unscaled_frame('box')
+        return kind, text
+
+    def _surface_feature_subset_plane(self):
+        """The ``plane`` sub-dictionary, or ``None`` when it is off.
+
+        MEASURED on v13: a zero normal is a FATAL IO ERROR "Plane normal has
+        zero length" -- refused here, before a run is started.
+        """
+        raw = self._v('surfaceFeatures/subsetPlane', False)
+        on = (raw.strip().lower() in ('true', '1', 'yes', 'on')
+              if isinstance(raw, str) else bool(raw))
+        if not on:
+            return None
+        point = self._surface_feature_vector('subsetPlanePoint', (0, 0, 0))
+        normal = self._surface_feature_vector('subsetPlaneNormal', (1, 0, 0))
+        if math.sqrt(sum(n * n for n in normal)) < 1e-300:
+            raise ValueError(
+                'the surfaceFeatures subset plane normal has zero length; '
+                'OpenFOAM 13 stops with a fatal error on it')
+        self._warn_unscaled_frame('plane')
+        return {'planeType': 'pointAndNormal',
+                'point': self._vector_text(point),
+                'normal': self._vector_text(normal)}
+
+    def _added_features_source(self):
+        """``(path, content)`` of the added feature file, or ``None``.
+
+        MEASURED on v13: addFeatures reads the object MUST_READ from
+        ``constant/extendedFeatureEdgeMesh`` -- a missing file is a fatal
+        "cannot find file" -- and only as an ``extendedFeatureEdgeMesh``; a
+        ``featureEdgeMesh`` (.eMesh) there fails with "Attempt to get back
+        from bad stream". Both are refused here with the file named.
+        """
+        text = str(self._v('surfaceFeatures/addFeaturesFile', '') or '').strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            if self.case_dir is None:
+                raise ValueError(
+                    f'the added feature file {text} is a relative path and '
+                    f'there is no case to resolve it against')
+            path = Path(self.case_dir) / path
+        if not path.is_file():
+            raise ValueError(
+                f'the added feature file {path} does not exist; feature '
+                f'extraction cannot run until it is restored or the setting '
+                f'is cleared')
+        content = path.read_bytes()
+        if path.suffix == '.gz':
+            import gzip
+            try:
+                content = gzip.decompress(content)
+            except OSError as error:
+                raise ValueError(
+                    f'the added feature file {path} is not a readable gzip '
+                    f'file: {error}') from None
+        header = content[:4096].decode('latin-1')
+        match = re.search(r'\bclass\s+(\w+)\s*;', header)
+        found = match.group(1) if match else None
+        if found != 'extendedFeatureEdgeMesh':
+            what = f'a {found}' if found else 'not an OpenFOAM object'
+            raise ValueError(
+                f'the added feature file {path} is {what}, not an '
+                f'extendedFeatureEdgeMesh; OpenFOAM 13 reads only that class '
+                f'(a .eMesh featureEdgeMesh fails with "Attempt to get back '
+                f'from bad stream")')
+        return path, content
+
+    def _added_features_name(self):
+        """The case copy's object name: prefix, file stem, content hash.
+
+        The hash is in the name so a changed file is a changed dictionary, and
+        the extraction fingerprint changes with the file's content.
+        """
+        source = self._added_features_source()
+        if source is None:
+            return None
+        path, content = source
+        stem = path.name
+        for suffix in ('.gz', '.extendedFeatureEdgeMesh'):
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+        stem = re.sub(r'[^A-Za-z0-9_]', '_', stem) or 'features'
+        digest = hashlib.sha256(content).hexdigest()[:12]
+        return f'{self.ADDED_FEATURES_PREFIX}{stem}_{digest}'
+
+    def stage_added_features(self, case_dir) -> Path | None:
+        """Copy the added feature file into the case that reads it.
+
+        The copy is the case-owned input: the run reads
+        ``constant/extendedFeatureEdgeMesh/<name>.extendedFeatureEdgeMesh``,
+        never the user's original. Copies of earlier contents are removed so
+        the directory holds exactly what the dictionary names.
+        """
+        case_dir = Path(case_dir)
+        self.case_dir = case_dir
+        directory = case_dir / 'constant' / 'extendedFeatureEdgeMesh'
+        name = self._added_features_name()
+        keep = f'{name}.extendedFeatureEdgeMesh' if name else None
+        if directory.is_dir():
+            for old in directory.glob(
+                    f'{self.ADDED_FEATURES_PREFIX}*.extendedFeatureEdgeMesh'):
+                if old.name != keep:
+                    old.unlink()
+        if name is None:
+            return None
+        _path, content = self._added_features_source()
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / keep
+        temporary = directory / f'{keep}.tmp'
+        temporary.write_bytes(content)
+        os.replace(temporary, destination)
+        return destination
+
+    def _surface_feature_option_fingerprint(self) -> dict:
+        """The options surfaceFeaturesDict carries, as the writer renders
+        them, for the extraction fingerprint (DP-1056).
+
+        Rendered against a stand-in entry, so it holds exactly what the writer
+        would emit. Warnings raised on the way are the writer's to report, not
+        the fingerprint's. An invalid setting fingerprints as its error, so it
+        reads stale instead of throwing on every page refresh.
+        """
+        warnings = list(self.warnings)
+        probe: dict = {'_': {}}
+        try:
+            self._apply_surface_feature_options(probe)
+            options = probe['_']
+        except (ValueError, OSError) as error:
+            options = {'invalid': str(error)}
+        finally:
+            self.warnings[:] = warnings
+        return options
+
     #: The quality thresholds both dictionaries carry, in the order
     #: OpenFOAM 13 lists them.
+    #:
+    #: Plan 37 UF15. ``minFaceFlatness`` is last and optional: it has no
+    #: shipped value, so ``mesh_quality_controls`` drops it while it is unset
+    #: and the block is the one every existing project already wrote.
     QUALITY_KEYS = (
         'maxNonOrtho', 'maxBoundarySkewness', 'maxInternalSkewness',
         'maxConcave', 'minVol', 'minTetQuality', 'minVolCollapseRatio',
         'minArea', 'minTwist', 'minDeterminant', 'minFaceWeight',
-        'minVolRatio', 'nSmoothScale', 'errorReduction',
+        'minVolRatio', 'nSmoothScale', 'errorReduction', 'minFaceFlatness',
     )
 
     def _quality_controls(self) -> dict:
@@ -1067,6 +1577,44 @@ class CaseBuilder:
                 'slave_scope_id': slave.strip(),
             })
         return pairs
+
+    def _exclude_points(self) -> tuple[tuple[str, tuple], ...]:
+        """Plan 37 UF16: ``(name, point)`` of every exclude point, in metres."""
+        rows = []
+        for key, item in sorted(
+                self._elements('castellation/excludePoints').items(),
+                key=lambda pair: int(pair[0]) if str(pair[0]).isdigit()
+                else pair[0]):
+            name = str(self._item_value(item, 'name', '') or '').strip()
+            try:
+                point = tuple(float(value) for value in item.vector('point'))
+            except Exception:  # noqa: BLE001 - a raw dict row
+                raw = self._item_value(item, 'point', {}) or {}
+                point = tuple(float(raw.get(axis, 0.0)) for axis in 'xyz')
+            rows.append((name or f'exclude {key}', point))
+        return tuple(rows)
+
+    def _refuse_void_exclusions(self, excludes, seeds) -> None:
+        """Plan 37 UF16: refuse an exclude point OpenFOAM 13 would ignore.
+
+        Measured live: a point off the background mesh, on its boundary or on
+        a region seed removes nothing, rc 0, and still switches the run to
+        keeping every other space. Only the exact checks are made here; the
+        voxel same-space check needs the labelled domain and is the
+        preflight's (``core/mesh/exclude_points.preflight``).
+        """
+        from foammesh.core.mesh.domain_box import domain_box
+        from foammesh.core.mesh.exclude_points import ERROR, exact_findings
+
+        try:
+            box = domain_box(self.db, geometry_bounds=(
+                None if self.bbox is None else self.bbox.to_tuple()))
+        except Exception:  # noqa: BLE001 - no box, no domain check
+            box = None
+        errors = [finding for finding in exact_findings(
+            excludes, seeds=seeds, domain=box) if finding.severity == ERROR]
+        if errors:
+            raise ValueError('; '.join(finding.message for finding in errors))
 
     def _fluid_seeds(self) -> tuple[tuple, ...]:
         """Every material point the project defines, in Region page order.
@@ -1378,6 +1926,13 @@ class CaseBuilder:
         result.update(self._open_primitive_refinement_surfaces())
         result.update(self._closed_primitive_refinement_surfaces())
         self._warn_primitive_surface_bindings()
+        # Plan 37 UF14. The farfield is a boundary -- ``patchInfo``, no
+        # ``faceZone`` -- so snappy keeps only the seeded side of it. Every
+        # other primitive keeps DP-668's internal faceZone.
+        if self._farfield() is not None:
+            from foammesh.core.mesh import snappy_farfield
+            result[snappy_farfield.GEOMETRY_KEY] = (
+                snappy_farfield.refinement_entry())
         return result
 
     #: DP-668. The modelled shapes whose ``<name>_surface`` row a surface
@@ -2194,6 +2749,18 @@ class CaseBuilder:
                 }
             elif shape in self._OPEN_PRIMITIVE_SHAPES and p1 is not None:
                 data[name] = self._open_primitive_entry(geometry, shape, p1, p2)
+        # Plan 37 UF14. The farfield is written last, under its own key, and
+        # only when there is one, so a project without it writes the bytes it
+        # always wrote.
+        farfield = self._farfield()
+        if farfield is not None:
+            from foammesh.core.mesh.snappy_farfield import GEOMETRY_KEY
+            if GEOMETRY_KEY in data:
+                raise ValueError(
+                    f'farfield: a surface or shape is already called '
+                    f'{GEOMETRY_KEY}, the name the farfield patch takes; '
+                    'rename it or turn the farfield off')
+            data[GEOMETRY_KEY] = farfield.geometry_entry()
         return data
 
     #: Plan 31. The three OpenFOAM 13 searchable surfaces that describe an
@@ -2727,6 +3294,19 @@ class CaseBuilder:
             castellated['insidePoints'] = [list(point) for point in seeds]
         elif seeds:
             castellated['insidePoint'] = list(seeds[0])
+        # Plan 37 UF16. Every space holding one is removed. Written only when
+        # there is one, so a project without them writes today's bytes.
+        excludes = self._exclude_points()
+        if excludes:
+            self._refuse_void_exclusions(excludes, seeds)
+            castellated['outsidePoints'] = [list(point) for _name, point
+                                            in excludes]
+        # Plan 37 UF14. A seed outside the farfield would keep the ring the
+        # block adds around it, and an authored block that does not hold the
+        # farfield cannot be cut by it: both are refused before writing.
+        farfield = self._farfield()
+        if farfield is not None:
+            self._farfield_checks(farfield, seeds, excludes)
         self._add_optional(castellated, 'castellation', (
             'gapLevelIncrement', 'planarAngle'))
         self._add_toggles(castellated, 'castellation', (
@@ -2843,10 +3423,12 @@ class CaseBuilder:
             'nRelaxedIter': self._v('addLayers/nRelaxedIter', '20'),
             'meshShrinker': self._v('addLayers/meshShrinker', 'displacementMedialAxis'),
         }
+        # Plan 37 UF15: concaveAngle and mergeFaces join the optional keys,
+        # so a case that never set them writes the block it always wrote.
         self._add_optional(add_layers, 'addLayers', (
-            'nMedialAxisIter', 'nSmoothDisplacement'))
+            'nMedialAxisIter', 'nSmoothDisplacement', 'concaveAngle'))
         self._add_toggles(add_layers, 'addLayers', (
-            'detectExtrusionIsland', 'additionalReporting'))
+            'detectExtrusionIsland', 'additionalReporting', 'mergeFaces'))
         quality = self._quality_controls()
         d = {
             'castellatedMesh': castellation,
@@ -3049,6 +3631,7 @@ class CaseBuilder:
         reached ``system`` with the recorded content digest.
         """
         case_dir = Path(case_dir)
+        self.case_dir = case_dir
         surface_entries = self.stage_tri_surfaces(case_dir, prepared_geometry)
         self.write_group_manifest(case_dir, prepared_geometry)
         system = case_dir / 'system'
@@ -3056,6 +3639,7 @@ class CaseBuilder:
         staging = case_dir / f'.foammesh-dictionaries-{uuid4().hex}'
         try:
             generated = self.write_case(staging)
+            self.stage_added_features(case_dir)
             staged_system = staging / 'system'
             entries = []
             for name in sorted(generated):
@@ -3073,7 +3657,11 @@ class CaseBuilder:
                 tuple(entries), f'{self.target.flavor.value}-{self.target.version}',
                 tuple(surface_entries),
                 tuple(self._fluid_seed()) if self._fluid_seed() is not None else None,
-                self._bbox_tuple(self._effective_bbox()),
+                # DP-1099. The geometry extent this builder was given, not the
+                # block: `load_case_context` restores it as that extent, and
+                # a regeneration applies the standoff to it -- recording the
+                # stood-off block made every refresh stand it off again.
+                self._bbox_tuple(self.bbox),
                 self._configuration_sha256(),
                 {
                     _dictionary_stage(entry['name']): str(entry['sha256'])
@@ -3119,7 +3707,8 @@ class CaseBuilder:
             # derived box from a name that was invented in place of a user's
             # inlet.
             'background_boundaries': [
-                dict(item) for item in self.background_boundaries()],
+                dict(item) for item in self.background_boundaries()]
+            + self._farfield_boundaries(),
         }
         path = group_manifest_path(case_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3220,6 +3809,7 @@ class CaseBuilder:
                 'regenerate dictionaries once')
         from foammesh.core.geometry import BBox
         self.bbox = BBox(*(float(value) for value in bbox))
+        self.case_dir = case_dir
         fluid_seed = document.get('fluid_seed')
         self._restored_fluid_seed = (
             tuple(float(value) for value in fluid_seed)
@@ -3278,29 +3868,50 @@ class CaseBuilder:
         previous = self.load_case_context(case_dir)
         self._require_current_staged_surfaces(case_dir)
         system = case_dir / 'system'
+        # Plan 37 UF19. A surfaceFeatures setting the writer refuses (an
+        # inverted subset box, a missing added feature file) must stop feature
+        # extraction, not the regeneration of every other stage. Every
+        # renderer still runs, as it always did, so the manifest carries the
+        # warnings of the whole setup; only that one refusal is tolerated
+        # outside its own stage (the stale-dependency check guards the rest).
         renderers = {
-            'blockMesh': {'blockMeshDict': self.block_mesh_dict()},
-            'surfaceFeatures': {
+            'blockMesh': lambda: {'blockMeshDict': self.block_mesh_dict()},
+            'surfaceFeatures': lambda: {
                 'surfaceFeaturesDict': self.surface_features_dict()},
-            'castellation': {'snappyHexMeshDict': self.snappy_hex_mesh_dict(
-                castellation=True, snap=False, layers=False)},
-            'snappyHexMesh': {'snappyHexMeshDict': self.snappy_hex_mesh_dict(
-                castellation=(
-                    True if castellation is None else castellation),
-                snap=True if snap is None else snap,
-                layers=False if layers is None else layers)},
-            'snap': {'snappyHexMeshDict': self.snappy_hex_mesh_dict(
+            'castellation': lambda: {
+                'snappyHexMeshDict': self.snappy_hex_mesh_dict(
+                    castellation=True, snap=False, layers=False)},
+            'snappyHexMesh': lambda: {
+                'snappyHexMeshDict': self.snappy_hex_mesh_dict(
+                    castellation=(
+                        True if castellation is None else castellation),
+                    snap=True if snap is None else snap,
+                    layers=False if layers is None else layers)},
+            'snap': lambda: {'snappyHexMeshDict': self.snappy_hex_mesh_dict(
                 castellation=False, snap=True, layers=False)},
-            'layers': {'snappyHexMeshDict': self.snappy_hex_mesh_dict(
-                castellation=False, snap=False, layers=True)},
-            'checkMesh': {},
+            'layers': lambda: {
+                'snappyHexMeshDict': self.snappy_hex_mesh_dict(
+                    castellation=False, snap=False, layers=True)},
+            'checkMesh': lambda: {},
         }
         if stage not in renderers:
             raise ValueError(f'unknown dictionary regeneration stage: {stage}')
+        rendered: dict = {}
+        for other, render in renderers.items():
+            if other == stage:
+                rendered = render()
+                continue
+            try:
+                render()
+            except ValueError:
+                if other != 'surfaceFeatures':
+                    raise
+        if stage == 'surfaceFeatures':
+            self.stage_added_features(case_dir)
         entries_by_name = {
             str(item['name']): dict(item)
             for item in previous.get('files', ())}
-        for name, text in renderers[stage].items():
+        for name, text in rendered.items():
             destination = system / name
             temporary = destination.with_suffix(destination.suffix + '.tmp')
             temporary.write_text(text, encoding='utf-8')
@@ -3319,7 +3930,8 @@ class CaseBuilder:
             f'{self.target.flavor.value}-{self.target.version}',
             tuple(previous.get('surfaces', ())),
             self._restored_fluid_seed,
-            self._bbox_tuple(self._effective_bbox()),
+            # DP-1099. The restored geometry extent, as generation recorded it.
+            self._bbox_tuple(self.bbox),
             self._configuration_sha256(),
             {
                 _dictionary_stage(item['name']): str(item['sha256'])
@@ -3370,6 +3982,7 @@ class CaseBuilder:
 
     def stage_staleness(self, case_dir) -> dict[str, bool]:
         case_dir = Path(case_dir)
+        self.case_dir = case_dir
         state_path = (
             case_dir / 'foammesh' / 'dictionaries' / 'stage-runs.json')
         state = {}
@@ -3379,8 +3992,7 @@ class CaseBuilder:
         return {
             stage: (
                 stage in state and
-                state[stage].get('input_sha256') !=
-                self.stage_input_sha256(stage))
+                not self._stage_is_current(stage, state[stage]))
             for stage in (
                 'blockMesh', 'surfaceFeatures', 'castellation',
                 'snap', 'layers', 'checkMesh')
@@ -3397,6 +4009,7 @@ class CaseBuilder:
             'checkMesh': (),
             'blockMesh': (),
         }
+        self.case_dir = Path(case_dir)
         state_path = (
             Path(case_dir) / 'foammesh' / 'dictionaries' /
             'stage-runs.json')
@@ -3407,8 +4020,7 @@ class CaseBuilder:
         stale = [
             dependency for dependency in dependencies.get(stage, ())
             if dependency in state and
-            state[dependency].get('input_sha256') !=
-            self.stage_input_sha256(dependency)]
+            not self._stage_is_current(dependency, state[dependency])]
         if stale:
             raise ValueError(
                 'upstream mesh stages are stale and must be rerun first: ' +
@@ -3416,6 +4028,7 @@ class CaseBuilder:
 
     def mark_stage_run(self, case_dir, stage: str) -> Path:
         case_dir = Path(case_dir)
+        self.case_dir = case_dir
         destination = (
             case_dir / 'foammesh' / 'dictionaries' / 'stage-runs.json')
         document = {'schema_version': 1, 'stages': {}}

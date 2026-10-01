@@ -148,6 +148,10 @@ SUPPLEMENTAL_TO_OPERATION: dict[str, str] = {
     # show files the diagnostics already wrote; neither touches the case.
     '_openLogsAction': CLIENT_SHELL,
     '_crashReportAction': CLIENT_SHELL,
+    # Plan 37: the Farfield row's menu. Edit opens the dialog, which saves
+    # through configuration.patch; Remove switches the one record off.
+    'farfieldEdit': CLIENT_SHELL,
+    'farfieldRemove': 'configuration.patch',
 }
 
 

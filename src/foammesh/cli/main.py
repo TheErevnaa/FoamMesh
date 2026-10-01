@@ -308,8 +308,40 @@ def _cmd_mesh_plan(args) -> int:
     }))
 
 
+#: Plan 37 UF5. The CLI's unlock and undo are the GUI's, operation for
+#: operation, so the lock has no back door.
+_UNLOCK_ACTIONS = {
+    'unlock-preview': 'mesh.workflow.unlock_preview',
+    'unlock': 'mesh.workflow.unlock',
+    'undo-unlock-preview': 'mesh.workflow.undo_unlock_preview',
+    'undo-unlock': 'mesh.workflow.undo_unlock',
+}
+
+
+
+def _cmd_redistribute(args) -> int:
+    """Plan 37 UF17. Change the core count of a decomposed mesh.
+
+    ``preview`` says what would happen, or why it cannot; ``run`` is the
+    GUI's own staged transaction, so a refused or failed change leaves the
+    processor cases as they were.
+    """
+    parameters = {'ranks': args.ranks}
+    if getattr(args, 'expected_revision', None):
+        parameters['expected_revision'] = args.expected_revision
+    operation = ('mesh.redistribute.preview' if args.redistribute_action == 'preview'
+                 else 'mesh.redistribute')
+    return _emit_operation(_execute(args.case, operation, parameters))
+
 def _cmd_workflow_task(args) -> int:
     parameters = {'engine_id': args.engine}
+    if args.task_action in _UNLOCK_ACTIONS:
+        if getattr(args, 'task_id', None):
+            parameters['task_id'] = args.task_id
+        if getattr(args, 'expected_revision', None) is not None:
+            parameters['expected_revision'] = args.expected_revision
+        return _emit_operation(_execute(
+            args.case, _UNLOCK_ACTIONS[args.task_action], parameters))
     if args.task_action == 'transition':
         parameters.update({
             'task_id': args.task_id,
@@ -321,6 +353,31 @@ def _cmd_workflow_task(args) -> int:
         if args.task_action == 'state'
         else 'mesh.workflow.task_transition',
         parameters))
+
+
+def _cmd_stages(args) -> int:
+    """Plan 37 UF5. The kept stage snapshots, and the disk policy they obey."""
+    from foammesh.core.jobs import stage_snapshots
+
+    if args.stages_action == 'policy':
+        policy = stage_snapshots.load_policy()
+        if args.quota_gb is not None or args.reserve_gb is not None:
+            gib = stage_snapshots.GIB
+            policy = stage_snapshots.save_policy(stage_snapshots.AdmissionPolicy(
+                quota_bytes=int(args.quota_gb * gib) if args.quota_gb is not None
+                else policy.quota_bytes,
+                reserve_bytes=int(args.reserve_gb * gib)
+                if args.reserve_gb is not None else policy.reserve_bytes))
+        document = policy.to_dict()
+    elif args.stages_action == 'verify':
+        document = stage_snapshots.verify(args.case, args.stage, args.revision)
+    else:
+        document = {'revisions': stage_snapshots.list_revisions(args.case),
+                    'stages': stage_snapshots.list_stages(args.case, args.revision),
+                    'skipped': stage_snapshots.skipped(args.case),
+                    'usage': stage_snapshots.case_usage(args.case)}
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return 0 if document.get('ok', True) else 1
 
 
 def _cmd_canonical(args) -> int:
@@ -517,6 +574,50 @@ def build_parser() -> argparse.ArgumentParser:
                 'transition',
                 choices=('configure', 'accept', 'skip', 'revert', 'fail'))
         item.set_defaults(func=_cmd_workflow_task)
+    for action in _UNLOCK_ACTIONS:
+        item = task_sub.add_parser(action)
+        item.add_argument('case')
+        item.add_argument(
+            '--engine', choices=engine_ids, default=engine_ids[0])
+        if action in ('unlock-preview', 'unlock'):
+            item.add_argument('task_id')
+        if action == 'unlock':
+            item.add_argument(
+                '--expected-revision', type=int, default=None,
+                help='refuse if the published results moved since the preview')
+        item.set_defaults(func=_cmd_workflow_task)
+
+    p_redistribute = sub.add_parser(
+        'redistribute', help='change the core count of a decomposed mesh')
+    redistribute_sub = p_redistribute.add_subparsers(
+        dest='redistribute_action', required=True)
+    for action in ('preview', 'run'):
+        item = redistribute_sub.add_parser(action)
+        item.add_argument('case')
+        item.add_argument('--ranks', type=int, required=True,
+                          help='the number of processor cases wanted')
+        if action == 'run':
+            item.add_argument(
+                '--expected-revision', default=None,
+                help='refuse if the processor cases changed since the preview')
+        item.set_defaults(func=_cmd_redistribute)
+
+    p_stages = sub.add_parser(
+        'stages', help='kept snappy stage snapshots and their disk policy')
+    stages_sub = p_stages.add_subparsers(dest='stages_action', required=True)
+    item = stages_sub.add_parser('list')
+    item.add_argument('case')
+    item.add_argument('--revision', default=None)
+    item.set_defaults(func=_cmd_stages)
+    item = stages_sub.add_parser('verify')
+    item.add_argument('case')
+    item.add_argument('stage')
+    item.add_argument('--revision', default=None)
+    item.set_defaults(func=_cmd_stages)
+    item = stages_sub.add_parser('policy')
+    item.add_argument('--quota-gb', type=float, default=None)
+    item.add_argument('--reserve-gb', type=float, default=None)
+    item.set_defaults(func=_cmd_stages)
 
     p_canonical = sub.add_parser('canonical', help='inspect and export a canonical mixed mesh')
     canonical_sub = p_canonical.add_subparsers(dest='canonical_action', required=True)

@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton)
 
 from foammesh.support.simple_db.simple_schema import ValidationError
-from foammesh.view.facade_client import submit
+from foammesh.view.facade_client import FailedResult, submit
 from foammesh.view.widgets.commit_guard import CONFLICT_ERRORS, conflict_message
 
 from widgets.async_message_box import AsyncMessageBox
@@ -16,11 +16,12 @@ from widgets.list_table import ListItemWithButtons
 from foammesh.app import app
 from foammesh.db.configurations import defaultsDB
 from foammesh.db.configurations_schema import (
-    LayerPolicy, MeshShrinker, OptionalToggle)
+    LayerPatchSelector, LayerPolicy, MeshShrinker, OptionalToggle)
 from foammesh.view.step_page import StepPage
 from foammesh.view.main_window.inpage_editor import open_in_page
 from foammesh.core.mesh.sizing import first_layer_height
 from .boundary_setting_dialog import BoundarySettingDialog
+from foammesh.view.snappy_workflow.layer_membership import binding_pending
 
 
 def layerCountLabel(policy, count) -> str:
@@ -47,6 +48,16 @@ STAGED_MESH_ADVISORY = (
     'settings. For the mesh you hand to a solver, finish with the full '
     'pipeline on the Base grid step so every phase runs in one qualified '
     'snappyHexMesh pass.')
+
+
+def _selects_by_pattern(element) -> bool:
+    """Whether a stored layer group names its patches by a pattern."""
+    try:
+        selector = element.value('patchSelector')
+    except (KeyError, AttributeError):
+        return False
+    selector = getattr(selector, 'value', selector)
+    return str(selector) == LayerPatchSelector.PATTERN.value
 
 
 class BoundaryLayerPage(StepPage):
@@ -266,14 +277,36 @@ class BoundaryLayerPage(StepPage):
         if None in groups:
             groups.remove(None)
 
+        orphans = []
         for groupId, element in self._db.getElements('addLayers/layers').items():
             if groupId in groups:
                 self._addConfigurationItem(
                     groupId, element.value('groupName'),
                     layerCountLabel(element.value('layerPolicy'),
                                     element.value('nSurfaceLayers')))
-            else:
-                self._db.removeElement('addLayers/layers', groupId)
+            elif not _selects_by_pattern(element) and not binding_pending(groupId):
+                # Plan 37 UF20: nor a group the Boundary layers page wrote a
+                # moment ago and is still binding -- see ``binding_pending``.
+                # Plan 37 UF20. A group on the pattern selector reaches its
+                # patches through its own regular expression; no geometry row
+                # ever names it, so "no geometry uses it" is how every such
+                # group looks. Pruned here, each one the Boundary layers page
+                # created was deleted a second after it was added.
+                orphans.append(groupId)
+        for groupId in orphans:
+            self._db.removeElement('addLayers/layers', groupId)
+        if orphans:
+            # DP-1030. The pruning above went into a working copy nothing
+            # committed, so the groups no geometry uses were back in the case
+            # on every load. Committed from a fresh copy, the way a removal
+            # from the list is.
+            pruned = app.facadeClient.checkout()
+            for groupId in orphans:
+                pruned.removeElement('addLayers/layers', groupId)
+            submit(app.facadeClient, 'configuration.commit_working_copy',
+                   {'working_copy': pruned,
+                    'action': 'remove unused layer groups',
+                    'reason': None, 'target': None})
 
         self._setConfigurastions(self._db.getElement('addLayers'))
 
@@ -365,7 +398,11 @@ class BoundaryLayerPage(StepPage):
                 self._widget, self.tr('Complete'),
                 message + '\n\n' + self.tr(STAGED_MESH_ADVISORY))
 
-        self._enableEdit()
+        # Plan 37 UF5 DP-1084. A run that published this stage locks the
+        # page while it runs (the step manager re-reads the lock when the
+        # stage completes); the editors stay shut under that lock.
+        if not self._locked:
+            self._enableEdit()
         self._ui.boundaryLayerCancel.hide()
 
         self.updateWorkingStatus()
@@ -404,7 +441,22 @@ class BoundaryLayerPage(StepPage):
         # DP-119. Same defect as the edit dialog had: these three writes went
         # into a working copy nothing ever committed, so a group removed here
         # came back the next time the page loaded, still owning its patches.
-        def dropRow(_result=None):
+        def dropRow(result=None):
+            # DP-1030. The row used to go whatever the case said: a refused
+            # removal took it off the screen while the group stayed in the
+            # case, and it came back on the next load unexplained.
+            if result is not None and (
+                    isinstance(result, FailedResult)
+                    or getattr(result, 'status', 'accepted') != 'accepted'):
+                error = getattr(result, 'error', None)
+                why = (conflict_message(error)
+                       if isinstance(error, CONFLICT_ERRORS)
+                       else getattr(result, 'message', '') or '')
+                QMessageBox.warning(
+                    self._widget, self.tr('Layer group not removed'),
+                    self.tr('The case did not remove this layer group, so it '
+                            'stays in the list.') + (f'\n\n{why}' if why else ''))
+                return
             self._db = app.facadeClient.checkout()
             self._ui.boundaryLayerConfigurations.removeItem(groupId)
 

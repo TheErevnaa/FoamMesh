@@ -214,6 +214,9 @@ class CutMode(Enum):
     """
     SMOOTH  = auto()  # noqa: E221
     CRINKLE = auto()
+    #: Plan 37 UF7. The whole cells the first plane meets, on both sides,
+    #: masked by the other planes (`foammesh.rendering.cut_cells`).
+    CUT_CELLS = auto()
 
 
 class MeshQualityIndex(Enum):
@@ -790,8 +793,12 @@ class ActorInfo(QObject):
 
         inputFilter = self._cutFilters[0]
         if planes and self._properties.cutEnabled:
-            for c in planes:
-                f = self._clipFilter(c)
+            # Plan 37 UF7. Cut cells is one stage over all the planes (the
+            # first is the one cutting, the rest mask), not a chain of clips.
+            cells = (self._cutCellsFilter(planes)
+                     if self._cutMode is CutMode.CUT_CELLS else None)
+            for f in ([cells] if cells is not None
+                      else [self._clipFilter(c) for c in planes]):
                 f.SetInputConnection(inputFilter.GetOutputPort())
                 self._cutFilters.append(f)
                 inputFilter = f
@@ -1009,6 +1016,10 @@ class ActorInfo(QObject):
     def _clipFilter(self, cutter: vtkPlane):
         raise NotImplementedError
 
+    def _cutCellsFilter(self, planes):
+        """Plan 37 UF7. The Cut cells stage, or None to clip as before."""
+        return None
+
 
 class MeshActor(ActorInfo):
     def __init__(self, dataSet, id_, name):
@@ -1108,6 +1119,10 @@ class MeshActor(ActorInfo):
         f.SetClipFunction(cutter)
         f.InsideOutOff()
         return f
+
+    def _cutCellsFilter(self, planes):
+        from foammesh.rendering.cut_cells import CutCellsFilter
+        return CutCellsFilter(planes)
 
     def getNumberOfDisplayedCells(self) -> int:
         # R140. A VTK filter is lazy: until something pulls on it, its output
@@ -1260,6 +1275,10 @@ class BoundaryActor(ActorInfo):
         f.InsideOutOff()
         return f
 
+    def _cutCellsFilter(self, planes):
+        from foammesh.rendering.cut_cells import CutCellsFilter
+        return CutCellsFilter(planes, polyData=True)
+
 
 class RegionMarkerActor(ActorInfo):
     """Where a region seed sits, drawn as a glyph rather than a form field.
@@ -1325,6 +1344,37 @@ class RegionMarkerActor(ActorInfo):
         return f
 
 
+class ExcludeMarkerActor(RegionMarkerActor):
+    """Plan 37 UF16. Where an exclude point sits: a cube, not a seed's ball.
+
+    A `RegionMarkerActor` in every other way -- sized from the model, shown
+    with the seeds on Domain & Regions, kept out of the base-grid box and out
+    of a section's cut -- so the one difference on screen is the shape (and
+    the warning colour the manager gives it).
+    """
+
+    @classmethod
+    def build(cls, point_id, name, point, bounds):
+        from vtkmodules.vtkFiltersSources import vtkCubeSource
+
+        if point is None:
+            return None
+        try:
+            centre = tuple(float(value) for value in point)
+        except (TypeError, ValueError):
+            return None
+        if len(centre) != 3:
+            return None
+        side = 2.0 * cls.radiusFor(bounds)
+        source = vtkCubeSource()
+        source.SetCenter(*centre)
+        source.SetXLength(side)
+        source.SetYLength(side)
+        source.SetZLength(side)
+        source.Update()
+        return cls(source.GetOutput(), f'exclude:{point_id}', str(name))
+
+
 class GeometryActor(ActorInfo):
     def __init__(self, dataSet, id_, name):
         super().__init__(dataSet, id_, name, ActorType.GEOMETRY)
@@ -1385,3 +1435,7 @@ class GeometryActor(ActorInfo):
         f.SetClipFunction(cutter)
         f.InsideOutOff()
         return f
+
+    def _cutCellsFilter(self, planes):
+        from foammesh.rendering.cut_cells import CutCellsFilter
+        return CutCellsFilter(planes, polyData=True)

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from widgets.fit_to_text import FlowLayout, fit_to_text
 
 from foammesh.app import app
+from foammesh.view.outside_task import modal
 from foammesh.core.facade.errors import FacadeError
 from foammesh.view.facade_client import FailedResult, query, submit
 from foammesh.view.step_page import StepPage
@@ -1697,7 +1698,8 @@ class GeometryRepairPage(StepPage):
             preview = (await self._runPreparation(
                 'geometry.repair.preview', {'plan': plan})).payload
         except (TypeError, ValueError) as error:
-            QMessageBox.warning(self._widget, self.tr('Repair plan'), str(error))
+            await modal(QMessageBox.warning,
+                        self._widget, self.tr('Repair plan'), str(error))
             return None
         self._repairPlan = plan
         self._repairPlan['expected_preview_digest'] = preview.get('preview_digest')
@@ -1741,7 +1743,8 @@ class GeometryRepairPage(StepPage):
         if not writes:
             self.showProceedRefusal(effect)
             return
-        answer = QMessageBox.question(
+        answer = await modal(
+            QMessageBox.question,
             self._widget, self.tr('Apply repair preview'),
             ' '.join(filter(None, (
                 self.tr('{0} previewed.').format(
@@ -1796,7 +1799,8 @@ class GeometryRepairPage(StepPage):
         try:
             parameters = self._wrapParameters()
         except ValueError as error:
-            QMessageBox.warning(self._widget, self.tr('Wrap controls'), str(error))
+            await modal(QMessageBox.warning,
+                        self._widget, self.tr('Wrap controls'), str(error))
             return None
         preview = (await self._runPreparation(
             'geometry.wrap.preview', {'geometry_id': geometry_id, **parameters})).payload
@@ -1826,7 +1830,8 @@ class GeometryRepairPage(StepPage):
         preview = await self._estimateWrapCore()
         if not geometry_id or preview is None:
             return
-        answer = QMessageBox.warning(
+        answer = await modal(
+            QMessageBox.warning,
             self._widget, self.tr('Apply wrap'),
             self._wrapAcceptanceSummary(preview),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,

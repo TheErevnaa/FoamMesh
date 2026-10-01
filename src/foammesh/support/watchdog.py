@@ -105,7 +105,9 @@ def format_stacks(seconds: float, gui_ident: int | None,
             label = ' (GUI thread)'
         else:
             label = f' ({names[ident]})' if names.get(ident) else ''
-        lines.append(f'Thread 0x{ident:016x}{label} (most recent call first):')
+        # faulthandler's own header; '0x' is a hex prefix, not a times sign.
+        lines.append('Thread 0x' + format(ident, '016x')
+                     + f'{label} (most recent call first):')
         stack = []
         frame = frames[ident]
         while frame is not None:

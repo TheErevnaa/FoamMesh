@@ -12,9 +12,11 @@ governing control -- ``includedAngle`` -- had no visible effect at all.
 """
 from __future__ import annotations
 
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFormLayout, QGroupBox, QHeaderView,
-    QLabel, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QFileDialog, QFormLayout, QGroupBox, QHeaderView,
+    QLabel, QLineEdit, QStyle, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout,
 )
 
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
@@ -36,6 +38,15 @@ REFINEMENT_COLLECTION = 'meshing.castellation.surface_refinements'
 #: is about. It used to be the third sentence of a standing paragraph in the
 #: result box and the whole of a second label under the spin box, so a reader
 #: met it twice before meeting anything they could set.
+#: Plan 37 UF19. The subset coordinates, shown only while their switch is on.
+SUBSET_BOX_FIELDS = tuple(
+    f'meshing.surface_features.subset_box_{end}.{axis}'
+    for end in ('min', 'max') for axis in 'xyz')
+SUBSET_PLANE_FIELDS = tuple(
+    f'meshing.surface_features.subset_plane_{part}.{axis}'
+    for part in ('point', 'normal') for axis in 'xyz')
+ADD_FEATURES_FIELD = 'meshing.surface_features.add_features_file'
+
 INCLUDED_ANGLE_HELP = (
     'surfaceFeatures keeps an edge whose two faces meet at less than this '
     'angle, so a low angle keeps almost every edge and a high one keeps only '
@@ -82,6 +93,14 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         self._note.setVisible(False)
         self._featureBox = box
         inner.addWidget(self._note)
+        # Plan 37 UF19. OpenFOAM 13 extracts nothing from a box or plane that
+        # misses the surface and exits 0 -- the one outcome a table of zeroes
+        # does not explain. Shown only then.
+        self._subsetNote = QLabel('', box)
+        self._subsetNote.setObjectName('featureSubsetEmpty')
+        self._subsetNote.setWordWrap(True)
+        self._subsetNote.setVisible(False)
+        inner.addWidget(self._subsetNote)
 
         # DP-512. The File column held `surface_<uuid>.eMesh`, a name the
         # user never chose and cannot act on; the user struck it out. The
@@ -334,10 +353,39 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         said = (self.tr('The last extraction kept these edges.') if rows
                 else self.tr('No feature edges have been extracted yet.'))
         self._note.setText(said)
+        self._populate_subset_note(rows)
         box = getattr(self, '_featureBox', None)
         if box is not None:
             box.setToolTip(said)
             box.setAccessibleDescription(said)
+
+
+    def active_subset(self) -> str:
+        """'box', 'plane', 'box and plane', or '' when nothing is subset."""
+        ids = ('meshing.surface_features.subset_box',
+               'meshing.surface_features.subset_plane')
+        try:
+            values = self._client.field_values(ids) or {}
+        except Exception:                                    # noqa: BLE001
+            return ''
+        box = str(values.get(ids[0]) or 'none') != 'none'
+        plane = str(values.get(ids[1])).strip().lower() in ('true', '1')
+        return ' and '.join(name for name, on in
+                            (('box', box), ('plane', plane)) if on)
+
+    def _populate_subset_note(self, rows) -> None:
+        empty = [str(entry.get('display_name') or entry.get('name') or '')
+                 for entry in rows if not int(entry.get('edges') or 0)]
+        subset = self.active_subset() if empty else ''
+        if subset:
+            self._subsetNote.setText(self.tr(
+                'The feature subset %s kept no edges on %s. OpenFOAM does not '
+                'report this; check that the coordinates are in the surface '
+                'file\'s frame and actually meet the surface.')
+                % (subset, ', '.join(empty)))
+        else:
+            self._subsetNote.setText('')
+        self._subsetNote.setVisible(bool(subset))
 
 
 class _FeatureFilterGroup(FieldGroupPage):
@@ -362,17 +410,59 @@ class _FeatureFilterGroup(FieldGroupPage):
         'meshing.surface_features.keep_open_edges',
         'meshing.surface_features.trim_min_length',
         'meshing.surface_features.trim_min_elements',
+        # Plan 37 UF19. subsetFeatures box and plane, then addFeatures, in
+        # the order OpenFOAM 13 applies them. The coordinates are rows only
+        # while their switch is on, so the panel grows by three rows.
+        'meshing.surface_features.subset_box',
+        *SUBSET_BOX_FIELDS,
+        'meshing.surface_features.subset_plane',
+        *SUBSET_PLANE_FIELDS,
+        ADD_FEATURES_FIELD,
     )
     heading = 'Which edges survive'
     purpose = (
         'The included angle above decides which edges are candidates; these '
-        'decide which candidates are kept. They change the .eMesh, so the '
-        'stage has to run again for them to take effect.')
+        'decide which candidates are kept, and which are added from a file. '
+        'They change the .eMesh, so the stage has to run again for them to '
+        'take effect.')
     caveat = (
         'Keeping non-manifold and open edges is OpenFOAM\'s default and is '
         'right for a clean closed surface. Turn them off when the geometry '
         'is a tessellation with holes or T-junctions, where those edges are '
         'defects rather than features.')
+
+    def build(self) -> None:
+        super().build()
+        editor = self._editors.get(ADD_FEATURES_FIELD)
+        if editor is None:
+            return
+        # Plan 37 UF19. A path typed by hand is the usual way to name the
+        # wrong file; the button fills the same field, and the field is still
+        # what is saved. It sits inside the box as a trailing icon: a button
+        # beside it took 75 px out of the box, which then ended short of
+        # every other field in the column (DP-156).
+        line = editor.editor
+        action = QAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon),
+            self.tr('Choose the added feature file…'), line)
+        action.triggered.connect(lambda: self._browse_added_features(editor))
+        line.addAction(action, QLineEdit.ActionPosition.TrailingPosition)
+        button = next(child for child in line.findChildren(QToolButton)
+                      if child.defaultAction() is action)
+        button.setObjectName('addFeaturesBrowse')
+        button.setAccessibleName(self.tr('Choose the added feature file'))
+        button.setToolTip(action.text())
+        self._browse = button
+
+    def _browse_added_features(self, editor) -> None:
+        path, _selected = QFileDialog.getOpenFileName(
+            self, self.tr('Added feature edges'), str(editor.value() or ''),
+            self.tr('Extended feature edge mesh '
+                    '(*.extendedFeatureEdgeMesh *.extendedFeatureEdgeMesh.gz)'
+                    ';;All files (*)'))
+        if path:
+            editor.set_value(path)
+            editor.valueChanged.emit(editor.field_id, editor.value())
 
 
 class _FeatureDiagnosticsGroup(FieldGroupPage):

@@ -22,14 +22,21 @@ writer and nowhere on screen:
   are empty on every existing project, ``background_mesh.from_records``
   returns ``None`` when no block is authored, and the derived single box is
   written byte for byte as before.
+
+Plan 37 UF12 gives every graded direction a side as well as a ratio: the
+ratio is the largest cell over the smallest and "Fine cells at" says where the
+small ones go, so nobody types a reciprocal -- the arithmetic that put the
+old "toward start" switch's cells at the wrong end (DP-1033).
 """
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QFormLayout, QGroupBox, QRadioButton, QVBoxLayout,
+    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QRadioButton, QVBoxLayout,
 )
 
 from foammesh.core.facade import applicability
+from foammesh.core.mesh import grading as background_mesh
 from foammesh.view.theming.metrics import ReflowGrid, apply_form_metrics
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
 from foammesh.view.workflow_controls.conditional_fields import (
@@ -51,6 +58,56 @@ FACES = (
     ('z_max', 'zMax', 'High Z'),
 )
 
+#: Plan 37 UF12. Each axis of the one derived block: its ratio, then the side
+#: its small cells go on, in the order the Grading group draws them.
+GRADING_FIELDS = tuple(
+    field_id for axis in 'xyz' for field_id in (
+        f'meshing.base_grid.grading.{axis}',
+        f'meshing.base_grid.grading_fine.{axis}'))
+
+#: The words the derived block's side is offered under. The block is axis
+#: aligned, so its start is the minus side of the world axis and the plan
+#: names both, rather than the stored word alone.
+FINE_LABELS = {
+    'start': '− side (start)',
+    'end': '+ side (end)',
+    'centre': 'Centre',
+    'both_edges': 'Both edges',
+}
+
+#: The note the grading migration leaves, said once until dismissed.
+GRADING_NOTICE = 'meshing.base_grid.grading_notice'
+
+
+class DismissedNotes:
+    """Which grading notes this user has dismissed, kept on this machine.
+
+    The note is read-only in the project -- it records what the migration
+    did, and a field whose change stales nothing is not a field AF2 lets a
+    page write -- so dismissing it is the viewer's, not the case's.
+    """
+
+    KEY = 'plan37/dismissedGradingNotes'
+
+    def _settings(self):
+        from PySide6.QtCore import QSettings
+        return QSettings('FoamMesh', 'FoamMesh')
+
+    def __contains__(self, token: str) -> bool:
+        try:
+            return token in (self._settings().value(self.KEY) or [])
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    def add(self, token: str) -> None:
+        try:
+            settings = self._settings()
+            seen = list(settings.value(self.KEY) or [])
+            if token not in seen:
+                settings.setValue(self.KEY, (seen + [token])[-200:])
+        except Exception:                                    # noqa: BLE001
+            pass
+
 #: Field id prefixes claimed by the per-face groups.
 _FACE_PREFIXES = (
     'meshing.base_grid.boundary_types.',
@@ -67,8 +124,13 @@ class SnappyBaseGridPage(SnappyTaskPage):
     #: "Run to end"; §7.1 allows this page exactly one Run.
     run_stage = 'blockMesh'
     #: Written by this task, absent from its descriptor. Without it the port
-    #: would silently drop a field the legacy page could set.
-    extra_field_ids = ('meshing.base_grid.standoff',)
+    #: would silently drop a field the legacy page could set. Plan 37 UF12:
+    #: the three sides ride here too -- declaring them on the task would
+    #: change the workflow digest and discard every saved case's progress.
+    extra_field_ids = ('meshing.base_grid.standoff',
+                       'meshing.base_grid.grading_fine.x',
+                       'meshing.base_grid.grading_fine.y',
+                       'meshing.base_grid.grading_fine.z')
 
     VERTEX_COLUMNS = ('x', 'y', 'z')
     #: Plan 33 OF-03. MEASURED at a 560 px settings column: nine columns
@@ -94,6 +156,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
         # now, where it is read by someone who wants it and skipped by
         # someone who does not.
         layout.insertWidget(0, self._build_mode_choice())
+        self._grading_box = self._build_grading()
+        layout.addWidget(self._grading_box)
         self._faces_box = self._build_faces()
         layout.addWidget(self._faces_box)
         self._build_authoring(layout)
@@ -156,9 +220,10 @@ class SnappyBaseGridPage(SnappyTaskPage):
         grading, and only Scale is read in both modes (``background_topology``).
         """
         custom = self.authoring_is_chosen()
-        box = getattr(self, '_faces_box', None)
-        if box is not None:
-            box.setVisible(not custom)
+        for name in ('_faces_box', '_grading_box'):
+            box = getattr(self, name, None)
+            if box is not None:
+                box.setVisible(not custom)
         for panel in self.authoring_panels():
             panel.setVisible(custom)
         self._refresh_sizing_rows()
@@ -218,7 +283,157 @@ class SnappyBaseGridPage(SnappyTaskPage):
             self._face_grid.addCell(group)
         return box
 
+    # -- grading of the derived block (Plan 37 UF12) ------------------------ #
+
+    def _build_grading(self) -> QGroupBox:
+        """Each axis as a ratio and a side, with what they will write.
+
+        Holds the migration's one-time note too: a project that stored a
+        ratio below one opens showing its reciprocal with the side at End,
+        and a changed number with no word about it reads as a lost setting.
+        """
+        box = QGroupBox(self.tr('Grading'), self)
+        box.setObjectName('baseGridGradingBox')
+        box.setToolTip(self.tr(
+            'The ratio is the largest cell divided by the smallest, never '
+            'below 1; 1 is uniform. Fine cells at says which side the small '
+            'cells go on.'))
+        outer = QVBoxLayout(box)
+        # DP-1047. Left to the layout default the grading form's labels
+        # started 9 px right of the page's one label column. The box keeps
+        # its frame inset -- its form sits straight inside it, where the
+        # faces above sit inside frames of their own -- and loses the
+        # layout's margin.
+        outer.setContentsMargins(0, outer.contentsMargins().top(),
+                                 0, outer.contentsMargins().bottom())
+        self._grading_notice = QFrame(box)
+        self._grading_notice.setObjectName('baseGridGradingNotice')
+        notice = QHBoxLayout(self._grading_notice)
+        notice.setContentsMargins(0, 0, 0, 0)
+        self._grading_notice_text = QLabel(self._grading_notice)
+        self._grading_notice_text.setWordWrap(True)
+        self._grading_notice_text.setObjectName('baseGridGradingNoticeText')
+        notice.addWidget(self._grading_notice_text, 1)
+        self._grading_dismiss = QPushButton(self._grading_notice)
+        self._grading_dismiss.setText(self.tr('Dismiss'))
+        self._grading_dismiss.setObjectName('baseGridGradingDismiss')
+        self._grading_dismiss.setAccessibleName(self.tr(
+            'Dismiss the grading note'))
+        self._grading_dismiss.clicked.connect(self.dismiss_grading_notice)
+        notice.addWidget(self._grading_dismiss)
+        self._grading_notice.setVisible(False)
+        outer.addWidget(self._grading_notice)
+        container = QFrame(box)
+        self._grading_form = QFormLayout(container)
+        apply_form_metrics(self._grading_form)
+        outer.addWidget(container)
+        self._grading_report = QLabel(box)
+        self._grading_report.setObjectName('baseGridGradingReport')
+        self._grading_report.setWordWrap(True)
+        outer.addWidget(self._grading_report)
+        return box
+
+    def _populate_fields(self, fields) -> None:
+        """Put each side straight after its ratio, then name the sides.
+
+        The sides arrive last, as extra fields; a Grading group reading
+        ratio X, ratio Y, ratio Z and only then the three sides makes the
+        reader pair them up by hand.
+        """
+        fields = list(fields)
+        ordered = [field for field in fields
+                   if field.get('field_id') not in GRADING_FIELDS]
+        by_id = {field.get('field_id'): field for field in fields}
+        ordered += [by_id[field_id] for field_id in GRADING_FIELDS
+                    if field_id in by_id]
+        super()._populate_fields(ordered)
+        for axis in 'xyz':
+            editor = self._editors.get(f'meshing.base_grid.grading_fine.{axis}')
+            combo = getattr(editor, 'editor', None)
+            if combo is None or not hasattr(combo, 'itemData'):
+                continue
+            for index in range(combo.count()):
+                value = str(combo.itemData(index))
+                if value in FINE_LABELS:
+                    combo.setItemText(index, self.tr(FINE_LABELS[value]))
+        self._refresh_grading_report()
+
+    def _grading_value(self, field_id, default=None):
+        if field_id in self._pending:
+            return self._pending[field_id]
+        editor = self._editors.get(field_id)
+        if editor is not None:
+            return editor.value()
+        return default
+
+    def grading_report(self) -> str:
+        """What the three axes will write, one sentence per graded axis."""
+        mode = self._grading_value(self.SIZING_MODE, 'counts')
+        counted = str(getattr(mode, 'value', mode) or 'counts') == 'counts'
+        lines = []
+        for axis in 'xyz':
+            ratio = self._grading_value(f'meshing.base_grid.grading.{axis}', 1)
+            fine = self._grading_value(
+                f'meshing.base_grid.grading_fine.{axis}', 'start')
+            count = self._grading_value(f'meshing.base_grid.cells.{axis}')
+            if not counted:
+                # The count follows from the target size at write time, so
+                # only the side is known here; the writer refuses a split
+                # that cannot grade.
+                count = None
+            sentence = background_mesh.grading_summary(
+                count, fine, ratio if ratio not in (None, '') else 1,
+                axis.upper())
+            if sentence:
+                lines.append(sentence)
+        return '\n'.join(lines)
+
+    def _refresh_grading_report(self) -> None:
+        label = getattr(self, '_grading_report', None)
+        if label is None:
+            return
+        text = self.grading_report()
+        label.setText(text)
+        label.setVisible(bool(text))
+        self._refresh_grading_notice()
+
+    #: Where dismissals are kept; a test swaps in a plain set.
+    dismissed_notes = DismissedNotes()
+
+    def _notice_token(self, text: str) -> str:
+        import hashlib
+        case = str(getattr(self._client, 'case_root', '') or '')
+        return hashlib.sha1(f'{case}|{text}'.encode()).hexdigest()
+
+    def grading_notice(self) -> str:
+        """The migration's note, unless this user has dismissed it here."""
+        try:
+            value = self._client.field_values((GRADING_NOTICE,))[GRADING_NOTICE]
+        except Exception:                                    # noqa: BLE001
+            return ''
+        text = str(value or '').strip()
+        if text and self._notice_token(text) in self.dismissed_notes:
+            return ''
+        return text
+
+    def _refresh_grading_notice(self) -> None:
+        frame = getattr(self, '_grading_notice', None)
+        if frame is None:
+            return
+        text = self.grading_notice()
+        self._grading_notice_text.setText(text)
+        frame.setVisible(bool(text))
+
+    def dismiss_grading_notice(self) -> None:
+        """Put the note away: it is said once, and this is the once."""
+        text = self._grading_notice_text.text().strip()
+        if text:
+            self.dismissed_notes.add(self._notice_token(text))
+        self._grading_notice.setVisible(False)
+
     def field_form(self, field_id: str, classification):
+        if field_id in GRADING_FIELDS:
+            return getattr(self, '_grading_form', None)
         forms = getattr(self, '_face_forms', {})
         for prefix in _FACE_PREFIXES:
             if field_id.startswith(prefix):
@@ -226,7 +441,9 @@ class SnappyBaseGridPage(SnappyTaskPage):
         return None
 
     def field_forms(self):
-        return tuple(getattr(self, '_face_forms', {}).values())
+        forms = tuple(getattr(self, '_face_forms', {}).values())
+        grading = getattr(self, '_grading_form', None)
+        return forms + ((grading,) if grading is not None else ())
 
     # -- which sizing the run reads ------------------------------------------ #
 
@@ -241,6 +458,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
         'meshing.base_grid.cells.x', 'meshing.base_grid.cells.y',
         'meshing.base_grid.cells.z', 'meshing.base_grid.grading.x',
         'meshing.base_grid.grading.y', 'meshing.base_grid.grading.z',
+        'meshing.base_grid.grading_fine.x', 'meshing.base_grid.grading_fine.y',
+        'meshing.base_grid.grading_fine.z',
         'meshing.base_grid.standoff')
 
     def reload_values(self) -> None:
@@ -254,6 +473,9 @@ class SnappyBaseGridPage(SnappyTaskPage):
         super()._on_field_changed(field_id, value)
         if field_id == self.SIZING_MODE:
             self._refresh_sizing_rows()
+        if field_id in GRADING_FIELDS or field_id == self.SIZING_MODE \
+                or field_id.startswith('meshing.base_grid.cells.'):
+            self._refresh_grading_report()
 
     def _refresh_sizing_rows(self) -> None:
         """Judge the page's clauses against the mode as it is being edited.
@@ -304,7 +526,7 @@ class SnappyBaseGridPage(SnappyTaskPage):
             columns=self.VERTEX_COLUMNS, parent=self)
         layout.addWidget(self.vertex_panel)
 
-        self.block_panel = ChildControlPanel(
+        self.block_panel = BlockPanel(
             self._client, 'base_grid.blocks', self.tr('Blocks'),
             columns=self.BLOCK_COLUMNS, parent=self)
         layout.addWidget(self.block_panel)
@@ -335,7 +557,7 @@ class SnappyBaseGridPage(SnappyTaskPage):
         layout.addWidget(self.merge_panel)
 
         for panel in self.authoring_panels():
-            panel.childrenChanged.connect(self.refresh)
+            panel.childrenChanged.connect(self.refresh_keeping_edits)
         self.patch_panel.childrenChanged.connect(self.sync_merge_patches)
 
     def authoring_panels(self) -> tuple:
@@ -389,3 +611,119 @@ class SnappyBaseGridPage(SnappyTaskPage):
     def refresh(self) -> None:
         super().refresh()
         self.sync_authoring()
+
+
+class BlockPanel(ChildControlPanel):
+    """The block table, whose editor keeps each direction's two authorities apart.
+
+    Plan 37 UF12. A direction is either a side and a ratio -- and then the
+    text beside them is what they write, regenerated as they change -- or a
+    Custom profile, and then the text is the grading, written as typed.
+    Typing in the text while a side is chosen is a request for the text, so
+    the side falls back to Custom profile rather than the text being thrown
+    away on the next change of ratio.
+
+    Start and End follow the block's own vertex order, which is not the
+    world's: each side says which vertex the direction starts from and which
+    it runs toward, read off the vertices typed above it.
+    """
+
+    #: blockMesh hex order: local X runs 0 -> 1, Y 0 -> 3, Z 0 -> 4.
+    AXIS_ENDS = {'X': (0, 1), 'Y': (0, 3), 'Z': (0, 4)}
+
+    def __init__(self, facade_client, collection_id: str, title: str,
+                 *args, **kwargs):
+        self._directions = {axis: QLabel() for axis in 'XYZ'}
+        for axis, label in self._directions.items():
+            label.setWordWrap(True)
+            label.setObjectName(f'blockGradingDirection{axis}')
+        annotations = dict(kwargs.pop('annotations', None) or {})
+        annotations.update({f'grading_{axis.lower()}_fine': label
+                            for axis, label in self._directions.items()})
+        super().__init__(facade_client, collection_id, title, *args,
+                         annotations=annotations, **kwargs)
+        self._syncing = False
+        for axis in 'xyz':
+            for key in (f'grading_{axis}_fine', f'grading_{axis}_ratio'):
+                editor = self.editor(key)
+                if editor is not None:
+                    editor.valueChanged.connect(
+                        lambda *_a, a=axis: self.regenerate(a))
+            text = self.editor(f'grading_{axis}')
+            if text is not None:
+                text.valueChanged.connect(
+                    lambda *_a, a=axis: self._text_typed(a))
+        vertices = self.editor('vertices')
+        if vertices is not None:
+            vertices.valueChanged.connect(lambda *_a: self.describe_directions())
+        self.describe_directions()
+
+    @staticmethod
+    def _plain(value):
+        return str(getattr(value, 'value', value) or '')
+
+    def regenerate(self, axis: str) -> None:
+        """Write the side and ratio of one direction into its text."""
+        fine = self._plain(self.editor(f'grading_{axis}_fine').value())
+        ratio_editor = self.editor(f'grading_{axis}_ratio')
+        custom = fine not in background_mesh.FINE_PRESETS
+        ratio_editor.editor.setEnabled(not custom)
+        if custom:
+            return
+        try:
+            # Shown the way a profile is typed, without the outer brackets
+            # the dictionary puts round one direction's segments.
+            text = background_mesh.preset_text(fine, ratio_editor.value())
+        except (background_mesh.BackgroundMeshError, TypeError, ValueError):
+            return
+        self._syncing = True
+        try:
+            self.editor(f'grading_{axis}').set_value(text)
+        finally:
+            self._syncing = False
+
+    def _text_typed(self, axis: str) -> None:
+        if self._syncing:
+            return
+        fine = self.editor(f'grading_{axis}_fine')
+        if self._plain(fine.value()) in background_mesh.FINE_PRESETS:
+            fine.set_value(background_mesh.FINE_CUSTOM_PROFILE)
+            self.editor(f'grading_{axis}_ratio').editor.setEnabled(False)
+
+    def describe_directions(self) -> None:
+        """Say where Start is for this block, from the vertices typed."""
+        editor = self.editor('vertices')
+        numbers = str(editor.value() if editor is not None else '').split()
+        for axis, (first, last) in self.AXIS_ENDS.items():
+            if len(numbers) == 8:
+                text = self.tr(
+                    'Local {0} runs from vertex {1} (Start) toward vertex {2} '
+                    '(End), in this block\'s own vertex order.').format(
+                        axis, numbers[first], numbers[last])
+            else:
+                text = self.tr(
+                    'Local {0} runs from the first vertex listed (Start) '
+                    'toward the {1} (End).').format(
+                        axis, {'X': 'second', 'Y': 'fourth',
+                               'Z': 'fifth'}[axis])
+            self._directions[axis].setText(text)
+
+    def _load_selected(self) -> None:
+        super()._load_selected()
+        self._after_load()
+
+    def editor_dialog(self):
+        # Reached by Add and by Edit after the values are set, both of which
+        # set them with signals blocked.
+        self._after_load()
+        return super().editor_dialog()
+
+    def _after_load(self) -> None:
+        """Values are loaded with signals blocked; bring the extras along."""
+        self.describe_directions()
+        for axis in 'xyz':
+            fine = self.editor(f'grading_{axis}_fine')
+            ratio = self.editor(f'grading_{axis}_ratio')
+            if fine is not None and ratio is not None:
+                ratio.editor.setEnabled(
+                    self._plain(fine.value()) in background_mesh.FINE_PRESETS)

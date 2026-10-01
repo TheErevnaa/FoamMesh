@@ -55,8 +55,12 @@ _ALLOWED_CHARACTERS = re.compile(r'^[A-Za-z_0-9 .,+\-*/^()%<>=!&|?:]*$')
 #: keystroke.
 SAMPLES = 9
 
-#: Refuse a mesh larger than this. Matches the global sizing guard.
-MAXIMUM_ELEMENT_ESTIMATE = 50_000_000
+#: No fixed element cap (2026-10-01: a mesh may go beyond 150 M cells when
+#: the RAM holds it): an expression is refused only when the mesh it asks
+#: for needs more RAM than is free (``resource_budget.mesher_memory_refusal``,
+#: the same rule as the global sizing). This only keeps a runaway estimate a
+#: finite integer.
+ESTIMATE_CEILING = 10 ** 15
 
 
 class ExpressionError(ValueError):
@@ -209,13 +213,16 @@ def cost(expression: str, bbox) -> ExpressionCost:
     # Roughly six tetrahedra fill a cube of edge h, so each sample contributes
     # its share of the box divided by h cubed.
     estimate = int(min(6.0 * box_volume * density_sum / max(evaluated, 1),
-                       float(MAXIMUM_ELEMENT_ESTIMATE) * 10))
-    if estimate > MAXIMUM_ELEMENT_ESTIMATE:
+                       float(ESTIMATE_CEILING)))
+    from foammesh.support.resource_budget import mesher_memory_refusal
+
+    refusal = mesher_memory_refusal('gmsh', estimate)
+    if refusal is not None:
         raise ExpressionError(
             f'the expression asks for roughly {estimate:,} elements '
             f'(sizes from {smallest:.6g} to {largest:.6g} m across a '
-            f'{box_volume:.6g} m3 domain). Raise the smallest size it '
-            'produces, or restrict it to a smaller region.')
+            f'{box_volume:.6g} m3 domain): {refusal}. Raise the smallest '
+            'size it produces, or restrict it to a smaller region.')
     return ExpressionCost(
         minimum_size=smallest, maximum_size=largest,
         estimated_elements=estimate, sampled=total, non_positive=non_positive)

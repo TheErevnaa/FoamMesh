@@ -247,6 +247,18 @@ def mesh_quality_block(check_mesh: Mapping | None,
     detail = {'check_mesh': authoritative,
               'canonical_quality': other or 'not evaluated'}
     fingerprint = str((check_mesh or {}).get('report_fingerprint') or '')
+    # Plan 37 F-2. A snappy mesh in more pieces than its seeds ask for is
+    # said in the summary in the same sentence the QA page shows: how many
+    # regions, the probable cause and what to do.
+    retained = (check_mesh or {}).get('retainedRegions')
+    if isinstance(retained, Mapping) and retained.get('split'):
+        detail['retained_regions'] = {
+            'regions': retained.get('regions'),
+            'expected': retained.get('expected'),
+            'retained_cells': retained.get('retained_cells'),
+            'cells': retained.get('cells'),
+            'cause': retained.get('cause'),
+            'message': str(retained.get('message') or '')}
 
     if other and other != authoritative:
         # Reported, never resolved. A checkMesh-valid mesh that canonical

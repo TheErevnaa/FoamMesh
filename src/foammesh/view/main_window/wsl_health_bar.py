@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QPlainTextEdit
                                QPushButton, QVBoxLayout)
 
 from foammesh.core.jobs.wsl_health import UNREACHABLE
+from foammesh.core.quantities import count_text
 from foammesh.core.project.events import Event
 from foammesh.view.main_window.recovery_offer import _Bar
 
@@ -126,7 +127,7 @@ class RuntimeDiagnosticsDialog(QDialog):
         self.setModal(False)
         self._health = health
         self._tasks = _Tasks()
-        self._profile = [self.tr('Asking the runtime...')]
+        self._profile = [self.tr('Asking the runtime…')]
         layout = QVBoxLayout(self)
         self.text = QPlainTextEdit(self)
         self.text.setObjectName('runtimeDiagnosticsText')
@@ -286,7 +287,8 @@ class WslHealthBar(_Bar):
         if monitor is None:
             return None
         running = monitor.jobs_running
-        jobs = (self.tr(' {0} job(s) are running there now and will stop.').format(running)
+        jobs = (self.tr(' {0} running there now and will stop.').format(
+                    count_text(running, 'job is', 'jobs are'))
                 if running else '')
         if not await confirm(self, self.tr('Restart WSL runtime'), self.tr(
                 'This runs "wsl --terminate {0}". Every program in that '

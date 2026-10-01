@@ -33,6 +33,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from foammesh.core.mesh import mesh_preview
+from foammesh.rendering import gpu_profile
 from foammesh.support import disposal
 from foammesh.support import resource_budget as budget
 from foammesh.support.vtk_threads import vtk_run_in_thread
@@ -130,6 +131,11 @@ class MeshPreviewLoader(QObject):
         volume = mode == VOLUME
         operation = (mesh_preview.VOLUME_OPERATION if volume
                      else mesh_preview.OPERATION)
+        if counts is None:
+            # A binary or otherwise unmeasured case: size the estimate from
+            # the list headers, not the fixed cost alone (a ~480 MB cap).
+            counts = await asyncio.to_thread(
+                mesh_preview.size_counts, self._caseDir)
         estimate = budget.estimate_peak_bytes(operation, counts)
         override = None
         if self._buildAnyway:
@@ -152,14 +158,20 @@ class MeshPreviewLoader(QObject):
                 refusal=True)
         from foammesh.core.jobs import local_worker
 
-        max_bytes = (budget.FULL_VOLUME_MAX_BYTES if volume
-                     else budget.PREVIEW_MAX_BYTES)
+        # The volume has no fixed cell or byte cap: its memory was admitted
+        # above, and its files are checked against the free RAM before they
+        # are opened (`_refuseFiles`).
+        # The surface keeps as many triangles as the GPU that draws it can
+        # hold, its bytes held to a share of the free RAM (gpu_profile).
+        max_triangles, preview_bytes = await asyncio.to_thread(
+            gpu_profile.preview_budget)
+        max_bytes = None if volume else preview_bytes
         args = {'case': str(self._caseDir), 'time': time,
                 'region_seeds': self._regionSeeds,
                 'out_dir': str(mesh_preview.cache_dir(self._caseDir)),
-                'max_triangles': budget.PREVIEW_MAX_TRIANGLES,
-                'max_bytes': max_bytes,
-                'max_cells': budget.FULL_VOLUME_MAX_CELLS}
+                'max_triangles': max_triangles}
+        if max_bytes is not None:
+            args['max_bytes'] = max_bytes
         self.progress.emit(self.tr('Building the mesh preview…'))
         async with grant:
             outcome = await local_worker.run_worker(
@@ -225,10 +237,18 @@ class MeshPreviewLoader(QObject):
                 return self.tr('Preview not built: {0} changed after the '
                                'worker wrote it.').format(path.name)
             total += size
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             return self.tr('Preview not built: its files take {0}, over the '
                            '{1} limit.').format(budget.format_bytes(total),
                                                 budget.format_bytes(max_bytes))
+        if max_bytes is None and not self._buildAnyway:
+            needed = mesh_preview.VOLUME_LOAD_FACTOR * total
+            measured = budget.quick_snapshot()
+            if needed > measured.budget:
+                return self.tr('Preview not built: opening the volume needs '
+                               'about {0} of RAM and {1} is free.').format(
+                    budget.format_bytes(needed),
+                    budget.format_bytes(measured.budget))
         return ''
 
     @staticmethod

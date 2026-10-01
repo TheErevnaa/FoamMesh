@@ -17,7 +17,7 @@ the boundaries it chose.
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel, QMessageBox
+from PySide6.QtWidgets import QLabel
 
 from foammesh.core.geometry.boundary_roles import (
     boundaries_from_manifest, default_layer_pattern, default_layer_targets,
@@ -27,11 +27,41 @@ from foammesh.view.workflow_controls.child_controls import ChildControlPanel
 
 from .base import SnappyTaskPage
 from .layer_membership import (
-    BY_PATTERN, LayerMembership, bound_layer_groups, unbind_layer_group,
+    BY_PATTERN, LayerMembership, begin_group_write, bound_layer_groups,
+    end_group_write, hold_binding, release_binding, unbind_layer_group,
 )
 from .layer_pattern_preview import (
     LayerPatternPreview, candidate_patch_names,
 )
+
+
+#: Plan 37 UF2 (DP-1028). Whether this case has had its default group.
+DEFAULTED_FIELD = 'meshing.layers.defaulted'
+
+
+def case_was_defaulted(client) -> bool:
+    """Whether the case records that it already had its default group."""
+    try:
+        configuration = client.configuration() or {}
+    except Exception:                            # noqa: BLE001 - advisory only
+        return False
+    layers = configuration.get('addLayers')
+    return bool(isinstance(layers, dict) and layers.get('defaulted'))
+
+
+def remember_defaulted(client, then=None) -> None:
+    """Record, once, that the case has had its say about layer groups.
+
+    DP-1028. Written when the page makes the default group and when a user
+    removes a group, so an empty list afterwards is the user's answer rather
+    than an invitation to make "Walls" again.
+    """
+    if case_was_defaulted(client):
+        if then is not None:
+            then()
+        return
+    submit(client, 'configuration.patch', {'patch': {DEFAULTED_FIELD: True}},
+           then=lambda _result: then() if then is not None else None)
 
 
 class LayerGroupPanel(ChildControlPanel):
@@ -90,29 +120,48 @@ class LayerGroupPanel(ChildControlPanel):
     def _run(self, operation: str, parameters: dict) -> None:
         """The inherited write, followed by the binding it implies."""
         kind = operation.rsplit('.', 1)[-1]
+        # Plan 37 UF3 DP-1035. Tracked from the press to the binding that
+        # follows it, so Proceed waits for both and the task hears of them.
+        write = self._open_write()
+
+        # Plan 37 UF20. From the send, not the answer: the legacy page prunes
+        # on the case's announcement of the create, which comes first.
+        guarded = kind != 'remove'
+        if guarded:
+            begin_group_write()
 
         def ran(result) -> None:
             if getattr(result, 'status', 'accepted') != 'accepted':
-                QMessageBox.warning(
-                    self, self.tr('Operation failed'),
-                    str(getattr(result, 'message', '')
-                        or self.tr('The facade rejected the change.')))
+                if guarded:
+                    end_group_write()
+                self._close_write(write, False, result)
                 return
             payload = getattr(result, 'payload', None) or {}
             group = (payload.get('entity_id') if kind == 'create'
                      else parameters.get('entity_id'))
 
             def finished() -> None:
+                release_binding(group)
                 self.refresh()
                 self.childrenChanged.emit()
+                self._close_write(write, True)
 
             if kind == 'remove':
-                unbind_layer_group(self._client, parameters.get('entity_id'),
-                                   then=finished)
+                # DP-1028. A removal is the user saying what the list holds,
+                # so the case stops being one that is owed a default.
+                unbind_layer_group(
+                    self._client, parameters.get('entity_id'),
+                    then=lambda: remember_defaulted(self._client,
+                                                    then=finished))
             else:
+                # Plan 37 UF20. Until the binding lands no geometry row names
+                # the group, and the legacy page's prune would delete it.
+                hold_binding(group)
+                end_group_write()
                 self.membership.commit(group, then=finished)
 
-        submit(self._client, operation, parameters, then=ran)
+        self._track_write(write, submit(self._client, operation, parameters,
+                                        then=ran))
 
 
 class SnappyLayersPage(SnappyTaskPage):
@@ -153,7 +202,10 @@ class SnappyLayersPage(SnappyTaskPage):
 
     #: What the defaulted group is called on screen. It is an ordinary group:
     #: a user can rename it, re-point it or delete it, and nothing here puts
-    #: it back once the case holds a group of its own.
+    #: it back once the case holds a group of its own. DP-1028: that promise
+    #: is kept by ``addLayers/defaulted``, which the case stores the first
+    #: time it is given the group (or a user removes one), so the default is
+    #: made once per case and never again from an empty list.
     DEFAULT_GROUP_NAME = 'Walls'
 
     #: How many layers the defaulted group asks for. The schema default for
@@ -186,7 +238,7 @@ class SnappyLayersPage(SnappyTaskPage):
         self.panel.set_choices('layer_policy', [
             (self.tr(label), value, self.tr(explained), True)
             for label, value, explained in self.POLICY_CHOICES])
-        self.panel.childrenChanged.connect(self.refresh)
+        self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         # Plan 33 OF-07. First in the column: the surfaces are what this step
         # is about, and the eighteen shrinking and smoothing controls the task
         # declares are the settings behind them.
@@ -328,34 +380,58 @@ class SnappyLayersPage(SnappyTaskPage):
         adds nothing. DP-228: the run must consume what the page shows, so
         the group is written through the facade at the moment it is chosen
         rather than left as an unsaved proposal.
+
+        DP-1028. Once per case: a case that has had its default, or whose
+        user has removed a group, holds ``addLayers/defaulted`` and is never
+        given another, so deleting the last group leaves the list empty. The
+        guard stays up until the create has landed -- dropped as soon as the
+        write was merely scheduled, every refresh before it landed sent
+        another "Walls".
         """
         if getattr(self, '_defaultingTargets', False):
             return
         if self.panel.rows() or not self.layersEnabled():
             return
+        if case_was_defaulted(self._client):
+            return
         targets = self.defaultTargets()
         if not targets:
             return
         self._defaultingTargets = True
-        try:
-            submit(self._client, 'meshing.layers.groups.create', {'fields': {
-                'group_name': self.DEFAULT_GROUP_NAME,
-                'layer_policy': 'grow',
-                'surface_layers': self.DEFAULT_SURFACE_LAYERS,
-                'patch_selector': 'pattern',
-                # One key selecting exactly these names. `layerParameters.C`
-                # reads a quoted key as a `wordRe`, and the writer quotes it.
-                'patch_pattern': default_layer_pattern(targets),
-            }}, then=lambda _result: self.panel.refresh())
-        finally:
+
+        def finished() -> None:
             self._defaultingTargets = False
-        self._defaultedTargets = tuple(targets)
+            self.panel.refresh()
+            self.updateDefaultNote()
+            self.sync_unbound_groups()
+
+        def landed(result) -> None:
+            if getattr(result, 'status', 'accepted') != 'accepted':
+                finished()
+                return
+            self._defaultedTargets = tuple(targets)
+            remember_defaulted(self._client, then=finished)
+
+        submit(self._client, 'meshing.layers.groups.create', {'fields': {
+            'group_name': self.DEFAULT_GROUP_NAME,
+            'layer_policy': 'grow',
+            'surface_layers': self.DEFAULT_SURFACE_LAYERS,
+            'patch_selector': 'pattern',
+            # One key selecting exactly these names. `layerParameters.C`
+            # reads a quoted key as a `wordRe`, and the writer quotes it.
+            'patch_pattern': default_layer_pattern(targets),
+        }}, then=landed)
 
     def updateDefaultNote(self) -> None:
         """Name the boundaries the role rule chose, and the ones it left."""
         if not hasattr(self, '_defaultNote'):
             return
         targets = tuple(getattr(self, '_defaultedTargets', ()) or ())
+        # DP-1028. The sentence is about a group on screen; once the user has
+        # deleted every group it describes nothing.
+        panel = getattr(self, 'panel', None)
+        if panel is not None and not panel.rows():
+            targets = ()
         if not targets:
             self._defaultNote.clear()
             self._defaultNote.setVisible(False)

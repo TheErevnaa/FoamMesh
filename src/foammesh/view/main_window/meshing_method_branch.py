@@ -11,7 +11,8 @@ construction, and no case exists when ``MainWindow`` is first assembled.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtWidgets import QMenu
 
 from foammesh.core.engine.contracts import TaskState
 from foammesh.db.configurations_schema import Step
@@ -273,6 +274,9 @@ class MeshingMethodBranch(QObject):
     """Owns the Meshing Method node, its engine pages, and their routing."""
 
     pageRequested = Signal(object)
+    #: Plan 37 UF5 DP-1084. The engine branch's set of result-locked tasks
+    #: changed (an unlock, an undo, or a run that published a stage).
+    resultLocksChanged = Signal()
 
     #: Plan 32 §7.3. Off, for everybody, unless something turns it on.
     #:
@@ -329,6 +333,14 @@ class MeshingMethodBranch(QObject):
         # band reads 3, 4, 5 downwards and the paint is the walk.
         navigation.nestStepInBranch(Step.GEOMETRY_REPAIR, METHOD_TOKEN)
         navigation.branchRequested.connect(self._onBranchRequested)
+        # Plan 37 UF5 DP-1043. A locked step is unlocked from its own row:
+        # right-click, "Unlock and discard later results...". The outline is
+        # the navigation's widget; the menu is this branch's, because the
+        # rows it acts on are.
+        tree = getattr(navigation, '_tree', None)
+        if tree is not None and hasattr(tree, 'customContextMenuRequested'):
+            tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            tree.customContextMenuRequested.connect(self._onOutlineMenu)
 
     # -- lazy construction ------------------------------------------------- #
 
@@ -403,6 +415,7 @@ class MeshingMethodBranch(QObject):
             # state; without this the navigation goes stale until an engine
             # switch or full reload.
             self._branch.taskChanged.connect(lambda _tid: self._syncChildren())
+            self._branch.resultLocksChanged.connect(self.resultLocksChanged)
         else:
             # force=False: a runtime probe is a fact about the machine and
             # is already cached; re-opening this node must not re-boot WSL.
@@ -532,6 +545,69 @@ class MeshingMethodBranch(QObject):
         task_id = self._branch.currentTask()
         if task_id:
             self._navigation.setBranchCurrent(TASK_TOKEN_PREFIX + task_id)
+
+    # -- Plan 37 UF5: unlock and undo from the outline --------------------- #
+
+    UNLOCK_ACTION = 'Unlock and discard later results\u2026'
+    UNDO_ACTION = 'Restore previous mesh and settings\u2026'
+
+    def unlockTarget(self, token: str) -> str | None:
+        """The locked task a row's unlock would reopen, or ``None``.
+
+        The row's own task when it is locked; otherwise the first locked
+        substep the row's press settles (a row carries its substeps).
+        """
+        token = self.resolveToken(token)
+        if (self._branch is None or token is None
+                or not str(token).startswith(TASK_TOKEN_PREFIX)):
+            return None
+        task_id = token[len(TASK_TOKEN_PREFIX):]
+        engine_id = str(getattr(self._branch, 'engine_id', '') or '')
+        for member in row_tasks(engine_id, task_id):
+            if self._branch.resultLocked(member):
+                return member
+        return None
+
+    def rowActions(self, token: str) -> list:
+        """``(object name, label, enabled, tooltip, callback)`` per action."""
+        token = self.resolveToken(token)
+        if (self._branch is None or token is None
+                or not str(token).startswith(TASK_TOKEN_PREFIX)):
+            return []
+        target = self.unlockTarget(token)
+        actions = [(
+            'outlineUnlockStep', self.tr(self.UNLOCK_ACTION), target is not None,
+            '' if target else self.tr(
+                'This step is not locked: its settings can be changed as '
+                'they are.'),
+            (lambda: self._branch.requestUnlock(target)) if target else None)]
+        undo = self._branch.undoAvailable()
+        actions.append((
+            'outlineUndoUnlock', self.tr(self.UNDO_ACTION), bool(undo),
+            '' if undo else self.tr('There is no unlock to undo.'),
+            self._branch.requestUndoUnlock if undo else None))
+        return actions
+
+    def _onOutlineMenu(self, position) -> None:
+        tree = getattr(self._navigation, '_tree', None)
+        if tree is None:
+            return
+        index = tree.indexAt(position)
+        token = str(index.data(TOKEN_ROLE) or '') if index.isValid() else ''
+        actions = self.rowActions(token) if token else []
+        if not actions:
+            return
+        menu = QMenu(tree)
+        menu.setObjectName('outlineRowMenu')
+        for name, label, enabled, tooltip, callback in actions:
+            action = menu.addAction(label)
+            action.setObjectName(name)
+            action.setEnabled(bool(enabled))
+            action.setToolTip(tooltip)
+            if callback is not None:
+                action.triggered.connect(lambda _checked=False, cb=callback: cb())
+        menu.setToolTipsVisible(True)
+        menu.exec(tree.viewport().mapToGlobal(position))
 
     # -- routing ----------------------------------------------------------- #
 

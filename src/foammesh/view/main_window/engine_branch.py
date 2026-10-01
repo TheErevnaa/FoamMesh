@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.core.engine.contracts import TaskState
+from foammesh.core.quantities import count_text
 from foammesh.core.workflow.dynamic import EngineWorkflowGraph
 from foammesh.view.gmsh_workflow import GMSH_TASK_PAGES
 from foammesh.view.snappy_workflow import SNAPPY_TASK_PAGES
 from foammesh.view.facade_client import query, submit
+from foammesh.view.outside_task import modal
 
 from .run_narration import describe_result, newest_log
 
@@ -122,11 +124,25 @@ class EngineBranchView(QWidget):
     engineChanged = Signal(str)
     #: A task page accepted or reverted an edit; listeners re-sync task labels.
     taskChanged = Signal(str)
+    #: Plan 37 UF5 DP-1084. The result-locked task set differs from the one
+    #: last applied, so a page shown outside this branch can re-read it.
+    resultLocksChanged = Signal()
 
     #: Plan 32 §7.3. Mirrors `MeshingMethodBranch.lockBypass`, which is the
     #: only thing that ever writes it, so both doors into a task page answer
     #: the same about the lock. Off unless a harness turns it on.
     lockBypass = False
+
+    #: Plan 37 UF5 DP-1043. Tasks whose published result is the mesh on
+    #: disk, read with the task states. Their pages are read-only.
+    _resultLocked: frozenset = frozenset()
+    #: Plan 37 F5. The publication record of each task, as last read: its
+    #: ``revision`` is the identity a run's result is named by.
+    _publications: dict = {}
+    #: Plan 37 I2. The steps the last unlock discarded, while the viewport
+    #: labels the mesh that unlock kept as the previous result; empty once
+    #: the label is down.
+    _historicalScope: tuple = ()
 
     def __init__(self, facade_client, parent=None):
         super().__init__(parent)
@@ -142,6 +158,9 @@ class EngineBranchView(QWidget):
         self._engineName = ''
         self._workflow_digest = ''
         self._workflow: dict = {}
+        #: Plan 37 UF3 DP-1034: scheduled transitions not yet repainted,
+        #: keyed by (task_id, transition), so a caller can wait for them.
+        self._landing: dict = {}
         self.setObjectName('engineBranchView')
         self.setAccessibleName(self.tr('Selected meshing engine tasks'))
 
@@ -317,6 +336,9 @@ class EngineBranchView(QWidget):
             if revert_signal is not None:
                 revert_signal.connect(
                     lambda tid: self._on_task_transition(tid, 'revert'))
+            unlock_signal = getattr(page, 'unlockRequested', None)
+            if unlock_signal is not None:
+                unlock_signal.connect(lambda tid: self.requestUnlock(tid))
             run_signal = getattr(page, 'runRequested', None)
             if run_signal is not None:
                 run_signal.connect(self._on_run_requested)
@@ -421,6 +443,8 @@ class EngineBranchView(QWidget):
         # that loses entries without saying so cannot be read as a record.
         self._setStateNotice('')
         self._subscribeToChecks()
+        self._resultLocked = frozenset()
+        self._publications = {}
         try:
             state_payload = query(
                 self._client, 'mesh.workflow.task_state',
@@ -435,6 +459,11 @@ class EngineBranchView(QWidget):
                 'the tasks below show as not yet run. Nothing on disk has '
                 'been changed.'))
             return graph
+        self._resultLocked = frozenset(snapshot.get('locked') or ())
+        self._publications = {
+            str(task): dict(record) for task, record in
+            (snapshot.get('publications') or {}).items()
+            if isinstance(record, dict)}
         notice = snapshot.get('workflow_reset_notice') or {}
         message = str(notice.get('message') or '')
         if message:
@@ -457,6 +486,12 @@ class EngineBranchView(QWidget):
         notice.setText(message)
         notice.setVisible(bool(message))
 
+    def _paintStateNotice(self) -> None:
+        """Paint the state notice now, not when the loop next goes idle."""
+        notice = getattr(self, '_stateNotice', None)
+        if notice is not None and notice.isVisible():
+            notice.repaint()
+
     def taskTitles(self) -> dict:
         """Task id to the human title of the task."""
         titles = {}
@@ -475,6 +510,7 @@ class EngineBranchView(QWidget):
     def _apply_states(self) -> None:
         """Disable tasks whose prerequisites are not satisfied (§5.17)."""
         self._refresh_page_status()
+        self._apply_result_locks()
         if self._graph is None:
             return
         for row, task_id in enumerate(self._order):
@@ -500,6 +536,60 @@ class EngineBranchView(QWidget):
                 item.setFlags(flags | Qt.ItemFlag.ItemIsEnabled)
 
         self._showCheckNotice()
+        self._settleHistoricalLabel()
+
+    def _writesMesh(self, task_id: str) -> bool:
+        """Whether running ``task_id`` changes the mesh on disk (I2).
+
+        A task with an engine stage other than checkMesh meshes or publishes;
+        a settings step, a check and the export do not.
+        """
+        for task in self.workflow_tasks:
+            if task.get('task_id') == task_id:
+                stage = str(task.get('engine_stage') or '')
+                return bool(stage) and stage != 'checkMesh'
+        return False
+
+    def _settleHistoricalLabel(self) -> None:
+        """Take the "Previous mesh" label down once its scope is re-run (I2).
+
+        MEASURED on the Gmsh UF20 walk: Quality was unlocked and re-run to
+        passed, Export read ready, and the viewport still said "Previous mesh
+        -- edits to Quality not applied" until a later mesh run replaced it.
+        Only a run that reloads the mesh took the label down, and a check
+        does not reload: nothing about the mesh changes, so the mesh on
+        screen *is* the current one once the check has passed again.
+
+        So on every repaint of the states: while a step in the unlocked
+        scope that writes the mesh has not run again, the label is true and
+        stays. Otherwise it goes as soon as a step in the scope has
+        completed again, or when no step anywhere is stale. With no
+        mesh-writing step in the scope the mesh on screen is the one the
+        run line named before the unlock, so that line is put back;
+        otherwise the line is left for the run that re-meshed to name.
+        """
+        scope = tuple(self._historicalScope or ())
+        if not scope or self._graph is None:
+            return
+        from foammesh.app import app
+
+        shown = getattr(getattr(app, 'window', None),
+                        'historicalResultShown', None)
+        if callable(shown) and not shown():
+            # A run, an undo or a case switch has already taken it down.
+            self._historicalScope = ()
+            return
+        writers = [task for task in scope if self._writesMesh(task)]
+        if any(not self.is_accepted(task) for task in writers):
+            return
+        rerun = any(self.is_accepted(task) for task in scope)
+        stale = any(
+            self.task_state(str(task.get('task_id') or ''))
+            == TaskState.STALE.value for task in self.workflow_tasks)
+        if not rerun and stale:
+            return
+        self._historicalScope = ()
+        self._labelViewport('clearHistoricalResult', not writers)
 
     def _showCheckNotice(self) -> None:
         """Say which checks are running, or why one could not (Plan 35 CR2)."""
@@ -640,12 +730,81 @@ class EngineBranchView(QWidget):
         soon as the write is scheduled. A caller that has to know whether the
         task is settled before it does the next thing awaits
         `record_transition_async` instead (DP-253).
+
+        Plan 37 UF3 DP-1034. A caller that did not send the transition but
+        has to act on it -- Proceed, after the save that sent it -- awaits
+        `transitions_landed`. Each scheduled write is tracked until its
+        repaint has run, and a second request for the same transition on
+        the same task while the first is still in flight joins it: the
+        transition is one state change, so sending it twice records nothing
+        more and only doubles the invalidation it causes.
         """
-        submit(self._client, 'mesh.workflow.task_transition', {
+        key = (task_id, transition)
+        landing = self._landings().get(key)
+        if landing is not None and not landing.done():
+            return landing
+        try:
+            future = asyncio.get_running_loop().create_future()
+        except RuntimeError:
+            future = None
+
+        def settle(accepted) -> None:
+            if self._landings().get(key) is future:
+                self._landings().pop(key, None)
+            if future is not None and not future.done():
+                future.set_result(bool(accepted))
+
+        def recorded(result) -> None:
+            accepted = False
+            try:
+                accepted = self._transition_recorded(
+                    task_id, result, after_save=after_save)
+            finally:
+                settle(accepted)
+
+        if future is not None:
+            self._landings()[key] = future
+        task = submit(self._client, 'mesh.workflow.task_transition', {
             'engine_id': self._engine_id, 'task_id': task_id,
-            'transition': transition},
-            then=lambda result: self._transition_recorded(
-                task_id, result, after_save=after_save))
+            'transition': transition}, then=recorded)
+        if task is None:
+            # Written synchronously: the repaint has already run.
+            settle(self.is_accepted(task_id))
+        else:
+            # A write cancelled before it answered never reaches `recorded`,
+            # and a waiter must not wait for it for ever.
+            task.add_done_callback(
+                lambda done: settle(False) if done.cancelled() else None)
+        return future
+
+    def _landings(self) -> dict:
+        """The transitions still on their way, keyed by (task, transition).
+
+        Created on first use so a view assembled without ``__init__`` (the
+        row-lock doubles borrow these methods) still coalesces its presses.
+        """
+        return self.__dict__.setdefault('_landing', {})
+
+    async def transitions_landed(self) -> bool:
+        """Wait until every transition this branch has scheduled has landed.
+
+        Plan 37 UF3 DP-1034. A page save emits `updateRequested`, and the
+        branch answers it with a scheduled `configure` (or `accept`) that
+        nobody awaited: the settle that followed read the graph from before
+        it -- the edited task still PASSED -- and moved on without running.
+        MEASURED in the user's report: back to a meshed step, edit, Proceed,
+        and the mesh on screen was the one made with the old settings.
+
+        Returns whether every transition that was waited on was accepted.
+        """
+        accepted = True
+        while True:
+            pending = [future for future in self._landings().values()
+                       if not future.done()]
+            if not pending:
+                return accepted
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            accepted = accepted and all(result is True for result in results)
 
     def _transition_recorded(self, task_id: str, result, *,
                              after_save: bool = False) -> bool:
@@ -674,6 +833,12 @@ class EngineBranchView(QWidget):
                     self, self.tr('Settings saved'),
                     self.tr('Your settings were saved. ')
                     + self._locked_sentence(task_id))
+            elif self._is_check_task(task_id):
+                # Plan 37 UF4 DP-1025. A check that stopped Check & Proceed
+                # is titled as that, not as an internal "Task state"; the
+                # facade's sentence already says what failed and what to do.
+                QMessageBox.warning(
+                    self, self.tr('Quality check did not finish'), message)
             else:
                 QMessageBox.warning(self, self.tr('Task state'), message)
         self._graph = self._build_graph(self._engine_id)
@@ -711,14 +876,24 @@ class EngineBranchView(QWidget):
             self._on_task_transition(task_id, transition,
                                      after_save=after_save)
             return self.is_accepted(task_id)
+        # Plan 37 UF3 DP-1034. The same transition already in flight is
+        # joined rather than sent again, and anything else scheduled is let
+        # land first, so this one is answered against the graph those
+        # writes left and not overtaken by them.
+        landing = self._landings().get((task_id, transition))
+        if landing is not None and not landing.done():
+            await landing
+            return self.is_accepted(task_id)
+        await self.transitions_landed()
         try:
             result = await runner('mesh.workflow.task_transition', {
                 'engine_id': self._engine_id, 'task_id': task_id,
                 'transition': transition})
         except FacadeError as error:
             result = FailedResult(error)
-        return self._transition_recorded(task_id, result,
-                                         after_save=after_save)
+        # A refusal is said in a box; it is opened with no task current.
+        return await modal(self._transition_recorded, task_id, result,
+                           after_save=after_save)
 
     #: Engine id -> the facade operation that runs its whole pipeline. An
     #: engine absent here renders no run button.
@@ -856,8 +1031,10 @@ class EngineBranchView(QWidget):
                 self._reload_mesh()
             self._graph = self._build_graph(self._engine_id)
             self._apply_states()
+            self._noticeSkippedSnapshots(baseline, payload)
             self.taskChanged.emit(task_id)
 
+        baseline = self._skipBaseline()
         # DP-506. The Console shows the run while it runs, as the window's
         # own pipeline run does; the subscription ends with the result.
         unsubscribe = self._stream_to_console()
@@ -928,7 +1105,10 @@ class EngineBranchView(QWidget):
                 page.refresh()
             self._graph = self._build_graph(self._engine_id)
             self._apply_states()
+            self._noticeSkippedSnapshots(baseline, payload)
             self.taskChanged.emit(task_id)
+
+        baseline = self._skipBaseline()
 
         def start() -> None:
             task = _submit(self._client, operation, parameters, on_result)
@@ -957,7 +1137,8 @@ class EngineBranchView(QWidget):
             failure = await self._write_stage_dictionaries(stage)
             if failure:
                 released()
-                QMessageBox.warning(self, self.tr('Stage run'), failure)
+                await modal(lambda: QMessageBox.warning(
+                    self, self.tr('Stage run'), failure))
                 return
             start()
 
@@ -979,10 +1160,12 @@ class EngineBranchView(QWidget):
         `_reload_mesh` still runs for the two paths that genuinely have no
         other draw -- the bare facade run and a single stage run.
         """
+        baseline = self._skipBaseline()
         try:
             await runner()
         finally:
             self.refresh_states()
+            self._noticeSkippedSnapshots(baseline)
             self.taskChanged.emit(task_id)
 
     # -- task state queries for the wizard --------------------------------- #
@@ -1148,6 +1331,15 @@ class EngineBranchView(QWidget):
         """
         reason = str(payload.get('reason') or getattr(result, 'message', '')
                      or fallback)
+        # DP-1081. A disk refusal carries its reason as a code ('free_space'),
+        # which this printed as the whole message.
+        disk = self.insufficientDiskText(
+            payload, (self.tr('The %s run') % stage) if stage
+            else self.tr('The run'))
+        if disk:
+            reason = disk
+            payload = {key: value for key, value in payload.items()
+                       if key != 'cause'}
         job = payload.get('job') if isinstance(payload.get('job'), dict) else {}
         details = str(payload.get('details') or '').strip()
         log = str(payload.get('log') or job.get('log_path') or '')
@@ -1210,6 +1402,8 @@ class EngineBranchView(QWidget):
         unsubscribe = self._stream_to_console()
         result = None
         failure = ''
+        baseline = self._skipBaseline()
+        published_before = self.publicationRevision(task_id, active_only=False)
         try:
             # DP-256. The dictionaries this stage meshes from, written the
             # way every other route to a run writes them, before the run.
@@ -1217,7 +1411,9 @@ class EngineBranchView(QWidget):
             if not failure:
                 result = await runner('workflow.run_stage', {'stage': stage})
         except FacadeError as error:
-            failure = str(error)
+            failure = (self.insufficientDiskText(
+                getattr(error, 'details', None),
+                self.tr('The %s run') % stage) or str(error))
         finally:
             self._stage_running = False
             unsubscribe()
@@ -1225,21 +1421,23 @@ class EngineBranchView(QWidget):
             # run, so a warning is never raised behind a modal still claiming
             # the stage is running (the D6 stacked-dialog shape).
             progress.close()
+        # Plan 37 UF20 follow-up: every box this coroutine opens is opened
+        # with no task current (`outside_task`), so its nested loop does not
+        # refuse -- and drop -- the tasks it steps.
         if failure:
-            QMessageBox.warning(self, self.tr('Stage run'), failure)
+            await modal(lambda: QMessageBox.warning(
+                self, self.tr('Stage run'), failure))
         payload = getattr(result, 'payload', {}) or {}
         accepted = getattr(result, 'status', '') == 'accepted'
         if result is not None and not accepted:
             if self._was_cancelled(payload):
                 self._report_cancelled_stage(stage)
             else:
-                self._warn_failure(
+                await modal(
+                    self._warn_failure,
                     self.tr('Stage run'), payload, result,
                     self.tr('The stage could not run.'), stage=stage)
         self._publish_verdict(payload)
-        if accepted and payload.get('region_warnings'):
-            self._report_run(self._with_region_warnings(
-                self.tr('%s completed.') % stage, payload))
         if accepted:
             # DP-763. `Run & Proceed` on a stage page comes here, and the
             # stage's mesh stayed on disk: the viewport kept the STL through
@@ -1250,8 +1448,80 @@ class EngineBranchView(QWidget):
         if page is not None:
             page.refresh()
         self.refresh_states()
+        if accepted:
+            # Plan 37 F5. A re-run after Back, edit, Proceed has to be told
+            # apart from the run it replaces, and the cell count alone cannot
+            # do that. The publication revision the run was recorded under is
+            # read after the states are, so it is this run's.
+            #
+            # Plan 37 UF20 follow-up. Only when this run published it: the
+            # record a run leaves behind when it could not be recorded is the
+            # previous one. MEASURED on the SU2 walk: a Layers run that was
+            # blocked at the snap fidelity gate read "layers completed.
+            # Published as revision 6." -- revision 6 was the old Layers
+            # result, deactivated by the unlock -- and the run published
+            # nothing.
+            revision = self.publicationRevision(task_id)
+            if revision == published_before:
+                revision = 0
+            unpublished = self._unpublishedReason(task_id, payload)
+            if unpublished:
+                self._report_run(self._with_region_warnings(
+                    self.tr('{0} ran, but its result was not published: '
+                            '{1}').format(stage, unpublished), payload),
+                    failed=True)
+            elif revision or payload.get('region_warnings'):
+                message = self.tr('%s completed.') % stage
+                if revision:
+                    message += ' ' + self.revisionText(revision)
+                self._report_run(self._with_region_warnings(message, payload))
+        self._noticeSkippedSnapshots(baseline, payload)
         self.taskChanged.emit(task_id)
         return accepted
+
+    def publicationRevision(self, task_id: str, *,
+                            active_only: bool = True) -> int:
+        """The revision ``task_id``'s result was published under, or 0.
+
+        Plan 37 F5. The publication manifest (UF5) numbers every publish and
+        unlock; the number a task's record carries names the run that made
+        its result, which a timestamp or a cell count does not. A record an
+        unlock deactivated names no current result, so it reads 0 unless
+        ``active_only`` is False.
+        """
+        record = self._publications.get(str(task_id)) or {}
+        if active_only and record and not record.get('active', True):
+            return 0
+        try:
+            return int(record.get('revision') or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _unpublishedReason(self, task_id: str, payload: dict) -> str:
+        """Why a stage that ran was not recorded, or '' when it was.
+
+        Plan 37 UF20 follow-up. The facade records a stage only up to the
+        first gate it meets, and says so in ``task_state.blocked``; nothing
+        read it, so a run that published nothing ended in silence and the
+        wizard stayed on the page (the SU1/SU2 "Layers never finishes").
+        """
+        state = (payload or {}).get('task_state')
+        blocked = state.get('blocked') if isinstance(state, dict) else None
+        if not isinstance(blocked, dict) or not blocked:
+            return ''
+        if self.is_accepted(task_id):
+            return ''
+        waiting = [str(self.task_info(item).get('title') or item)
+                   for item in self.blocking_prerequisites(task_id)]
+        if waiting:
+            return self.tr('{0} must be finished again first, then run '
+                           'this step again.').format(', '.join(waiting))
+        return str(blocked.get('reason') or self.tr(
+            'the workflow did not accept it.'))
+
+    def revisionText(self, revision: int) -> str:
+        """The sentence that names a published result's revision (F5)."""
+        return self.tr('Published as revision {0}.').format(int(revision))
 
     def _qa_operation_name(self) -> str:
         """Which check this project's QA row runs, per its target solver.
@@ -1273,6 +1543,29 @@ class EngineBranchView(QWidget):
         return str(payload.get('qa_operation')
                    or qa_operation(payload.get('target_solver')))
 
+    @staticmethod
+    def _facadeFailureLead(error) -> str:
+        """The first line of a refusal: what failed and why (Plan 37 F2).
+
+        §8 check 4: every injected failure names its task and its reason.
+        MEASURED on the Gmsh UF20 walk, the Quality refusal led with
+        "required utility is unavailable" -- the task was named under it,
+        but not checkMesh, and not why. The facade now says both; an error
+        whose text still names no utility is rebuilt from the utility and
+        the reason in its details.
+        """
+        from foammesh.core.facade.errors import unavailable_utility_text
+
+        text = str(error).strip()
+        details = getattr(error, 'details', None)
+        if not isinstance(details, dict):
+            return text
+        utility = str(details.get('utility') or '').strip()
+        if utility and utility not in text:
+            text = unavailable_utility_text(
+                utility, str(details.get('reason') or ''))
+        return text
+
     async def run_mesh_check_async(self, task_id: str) -> bool:
         """Run checkMesh on the case-root mesh and wait for it.
 
@@ -1290,7 +1583,16 @@ class EngineBranchView(QWidget):
         try:
             result = await runner(self._qa_operation_name())
         except FacadeError as error:
-            QMessageBox.warning(self, self.tr('Mesh check'), str(error))
+            # Plan 37 UF4 DP-1025: what failed, then what to do about it.
+            # Plan 37 UF20 follow-up, MEASURED on SU2: opened here, inside
+            # the wizard's task, this box's nested loop had asyncio refuse
+            # the tasks it stepped and a MeshManager.reload() was dropped.
+            text = self._facadeFailureLead(error) + '\n\n' + self.tr(
+                'The mesh check could not run, so Quality was not marked '
+                'done. Nothing about the mesh changed. Fix the cause '
+                'above, then press Check & Proceed again.')
+            await modal(lambda: QMessageBox.warning(
+                self, self.tr('Mesh check'), text))
         payload = getattr(result, 'payload', {}) or {}
         self._publish_verdict(payload)
         page = self._pages.get(task_id)
@@ -1298,7 +1600,27 @@ class EngineBranchView(QWidget):
             page.refresh()
         self.refresh_states()
         self.taskChanged.emit(task_id)
-        return result is not None and self.is_accepted(task_id)
+        accepted = result is not None and self.is_accepted(task_id)
+        if result is not None and not accepted:
+            # Plan 37 UF4 DP-1026. The check ran but the row did not move --
+            # a Gmsh element report missing for this mesh, say. The facade
+            # names why in the payload; nothing used to show it, so the
+            # wizard stopped on Quality with nothing on screen.
+            blocked = (payload.get('task_state') or {}).get('blocked') or {}
+            reason = str(blocked.get('reason') or payload.get('message') or '')
+            if reason:
+                await modal(lambda: QMessageBox.warning(
+                    self, self.tr('Quality check did not finish'), reason))
+        return accepted
+
+    @staticmethod
+    def _is_check_task(task_id: str) -> bool:
+        """A task Check & Proceed runs as a check (Plan 37 UF4)."""
+        from foammesh.core.facade.domain_operations import (
+            CHECK_TASK_OPERATIONS,
+        )
+
+        return task_id in CHECK_TASK_OPERATIONS
 
     def _reload_mesh(self) -> None:
         """Draw the mesh a stage has just written (F10).
@@ -1318,6 +1640,9 @@ class EngineBranchView(QWidget):
         from foammesh.app import app
 
         window = getattr(app, 'window', None)
+        # Plan 37 I2. A run has published: what is drawn next is its result,
+        # not the output an unlock kept on screen.
+        self._labelViewport('clearHistoricalResult', False)
         manager = getattr(window, 'meshManager', None)
         if manager is None:
             return
@@ -1404,6 +1729,468 @@ class EngineBranchView(QWidget):
             show(dict(verdict))
 
     # -- navigation -------------------------------------------------------- #
+
+    # -- Plan 37 UF5: locked results, unlock and undo ---------------------- #
+
+    def resultLocked(self, task_id: str) -> bool:
+        """Whether ``task_id``'s published result is the mesh on disk.
+
+        Not `taskIsLocked`, which is the other lock -- a task the workflow
+        has not reached. This one is a task already done: its settings are
+        what the mesh was made from, so they are read-only until the step
+        is unlocked (which discards what came after it).
+        """
+        return task_id in self._resultLocked
+
+    def resultLockedTasks(self) -> tuple:
+        return tuple(task for task in self._order if task in self._resultLocked)
+
+    #: The result-locked set last applied to the pages (DP-1084).
+    _appliedResultLocks: frozenset = frozenset()
+
+    def _apply_result_locks(self) -> None:
+        if self._resultLocked != self._appliedResultLocks:
+            self._appliedResultLocks = self._resultLocked
+            self.resultLocksChanged.emit()
+        for task_id, page in self._pages.items():
+            setter = getattr(page, 'setResultLocked', None)
+            if not callable(setter):
+                continue
+            try:
+                setter(task_id in self._resultLocked)
+            except Exception:                                # noqa: BLE001
+                logger.exception('the %s page could not show its lock', task_id)
+
+    def _confirm(self, title: str, text: str) -> bool:
+        """Ask before discarding work. Tests replace this."""
+        answer = QMessageBox.question(
+            self, title, text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _warn(self, title: str, text: str) -> None:
+        """Say why nothing happened. Tests replace this."""
+        QMessageBox.warning(self, title, text)
+
+    @staticmethod
+    def _bytes(count) -> str:
+        value = float(count or 0)
+        for unit in ('bytes', 'KB', 'MB', 'GB'):
+            if value < 1024 or unit == 'GB':
+                return (f'{value:.0f} {unit}' if unit == 'bytes'
+                        else f'{value:.1f} {unit}')
+            value /= 1024
+        return f'{value:.1f} GB'
+
+    def unlockConfirmation(self, preview: dict) -> str:
+        """What the unlock confirmation says: tasks, artifacts, disk cost."""
+        titles = list(preview.get('titles') or preview.get('scope') or ())
+        lines = [self.tr('Unlocking "{0}" reopens it and every step after it '
+                         'that depends on it. Their results are discarded and '
+                         'they have to be run again:').format(
+                             titles[0] if titles else preview.get('task_id'))]
+        lines += [f'  • {title}' for title in titles]
+        artifacts = list(preview.get('artifacts') or ())
+        if artifacts:
+            lines.append('')
+            lines.append(self.tr('Kept on disk as the previous result until '
+                                 'the next run replaces it:'))
+            for artifact in artifacts:
+                lines.append(f'  • {artifact.get("path")} '
+                             f'({self._bytes(artifact.get("bytes"))})')
+            lines.append(self.tr('The mesh on screen stays as it is: nothing '
+                                 'is re-meshed until you run a step again.'))
+        lines.append('')
+        lines.append(self.tr('A copy is kept so that "Restore previous mesh '
+                             'and settings" can put everything back: {0} of '
+                             'disk ({1} free).').format(
+                                 self._bytes(preview.get('disk_cost_bytes')),
+                                 self._bytes(preview.get('free_bytes'))))
+        if preview.get('replaces_undo'):
+            lines.append(self.tr('This replaces the restore point kept by the '
+                                 'previous unlock.'))
+        lines += self._replayLines(preview.get('replay'))
+        lines += self._skippedLines(self.skippedSnapshots(preview))
+        lines += self._exportLines(preview)
+        return '\n'.join(lines)
+
+    # -- stage snapshots and exports in the unlock confirmation (UF5) ------ #
+    def _caseFolder(self):
+        try:
+            return getattr(self._client, 'case_path', None)
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def skippedSnapshots(self, preview: dict | None = None) -> list[dict]:
+        """Stage snapshots that were skipped and are not kept now.
+
+        The preview's own list when the facade sends one; otherwise the
+        case's ``skipped.json``, the newest entry per stage, leaving out a
+        stage that a later run did keep.
+        """
+        if preview and 'skipped_snapshots' in preview:
+            return list(preview.get('skipped_snapshots') or ())
+        case = self._caseFolder()
+        if not case:
+            return []
+        try:
+            from foammesh.core.jobs import stage_snapshots
+            entries = stage_snapshots.skipped(case)
+            kept = set(stage_snapshots.resolve(case))
+        except Exception:                                    # noqa: BLE001
+            logger.debug('skipped snapshots unreadable', exc_info=True)
+            return []
+        newest = {}
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get('stage'):
+                newest[entry['stage']] = entry
+        return [entry for stage, entry in newest.items() if stage not in kept]
+
+    def _replayLines(self, replay) -> list[str]:
+        if not isinstance(replay, dict) or not replay.get('stage'):
+            return []
+        stage = replay['stage']
+        source = replay.get('from') or None
+        regenerate = [name for name in (replay.get('regenerate') or ())
+                      if name != stage]
+        lines = ['']
+        if source and not regenerate:
+            lines.append(self.tr('The next run starts at {0} from the kept '
+                                 '{1} snapshot.').format(
+                                     stage, source.get('stage')))
+        elif source:
+            lines.append(self.tr('The next run starts at {0}: {1} is '
+                                 'regenerated first from the nearest kept '
+                                 'stage, {2}.').format(
+                                     stage, ', '.join(regenerate),
+                                     source.get('stage')))
+        elif regenerate:
+            lines.append(self.tr('The next run starts at {0}: no earlier '
+                                 'stage is kept, so {1} is regenerated first '
+                                 'from the start.').format(
+                                     stage, ', '.join(regenerate)))
+        else:
+            lines.append(self.tr('The next run starts at {0}.').format(stage))
+        return lines
+
+    def _skippedLines(self, skipped) -> list[str]:
+        if not skipped:
+            return []
+        lines = ['', self.tr('These stage snapshots were not kept:')]
+        lines += ['  • ' + self.skipDescription(entry) for entry in skipped]
+        return lines
+
+    def skipDescription(self, entry: dict) -> str:
+        """One skipped stage snapshot, why, and what it costs later."""
+        reason = {
+            'free_space': self.tr('the disk was below the free-space reserve'),
+            'quota': self.tr('the stage snapshot quota was full'),
+            'decomposed': self.tr('the mesh was still decomposed'),
+        }.get(entry.get('reason'), str(entry.get('reason') or ''))
+        text = self.tr('{0} was not kept because {1}').format(
+            entry.get('stage'), reason)
+        if entry.get('consequence'):
+            text += '; ' + str(entry['consequence'])
+        return text + '.'
+
+    def _exportLines(self, preview: dict) -> list[str]:
+        lines = []
+        managed = list(preview.get('stale_exports') or ())
+        if managed:
+            lines += ['', self.tr('These exports made by this case no longer '
+                                  'match the mesh and are marked stale:')]
+            lines += [f'  • {item.get("destination")}' for item in managed]
+        external = list(preview.get('external_exports') or ())
+        if external:
+            lines += ['', self.tr('These exports were written outside the '
+                                  'case. Their record is marked stale; the '
+                                  'files themselves are not touched:')]
+            lines += [f'  • {item.get("destination")}' for item in external]
+        return lines
+
+    # -- snapshots skipped for disk, and disk refusals, said plainly (UF5) -- #
+    def insufficientDiskText(self, details, action: str, *,
+                             copy: str = '') -> str:
+        """A refusal for disk space in plain words, or ``''`` for another one.
+
+        *details* are a refusal's details: the unlock's (``reason`` is
+        ``insufficient_disk``) or a stage run's (``error`` is
+        ``insufficient_disk``, ``reason`` is ``free_space`` or ``quota``).
+        Says what was needed, what is free and the reserve, and what to do.
+        """
+        details = dict(details) if isinstance(details, dict) else {}
+        if 'insufficient_disk' not in (details.get('error'),
+                                       details.get('reason')):
+            return ''
+        policy = details.get('policy') if isinstance(
+            details.get('policy'), dict) else {}
+        required = int(details.get('required_bytes') or 0)
+        copy = copy or (self.tr('the mesh the {0} stage starts from').format(
+            details['stage']) if details.get('stage') else
+            self.tr('the copy it needs'))
+        if details.get('reason') == 'quota':
+            quota = policy.get('quota_bytes')
+            if quota is None:
+                from foammesh.core.jobs import stage_snapshots
+                quota = stage_snapshots.load_policy().quota_bytes
+            return self.tr(
+                '{0} was refused: keeping {1} would bring what this case '
+                'keeps on disk to {2}, over the stage snapshot quota of {3}. '
+                'Raise "Stage snapshot quota" in Settings > Preferences, '
+                'then try again.').format(
+                    action, copy, self._bytes(required), self._bytes(quota))
+        reserve = details.get('reserve_bytes', policy.get('reserve_bytes'))
+        if reserve is None:
+            from foammesh.core.jobs import stage_snapshots
+            reserve = stage_snapshots.load_policy().reserve_bytes
+        reserve = int(reserve or 0)
+        needed = max(0, required - reserve)
+        free = details.get('free_bytes')
+        free_text = (self._bytes(free) if free is not None
+                     else self.tr('an unknown amount'))
+        return self.tr(
+            '{0} was refused: there is not enough free disk space to keep '
+            '{1}. It needs {2}, and {3} more is always left free as the '
+            'reserve, but the disk has {4} free. Free some disk space, or '
+            'lower "Free space kept on the disk" in Settings > Preferences, '
+            'then try again.').format(
+                action, copy, self._bytes(needed), self._bytes(reserve),
+                free_text)
+
+    def _skipBaseline(self) -> set:
+        """The skipped-snapshot entries already recorded before an action."""
+        case = self._caseFolder()
+        if not case:
+            return set()
+        try:
+            from foammesh.core.jobs import stage_snapshots
+            return {self._skipKey(entry)
+                    for entry in stage_snapshots.skipped(case)}
+        except Exception:                                    # noqa: BLE001
+            return set()
+
+    @staticmethod
+    def _skipKey(entry) -> tuple:
+        entry = entry if isinstance(entry, dict) else {}
+        return (entry.get('stage'), entry.get('at'), entry.get('reason'))
+
+    def newlySkippedSnapshots(self, baseline, payload=None) -> list[dict]:
+        """Stage snapshots skipped for the quota or the reserve just now.
+
+        From the result's own ``stage_snapshot`` and replay records, and
+        from the case's ``skipped.json`` entries not in *baseline* (a
+        pipeline run hands no payload back here).
+        """
+        found = []
+        payload = payload if isinstance(payload, dict) else {}
+        records = [payload.get('stage_snapshot')]
+        replay = payload.get('replay') if isinstance(
+            payload.get('replay'), dict) else {}
+        records += [item.get('snapshot') for item in
+                    (replay.get('regenerated') or ()) if isinstance(item, dict)]
+        found += [record for record in records if isinstance(record, dict)
+                  and record.get('skipped')]
+        case = self._caseFolder()
+        if case and baseline is not None:
+            try:
+                from foammesh.core.jobs import stage_snapshots
+                found += [entry for entry in stage_snapshots.skipped(case)
+                          if self._skipKey(entry) not in baseline]
+            except Exception:                                # noqa: BLE001
+                logger.debug('skipped snapshots unreadable', exc_info=True)
+        unique, seen = [], set()
+        for entry in found:
+            key = (entry.get('stage'), entry.get('reason'))
+            if entry.get('reason') in ('quota', 'free_space') and key not in seen:
+                seen.add(key)
+                unique.append(entry)
+        return unique
+
+    def _noticeSkippedSnapshots(self, baseline, payload=None, *,
+                                append: bool = False) -> str:
+        """Say, without a modal, which stage snapshots were not kept."""
+        skipped = self.newlySkippedSnapshots(baseline, payload)
+        if not skipped:
+            return ''
+        text = '\n'.join(self.tr('Stage snapshot not kept: {0}').format(
+            self.skipDescription(entry)) for entry in skipped)
+        notice = getattr(self, '_stateNotice', None)
+        current = notice.text() if (append and notice is not None) else ''
+        self._setStateNotice((current + '\n' if current else '') + text)
+        console = self._console()
+        write = getattr(console, 'append', None) if console is not None else None
+        if callable(write):
+            write(text)
+        return text
+
+    def requestUnlock(self, task_id: str) -> bool:
+        """Unlock ``task_id`` after the user has seen what it discards."""
+        title = self.tr('Unlock and discard later results')
+        try:
+            preview = query(self._client, 'mesh.workflow.unlock_preview',
+                            {'engine_id': self._engine_id,
+                             'task_id': task_id}).payload or {}
+        except Exception as error:                           # noqa: BLE001
+            self._warn(title, str(error))
+            return False
+        if not preview.get('locked'):
+            self._warn(title, self.tr('This step is not locked: its settings '
+                                      'can be changed as they are.'))
+            return False
+        reserve = preview.get('reserve_bytes')
+        if not preview.get('fits', True):
+            cost = int(preview.get('disk_cost_bytes') or 0)
+            self._warn(title, self.insufficientDiskText({
+                'reason': 'insufficient_disk',
+                'required_bytes': cost + int(reserve or 0),
+                'free_bytes': preview.get('free_bytes'),
+                'reserve_bytes': reserve}, self.tr('Unlocking'),
+                copy=self.tr('the copy of the current mesh kept for undo')))
+            return False
+        if not self._confirm(title, self.unlockConfirmation(preview)):
+            return False
+        baseline = self._skipBaseline()
+        # Plan 37 I2. Read before the unlock lands: the label names the
+        # latest publication the mesh on screen belongs to -- the newest
+        # among the steps this unlock discards -- not the revision the unlock
+        # itself writes.
+        retained_revision = max(
+            [self.publicationRevision(scoped, active_only=False)
+             for scoped in (preview.get('scope') or [task_id])] or [0])
+        # Plan 37 UF20 follow-up, MEASURED live (BUDGETS.md section 2): after
+        # Yes nothing on screen changed for 1.6-2.2 s -- the unlock's task
+        # transition holds the owner loop for ~2.1 s and the first visible
+        # change waited for `landed`. Say so at once, painted before the
+        # write is scheduled, and let `landed` replace it.
+        self._setStateNotice(self.tr('Unlocking "{0}"…').format(
+            (preview.get('titles') or [task_id])[0]))
+        self._paintStateNotice()
+
+        def landed(result) -> None:
+            if getattr(result, 'status', '') == 'failed':
+                self._setStateNotice('')
+                details = dict(getattr(result, 'payload', None) or {})
+                details.setdefault('reserve_bytes', reserve)
+                self._warn(title, self.insufficientDiskText(
+                    details, self.tr('Unlocking'),
+                    copy=self.tr('the copy of the current mesh kept for '
+                                 'undo'))
+                    or str(getattr(result, 'message', '') or ''))
+                self.refresh_states()
+                return
+            payload = getattr(result, 'payload', None) or {}
+            self.refresh_states()
+            count = len(payload.get('deactivated') or preview.get('scope') or ())
+            self._setStateNotice(self.tr(
+                '"{0}" is unlocked and {1} reopened. The mesh on disk '
+                'is the previous result until you run again; "Restore previous '
+                'mesh and settings" (right-click a step) puts it all '
+                'back.').format(
+                    (preview.get('titles') or [task_id])[0],
+                    count_text(count, 'step')))
+            self._noticeSkippedSnapshots(baseline, payload, append=True)
+            self._historicalScope = tuple(
+                payload.get('scope') or preview.get('scope') or (task_id,))
+            self._labelViewport('showHistoricalResult',
+                                (preview.get('titles') or [task_id])[0],
+                                retained_revision)
+            self.taskChanged.emit(task_id)
+
+        submit(self._client, 'mesh.workflow.unlock', {
+            'engine_id': self._engine_id, 'task_id': task_id,
+            'expected_revision': preview.get('publication_revision')},
+            then=landed)
+        return True
+
+    def _labelViewport(self, method: str, *args) -> None:
+        """Tell the window's viewport what the mesh on screen now is (I2).
+
+        Plan 37 I2. After an unlock the mesh on screen is the unlocked step's
+        retained output, not the result of the edits about to be made, and
+        the page notice alone did not say so where the mesh is. Reached
+        through ``app.window`` for the reason `_report_run` gives.
+        """
+        from foammesh.app import app
+
+        call = getattr(getattr(app, 'window', None), method, None)
+        if callable(call):
+            try:
+                call(*args)
+            except Exception:                                # noqa: BLE001
+                logger.debug('the viewport label could not be set',
+                             exc_info=True)
+
+    def undoAvailable(self) -> dict:
+        """The undo preview when an unlock can be undone, else ``{}``."""
+        try:
+            preview = query(self._client, 'mesh.workflow.undo_unlock_preview',
+                            {'engine_id': self._engine_id}).payload or {}
+        except Exception:                                    # noqa: BLE001
+            return {}
+        return preview if preview.get('available') else {}
+
+    def undoConfirmation(self, preview: dict) -> str:
+        titles = list(preview.get('titles') or preview.get('scope') or ())
+        lines = [self.tr('Restore the mesh, the settings and the step states '
+                         'as they were before "{0}" was unlocked.').format(
+                             titles[0] if titles else preview.get('task_id'))]
+        changed = list(preview.get('discarded_settings') or ())
+        if changed:
+            lines.append('')
+            lines.append(self.tr('These settings changed since, and the '
+                                 'change is discarded:'))
+            lines += [f'  • {path}' for path in changed[:20]]
+            if len(changed) > 20:
+                lines.append(self.tr('  and {0} more').format(len(changed) - 20))
+        if preview.get('restores_mesh'):
+            lines.append('')
+            lines.append(self.tr('The mesh on disk is replaced by the one '
+                                 'kept at the unlock.'))
+        return '\n'.join(lines)
+
+    def requestUndoUnlock(self) -> bool:
+        """Put back what the last unlock discarded, after asking."""
+        title = self.tr('Restore previous mesh and settings')
+        preview = self.undoAvailable()
+        if not preview:
+            self._warn(title, self.tr(
+                'There is no unlock to undo: a run since the last unlock '
+                'replaced the restore point, or nothing was unlocked.'))
+            return False
+        if not self._confirm(title, self.undoConfirmation(preview)):
+            return False
+        baseline = self._skipBaseline()
+
+        def landed(result) -> None:
+            failed = getattr(result, 'status', '') == 'failed'
+            if failed:
+                self._warn(title, self.insufficientDiskText(
+                    getattr(result, 'payload', None), self.tr('Restoring'),
+                    copy=self.tr('the restored mesh'))
+                    or str(getattr(result, 'message', '') or ''))
+            self.refresh_states()
+            for page in list(self._pages.values()):
+                reload_page = getattr(page, 'refresh', None)
+                if callable(reload_page):
+                    try:
+                        reload_page()
+                    except Exception:                        # noqa: BLE001
+                        logger.exception('a page could not re-read the '
+                                         'restored settings')
+            if not failed:
+                self._setStateNotice(self.tr(
+                    'The mesh and settings from before the unlock are '
+                    'restored.'))
+                self._noticeSkippedSnapshots(
+                    baseline, getattr(result, 'payload', None), append=True)
+                self._historicalScope = ()
+                self._labelViewport('clearHistoricalResult', True)
+                self.taskChanged.emit(str(preview.get('task_id') or ''))
+
+        submit(self._client, 'mesh.workflow.undo_unlock',
+               {'engine_id': self._engine_id}, then=landed)
+        return True
 
     def currentTask(self) -> str:
         """The task whose page is on screen, or ``''`` for none.

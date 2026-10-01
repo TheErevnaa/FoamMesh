@@ -21,6 +21,7 @@ from .wsl_wrapper import (
     EXIT_PREFIX, HEARTBEAT_PREFIX, RUN_DIR_VARIABLE, RUN_ID_VARIABLE, RUN_PREFIX,
 )
 from foammesh.core.project.events import Event
+from foammesh.core.quantities import agreeing, count_text
 
 logger = logging.getLogger(__name__)
 
@@ -793,8 +794,11 @@ class JobManager:
             if output_truncated:
                 warnings = ('in-memory output was truncated; the full stream remains in the log',)
             if reader.truncated_lines:
-                warnings = (*warnings, f'{reader.truncated_lines} overlong output line(s) '
-                            f'were cut at {LINE_LIMIT_BYTES // 1024} KiB')
+                cut = reader.truncated_lines
+                warnings = (*warnings,
+                            f"{count_text(cut, 'overlong output line')} "
+                            f"{agreeing(cut, 'was', 'were')} cut at "
+                            f'{LINE_LIMIT_BYTES // 1024} KiB')
             run_state = None
             if records is not None:
                 # `exited` needs the wrapper's acknowledgement, or a native

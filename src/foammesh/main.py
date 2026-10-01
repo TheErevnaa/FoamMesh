@@ -70,6 +70,13 @@ if __name__ == '__main__':
         # then.
         from foammesh.support import native_capture
         native_capture.install()
+    # 2026-10-01. Ask for the high-performance GPU before Qt or VTK loads
+    # OpenGL; the driver falls back to the integrated GPU by itself.
+    try:
+        from foammesh.rendering import gpu_profile as _gpu_profile
+        _gpu_profile.prefer_discrete_gpu()
+    except Exception:                                       # noqa: BLE001
+        pass
 
 import qasync
 from PySide6.QtWidgets import QApplication

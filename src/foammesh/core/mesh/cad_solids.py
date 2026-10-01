@@ -508,21 +508,75 @@ def _numeric(key):
     return (0, int(text), '') if text.isdigit() else (1, 0, text)
 
 
-# -- DP-915: the far-field box ----------------------------------------------- #
+# -- DP-915: the far field ---------------------------------------------------- #
 
-def farfield_enabled(db) -> bool:
-    """Whether the case asks Gmsh for the far-field box (describe geometry)."""
+#: Plan 37 UF13. The far field is one of these; unset or unknown is the box,
+#: the shape the runner builds by default.
+FARFIELD_SHAPES = ('box', 'sphere', 'cylinder')
+
+
+def _shape_word(shape) -> str:
+    shape = str(shape or '').strip().lower()
+    return shape if shape in FARFIELD_SHAPES else 'box'
+
+
+def farfield_shape(db) -> str:
+    """``box``, ``sphere`` or ``cylinder``: the shape of the case's far field."""
     if db is None:
-        return False
+        return 'box'
+    try:
+        value = db.getValue('gmsh/farfield/shape')
+    except Exception:  # noqa: BLE001 - a case without the leaf
+        value = None
+    return _shape_word(getattr(value, 'value', value))
+
+
+class FarfieldState(str):
+    """The far field's shape when it is on, else ``''`` -- with ``.shape``.
+
+    A string so every reader that asks "is it on" reads it as before; the
+    ``shape`` attribute is the chosen shape whether the far field is on or
+    off, so a note about a far field that is off can name the one chosen.
+    """
+
+    shape: str
+
+    def __new__(cls, on: bool, shape: str = 'box'):
+        shape = _shape_word(shape)
+        state = super().__new__(cls, shape if on else '')
+        state.shape = shape
+        return state
+
+
+def shape_of(farfield) -> str:
+    """The shape *farfield* names: a `FarfieldState`, a shape string, or a
+    bare flag (the box)."""
+    shape = getattr(farfield, 'shape', None)
+    if shape:
+        return _shape_word(shape)
+    return _shape_word(farfield if isinstance(farfield, str) else 'box')
+
+
+def farfield_enabled(db) -> str:
+    """The far field's shape when the case asks Gmsh for one, else ``''``.
+
+    Truthy exactly when the far field is on, so every reader that asks
+    "is it on" reads it as before; Plan 37 UF13 made it the shape so that
+    `propose`, handed this value, names a sphere or a cylinder as one. It is
+    a `FarfieldState`, whose ``shape`` is the chosen shape even when off.
+    """
+    if db is None:
+        return FarfieldState(False)
     try:
         value = db.getValue('gmsh/farfield/enabled')
     except Exception:  # noqa: BLE001 - a case without the leaf
-        return False
-    return _truthy(getattr(value, 'value', value))
+        return FarfieldState(False)
+    return FarfieldState(_truthy(getattr(value, 'value', value)),
+                         farfield_shape(db))
 
 
-def farfield_cuts(found: CaseSolids, enabled: bool) -> bool:
-    """Whether the far-field box subtracts every solid of *found*.
+def farfield_cuts(found: CaseSolids, enabled) -> bool:
+    """Whether the far field subtracts every solid of *found*.
 
     DP-915. With the box on, the runner cuts it against every imported
     volume (``occ.cut`` with ``removeTool``) and every imported volume is
@@ -535,33 +589,60 @@ def farfield_cuts(found: CaseSolids, enabled: bool) -> bool:
         solid.measured == MEASURED_OCC for solid in found.solids)
 
 
-def farfield_note(names) -> str:
-    """What detect says when the far-field box is the fluid (DP-915)."""
+def farfield_note(names, shape: str = 'box') -> str:
+    """What detect says when the far field is the fluid (DP-915).
+
+    Plan 37 UF13: *shape* is the far field's, so a sphere is not called a
+    box. The box sentence is unchanged.
+    """
+    shape = _shape_word(shape)
     names = [str(name) for name in names]
     bodies = (f"'{names[0]}'" if len(names) == 1
               else ', '.join(f"'{name}'" for name in names))
     noun = 'body' if len(names) == 1 else 'bodies'
-    return (f'The far-field box is on: the run cuts {bodies} out of the box, '
+    return (f'The far-field {shape} is on: the run cuts {bodies} out of the '
+            f'{shape}, '
             f'so the {noun} {"is" if len(names) == 1 else "are"} the '
             'obstacle and the fluid is the space around '
             f'{"it" if len(names) == 1 else "them"}. That one fluid region '
             'is built by the run itself; there is nothing to apply.')
 
 
-FARFIELD_OFF_NOTE = (
-    'External flow on Gmsh: the far-field box is off, so the run meshes the '
-    'solids themselves. Turn the far-field box on (describe the geometry) to '
-    'mesh the space around the bodies, or accept a solid only if it is the '
-    'flow domain around them.')
+def farfield_off_note(shape: str = 'box') -> str:
+    """What detect says in external flow with the far field off (DP-915).
 
-FARFIELD_TESSELLATED_NOTE = (
-    'The far-field box is on, but it is cut by the CAD kernel and this '
-    'geometry is tessellated, so the run builds no box and meshes the solids '
-    'themselves. Import the geometry as STEP to have the box built.')
+    Plan 37 UF13: it names the shape chosen for the far field; the box
+    sentence is `FARFIELD_OFF_NOTE`, unchanged.
+    """
+    shape = _shape_word(shape)
+    return (f'External flow on Gmsh: the far-field {shape} is off, so the '
+            f'run meshes the solids themselves. Turn the far-field {shape} '
+            'on (describe the geometry) to mesh the space around the bodies, '
+            'or accept a solid only if it is the flow domain around them.')
+
+
+FARFIELD_OFF_NOTE = farfield_off_note('box')
+
+
+def farfield_tessellated_note(shape: str = 'box') -> str:
+    """Why a far field on a tessellated import is not built (DP-915).
+
+    Plan 37 UF13: it names the far field's own shape; the box sentence is
+    `FARFIELD_TESSELLATED_NOTE`, unchanged.
+    """
+    shape = _shape_word(shape)
+    return (f'The far-field {shape} is on, but it is cut by the CAD kernel '
+            f'and this geometry is tessellated, so the run builds no {shape} '
+            'and meshes the solids themselves. Import the geometry as STEP '
+            f'to have the {shape} built.')
+
+
+FARFIELD_TESSELLATED_NOTE = farfield_tessellated_note('box')
 
 
 def propose(found: CaseSolids, count: int, typing: dict | None = None, *,
-            external: bool = False, farfield: bool = False) -> dict:
+            external: bool = False, farfield=False,
+            shape: str | None = None) -> dict:
     """The RP7 detect payload, answered from the solids.
 
     ``spaces`` are the solids, largest first, each with RP7's keys (``seed``
@@ -577,12 +658,18 @@ def propose(found: CaseSolids, count: int, typing: dict | None = None, *,
     mismatch; asking for more is ``farfield_is_the_fluid``. In external flow
     otherwise, as on the voxel path (DP-864), the solids past the count are
     not a surplus, and ``note`` says the box is off.
+
+    Plan 37 UF13. *farfield* may be the far field's shape, as
+    `farfield_enabled` returns it (whose ``shape`` survives the far field
+    being off), or *shape* names it; every note then says sphere or cylinder
+    rather than box. Neither given is the box.
     """
     from foammesh.core.mesh import fluid_regions
 
     count = int(count)
     typing = dict(typing or {})
     cut = farfield_cuts(found, farfield)
+    shape = _shape_word(shape or shape_of(farfield))
     ordered = sorted(found.solids, key=lambda solid: -solid.volume)
     rows = []
     for index, solid in enumerate(ordered, start=1):
@@ -605,7 +692,7 @@ def propose(found: CaseSolids, count: int, typing: dict | None = None, *,
                   else fluid_regions.FARFIELD_IS_THE_FLUID)
         mismatch = (None if reason is None else
                     {'asked': count, 'found': 1, 'reason': reason})
-        note = farfield_note(row['name'] for row in rows)
+        note = farfield_note((row['name'] for row in rows), shape)
         typed = [row['name'] for row in rows
                  if typing.get(row['region_uuid'])]
         if typed:
@@ -629,9 +716,9 @@ def propose(found: CaseSolids, count: int, typing: dict | None = None, *,
         mismatch = (None if reason is None else
                     {'asked': count, 'found': found_count, 'reason': reason})
         if farfield and rows:
-            note = FARFIELD_TESSELLATED_NOTE
+            note = farfield_tessellated_note(shape)
         elif external and rows:
-            note = FARFIELD_OFF_NOTE
+            note = farfield_off_note(shape)
     return {'spaces': rows, 'proposed': proposed,
             'found_enclosed': found_count, 'mismatch': mismatch,
             'h': None, 'voxels': 0, 'elapsed': float(found.elapsed),

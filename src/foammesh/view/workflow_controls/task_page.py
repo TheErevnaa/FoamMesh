@@ -308,6 +308,10 @@ class EngineTaskPage(QWidget):
     #: The branch owns that button, so a page that can refuse the run says so
     #: rather than shutting a button of its own -- see ``runAllRefusal``.
     runAllRefusalChanged = Signal(str)
+    #: Plan 37 UF5 DP-1043. The user asked to unlock this (locked) task.
+    unlockRequested = Signal(str)
+    #: Whether this task's published result is the mesh on disk.
+    _resultLockedFlag = False
 
     def __init__(self, facade_client, task_id: str, parent=None, *,
                  engine_id: str | None = None):
@@ -398,6 +402,36 @@ class EngineTaskPage(QWidget):
         # is for`, which is where a reader looks for an explanation they did
         # not ask for. `_description` and `_prerequisites` are still built,
         # still filled, and still where the words are authored.
+        # Plan 37 UF5 DP-1043. A task whose result is the mesh on disk is
+        # read-only, and the page says so where the settings start -- with
+        # the one way out beside it. It also says what selecting the row did
+        # *not* do: an earlier step's page shows the settings that step was
+        # run with, not a mesh of its own.
+        self._resultLock = QWidget(self)
+        self._resultLock.setObjectName('engineTaskResultLock')
+        lock_row = QHBoxLayout(self._resultLock)
+        lock_row.setContentsMargins(0, 0, 0, 0)
+        self._resultLockText = QLabel(self.tr(
+            'Locked: the mesh on disk was made from these settings, so they '
+            'are read-only. Opening this step does not bring back its own '
+            'mesh — the mesh on screen is still the latest result.'),
+            self._resultLock)
+        self._resultLockText.setObjectName('engineTaskResultLockText')
+        self._resultLockText.setWordWrap(True)
+        self._resultLockText.setProperty('foammeshStatus', 'info')
+        self._unlock = QPushButton(
+            self.tr('Unlock and discard later results…'), self._resultLock)
+        self._unlock.setObjectName('engineTaskUnlock')
+        self._unlock.setAccessibleDescription(self.tr(
+            'Reopen this step and the steps after it that depend on it. '
+            'Their results are discarded; a copy is kept so the previous '
+            'result can be restored.'))
+        self._unlock.clicked.connect(
+            lambda: self.unlockRequested.emit(self.task_id))
+        lock_row.addWidget(self._resultLockText, 1)
+        lock_row.addWidget(self._unlock, 0)
+        self._resultLock.setVisible(False)
+        outer.addWidget(self._resultLock)
         for widget in (self._status, self._revisit, self._warnings,
                        self._preview_note):
             outer.addWidget(widget)
@@ -529,6 +563,26 @@ class EngineTaskPage(QWidget):
         self.setRunStageAvailable(not self.run_stage_unavailable,
                                   self.run_stage_unavailable)
         self.refresh()
+
+    def setResultLocked(self, locked: bool) -> None:
+        """Make the page read-only while its result is the mesh on disk.
+
+        Plan 37 UF5 DP-1043. The facade refuses the edit either way
+        (DP-1040); this is so the page does not offer one it will refuse.
+        The whole settings body goes read-only -- editors and adopted panels
+        alike -- and so do the commit buttons.
+        """
+        locked = bool(locked)
+        self._resultLockedFlag = locked
+        self._resultLock.setVisible(locked)
+        self._body.setEnabled(not locked)
+        self._revert.setEnabled(not locked)
+        if locked:
+            self._update.setEnabled(False)
+            self._preview.setEnabled(False)
+
+    def isResultLocked(self) -> bool:
+        return self._resultLockedFlag
 
     def setRunStageAvailable(self, available: bool, reason: str = '') -> None:
         """Gate the per-stage run button and say why when it is shut.
@@ -765,6 +819,33 @@ class EngineTaskPage(QWidget):
         # has a downstream cost and taken away again when the edit is gone.
         self._clear_revisit_note()
         self._set_dirty(False)
+
+    def refresh_keeping_edits(self, *_args) -> None:
+        """Re-read the page after one of its own tables wrote a row.
+
+        Plan 37 UF20. MEASURED live (snappy elbow): a concave angle and a
+        merge-faces choice typed on Boundary layers, and the two cell limits
+        typed on Castellation, were gone by Proceed -- each page's table
+        wrote a row, its ``childrenChanged`` re-read the whole page, and the
+        re-read put the stored values back over the typed ones and dropped
+        them from the page's unsaved edits. A row the user adds is not a
+        reason to throw away what they typed above it; a history move, which
+        calls ``refresh`` itself, still is (DP-363).
+        """
+        pending = dict(self._pending)
+        self.refresh()
+        if not pending:
+            return
+        for field_id, value in pending.items():
+            editor = self._editors.get(field_id)
+            if editor is None:
+                continue
+            editor.set_value(value)
+            self._pending[field_id] = value
+        self._inactive_fields = refresh_applicability(
+            self._client, self._editors, self._pending)
+        self._refresh_advanced_header()
+        self._set_dirty(bool(self._pending))
 
     def _prerequisite_ids(self) -> tuple:
         """The tasks this line should name: what the user must settle first.
@@ -1361,6 +1442,7 @@ class EngineTaskPage(QWidget):
         # one is an edit made on this page and has to light this page's
         # Update.
         dirty = bool(dirty) or any(panel.is_dirty for panel in self._panels)
+        dirty = dirty and not self._resultLockedFlag
         self._update.setEnabled(dirty)
         self._preview.setEnabled(dirty)
         self.dirtyChanged.emit(dirty)
@@ -1429,9 +1511,57 @@ class EngineTaskPage(QWidget):
             panel.reload()
         self.clear_preview()
         self._set_dirty(False)
-        self.updateRequested.emit(self.task_id)
+        # Plan 37 UF3 DP-1034. A patch the facade answered `no_op` changed
+        # nothing, so there is nothing to configure: sending the transition
+        # anyway staled a finished mesh that the settings still describe,
+        # and Proceed then meshed it again for no reason.
+        if not payload.get('no_op'):
+            self.updateRequested.emit(self._configured_task(payload))
         self.refresh()
         return True
+
+    def _configured_task(self, payload) -> str:
+        """The task an accepted patch made the next one to run.
+
+        Plan 37 UF15. Usually this page's own. A field the engine reads at an
+        earlier stage -- snappy's mesh-quality limits, read by Snap and
+        Layers but set on Quality -- comes back with the stage tasks the
+        facade staled for it, earliest first, and the run has to start from
+        the earliest of those: configuring this page's task instead would
+        ask for a check of a mesh that is about to be remade.
+        """
+        staled = [str(task) for task in (payload.get('staled_tasks') or ())]
+        return staled[0] if staled else self.task_id
+
+    def child_edit_committed(self, panel=None) -> None:
+        """A table on this page wrote a row: the task's settings changed.
+
+        Plan 37 UF3 DP-1035. Refinement groups, layer groups and size fields
+        are written by their own tables, one command per row, and none of
+        them told the workflow. MEASURED in the user's report: back to a
+        meshed step, add a size field, Proceed -- the step still read done
+        and the mesh on screen was the one made without it. A committed row
+        is the same news as a saved field, so it is announced the same way.
+        """
+        self.updateRequested.emit(self.task_id)
+
+    def _child_panels(self) -> list:
+        from .child_controls import ChildControlPanel
+        return list(self.findChildren(ChildControlPanel))
+
+    async def settle_child_writes(self) -> bool:
+        """Wait for this page's table writes; False if one was refused.
+
+        Plan 37 UF3 DP-1035. A row written a moment before Proceed is still
+        in flight when the press saves the page, and the settle that follows
+        would read the graph from before it.
+        """
+        settled = True
+        for panel in self._child_panels():
+            waiter = getattr(panel, 'settle_writes', None)
+            if waiter is not None and not await waiter():
+                settled = False
+        return settled
 
     def apply(self):
         if not self.is_dirty:
@@ -1470,11 +1600,19 @@ class EngineTaskPage(QWidget):
         if not self.is_dirty:
             return True
         runner = getattr(self._client, 'run', None)
-        if runner is None:
-            return False
         try:
-            result = await runner('configuration.patch',
+            if runner is None:
+                # Plan 37 UF3. A client with no loop -- the headless shell,
+                # a scripted walk -- still saves; there is nothing to await,
+                # so the write simply runs where it is.
+                blocking = getattr(self._client, 'run_sync', None)
+                if blocking is None:
+                    return False
+                result = blocking('configuration.patch',
                                   {'patch': self.pending_patch()})
+            else:
+                result = await runner('configuration.patch',
+                                      {'patch': self.pending_patch()})
         except Exception:
             return False
         return self._patch_accepted(result)

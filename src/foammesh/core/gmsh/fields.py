@@ -248,6 +248,29 @@ CONTROLS = _register(
     GmshControl('gmsh/farfield/padding', RUNNER, 'occ.addBox',
                 native_kind=API,
                 note='multiples of the bounding-box diagonal, per side'),
+    # Plan 37 UF13 (section 4.4). The shared farfield specification: the
+    # shape picks the OCC primitive the solids are cut out of, and the rest
+    # size and place it. Containment is checked before the cut.
+    GmshControl('gmsh/farfield/shape', RUNNER,
+                'occ.addBox|occ.addSphere|occ.addCylinder', native_kind=API,
+                note='box, sphere or cylinder; faces named geometrically '
+                     'after the cut'),
+    GmshControl('gmsh/farfield/centreMode', RUNNER,
+                'occ.addSphere|occ.addCylinder', native_kind=API,
+                note='auto = the imported bounding-box centre'),
+    *(GmshControl(f'gmsh/farfield/centre/{axis}', RUNNER,
+                  'occ.addBox|occ.addSphere|occ.addCylinder', native_kind=API,
+                  note='metres; read only when the centre is explicit')
+      for axis in 'xyz'),
+    GmshControl('gmsh/farfield/radius', RUNNER,
+                'occ.addSphere|occ.addCylinder', native_kind=API,
+                note='metres; refused unless every body fits with clearance'),
+    GmshControl('gmsh/farfield/length', RUNNER, 'occ.addCylinder',
+                native_kind=API, note='metres, cap to cap'),
+    *(GmshControl(f'gmsh/farfield/axis/{axis}', RUNNER, 'occ.addCylinder',
+                  native_kind=API,
+                  note='direction only, normalised; zero is refused')
+      for axis in 'xyz'),
 
     # -- parallel -------------------------------------------------------- #
     GmshControl('gmsh/parallel/threads', RUNNER,

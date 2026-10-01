@@ -159,6 +159,8 @@ def _collection_ui(collection_id: str) -> str:
         'meshing.castellation.volume_refinements': 'workflow.castellation',
         'meshing.castellation.feature_bands': 'workflow.castellation',
         'meshing.castellation.volume_bands': 'workflow.castellation',  # DP-586
+        # Plan 37 UF16. Read at castellation, authored beside the seeds.
+        'meshing.castellation.exclude_points': 'workflow.region',
         'meshing.layers.groups': 'workflow.layers',
         'geometry.interface_pairs': 'workflow.geometry.interfaces',
     }.get(collection_id, '')

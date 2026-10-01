@@ -43,6 +43,56 @@ SLAVE = ('slaveLayerGroup', 'slave_layer_group')
 _LAYERED = (CFDType.BOUNDARY.value, CFDType.INTERFACE.value)
 
 
+#: Plan 37 UF20. Layer groups written a moment ago whose geometry binding is
+#: still on its way. A group is created (or edited) first and bound second, as
+#: two writes; between them no geometry row names it, which is exactly how an
+#: unused group looks to the legacy Boundary layer page's prune. MEASURED
+#: live (snappy elbow): ``create meshing.layers.groups/1`` at 15:48:03.7, the
+#: hidden legacy page's ``remove unused layer groups`` at 15:48:04.5, the
+#: binding at 15:48:10.1 -- the user's group was gone and the page's default
+#: "Walls" took its id.
+_BINDING_PENDING: set[str] = set()
+
+
+def hold_binding(group) -> None:
+    """Mark *group* as written and about to be bound."""
+    key = _key(group)
+    if key is not None:
+        _BINDING_PENDING.add(key)
+
+
+def release_binding(group) -> None:
+    """The binding for *group* has landed (or will not come)."""
+    key = _key(group)
+    if key is not None:
+        _BINDING_PENDING.discard(key)
+
+
+#: Group writes sent and not yet answered. MEASURED on the re-run: the case
+#: announces the create before the page hears its answer, and the legacy page
+#: repaints -- and prunes -- on that announcement, so while a write is out no
+#: id is known yet and every unbound group has to be spared.
+_WRITES_OUT = [0]
+
+
+def begin_group_write() -> None:
+    """A group create or edit has been sent; its id is not known yet."""
+    _WRITES_OUT[0] += 1
+
+
+def end_group_write() -> None:
+    """The write sent by ``begin_group_write`` has been answered."""
+    _WRITES_OUT[0] = max(0, _WRITES_OUT[0] - 1)
+
+
+def binding_pending(group) -> bool:
+    """Whether *group* is between its write and its binding."""
+    if _WRITES_OUT[0]:
+        return True
+    key = _key(group)
+    return key is not None and key in _BINDING_PENDING
+
+
 def _entry(gId, slave: bool) -> str:
     return f'{gId}s' if slave else str(gId)
 

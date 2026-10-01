@@ -12,6 +12,10 @@ from foammesh.view.workflow_controls.checkmesh_findings import (
     CheckMeshFindings,
 )
 
+from foammesh.view.snappy_workflow.qa_page import (  # Plan 37 UF18
+    CheckHighlightsPanel, _CheckMeshGroup,
+)
+
 from .base import GmshTaskPage
 
 
@@ -159,15 +163,32 @@ class GmshQaPage(GmshTaskPage):
         # whose QWidget base has not been constructed to be a parent.
         self._su2Findings = Su2ReadinessFindings(self._client)
         layout.addWidget(self._su2Findings)
+        # Plan 37 UF18. checkMesh's own settings -- thresholds and the four
+        # switches -- were reachable from the snappy QA page only, although
+        # the Gmsh route runs the same checkMesh with the same request
+        # (`checkmesh_request`). The same panel, adopted the same way.
+        self._check = self.adoptPanel(_CheckMeshGroup(self._client))
+        layout.addWidget(self._check)
+        self._highlights = CheckHighlightsPanel(self._client)
+        layout.addWidget(self._highlights)
+
+    def aligned_forms(self):
+        group = getattr(self, '_check', None)
+        form = getattr(group, 'form_layout', None)
+        return (form(),) if callable(form) else ()
 
     def refresh(self) -> None:
         super().refresh()
+        group = getattr(self, '_check', None)
+        if group is not None and hasattr(group, 'reload'):
+            # DP-339. A refresh keeps an uncommitted edit.
+            group.reload(discard_pending=False)
         self._describeCheck()
 
     def refresh_status(self) -> None:
         """Re-read the task's state *and* the report that produced it."""
         super().refresh_status()
-        for name in ('_findings', '_su2Findings'):
+        for name in ('_findings', '_su2Findings', '_highlights'):
             panel = getattr(self, name, None)
             if panel is not None:
                 panel.refresh()
@@ -217,6 +238,15 @@ class GmshQaPage(GmshTaskPage):
         # hidden one made, made louder.
         self._findings.setVisible(not su2)
         self._su2Findings.setVisible(su2)
+        check = getattr(self, '_check', None)
+        if check is not None and hasattr(check, 'setVisible'):
+            # Plan 37 UF18. checkMesh's settings only where it is the check.
+            check.setVisible(not su2)
+        highlights = getattr(self, '_highlights', None)
+        if highlights is not None:
+            highlights.setRouteAllowed(not su2)
+            if su2:
+                highlights.clear()
         for panel in (self._findings, self._su2Findings):
             panel.refresh()
         # W-O1. The sentence lands on the panel this check fills, so the

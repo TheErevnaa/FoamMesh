@@ -1,22 +1,26 @@
 """The small AF1 facade: registry, concurrency checks, and AF1V field patch."""
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 from foammesh.core.project import Event, Source
 
 from .application_session import ApplicationSession
 from .commands import Actor, ActorKind, Command, CommandSource
-from .domain_operations import DomainOperations
+from .domain_operations import DomainOperations, TaskLockedError
 from foammesh.support.simple_db.simple_db import ConcurrentEditError
 
 from .errors import (AuthorizationRequiredError, CaseNotFoundError, OperationNotFoundError,
                      PlanStaleError, RevisionConflictError, UndoNotAllowedError,
                      ValidationFailedError)
 from .field_adapters import build_entity_adapters, coerce_for_apply, read_value, values_equal
-from .field_metadata import MESH_FINGERPRINT, expand_fingerprints, stales
+from .field_metadata import (MESH_FINGERPRINT, MESH_STAGE_ENGINE_STAGES, earliest_stage,
+                             expand_fingerprints, stales)
 from .fields import REGISTRY as FIELD_REGISTRY
 from .operations import OperationKind, build_operation_registry
 from .presentation import PresentationOperations, PresentationState
@@ -24,6 +28,8 @@ from .results import OperationResult
 from .session import CaseSession
 from .plans import PlanState, PlanStore
 from .vertical_slice import VerticalSliceOperations
+
+logger = logging.getLogger(__name__)
 
 
 #: Collections whose rows carry a stable prepared-geometry scope token. Every
@@ -57,6 +63,231 @@ def _scope_is_unused(collection_id: str, normalized: dict) -> bool:
 # The full AF2 semantic-ID -> storage-path map, generated from the schema.
 FIELD_STORAGE = FIELD_REGISTRY.storage_map()
 
+
+#: Plan 37 UF5. Collections a task's page edits but whose descriptor task
+#: binds no field for them (a table page binds the rows, not the fields).
+_SUPPLEMENTARY_COLLECTION_TASKS = {
+    'gmsh': {
+        'gmsh.size_fields.controls': 'gmsh.size_fields',
+        'gmsh.surface_sizes.controls': 'gmsh.size_fields',
+        'gmsh.curve_controls.controls': 'gmsh.curve_controls',
+        'gmsh.volume_controls.controls': 'gmsh.volume_controls',
+        'gmsh.periodic_pairs.controls': 'gmsh.periodic',
+    },
+    'snappy': {},
+}
+
+#: Plan 37 DP-1102. Storage paths no task's fields bind, yet a stage's
+#: result was built from them. The farfield is one record both engines read
+#: (edited from the Geometry page), so after publish an edit to it went
+#: straight past the lock.
+_SUPPLEMENTARY_PATH_TASKS = {
+    'gmsh': {'gmsh/farfield': 'gmsh.describe_geometry'},
+    'snappy': {'gmsh/farfield': 'snappy.domain_regions'},
+}
+
+#: Plan 37 UF5 DP-1063. The geometry and region lists are no one page's
+#: fields -- no task binds them -- yet every stage's result was made from
+#: them, so an edit to either went straight past the lock. Each list maps to
+#: the tasks that consume it, first choice first: the first of them that is
+#: locked names the refusal (a Gmsh volume page left at its defaults is not
+#: published, and its regions were still meshed under the geometry step). A
+#: few leaves map to the one stage that reads them. An empty tuple is a leaf
+#: the mesh does not consume: a geometry's name is its patch name, which a
+#: rename changes on the mesh too, without a new mesh.
+_ITEM_LOCKS = {
+    'snappy': {
+        'roots': {'geometry': ('snappy.domain_regions',),
+                  'region': ('snappy.domain_regions',)},
+        'leaves': {'geometry': {'name': (),
+                                'castellationGroup': ('snappy.castellation',),
+                                'layerGroup': ('snappy.layers',),
+                                'slaveLayerGroup': ('snappy.layers',)}},
+    },
+    'gmsh': {
+        'roots': {'geometry': ('gmsh.describe_geometry',),
+                  'region': ('gmsh.volume_controls', 'gmsh.describe_geometry')},
+        'leaves': {'geometry': {'name': ()}},
+    },
+}
+
+
+def _item_lock_task(engine_id: str, changed: str, locked):
+    """The locked task an item-list path is refused under; ``None`` when it
+    is exempt or nothing it feeds is locked, ``_UNMATCHED`` when the path is
+    not in the geometry or region lists."""
+    rules = _ITEM_LOCKS.get(engine_id)
+    parts = str(changed).strip('/').split('/')
+    if not rules or parts[0] not in rules['roots']:
+        return _UNMATCHED
+    leaves = rules['leaves'].get(parts[0], {})
+    candidates = (leaves[parts[2]] if len(parts) > 2 and parts[2] in leaves
+                  else rules['roots'][parts[0]])
+    return next((task for task in candidates if task in locked), None)
+
+
+_UNMATCHED = object()
+
+
+def _changed_geometry_files(session, data) -> list:
+    """Geometry surfaces (``_files``) a working copy added or replaced.
+
+    A checkout shares the VTK objects, so a surface the copy did not touch is
+    the same object in both; anything else is a new or re-cut surface.
+    """
+    mine = (getattr(data, '_files', None) or {}).get('geometry') or {}
+    theirs = (getattr(session.state.db, '_files', None) or {}).get('geometry') or {}
+    return sorted(f'_files/geometry/{key}' for key, value in mine.items()
+                  if theirs.get(key) is not value)
+
+
+_LOCK_PATHS: dict = {}
+
+
+def _lock_paths(descriptor) -> tuple:
+    """``(storage path, task id)`` for every input a task's result consumed."""
+    key = (descriptor.engine_id, descriptor.digest)
+    cached = _LOCK_PATHS.get(key)
+    if cached is not None:
+        return cached
+    collections = FIELD_REGISTRY.collections
+    pairs = []
+    for task in descriptor.ordered_tasks():
+        for binding in task.fields:
+            if binding.field_id in FIELD_STORAGE:
+                pairs.append((FIELD_STORAGE[binding.field_id], task.task_id))
+            elif binding.field_id in collections:
+                pairs.append((collections[binding.field_id].storage_path, task.task_id))
+    for collection_id, task_id in _SUPPLEMENTARY_COLLECTION_TASKS.get(
+            descriptor.engine_id, {}).items():
+        if collection_id in collections:
+            pairs.append((collections[collection_id].storage_path, task_id))
+    pairs.extend(_SUPPLEMENTARY_PATH_TASKS.get(descriptor.engine_id, {}).items())
+    # Plan 37 UF15. A field this engine reads at an earlier stage than the
+    # task that shows it -- snappy's mesh-quality limits, set on Quality but
+    # read by Snap and Layers -- is also an input of that stage's result.
+    stage_tasks = {task.engine_stage: task.task_id
+                   for task in descriptor.ordered_tasks() if task.engine_stage}
+    for field_id, storage in FIELD_STORAGE.items():
+        if field_id not in FIELD_REGISTRY:
+            continue
+        field = FIELD_REGISTRY.get(field_id)
+        if not any(name == descriptor.engine_id
+                   for name, _ in field.invalidates_by_engine):
+            continue
+        stage = earliest_stage(field.invalidates_for(descriptor.engine_id))
+        task_id = stage_tasks.get(MESH_STAGE_ENGINE_STAGES.get(stage))
+        if task_id is not None:
+            pairs.append((storage, task_id))
+    cached = tuple((path.strip('/'), task_id) for path, task_id in pairs)
+    _LOCK_PATHS[key] = cached
+    return cached
+
+
+def _changed_paths(data) -> list:
+    """The full storage paths a working copy changed, relative to the db root."""
+    from foammesh.support.simple_db.simple_db import _diffLeaves
+    base = str(getattr(data, '_base', '') or '').strip('/')
+    leaves = _diffLeaves(data._schema, data._baseline, data._content)
+    paths = []
+    for leaf in leaves:
+        leaf = str(leaf).strip('/')
+        paths.append(f'{base}/{leaf}' if base and leaf else (base or leaf))
+    return paths
+
+
+def refuse_locked_edit(session, data) -> None:
+    """Plan 37 UF5 DP-1040. Refuse an edit to a locked task's mesh inputs.
+
+    The lock is the facade's, not the widgets': the GUI's page commits, the
+    CLI's patches and an agent's collection edits all arrive here, and a task
+    whose published result the edit would silently contradict refuses it with
+    a typed error that names the task and the way out (unlock).
+    """
+    found = _locked_tasks_of(session)
+    if found is None:
+        return
+    engine_id, descriptor, locked = found
+    hits: dict = {}
+    for changed in _changed_paths(data):
+        item_task = _item_lock_task(engine_id, changed, locked)
+        if item_task is not _UNMATCHED:
+            if item_task is not None:
+                hits.setdefault(item_task, []).append(changed)
+            continue
+        for path, task_id in _lock_paths(descriptor):
+            if task_id not in locked:
+                continue
+            if (changed == path or changed.startswith(path + '/')
+                    or path.startswith(changed + '/')):
+                hits.setdefault(task_id, []).append(changed)
+    surfaces = _changed_geometry_files(session, data)
+    geometry_task = _item_lock_task(engine_id, 'geometry', locked)
+    if surfaces and geometry_task not in (None, _UNMATCHED):
+        hits.setdefault(geometry_task, []).extend(surfaces)
+    _raise_locked(engine_id, descriptor, hits)
+
+
+def refuse_locked_items(session, root: str, *, operation: str = '') -> None:
+    """Plan 37 UF5 DP-1063. Refuse an operation that rewrites the geometry
+    (``root='geometry'``) or the regions (``'region'``) of a locked case.
+
+    For the operations that change the geometry artifacts on disk -- import,
+    repair, wrap, split, patch cuts -- before they write anything, since
+    there is no working copy to diff once the artifact store has changed.
+    """
+    found = _locked_tasks_of(session)
+    if found is None:
+        return
+    engine_id, descriptor, locked = found
+    task_id = _item_lock_task(engine_id, root, locked)
+    if task_id in (None, _UNMATCHED):
+        return
+    _raise_locked(engine_id, descriptor,
+                  {task_id: [f'{root} ({operation})' if operation else root]})
+
+
+def _locked_tasks_of(session):
+    """``(engine id, descriptor, locked task ids)``, or ``None`` when
+    nothing is locked (or the case has no engine yet).
+
+    This runs on the owner loop for every configuration edit, so the common
+    case -- nothing ever published -- is answered from one directory listing
+    before the engine registry and its workflow descriptor are touched (the
+    AF1 owner-loop budget measured a 65-98 ms first edit when it was not).
+    """
+    workflow = Path(session.case_path) / 'foammesh' / 'workflow'
+    if not any(workflow.glob('*-publications.json')):
+        return None
+    from foammesh.core.engine.registry import ENGINE_REGISTRY, configured_engine_id
+    from foammesh.core.workflow.task_state_store import EngineTaskStateStore
+    try:
+        engine_id = str(configured_engine_id(session.state.db)).strip().lower()
+        descriptor = ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
+    except Exception:
+        return None
+    store = EngineTaskStateStore(session.case_path, descriptor)
+    if not store.publications_path.is_file():
+        return None
+    locked = set(store.locked_tasks())
+    if not locked:
+        return None
+    return engine_id, descriptor, locked
+
+
+def _raise_locked(engine_id, descriptor, hits: dict) -> None:
+    if not hits:
+        return
+    tasks = [task.task_id for task in descriptor.ordered_tasks() if task.task_id in hits]
+    titles = [descriptor.task(task_id).title for task_id in tasks]
+    raise TaskLockedError(
+        f'{", ".join(titles)} {"is" if len(titles) == 1 else "are"} locked: '
+        'the mesh on disk was made from these settings. Unlock the step '
+        '(discarding the results after it) to change them.',
+        details={'tasks': tasks, 'titles': titles, 'engine_id': engine_id,
+                 'paths': sorted({item for values in hits.values() for item in values}),
+                 'unlock_operation': 'mesh.workflow.unlock'})
+
 # The ten AF1V fields remain a named, frozen subset of the full registry.
 AF1V_FIELDS = {
     field_id: FIELD_STORAGE[field_id] for field_id in (
@@ -75,8 +306,13 @@ AF1V_FIELDS = {
 _WHOLE_WORKING_COPY_STALES = stales('mesh.base_grid', 'quality')
 
 
-def _invalidation_for(field_ids) -> tuple[str, ...]:
+def _invalidation_for(field_ids, engine_id=None) -> tuple[str, ...]:
     """Union of the artifact fingerprints the changed fields stale (§6.7).
+
+    Plan 37 UF15. Resolved on ``engine_id``'s route: a field may stale more
+    on one engine than another (``FieldDescriptor.invalidates_for``) -- the
+    mesh-quality limits stale the snapped mesh onward on snappy, which meshes
+    against them, and only the quality report on Gmsh, which does not.
 
     Plan 32 W4 (DP-242). The union is resolved through
     ``expand_fingerprints``, so a field naming a snappyHexMesh stage stales
@@ -89,8 +325,80 @@ def _invalidation_for(field_ids) -> tuple[str, ...]:
     invalidated: set[str] = set()
     for field_id in field_ids:
         if field_id in FIELD_REGISTRY:
-            invalidated.update(FIELD_REGISTRY.get(field_id).invalidates)
+            invalidated.update(
+                FIELD_REGISTRY.get(field_id).invalidates_for(engine_id))
     return expand_fingerprints(invalidated)
+
+
+def _session_engine(session) -> str | None:
+    """The engine the case is configured for, or ``None`` before one is."""
+    from foammesh.core.engine.registry import configured_engine_id
+    try:
+        engine_id = str(configured_engine_id(session.state.db) or '').strip().lower()
+    except Exception:                                        # noqa: BLE001
+        return None
+    return engine_id or None
+
+
+def _engine_stage_tasks(engine_id, field_ids) -> tuple[str, ...]:
+    """The engine tasks an engine-specific invalidation reaches back to.
+
+    Plan 37 UF15. The task graph learns of an edit from the page it was made
+    on, which configures that page's own task and stales what follows it.
+    A field that stales an *earlier* stage on this engine than the task that
+    owns it -- a mesh-quality limit, edited on Quality after Layers, that
+    snappy reads at Snap -- has to stale that stage's task too, or the
+    outline shows Snap and Layers done over a mesh made with the old limits.
+    Only fields with an ``invalidates_by_engine`` row for this engine are
+    asked: every other field's stage is the stage of the task it is bound to.
+    """
+    if not engine_id:
+        return ()
+    stages: set[str] = set()
+    for field_id in field_ids:
+        if field_id not in FIELD_REGISTRY:
+            continue
+        descriptor = FIELD_REGISTRY.get(field_id)
+        if not any(name == engine_id for name, _ in descriptor.invalidates_by_engine):
+            continue
+        stage = earliest_stage(descriptor.invalidates_for(engine_id))
+        if stage is not None:
+            stages.add(MESH_STAGE_ENGINE_STAGES[stage])
+    if not stages:
+        return ()
+    from foammesh.core.engine.registry import ENGINE_REGISTRY
+    try:
+        workflow = ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
+    except Exception:                                        # noqa: BLE001
+        return ()
+    return tuple(task.task_id for task in workflow.ordered_tasks()
+                 if task.engine_stage in stages)
+
+
+def _stale_engine_stages(session, engine_id, field_ids) -> tuple[str, ...]:
+    """Stale the stage tasks ``_engine_stage_tasks`` names; returns what moved.
+
+    A stage that never ran has no result to stale, and the graph's own
+    ``invalidate`` leaves it alone, so a case not yet meshed is untouched.
+    """
+    task_ids = _engine_stage_tasks(engine_id, field_ids)
+    if not task_ids:
+        return ()
+    from foammesh.core.engine.registry import ENGINE_REGISTRY
+    from foammesh.core.workflow.task_state_store import EngineTaskStateStore
+    store = EngineTaskStateStore(
+        session.case_path, ENGINE_REGISTRY.get(engine_id).workflow_descriptor())
+    if not store.path.is_file():
+        return ()
+    graph = store.load()
+    changed: list[str] = []
+    for task_id in task_ids:
+        for stale in graph.invalidate(task_id, include_self=True):
+            if stale not in changed:
+                changed.append(stale)
+    if changed:
+        store.save(graph)
+    return tuple(changed)
 
 
 def _publish_verdict_staleness(session, invalidated, changed) -> None:
@@ -198,7 +506,7 @@ class FoamMeshFacade:
         self.register('artifact.report.generate', self.slice_operations.generate_report)
         self.register('job.test.start', self.slice_operations.start_job)
         self.register('job.cancel', self.slice_operations.cancel_job)
-        self.register('job.cancel_active', self.slice_operations.cancel_active_jobs)
+        self.register('job.cancel_active', self._cancel_active_jobs)
         for collection_id in self.entities:
             self.register(f'{collection_id}.create', self._make_collection_create(collection_id))
             self.register(f'{collection_id}.patch', self._make_collection_patch(collection_id))
@@ -210,8 +518,98 @@ class FoamMeshFacade:
 
     def attach(self, session: CaseSession) -> CaseSession:
         self._cases[session.case_id] = session
+        # The lock check behind every configuration edit reads the engine
+        # registry; importing it here, at attach, keeps that one-time cost
+        # off the owner loop's first edit after a publish.
+        import foammesh.core.engine.registry  # noqa: F401
         self._publish_prepared_catalogue(session)
+        self._recover_interrupted_unlock(session)
+        self._recover_interrupted_redistribute(session)
         return session
+
+    def _recover_interrupted_redistribute(self, session: CaseSession) -> dict | None:
+        """Plan 37 UF17. Settle a core-count change a crash interrupted.
+
+        Before publication the live processor cases were never touched and
+        the stage is discarded; mid-publication the swap is finished or
+        undone by rename; after it the retired ranks are removed. A change
+        whose files landed but whose core-count setting did not gets the
+        setting now, so the next parallel stage reuses these ranks.
+        """
+        from foammesh.core.jobs import redistribute_transaction as transaction
+        if session.read_only or not transaction.transactions_root(
+                session.case_path).is_dir():
+            return None
+        try:
+            report = transaction.recover_at_open(session.case_path)
+        except OSError:
+            logger.warning('core-count change recovery failed', exc_info=True)
+            return None
+        for item in report['settings']:
+            try:
+                transaction.apply_setting(session, item['target_ranks'],
+                                          reason='redistribute recovery')
+            except Exception:  # noqa: BLE001 - the executor's gate retries
+                logger.warning('core-count setting of %s could not be published',
+                               item['id'], exc_info=True)
+                continue
+            transaction.finish(session.case_path, item['id'])
+        return report
+
+    def _recover_interrupted_unlock(self, session: CaseSession) -> dict | None:
+        """Plan 37 UF5 DP-1062. Settle an unlock or undo a crash interrupted.
+
+        Every way a case is opened -- the desktop's in-place session, the
+        facade's own ``open_case``, the CLI and the API -- attaches it here,
+        so this is the one place a half-done unlock is rolled back (it is
+        two small files) and a half-done undo finished, before anything can
+        ask for a run. The executor's gate still refuses a run while an
+        undo is waiting, so a case another flow holds right now is safe to
+        leave to it.
+        """
+        from foammesh.core.jobs import stage_snapshots, unlock_transaction
+        if session.read_only:
+            return None
+        try:
+            # Plan 37 UF5: a stage snapshot copy or a replay restore that a
+            # crash interrupted is removed or rolled back before any run.
+            stage_snapshots.recover(session.case_path)
+        except OSError:
+            logger.warning('stage snapshot recovery failed', exc_info=True)
+        if not unlock_transaction.pending_root(session.case_path).is_dir():
+            return None
+        report = unlock_transaction.recover_at_open(session.case_path)
+        if not report['waiting'] or report['busy']:
+            return report
+        # An undo was interrupted: its settings go back through the project
+        # state, so it is finished as the ordinary undo command -- queued on
+        # the owner loop when there is one (the desktop), inline when not.
+        command = Command('mesh.workflow.undo_unlock', session.case_id, {},
+                          Actor('foammesh-recovery', ActorKind.SYSTEM),
+                          CommandSource.SYSTEM)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                result = asyncio.run(self.execute(command))
+                report['resumed'].extend([result.payload.get('operation_id')])
+                report['waiting'] = unlock_transaction.blocking_recovery(
+                    session.case_path)
+            except Exception:  # noqa: BLE001 - the executor's gate still refuses runs
+                logger.exception('could not finish the interrupted undo in %s',
+                                 session.case_path)
+            return report
+
+        async def finish():
+            try:
+                await self.execute(command)
+            except Exception:  # noqa: BLE001
+                logger.exception('could not finish the interrupted undo in %s',
+                                 session.case_path)
+        loop.create_task(finish(), name='foammesh-unlock-recovery')
+        return report
 
     @staticmethod
     def _publish_prepared_catalogue(session: CaseSession) -> None:
@@ -576,16 +974,22 @@ class FoamMeshFacade:
                 'error': str(error),
             }) from error
         self._validate_configuration_patch(changed, data)
+        refuse_locked_edit(session, data)
         transaction = session.state.commit(
             data, action='facade configuration patch', source=_source(command.source),
             target=','.join(sorted(changed)), reason=f'actor={command.actor.id}')
         latest = session.latest_change_set()
-        invalidated = _invalidation_for(changed)
+        engine_id = _session_engine(session)
+        invalidated = _invalidation_for(changed, engine_id)
+        staled_tasks = _stale_engine_stages(session, engine_id, changed)
         _publish_verdict_staleness(session, invalidated, tuple(sorted(changed)))
+        payload = {'transaction_id': transaction.tx_id,
+                   'change_set_id': latest['change_set_id'] if latest else None}
+        if staled_tasks:
+            payload['staled_tasks'] = list(staled_tasks)
         return OperationResult('accepted', command.operation, session.revisions,
                                tuple(sorted(changed)), invalidated,
-                               payload={'transaction_id': transaction.tx_id,
-                                        'change_set_id': latest['change_set_id'] if latest else None})
+                               payload=payload)
 
     def _commit_working_copy(self, session: CaseSession, command: Command) -> OperationResult:
         """Commit a pre-built editable working copy through the facade (§4.6).
@@ -607,6 +1011,7 @@ class FoamMeshFacade:
         action = command.parameters.get('action') or 'gui edit'
         reason = command.parameters.get('reason') or f'actor={command.actor.id}'
         try:
+            refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=action, source=_source(command.source),
                 target=command.parameters.get('target'), reason=reason)
@@ -641,7 +1046,8 @@ class FoamMeshFacade:
                                         read_only_check=True)
         diff = [{'field_id': field_id, **values} for field_id, values in sorted(changed.items())]
         return OperationResult('accepted', command.operation, session.revisions,
-                               tuple(sorted(changed)), _invalidation_for(changed),
+                               tuple(sorted(changed)),
+                               _invalidation_for(changed, _session_engine(session)),
                                payload={'dry_run': True, 'diff': diff,
                                         'would_change': bool(changed)})
 
@@ -678,6 +1084,7 @@ class FoamMeshFacade:
             self._validate_collection_row(
                 collection_id, data, f'{adapter.storage_path}/{key}',
                 normalized)
+            refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=f'create {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
@@ -708,6 +1115,7 @@ class FoamMeshFacade:
             self._validate_collection_row(
                 collection_id, data, f'{adapter.storage_path}/{key}',
                 normalized)
+            refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=f'edit {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
@@ -968,6 +1376,7 @@ class FoamMeshFacade:
                 raise ValidationFailedError('entity does not exist', details={
                     'collection': collection_id, 'entity_id': key})
             data.removeElement(adapter.storage_path, key)
+            refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=f'remove {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
@@ -1070,6 +1479,25 @@ class FoamMeshFacade:
                 break
             transactions.append(transaction)
         return transactions
+
+    async def _cancel_active_jobs(self, session: CaseSession,
+                                  command: Command) -> OperationResult:
+        """Everything the case is running, and a stage snapshot being copied.
+
+        Plan 37 UF5. A stage snapshot is copied in a worker thread after the
+        stage's process has ended, so no job owns it; its copy loop checks a
+        cancel event every chunk, which is what bounds the wait here.
+        """
+        from foammesh.core.jobs import stage_snapshots
+
+        copies = stage_snapshots.cancel_all(session.case_path)
+        result = await self.slice_operations.cancel_active_jobs(session, command)
+        if not copies:
+            return result
+        payload = dict(result.payload)
+        payload['snapshot_copies_cancelled'] = copies
+        payload['cancelled'] = int(payload.get('cancelled') or 0) + copies
+        return replace(result, payload=payload)
 
     def _revert_change_set(self, session: CaseSession, command: Command) -> OperationResult:
         change_set_id = command.parameters.get('change_set_id')

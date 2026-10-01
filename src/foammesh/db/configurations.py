@@ -112,6 +112,13 @@ class Configurations(SimpleDB):
         return key
 
     def removeGeometryPolyData(self, key):
+        # Plan 37 UF20. A primitive's surfaces have no file (``path`` is
+        # None); removing one used to store a ``None`` key beside the string
+        # ones, and every later sort of the store -- the copy an unlock keeps
+        # for its undo -- failed with "'<' not supported between NoneType
+        # and str".
+        if key is None:
+            return
         self._files['geometry'][key] = None
 
     def geometryPolyData(self, key):

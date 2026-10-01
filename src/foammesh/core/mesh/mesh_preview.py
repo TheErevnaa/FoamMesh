@@ -13,8 +13,8 @@ away from. The picture now comes from a worker (``foammesh.workers``):
   case's ``foammesh/cache/``. The window only reads that file back.
 * **Below** :data:`VOLUME_AUTO_MAX_CELLS` cells (D7) the worker also reads the
   volume, the way the viewport always did, and writes it as ``.vtu``; above
-  it, "Load full volume" asks for that, up to
-  ``resource_budget.FULL_VOLUME_MAX_CELLS``.
+  it, "Load full volume" asks for that, for a mesh of any cell count whose
+  read the free RAM holds (no fixed cap since 2026-10-01).
 * A surface above ``PREVIEW_MAX_TRIANGLES`` triangles, or one whose file would
   exceed ``PREVIEW_MAX_BYTES``, is decimated in the worker
   (``vtkQuadricDecimation``) and says so.
@@ -51,6 +51,10 @@ OPERATIONS = (OPERATION, VOLUME_OPERATION)
 
 #: D7. The volume is read by default only below this many cells.
 VOLUME_AUTO_MAX_CELLS = 200_000
+#: Opening the volume's ``.vtu`` in the window holds about this many times
+#: its bytes (the reader's buffer and the grid it builds), checked against
+#: the free RAM before it is opened -- there is no fixed size cap.
+VOLUME_LOAD_FACTOR = 3
 #: Must equal ``actor_info.SILHOUETTE_FEATURE_ANGLE``: the precomputed edges
 #: stand in for the ones the actor would have computed itself.
 FEATURE_ANGLE = 30.0
@@ -179,7 +183,7 @@ def case_counts(case, layout: str | None = None) -> dict | None:
                     total['formats'][key] = value
             mesh = rank / 'constant' / 'polyMesh'
             total['face_zone_bytes'] += _face_zone_bytes(mesh)
-            for patch in _read_boundary(mesh):
+            for patch in _read_boundary(mesh, any_format=True):
                 if patch.patch_type in PROCESSOR_TYPES:
                     continue
                 patches[patch.name] = patches.get(patch.name, 0) + patch.n_faces
@@ -204,6 +208,53 @@ def estimated_cells(counts: dict | None) -> int | None:
     # Every internal face bounds two cells, every boundary face one; a
     # hexahedron has six. Only used to choose between two ways of drawing.
     return max(1, (2 * internal + boundary) // 6)
+
+
+def size_counts(case, layout: str | None = None) -> dict | None:
+    """What a mesh's memory estimate needs when :func:`case_counts` is None.
+
+    :func:`case_counts` also reads the boundary table, which it refuses for a
+    binary case. Without counts the estimate was the fixed cost alone, so the
+    worker ran under a ~480 MB cap whatever the mesh (and "Build anyway"
+    could not raise it). This reads only each list's header, its count and
+    the owner note -- binary or not, every rank of a decomposed case -- so
+    the estimate scales with the mesh. ``bounded`` is False: such a case is
+    read by the VTK reader. None when no list header can be read.
+    """
+    from foammesh.core.mesh import poly_mesh_boundary as boundary
+
+    case = Path(case)
+    layout = layout or case_layout(case)
+    if layout == 'decomposed':
+        meshes = [rank / 'constant' / 'polyMesh' for rank in _ranks(case)]
+    else:
+        meshes = [case / 'constant' / 'polyMesh']
+    total = {'points': 0, 'faces': 0, 'internal_faces': 0, 'cells': 0,
+             'file_bytes': {}, 'bounded': False, 'layout': layout}
+    read = False
+    for mesh in meshes:
+        heads = {}
+        for name in ('points', 'faces', 'owner', 'neighbour'):
+            try:
+                member, header, count = boundary._head_count(mesh, name)
+                size = boundary._uncompressed_size(member)
+            except (PolyMeshReadError, OSError, ValueError):
+                continue
+            heads[name] = (header, count)
+            total['file_bytes'][name] = total['file_bytes'].get(name, 0) + size
+            read = True
+        note = dict(boundary._NOTE_COUNT.findall(
+            (heads.get('owner') or ({}, 0))[0].get('note', '')))
+        total['points'] += int((heads.get('points') or ({}, 0))[1])
+        total['faces'] += int((heads.get('owner') or ({}, 0))[1])
+        internal = int((heads.get('neighbour') or ({}, 0))[1])
+        total['internal_faces'] += internal
+        if 'nCells' in note:
+            total['cells'] += int(note['nCells'])
+        else:
+            faces = int((heads.get('owner') or ({}, 0))[1])
+            total['cells'] += max(0, (internal + faces) // 6)
+    return total if read else None
 
 
 def bounded_readable(case, time_value=0, counts: dict | None = None) -> bool:
@@ -625,9 +676,14 @@ def build_preview(operation: str, args: dict) -> dict:
     stem = str(args.get('stem') or f'{FILE_PREFIX}{uuid.uuid4().hex}')
     max_triangles = int(args.get('max_triangles')
                         or budget.PREVIEW_MAX_TRIANGLES)
-    max_bytes = int(args.get('max_bytes') or (
-        budget.FULL_VOLUME_MAX_BYTES if volume else budget.PREVIEW_MAX_BYTES))
-    max_cells = int(args.get('max_cells') or budget.FULL_VOLUME_MAX_CELLS)
+    # The surface preview is bounded for the viewport; the volume has no
+    # fixed cell or byte cap: the admission granted its memory, and the
+    # window checks the RAM its files need before it opens them.
+    max_bytes = args.get('max_bytes') or (
+        None if volume else budget.PREVIEW_MAX_BYTES)
+    max_bytes = None if max_bytes is None else int(max_bytes)
+    max_cells = args.get('max_cells')
+    max_cells = None if max_cells is None else int(max_cells)
     seeds = [(name, point) for name, point in (args.get('region_seeds') or ())]
 
     layout = case_layout(case)
@@ -639,10 +695,11 @@ def build_preview(operation: str, args: dict) -> dict:
     counts = case_counts(case, layout)
     payload['counts'] = counts
     cells = estimated_cells(counts)
-    if volume and cells is not None and cells > max_cells:
+    if (volume and cells is not None and max_cells is not None
+            and cells > max_cells):
         raise PreviewRefused(
             'volume_too_large',
-            f'the volume has {cells:,} cells; the viewport draws at most '
+            f'the volume has {cells:,} cells; this request draws at most '
             f'{max_cells:,}', cells=cells, max_cells=max_cells)
 
     volumes = []
@@ -667,10 +724,10 @@ def build_preview(operation: str, args: dict) -> dict:
         if volume:
             cells = sum(data.GetNumberOfCells() for r, c, n, data in volumes
                         if c == 'internalMesh')
-            if cells > max_cells:
+            if max_cells is not None and cells > max_cells:
                 raise PreviewRefused(
                     'volume_too_large',
-                    f'the volume has {cells:,} cells; the viewport draws at '
+                    f'the volume has {cells:,} cells; this request draws at '
                     f'most {max_cells:,}', cells=cells, max_cells=max_cells)
         else:
             volumes = []
@@ -718,7 +775,7 @@ def build_preview(operation: str, args: dict) -> dict:
                                 'name': name, 'path': str(path),
                                 'bytes': size,
                                 'cells': int(grid.GetNumberOfCells())})
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             raise PreviewRefused(
                 'volume_too_large' if volume else 'preview_too_large',
                 f'the preview files take {total:,} bytes; the limit is '

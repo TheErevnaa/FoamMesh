@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from foammesh.core.facade import applicability
 from foammesh.core.facade.errors import ValidationFailedError
 from foammesh.core.facade.fields import REGISTRY
-from foammesh.view.facade_client import query, submit
+from foammesh.view.facade_client import query, query_async, submit
 
 from .conditional_fields import refresh_applicability
 from foammesh.view.theming.metrics import (align_unit_column,
@@ -275,12 +276,21 @@ class FieldGroupPage(QWidget):
             # CP-09 item 4. A setting the configuration cannot reach stays on
             # the page, greyed and explained, and out of the patch.
             self._inactive = refresh_applicability(
-                self._client, self._editors, self._pending)
+                self._client, self._editors, self._pending,
+                overrides=self._conditionOverrides())
         # DP-156. A page reached on its own aligns its own unit column; a
         # panel embedded on a task page has this done again, across both
         # panels, after the page's refresh has reloaded them.
         align_unit_column((self.form_layout(),))
         self._set_dirty(bool(self._pending))
+
+    def _conditionOverrides(self) -> dict:
+        """Values the applicability clauses judge in place of the stored ones.
+
+        None here: a page's rows follow the case as it is written. A page
+        whose rows follow a choice as it is made returns its pending edits.
+        """
+        return {}
 
     @property
     def is_dirty(self) -> bool:
@@ -474,6 +484,10 @@ class ExecutionPreferencesPage(FieldGroupPage):
         return tuple(field_id for field_id in self.field_ids
                      if field_id in shown)
 
+    def __init__(self, facade_client, parent=None):
+        super().__init__(facade_client, parent)
+        self._mountRedistribute()
+
     def setEngine(self, engine_id: str) -> None:
         """Say which mesher the page is standing on, and ask the rule again."""
         engine = str(engine_id or '').rsplit('.', 1)[-1].lower()
@@ -482,6 +496,169 @@ class ExecutionPreferencesPage(FieldGroupPage):
         self._engine_id = engine
         self._applyRoute()
         self._refreshEffectiveCount()
+        self._refreshRedistribute()
+
+    # -- Plan 37 UF17: change the core count of a decomposed mesh ----------- #
+
+    def _mountRedistribute(self) -> None:
+        """A button under the settings that re-splits the processor cases.
+
+        Editing the core ceiling changes what the *next* decomposition asks
+        for; it does nothing to processor cases already on disk, which a
+        stage reuses only while their count matches. This moves the mesh
+        that is there onto the new count (``mesh.redistribute``), after a
+        preview says what it will do and the user confirms it. It lives
+        below the group box, not in the form, because the form is rebuilt.
+        """
+        button = QPushButton(self.tr('Change core count of the mesh…'),
+                             self._body)
+        button.setObjectName('executionRedistributeButton')
+        button.setAccessibleName(self.tr('Change core count of the mesh'))
+        button.setAccessibleDescription(self.tr(
+            'Split the decomposed mesh already on disk over a different '
+            'core count, without meshing again.'))
+        button.setToolTip(button.accessibleDescription())
+        # `clicked` carries a bool; the count is asked, not taken from it.
+        button.clicked.connect(lambda _checked=False: self.redistribute())
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(button)
+        layout = self._body.layout()
+        layout.insertLayout(max(layout.count() - 1, 0), row)
+        self._redistribute_button = button
+        self._refreshRedistribute()
+
+    def _refreshRedistribute(self) -> None:
+        button = getattr(self, '_redistribute_button', None)
+        if button is None:
+            return
+        # Only snappy decomposes; a Gmsh case has no processor cases.
+        button.setVisible(self._engine_id == 'snappy')
+
+    def _askTarget(self, current: int) -> int | None:
+        from PySide6.QtWidgets import QInputDialog
+        value, accepted = QInputDialog.getInt(
+            self, self.tr('Change core count'),
+            self.tr('Spread the decomposed mesh over (cores)'),
+            max(int(current or 2), 2), 2, 4096, 1)
+        return int(value) if accepted else None
+
+    def _confirm(self, text: str) -> bool:
+        answer = QMessageBox.question(
+            self, self.tr('Change core count'), text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _tell(self, text: str, warning: bool = False) -> None:
+        box = QMessageBox.warning if warning else QMessageBox.information
+        box(self, self.tr('Change core count'), text)
+
+    def redistributeSummary(self, report: dict) -> str:
+        """The confirmation text: what moves, what is dropped, what goes stale."""
+        census = report.get('census') or {}
+        lines = [self.tr('Move the decomposed mesh from {0} to {1} cores.').format(
+            report.get('source_ranks'), report.get('target_ranks'))]
+        if census.get('cells') is not None:
+            lines.append(self.tr('{0:,} cells and every zone and field are kept; '
+                                 'the case-root mesh is not touched.').format(
+                int(census['cells'])))
+        lines.append(self.tr('redistributePar runs on {0} processes on a copy; '
+                             'the processor cases are swapped only after the '
+                             'copy passes checkMesh.').format(report.get('np')))
+        # Plan 37 UF20, MEASURED live: the preview sends ``unmapped`` as a
+        # list of ``{file, what}`` (``redistribute_transaction.assess``); this
+        # read it as a dict, and on a case with any unmapped file the
+        # confirmation died on ``'list' object has no attribute 'values'``.
+        unmapped = report.get('unmapped') or []
+        if isinstance(unmapped, dict):
+            unmapped = list(unmapped.values())
+        names = sorted({str(item.get('what') or item.get('file'))
+                        if isinstance(item, dict) else str(item)
+                        for item in unmapped})
+        if names:
+            lines.append(self.tr('Not carried over: {0}.').format(
+                ', '.join(names)))
+        lines.append(self.tr('The quality report goes stale, and the core '
+                             'count setting becomes {0}.').format(
+            report.get('target_ranks')))
+        return '\n\n'.join(lines)
+
+    def redistribute(self, target: int | None = None):
+        """Preview, confirm, then run ``mesh.redistribute``."""
+        if target is None:
+            try:
+                current = int(self._currentValue('mesh.execution.max_cpu_cores') or 0)
+            except (TypeError, ValueError):
+                current = 0
+            target = self._askTarget(current)
+            if target is None:
+                return None
+        # Plan 37 UF20, MEASURED live: the preview's handler awaits (it
+        # settles an interrupted change and counts the processor cases in a
+        # worker), so the synchronous ``query`` refused it on every click with
+        # "mesh.redistribute.preview requires the async execute() path" and
+        # the button never got past its first dialog. It is awaited on the
+        # running loop; what follows -- a modal confirmation -- is handed
+        # back through ``call_soon`` so its nested loop does not run inside
+        # this task (DP-34).
+        import asyncio
+
+        parameters = {'ranks': int(target)}
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                preview = query(self._client, 'mesh.redistribute.preview',
+                                parameters)
+            except Exception as error:  # noqa: BLE001 - said, not raised
+                self._tell(str(error), warning=True)
+                return None
+            return self._redistributeFromPreview(preview, target)
+
+        async def ask():
+            try:
+                preview = await query_async(
+                    self._client, 'mesh.redistribute.preview', parameters)
+            except Exception as error:  # noqa: BLE001 - said, not raised
+                loop.call_soon(self._tell, str(error), True)
+                return
+            loop.call_soon(self._redistributeFromPreview, preview, target)
+
+        return loop.create_task(ask())
+
+    def _redistributeFromPreview(self, preview, target: int):
+        """Confirm what the preview said, then run ``mesh.redistribute``."""
+        report = getattr(preview, 'payload', None) or {}
+        refusal = report.get('refusal')
+        if refusal:
+            self._tell(str(refusal.get('reason') or refusal.get('code')))
+            return None
+        if not self._confirm(self.redistributeSummary(report)):
+            return None
+        button = self._redistribute_button
+        button.setEnabled(False)
+
+        def done(result):
+            button.setEnabled(True)
+            if getattr(result, 'status', '') == 'accepted':
+                payload = getattr(result, 'payload', None) or {}
+                self.reload()
+                self._tell(self.tr('The mesh is now split over {0} cores.').format(
+                    payload.get('target_ranks', target)))
+                return
+            details = getattr(result, 'payload', None) or {}
+            self._tell(self.tr('The core count was not changed; the processor '
+                               'cases are as they were.\n\n{0}').format(
+                getattr(result, 'message', '') or details.get('reason', '')),
+                warning=True)
+
+        return submit(self._client, 'mesh.redistribute',
+                      {'ranks': int(target),
+                       'expected_revision': report.get('revision')},
+                      then=done)
 
     def engineId(self) -> str:
         return self._engine_id
@@ -752,8 +929,9 @@ class GmshHealingPanel(FieldGroupPage):
     # nothing is re-imported when they do.
     purpose = (
         'How Gmsh reads the geometry when it meshes it: the tolerances, the '
-        'sewing and the fixes its CAD importer applies, and the far-field box '
-        'it can build around the result. They take effect in the Gmsh run '
+        'sewing and the fixes its CAD importer applies, and the far field — '
+        'a box, sphere or cylinder — it can build around the result. They '
+        'take effect in the Gmsh run '
         'only; the readiness report on this page is not re-run with them.')
     caveat = ''
     field_ids: tuple[str, ...] = tuple(
@@ -798,6 +976,40 @@ class GmshHealingPanel(FieldGroupPage):
         return bool(entries) and not any(is_cad_entry(item)
                                          for item in entries)
 
+    #: Plan 37. The farfield these fields describe is one record, edited here
+    #: and from Geometry > Farfield...; the line says where the other is.
+    FARFIELD_POINTER = ('The far field can also be set up from '
+                        'Geometry → Farfield…; both edit the '
+                        'same settings.')
+
+    def build(self) -> None:
+        super().build()
+        layout = self.form_layout()
+        editor = self._editors.get('gmsh.describe_geometry.enabled')
+        if editor is None:
+            return
+        row, _role = layout.getWidgetPosition(editor.label)
+        if row < 0:
+            return
+        pointer = QLabel(self.tr(self.FARFIELD_POINTER), self._form)
+        pointer.setObjectName('gmshFarfieldPointer')
+        pointer.setWordWrap(True)
+        layout.insertRow(row, pointer)
+        # Plan 37 UF13. Said under the shape when a sphere or cylinder was
+        # sized to hold the geometry, as Geometry > Farfield... says it.
+        shape = self._editors.get('gmsh.describe_geometry.shape')
+        fit_row = (layout.getWidgetPosition(shape.label)[0]
+                   if shape is not None else -1)
+        note = QLabel(self._form)
+        note.setObjectName('gmshFarfieldFitNote')
+        note.setWordWrap(True)
+        note.hide()
+        if fit_row >= 0:
+            layout.insertRow(fit_row + 1, note)
+        else:
+            layout.addRow(note)
+        self._fitNote = note
+
     def pinnedReasons(self) -> dict[str, str]:
         """The fields this case cannot use, beyond their own conditions."""
         pinned = {self.IMPORT_SCALING: self.IMPORT_SCALING_REASON}
@@ -808,6 +1020,15 @@ class GmshHealingPanel(FieldGroupPage):
 
     def reload(self, *, discard_pending: bool = True) -> None:
         super().reload(discard_pending=discard_pending)
+        note = getattr(self, '_fitNote', None)
+        if note is not None and discard_pending:
+            note.hide()
+        if self._applyPinned():
+            align_unit_column((self.form_layout(),))
+            self._set_dirty(bool(self._pending))
+
+    def _applyPinned(self) -> bool:
+        """Take the pinned fields off the form; True when any row went."""
         inactive = getattr(self, '_inactive', None)
         if inactive is None:
             inactive = self._inactive = {}
@@ -820,6 +1041,136 @@ class GmshHealingPanel(FieldGroupPage):
             inactive[field_id] = reason
             self._pending.pop(field_id, None)
             changed = True
-        if changed:
-            align_unit_column((self.form_layout(),))
-            self._set_dirty(bool(self._pending))
+        return changed
+
+    # -- the farfield rows follow the shape as it is chosen ---------------- #
+
+    #: Plan 37 UF13. The settings the farfield rows' clauses read on this
+    #: page: the radius, length and axis follow the shape, the explicit
+    #: centre follows the centre mode.
+    FARFIELD_SWITCHES = ('gmsh.describe_geometry.shape',
+                         'gmsh.describe_geometry.centre_mode')
+
+    def _conditionOverrides(self) -> dict:
+        """The shape and centre mode as chosen, applied or not.
+
+        Plan 37 UF13. The rows were judged on the stored shape only, so a
+        sphere's radius appeared after Apply. Geometry → Farfield… swaps them
+        as the shape is chosen; this panel edits the same record and now
+        does the same.
+        """
+        return {field_id: self._pending[field_id]
+                for field_id in self.FARFIELD_SWITCHES
+                if field_id in self._pending}
+
+    #: Choosing these sizes a sphere or cylinder that would not hold the
+    #: geometry, as Geometry > Farfield... does (``FarfieldDialog._fit``).
+    FARFIELD_FIT_TRIGGERS = FARFIELD_SWITCHES + (
+        'gmsh.describe_geometry.enabled',)
+    FIT_NOTE = ('Sized to hold the geometry with room around it; change it '
+                'if you need a different size.')
+
+    def _on_changed(self, field_id: str, value) -> None:
+        super()._on_changed(field_id, value)
+        if field_id in self.FARFIELD_FIT_TRIGGERS:
+            self._fitFarfield()
+        if field_id in self.FARFIELD_SWITCHES:
+            self._refreshFarfieldRows()
+
+    def modelBounds(self):
+        """The model's extent in Gmsh order, or ``None`` with no geometry.
+
+        Read as Geometry > Farfield... reads it, from the geometry manager's
+        surface bounds.
+        """
+        try:
+            from foammesh.app import app
+            from foammesh.core.mesh import snappy_farfield
+            manager = getattr(getattr(app, 'window', None),
+                              'geometryManager', None)
+            surfaces = getattr(manager, 'getSurfaceBounds', None)
+            extent = surfaces() if surfaces is not None else None
+            return (None if extent is None
+                    else snappy_farfield.gmsh_bounds(extent.toTuple()))
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def fitNote(self) -> QLabel | None:
+        return getattr(self, '_fitNote', None)
+
+    def _fitFarfield(self) -> bool:
+        """A sphere or cylinder chosen too small is sized to hold the model.
+
+        Plan 37 UF13. The same rule as ``FarfieldDialog._fit``: only with an
+        automatic centre, and only when the size on screen would be refused
+        for containment. The new radius (and a cylinder's length) is put in
+        the edit, so Apply writes it. True when anything was sized.
+        """
+        from foammesh.core.mesh import farfield_spec
+        from foammesh.view.geometry.farfield_dialog import (FIELDS,
+                                                            spec_from_values)
+
+        note = self.fitNote()
+        if note is not None:
+            note.hide()
+        values = {field_id: (self._pending[field_id]
+                             if field_id in self._pending
+                             else self._editors[field_id].value())
+                  for field_id, _leaf in FIELDS if field_id in self._editors}
+        try:
+            spec = spec_from_values(values)
+        except Exception:                                    # noqa: BLE001
+            return False
+        bounds = self.modelBounds()
+        if (bounds is None or not spec.enabled or spec.shape == 'box'
+                or spec.centre_mode != 'auto' or spec.problems()
+                or not farfield_spec.check(spec, bounds)):
+            return False
+        sized = farfield_spec.fitted(spec, bounds)
+        fits = {'gmsh.describe_geometry.radius': sized.radius}
+        if spec.shape == 'cylinder':
+            fits['gmsh.describe_geometry.length'] = sized.length
+        for field_id, value in fits.items():
+            editor = self._editors.get(field_id)
+            if editor is None:
+                continue
+            editor.set_value(value)
+            self._pending[field_id] = editor.value()
+        self._set_dirty(True)
+        if note is not None:
+            note.setText(self.tr(self.FIT_NOTE))
+            note.show()
+        return True
+
+    def _refreshFarfieldRows(self) -> None:
+        """Offer the rows the chosen shape and centre mode read, now.
+
+        Nothing is dropped from the edit: a radius typed for a sphere is
+        kept if the shape goes back to sphere before Apply, and
+        `pending_patch` leaves out whatever the shape on screen does not read.
+        """
+        self._inactive = refresh_applicability(
+            self._client, self._editors, None,
+            overrides=self._conditionOverrides())
+        self._applyPinned()
+        align_unit_column((self.form_layout(),))
+
+    def pending_patch(self) -> dict:
+        """The edit, less the farfield rows the chosen shape does not read.
+
+        Only the rows whose clauses name the shape or the centre mode are
+        held back here; every other inactive row is dropped by the reload,
+        as on every field page.
+        """
+        inactive = getattr(self, '_inactive', None) or {}
+        held = set()
+        for field_id in self._pending:
+            editor = self._editors.get(field_id)
+            if field_id not in inactive or editor is None:
+                continue
+            clauses = getattr(editor.descriptor, 'applies_when', ()) or ()
+            if set(applicability.referenced_fields(clauses)) & set(
+                    self.FARFIELD_SWITCHES):
+                held.add(field_id)
+        return {field_id: value for field_id, value in self._pending.items()
+                if field_id not in held}

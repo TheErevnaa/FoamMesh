@@ -52,6 +52,23 @@ def assembly_layer_refusal(volumes: int) -> str:
             'into one job per volume.')
 
 
+def nothing_chosen_layer_refusal() -> str:
+    """Layers on, the ticks are the answer, and nothing is ticked.
+
+    Plan 37 F3d. ``runner_v1`` refuses this after WSL has booted and the
+    geometry has been imported ("boundary layers are switched on and no
+    surface was chosen to grow them"), and the Boundary layers page has said
+    since Plan 33 section 1.1 that the run will be refused. Nothing it needs
+    is only known inside the run, so it is refused at run start, in the same
+    terms, before anything is written.
+    """
+    return ('boundary layers are switched on and no surface was chosen to '
+            'grow them, so no layer could be grown and the mesh would have '
+            'no near-wall resolution at all. Tick the surfaces a layer '
+            'stands on, ask for every eligible wall, or turn boundary layers '
+            'off.')
+
+
 def prepared_volume_count(prepared_geometry) -> tuple[int, str]:
     """How many volumes the prepared revision recorded, and who counted them.
 
@@ -1161,7 +1178,8 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     # each named patch bounds. Anything this cannot place is still left to
     # the runner rather than guessed at.
     refusal = layer_selection_refusal(
-        prepared_geometry, intent.layers.enabled, intent.layers.patches)
+        prepared_geometry, intent.layers.enabled, intent.layers.patches,
+        intent.layers.patch_mode)
     if refusal:
         raise ExecutionError(refusal)
     if intent.export.mesh_format == 'su2' and 'su2' not in formats:
@@ -1497,7 +1515,8 @@ def selection_covers_a_spanning_source(prepared_geometry, named) -> bool:
     return False
 
 
-def layer_selection_refusal(prepared_geometry, enabled, patches) -> str:
+def layer_selection_refusal(prepared_geometry, enabled, patches,
+                            patch_mode=None) -> str:
     """The sentence the run refuses a layer selection with, or ``''``.
 
     DP-123. The pre-flight used to read "a patch is named" as "graded", so
@@ -1510,12 +1529,19 @@ def layer_selection_refusal(prepared_geometry, enabled, patches) -> str:
     Unknown refuses nothing, in both of its forms: a revision that never
     counted its volumes, and one that records no membership for the patches
     named. Guessing either way would refuse a mesh that works.
+
+    Plan 37 F3d. ``patch_mode`` is the choice the selection is read with.
+    ``selected`` with nothing named grows on nothing, which the runner
+    refuses on any geometry; ``None`` (not known) and an unset mode, which
+    the migration reads as every eligible wall when nothing is named, add
+    no refusal.
     """
     if not enabled:
         return ''
     volumes, counted_by = prepared_volume_count(prepared_geometry)
     if counted_by == 'unknown' or volumes <= 1:
-        return ''
+        return (nothing_chosen_layer_refusal()
+                if _grows_on_nothing(patch_mode, patches) else '')
     if not patches:
         return assembly_layer_refusal(volumes)
     named = {str(name).strip() for name in patches}
@@ -1528,6 +1554,17 @@ def layer_selection_refusal(prepared_geometry, enabled, patches) -> str:
     owners = regions_by_patch(prepared_regions(_group_manifest(prepared_geometry)))
     state, _common = grade_layer_selection(patches, owners)
     return assembly_layer_refusal(volumes) if state in REFUSED_LAYER_GRADES else ''
+
+
+def _grows_on_nothing(patch_mode, patches) -> bool:
+    """The ticks are the answer and nothing is ticked (Plan 37 F3d)."""
+    from .layer_targets import MODE_SELECTED, normalise_mode
+
+    if patch_mode is None:
+        return False
+    named = [str(name).strip() for name in (patches or ())]
+    return (normalise_mode(patch_mode) == MODE_SELECTED
+            and not any(named))
 
 
 def prepared_geometry_paths(prepared_geometry, case_path: Path) -> tuple[Path, ...]:

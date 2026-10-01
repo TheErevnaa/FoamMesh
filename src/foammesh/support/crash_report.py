@@ -339,6 +339,14 @@ def system_text(*, version: str | None = None, gl_info: dict | None = None,
     lines.append(f'OpenGL vendor: {gl_info.get("vendor") or "unknown"}')
     lines.append(f'OpenGL renderer: {gl_info.get("renderer") or "unknown"}')
     lines.append(f'OpenGL version: {gl_info.get("version") or "unknown"}')
+    # The class of the adapter drawing (gpu_profile) sets the display budgets.
+    lines.append(f'drawing GPU class: {gl_info.get("tier") or "unknown"}')
+    memory = gl_info.get('gpu_memory_bytes')
+    try:
+        memory = _size_text(int(memory)) if memory else 'unknown'
+    except (TypeError, ValueError):
+        memory = 'unknown'
+    lines.append(f'drawing GPU memory: {memory}')
     if probe_wsl and sys.platform == 'win32':
         lines += ['', '--- wsl --status ---', run_wsl(['--status']),
                   '', '--- wsl -l -v ---', run_wsl(['-l', '-v'])]

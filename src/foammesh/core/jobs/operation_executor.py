@@ -23,6 +23,10 @@ from .manager import JobErrorCategory, JobManager, JobRequest, JobResult
 Parser = Callable[[JobResult], Any | Awaitable[Any]]
 ArtifactValidator = Callable[[Path], bool]
 
+#: Plan 37 UF5: how long a run waits for the case lease (a running check)
+#: before it is refused as busy.
+LEASE_WAIT_SECONDS = 120.0
+
 
 @dataclass(frozen=True)
 class ExpectedArtifact:
@@ -67,6 +71,10 @@ class OperationSpec:
     #: kind's default).
     ranks: int = 1
     idle_timeout: float | None = None
+    #: Plan 37 UF17. Extra fields for the run record, as ``((key, value),)``
+    #: -- ``staging`` names a run that writes into a staging copy, whose
+    #: failure must not discard the case's live processor cases.
+    record_extra: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -124,6 +132,39 @@ class OperationExecutor:
         self.recovery = recovery or MeshRecoveryService()
 
     async def execute(self, session, spec: OperationSpec, *, on_line=None) -> OperationExecution:
+        # Plan 37 UF5 DP-1039. The case mutation lease: a run that writes the
+        # case holds it exclusively, a reader shares it, so a check never
+        # reads a mesh a mesher is rewriting and an unlock never moves files
+        # under a running job. A mutation that cannot get the case in time is
+        # refused before anything is spawned or snapshotted.
+        from . import case_lease
+        mode = case_lease.EXCLUSIVE if spec.mutation else case_lease.SHARED
+        try:
+            lease = case_lease.acquire(session.case_path, mode, spec.operation,
+                                       timeout=LEASE_WAIT_SECONDS)
+            await lease.__aenter__()
+        except case_lease.CaseBusyError as busy:
+            return self._refuse_busy(session, spec, busy)
+        try:
+            return await self._execute_held(session, spec, on_line=on_line)
+        finally:
+            await lease.__aexit__(None, None, None)
+
+    def _refuse_busy(self, session, spec: OperationSpec, busy) -> OperationExecution:
+        request = JobRequest(name=spec.operation, argv=tuple(str(item) for item in spec.argv),
+                             cwd=Path(spec.cwd), mutation=spec.mutation)
+        refusal = getattr(self.jobs, 'record_refusal', None)
+        if refusal is None:
+            raise RuntimeError(str(busy))
+        job = refusal(request, str(busy), exit={
+            'kind': 'case_busy', 'reason': str(busy), 'signal': '',
+            'actions': ['retry'], 'hint': '', 'holders': list(busy.holders)})
+        session.state.bus.publish(
+            Event.OPERATION_FAILED, operation=spec.operation, job_id=job.job_id,
+            result=job.to_dict(), recovery_status=None, history_entry_id=None)
+        return OperationExecution(spec.operation, job)
+
+    async def _execute_held(self, session, spec: OperationSpec, *, on_line=None) -> OperationExecution:
         if not spec.operation or not spec.argv:
             raise ValueError('operation and argv are required')
         cwd = Path(spec.cwd).resolve()
@@ -147,10 +188,28 @@ class OperationExecutor:
             refused = await self._pass_recovery_gate(session, spec, cwd)
             if refused is not None:
                 return refused
+            # Plan 37 UF5 DP-1041. An unlock or undo a crash interrupted is
+            # finished or rolled back first; one that cannot be (an undo
+            # waiting for the project state) refuses the run.
+            refused = self._pass_unlock_recovery(session, spec)
+            if refused is not None:
+                return refused
+            # Plan 37 UF17. A core-count change a crash interrupted is
+            # finished or discarded before anything else writes the case.
+            refused = self._pass_redistribute_recovery(session, spec)
+            if refused is not None:
+                return refused
         before = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
         probed_before = (await self._probe_fingerprint(spec.mesh_change_probes)
                          if spec.mutation and spec.mesh_change_probes else None)
         recovery_point = await self._prepare_recovery(session, spec)
+        if spec.mutation and spec.recover_mesh:
+            # Plan 37 UF5 DP-1042. A mesher run is admitted and its own
+            # rollback point is durable: "Restore previous mesh and settings"
+            # no longer describes a state to go back to. A refused launch
+            # returned above and kept it.
+            from . import unlock_transaction
+            unlock_transaction.consume_undo(session.case_path, reason=spec.operation)
         session.state.bus.publish(
             Event.OPERATION_STARTED, operation=spec.operation,
             mutation=spec.mutation, recovery_id=(
@@ -158,6 +217,7 @@ class OperationExecutor:
         record_fields = {
             'operation': spec.operation, 'ranks': int(spec.ranks or 1),
             'recovery_id': recovery_point.recovery_id if recovery_point else None,
+            **dict(spec.record_extra or ()),
         } if spec.mutation else None
         request = JobRequest(
             name=spec.operation,
@@ -392,6 +452,75 @@ class OperationExecutor:
             import logging
             logging.getLogger(__name__).exception(
                 'run record %s could not move to %s', run_id, state)
+
+    def _pass_unlock_recovery(self, session, spec: OperationSpec):
+        from . import unlock_transaction
+        case_path = Path(session.case_path)
+        if not unlock_transaction.pending_root(case_path).is_dir():
+            return None
+        store = None
+        try:
+            from foammesh.core.engine.registry import (
+                ENGINE_REGISTRY, configured_engine_id)
+            from foammesh.core.workflow.task_state_store import EngineTaskStateStore
+            engine_id = configured_engine_id(session.state.db)
+            store = EngineTaskStateStore(
+                case_path, ENGINE_REGISTRY.get(engine_id).workflow_descriptor())
+        except Exception:  # noqa: BLE001 - no engine: nothing to roll back into
+            store = None
+        unlock_transaction.recover(case_path, store)
+        waiting = unlock_transaction.blocking_recovery(case_path)
+        if not waiting:
+            return None
+        message = ('an interrupted unlock or undo of this case has to be '
+                   'finished first: choose "Restore previous mesh and '
+                   'settings" to complete it')
+        request = JobRequest(name=spec.operation, argv=tuple(str(item) for item in spec.argv),
+                             cwd=Path(spec.cwd), mutation=spec.mutation)
+        refusal = getattr(self.jobs, 'record_refusal', None)
+        if refusal is None:
+            raise RuntimeError(message)
+        job = refusal(request, message, exit={
+            'kind': 'unlock_pending', 'reason': message, 'signal': '',
+            'actions': ['undo_unlock'], 'hint': '', 'operations': waiting})
+        session.state.bus.publish(
+            Event.OPERATION_FAILED, operation=spec.operation, job_id=job.job_id,
+            result=job.to_dict(), recovery_status=None, history_entry_id=None)
+        return OperationExecution(spec.operation, job)
+
+    def _pass_redistribute_recovery(self, session, spec: OperationSpec):
+        from . import redistribute_transaction as transaction
+        case_path = Path(session.case_path)
+        if not transaction.blocking(case_path):
+            return None
+        report = transaction.recover(case_path)
+        for item in report['settings']:
+            try:
+                transaction.apply_setting(session, item['target_ranks'],
+                                          reason='redistribute recovery')
+            except Exception:  # noqa: BLE001 - stays pending for the next pass
+                import logging
+                logging.getLogger(__name__).exception(
+                    'core-count setting of %s could not be published', item['id'])
+                continue
+            transaction.finish(case_path, item['id'])
+        waiting = transaction.blocking(case_path)
+        if not waiting:
+            return None
+        message = ('an interrupted core-count change of this case has to be '
+                   'settled first: reopen the case once its run has stopped')
+        request = JobRequest(name=spec.operation, argv=tuple(str(item) for item in spec.argv),
+                             cwd=Path(spec.cwd), mutation=spec.mutation)
+        refusal = getattr(self.jobs, 'record_refusal', None)
+        if refusal is None:
+            raise RuntimeError(message)
+        job = refusal(request, message, exit={
+            'kind': 'redistribute_pending', 'reason': message, 'signal': '',
+            'actions': [], 'hint': '', 'operations': waiting})
+        session.state.bus.publish(
+            Event.OPERATION_FAILED, operation=spec.operation, job_id=job.job_id,
+            result=job.to_dict(), recovery_status=None, history_entry_id=None)
+        return OperationExecution(spec.operation, job)
 
     async def _prepare_recovery(self, session, spec: OperationSpec) -> MeshRecoveryPoint | None:
         mesh = session.case_path / 'constant' / 'polyMesh'

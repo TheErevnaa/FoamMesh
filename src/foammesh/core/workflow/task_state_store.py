@@ -51,6 +51,15 @@ _SETTLED = frozenset({
     TaskState.COMPLETED, TaskState.WAIVED,
 })
 
+#: Plan 37 UF5. The evidence kinds that publish a mesh result. A check's
+#: verdict judges a mesh; it does not make one, so it locks nothing.
+PUBLISHING_EVIDENCE = frozenset({'stage', 'atomic_run'})
+PUBLICATION_SCHEMA_VERSION = 1
+#: A task holds its published result while it is in one of these. SKIPPED
+#: is the record that nothing ran, so there is nothing of it to lock.
+_PUBLISHED_STATES = _SETTLED - {TaskState.SKIPPED}
+
+
 def run_gated_task_ids(descriptor: WorkflowDescriptor) -> frozenset[str]:
     """Tasks this engine only lets a recorded run accept.
 
@@ -320,6 +329,49 @@ class EngineTaskStateStore:
         return [task.task_id for task in self.descriptor.ordered_tasks()
                 if task.task_id in wanted]
 
+    def stale_checks_below(self, task_ids) -> list[str]:
+        """Mark stale every judged check that sits below a task just rerun.
+
+        Plan 37 UF3 DP-1038. A check's evidence is a report on one mesh. A
+        rerun replaces that mesh, and the recorder keeps a settled task as
+        "already recorded" unless the run performed it -- which a check never
+        is -- so Geometry fidelity, Resolution adequacy and the summary kept
+        reading done, beside the old mesh's verdict, under a mesh they had
+        never measured. MEASURED in the user's report: Run to end after an
+        edit left every check green.
+
+        Only checks that hold a result and are descendants of a task named
+        here are touched; the invalidation carries on below each of them, so
+        what was judged through the check is re-judged too. Called before the
+        run is recorded, so the recorder then stops at the first stale gate
+        and the gate is run again, the way it is after a first run. Returns
+        the tasks that went stale.
+        """
+        performed = set(task_ids)
+        if not performed:
+            return []
+        loaded = self.load_result()
+        graph = loaded.graph
+        below: set[str] = set()
+        for task_id in performed:
+            try:
+                below.update(self.descriptor.descendants(task_id))
+            except (KeyError, LookupError, ValueError):
+                continue
+        changed: list[str] = []
+        for task in self.descriptor.ordered_tasks():
+            is_check = task.run_gated and not task.engine_stage
+            if (not is_check or task.task_id not in below
+                    or task.task_id in performed
+                    or graph.state(task.task_id) not in _SETTLED):
+                continue
+            for stale in graph.invalidate(task.task_id, include_self=True):
+                if stale not in changed:
+                    changed.append(stale)
+        if changed:
+            self.save(graph)
+        return changed
+
     def record_stage_chain_success(self, task_id: str, *,
                                    warning: bool = False,
                                    reasons=()) -> dict:
@@ -575,6 +627,16 @@ class EngineTaskStateStore:
             task_id: (dict(evidence, warnings=list(reasons))
                       if task_id in warned and reasons else dict(evidence))
             for task_id in advanced})
+        if evidence.get('kind') in PUBLISHING_EVIDENCE:
+            # Plan 37 UF5 DP-1040. What a run consumed is published, and a
+            # published task's mesh inputs are locked until it is unlocked.
+            # Everything the run implies counts, not only what it advanced: a
+            # manually accepted Gmsh sizing page is "already recorded" here,
+            # and the mesh was still built from it. Nothing past a block ran.
+            reached = list(task_ids)
+            if blocked is not None and blocked['task_id'] in reached:
+                reached = reached[:reached.index(blocked['task_id'])]
+            self._publish(graph, reached, evidence)
         return {'tasks': document['tasks'], 'advanced': advanced,
                 'skipped': skipped, 'blocked': blocked,
                 'evidence': dict(evidence),
@@ -587,4 +649,197 @@ class EngineTaskStateStore:
         return dict(graph.to_dict(), schema_version=SCHEMA_VERSION,
                     next_runnable=graph.next_runnable(),
                     evidence=self.evidence(),
+                    locked=self.locked_tasks(graph),
+                    publications=self.lock_state(graph),
                     workflow_reset_notice=loaded.notice())
+
+    # -- publications and the step lock (Plan 37 UF5) --------------------- #
+
+    @property
+    def publications_path(self) -> Path:
+        return self.path.with_name(
+            f'{self.descriptor.engine_id}-publications.json')
+
+    def publications(self) -> dict:
+        """The revisioned publication manifest (empty when never written).
+
+        A case meshed before UF5 has none: its results are of unknown
+        provenance, nothing is locked, and nothing is invented for it.
+        """
+        empty = {'schema_version': PUBLICATION_SCHEMA_VERSION,
+                 'engine_id': self.descriptor.engine_id,
+                 'revision': 0, 'publications': {}}
+        try:
+            document = json.loads(self.publications_path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return empty
+        except (OSError, ValueError):
+            return dict(empty, unreadable=True)
+        if not isinstance(document, dict) or not isinstance(
+                document.get('publications'), dict):
+            return dict(empty, unreadable=True)
+        return document
+
+    def _write_publications(self, document: dict) -> dict:
+        _write_json_durably(self.publications_path, document)
+        return document
+
+    def _publish(self, graph: EngineWorkflowGraph, task_ids, evidence: dict) -> dict:
+        document = self.publications()
+        known = {task.task_id for task in self.descriptor.ordered_tasks()}
+        mesh = mesh_identity(self.path.parents[2])
+        stamp = _now()
+        revision = int(document.get('revision') or 0) + 1
+        changed = False
+        for task_id in task_ids:
+            if task_id not in known or graph.state(task_id) not in _PUBLISHED_STATES:
+                continue
+            document['publications'][task_id] = {
+                'active': True, 'revision': revision, 'published_at': stamp,
+                'evidence_kind': str(evidence.get('kind') or ''),
+                'stage_task': evidence.get('stage_task'),
+                'state': graph.state(task_id).value,
+                'mesh_revision': mesh}
+            changed = True
+        if not changed:
+            return document
+        document['revision'] = revision
+        document['schema_version'] = PUBLICATION_SCHEMA_VERSION
+        document['engine_id'] = self.descriptor.engine_id
+        return self._write_publications(document)
+
+    def locked_tasks(self, graph: EngineWorkflowGraph | None = None) -> list[str]:
+        """The tasks whose mesh inputs are locked, in outline order.
+
+        Locked means an *active* publication and a graph state that still
+        holds the published result. The publication manifest is the
+        authority (PASSED alone is not: a manual accept publishes nothing),
+        and the graph is the revision check: any path that staled or reopened
+        the task -- a configure, a reset, an unlock of a predecessor walked
+        along the dependency edges -- has already moved it out of the
+        published states, so its lock went with it.
+        """
+        if not self.publications_path.is_file():
+            return []
+        graph = graph or self.load()
+        active = {task_id for task_id, record in
+                  self.publications()['publications'].items()
+                  if isinstance(record, dict) and record.get('active')}
+        return [task.task_id for task in self.descriptor.ordered_tasks()
+                if task.task_id in active
+                and graph.state(task.task_id) in _PUBLISHED_STATES]
+
+    def lock_state(self, graph: EngineWorkflowGraph | None = None) -> dict:
+        if not self.publications_path.is_file():
+            return {}
+        graph = graph or self.load()
+        locked = set(self.locked_tasks(graph))
+        result = {}
+        for task_id, record in self.publications()['publications'].items():
+            if isinstance(record, dict):
+                result[task_id] = dict(record, locked=task_id in locked)
+        return result
+
+    def is_locked(self, task_id: str) -> bool:
+        return task_id in self.locked_tasks()
+
+    def unlock_scope(self, task_id: str) -> list[str]:
+        """The task and every task that depends on it, by dependency edges."""
+        self.descriptor.task(task_id)
+        return [task_id, *self.descriptor.descendants(task_id)]
+
+    def unlock(self, task_id: str, *, operation_id: str) -> dict:
+        """Reopen a locked task and discard the results that depend on it.
+
+        The task and its dependants go STALE; their publications are
+        deactivated -- kept rather than deleted, so the historical record
+        stays addressable.
+        """
+        loaded = self.load_result()
+        graph = loaded.graph
+        if task_id not in self.locked_tasks(graph):
+            raise TaskStateError(f'{task_id} is not locked')
+        scope = self.unlock_scope(task_id)
+        invalidated = graph.invalidate(task_id, include_self=True)
+        document = self.save(graph)
+        publications = self.publications()
+        revision = int(publications.get('revision') or 0) + 1
+        deactivated = []
+        for scoped in scope:
+            record = publications['publications'].get(scoped)
+            if isinstance(record, dict) and record.get('active'):
+                record['active'] = False
+                record['deactivated_by'] = operation_id
+                record['deactivated_revision'] = revision
+                deactivated.append(scoped)
+        publications['revision'] = revision
+        self._write_publications(publications)
+        return {'task_id': task_id, 'scope': scope,
+                'invalidated': list(invalidated), 'deactivated': deactivated,
+                'tasks': document['tasks'],
+                'publication_revision': revision}
+
+    def document_texts(self) -> tuple:
+        """The task-state and publication files as they are on disk."""
+        texts = []
+        for path in (self.path, self.publications_path):
+            try:
+                texts.append(path.read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                texts.append(None)
+        return texts[0], texts[1]
+
+    def restore_documents(self, tasks_text, publications_text) -> None:
+        """Put both files back byte for byte (undo and rollback)."""
+        for path, text in ((self.path, tasks_text),
+                           (self.publications_path, publications_text)):
+            if text is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            _write_text_durably(path, text)
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _write_text_durably(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    with open(temporary, 'w', encoding='utf-8', newline='\n') as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _write_json_durably(path: Path, document: dict) -> None:
+    _write_text_durably(path, json.dumps(document, indent=2, sort_keys=True) + '\n')
+
+
+MESH_FILES = ('points', 'faces', 'owner', 'neighbour', 'boundary')
+
+
+def mesh_identity(case_path):
+    """A cheap identity of ``constant/polyMesh``: names, sizes and mtimes.
+
+    Not a content hash: it names *which* mesh a publication was made on, so
+    a later reader can tell it was replaced, without reading gigabytes.
+    """
+    import hashlib
+    root = Path(case_path) / 'constant' / 'polyMesh'
+    parts = []
+    for name in MESH_FILES:
+        for candidate in (root / name, root / f'{name}.gz'):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            parts.append(f'{candidate.name}:{stat.st_size}:{stat.st_mtime_ns}')
+    if not parts:
+        return None
+    return hashlib.sha1('|'.join(parts).encode('utf-8')).hexdigest()[:16]

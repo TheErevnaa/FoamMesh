@@ -43,8 +43,9 @@ from PySide6.QtWidgets import (
     QLabel, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QStyle,
     QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from foammesh.core.mesh.presentation import count_text
 from foammesh.view.facade_client import query, submit
-from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT
+from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT, CompactSpinBox
 from foammesh.view.theming.patch_palette import zone_colour
 from foammesh.view.theming.status_colors import set_status
 
@@ -101,11 +102,11 @@ def format_depth(depth) -> str:
 
 
 def _spaces(count) -> str:
-    return '1 space' if count == 1 else f'{count} spaces'
+    return count_text(count, 'space', 'spaces')
 
 
 def _regions(count) -> str:
-    return '1 fluid region' if count == 1 else f'{count} fluid regions'
+    return count_text(count, 'fluid region', 'fluid regions')
 
 
 def mismatch_text(payload) -> str:
@@ -120,10 +121,14 @@ def mismatch_text(payload) -> str:
         return ''
     reason = mismatch.get('reason')
     if reason == 'farfield_is_the_fluid':
-        # DP-915: Gmsh's far-field box cuts the bodies out; the outside is
-        # the one fluid region and nothing is proposed.
+        # DP-915: Gmsh's far field cuts the bodies out; the outside is the
+        # one fluid region and nothing is proposed. Plan 37 UF14: the far
+        # field is a box, sphere or cylinder, so the fallback names the
+        # shape when the payload carries it and no shape when it does not.
+        shape = str(payload.get('farfield_shape') or '').strip()
+        field = f'far-field {shape}' if shape else 'far field'
         return str(payload.get('note') or
-                   'The far-field box is on: the bodies are cut out of it, '
+                   f'The {field} is on: the bodies are cut out of it, '
                    'and the fluid is the one space around them.')
     asked = int(mismatch.get('asked') or 0)
     found = int(mismatch.get('found') or 0)
@@ -272,7 +277,7 @@ class RegionDetectionPanel(QFrame):
         row = QHBoxLayout()
         question = QLabel(self.tr('How many fluid regions are there?'), page)
         question.setWordWrap(True)
-        self._count = QSpinBox(page)
+        self._count = CompactSpinBox(page)
         self._count.setObjectName('regionDetectionCount')
         self._count.setRange(1, 64)
         self._count.setValue(1)
@@ -700,7 +705,7 @@ class RegionDetectionPanel(QFrame):
         if row.get('outside'):
             volume.setToolTip(self.tr(
                 'The outside: the space around the body, open to the '
-                'domain box.'))
+                'domain box'))
         depth.setToolTip(tip)
         for item in (volume, depth):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled
@@ -763,7 +768,7 @@ class RegionDetectionPanel(QFrame):
                     if id(item) not in self._edited:
                         item.setText(label)
                     item.setIcon(QIcon())
-                    item.setToolTip(self.tr('Tick to use this space.'))
+                    item.setToolTip(self.tr('Tick to use this space'))
                     item.setData(Qt.ItemDataRole.AccessibleDescriptionRole,
                                  self.tr('Not kept, %s') % label)
         finally:

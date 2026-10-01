@@ -86,6 +86,14 @@ _FALLBACK_AXIS_COLOURS = ('#d9534f', '#3fae5a', '#3f8ae0')
 _AXIS_TOKENS = ('status.error', 'status.success', 'status.info')
 _FALLBACK_SEED = '#9aa4b2'
 
+#: Plan 37 UF16. What a handle places: a region seed (the ball) or an
+#: exclude point (a cube, in the theme's warning colour, its readout saying
+#: "Exclude"), so the two can never be mistaken for one another on screen.
+SEED, EXCLUDE = 'seed', 'exclude'
+_ROLES = (SEED, EXCLUDE)
+_EXCLUDE_TOKEN = 'status.warning'
+_FALLBACK_EXCLUDE = '#d9822b'
+
 #: Handle proportions, in arrow lengths.
 _BALL_RADIUS = 0.12
 _SQUARE_NEAR, _SQUARE_FAR = 0.28, 0.48
@@ -139,6 +147,23 @@ def axisColours() -> tuple[str, str, str]:
     except Exception:                                         # noqa: BLE001
         pass
     return _FALLBACK_AXIS_COLOURS
+
+
+def excludeColour() -> str:
+    """Plan 37 UF16. The theme's warning colour: an exclude point's handle
+    and markers. None of the axes (error, success, info) and none of the seed
+    verdicts (success, error) use it."""
+    from foammesh.app import app
+
+    try:
+        tokens = app.themeManager.tokens if app.themeManager else None
+        if tokens is not None:
+            value = tokens.values.get(_EXCLUDE_TOKEN)
+            if value:
+                return str(value)
+    except Exception:                                         # noqa: BLE001
+        pass
+    return _FALLBACK_EXCLUDE
 
 
 def _textColour() -> str:
@@ -217,8 +242,13 @@ class SeedGizmo(QObject):
     #: A drag started or ended (True, False).
     dragging = Signal(bool)
 
-    def __init__(self, view=None, point=(0.0, 0.0, 0.0), parent=None):
+    def __init__(self, view=None, point=(0.0, 0.0, 0.0), parent=None, *,
+                 role=SEED):
         super().__init__(parent)
+        if role not in _ROLES:
+            raise ValueError(f'a handle places a seed or an exclude point, '
+                             f'not {role!r}')
+        self._role = role
         self._view = view
         self._point = tuple(float(value) for value in point)
         self._bounds = None
@@ -246,7 +276,7 @@ class SeedGizmo(QObject):
         self._cross = None
         self._verdict = None
         self._picker = None
-        self._colour = _FALLBACK_SEED
+        self._colour = excludeColour() if role == EXCLUDE else _FALLBACK_SEED
         self._closed = False
         #: RP4. Per axis: (cross-hair actor, its data, drop actor, its data).
         self._shadows = {}
@@ -295,8 +325,12 @@ class SeedGizmo(QObject):
         self._renderer, self._window = overlay, window
 
         colours = axisColours()
-        self._handles[(CENTRE, None)] = self._part(
-            _ballPolyData(), self._colour, 'seedGizmo:ball')
+        if self._role == EXCLUDE:
+            ball = self._part(_cubePolyData(), self._colour,
+                              'excludeGizmo:ball')
+        else:
+            ball = self._part(_ballPolyData(), self._colour, 'seedGizmo:ball')
+        self._handles[(CENTRE, None)] = ball
         for axis in range(3):
             self._handles[(AXIS, axis)] = self._part(
                 _arrowPolyData(axis), colours[axis], f'seedGizmo:arrow{"XYZ"[axis]}')
@@ -550,6 +584,10 @@ class SeedGizmo(QObject):
     def colour(self) -> str:
         return self._colour
 
+    def role(self) -> str:
+        """Plan 37 UF16. `SEED` or `EXCLUDE`: what this handle places."""
+        return self._role
+
     def setVerdict(self, verdict) -> None:
         """Plan 36 RP10. Say the verdict in the handle's shape as well.
 
@@ -564,6 +602,10 @@ class SeedGizmo(QObject):
 
     def shape(self) -> str:
         """`SOLID`, `HOLLOW` or `CROSSED`: what the handle's shape says."""
+        if self._role == EXCLUDE:
+            # Plan 37 UF16. An exclude point may sit in any space; only one
+            # on a wall is a point v13 ignores (live S6).
+            return CROSSED if self._verdict == 'on_surface' else SOLID
         if self._verdict == 'inside':
             return SOLID
         return CROSSED if self._verdict in WRONG_PLACE else HOLLOW
@@ -715,6 +757,12 @@ class SeedGizmo(QObject):
         x, y, z = point
         return f'x {x:.4f} \u00b7 y {y:.4f} \u00b7 z {z:.4f} m'
 
+    def readoutLabel(self, point) -> str:
+        """What this handle's readout says at *point*; an exclude point's
+        says so first (Plan 37 UF16)."""
+        text = self.readoutFor(point)
+        return f'Exclude \u00b7 {text}' if self._role == EXCLUDE else text
+
     def _beforeSceneRender(self, *_args) -> None:
         """Choose the walls again, but only when the camera changed octant."""
         if self._bounds is None or self._main is None:
@@ -772,7 +820,7 @@ class SeedGizmo(QObject):
     def _showReadout(self, x, y) -> None:
         if self._readout is None:
             return
-        self._readout.SetInput(self.readoutFor(self._point))
+        self._readout.SetInput(self.readoutLabel(self._point))
         self._readout.SetDisplayPosition(int(x) + _READOUT_OFFSET[0],
                                          int(y) + _READOUT_OFFSET[1])
         self._readout.VisibilityOn()
@@ -1199,6 +1247,19 @@ def _ballPolyData():
     source.SetRadius(_BALL_RADIUS)
     source.SetThetaResolution(24)
     source.SetPhiResolution(16)
+    source.Update()
+    return source.GetOutput()
+
+
+def _cubePolyData():
+    """Plan 37 UF16. The exclude handle: a cube the seed ball's size."""
+    from vtkmodules.vtkFiltersSources import vtkCubeSource
+
+    side = 2.0 * _BALL_RADIUS * 0.85
+    source = vtkCubeSource()
+    source.SetXLength(side)
+    source.SetYLength(side)
+    source.SetZLength(side)
     source.Update()
     return source.GetOutput()
 

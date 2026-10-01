@@ -445,7 +445,64 @@ def _workflow_operations() -> list[OperationDescriptor]:
                             artifact_contract=('workflow-task-state',),
                             summary='Accept, configure, skip, revert, or fail one '
                                     'engine workflow task and persist the state.'),
-        OperationDescriptor('workflow.status', 'Workflow status', 'case', ImpactClass.READ),
+        # Plan 37 UF5. The previews list what an unlock or an undo would
+        # reset and cost; the other two do it, under the case mutation lease,
+        # through a PREPARED/COMMITTED manifest that a crash resumes or rolls
+        # back.
+        OperationDescriptor('mesh.workflow.unlock_preview',
+                            'Preview unlocking a step', 'case', ImpactClass.READ,
+                            summary='The steps an unlock would reopen, the '
+                                    'results it would set aside and their disk '
+                                    'cost, and whether it is refused.'),
+        OperationDescriptor('mesh.workflow.unlock',
+                            'Unlock a step and discard later results', 'case',
+                            ImpactClass.FILE_PRODUCING, recovery='restore_point',
+                            artifact_contract=('workflow-task-state',),
+                            summary='Reopen a published step and its dependants, '
+                                    'keeping one restore point of the mesh, '
+                                    'settings and task states.'),
+        OperationDescriptor('mesh.workflow.undo_unlock_preview',
+                            'Preview restoring the previous mesh', 'case',
+                            ImpactClass.READ,
+                            summary='The settings, task states and mesh an undo '
+                                    'would put back, and whether it is refused.'),
+        OperationDescriptor('mesh.workflow.undo_unlock',
+                            'Restore the previous mesh and settings', 'case',
+                            ImpactClass.FILE_PRODUCING, recovery='restore_point',
+                            artifact_contract=('workflow-task-state', 'mesh'),
+                            summary='Put back the mesh, settings and task states '
+                                    'the last unlock set aside.'),
+        # Plan 37 UF17. Change the core count of a decomposed mesh: v13
+        # redistributePar -parallel on a staging copy, validated and then
+        # swapped in by rename; the core-count setting is published last.
+        OperationDescriptor('mesh.redistribute.preview',
+                            'Preview changing the core count', 'case',
+                            ImpactClass.READ,
+                            parameters_schema={
+                                'type': 'object', 'properties': {
+                                    'ranks': {'type': 'integer', 'minimum': 1},
+                                    'expected_revision': {'type': 'string'}},
+                                'required': ['ranks']},
+                            summary='The global mesh of the processor cases, the '
+                                    'ranks the change runs on, what it cannot '
+                                    'carry and its disk cost, or why it is '
+                                    'refused.'),
+        OperationDescriptor('mesh.redistribute',
+                            'Change the core count of the decomposed mesh',
+                            'case', ImpactClass.EXPENSIVE_JOB,
+                            capabilities=('redistributePar', 'mpirun', 'checkMesh'),
+                            parameters_schema={
+                                'type': 'object', 'properties': {
+                                    'ranks': {'type': 'integer', 'minimum': 1},
+                                    'expected_revision': {'type': 'string'}},
+                                'required': ['ranks']},
+                            recovery='restore_point',
+                            artifact_contract=('mesh',),
+                            summary='Redistribute the processor cases over a '
+                                    'new number of cores, preserving the global '
+                                    'mesh, zones and fields, and set the core '
+                                    'count to match.'),
+        OperationDescriptor('workflow.status','Workflow status', 'case', ImpactClass.READ),
         OperationDescriptor('workflow.start_authored', 'Start authored workflow', 'case',
                             ImpactClass.MESH_MUTATION, recovery='restore_point'),
         OperationDescriptor('workflow.return_to_external', 'Return to external workflow', 'case',
@@ -536,6 +593,12 @@ def _mesh_operations() -> list[OperationDescriptor]:
         OperationDescriptor('quality.failed_sets', 'List failed quality sets', 'case',
                             ImpactClass.READ),
         OperationDescriptor('quality.failed_set.select', 'Select a failed quality set', 'case',
+                            ImpactClass.READ),
+        # Plan 37 UF18: the check's written sets and surfaces, and their
+        # geometry read in the mesh worker for the viewport's highlights.
+        OperationDescriptor('quality.check_artifacts', 'List check outputs', 'case',
+                            ImpactClass.READ),
+        OperationDescriptor('quality.check_highlights', 'Read check highlights', 'case',
                             ImpactClass.READ),
         OperationDescriptor('quality.compare', 'Compare quality reports', 'case',
                             ImpactClass.READ),

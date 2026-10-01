@@ -32,7 +32,8 @@ from foammesh.core.mesh import detection_record  # RP13 #3
 from .commands import Command
 from .errors import (CapabilityUnavailableError, CheckOverBudgetError,
                      CheckUnavailableError, FacadeError,
-                     PreconditionFailedError, ValidationFailedError)
+                     PreconditionFailedError, ValidationFailedError,
+                     unavailable_utility_text)
 from .probe_cache import ProbeCache
 from .results import OperationResult
 from .session import CaseSession
@@ -64,6 +65,25 @@ def _runner_log_tail(layout, limit: int = 400) -> str:
     except OSError:
         return ''
     return ' '.join(text.replace('\x00', '').split())[-limit:]
+
+
+class TaskLockedError(FacadeError):
+    """Plan 37 UF5: the edit would change a task that holds a published result."""
+    code = 'task_locked'
+
+
+class UnlockRefusedError(FacadeError):
+    """Plan 37 UF5: an unlock or undo that changed nothing, and why
+    (``details['reason']``: case_busy, not_locked, revision_conflict,
+    insufficient_disk, undo_not_durable, undo_unavailable, undo_damaged)."""
+    code = 'unlock_refused'
+
+
+class RedistributeRefusedError(FacadeError):
+    """Plan 37 UF17: a core-count change that left the live processor cases
+    as they were, and why (``details['reason']``, one of
+    :data:`foammesh.core.jobs.redistribute_transaction.REASONS`)."""
+    code = 'redistribute_refused'
 
 
 #: Signals worth naming when a runner dies of one. Anything else is reported
@@ -784,6 +804,9 @@ def _prepared_boundary_categories(db, geometry_entries: list[dict]) -> dict:
 #: dialog never pays for a cold WSL boot twice; short enough that installing
 #: the missing runtime is noticed without restarting the window.
 _PROBE_TTL_SECONDS = 300.0
+#: Plan 37 UF5: how long a worker check waits for a mesher to release the
+#: case before it is refused as busy (retryable).
+WORKER_LEASE_WAIT_SECONDS = 2.0
 
 #: The engine tasks whose questions `3. Preparation` asks, and which therefore
 #: have no row of their own to reopen by hand (Plan 32 section 4.4).
@@ -946,9 +969,89 @@ class DomainOperations:
 
     # -- registration ------------------------------------------------------ #
 
+    #: Plan 37 UF5 DP-1063. Operations that rewrite the geometry artifacts
+    #: on disk (not a working copy the lock could diff), refused up front on a
+    #: case whose mesh was made from that geometry. A ``preview`` asks only.
+    _GEOMETRY_REWRITES = frozenset({
+        'geometry.import', 'geometry.split', 'geometry.combine',
+        'geometry.transform', 'geometry.repair', 'geometry.repair.apply',
+        'geometry.repair.rollback', 'geometry.wrap.apply',
+        'geometry.patches.merge', 'geometry.patches.split',
+        'geometry.patches.split_by_angle', 'geometry.split_interfaces',
+        'geometry.prepared.create', 'geometry.prepared.select',
+    })
+
+    #: Plan 37 UF5. The exports whose provenance is recorded, so an unlock
+    #: can say which of them describe the mesh it discards.
+    _PROVENANCE_EXPORTS = frozenset({
+        'case.export.native', 'case.export.vtk', 'case.export.cgns',
+        'case.export.gmsh', 'case.export.su2', 'case.export.med',
+        'case.export.unv', 'case.export.fluent',
+        'mesh.canonical.export.openfoam',
+    })
+
     def register_all(self, register) -> None:
         for operation, handler in self.handlers().items():
+            if operation in self._GEOMETRY_REWRITES:
+                handler = self._refusing_on_locked_geometry(operation, handler)
+            if operation in self._PROVENANCE_EXPORTS:
+                handler = self._recording_export_provenance(operation, handler)
             register(operation, handler)
+
+    @staticmethod
+    def _recording_export_provenance(operation: str, handler):
+        """Note which mesh an export was written from, after it succeeded."""
+        from functools import wraps
+
+        def note(session, command, result):
+            destination = (command.parameters or {}).get('destination')
+            if (getattr(result, 'status', '') == 'accepted'
+                    and isinstance(destination, str) and destination):
+                from foammesh.core.jobs import export_provenance
+                try:
+                    export_provenance.record(session.case_path, destination,
+                                             operation=operation)
+                except (OSError, ValueError):
+                    logger.warning('export provenance not recorded for %s',
+                                   destination, exc_info=True)
+            return result
+
+        if inspect.iscoroutinefunction(handler):
+            @wraps(handler)
+            async def recorded(session, command, *args, **kwargs):
+                return note(session, command,
+                            await handler(session, command, *args, **kwargs))
+        else:
+            @wraps(handler)
+            def recorded(session, command, *args, **kwargs):
+                result = handler(session, command, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    async def later():
+                        return note(session, command, await result)
+                    return later()
+                return note(session, command, result)
+        return recorded
+
+    @staticmethod
+    def _refusing_on_locked_geometry(operation: str, handler):
+        from functools import wraps
+
+        def refuse(session, command) -> None:
+            if not (command.parameters or {}).get('preview'):
+                from .facade import refuse_locked_items
+                refuse_locked_items(session, 'geometry', operation=operation)
+
+        if inspect.iscoroutinefunction(handler):
+            @wraps(handler)
+            async def guarded(session, command, *args, **kwargs):
+                refuse(session, command)
+                return await handler(session, command, *args, **kwargs)
+        else:
+            @wraps(handler)
+            def guarded(session, command, *args, **kwargs):
+                refuse(session, command)
+                return handler(session, command, *args, **kwargs)
+        return guarded
 
     def handlers(self) -> dict:
         table = {
@@ -1018,6 +1121,13 @@ class DomainOperations:
             'mesh.workflow.task_state': self._mesh_workflow_task_state,
             'mesh.workflow.task_page': self._mesh_workflow_task_page,
             'mesh.workflow.task_transition': self._mesh_workflow_task_transition,
+            'mesh.workflow.unlock_preview': self._mesh_workflow_unlock_preview,
+            'mesh.workflow.unlock': self._mesh_workflow_unlock,
+            'mesh.workflow.undo_unlock_preview':
+                self._mesh_workflow_undo_unlock_preview,
+            'mesh.workflow.undo_unlock': self._mesh_workflow_undo_unlock,
+            'mesh.redistribute.preview': self._mesh_redistribute_preview,
+            'mesh.redistribute': self._mesh_redistribute,
             'workflow.status': self._workflow_status,
             'workflow.start_authored': self._workflow_start_authored,
             'workflow.return_to_external': self._workflow_return_to_external,
@@ -1045,6 +1155,11 @@ class DomainOperations:
             'mesh.run.accept': self._mesh_run_accept,
             'quality.report': self._quality_report,
             'quality.failed_sets': self._quality_failed_sets,
+            # Plan 37 UF18: what checkMesh wrote, by revision; the geometry
+            # is parsed in the mesh worker, under the check_artifacts budgets.
+            'quality.check_artifacts': self._quality_check_artifacts,
+            'quality.check_highlights':
+                self._worker_handler('quality.check_highlights'),
             'quality.failed_set.select': self._quality_failed_set_select,
             'quality.compare': self._quality_compare,
             'quality.report.export': self._quality_report_export,
@@ -2048,26 +2163,184 @@ class DomainOperations:
         before.
         """
         operation, inner = self._check_command(command, task_id)
+        title = self._check_title(store, task_id)
+        # Plan 37 UF4 DP-1025. A task still locked behind a prerequisite is
+        # refused here, naming the prerequisite, before anything measures the
+        # mesh. It used to run the whole check in a worker and only then
+        # answer "produced a report but the task could not advance" --
+        # measured live on the Gmsh elbow with Reference readiness unaccepted.
+        self._refuse_locked_check(store, task_id, title)
         handler = self.handlers()[operation]
         result = handler(session, inner)
         if not inspect.isawaitable(result):
             return self._record_check(task_id, operation, result, store)
 
         async def finish():
-            checks = self._checks_for(session)
-            checks['checking'][task_id] = operation
-            checks['failures'].pop(task_id, None)
-            try:
-                outcome = await result
-            except FacadeError as error:
-                checks['failures'][task_id] = _check_failure(
-                    operation, error)
-                raise
-            finally:
-                checks['checking'].pop(task_id, None)
+            # DP-1027. One job per check and mesh: a second request joins
+            # the one in flight rather than measuring the mesh again.
+            job = self._check_job(session, task_id, operation, result, title)
+            outcome = await asyncio.shield(job['future'])
+            self._assert_job_current(session, job)
             return self._record_check(task_id, operation, outcome, store)
 
         return finish()
+
+    @staticmethod
+    def _check_title(store, task_id: str) -> str:
+        """The name the user reads for ``task_id`` (its row, not its id)."""
+        try:
+            return str(store.descriptor.task(task_id).title or task_id)
+        except Exception:                                   # noqa: BLE001
+            return task_id
+
+    def _refuse_locked_check(self, store, task_id: str, title: str) -> None:
+        try:
+            graph = store.load_result().graph
+            if graph.is_runnable(task_id):
+                return
+            blocking = graph.blocking_prerequisites(task_id)
+        except Exception:                                   # noqa: BLE001
+            return                  # the recorder still refuses, by name
+        names = ', '.join(self._check_title(store, parent)
+                          for parent in blocking)
+        if names:
+            text = ('{0} was not checked and could not advance: it is locked '
+                    'by prerequisites until {1} is done. Finish {1} on its '
+                    'step (press Proceed there), {2}').format(
+                        title, names, _CHECK_AGAIN)
+        else:
+            text = ('{0} was not checked and could not advance: it is locked '
+                    'by prerequisites. Finish the steps above it, {1}').format(
+                        title, _CHECK_AGAIN)
+        raise ValidationFailedError(text, details={
+            'task_id': task_id, 'reason': 'locked', 'actionable': True,
+            'waiting_on': list(blocking), 'retryable': True})
+
+    # -- Plan 37 UF4 DP-1027: one revision-keyed job per check -------------- #
+
+    def _check_job(self, session: CaseSession, task_id: str, operation: str,
+                   pending, title: str) -> dict:
+        """Start the job that runs ``pending``, or join the one in flight.
+
+        A job is keyed by the check, the mesh on disk and the settings. The
+        same key joins (``pending`` is dropped unrun); a different key -- a
+        new mesh arrived -- supersedes the old job, whose waiters are told so
+        and whose result is never recorded. Only the current job's ending
+        touches the ``checking`` flag and the failure the page shows, so a
+        superseded or background job cannot clear a flag it does not own.
+        """
+        checks = self._checks_for(session)
+        jobs = checks.setdefault('jobs', {})
+        revision = _mesh_revision(getattr(session, 'case_path', ''))
+        key = (operation, revision, _settings_digest(session))
+        job = jobs.get(task_id)
+        if job is not None and not job['future'].done():
+            if job['key'] == key:
+                if inspect.iscoroutine(pending):
+                    pending.close()
+                return job
+            self._stop_job(job, 'superseded')
+        job = {'task_id': task_id, 'operation': operation, 'key': key,
+               'revision': revision, 'title': title, 'stop': None,
+               'case_path': getattr(session, 'case_path', '')}
+
+        async def runner():
+            try:
+                outcome = await pending
+            except asyncio.CancelledError:
+                raise self._stopped_error(job) from None
+            except FacadeError as error:
+                raise _actionable_check_error(title, operation, error) from None
+            if _mesh_revision(job['case_path']) != job['revision']:
+                raise self._stale_error(job)
+            return outcome
+
+        future = asyncio.ensure_future(runner())
+        job['future'] = future
+        jobs[task_id] = job
+        checks['checking'][task_id] = operation
+        checks['failures'].pop(task_id, None)
+
+        def finished(done, job=job):
+            error = None if done.cancelled() else done.exception()
+            if jobs.get(task_id) is not job:
+                return                               # superseded: not ours
+            jobs.pop(task_id, None)
+            checks['checking'].pop(task_id, None)
+            if done.cancelled():
+                error = self._stopped_error(job)
+            if isinstance(error, FacadeError):
+                checks['failures'][task_id] = _check_failure(operation, error)
+            elif error is not None:
+                checks['failures'][task_id] = {
+                    'operation': operation, 'code': 'check_unavailable',
+                    'reason': 'worker_error', 'retryable': True,
+                    'message': '{0} could not run ({1}). {2}'.format(
+                        title, error, _CHECK_AGAIN_SENTENCE)}
+            else:
+                checks['failures'].pop(task_id, None)
+
+        future.add_done_callback(finished)
+        return job
+
+    @staticmethod
+    def _stop_job(job: dict, reason: str) -> None:
+        job['stop'] = reason
+        job['future'].cancel()
+
+    @staticmethod
+    def _stopped_error(job: dict) -> FacadeError:
+        reason = job.get('stop') or 'cancelled'
+        if reason == 'superseded':
+            text = ('{0} was stopped because a new mesh arrived while it was '
+                    'checking the old one; the old result was discarded. '
+                    'Press Check & Proceed to check the current mesh.')
+        else:
+            text = ('{0} was cancelled before it finished, so Quality was not '
+                    'marked done. The mesh is unchanged; press Check & Proceed '
+                    'to run it again.')
+        return CheckUnavailableError(text.format(job['title']), details={
+            'reason': reason, 'outcome': 'cancelled', 'retryable': True,
+            'operation': job['operation'], 'actionable': True})
+
+    @staticmethod
+    def _stale_error(job: dict) -> FacadeError:
+        return CheckUnavailableError(
+            'The mesh changed while {0} was checking it, so that result was '
+            'discarded. Press Check & Proceed to check the current mesh.'
+            .format(job['title']), details={
+                'reason': 'stale_result', 'outcome': 'stale',
+                'retryable': True, 'operation': job['operation'],
+                'actionable': True})
+
+    def _assert_job_current(self, session: CaseSession, job: dict) -> None:
+        """Refuse to record a job's result once the mesh has moved on."""
+        if _mesh_revision(job['case_path']) == job['revision']:
+            return
+        error = self._stale_error(job)
+        checks = self._checks_for(session)
+        if checks.setdefault('jobs', {}).get(job['task_id']) in (None, job):
+            checks['failures'][job['task_id']] = _check_failure(
+                job['operation'], error)
+        raise error
+
+    def cancel_check_jobs(self, session: CaseSession,
+                          task_id: str | None = None) -> list:
+        """Cancel the check jobs of ``session`` (or just ``task_id``).
+
+        Each cancelled check is left unrun and retryable: its page says it
+        was cancelled, and the next Check & Proceed starts a fresh job.
+        Returns the task ids that were cancelled.
+        """
+        jobs = self._checks_for(session).setdefault('jobs', {})
+        stopped = []
+        for key, job in list(jobs.items()):
+            if task_id is not None and key != task_id:
+                continue
+            if not job['future'].done():
+                self._stop_job(job, 'cancelled')
+                stopped.append(key)
+        return stopped
 
     def _record_check(self, task_id: str, operation: str, result, store):
         """Store one check's verdict as the task's evidence."""
@@ -2088,8 +2361,9 @@ class DomainOperations:
                           or document.get('summary_fingerprint') or '')
         if not fingerprint:
             raise ValidationFailedError(
-                f'{task_id} produced no report fingerprint, so there is no '
-                'evidence to record; the check did not run')
+                '{0} produced no report fingerprint, so there is no evidence '
+                'to record; the check did not run. The mesh is unchanged; '
+                '{1}'.format(self._check_title(store, task_id), _CHECK_AGAIN))
         recorded = store.record_check_result(
             task_id,
             evidence={'operation': operation, 'verdict': verdict,
@@ -2108,11 +2382,17 @@ class DomainOperations:
             # of a row that had not moved and a pipeline still locked behind
             # it. The evidence is written either way; what changes is that the
             # user is told why the row did not move.
+            # Plan 37 UF4 DP-1025: named as the row the user reads, and
+            # ending on what to do.
             raise ValidationFailedError(
                 '{0} produced a report but the task could not advance: '
-                '{1} (state {2})'.format(
-                    task_id, blocked.get('reason') or 'refused',
-                    blocked.get('state') or 'unknown'))
+                '{1} (state {2}). Finish the step it is waiting on, '
+                '{3}'.format(
+                    self._check_title(store, task_id),
+                    blocked.get('reason') or 'refused',
+                    blocked.get('state') or 'unknown', _CHECK_AGAIN),
+                details={'task_id': task_id, 'actionable': True,
+                         'reason': 'not_advanced', 'retryable': True})
         return dict(recorded, check={'operation': operation,
                                      'verdict': verdict,
                                      'report_fingerprint': fingerprint,
@@ -2160,6 +2440,27 @@ class DomainOperations:
         died, it was cancelled -- is ``check_unavailable`` and retryable. No
         path falls back to measuring in this process.
         """
+        # Plan 37 UF5 DP-1039: a worker reads the mesh, so it shares the case
+        # lease; a mesher or an unlock holding it exclusively refuses the
+        # check (retryable) rather than let it read a mesh being rewritten.
+        # Taken before admission, so a refused check holds no budget.
+        from foammesh.core.jobs import case_lease
+        try:
+            lease = case_lease.acquire(session.case_path, case_lease.SHARED, operation,
+                                       timeout=WORKER_LEASE_WAIT_SECONDS)
+            await lease.__aenter__()
+        except case_lease.CaseBusyError as busy:
+            raise CheckUnavailableError(
+                f'{operation} was not started: {busy}',
+                details={'outcome': 'case_busy', 'operation': operation,
+                         'holders': list(busy.holders), 'retryable': True}) from None
+        try:
+            return await self._run_in_worker_held(session, command, operation)
+        finally:
+            await lease.__aexit__(None, None, None)
+
+    async def _run_in_worker_held(self, session: CaseSession, command: Command,
+                                  operation: str) -> OperationResult:
         from foammesh.core.jobs import local_worker
         from foammesh.core.mesh.poly_mesh_boundary import (
             PolyMeshReadError, read_counts,
@@ -2259,12 +2560,499 @@ class DomainOperations:
             return self._read_result(session, command, dict(
                 recorded, engine_id=engine_id))
 
+        # Plan 37 UF5 DP-1040. A task holding a published result is locked:
+        # reopening it here would leave the mesh on disk claiming settings
+        # it was not made from. `mesh.workflow.unlock` is the way back.
+        if store.is_locked(task_id):
+            if transition == 'accept':
+                # Accepting what is already accepted changes nothing; going
+                # through configure->finish would stale every result below.
+                snapshot = store.snapshot()
+                return self._read_result(session, command, {
+                    'transition': None, 'tasks': snapshot['tasks'],
+                    'locked': True, 'engine_id': engine_id,
+                    'workflow_reset_notice': snapshot.get('workflow_reset_notice')})
+            title = store.descriptor.task(task_id).title
+            raise TaskLockedError(
+                f'{title} is locked: the mesh on disk was made from its '
+                'settings. Unlock it (discarding the results after it) '
+                'before changing it.',
+                details={'tasks': [task_id], 'titles': [title],
+                         'engine_id': engine_id, 'transition': transition,
+                         'unlock_operation': 'mesh.workflow.unlock'})
         try:
             result = store.apply(task_id, transition)
         except (TaskStateError, ValueError, KeyError) as error:
             raise ValidationFailedError(str(error)) from error
         return self._read_result(session, command, dict(
             result, engine_id=engine_id))
+
+    # -- Plan 37 UF5: unlock and undo ------------------------------------- #
+
+    @staticmethod
+    def _unlock_refused(error) -> 'UnlockRefusedError':
+        return UnlockRefusedError(str(error), details=dict(
+            error.details, reason=error.code,
+            retryable=error.code in ('case_busy', 'insufficient_disk')))
+
+    def _mesh_workflow_unlock_preview(self, session: CaseSession,
+                                      command: Command) -> OperationResult:
+        """What unlocking a task would reset, and what it costs on disk."""
+        from foammesh.core.jobs import unlock_transaction
+        engine_id, store = self._task_state_store(session, command)
+        task_id = str(command.parameters.get('task_id') or '').strip()
+        if not task_id:
+            raise ValidationFailedError('task_id is required')
+        try:
+            preview = unlock_transaction.preview_unlock(
+                session.case_path, store, task_id)
+        except KeyError as error:
+            raise ValidationFailedError(f'unknown task: {task_id}') from error
+        return self._read_result(session, command, dict(
+            preview, engine_id=engine_id))
+
+    def _mesh_workflow_unlock(self, session: CaseSession, command: Command):
+        """Unlock a task: it and its dependants reopen; one undo is kept.
+
+        The copy the undo needs is written off the owner loop. The mesh on
+        disk is not touched: it stays as the previous result, and the
+        outline says its step is no longer published.
+        """
+        from foammesh.core.jobs import unlock_transaction
+        session.require_writable()
+        engine_id, store = self._task_state_store(session, command)
+        task_id = str(command.parameters.get('task_id') or '').strip()
+        if not task_id:
+            raise ValidationFailedError('task_id is required')
+        try:
+            store.descriptor.task(task_id)
+        except KeyError as error:
+            raise ValidationFailedError(f'unknown task: {task_id}') from error
+        expected = command.parameters.get('expected_revision')
+        settings_text = session.state.db.toYaml()
+        surfaces = self._surface_snapshot(session)
+
+        async def run():
+            try:
+                result = await asyncio.to_thread(
+                    unlock_transaction.unlock, session.case_path, store, task_id,
+                    settings_text=settings_text,
+                    expected_revision=(None if expected is None else int(expected)),
+                    capture_surfaces=lambda directory: self._write_surfaces(
+                        surfaces, directory))
+            except unlock_transaction.UnlockError as error:
+                raise self._unlock_refused(error) from None
+            session.state.bus.publish(
+                Event.ARTIFACT_QUALITY_CHANGED, operation=command.operation,
+                job_id=None, artifacts=[], quality=task_id)
+            return self._read_result(session, command, dict(
+                result, engine_id=engine_id, state=store.snapshot()))
+
+        return run()
+
+    # -- Plan 37 UF17: change the core count of a decomposed mesh ---------- #
+
+    @staticmethod
+    def _redistribute_refused(error) -> 'RedistributeRefusedError':
+        return RedistributeRefusedError(str(error), details=dict(
+            error.details, reason=error.code,
+            retryable=error.code in ('case_busy', 'insufficient_disk',
+                                     'pending_transaction', 'stale_revision')))
+
+    @staticmethod
+    def _redistribute_target(command: Command) -> int:
+        try:
+            return int(command.parameters.get('ranks'))
+        except (TypeError, ValueError) as error:
+            raise ValidationFailedError(
+                'ranks must be a whole number of cores', details={
+                    'reason': 'target_invalid',
+                    'ranks': command.parameters.get('ranks')}) from error
+
+    @staticmethod
+    def _redistribute_settings(session: CaseSession):
+        from dataclasses import replace
+        from foammesh.openfoam import decomposition
+        # A weight field is read from the case root at the start time; the
+        # stage has none, and redistributePar would abort on it.
+        return replace(decomposition.DecompositionSettings.read(session.state.db),
+                       weight_field='')
+
+    def _redistribute_assess(self, session: CaseSession, target: int,
+                             expected_revision=None, settings=None) -> dict:
+        """The transaction's own assessment, plus the method's cell split."""
+        from foammesh.core.execution.resources import machine_cpu_limit
+        from foammesh.core.jobs import redistribute_transaction
+        from foammesh.openfoam import decomposition
+        try:
+            cpu_limit = machine_cpu_limit()
+        except Exception:  # noqa: BLE001 - an unknown machine refuses nothing
+            cpu_limit = None
+        report = redistribute_transaction.assess(
+            session.case_path, target, cpu_limit=cpu_limit,
+            expected_revision=expected_revision)
+        report['cpu_limit'] = cpu_limit
+        settings = settings or self._redistribute_settings(session)
+        report['method'] = settings.method
+        if report['refusal'] is None:
+            try:
+                decomposition.build(
+                    target, method=settings.method, order=settings.order,
+                    cells=settings.cells, constraints=settings.constraints(
+                        (report['census'] or {}).get('face_zones') or ()))
+            except decomposition.DecompositionError as error:
+                report['refusal'] = {
+                    'code': 'method_needs_cells',
+                    'reason': redistribute_transaction.REASONS['method_needs_cells'],
+                    'details': {'method': settings.method, 'error': str(error)}}
+        return report
+
+    async def _settle_redistribute(self, session: CaseSession, *,
+                                   lease_held: bool) -> dict | None:
+        """Settle a core-count change an interruption left behind.
+
+        UF20 D-1/D-2: a transaction whose run a killed app left open, or a
+        stage folder a failed launch could not remove, refused every later
+        change until the case was reopened (and, for the open run, swept
+        first). The run-record gate closes a run only once its writer is
+        confirmed dead, then the stage is discarded as at case open; a run
+        that may still be alive keeps its transaction waiting. Without the
+        lease (the preview) this is skipped when another flow holds the case.
+        """
+        from foammesh.core.jobs import case_lease
+        from foammesh.core.jobs import redistribute_transaction as transaction
+        case_path = session.case_path
+        if session.read_only or not transaction.blocking(case_path):
+            return None
+        active = tuple(getattr(session.jobs, 'active_job_ids', ()) or ())
+
+        def settle():
+            if lease_held:
+                return transaction.settle(case_path, active_run_ids=active)
+            try:
+                with case_lease.hold(case_path, case_lease.EXCLUSIVE,
+                                     transaction.RECOVER_OPERATION):
+                    return transaction.settle(case_path, active_run_ids=active)
+            except case_lease.CaseBusyError:
+                return None
+
+        report = await asyncio.to_thread(settle)
+        for item in (report or {}).get('settings', ()):
+            try:
+                transaction.apply_setting(session, item['target_ranks'],
+                                          reason='redistribute recovery')
+            except Exception:  # noqa: BLE001 - stays pending for the next pass
+                logger.warning('core-count setting of %s could not be published',
+                               item['id'], exc_info=True)
+                continue
+            await asyncio.to_thread(transaction.finish, case_path, item['id'])
+        return report
+
+    def _mesh_redistribute_preview(self, session: CaseSession, command: Command):
+        """What changing the core count would do, or why it cannot."""
+        target = self._redistribute_target(command)
+        expected = command.parameters.get('expected_revision')
+        settings = self._redistribute_settings(session)
+
+        async def run():
+            await self._settle_redistribute(session, lease_held=False)
+            report = await asyncio.to_thread(
+                self._redistribute_assess, session, target, expected, settings)
+            report['allowed'] = report['refusal'] is None
+            return self._read_result(session, command, report)
+
+        return run()
+
+    def _mesh_redistribute(self, session: CaseSession, command: Command):
+        """Redistribute the processor cases over ``ranks`` cores.
+
+        ``redistributePar -parallel`` on ``max(source, target)`` ranks, on a
+        staging copy (v13 writes in place even when it refuses), validated
+        against the source and by ``checkMesh -parallel`` before the live
+        processor cases are swapped by rename. The core-count setting is
+        published last. The case-root mesh is not touched.
+        """
+        from foammesh.core.jobs import case_lease
+        from foammesh.core.jobs import redistribute_transaction as transaction
+        from foammesh.openfoam import decomposition
+        session.require_writable()
+        target = self._redistribute_target(command)
+        expected = command.parameters.get('expected_revision')
+        settings = self._redistribute_settings(session)
+
+        def refused(code, message=None, **details):
+            return self._redistribute_refused(
+                transaction.RedistributeError(code, message, details=details))
+
+        async def run():
+            try:
+                async with case_lease.acquire(
+                        session.case_path, case_lease.EXCLUSIVE, command.operation,
+                        timeout=0):
+                    return await held()
+            except case_lease.CaseBusyError as error:
+                raise refused('case_busy', holders=[
+                    item.get('operation') for item in error.holders]) from None
+
+        async def held():
+            if tuple(session.jobs.active_job_ids):
+                raise refused('case_busy', jobs=list(session.jobs.active_job_ids))
+            await self._settle_redistribute(session, lease_held=True)
+            report = await asyncio.to_thread(
+                self._redistribute_assess, session, target, expected, settings)
+            if report['refusal'] is not None:
+                refusal = report['refusal']
+                raise refused(refusal['code'], refusal['reason'], **refusal['details'])
+            await self._utilities_ready(('redistributePar', 'mpirun', 'checkMesh'))
+            registry = self._capabilities_registry()
+            if hasattr(registry, 'utility'):
+                for name in ('redistributePar', 'mpirun', 'checkMesh'):
+                    capability = registry.utility(name)
+                    if capability is not None and not capability.available:
+                        raise CapabilityUnavailableError(
+                            'changing the core count needs the full OpenFOAM '
+                            'runtime', details={'utility': name,
+                                                'reason': getattr(capability, 'reason', '')})
+            face_zones = (report['census'] or {}).get('face_zones') or ()
+
+            def write_dictionary(stage, ranks):
+                decomposition.write(stage, ranks, settings, face_zones=face_zones)
+
+            try:
+                manifest = await asyncio.to_thread(
+                    transaction.prepare, session.case_path, target,
+                    write_decompose_dict=write_dictionary,
+                    cpu_limit=report.get('cpu_limit'),
+                    expected_revision=report['revision'],
+                    operation=command.operation)
+            except transaction.RedistributeError as error:
+                raise self._redistribute_refused(error) from None
+            transaction_id = manifest['id']
+            try:
+                return await launched(manifest, registry)
+            except BaseException:
+                # Nothing live was renamed before PUBLISHING; a transaction
+                # that reached it is settled by recovery, never abandoned.
+                current = transaction.load(session.case_path, transaction_id)
+                if current is not None and current.get('state') in (
+                        transaction.PREPARED, transaction.LAUNCHED,
+                        transaction.VALIDATED):
+                    try:
+                        await asyncio.to_thread(
+                            transaction.abandon, session.case_path, transaction_id)
+                    except Exception:  # noqa: BLE001 - recovery at open settles it
+                        pass
+                transaction.release(transaction_id)
+                raise
+
+        async def launched(manifest, registry):
+            transaction_id = manifest['id']
+            stage = transaction.stage_path(session.case_path, transaction_id)
+            relative = stage.relative_to(session.case_path).as_posix()
+            np = int(manifest['np'])
+            mpi = tuple(registry.mpi_options()) if hasattr(registry, 'mpi_options') else ()
+            await asyncio.to_thread(
+                transaction.mark, session.case_path, transaction_id,
+                transaction.LAUNCHED)
+            launch = registry.command(
+                'mpirun', (*mpi, '-np', str(np), 'redistributePar', '-parallel'),
+                cwd=stage)
+            execution = await self._context(session).executor.execute(
+                session, OperationSpec(
+                    operation=command.operation, argv=launch.argv, cwd=stage,
+                    mutation=True, timeout=command.parameters.get('timeout_seconds'),
+                    max_output_bytes=4 * 1024 * 1024, recover_mesh=False,
+                    artifact_event=Event.ARTIFACT_QUALITY_CHANGED,
+                    cleanup_argv=launch.cleanup_argv, expects_mesh_change=False,
+                    ranks=np, record_extra=(('staging', relative),
+                                            ('redistribute_id', transaction_id))),
+                on_line=command.parameters.get('on_line'))
+            if not execution.succeeded:
+                job = execution.job
+                raise refused('launch_failed', (
+                    'redistributePar did not finish; the processor cases are '
+                    'unchanged'), job=job.to_dict(), error=job.error or '')
+            try:
+                validated = await asyncio.to_thread(
+                    transaction.validate, session.case_path, transaction_id)
+            except transaction.RedistributeError as error:
+                raise self._redistribute_refused(error) from None
+            check_launch = registry.command(
+                'mpirun', (*mpi, '-np', str(target), 'checkMesh', '-parallel'),
+                cwd=stage)
+            check = await self._context(session).executor.execute(
+                session, OperationSpec(
+                    operation='mesh.redistribute.check', argv=check_launch.argv,
+                    cwd=stage, mutation=False,
+                    timeout=command.parameters.get('timeout_seconds'),
+                    max_output_bytes=4 * 1024 * 1024,
+                    cleanup_argv=check_launch.cleanup_argv,
+                    parser=_parse_parallel_check, ranks=target))
+            parsed = check.parsed or {}
+            cells = validated['census']['cells']
+            if not check.succeeded or parsed.get('cells') != cells:
+                raise refused('check_failed', job=check.job.to_dict(),
+                              expected_cells=cells, found=parsed)
+            # checkMesh may have left sets behind: nothing it writes is kept.
+            await asyncio.to_thread(
+                transaction.strip_unmapped, transaction.processor_dirs(stage))
+            await asyncio.to_thread(transaction.publish, session.case_path, transaction_id)
+            changed = transaction.apply_setting(
+                session, target, reason=f'redistributed {manifest["source_ranks"]} '
+                                        f'-> {target} cores')
+            await asyncio.to_thread(transaction.finish, session.case_path, transaction_id)
+            session.state.bus.publish(
+                Event.ARTIFACT_QUALITY_CHANGED, operation=command.operation,
+                job_id=execution.job.job_id, artifacts=[], quality='redistributed')
+            dropped = validated['dropped']
+            return OperationResult(
+                'accepted', command.operation, session.revisions,
+                invalidated_outputs=('quality',),
+                payload={
+                    'transaction_id': transaction_id,
+                    'source_ranks': manifest['source_ranks'],
+                    'target_ranks': target, 'np': np,
+                    'census': validated['census'],
+                    'removed_surplus': validated['removed_surplus'],
+                    'dropped': [{'file': name,
+                                 'what': transaction.UNMAPPED.get(name, name)}
+                                for name in dropped],
+                    # Anything indexed by the old ranks' local cell labels.
+                    'stale': ['quality'] + sorted(dropped),
+                    'check': {'mesh_ok': bool(parsed.get('mesh_ok')),
+                              'failed_checks': parsed.get('failed_checks', 0),
+                              'cells': parsed.get('cells')},
+                    'settings': changed,
+                    'execution': execution.to_payload(),
+                    'check_execution': check.to_payload(),
+                })
+
+        return run()
+
+    def _mesh_workflow_undo_unlock_preview(self, session: CaseSession,
+                                           command: Command) -> OperationResult:
+        from foammesh.core.jobs import unlock_transaction
+        try:
+            preview = unlock_transaction.preview_undo(
+                session.case_path, session.state.db)
+        except unlock_transaction.UnlockError as error:
+            return self._read_result(session, command, {
+                'available': False, 'reason': error.code})
+        return self._read_result(session, command, dict(preview, available=True))
+
+    def _mesh_workflow_undo_unlock(self, session: CaseSession, command: Command):
+        """Restore previous mesh and settings: undo the last unlock whole."""
+        from foammesh.core.jobs import unlock_transaction
+        session.require_writable()
+        engine_id, store = self._task_state_store(session, command)
+        record = unlock_transaction.undo_available(session.case_path)
+        if record and record.get('engine_id') and record['engine_id'] != engine_id:
+            engine_id, store = self._task_state_store(session, Command(
+                command.operation, command.case_id,
+                {'engine_id': record['engine_id']}))
+        loop = asyncio.get_running_loop()
+
+        async def replace_settings(text):
+            import yaml
+            db = session.state.db
+            document = db.validateData(yaml.full_load(text), fillWithDefault=True)
+            session.state.replace_document(
+                document, action='restore previous mesh and settings')
+
+        def restore_settings(text):
+            # Called from the worker thread; the project state belongs to
+            # the owner loop, which is free while it awaits this thread.
+            asyncio.run_coroutine_threadsafe(
+                replace_settings(text), loop).result()
+
+        async def put_surfaces(surfaces):
+            self._assign_surfaces(session, surfaces)
+
+        def restore_surfaces(directory):
+            surfaces = self._read_surfaces(directory)       # parsed off the loop
+            asyncio.run_coroutine_threadsafe(
+                put_surfaces(surfaces), loop).result()
+
+        async def run():
+            try:
+                result = await asyncio.to_thread(
+                    unlock_transaction.undo, session.case_path, store,
+                    restore_settings=restore_settings,
+                    restore_surfaces=restore_surfaces)
+            except unlock_transaction.UnlockError as error:
+                raise self._unlock_refused(error) from None
+            if result.get('restored_mesh'):
+                session.state.bus.publish(
+                    Event.ARTIFACT_MESH_CHANGED, operation=command.operation,
+                    run_id=result['operation_id'])
+            session.state.bus.publish(
+                Event.ARTIFACT_QUALITY_CHANGED, operation=command.operation,
+                job_id=None, artifacts=[], quality=result.get('task_id'))
+            return self._read_result(session, command, dict(
+                result, engine_id=engine_id, state=store.snapshot()))
+
+        return run()
+
+    # Plan 37 UF5 DP-1063. The geometry surfaces a case holds in memory (the
+    # configuration's ``_files``) are part of what undo restores: a geometry
+    # edited, re-imported or deleted after an unlock is otherwise left behind
+    # by settings that name the surfaces it had before.
+
+    @staticmethod
+    def _surface_snapshot(session: CaseSession) -> dict:
+        """The surfaces now, by key (a shallow copy; VTK objects are
+        replaced, never edited in place, so this is a stable view)."""
+        files = getattr(session.state.db, '_files', None) or {}
+        return dict(files.get('geometry') or {})
+
+    @staticmethod
+    def _write_surfaces(surfaces: dict, directory) -> None:
+        from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        index = {}
+        for key, poly in sorted(surfaces.items()):
+            if poly is None:
+                index[key] = None
+                continue
+            name = f'{key}.vtp'
+            writer = vtkXMLPolyDataWriter()
+            writer.SetInputData(poly)
+            writer.SetFileName(str(directory / name))
+            writer.SetDataModeToBinary()
+            if not writer.Write():
+                raise OSError(f'could not write the surface {key}')
+            index[key] = name
+        (directory / 'index.json').write_text(
+            json.dumps(index, indent=2, sort_keys=True), encoding='utf-8')
+
+    @staticmethod
+    def _read_surfaces(directory) -> dict:
+        from vtkmodules.vtkIOXML import vtkXMLPolyDataReader
+        directory = Path(directory)
+        index = json.loads((directory / 'index.json').read_text(encoding='utf-8'))
+        surfaces = {}
+        for key, name in index.items():
+            if name is None:
+                surfaces[key] = None
+                continue
+            reader = vtkXMLPolyDataReader()
+            reader.SetFileName(str(directory / name))
+            reader.Update()
+            surfaces[key] = reader.GetOutput()
+        return surfaces
+
+    @staticmethod
+    def _assign_surfaces(session: CaseSession, surfaces: dict) -> None:
+        """Put the captured surfaces back; one added since is dropped."""
+        files = getattr(session.state.db, '_files', None)
+        if files is None:
+            return
+        current = files.setdefault('geometry', {})
+        for key in list(current):
+            if key not in surfaces:
+                current[key] = None
+        current.update(surfaces)
 
     async def _mesh_gmsh_run(self, session: CaseSession,
                              command: Command) -> OperationResult:
@@ -3324,7 +4112,8 @@ class DomainOperations:
                 attribution['warning_for'] = tuple(warning_for)
             if reasons:
                 attribution['reasons'] = tuple(reasons)
-            return store.record_atomic_run_success(
+            staled = self._stale_checks_for_rerun(session, store, covered)
+            return self._with_staled(staled, store.record_atomic_run_success(
                 covered, warning=warning, **attribution,
                 # DP-228. The optional tasks the job this run consumed carried
                 # settings for. The graph answers the same question from a page
@@ -3332,7 +4121,7 @@ class DomainOperations:
                 configured=tuple(configured),
                 # R119/R158. Only tasks this run actually covered: a waiver
                 # names a gate the run reached, never one it skipped.
-                waived=tuple(task for task in waived if task in covered))
+                waived=tuple(task for task in waived if task in covered)))
         except (FacadeError, TaskStateError, LookupError, OSError, ValueError):
             # A workflow that cannot be advanced must not invalidate a mesh
             # that was produced and published. `FacadeError` belongs here for
@@ -3362,10 +4151,36 @@ class DomainOperations:
             _engine_id, store = self._task_state_store(session, command)
             # DP-817. The warning's text, passed only when there is one.
             extra = {'reasons': tuple(reasons)} if reasons else {}
-            return store.record_stage_chain_success(
-                task_id, warning=warning, **extra)
+            staled = self._stale_checks_for_rerun(session, store, (task_id,))
+            return self._with_staled(staled, store.record_stage_chain_success(
+                task_id, warning=warning, **extra))
         except (TaskStateError, LookupError, OSError, ValueError):
             return None
+
+    def _stale_checks_for_rerun(self, session: CaseSession, store,
+                                performed) -> list:
+        """A new mesh makes every verdict on the old one stale (DP-1038).
+
+        Plan 37 UF3. The checks below what this run performed are marked
+        stale before the run is recorded, so their old evidence is dropped
+        and the recorder stops at them as it does after a first run; and a
+        check job still measuring the replaced mesh is superseded now
+        rather than left to finish and be discarded (UF4's job record).
+        """
+        stale_below = getattr(store, 'stale_checks_below', None)
+        staled = list(stale_below(tuple(performed))) if stale_below else []
+        jobs = self._checks_for(session).setdefault('jobs', {})
+        revision = _mesh_revision(getattr(session, 'case_path', ''))
+        for job in list(jobs.values()):
+            if not job['future'].done() and job['revision'] != revision:
+                self._stop_job(job, 'superseded')
+        return staled
+
+    @staticmethod
+    def _with_staled(staled: list, recorded):
+        if isinstance(recorded, dict) and staled:
+            recorded = dict(recorded, staled_checks=list(staled))
+        return recorded
 
     def _record_stage_run_failure(self, session: CaseSession, command: Command,
                                   task_id: str | None) -> dict | None:
@@ -3388,6 +4203,35 @@ class DomainOperations:
         except (TaskStateError, LookupError, OSError, ValueError):
             return None
 
+    @staticmethod
+    def _mesh_written_at(case_path) -> float | None:
+        try:
+            return (Path(case_path) / 'constant' / 'polyMesh' / 'owner'
+                    ).stat().st_mtime
+        except OSError:
+            return None
+
+    def _collect_check_artifacts(self, session: CaseSession, argv, report, *,
+                                 started_at=None, wanted=None) -> dict | None:
+        """Keep the sets and surfaces this checkMesh run wrote (Plan 37 UF18).
+
+        Best effort: the verdict is already filed, and a highlight that
+        cannot be kept must not turn a finished check into a failed one.
+        """
+        from foammesh.core.quality import check_artifacts
+
+        try:
+            revisions = getattr(session, 'revisions', None)
+            return check_artifacts.collect(
+                session.case_path, argv=tuple(str(item) for item in argv or ()),
+                started_at=started_at, wanted=wanted, check='openfoam',
+                mesh_fingerprint=str(getattr(report, 'mesh_fingerprint', '')),
+                mesh_revision=getattr(revisions, 'artifact_sequence', None),
+                checked_at=str(getattr(report, 'checked_at', '') or ''))
+        except Exception as error:                            # noqa: BLE001
+            logger.warning('checkMesh outputs were not kept: %s', error)
+            return None
+
     def _persist_pipeline_check(self, session: CaseSession, execution) -> dict | None:
         """Store the checkMesh a pipeline run produced, as ``mesh.check`` would.
 
@@ -3403,8 +4247,10 @@ class DomainOperations:
         from foammesh.core.quality import MeshCheckService, parse_checkmesh
 
         job = execution.job
+        retained_context = self._retained_region_context(session)
         try:
             parsed = parse_checkmesh(str(getattr(job, 'output', '') or ''))
+            self._apply_retained_regions(retained_context, parsed)
             _, report = MeshCheckService.persist_result(
                 session.case_path, parsed,
                 command=tuple(getattr(job, 'argv', ()) or ()),
@@ -3413,6 +4259,12 @@ class DomainOperations:
         except (OSError, ValueError) as error:
             logger.warning('pipeline checkMesh output was not stored: %s', error)
             return None
+        # Plan 37 UF18. The pipeline's checkMesh keeps its outputs too. The
+        # job carries no start time; a file older than the mesh it checked
+        # cannot be this check's, so the mesh's own write time bounds it.
+        self._collect_check_artifacts(
+            session, tuple(getattr(job, 'argv', ()) or ()), report,
+            started_at=self._mesh_written_at(session.case_path))
         session.state.bus.publish(
             Event.ARTIFACT_QUALITY_CHANGED, operation='workflow.run_pipeline',
             job_id=getattr(job, 'job_id', None), artifacts=[], quality='checkMesh')
@@ -3492,27 +4344,41 @@ class DomainOperations:
                 if not blocked or not gates:
                     return recorded
                 results = {}
+                jobs_run = {}
                 for gate in gates:
                     operation, inner = self._check_command(command, gate)
-                    checks['checking'][gate] = operation
+                    title = self._gate_title(session, command, gate)
                     try:
                         outcome = self.handlers()[operation](session, inner)
                         if inspect.isawaitable(outcome):
-                            outcome = await outcome
+                            # Plan 37 UF4 DP-1027: the same job a
+                            # foreground Check & Proceed joins.
+                            job = self._check_job(
+                                session, gate, operation, outcome, title)
+                            jobs_run[gate] = job
+                            outcome = await asyncio.shield(job['future'])
                         results[gate] = (operation, outcome)
                     except FacadeError as error:
-                        checks['failures'][gate] = _check_failure(
-                            operation, error)
+                        if gate not in jobs_run:
+                            error = _actionable_check_error(
+                                title, operation, error)
+                            checks['failures'][gate] = _check_failure(
+                                operation, error)
                         logger.warning('check %s did not run: %s', gate, error)
                     finally:
-                        checks['checking'].pop(gate, None)
+                        if gate not in jobs_run:
+                            checks['checking'].pop(gate, None)
                 if len(results) != len(gates):
                     return recorded
                 previous = recorded
 
-                async def record(results=results, previous=previous):
+                async def record(results=results, previous=previous,
+                                 jobs_run=jobs_run):
                     engine_id, store = self._task_state_store(session, command)
                     for gate, (operation, outcome) in results.items():
+                        if gate in jobs_run:
+                            # A result for a mesh replaced since is dropped.
+                            self._assert_job_current(session, jobs_run[gate])
                         self._record_check(gate, operation, outcome, store)
                     covered = getattr(
                         ENGINE_REGISTRY.get(engine_id), 'ATOMIC_RUN_TASKS', ())
@@ -3537,6 +4403,11 @@ class DomainOperations:
                 except (TaskStateError, LookupError, OSError, ValueError,
                         FacadeError) as error:
                     for gate, (operation, _outcome) in results.items():
+                        if (isinstance(error, FacadeError)
+                                and (error.details or {}).get('actionable')):
+                            checks['failures'][gate] = _check_failure(
+                                operation, error)
+                            continue
                         checks['failures'][gate] = {
                             'operation': operation, 'reason': 'not_recorded',
                             'message': str(error), 'retryable': True}
@@ -3561,8 +4432,13 @@ class DomainOperations:
             logger.exception('the pipeline check gates could not run')
             return recorded
         finally:
+            # Plan 37 UF4 DP-1027. Only the flags this run set and no live
+            # job owns: popping every entry cleared the "checking" flag of a
+            # check the user had started from the page, while it still ran.
+            live = checks.setdefault('jobs', {})
             for gate in list(checks['checking']):
-                checks['checking'].pop(gate, None)
+                if gate not in live:
+                    checks['checking'].pop(gate, None)
             try:
                 session.state.bus.publish(
                     Event.ARTIFACT_QUALITY_CHANGED,
@@ -3573,11 +4449,24 @@ class DomainOperations:
                              exc_info=True)
 
     def _checks_for(self, session: CaseSession) -> dict:
-        """What this case is checking right now, and what could not be."""
+        """What this case is checking right now, and what could not be.
+
+        ``jobs`` (Plan 37 UF4 DP-1027) holds the one in-flight job per check
+        task that foreground and background requests share.
+        """
         registry = self.__dict__.setdefault('_gate_checks', {})
         key = str(getattr(session, 'case_path', '') or '')
         return registry.setdefault(
-            key, {'checking': {}, 'failures': {}, 'tasks': set()})
+            key, {'checking': {}, 'failures': {}, 'tasks': set(),
+                  'jobs': {}})
+
+    def _gate_title(self, session: CaseSession, command: Command,
+                    task_id: str) -> str:
+        try:
+            _engine_id, store = self._task_state_store(session, command)
+        except Exception:                                   # noqa: BLE001
+            return task_id
+        return self._check_title(store, task_id)
 
     def check_tasks_in_flight(self, session: CaseSession) -> list:
         """The background gate tasks of ``session`` (tests and shutdown)."""
@@ -4338,10 +5227,11 @@ runTimeModifiable true;
         for name, capability in (found or {}).items():
             if getattr(capability, 'transient', False) is True and \
                     not getattr(capability, 'available', False):
+                reason = str(getattr(capability, 'reason', '') or '')
                 raise CapabilityUnavailableError(
-                    'required utility is unavailable', details={
+                    unavailable_utility_text(name, reason), details={
                         'utility': name,
-                        'reason': getattr(capability, 'reason', ''),
+                        'reason': reason,
                         'retryable': True})
 
     async def _utility_ready(self, name: str) -> str:
@@ -4383,8 +5273,13 @@ runTimeModifiable true;
     def _require_utility(self, name: str) -> str:
         capability = self._capabilities_registry().utility(name)
         if not getattr(capability, 'available', False) or not getattr(capability, 'executable', None):
-            raise CapabilityUnavailableError('required utility is unavailable', details={
-                'utility': name})
+            # Plan 37 F2 (§8 check 4). "required utility is unavailable"
+            # named neither the utility nor why, so the Quality refusal could
+            # not be acted on; the probe's own reason says both.
+            reason = str(getattr(capability, 'reason', '') or '')
+            raise CapabilityUnavailableError(
+                unavailable_utility_text(name, reason), details={
+                    'utility': name, 'reason': reason})
         return capability.executable
 
     def _context(self, session: CaseSession) -> OperationContext:
@@ -6446,8 +7341,15 @@ runTimeModifiable true;
             feature_payload = await self._ensure_surface_features(
                 session, command, engine)
             self._require_current_surface_features(session)
+        # Plan 37 UF5. An edited stage never runs on its own previous output:
+        # the stage it reads from is put back first, from its kept snapshot,
+        # or regenerated from the nearest one that is kept.
+        replay = await self._replay_stage_input(
+            session, command, engine, definition)
         execution, payload = await self._run_stage_definition(
             session, command, engine, definition)
+        if replay:
+            payload['replay'] = replay
         if feature_payload is not None:
             payload['surface_features'] = feature_payload
         payload.update(self._region_warnings_payload(seed_warnings))
@@ -6471,6 +7373,8 @@ runTimeModifiable true;
                 # A stage left decomposed binds when it is reconstructed.
                 payload.update(self._trace_mesh_state(
                     session, definition.stage, execution))
+                payload['stage_snapshot'] = await self._capture_stage_snapshot(
+                    session, engine, definition.stage, execution)
         else:
             # R92. The task state was recorded only on success, so a stage
             # that failed left the tree holding whatever it said before.
@@ -6498,6 +7402,240 @@ runTimeModifiable true;
             session.revisions, invalidated_outputs=('quality',),
             warnings=tuple(seed_warnings) + tuple(execution.warnings or ()),
             payload=payload)
+
+    # -- Plan 37 UF5: stage snapshots and predecessor replay --------------- #
+
+    @staticmethod
+    def _keeps_stage_snapshots(engine, stage: str) -> bool:
+        """Whether *stage* is one of *engine*'s own workflow stages that
+        are kept and replayed -- asked of the engine's workflow, so an engine
+        whose run folder already keeps its result (Gmsh) is left alone."""
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        task_id = snapshots.STAGE_TASKS.get(stage)
+        if task_id is None:
+            return False
+        try:
+            engine.workflow_descriptor().task(task_id)
+        except (AttributeError, LookupError, TypeError, ValueError):
+            return False
+        return True
+
+    async def _capture_stage_snapshot(self, session: CaseSession, engine,
+                                      stage: str, execution=None) -> dict | None:
+        """Keep what *stage* just published, off the owner loop.
+
+        Nonessential: a snapshot that cannot be taken (admission, a cancel,
+        a disk error) is reported in the payload and never fails the stage.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        if not self._keeps_stage_snapshots(engine, stage):
+            return None
+        if self._gather_pending(session.case_path):
+            # Plan 37 UF20. The stage's result is still in the processor
+            # cases; the case root is the mesh it started from, and keeping
+            # that under this stage's name makes a later replay start from it.
+            return {'captured': False, 'stage': stage, 'reason': 'decomposed',
+                    'message': f'{stage} is still decomposed; the case root '
+                               'is not its result, so it was not kept',
+                    'consequence': 'a re-run that starts from it regenerates it'}
+        job = getattr(execution, 'job', None)
+        argv = tuple(getattr(job, 'argv', ()) or ())
+        runtime = {'utility': 'blockMesh' if stage == 'blockMesh'
+                   else 'snappyHexMesh',
+                   'executable': str(argv[0]) if argv else ''}
+        token = snapshots.cancel_token(session.case_path)
+        try:
+            captured = await asyncio.to_thread(
+                snapshots.capture, session.case_path, stage,
+                engine_id=getattr(engine, 'engine_id', ''), runtime=runtime,
+                cancel=token)
+        except snapshots.SnapshotError as error:
+            return {'captured': False, 'stage': stage, 'reason': error.code,
+                    'message': str(error)}
+        except OSError as error:
+            logger.warning('stage snapshot of %s not kept', stage, exc_info=True)
+            return {'captured': False, 'stage': stage, 'reason': 'io_error',
+                    'message': str(error)}
+        finally:
+            snapshots.release_token(session.case_path, token)
+        return {key: captured.get(key) for key in (
+            'captured', 'skipped', 'stage', 'revision', 'path', 'bytes',
+            'digest', 'copy_seconds', 'verify_seconds', 'reason',
+            'consequence') if key in captured}
+
+    def _stage_validity(self, session: CaseSession, command: Command,
+                        stage: str) -> tuple[list | None, bool]:
+        """``(stages whose published result stands, live mesh is *stage*'s
+        output or later)``. Unknown answers are ``(None, False)``: a case the
+        graph cannot describe runs as it always did."""
+        from foammesh.core.jobs import stage_snapshots as snapshots
+        from foammesh.core.workflow.task_state_store import (
+            _PUBLISHED_STATES, TaskStateError, mesh_identity,
+        )
+
+        try:
+            _engine_id, store = self._task_state_store(session, command)
+            graph = store.load()
+            valid = [name for name, task in snapshots.STAGE_TASKS.items()
+                     if graph.state(task) in _PUBLISHED_STATES]
+            live = mesh_identity(session.case_path)
+            rank = snapshots._stage_rank(stage)
+            records = store.publications().get('publications') or {}
+            # Plan 37 UF20 follow-up. Which stage wrote the live mesh is read
+            # off the publication order, not off the identity each record
+            # carries: a parallel stage is recorded while its result is still
+            # in the processor cases, so its `mesh_revision` names the mesh it
+            # started from. MEASURED on the SU2 walk: Layers was recorded over
+            # the snapped root and gathered afterwards, so after Snap was
+            # unlocked no record matched the live (layered) mesh, the Snap
+            # re-run skipped the castellation replay the unlock box promised
+            # and snapped the layered mesh; and the Layers press then matched
+            # Snap's record against the root it started from, regenerated
+            # Castellation and Snap, staled the snap fidelity gate and left
+            # Layers unpublished. The newest publication is the run that wrote
+            # the mesh; a run publishes the stage it performed under the same
+            # revision as the stages it implies, so its latest stage is the
+            # one that ran.
+            ranked = {task: snapshots._stage_rank(name)
+                      for name, task in snapshots.STAGE_TASKS.items()}
+            latest, newest = 0, -1
+            for task, record in records.items():
+                if task not in ranked or not isinstance(record, dict):
+                    continue
+                try:
+                    revision = int(record.get('revision') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if revision > latest:
+                    latest, newest = revision, ranked[task]
+                elif revision == latest:
+                    newest = max(newest, ranked[task])
+            later_output = bool(latest) and newest >= rank and newest > 0
+            active = snapshots.active(session.case_path) or {}
+            if (live and active.get('mesh_identity') == live
+                    and active.get('stage') not in (None, 'blockMesh')
+                    and snapshots._stage_rank(active['stage']) >= rank):
+                later_output = True
+            return valid, later_output
+        except (FacadeError, TaskStateError, LookupError, OSError, ValueError):
+            return None, False
+
+    @staticmethod
+    def _drop_stage_inputs(case_path, stage: str) -> None:
+        """Forget the engine's input copies from *stage* on, so the stage
+        copies the input replay just put in place instead of an older one."""
+        root = Path(case_path) / 'foammesh' / 'mesh-snapshots'
+        key = 'castellation' if stage == 'snappyHexMesh' else stage
+        order = ('castellation', 'snap', 'layers')
+        if key not in order:
+            return
+        for later in order[order.index(key):]:
+            shutil.rmtree(root / later, ignore_errors=True)
+
+    async def _restore_stage_snapshot(self, session: CaseSession,
+                                      source: dict) -> None:
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        token = snapshots.cancel_token(session.case_path)
+        try:
+            await asyncio.to_thread(
+                snapshots.restore, session.case_path, source['stage'],
+                source['revision'], cancel=token)
+        except snapshots.DiskAdmissionError as error:
+            raise PreconditionFailedError(str(error), details=dict(
+                error.details, error='insufficient_disk')) from error
+        finally:
+            snapshots.release_token(session.case_path, token)
+        # Plan 37 UF20. The case-root mesh was just replaced, so processor
+        # cases split from the mesh it replaced are no longer this stage's
+        # input. `_ensure_decomposed` reuses processor cases whose count
+        # matches the ranks, and a parallel re-run of an unlocked
+        # Castellation meshed the old *snapped* mesh from them (MEASURED:
+        # "Initial mesh : cells:3230", not the base grid's 1000), so a raised
+        # refinement level refined nothing. A gather still pending for them
+        # would write that old mesh back over the restored root.
+        self._discard_decomposition(session.case_path)
+        (session.case_path / self.PENDING_GATHER).unlink(missing_ok=True)
+
+    async def _replay_stage_input(self, session: CaseSession, command: Command,
+                                  engine, definition) -> dict | None:
+        """Put the mesh *definition*'s stage reads from in place (UF5).
+
+        Snap starts from Castellation, Layers from Snap, Castellation from
+        the base grid. The kept snapshot of that stage is restored when the
+        live mesh is not already a copy of it; when it is missing, the
+        stages in between are regenerated from the nearest kept one. With no
+        snapshots and no sign that the live mesh is this stage's own output
+        (a first run, or a case older than the snapshots), nothing changes.
+
+        Launching is refused, with a typed reason, when the stage's input
+        copy could not be kept.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        stage = definition.stage
+        if (stage not in snapshots.PREDECESSOR
+                or not self._keeps_stage_snapshots(engine, stage)):
+            return None
+        case = session.case_path
+        live_bytes = await asyncio.to_thread(
+            snapshots._tree_bytes, Path(case) / 'constant' / 'polyMesh')
+        try:
+            snapshots.require_admission(
+                case, live_bytes, what=f'the mesh {stage} starts from')
+        except snapshots.DiskAdmissionError as error:
+            raise PreconditionFailedError(str(error), details=dict(
+                error.details, error='insufficient_disk', stage=stage)) from error
+        valid, later_output = self._stage_validity(session, command, stage)
+        plan = snapshots.plan_replay(case, stage, valid_stages=valid)
+        predecessor = plan['input']
+        source = plan['restore']
+        summary = {'stage': stage, 'input': predecessor, 'from': source,
+                   'regenerated': []}
+        if source is not None and source['stage'] == predecessor:
+            if not plan['live_is_input']:
+                await self._restore_stage_snapshot(session, source)
+                summary['restored'] = True
+            self._drop_stage_inputs(case, stage)
+            return summary
+        if not later_output:
+            return None
+        if source is not None:
+            await self._restore_stage_snapshot(session, source)
+            summary['restored'] = True
+        for step in plan['regenerate']:
+            step_definition = engine.validate(step)
+            self._drop_stage_inputs(case, step)
+            if step != 'blockMesh':
+                await self._ensure_surface_features(session, command, engine)
+            execution, step_payload = await self._run_stage_definition(
+                session, command, engine, step_definition)
+            if not execution.succeeded:
+                raise PreconditionFailedError(
+                    f'{stage} was not run: regenerating {step}, which it '
+                    'starts from, failed',
+                    details={'error': 'replay_failed', 'stage': stage,
+                             'replayed': step,
+                             'job': step_payload.get('job')})
+            self._record_stage_run_success(
+                session, command, getattr(step_definition, 'task_id', None))
+            # Plan 37 UF20. A parallel step leaves its result in the processor
+            # cases and the case root still holding the mesh it started from;
+            # the snapshot below copies the case root. Gathered first, or the
+            # step is kept as its own input (MEASURED: the kept castellation
+            # held the base grid's 1000 cells, and an unlocked Snap re-run
+            # "snapped" that grid and passed Quality on it).
+            if self._gather_pending(session.case_path):
+                await self._ensure_reconstructed(session, command)
+            self._trace_mesh_state(session, step, execution)
+            summary['regenerated'].append({
+                'stage': step,
+                'snapshot': await self._capture_stage_snapshot(
+                    session, engine, step, execution)})
+        self._drop_stage_inputs(case, stage)
+        return summary
 
     @staticmethod
     def _stage_failure(stage: str, job: Mapping) -> dict:
@@ -6836,7 +7974,21 @@ runTimeModifiable true;
             raise
         if parked.exists():
             rmtree(parked)
-        (case_path / self.PENDING_GATHER).unlink(missing_ok=True)
+        marker = case_path / self.PENDING_GATHER
+        try:
+            gathered_stage = json.loads(
+                marker.read_text(encoding='utf-8')).get('stage') or 'parallel'
+        except (OSError, ValueError, AttributeError):
+            gathered_stage = 'parallel'
+        marker.unlink(missing_ok=True)
+        # Plan 37 UF20. The parallel stage recorded the mesh as the
+        # workflow's own while the root still held the mesh before it; the
+        # gather has just replaced the root, so the record has to follow, or
+        # the next open reads "fingerprint differs" and reopens the case as
+        # an external mesh with its whole workflow outline gone.
+        from foammesh.core.case import record_generated_mesh
+        record_generated_mesh(case_path, provenance={
+            'generated_by': f'reconstructPar:{gathered_stage}'})
         payload = execution.to_payload()
         payload['trace'] = self._trace_mesh_state(session, 'reconstruct')
         return payload
@@ -7421,8 +8573,12 @@ runTimeModifiable true;
             missing = [
                 item for item in capabilities if not item.available]
             if missing:
+                # Plan 37 F2. Name each missing utility and the probe's
+                # reason in the sentence, not only in the details.
                 raise CapabilityUnavailableError(
-                    'OpenFOAM 13 pipeline runtime is incomplete',
+                    'OpenFOAM 13 pipeline runtime is incomplete. ' + ' '.join(
+                        unavailable_utility_text(item.name, item.reason)
+                        for item in missing),
                     details={'missing': [
                         {'utility': item.name, 'reason': item.reason}
                         for item in missing]})
@@ -7518,7 +8674,10 @@ runTimeModifiable true;
                 launch = registry.command(utility, arguments, cwd=node.cwd)
             except (FileNotFoundError, ValueError) as error:
                 raise CapabilityUnavailableError(
-                    f'pipeline utility unavailable: {utility}') from error
+                    unavailable_utility_text(
+                        utility, str(error), kind='pipeline utility'),
+                    details={'utility': utility,
+                             'reason': str(error)}) from error
             execution = await self._context(session).executor.execute(
                 session, OperationSpec(
                     operation=f'workflow.pipeline.{node.node_id}',
@@ -7644,6 +8803,11 @@ runTimeModifiable true;
             recorded['warning_for'] = ['snappy.qa']
             recorded['warning_reasons'] = list(qa_warning)
         task_state = self._advance_pipeline_gates(session, command, recorded)
+        # Plan 37 UF5. One pipeline run leaves only its finished mesh; that
+        # is kept as the all-in-one stage, so it can be compared and a later
+        # single-stage re-run knows the live mesh is not a stage input.
+        stage_snapshot = await self._capture_stage_snapshot(
+            session, engine, 'snappyHexMesh')
         self._close_run_manifest(
             record, status='succeeded',
             publication={'status': 'published',
@@ -7657,6 +8821,7 @@ runTimeModifiable true;
             payload={'allocation': allocation.to_dict(), 'dag': dag.to_dict(),
                      **self._region_warnings_payload(seed_warnings),
                      'run_manifest': record.document if record else {},
+                     'stage_snapshot': stage_snapshot,
                      'executions': executions,
                      'qualification_mode': mode.value,
                      'checkpoints': checkpoints,
@@ -8045,8 +9210,9 @@ runTimeModifiable true;
         if self._regions_are_solids(session):
             found, typing = await self._gmsh_solids(session)
             if found.solids:
-                # DP-915: with the far-field box on, the cut subtracts every
-                # solid; the fluid is the space around them, not a solid.
+                # DP-915: with the far field on (box, sphere or cylinder), the
+                # cut subtracts every solid; the fluid is the space around
+                # them, not a solid.
                 payload = cad_solids.propose(
                     found, count, typing, external=external,
                     farfield=cad_solids.farfield_enabled(session.state.db))
@@ -8074,6 +9240,10 @@ runTimeModifiable true;
             field, count, external=external, base_cell=base_cell,
             geometry_bounds=geometry_bounds, box=box,
             finest=self._finest_cell(session, base_cell)), **tail}
+        # DP-1111: with a farfield, the outside seed is moved from the
+        # block's corner (the ring snappy discards) to inside the farfield.
+        self._seeds_inside_farfield(session, field, payload['spaces'],
+                                    geometry_bounds)
         # RP13 #2 / DP-862: a voxel centre can sit exactly on a base-grid
         # face; every seed detect offers is moved off the mesh's faces.
         self._seeds_off_faces(session, field, payload['spaces'],
@@ -8139,6 +9309,40 @@ runTimeModifiable true;
             if found is None or int(found.label) != int(space_id):
                 moved = point
         return [float(value) for value in moved]
+
+    @staticmethod
+    def _seeds_inside_farfield(session: CaseSession, field, rows,
+                               geometry_bounds) -> None:
+        """DP-1111: an outside space's seed, moved inside the farfield.
+
+        The outside space is seeded at its deepest voxel, a corner of the
+        background block; with a farfield that corner is in the ring the
+        launch gate refuses (`_farfield_seed_gate`). No farfield, or no
+        voxel of the space inside it: the rows are left as they are, and the
+        gate names the seed.
+        """
+        from foammesh.core.mesh import snappy_farfield
+
+        if field is None or not any(row.get('outside') for row in rows):
+            return
+        db = getattr(session.state, 'db', None)
+        try:
+            spec = snappy_farfield.active(db) if db is not None else None
+            farfield = (snappy_farfield.resolve(spec, geometry_bounds)
+                        if spec is not None else None)
+        except Exception:  # noqa: BLE001 - the launch gate refuses the spec
+            return
+        if farfield is None:
+            return
+        for row in rows:
+            if not row.get('outside') or row.get('seed') is None:
+                continue
+            if farfield.contains(row['seed']) == snappy_farfield.INSIDE:
+                continue
+            moved = snappy_farfield.seed_inside(
+                farfield.primitive, field, row['id'], geometry_bounds)
+            if moved is not None:
+                row['seed'] = moved
 
     def _seeds_off_faces(self, session: CaseSession, field, rows,
                          geometry_bounds) -> None:
@@ -8424,6 +9628,8 @@ runTimeModifiable true;
                 data.setValue(f'{storage}/{key}/{relative_path}', value,
                               relative_path)
             written.append((key, name, kind, point, row.get('space')))
+        from .facade import refuse_locked_edit
+        refuse_locked_edit(session, data)       # Plan 37 UF5 DP-1063
         transaction = session.state.commit(
             data, action='create fluid regions',
             source=commit_source(command.source), target='regions.items',
@@ -8546,6 +9752,22 @@ runTimeModifiable true;
                             'regions_are_solids', False))
 
     @staticmethod
+    def _gmsh_farfield_shape(db) -> str:
+        """``box``, ``sphere`` or ``cylinder``: the Gmsh far field's shape.
+
+        Plan 37 UF13 made the far field a box, a sphere or a cylinder; a
+        message that said "the far-field box" for the other two named a
+        shape the case does not have. Unset or unreadable is the box, the
+        shape the runner builds by default.
+        """
+        try:
+            value = db.getValue('gmsh/farfield/shape')
+        except Exception:  # noqa: BLE001 - a case without the leaf
+            value = None
+        shape = str(getattr(value, 'value', value) or '').strip().lower()
+        return shape if shape in ('box', 'sphere', 'cylinder') else 'box'
+
+    @staticmethod
     def _gmsh_typing(db) -> dict:
         """``region_uuid`` -> the typing the Gmsh volume controls hold."""
         from foammesh.core.mesh.cad_solids import typing_of
@@ -8618,17 +9840,22 @@ runTimeModifiable true;
                 found, cad_solids.farfield_enabled(session.state.db)):
             # DP-915: the far-field cut consumes every imported solid, so a
             # control scoped to one is refused by the runner. Refuse here.
+            # Plan 37 UF13: the far field is a box, a sphere or a cylinder,
+            # and the sentence names the one the case has.
             names = [solid.name for solid in found.solids]
+            shape = self._gmsh_farfield_shape(session.state.db)
             raise PreconditionFailedError(
-                'the far-field box is on, so the run cuts '
+                f'the far-field {shape} is on, so the run cuts '
                 + ', '.join(f"'{name}'" for name in names)
-                + ' out of the box: '
+                + f' out of the {shape}: '
                 + ('that solid is' if len(names) == 1 else 'those solids are')
                 + ' the obstacle, and the fluid is the space around '
                 + ('it' if len(names) == 1 else 'them')
                 + ', which the run builds itself. There is no solid to type; '
-                  'turn the far-field box off to mesh the solids instead.',
+                  f'turn the far-field {shape} off to mesh the solids '
+                  'instead.',
                 details={'error': 'farfield_cuts_solids', 'engine': 'gmsh',
+                         'shape': shape,
                          'solids': [solid.region_uuid
                                     for solid in found.solids],
                          'names': names})
@@ -8738,6 +9965,8 @@ runTimeModifiable true;
                 self._rename_tree_volume(data, token, name)
             written.append((key, token, name or (current or {}).get('name')
                             or solid.name, kind, included, row.get('space')))
+        from .facade import refuse_locked_edit
+        refuse_locked_edit(session, data)       # Plan 37 UF5 DP-1063
         transaction = session.state.commit(
             data, action='type solids',
             source=commit_source(command.source),
@@ -9135,27 +10364,267 @@ runTimeModifiable true;
         the warnings the launch carries, as ``warnings`` and as
         ``payload['region_warnings']``.
         """
-        await self._prime_seed_spaces(session)
-        return list(self._validate_fluid_seed(
+        excludes = self._exclude_point_rows(session)
+        # Plan 37 UF18: an exclude point is judged against the labelled
+        # domain even with one region, so the field is primed for it too.
+        await self._prime_seed_spaces(session, force=bool(excludes))
+        warnings = list(self._validate_fluid_seed(
             session, allow_region_clash=allow_region_clash) or ())
+        if excludes:
+            warnings.extend(self._exclude_point_gate(session, excludes))
+        warnings.extend(self._farfield_seed_gate(session, excludes))
+        self._record_retained_estimate(session, excludes)
+        return warnings
+
+    def _region_seed_rows(self, session: CaseSession) -> list:
+        """``(label, type, xyz)`` of every region seed with a point."""
+        seeds = []
+        try:
+            regions = session.state.db.getElements('region') or {}
+        except Exception:  # noqa: BLE001 - a project without regions
+            regions = {}
+        for key, region in dict(regions).items():
+            try:
+                point = [float(value) for value in region.vector('point')]
+            except Exception:  # noqa: BLE001 - the seed checks refuse it
+                continue
+            seeds.append((self._region_label(key, region),
+                          self._region_type(region), point))
+        return seeds
+
+    def _record_retained_estimate(self, session: CaseSession,
+                                  excludes) -> None:
+        """Plan 37 F-2: what this launch expects to keep, for after the run.
+
+        Written when there are exclude points -- the voxel volume the seeds
+        keep and the exclude points remove -- and removed otherwise, so an
+        estimate never outlives the points it was made for. Best effort.
+        """
+        from foammesh.core.quality import retained_regions
+
+        try:
+            if not excludes:
+                retained_regions.write_estimate(session.case_path, None)
+                return
+            field = None
+            try:
+                inputs = self._fluid_space_inputs(session)
+                if inputs is not None:
+                    field = self._seed_space_field(session, inputs)
+            except Exception:  # noqa: BLE001 - estimated without the voxels
+                field = None
+            retained_regions.write_estimate(
+                session.case_path, retained_regions.estimate(
+                    self._region_seed_rows(session), excludes, field))
+        except Exception as error:  # noqa: BLE001 - never stops a launch
+            logger.warning('retained-region estimate not recorded: %s', error)
+
+    def _retained_region_context(self, session: CaseSession) -> dict | None:
+        """Plan 37 F-2: what a checked snappy mesh is judged against.
+
+        ``None`` on any other engine. Read on the command thread, so the
+        checkMesh parser -- which may run elsewhere -- touches no database.
+        """
+        from foammesh.core.quality import retained_regions
+
+        try:
+            # The engine whose regions are the spaces its seeds name (snappy)
+            # is asked, not named: a registered engine that does not mesh
+            # each solid as its own region.
+            from foammesh.core.engine.registry import ENGINE_REGISTRY
+
+            if (self._engine_id(session) not in ENGINE_REGISTRY.ids()
+                    or self._regions_are_solids(session)):
+                return None
+            # Seeds that cannot be read are not "no seeds": without them
+            # the expected count is unknown, so nothing is judged.
+            session.state.db.getElements('region')
+            excludes = self._exclude_point_rows(session)
+            names = [str(name) for name, _point in excludes]
+            estimate = retained_regions.read_estimate(session.case_path)
+            if estimate is not None and [
+                    str(row.get('name')) for row in
+                    estimate.get('excludes') or ()] != names:
+                estimate = None
+            return {'case_path': session.case_path,
+                    'seeds': len(self._region_seed_rows(session)),
+                    'excludes': names, 'estimate': estimate}
+        except Exception as error:  # noqa: BLE001 - judged without it
+            logger.warning('retained-region context not read: %s', error)
+            return None
+
+    @staticmethod
+    def _apply_retained_regions(context: dict | None, parsed) -> None:
+        """Judge *parsed* for pieces the seeds did not ask for (Plan 37 F-2).
+
+        The count is checkMesh's; when its log has none and exclude points
+        were set, the mesh's own connectivity is counted instead. A split
+        mesh is filed as not runnable -- the Quality task must not read as
+        passed -- and nothing is removed from it.
+        """
+        if not context or parsed is None:
+            return
+        from foammesh.core.quality import retained_regions
+
+        try:
+            counted = None
+            if getattr(parsed, 'regions', None) is None and context['excludes']:
+                counted = retained_regions.count_cell_regions(
+                    context['case_path'])
+            retained_regions.apply(parsed, retained_regions.assess(
+                parsed, seeds=context['seeds'],
+                excludes=context['excludes'],
+                estimate=context.get('estimate'), counted=counted))
+        except Exception as error:  # noqa: BLE001 - the check still files
+            logger.warning('retained regions not judged: %s', error)
+
+    def _farfield_seed_gate(self, session: CaseSession, excludes) -> list[str]:
+        """Plan 37 UF14: with a farfield, the seeds against it and the bodies.
+
+        With a farfield the fluid is the space inside it and outside every
+        body, so a fluid seed outside the farfield (snappy keeps the ring
+        between it and the block), on it, or inside a closed body is refused
+        here, before snappy runs, naming every one. A seed that may be in an
+        open body or sealed in a cavity (from the voxels) is a warning. No
+        farfield: nothing is asked and nothing is returned.
+        """
+        from foammesh.core.mesh import snappy_farfield
+
+        db = getattr(session.state, 'db', None)
+        try:
+            spec = snappy_farfield.active(db) if db is not None else None
+        except Exception:  # noqa: BLE001 - the case writer refuses the record
+            spec = None
+        if spec is None:
+            return []
+        try:
+            inputs = self._fluid_space_inputs(session)
+        except Exception:  # noqa: BLE001 - judged without the geometry
+            inputs = None
+        if inputs is None:
+            return []
+        surfaces, geometry_bounds, _box, _cell = inputs
+        try:
+            farfield = snappy_farfield.resolve(spec, geometry_bounds)
+        except ValueError as error:
+            raise PreconditionFailedError(
+                f'farfield: {error}',
+                details={'error': 'farfield_refused', 'findings': []}) from None
+        seeds = []
+        try:
+            regions = db.getElements('region') or {}
+        except Exception:  # noqa: BLE001 - the seed checks refuse this
+            regions = {}
+        for key, region in dict(regions).items():
+            try:
+                point = [float(value) for value in region.vector('point')]
+            except Exception:  # noqa: BLE001 - the seed checks refuse it
+                continue
+            seeds.append((self._region_label(key, region),
+                          self._region_type(region), point))
+        field = self._seed_space_field(session, inputs)
+        report = snappy_farfield.preflight(
+            farfield, seeds=seeds, excludes=excludes, surfaces=surfaces,
+            field=field)
+        if report.errors:
+            raise PreconditionFailedError(
+                '; '.join(one.message for one in report.errors),
+                details={'error': 'farfield_refused',
+                         'findings': [one.to_dict()
+                                      for one in report.findings]})
+        return [one.message for one in report.warnings]
+
+    @staticmethod
+    def _exclude_point_rows(session: CaseSession) -> list:
+        """``(name, xyz)`` of every exclude point the project defines."""
+        try:
+            items = session.state.db.getElements('castellation/excludePoints')
+        except Exception:  # noqa: BLE001 - a project without the list
+            return []
+        rows = []
+        for key, item in sorted(
+                dict(items or {}).items(),
+                key=lambda pair: (0, int(pair[0])) if str(pair[0]).isdigit()
+                else (1, str(pair[0]))):
+            try:
+                name = str(getattr(item.value('name'), 'value',
+                                   item.value('name')) or '').strip()
+            except Exception:  # noqa: BLE001 - an unnamed row
+                name = ''
+            try:
+                point = tuple(float(value) for value in item.vector('point'))
+            except Exception:  # noqa: BLE001 - the case writer refuses it
+                continue
+            rows.append((name or f'exclude {key}', point))
+        return rows
+
+    def _exclude_point_gate(self, session: CaseSession, excludes) -> list[str]:
+        """Plan 37 UF18: the UF16 exclude-point preflight, at launch.
+
+        ``core/mesh/exclude_points.preflight`` against the region seeds, the
+        background domain and -- when it can be had -- the Plan 36 voxel
+        field and its h/2 re-check. Its errors refuse the launch, naming
+        every one; its warnings are returned for the launch to carry, the
+        way the seed gate's are.
+        """
+        from foammesh.core.mesh.exclude_points import preflight
+
+        seeds = []
+        try:
+            regions = session.state.db.getElements('region') or {}
+        except Exception:  # noqa: BLE001 - the seed checks refuse this
+            regions = {}
+        for key, region in dict(regions).items():
+            try:
+                point = [float(value) for value in region.vector('point')]
+            except Exception:  # noqa: BLE001 - the seed checks refuse it
+                continue
+            seeds.append((self._region_label(key, region),
+                          self._region_type(region), point))
+        try:
+            inputs = self._fluid_space_inputs(session)
+        except Exception:  # noqa: BLE001 - judged without the geometry
+            inputs = None
+        surfaces, cell_size, field, finer = None, None, None, None
+        if inputs is not None:
+            surfaces, _bounds, box, cell_size = inputs
+            field = self._seed_space_field(session, inputs)
+            if field is not None:
+                finer = self._seed_space_finer(session, inputs, field)
+        domain = self._background_domain_bounds(session.case_path)
+        if domain is None and inputs is not None and hasattr(box, 'metres'):
+            domain = box
+        report = preflight(excludes, seeds=seeds, domain=domain,
+                           surfaces=surfaces, field=field, finer=finer,
+                           cell_size=cell_size)
+        if report.errors:
+            raise PreconditionFailedError(
+                '; '.join(one.message for one in report.errors),
+                details={'error': 'exclude_point_refused',
+                         'findings': [one.to_dict()
+                                      for one in report.findings],
+                         'removals': [dict(row) for row in report.removals]})
+        return [one.message for one in report.warnings]
 
     @staticmethod
     def _region_warnings_payload(seed_warnings) -> dict:
         """``{'region_warnings': [...]}`` when there are any, else ``{}``."""
         return {'region_warnings': list(seed_warnings)} if seed_warnings else {}
 
-    async def _prime_seed_spaces(self, session: CaseSession) -> None:
+    async def _prime_seed_spaces(self, session: CaseSession, *,
+                                 force: bool = False) -> None:
         """Label the fluid spaces off the main thread before the launch gate.
 
         The gate is synchronous; with the field cached here it answers from
-        memory instead of waiting on the worker thread.
+        memory instead of waiting on the worker thread. ``force`` labels it
+        for a single region too (Plan 37 UF18: exclude points need it).
         """
         from foammesh.core.mesh import fluid_regions
         from foammesh.support.vtk_threads import vtk_run_in_thread
 
         try:
             regions = session.state.db.getElements('region')
-            if not regions or len(regions) < 2:
+            if not force and (not regions or len(regions) < 2):
                 return
             inputs = self._fluid_space_inputs(session)
         except Exception:  # noqa: BLE001 - the gate reports what is wrong
@@ -9409,14 +10878,20 @@ runTimeModifiable true;
         # the problem-face surfaces, the user-defined criteria -- then the
         # operation's parameters on top, because a caller that names one is
         # asking for this run and not for the project.
+        # Plan 37 UF18. A parameter overrides the project only when it is
+        # given: the defaults used to be written in here as True, so the
+        # project's own allTopology/allGeometry/writeSets were never read.
+        overrides = {}
+        if 'write_sets' in command.parameters:
+            overrides['write_sets'] = bool(command.parameters['write_sets'])
+        if 'set_format' in command.parameters:
+            overrides['set_format'] = str(command.parameters['set_format'])
+        if 'extended_checks' in command.parameters:
+            extended = bool(command.parameters['extended_checks'])
+            overrides['extended_topology'] = extended
+            overrides['extended_geometry'] = extended
         request = checkmesh_request(
-            session.state.db, session.case_path,
-            write_sets=bool(command.parameters.get('write_sets', True)),
-            set_format=str(command.parameters.get('set_format', 'vtk')),
-            extended_topology=bool(
-                command.parameters.get('extended_checks', True)),
-            extended_geometry=bool(
-                command.parameters.get('extended_checks', True)))
+            session.state.db, session.case_path, **overrides)
         # F-04. The same flag set the meshing DAG's checkMesh nodes carry;
         # both write the same report at the same path, so they must not be
         # able to disagree about what was measured.
@@ -9429,13 +10904,24 @@ runTimeModifiable true;
             from foammesh.core.openfoam_runtime import LaunchCommand
             launch = LaunchCommand((utility, *semantic_argv))
         report_path = session.case_path / 'foammesh' / 'quality' / 'latest.json'
+        # Plan 37 UF18. checkMesh never clears its output directory; what
+        # this run wrote is what was modified after it started.
+        import time as _time
+        started_at = _time.time()
+
+        # Plan 37 F-2. Read on this thread; the parser may run on another.
+        retained_context = self._retained_region_context(session)
 
         def parse_and_persist(result):
             parsed = parse_checkmesh(result.output)
+            self._apply_retained_regions(retained_context, parsed)
             _, report = MeshCheckService.persist_result(
                 session.case_path, parsed, command=result.argv,
                 log_path=result.log_path or session.case_path / 'foammesh' / 'logs' /
                 'checkMesh.log')
+            self._collect_check_artifacts(
+                session, result.argv, report, started_at=started_at,
+                wanted=request)
             return report.to_dict()
 
         execution = await self._context(session).executor.execute(session, OperationSpec(
@@ -9680,9 +11166,14 @@ runTimeModifiable true;
         missing = [entry['check'] for entry in entries
                    if entry.get('verdict') == 'missing']
         if missing:
+            # Plan 37 UF4 DP-1026. This used to read "this route still owes
+            # gmsh-native" in a payload nothing displayed: the row did not
+            # move and nobody said why. Now it names the missing report in
+            # words and what produces it, and says so at the top level too.
+            reason = self._missing_route_reason(entries, missing)
             payload['task_state'] = {'advanced': [], 'blocked': {
-                'reason': 'this route still owes ' + ', '.join(
-                    str(name) for name in missing)}}
+                'reason': reason, 'missing': [str(name) for name in missing]}}
+            payload['message'] = reason
         else:
             payload['task_state'] = self._record_qa_run(
                 session, command, warning=verdict != PASSED or bool(blemished),
@@ -9693,6 +11184,27 @@ runTimeModifiable true;
             command.operation, session.revisions,
             invalidated_outputs=('quality',), warnings=warnings,
             payload=payload)
+
+    @staticmethod
+    def _missing_route_reason(entries: list, missing: list) -> str:
+        """What a route with an absent report tells the user to do."""
+        from foammesh.core.facade.quality_routes import NATIVE_GMSH_CHECK
+
+        sentences = []
+        for name in missing:
+            if name == NATIVE_GMSH_CHECK:
+                sentences.append(
+                    'The Gmsh element check has produced no report for this '
+                    'mesh, so Quality cannot be marked done. Run Generate '
+                    'mesh again (the mesh run writes that report), then press '
+                    'Check & Proceed.')
+                continue
+            label = next((str(entry.get('label') or name) for entry in entries
+                          if entry.get('check') == name), str(name))
+            sentences.append(
+                '{0} has no result for this mesh, so Quality cannot be marked '
+                'done. Press Check & Proceed again to run it.'.format(label))
+        return ' '.join(sentences)
 
     async def _run_route_check(self, session: CaseSession, command: Command,
                                check: str):
@@ -9943,6 +11455,15 @@ runTimeModifiable true;
             'mesh_fingerprint': report.mesh_fingerprint,
             'recommendations': items, 'recommendation_count': len(items),
         })
+
+    def _quality_check_artifacts(self, session: CaseSession,
+                                 command: Command) -> OperationResult:
+        """Plan 37 UF18: the newest check's written outputs, with a reason
+        for each one that cannot be drawn. Reads the manifest only."""
+        from foammesh.core.quality import check_artifacts
+        check = str(command.parameters.get('check') or 'openfoam')
+        manifest = check_artifacts.load_manifest(session.case_path, check=check)
+        return self._read_result(session, command, dict(manifest or {}))
 
     def _quality_failed_sets(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.quality.failed_cells import (
@@ -11597,6 +13118,103 @@ def _check_failure(operation: str, error: FacadeError) -> dict:
             'reason': str(details.get('reason') or error.code),
             'message': str(error),
             'retryable': bool(details.get('retryable', True))}
+
+
+#: Plan 37 UF4. What every check refusal ends on: the one thing to press.
+_CHECK_AGAIN = 'then press Check & Proceed again.'
+_CHECK_AGAIN_SENTENCE = 'Then press Check & Proceed again.'
+
+
+def _actionable_check_error(title: str, operation: str,
+                            error: FacadeError) -> FacadeError:
+    """``error`` reworded as what failed and what to do, class kept.
+
+    Plan 37 UF4 DP-1025. A check that could not produce a verdict reached the
+    user as the facade's own sentence -- ``quality.fidelity did not produce a
+    result: ...`` -- in a box titled "Task state", naming an operation id and
+    no next step. The evidence is kept verbatim inside the new text; the class
+    and the details are kept, so the code the page and the tests read
+    (``over_budget``, ``check_unavailable``) is unchanged.
+    """
+    details = dict(getattr(error, 'details', None) or {})
+    if details.get('actionable'):
+        return error
+    raw = str(error).strip().rstrip('.')
+    outcome = str(details.get('outcome') or '')
+    if isinstance(error, CheckOverBudgetError):
+        if outcome == 'refused':
+            text = ('{0} was not started: there is not enough free memory '
+                    'for it right now ({1}). The mesh is unchanged. Close '
+                    'other programs, or wait a minute for WSL to hand back '
+                    'the memory the mesher used, {2}').format(
+                        title, raw, _CHECK_AGAIN)
+        else:
+            text = ('{0} ran out of the memory set aside for it and was '
+                    'stopped ({1}). The mesh is unchanged. Close other '
+                    'programs to free memory, {2}').format(
+                        title, raw, _CHECK_AGAIN)
+    elif isinstance(error, CheckUnavailableError):
+        text = ('{0} could not run, so Quality was not marked done ({1}). '
+                'The mesh is unchanged; {2} If it keeps happening, restart '
+                'FoamMesh.').format(title, raw, _CHECK_AGAIN)
+    else:
+        text = ('{0} could not check this mesh: {1}. Fix what it names, '
+                '{2}').format(title, raw, _CHECK_AGAIN)
+    details.update(actionable=True, operation=details.get('operation')
+                   or operation)
+    try:
+        return type(error)(text, details=details)
+    except TypeError:                                   # pragma: no cover
+        return error
+
+
+def _mesh_revision(case_path) -> tuple:
+    """Which mesh is on disk: size and mtime of each polyMesh file.
+
+    Plan 37 UF4 DP-1027. A check job is keyed by it, so a result measured on
+    a mesh that has since been replaced is recognised as stale. Only stats,
+    never a read: it is taken on the thread that runs the window.
+    """
+    base = Path(str(case_path or '')) / 'constant' / 'polyMesh'
+    signature = []
+    for name in ('points', 'faces', 'owner', 'neighbour', 'boundary'):
+        found = None
+        for candidate in (base / name, base / (name + '.gz')):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            found = (candidate.name, stat.st_size, stat.st_mtime_ns)
+            break
+        signature.append(found)
+    return tuple(signature)
+
+
+def _settings_digest(session) -> str:
+    """The configuration a check job measured against (part of its key)."""
+    import hashlib
+
+    db = getattr(getattr(session, 'state', None), 'db', None)
+    try:
+        text = db.toYaml() if db is not None and hasattr(db, 'toYaml') else ''
+    except Exception:                                   # noqa: BLE001
+        return ''
+    return hashlib.sha1(str(text or '').encode('utf-8', 'replace')).hexdigest()
+
+
+def _parse_parallel_check(job) -> dict:
+    """``checkMesh -parallel``: the global cell count and its verdict.
+
+    Plan 37 UF17. Points, faces and internal faces in this output count the
+    processor-boundary duplicates, so only the cells are compared.
+    """
+    import re
+    text = getattr(job, 'output', '') or ''
+    cells = re.search(r'^\s*cells:\s*(\d+)', text, re.MULTILINE)
+    failed = re.search(r'Failed\s+(\d+)\s+mesh\s+checks', text)
+    return {'cells': int(cells.group(1)) if cells else None,
+            'mesh_ok': 'Mesh OK' in text,
+            'failed_checks': int(failed.group(1)) if failed else 0}
 
 
 def _assert_worker_isolation(table: dict) -> None:
