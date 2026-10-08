@@ -110,7 +110,17 @@ a = Analysis(
     hooksconfig={},
     # Runs before PyInstaller's own hooks and before main.py (Plan 35 CR10).
     runtime_hooks=[str(RUNTIME_HOOK)],
-    excludes=['PyQt5', 'PyQt6', 'IPython', 'pytest', 'sphinx', 'torch'],
+    # scipy (section planes, retained regions) names dask in its optional
+    # array-API support, and dask's imports reach distributed, fsspec, panel,
+    # holoviews, pandas and botocore: ~5,300 files the app never loads.
+    # scipy only uses dask when it is already imported.
+    excludes=['PyQt5', 'PyQt6', 'IPython', 'pytest', 'sphinx', 'torch',
+              'dask', 'distributed', 'fsspec', 'panel', 'bokeh', 'holoviews',
+              'hvplot', 'datashader', 'intake', 'xarray', 'pandas', 'pyarrow',
+              'fastparquet', 'botocore', 'boto3', 'conda', 'seaborn',
+              'statsmodels', 'plotly', 'sympy', 'numba', 'networkx', 'joblib',
+              'ipykernel', 'ipywidgets', 'jupyter_client', 'jupyter_server',
+              'nbclient'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
