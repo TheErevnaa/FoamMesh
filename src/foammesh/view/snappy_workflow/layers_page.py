@@ -140,11 +140,19 @@ class LayerGroupPanel(ChildControlPanel):
             group = (payload.get('entity_id') if kind == 'create'
                      else parameters.get('entity_id'))
 
+            # DP-1190. A binding the facade refused (a step that locked
+            # while the editor was open) is reported, not dropped: the table
+            # is re-read either way, so it shows what the case holds.
+            refusals = []
+
             def finished() -> None:
                 release_binding(group)
                 self.refresh()
                 self.childrenChanged.emit()
-                self._close_write(write, True)
+                if refusals:
+                    self._close_write(write, False, refusals[0])
+                else:
+                    self._close_write(write, True)
 
             if kind == 'remove':
                 # DP-1028. A removal is the user saying what the list holds,
@@ -152,13 +160,15 @@ class LayerGroupPanel(ChildControlPanel):
                 unbind_layer_group(
                     self._client, parameters.get('entity_id'),
                     then=lambda: remember_defaulted(self._client,
-                                                    then=finished))
+                                                    then=finished),
+                    refused=refusals.append)
             else:
                 # Plan 37 UF20. Until the binding lands no geometry row names
                 # the group, and the legacy page's prune would delete it.
                 hold_binding(group)
                 end_group_write()
-                self.membership.commit(group, then=finished)
+                self.membership.commit(group, then=finished,
+                                       refused=refusals.append)
 
         self._track_write(write, submit(self._client, operation, parameters,
                                         then=ran))

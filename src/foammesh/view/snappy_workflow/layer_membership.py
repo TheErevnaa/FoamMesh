@@ -286,35 +286,45 @@ class LayerMembership(QWidget):
             changes[field].update(self._merged.expand({gId: value}))
         return {field: rows for field, rows in changes.items() if rows}
 
-    def commit(self, group, then=None) -> None:
-        """Bind the checked boundaries to *group*, release the unchecked."""
+    def commit(self, group, then=None, refused=None) -> None:
+        """Bind the checked boundaries to *group*, release the unchecked.
+
+        DP-1190. *refused(result)* hears of the first binding write the
+        facade refused (a locked step refuses them all), before *then*.
+        """
         changes = self.pending(group)
         self._loaded = False
         self._initial = set()
-        _write(self._client, changes, then)
+        _write(self._client, changes, then, refused=refused)
 
 
-def _write(client, changes: dict, then=None) -> None:
-    """Patch each field's ``{gId: group}`` in turn, then call *then*."""
+def _write(client, changes: dict, then=None, refused=None) -> None:
+    """Patch each field's ``{gId: group}`` in turn, then call *then*.
+
+    DP-1190. A refusal of any write is reported once through *refused*.
+    """
     fields = [(field, rows) for field, rows in sorted(changes.items()) if rows]
     if not fields:
         if then is not None:
             then()
         return
+    refusals = []
 
     def step(index: int) -> None:
         if index == len(fields):
+            if refusals and refused is not None:
+                refused(refusals[0])
             if then is not None:
                 then()
             return
         field, rows = fields[index]
         _patch_bindings(client, rows, then=lambda: step(index + 1),
-                        field=field)
+                        field=field, refused=refusals.append)
 
     step(0)
 
 
-def unbind_layer_group(client, group, then=None) -> None:
+def unbind_layer_group(client, group, then=None, refused=None) -> None:
     """Clear every row bound to a layer group that was just removed.
 
     Row ids are reused, so a binding left behind on a removed group is
@@ -331,4 +341,4 @@ def unbind_layer_group(client, group, then=None) -> None:
                 if _key(row.get(stored)) == group}
         if rows:
             changes[field] = rows
-    _write(client, changes, then)
+    _write(client, changes, then, refused=refused)

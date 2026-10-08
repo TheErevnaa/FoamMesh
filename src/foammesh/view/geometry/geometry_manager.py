@@ -8,7 +8,8 @@ from foammesh.support.simple_db.simple_db import Element
 
 from foammesh.app import app
 from foammesh.db.configurations_schema import CFDType, GeometryType, Shape
-from foammesh.core.mesh.sizing import stand_off_bounds
+from foammesh.core.mesh.sizing import base_cell_size, stand_off_bounds
+from foammesh.core.mesh.domain_box import authored_base_cell
 from foammesh.core.selection import (
     SelectionEntity, SelectionKind, SelectionStatus)
 from foammesh.rendering.actor_info import GeometryActor, RegionMarkerActor
@@ -1027,6 +1028,13 @@ class GeometryManager(ActorManager):
         db = app.facadeClient.checkout()
         baseGrid = db.getElement('baseGrid')
 
+        # Plan 37 #9. Hand-written blocks are what blockMesh builds, at the
+        # Scale the writer gives them: their vertices times Scale over their
+        # own counts, not the geometry's box over the page's counts.
+        authored = authored_base_cell(db)
+        if authored is not None:
+            return authored
+
         if geometry is None:
             x1, x2, y1, y2, z1, z2 = stand_off_bounds(
                 self.getBounds().toTuple(), baseGrid.float('standoff'))
@@ -1034,9 +1042,19 @@ class GeometryManager(ActorManager):
             x1, y1, z1 = geometry.vector('point1')
             x2, y2, z2 = geometry.vector('point2')
 
-        return ((x2 - x1) / baseGrid.float('numCellsX'),
-                (y2 - y1) / baseGrid.float('numCellsY'),
-                (z2 - z1) / baseGrid.float('numCellsZ'))
+        # Plan 37 #9. In target-size mode the counts stored beside the target
+        # belong to the other mode, so dividing by them named a cell the
+        # writer never builds; the base cell there is the target itself.
+        def stored(name):
+            try:
+                return baseGrid.value(name)
+            except Exception:  # noqa: BLE001 - an element without the field
+                return None
+
+        return base_cell_size(
+            (x1, x2, y1, y2, z1, z2), mode=stored('sizingMode'),
+            target=stored('targetCellSize'),
+            counts=tuple(baseGrid.float(f'numCells{axis}') for axis in 'XYZ'))
 
 
     def _add(self, gId, geometry, volume):

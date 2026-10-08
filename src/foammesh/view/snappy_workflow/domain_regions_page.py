@@ -238,6 +238,8 @@ class RegionSeedPanel(ChildControlPanel):
         self._sectionButton = None
         # Plan 36 RP10. The placements made while the editor is open.
         self._placements = []
+        # Plan 37 #1(d): the suggested seed, asked once per Add.
+        self._freshPoint = None
         self._placementIndex = -1
         self._placementKeys = _PlacementKeys(self)
         self._adjusting = None
@@ -682,7 +684,38 @@ class RegionSeedPanel(ChildControlPanel):
         if self.isEditing() or self.isDetecting():
             return
         self._placingRegion = None
+        self._freshPoint = None
         super().open_add_dialog()
+
+    def fresh_value(self, key: str, descriptor):
+        """Plan 37 #1(d): a new region's seed starts inside the fluid.
+
+        Add opened the editor on the schema's (0, 0, 0), which for an elbow,
+        an annulus or a part away from the origin is outside the geometry --
+        the line under X, Y and Z said so, and OK wrote a seed snappy meshes
+        the wrong side from. The point now comes from
+        `geometry.fluid_seed.suggest` (the deepest point of the largest
+        enclosed space, judged as launch judges it), asked once per Add.
+        When nothing inside is found the schema default stands, as before.
+        """
+        if key in self.POINT_KEYS:
+            point = self._suggestedPoint()
+            if point is not None:
+                return point[self.POINT_KEYS.index(key)]
+        return super().fresh_value(key, descriptor)
+
+    def _suggestedPoint(self):
+        if getattr(self, '_freshPoint', None) is None:
+            self._freshPoint = ()
+            try:
+                payload = query(self._client, 'geometry.fluid_seed.suggest',
+                                {}).payload or {}
+            except Exception:                               # noqa: BLE001
+                payload = {}
+            point = payload.get('point')
+            if payload.get('inside') and point and len(point) == 3:
+                self._freshPoint = tuple(float(value) for value in point)
+        return self._freshPoint or None
 
     def open_edit_dialog(self, *args) -> None:
         if (self.isEditing() or self.isDetecting()
@@ -1045,6 +1078,16 @@ class RegionSeedPanel(ChildControlPanel):
             except Exception:  # noqa: BLE001 - the note still says it
                 pass
         count = len(written or ())
+        # Plan 37 #1(b): Accept all replaced the regions already defined
+        # unless the panel was told to keep them; the note says which.
+        panel = self._detection
+        if panel is not None and panel.replacesExisting():
+            self._say(self.tr(
+                'Replaced the regions with %s. Ctrl+Z '
+                '(Edit → Undo create fluid '
+                'regions) brings the old ones back.')
+                % count_text(count, 'region', 'regions'))
+            return
         # DP-135/DP-217: the menu path is spelled with the one arrow, bound
         # to its names by no-break spaces so it never wraps on the arrow.
         self._say(self.tr(
@@ -1265,13 +1308,20 @@ class RegionSeedPanel(ChildControlPanel):
             return {}
         if getattr(result, 'status', '') != 'accepted':
             return {}
-        regions = (getattr(result, 'payload', None) or {}).get('regions')
+        payload = getattr(result, 'payload', None) or {}
+        # Plan 37 #1 / #2: the flush-box, both-sides and duct warnings the
+        # launch will carry, read with the same answer.
+        self._placementWarnings = [
+            str(one.get('message')) for one in payload.get('warnings') or ()
+            if isinstance(one, dict) and one.get('message')]
+        regions = payload.get('regions')
         return {str(key): dict(row)
                 for key, row in dict(regions or {}).items()
                 if isinstance(row, dict)}
 
     def _decorateRows(self) -> None:
         """The colour chip, the space's volume, and a shared space."""
+        self._placementWarnings = []
         self._seedSpaces = self._readSeedSpaces()
         colours = region_zone_colours(
             [str(row.get('__key__')) for row in self._rows])
@@ -1304,6 +1354,8 @@ class RegionSeedPanel(ChildControlPanel):
                 item.setStatusTip(warning)
             if notes:
                 item.setToolTip('\n'.join(notes))
+        lines.extend(self.tr('Warning: %s') % text
+                     for text in getattr(self, '_placementWarnings', ()))
         self._seedWarning.setText('\n'.join(lines))
         self._seedWarning.setVisible(bool(lines))
         self._showSavedLabels()

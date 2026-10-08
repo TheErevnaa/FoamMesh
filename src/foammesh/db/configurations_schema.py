@@ -1514,7 +1514,7 @@ schema = {
             # default of four asked for threads the shipped configuration could
             # never use -- and reported nothing. Raising this is worthwhile
             # once the volume algorithm is hxt, which is the threaded one.
-            'threads': IntType().setRange(1, 64).setDefault(1),
+            'threads': IntType().setLowLimit(1).setDefault(1),
         },
         'healing': {
             'importTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
@@ -1756,8 +1756,12 @@ schema = {
         'numCellsY': IntType().setLowLimit(1).setDefault(10),
         'numCellsZ': IntType().setLowLimit(1).setDefault(10),
         'boundingHex6': IntType().setOptional().setDefault(None),
-        # blockMeshDict's ``scale``: the vertices are written in whatever unit
-        # the geometry was imported in, and this is the factor to metres.
+        # blockMeshDict's ``scale``. Plan 37 #9: held at 1. The geometry is
+        # converted to metres when it is imported (Geometry > Import unit), so
+        # the vertices -- derived from it, or typed in its frame -- are metres
+        # already, and blockMesh multiplying them by anything else moved and
+        # resized the block off the geometry. Kept so a project that saved
+        # another value still opens; the writer reports it and writes 1.
         'scale': FloatType().setLowLimit(0, False).setDefault(1),
         # R167. How far the derived background block stands off the geometry,
         # as a fraction of the geometry's largest span, applied to all six

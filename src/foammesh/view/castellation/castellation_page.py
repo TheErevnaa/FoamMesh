@@ -5,7 +5,8 @@ import asyncio
 
 import qasync
 from PySide6.QtGui import QIntValidator
-from PySide6.QtWidgets import QCheckBox, QGridLayout, QLabel, QLineEdit
+from PySide6.QtWidgets import (
+    QCheckBox, QGridLayout, QLabel, QLineEdit, QMessageBox)
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.view.widgets.commit_guard import CONFLICT_ERRORS, conflict_message
@@ -21,6 +22,7 @@ from foammesh.view.main_window.main_window_ui import Ui_MainWindow
 from foammesh.view.step_page import StepPage
 from foammesh.view.main_window.inpage_editor import open_in_page
 from foammesh.view.theming.metrics import unit_cell
+from foammesh.core.mesh import background_estimate
 from .surface_refinement_dialog import SurfaceRefinementDialog
 from .volume_refinement_dialog import VolumeRefinementDialog
 
@@ -309,26 +311,20 @@ class CastellationPage(StepPage):
         self._ui.surfaceRefinement.clear()
         self._ui.volumeRefinement.clear()
 
-        groups = {GeometryType.SURFACE.value: set(), GeometryType.VOLUME.value: set()}
-        for gId, geometry in self._db.getElements('geometry').items():
-            if group := geometry.value('castellationGroup'):
-                groups[geometry.value('gType')].add(group)
-
+        # DP-1191. Every stored group is listed, bound or not. Groups no
+        # geometry row named were removed from this page's working copy here
+        # and went out with the next Apply, so a group whose last surface was
+        # un-ticked on the Castellation step was deleted by a later save on
+        # this page. A group refining nothing is the user's to remove.
         for groupId, element in castellation.elements('refinementSurfaces').items():
-            if groupId in groups[GeometryType.SURFACE.value]:
-                surfaceRefinement = element.element('surfaceRefinement')
-                self._addSurfaceRefinementItem(
-                    groupId, element.value('groupName'),
-                    surfaceRefinement.value('minimumLevel'), surfaceRefinement.value('maximumLevel'))
-            else:
-                self._db.removeElement('castellation/refinementSurfaces', groupId)
+            surfaceRefinement = element.element('surfaceRefinement')
+            self._addSurfaceRefinementItem(
+                groupId, element.value('groupName'),
+                surfaceRefinement.value('minimumLevel'), surfaceRefinement.value('maximumLevel'))
 
         for groupId, element in castellation.elements('refinementVolumes').items():
-            if groupId in groups[GeometryType.VOLUME.value]:
-                self._addVolumeRefinementItem(groupId,
-                                              element.value('groupName'), element.value('volumeRefinementLevel'))
-            else:
-                self._db.removeElement('castellation/refinementVolumes', groupId)
+            self._addVolumeRefinementItem(groupId,
+                                          element.value('groupName'), element.value('volumeRefinementLevel'))
 
         self._loaded = True
 
@@ -384,21 +380,28 @@ class CastellationPage(StepPage):
                 box.setChecked(element.value(name))
 
     def _updateCellRisk(self):
+        # Plan 37 #7. The stored numCells are not read in the target-size
+        # mode, so multiplying them said about 1,000 cells for a far field
+        # that wrote 5.9 M. The count is the writer's own, the one the guided
+        # pages show.
+        from foammesh.view.snappy_workflow import background_estimate_label
+
         try:
             db = self._db or app.facadeClient.checkout()
-            counts = tuple(int(db.getValue(f'baseGrid/numCells{axis}'))
-                           for axis in 'XYZ')
-            background = counts[0] * counts[1] * counts[2]
+            found = background_estimate_label.current(db=db)
             maximum = int(float(self._ui.maxGlobalCells.text()))
         except (AttributeError, KeyError, TypeError, ValueError):
+            found, maximum = None, None
+        if found is None or maximum is None:
             self._cellRisk.setText(self.tr('Cell-count estimate unavailable.'))
             return
         message = self.tr(
             'Estimated background cells: {0:,}; maxGlobalCells: {1:,}.').format(
-                background, maximum)
-        if background / max(1, maximum) >= .5:
+                found.cells, maximum)
+        if found.cells / max(1, maximum) >= .5:
             message += self.tr(
                 ' Warning: refinement has little remaining global-cell budget.')
+        message += '\n' + background_estimate.describe(found)
         self._cellRisk.setText(message)
 
     def _openSurfaceRefinementDialog(self, groupId=None):
@@ -486,12 +489,60 @@ class CastellationPage(StepPage):
         self._ui.surfaceRefinement.addItem(item)
 
     def _removeSurfaceRefinement(self, groupId):
-        self._db.removeElement('castellation/refinementSurfaces', groupId)
-        self._db.updateElements(
-            'geometry', 'castellationGroup', None,
-            lambda i, e: e['castellationGroup'] == groupId and e['gType'] == GeometryType.SURFACE.value)
+        self._removeRefinementGroup(
+            'castellation/refinementSurfaces', GeometryType.SURFACE.value,
+            groupId, self._ui.surfaceRefinement)
 
-        self._ui.surfaceRefinement.removeItem(groupId)
+    def _removeRefinementGroup(self, path, gType, groupId, table):
+        """Remove one refinement group and release its geometry, now.
+
+        DP-1192. Remove went into ``self._db``, a working copy committed only
+        by Apply: the row left the table, the group and its bindings stayed in
+        the case, and a run (or the guided step) still refined with it. It is
+        committed at once from a fresh copy, the way the Boundary layer page
+        removes a layer group (DP-119), and the row goes when the case says
+        the group has gone -- a refusal (a locked step) is said and the row
+        stays.
+        """
+        from foammesh.view.facade_client import FailedResult, submit
+        from foammesh.view.workflow_controls.lock_refusal import (
+            locked_titles, refusal_message, refused)
+
+        def dropRow(result=None):
+            if result is not None and (isinstance(result, FailedResult)
+                                       or refused(result)):
+                error = getattr(result, 'error', None)
+                why = (conflict_message(error)
+                       if isinstance(error, CONFLICT_ERRORS)
+                       else refusal_message(result))
+                body = (self.tr('The case did not remove this refinement '
+                                'group, so it stays in the list.')
+                        + ('\n\n' + why if why else ''))
+                if locked_titles(result) is not None:
+                    QMessageBox.warning(self._widget, self.tr('Step locked'),
+                                        body)
+                else:
+                    QMessageBox.warning(
+                        self._widget, self.tr('Refinement group not removed'),
+                        body)
+                return
+            self._db = app.facadeClient.checkout()
+            table.removeItem(groupId)
+
+        db = app.facadeClient.checkout()
+        try:
+            db.removeElement(path, groupId)
+        except KeyError:
+            # The row outlived the group it stood for.
+            dropRow()
+            return
+        db.updateElements(
+            'geometry', 'castellationGroup', None,
+            lambda i, e: e['castellationGroup'] == groupId and e['gType'] == gType)
+        submit(app.facadeClient, 'configuration.commit_working_copy',
+               {'working_copy': db, 'action': 'update castellation',
+                'reason': None, 'target': None},
+               then=dropRow)
 
     def _volumeRefinementDialogAccepted(self):
         element = self._dialog.dbElement()
@@ -515,12 +566,9 @@ class CastellationPage(StepPage):
         self._ui.volumeRefinement.addItem(item)
 
     def _removeVolumeRefinement(self, groupId):
-        self._db.removeElement('castellation/refinementVolumes', groupId)
-        self._db.updateElements(
-            'geometry', 'castellationGroup', None,
-            lambda i, e: e['castellationGroup'] == groupId and e['gType'] == GeometryType.VOLUME.value)
-
-        self._ui.volumeRefinement.removeItem(groupId)
+        self._removeRefinementGroup(
+            'castellation/refinementVolumes', GeometryType.VOLUME.value,
+            groupId, self._ui.volumeRefinement)
 
     def _updateControlButtons(self):
         if self.isNextStepAvailable():

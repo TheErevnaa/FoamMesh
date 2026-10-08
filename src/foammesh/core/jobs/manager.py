@@ -750,7 +750,10 @@ class JobManager:
                 log_tail='\n'.join(transport.tail)).to_dict()
             if timed_out:
                 status = JobStatus.TIMED_OUT
-                error = f'operation exceeded its {request.timeout:g} second timeout'
+                # Plan 37 #7. Say which setting stopped it and how to lift it.
+                error = (f'operation exceeded its {request.timeout:g} second '
+                         'timeout; raise the limit, or set 0 for no limit, in '
+                         'Preferences > OpenFOAM runtime > Stage time limit')
                 category = JobErrorCategory.TIMEOUT
             elif cancelled:
                 status = JobStatus.CANCELLED

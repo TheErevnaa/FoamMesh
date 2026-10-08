@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from vtkmodules.vtkCommonDataModel import vtkPolyData
 from vtkmodules.vtkIOGeometry import vtkOBJReader
 
 from .base import ImportedSurface, ImportResult
@@ -57,12 +58,76 @@ def group_names(path) -> tuple[list[str], list[int]]:
     return names, face_groups
 
 
+def weld_coincident_points(polydata) -> int:
+    """Merge points that sit at exactly the same place; return how many went.
+
+    DP-1158. ``vtkOBJReader`` gives a corner its own point whenever its
+    ``f`` entry names a different normal or texture coordinate, so an OBJ
+    written with one normal per face (``f a//n b//n c//n``) -- which most
+    exporters do for a faceted model -- and a plain triangle soup both
+    arrive as one disconnected triangle per face. Every check downstream
+    then sees thousands of one-triangle shells: MEASURED, a 1 MB soup OBJ
+    peaked at 10.3 GB in the shell-pair check and a 0.56 MB per-face-normal
+    OBJ raised MemoryError under 12 GB.
+
+    Only exactly coincident coordinates are merged, so no geometry moves,
+    and no cell is added or removed, so the per-face group ids still line up
+    with the faces. Point data is dropped when anything merged: a normal or
+    texture coordinate that differed between the faces sharing a corner has
+    no single value at the welded point, and nothing downstream reads them.
+    A file with no coincident points is returned exactly as read.
+    """
+    import numpy as np
+    from vtkmodules.util.numpy_support import (numpy_to_vtk,
+                                               numpy_to_vtkIdTypeArray,
+                                               vtk_to_numpy)
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray
+
+    points = polydata.GetPoints()
+    if points is None or points.GetNumberOfPoints() < 2:
+        return 0
+    coordinates = vtk_to_numpy(points.GetData())
+    _, first, inverse = np.unique(coordinates, axis=0, return_index=True,
+                                  return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    if first.size == coordinates.shape[0]:
+        return 0
+    # Keep the welded points in the order they first appear, so a file that
+    # merges only a few points keeps its numbering otherwise.
+    order = np.argsort(first, kind='stable')
+    rank = np.empty_like(order)
+    rank[order] = np.arange(order.size)
+    remap = rank[inverse].astype(np.int64)
+    welded = vtkPoints()
+    welded.SetData(numpy_to_vtk(
+        np.ascontiguousarray(coordinates[first[order]]), deep=True))
+    # Fresh cell arrays rather than rewriting the reader's in place, which a
+    # shallow copy still shares.
+    for getter, setter in (('GetVerts', 'SetVerts'), ('GetLines', 'SetLines'),
+                           ('GetPolys', 'SetPolys'), ('GetStrips', 'SetStrips')):
+        cells = getattr(polydata, getter)()
+        if cells is None or cells.GetNumberOfCells() == 0:
+            continue
+        offsets = vtk_to_numpy(cells.GetOffsetsArray()).astype(np.int64)
+        connectivity = remap[vtk_to_numpy(cells.GetConnectivityArray())]
+        rebuilt = vtkCellArray()
+        rebuilt.SetData(numpy_to_vtkIdTypeArray(offsets, deep=True),
+                        numpy_to_vtkIdTypeArray(connectivity, deep=True))
+        getattr(polydata, setter)(rebuilt)
+    polydata.SetPoints(welded)
+    polydata.GetPointData().Initialize()
+    return int(coordinates.shape[0] - first.size)
+
+
 def read_obj(path) -> ImportResult:
     path = Path(path)
     reader = vtkOBJReader()
     reader.SetFileName(str(path))
     reader.Update()
-    polydata = reader.GetOutput()
+    polydata = vtkPolyData()
+    polydata.ShallowCopy(reader.GetOutput())
+    weld_coincident_points(polydata)
     names, face_groups = group_names(path)
     derived = False
     if names and len(face_groups) == polydata.GetNumberOfCells():

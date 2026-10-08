@@ -25,10 +25,16 @@ order is kept.
 ``bounds`` are block vertex coordinates, the frame the geometry is drawn in.
 ``blockMesh`` multiplies every vertex by ``scale``, so ``metres()`` is what
 the mesh spans once built -- the frame the launch gate has always judged
-seeds in.
+seeds in. Plan 37 #9: ``CaseBuilder`` writes a derived or Hex6 block at
+``scale 1`` (its vertices are already metres), and hand-written vertices at
+the user's Scale (`CaseBuilder.authored_scale`). A box from the configuration
+is returned already multiplied out, in metres with ``scale`` 1, so every
+reader of ``bounds`` sees what blockMesh builds; only a dictionary read back
+off disk carries another scale.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,14 +129,6 @@ def _builder(db, geometry_bounds):
     return CaseBuilder(db, bbox)
 
 
-def _scale(builder) -> float:
-    try:
-        scale = float(builder._v('baseGrid/scale', 1) or 1)
-    except (TypeError, ValueError):
-        return 1.0
-    return scale if scale > 0 else 1.0
-
-
 def _box_corners(bounds) -> tuple:
     x0, x1, y0, y1, z0, z1 = (float(value) for value in bounds)
     return ((x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
@@ -184,8 +182,8 @@ def _inside_hex(corners, points, slack):
     return held
 
 
-def _authored(builder):
-    """``(hull, blocks, cuboid)`` of the authored blocks, or ``None``."""
+def _authored_topology(builder):
+    """The authored topology and the scale it is written at, or ``None``."""
     from foammesh.openfoam import background_mesh
 
     try:
@@ -196,9 +194,28 @@ def _authored(builder):
     if topology is None:
         return None
     try:
-        hull = _hull(topology.vertices)
+        scale = float(builder.authored_scale())
+    except (TypeError, ValueError):
+        scale = 1.0
+    return topology, scale
+
+
+def _authored(builder):
+    """``(hull, blocks, cuboid)`` of the authored blocks, or ``None``.
+
+    In metres: every vertex times the Scale the writer gives hand-written
+    vertices (Plan 37 #9), so the box drawn is the box blockMesh builds.
+    """
+    found = _authored_topology(builder)
+    if found is None:
+        return None
+    topology, scale = found
+    try:
+        hull = _hull([[float(value) * scale for value in vertex[:3]]
+                      for vertex in topology.vertices])
         blocks = tuple(
-            tuple(tuple(float(value) for value in topology.vertices[index][:3])
+            tuple(tuple(float(value) * scale
+                        for value in topology.vertices[index][:3])
                   for index in block.vertices)
             for block in topology.blocks)
     except (TypeError, ValueError, IndexError):
@@ -249,11 +266,13 @@ def domain_box(db, case_path=None, geometry_bounds=None, *,
     """
     from foammesh.core.mesh.sizing import stand_off_bounds
 
+    # Plan 37 #9. A derived or Hex6 block is written with ``scale 1``
+    # (`CaseBuilder._block_scale`); authored blocks come back from `_authored`
+    # already multiplied by their Scale. Either way the box is in metres.
     scale = 1.0
     builder = None
     if db is not None:
         builder = _builder(db, geometry_bounds)
-        scale = _scale(builder)
         authored = _authored(builder)
         if authored is not None:
             hull, blocks, cuboid = authored
@@ -280,6 +299,49 @@ def domain_box(db, case_path=None, geometry_bounds=None, *,
     if case_path is not None:
         return written_domain_box(case_path)
     return None
+
+
+def has_authored_blocks(db) -> bool:
+    """Whether the case writes hand-written blocks, so Scale applies to them."""
+    if db is None:
+        return False
+    try:
+        return _authored_topology(_builder(db, None)) is not None
+    except Exception:  # noqa: BLE001 - no configuration, no blocks
+        return False
+
+
+def authored_base_cell(db) -> tuple[float, float, float] | None:
+    """The finest base cell of the hand-written blocks, in metres, or ``None``.
+
+    Plan 37 #9. Each block's extent per axis, times the Scale the writer
+    applies, over its cell count; the smallest over all blocks, since that is
+    the cell a refinement level is counted down from where it is finest.
+    """
+    if db is None:
+        return None
+    try:
+        found = _authored_topology(_builder(db, None))
+    except Exception:  # noqa: BLE001 - no configuration, no blocks
+        return None
+    if found is None:
+        return None
+    topology, scale = found
+    cell = [math.inf, math.inf, math.inf]
+    try:
+        for block in topology.blocks:
+            corners = [[float(value) * scale
+                        for value in topology.vertices[index][:3]]
+                       for index in block.vertices]
+            for axis in range(3):
+                values = [corner[axis] for corner in corners]
+                count = max(1, int(block.count(axis)))
+                cell[axis] = min(cell[axis], (max(values) - min(values)) / count)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not all(math.isfinite(value) for value in cell):
+        return None
+    return tuple(cell)
 
 
 def written_domain_box(case_path) -> DomainBox | None:

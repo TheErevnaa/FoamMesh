@@ -131,7 +131,13 @@ class PreferencesDialog(QDialog):
         self.bashrcEdit.setObjectName('preferencesBashrc')
         self.stageTimeout = CompactSpinBox(page)
         self.stageTimeout.setObjectName('preferencesStageTimeout')
-        self.stageTimeout.setRange(1, 7 * 24 * 3600)
+        # Plan 37 #7. 0 is no limit at all; every guided stage press reads
+        # this value, and so does the whole-pipeline run.
+        self.stageTimeout.setRange(0, 7 * 24 * 3600)
+        self.stageTimeout.setSpecialValueText(self.tr('No limit'))
+        self.stageTimeout.setToolTip(self.tr(
+            'How long one meshing stage may run before it is stopped. '
+            '0 means no limit.'))
         self.stageTimeout.setValue(int(runtime['stage_timeout']))
         form.addRow(self.tr('WSL distribution'), self.distroEdit)
         form.addRow(self.tr('WSL user'), self.userEdit)

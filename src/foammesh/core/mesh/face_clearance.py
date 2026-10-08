@@ -23,9 +23,10 @@ as it can be at every level at once -- ``1/3`` is never a dyadic fraction --
 which is why the snap goes to ``origin + (k + 1/3) * step`` and a nudge moves a
 third of a finest cell.
 
-Everything here is in block-vertex units, the frame the geometry is drawn in
-and the frame `domain_box.DomainBox.bounds` uses; ``blockMesh`` scales both
-the same way, so the fractions do not change.
+Everything here is in metres, the frame the geometry is drawn in and the
+frame `domain_box.DomainBox.bounds` uses: a topology's vertices are taken
+times its ``scale`` (Plan 37 #9 -- hand-written vertices may be typed in
+millimetres with ``scale 0.001``), so the grid is the one blockMesh builds.
 """
 from __future__ import annotations
 
@@ -278,9 +279,14 @@ def grid_from_topology(topology) -> BackgroundGrid | None:
         return None
     blocks = []
     try:
+        scale = float(getattr(topology, 'scale', 1) or 1)
+    except (TypeError, ValueError):
+        scale = 1.0
+    try:
         for block in topology.blocks:
             corners = tuple(
-                tuple(float(value) for value in topology.vertices[index][:3])
+                tuple(float(value) * scale
+                      for value in topology.vertices[index][:3])
                 for index in block.vertices)
             if block.grading_literal is not None:
                 gradings = _literal_gradings(block.grading_literal)

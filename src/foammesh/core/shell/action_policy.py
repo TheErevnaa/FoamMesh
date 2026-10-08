@@ -177,7 +177,7 @@ class ActionPolicy:
 
         result[ActionId.SAVE] = ActionPresentation(
             snapshot.dirty and project_idle,
-            reason=('No unsaved changes' if not snapshot.dirty else project_reason))
+            reason=self._save_reason(snapshot, project_reason))
         result[ActionId.UNDO] = ActionPresentation(
             snapshot.undo_available and project_idle,
             reason=('Nothing to undo' if not snapshot.undo_available else project_reason))
@@ -219,6 +219,24 @@ class ActionPolicy:
             return ActionPresentation(False, reason=snapshot.capability_reasons.get(
                 action.value, 'This feature is not available in this build'))
         return ActionPresentation(enabled, reason=reason)
+
+    @staticmethod
+    def _save_reason(snapshot: AppSnapshot, project_reason: str) -> str:
+        """Why Save is greyed out.
+
+        DP-1264. While a mesh ran, Save said only "Wait for the active mesh
+        operation to finish or cancel it", and a user an hour into a run read
+        that as "everything so far is at risk until it ends". It is not: each
+        finished stage is kept as it lands (DP-1234) and a stopped run resumes
+        from the last of them (DP-1236). The tooltip now says so.
+        """
+        if snapshot.job is JobState.RUNNING_MUTATION:
+            return ('Save is unavailable while the active mesh operation '
+                    'runs. Each finished stage is kept automatically, and a '
+                    'stopped run can be resumed from the last one.')
+        if not snapshot.dirty:
+            return 'No unsaved changes'
+        return project_reason
 
     @staticmethod
     def _job_reason(snapshot: AppSnapshot) -> str:

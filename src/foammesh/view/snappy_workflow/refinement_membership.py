@@ -233,38 +233,59 @@ class RefinementMembership(QWidget):
             changes = self._merged.expand(changes)
         return changes
 
-    def commit(self, group, then=None) -> None:
-        """Bind the checked rows to *group* and unbind the unchecked ones."""
+    def commit(self, group, then=None, refused=None) -> None:
+        """Bind the checked rows to *group* and unbind the unchecked ones.
+
+        DP-1190. *refused(result)* is called, before *then*, with the first
+        binding write the facade refused -- a locked step refuses them all.
+        """
         changes = self.pending(group)
         self._loaded = False
         self._initial = set()
-        _patch_bindings(self._client, changes, then)
+        _patch_bindings(self._client, changes, then, refused=refused)
 
 
 def _patch_bindings(client, changes: dict, then=None,
-                    field: str = 'castellation_group') -> None:
+                    field: str = 'castellation_group', refused=None) -> None:
     """Write ``{gId: group or None}`` as *field* patches on geometry rows.
 
     DP-524. The layer groups bind through ``layer_group`` and
     ``slave_layer_group`` by the same operation, so the field is a parameter.
+
+    DP-1190. Every answer is read. Only the last write used to carry a
+    continuation, and that continuation ignored what it was handed, so a
+    binding a locked step refused was dropped in silence and the editor
+    reported the group saved. *then* now runs once every write has been
+    answered, after *refused(first refusal)* when any was refused.
     """
+    from foammesh.view.workflow_controls.lock_refusal import (
+        refused as was_refused)
+
     items = sorted(changes.items())
     if not items:
         if then is not None:
             then()
         return
-    last = len(items) - 1
-    for index, (gId, group) in enumerate(items):
-        done = None
-        if then is not None and index == last:
-            def done(_result, then=then):
-                then()
+    state = {'left': len(items), 'refusals': []}
+
+    def done(result) -> None:
+        if was_refused(result):
+            state['refusals'].append(result)
+        state['left'] -= 1
+        if state['left'] > 0:
+            return
+        if state['refusals'] and refused is not None:
+            refused(state['refusals'][0])
+        if then is not None:
+            then()
+
+    for gId, group in items:
         submit(client, 'geometry.items.patch',
                {'entity_id': str(gId), 'fields': {field: group}},
                then=done)
 
 
-def unbind_group(client, kind: str, group, then=None) -> None:
+def unbind_group(client, kind: str, group, then=None, refused=None) -> None:
     """Clear every *kind* row bound to a group that was just removed.
 
     Row ids are reused, so a binding left behind on a removed group is
@@ -278,4 +299,4 @@ def unbind_group(client, kind: str, group, then=None) -> None:
     changes = {gId: None for gId, row in geometry_rows(configuration).items()
                if row.get('gType') == kind
                and _key(row.get('castellationGroup')) == group}
-    _patch_bindings(client, changes, then)
+    _patch_bindings(client, changes, then, refused=refused)

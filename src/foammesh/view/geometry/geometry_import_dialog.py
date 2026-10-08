@@ -5,9 +5,10 @@ from pathlib import Path
 
 from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog,
-                               QListWidgetItem, QMessageBox)
+                               QLabel, QListWidgetItem, QMessageBox)
 
 from foammesh.app import app
+from foammesh.core.geometry.measure import format_size, union_bounds
 from foammesh.core.geometry.units import UNIT_TO_M, suggest_unit
 from .geometry_import_dialog_ui import Ui_ImportDialog
 
@@ -26,6 +27,10 @@ UNIT_CHOICES = (
 #: a user to overrule the file, which is how a correct model gets scaled wrong.
 #: BREP is not one of them: it carries geometry only, so it has to be asked.
 SELF_DESCRIBING = {'.step', '.stp', '.iges', '.igs'}
+
+#: Formats whose size the dialog can read before import: a VTK reader gives
+#: the box. A CAD file needs the OpenCASCADE import itself to be measured.
+MEASURABLE = {'.stl', '.obj'}
 
 #: The split dialog's own slider and validator: whole degrees, 0 to 180.
 FEATURE_ANGLE_RANGE = (0, 180)
@@ -96,6 +101,16 @@ class ImportDialog(QDialog):
         self._ui.setupUi(self)
 
         self._dialog = None
+        #: DP-1182. The box of each chosen surface file, in file units, read
+        #: once when the files are chosen and re-scaled on a unit change.
+        self._measured = {}
+        self._sizeLabel = QLabel(self)
+        self._sizeLabel.setObjectName('modelSize')
+        self._sizeLabel.setWordWrap(True)
+        self._sizeLabel.setVisible(False)
+        layout = self._ui.verticalLayout
+        layout.insertWidget(layout.indexOf(self._ui.unitRow) + 1,
+                            self._sizeLabel)
 
         for label, value in UNIT_CHOICES:
             self._ui.unit.addItem(label, value)
@@ -127,6 +142,7 @@ class ImportDialog(QDialog):
 
     def _connectSignalsSlots(self):
         self._ui.select.clicked.connect(self._openFileDialog)
+        self._ui.unit.currentIndexChanged.connect(self._showSize)
 
     def _openFileDialog(self):
         self._dialog = QFileDialog(self, self.tr('Select geometry file'), app.settings.getRecentImportDirectory(), 'Geometry (*.stl *.obj *.step *.stp *.iges *.igs *.brep);;Surface (*.stl *.obj);;CAD (*.step *.stp *.iges *.igs *.brep)')
@@ -143,7 +159,49 @@ class ImportDialog(QDialog):
         self._ui.buttonBox.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
 
         app.settings.updateRecentImportDirectory(Path(files[0]).parent)
+        self._measured = {path: _fileBounds(path) for path in self.files()
+                          if path.suffix.lower() in MEASURABLE}
         self._suggestUnit()
+        self._showSize()
+
+    def sizeText(self) -> str:
+        """The chosen files' size in the chosen unit, or why it is not known.
+
+        DP-1182. The dialog said which unit a diagonal suggested and nothing
+        else, so a user could not check the one number that settles the
+        unit -- how big the part is -- before committing to it. Every
+        surface file chosen is measured (their combined box), scaled by the
+        unit they are declared in and written the way the rest of the
+        window writes a length. A CAD file is measured by the import itself,
+        and the line says that rather than leaving it out silently.
+        """
+        paths = self.files()
+        if not paths:
+            return ''
+        cad = [path for path in paths if path.suffix.lower() not in MEASURABLE]
+        bounds = union_bounds(box for box in self._measured.values()
+                              if box is not None)
+        size = ''
+        if bounds is not None:
+            unit = self._ui.unit.currentData() or 'm'
+            size = format_size(bounds, UNIT_TO_M.get(unit, 1.0))
+        if size:
+            text = self.tr('Size: {0}').format(size)
+            if len(paths) > 1:
+                text = self.tr('Size of the surface files together: {0}'
+                               ).format(size)
+            if cad:
+                text += self.tr('. CAD files are measured on import.')
+            return text
+        if cad:
+            return self.tr('The size of a CAD file is shown on the Geometry '
+                           'page once it is imported.')
+        return self.tr('The size could not be read from the chosen files.')
+
+    def _showSize(self, *_args):
+        text = self.sizeText()
+        self._sizeLabel.setText(text)
+        self._sizeLabel.setVisible(bool(text))
 
     def refusal(self):
         """Why OK cannot import this selection, or ``None``."""
@@ -186,7 +244,15 @@ class ImportDialog(QDialog):
             self._ui.unitHint.setText('')
             return
 
-        diagonal = _diagonal(paths)
+        diagonal = None
+        for path in paths:
+            # The boxes read when the files were chosen (DP-1182), so the
+            # file is not read a second time for the hint.
+            box = (self._measured[path] if path in self._measured
+                   else _fileBounds(path))
+            diagonal = _diagonalOf(box)
+            if diagonal is not None:
+                break
         if diagonal is None:
             self._ui.unitHint.setText('')
             return
@@ -200,30 +266,43 @@ class ImportDialog(QDialog):
             else self.tr('{0} Please check.').format(suggestion.message))
 
 
-def _diagonal(paths):
-    """Bounding-box diagonal of the first readable surface, in file units."""
-    import math
-
+def _fileBounds(path):
+    """The box of one STL/OBJ file in file units, or ``None``."""
     from vtkmodules.vtkIOGeometry import vtkOBJReader, vtkSTLReader
 
+    suffix = Path(path).suffix.lower()
+    if suffix == '.stl':
+        reader = vtkSTLReader()
+    elif suffix == '.obj':
+        reader = vtkOBJReader()
+    else:
+        return None
+    try:
+        reader.SetFileName(str(path))
+        reader.Update()
+        data = reader.GetOutput()
+        if data is None or data.GetNumberOfPoints() == 0:
+            return None
+        return tuple(float(value) for value in data.GetBounds())
+    except Exception:                                          # noqa: BLE001
+        # A file the reader cannot open is the import's problem to report,
+        # not the unit hint's. Fall through and leave the combo alone.
+        return None
+
+
+def _diagonalOf(bounds):
+    import math
+
+    if bounds is None:
+        return None
+    x0, x1, y0, y1, z0, z1 = bounds
+    return math.dist((x0, y0, z0), (x1, y1, z1))
+
+
+def _diagonal(paths):
+    """Bounding-box diagonal of the first readable surface, in file units."""
     for path in paths:
-        suffix = path.suffix.lower()
-        if suffix == '.stl':
-            reader = vtkSTLReader()
-        elif suffix == '.obj':
-            reader = vtkOBJReader()
-        else:
-            continue
-        try:
-            reader.SetFileName(str(path))
-            reader.Update()
-            data = reader.GetOutput()
-            if data is None or data.GetNumberOfPoints() == 0:
-                continue
-            x0, x1, y0, y1, z0, z1 = data.GetBounds()
-            return math.dist((x0, y0, z0), (x1, y1, z1))
-        except Exception:                                          # noqa: BLE001
-            # A file the reader cannot open is the import's problem to report,
-            # not the unit hint's. Fall through and leave the combo alone.
-            continue
+        diagonal = _diagonalOf(_fileBounds(path))
+        if diagonal is not None:
+            return diagonal
     return None

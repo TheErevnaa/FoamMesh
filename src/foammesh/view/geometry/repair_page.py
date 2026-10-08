@@ -1167,6 +1167,30 @@ class GeometryRepairPage(StepPage):
                then=discarded)
         self.stepReset.emit()
 
+    def forgetRemovedGeometry(self):
+        """Drop what this page drew from a geometry set that has changed.
+
+        DP-1213. Removing a geometry on `1. Geometry` left this page holding
+        the readiness report, the body tree and the repair plan of the set
+        before it, the removed body still in them, until something else
+        redrew it. Nothing here asks the facade for anything: the next
+        `show()` fetches the report of the set as it now is, and the prepared
+        revision of the old set is no longer current once its fingerprint
+        stops matching (`PreparedGeometryStore.current`).
+        """
+        self._repairPlan = None
+        self._details = {}
+        self._clearPlanCards()
+        self._planArea.setVisible(False)
+        self._planEmpty.setText(self._planEmptyText(suggested=False))
+        self._syncPlanButtons(searched=False, actions=False)
+        self._repairReport.setText('')
+        self._wrapPreview.setText('')
+        self._findings.setRowCount(0)
+        self._bodyTree.clear()
+        self._report = None
+        self._offerGeometries([])
+
     def refresh(self):
         # C31-12. `geometry.readiness` is a READ that declares an artifact
         # (`readiness_report`), so the registry classes it as a mutation and

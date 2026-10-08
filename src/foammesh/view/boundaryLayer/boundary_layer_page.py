@@ -16,12 +16,11 @@ from widgets.list_table import ListItemWithButtons
 from foammesh.app import app
 from foammesh.db.configurations import defaultsDB
 from foammesh.db.configurations_schema import (
-    LayerPatchSelector, LayerPolicy, MeshShrinker, OptionalToggle)
+    LayerPolicy, MeshShrinker, OptionalToggle)
 from foammesh.view.step_page import StepPage
 from foammesh.view.main_window.inpage_editor import open_in_page
 from foammesh.core.mesh.sizing import first_layer_height
 from .boundary_setting_dialog import BoundarySettingDialog
-from foammesh.view.snappy_workflow.layer_membership import binding_pending
 
 
 def layerCountLabel(policy, count) -> str:
@@ -48,16 +47,6 @@ STAGED_MESH_ADVISORY = (
     'settings. For the mesh you hand to a solver, finish with the full '
     'pipeline on the Base grid step so every phase runs in one qualified '
     'snappyHexMesh pass.')
-
-
-def _selects_by_pattern(element) -> bool:
-    """Whether a stored layer group names its patches by a pattern."""
-    try:
-        selector = element.value('patchSelector')
-    except (KeyError, AttributeError):
-        return False
-    selector = getattr(selector, 'value', selector)
-    return str(selector) == LayerPatchSelector.PATTERN.value
 
 
 class BoundaryLayerPage(StepPage):
@@ -270,43 +259,18 @@ class BoundaryLayerPage(StepPage):
 
         self._ui.boundaryLayerConfigurations.clear()
 
-        groups = set()
-        for gId, geometry in self._db.getElements('geometry').items():
-            groups.add(geometry.value('layerGroup'))
-            groups.add(geometry.value('slaveLayerGroup'))
-        if None in groups:
-            groups.remove(None)
-
-        orphans = []
+        # DP-1191. Every stored group is listed, bound or not. This used to
+        # prune the geometry-selector groups no boundary named, and commit
+        # the prune (DP-1030): the page is built hidden and loaded on every
+        # case announcement, so un-ticking the last surface of a group on the
+        # Boundary layers step deleted the group a moment later. A group
+        # covering nothing is the user's to remove; the guided page says it
+        # grows layers on nothing until it covers a boundary.
         for groupId, element in self._db.getElements('addLayers/layers').items():
-            if groupId in groups:
-                self._addConfigurationItem(
-                    groupId, element.value('groupName'),
-                    layerCountLabel(element.value('layerPolicy'),
-                                    element.value('nSurfaceLayers')))
-            elif not _selects_by_pattern(element) and not binding_pending(groupId):
-                # Plan 37 UF20: nor a group the Boundary layers page wrote a
-                # moment ago and is still binding -- see ``binding_pending``.
-                # Plan 37 UF20. A group on the pattern selector reaches its
-                # patches through its own regular expression; no geometry row
-                # ever names it, so "no geometry uses it" is how every such
-                # group looks. Pruned here, each one the Boundary layers page
-                # created was deleted a second after it was added.
-                orphans.append(groupId)
-        for groupId in orphans:
-            self._db.removeElement('addLayers/layers', groupId)
-        if orphans:
-            # DP-1030. The pruning above went into a working copy nothing
-            # committed, so the groups no geometry uses were back in the case
-            # on every load. Committed from a fresh copy, the way a removal
-            # from the list is.
-            pruned = app.facadeClient.checkout()
-            for groupId in orphans:
-                pruned.removeElement('addLayers/layers', groupId)
-            submit(app.facadeClient, 'configuration.commit_working_copy',
-                   {'working_copy': pruned,
-                    'action': 'remove unused layer groups',
-                    'reason': None, 'target': None})
+            self._addConfigurationItem(
+                groupId, element.value('groupName'),
+                layerCountLabel(element.value('layerPolicy'),
+                                element.value('nSurfaceLayers')))
 
         self._setConfigurastions(self._db.getElement('addLayers'))
 

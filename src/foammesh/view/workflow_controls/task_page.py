@@ -312,6 +312,13 @@ class EngineTaskPage(QWidget):
     unlockRequested = Signal(str)
     #: Whether this task's published result is the mesh on disk.
     _resultLockedFlag = False
+    #: DP-1220. The future an Update press resolves when its patch has
+    #: landed (accepted or refused), so a run that saves the page first waits
+    #: for it instead of racing it. ``None`` when no Update is in flight.
+    _applying = None
+    #: DP-1220. Why the last `save()` was refused, in the facade's words, for
+    #: the caller that has to say so ('' after a save that was accepted).
+    last_save_refusal = ''
 
     def __init__(self, facade_client, task_id: str, parent=None, *,
                  engine_id: str | None = None):
@@ -580,6 +587,22 @@ class EngineTaskPage(QWidget):
         if locked:
             self._update.setEnabled(False)
             self._preview.setEnabled(False)
+        self._lockChildTables(locked)
+
+    def _lockChildTables(self, locked: bool) -> None:
+        """DP-1190. Tell this page's row tables -- and an editor open over
+        one of them -- that the step locked (or unlocked) under them."""
+        from .child_controls import ChildControlPanel
+        from .lock_refusal import locked_sentence
+
+        task = self._task if isinstance(getattr(self, '_task', None), dict) else {}
+        title = str(task.get('title') or self.task_id or '')
+        note = locked_sentence([title] if title else [])
+        for panel in self.findChildren(ChildControlPanel):
+            try:
+                panel.setRowsLocked(locked, note)
+            except Exception:                                # noqa: BLE001
+                pass
 
     def isResultLocked(self) -> bool:
         return self._resultLockedFlag
@@ -833,8 +856,10 @@ class EngineTaskPage(QWidget):
         calls ``refresh`` itself, still is (DP-363).
         """
         pending = dict(self._pending)
+        focused = _focused_field(self)
         self.refresh()
         if not pending:
+            _refocus(self, focused)
             return
         for field_id, value in pending.items():
             editor = self._editors.get(field_id)
@@ -846,6 +871,43 @@ class EngineTaskPage(QWidget):
             self._client, self._editors, self._pending)
         self._refresh_advanced_header()
         self._set_dirty(bool(self._pending))
+        # DP-1222. `refresh` worked its derived values out from the stored
+        # ones -- `reload_values` had just cleared the edits -- so a page
+        # whose estimate follows what is typed showed the stored sizing's
+        # count beside the typed sizing until the next keystroke.
+        derived = getattr(self, 'refresh_derived', None)
+        if callable(derived):
+            derived()
+        _refocus(self, focused)
+
+    def refresh_derived(self) -> None:
+        """Work out again what this page computes from the case and the view.
+
+        DP-1221. MEASURED offscreen (audit probe, snappy Base grid): built
+        before any geometry was on screen, the page's background estimate
+        stayed hidden after a surface was imported, and after the surface
+        was replaced with one ten times the size it went on reading the old
+        count. The estimate was only worked out when the page re-read itself,
+        and nothing that changes the geometry asked it to. The engine branch
+        calls this when the case changes under the page and when the page is
+        opened; the default recomputes the background estimate on the pages
+        that carry one (Base grid and Castellation share it).
+        """
+        estimate = getattr(self, 'refresh_estimate', None)
+        if callable(estimate):
+            try:
+                estimate()
+            except Exception:                                # noqa: BLE001
+                # A sentence the page cannot work out is one it does not say;
+                # it is never a reason to take the page down with it.
+                pass
+
+    @property
+    def save_pending(self) -> bool:
+        """Edits that a run must wait for: unsaved, or an Update in flight."""
+        applying = self._applying
+        return self.is_dirty or bool(
+            applying is not None and not applying.done())
 
     def _prerequisite_ids(self) -> tuple:
         """The tasks this line should name: what the user must settle first.
@@ -1497,13 +1559,27 @@ class EngineTaskPage(QWidget):
         self._preview_note.clear()
         self._preview_note.setVisible(False)
 
-    def _patch_accepted(self, result) -> bool:
-        """Take an accepted patch, and say whether it was accepted."""
+    def _patch_accepted(self, result, carried=None) -> bool:
+        """Take an accepted patch, and say whether it was accepted.
+
+        ``carried`` is the patch that was sent. DP-1220: only the edits it
+        carried are spent. MEASURED by reading the code through: this
+        cleared every unsaved edit and re-read the page, so a field typed
+        while an Update or a run's save was on its way went back to its
+        stored value and out of the next patch, without a word. ``None`` (a
+        caller that does not say) keeps the old answer: everything is spent.
+        """
         if getattr(result, 'status', 'accepted') != 'accepted':
             return False
         payload = getattr(result, 'payload', {}) or {}
         self._last_change_set_id = payload.get('change_set_id')
-        self._pending.clear()
+        if carried is None:
+            self._pending.clear()
+        else:
+            for field_id in [key for key, value in self._pending.items()
+                             if key in carried
+                             and _same_value(carried[key], value)]:
+                self._pending.pop(field_id, None)
         # DP-157. The panels' values went out in this patch, so their
         # pending sets are spent; reloading clears them and re-reads
         # what the facade now holds.
@@ -1517,6 +1593,10 @@ class EngineTaskPage(QWidget):
         # and Proceed then meshed it again for no reason.
         if not payload.get('no_op'):
             self.updateRequested.emit(self._configured_task(payload))
+        # DP-1220. What the patch did not carry is still on the page.
+        if self._pending:
+            self.refresh_keeping_edits()
+            return True
         self.refresh()
         return True
 
@@ -1566,19 +1646,40 @@ class EngineTaskPage(QWidget):
     def apply(self):
         if not self.is_dirty:
             return None
+        import asyncio
+
+        # DP-1220. The patch this press sends, kept, so that when it lands
+        # only the edits it carried are taken off the page: a value typed
+        # while it was on its way is the user's next edit, not this one.
+        carried = self.pending_patch()
+        try:
+            landed = asyncio.get_running_loop().create_future()
+        except RuntimeError:
+            landed = None                   # no loop: the write runs in place
 
         def applied(result):
-            if not self._patch_accepted(result):
-                QMessageBox.warning(
-                    self, self.tr('Update failed'),
-                    str(getattr(result, 'message', '')
-                        or self.tr('The facade rejected the edit.')))
+            try:
+                if not self._patch_accepted(result, carried):
+                    QMessageBox.warning(
+                        self, self.tr('Update failed'),
+                        str(getattr(result, 'message', '')
+                            or self.tr('The facade rejected the edit.')))
+            finally:
+                if landed is not None and not landed.done():
+                    landed.set_result(None)
+                if self._applying is landed:
+                    self._applying = None
 
+        # DP-1220. MEASURED by reading the press through: Update returned
+        # before the facade had the patch, and a Run pressed in that window
+        # wrote the dictionaries from the values before it. `save()` -- which
+        # every run now goes through first -- waits on this.
+        self._applying = landed
         # C31-12. The patch is scheduled rather than run on the GUI thread;
         # everything that used to follow it runs in `applied` when it lands,
         # so the order is unchanged and the window stays live meanwhile.
         return submit(self._client, 'configuration.patch',
-                      {'patch': self.pending_patch()}, then=applied)
+                      {'patch': carried}, then=applied)
 
     async def save(self) -> bool:
         """Write this page's pending edits and wait to be told the answer.
@@ -1595,10 +1696,23 @@ class EngineTaskPage(QWidget):
         A caller that has to know before it moves the outline awaits this
         instead: the same command, awaited, with the same tail once it lands,
         answering True only when the facade accepted it. The refusal belongs
-        to whoever asked, so there is no dialog here (DP-227).
+        to whoever asked, so there is no dialog here (DP-227); its words are
+        left in ``last_save_refusal`` for that caller (DP-1220).
         """
+        import asyncio
+
+        self.last_save_refusal = ''
+        # DP-1220. An Update still on its way is part of this save: wait for
+        # it to land, then send whatever it did not carry.
+        applying = self._applying
+        if applying is not None and not applying.done():
+            try:
+                await asyncio.shield(applying)
+            except Exception:                                # noqa: BLE001
+                pass
         if not self.is_dirty:
             return True
+        carried = self.pending_patch()
         runner = getattr(self._client, 'run', None)
         try:
             if runner is None:
@@ -1608,14 +1722,17 @@ class EngineTaskPage(QWidget):
                 blocking = getattr(self._client, 'run_sync', None)
                 if blocking is None:
                     return False
-                result = blocking('configuration.patch',
-                                  {'patch': self.pending_patch()})
+                result = blocking('configuration.patch', {'patch': carried})
             else:
                 result = await runner('configuration.patch',
-                                      {'patch': self.pending_patch()})
-        except Exception:
+                                      {'patch': carried})
+        except Exception as error:                           # noqa: BLE001
+            self.last_save_refusal = str(error)
             return False
-        return self._patch_accepted(result)
+        accepted = self._patch_accepted(result, carried)
+        if not accepted:
+            self.last_save_refusal = str(getattr(result, 'message', '') or '')
+        return accepted
 
     def revert(self):
         """Discard pending values or revert only this page's accepted edit."""
@@ -1678,6 +1795,54 @@ class EngineTaskPage(QWidget):
         return submit(self._client, 'history.revert_change_set',
                       {'change_set_id': self._last_change_set_id},
                       then=reverted)
+
+
+def _same_value(left, right) -> bool:
+    """Whether a pending edit is still the value a patch carried (DP-1220)."""
+    try:
+        return bool(left == right)
+    except Exception:                                        # noqa: BLE001
+        return left is right
+
+
+def _focused_field(page):
+    """The field id whose editor holds the keyboard focus, or ``None``.
+
+    DP-1221. A re-read rebuilds the editors, so the one being typed into is
+    deleted under the cursor; the id is what survives the rebuild.
+    """
+    from PySide6.QtWidgets import QApplication
+
+    try:
+        # No application, no focus (a stand-in page built without one).
+        focus = (QApplication.focusWidget() if QApplication.instance()
+                 else None)
+    except Exception:                                        # noqa: BLE001
+        return None
+    if focus is None:
+        return None
+    for field_id, editor in (getattr(page, '_editors', None) or {}).items():
+        if not isinstance(editor, QWidget):
+            continue
+        try:
+            if editor is focus or editor.isAncestorOf(focus):
+                return field_id
+        except RuntimeError:
+            continue
+    return None
+
+
+def _refocus(page, field_id) -> None:
+    """Give the focus back to ``field_id``'s new editor (DP-1221)."""
+    if field_id is None:
+        return
+    editor = (getattr(page, '_editors', None) or {}).get(field_id)
+    target = getattr(editor, '_editor', editor)
+    if isinstance(target, QWidget):
+        try:
+            target.setFocus()
+        except RuntimeError:
+            pass
 
 
 def _shared_field_prefix(field_ids) -> str:

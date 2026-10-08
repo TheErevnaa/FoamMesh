@@ -395,10 +395,137 @@ class GeometryArtifactStore:
         self.readiness_path = self.root / 'readiness.json'
 
     def entries(self) -> list[dict]:
+        return list(self._document().get('geometries', ()))
+
+    def _document(self) -> dict:
         if not self.manifest_path.is_file():
+            return {}
+        return json.loads(self.manifest_path.read_text(encoding='utf-8'))
+
+    def removed_entries(self) -> list[dict]:
+        """Entries the user removed and an undo may still bring back (DP-1211)."""
+        return list(self._document().get('removed', ()))
+
+    def remove(self, geometry_ids) -> list[str]:
+        """Take these geometries out of the active set; return the ids taken.
+
+        DP-1211. Removing a geometry on the Geometry page edited the project
+        tree and nothing else, and this store had no way to forget an entry.
+        MEASURED with two STLs imported and one removed: ``entries()``, the
+        readiness report the Preparation page draws, ``geometry_fingerprint``
+        and the next prepared revision's ``sources`` all still held the
+        removed one, so it was meshed; deleting its ``rev1.stl`` then made
+        every one of them raise ``FileNotFoundError``.
+
+        The entry moves to a ``removed`` list in the same manifest rather than
+        being dropped, and its folder stays on disk, because an undo of the
+        removal has to be able to put it back exactly (:meth:`restore`).
+        Its cached readiness record goes, so nothing reports it.
+        """
+        wanted = {str(item) for item in geometry_ids or () if item}
+        document = self._document()
+        entries = list(document.get('geometries', ()))
+        removed = list(document.get('removed', ()))
+        kept, taken = [], []
+        for entry in entries:
+            (taken if entry['geometry_id'] in wanted else kept).append(entry)
+        if not taken:
             return []
-        document = json.loads(self.manifest_path.read_text(encoding='utf-8'))
-        return list(document.get('geometries', ()))
+        gone = {entry['geometry_id'] for entry in taken}
+        removed = [entry for entry in removed
+                   if entry['geometry_id'] not in gone] + taken
+        self._save(kept, removed=removed)
+        self._forget_readiness(gone)
+        return [entry['geometry_id'] for entry in taken]
+
+    def restore(self, geometry_ids) -> list[str]:
+        """Put removed geometries back in the active set (DP-1211 undo)."""
+        wanted = {str(item) for item in geometry_ids or () if item}
+        document = self._document()
+        entries = list(document.get('geometries', ()))
+        removed = list(document.get('removed', ()))
+        active = {entry['geometry_id'] for entry in entries}
+        back = [entry for entry in removed
+                if entry['geometry_id'] in wanted
+                and entry['geometry_id'] not in active]
+        if not back:
+            return []
+        returned = {entry['geometry_id'] for entry in back}
+        self._save(entries + back, removed=[
+            entry for entry in removed if entry['geometry_id'] not in returned])
+        return [entry['geometry_id'] for entry in back]
+
+    def settle_removed(self, referenced) -> dict:
+        """Settle the removed list once no undo can reach it (DP-1268).
+
+        :meth:`remove` keeps the entry and its folder because an undo in the
+        same session may want them back. Undo history lives in memory, so at
+        the next open nothing can: the folders were kept for ever, a full
+        copy of every geometry the user had ever removed. The store's removal
+        is also on disk the moment it happens while the tree's waits for a
+        save, so a case closed without saving reopens with rows naming an
+        entry this store has put aside; that one comes back instead.
+
+        ``referenced`` is the set of geometry ids the opened tree names. A
+        removed entry it names is restored; every other one is dropped from
+        the manifest and its files under this store's root are deleted,
+        except any file an active entry still points at.
+        """
+        referenced = {str(item) for item in referenced or () if item}
+        removed = self.removed_entries()
+        if not removed:
+            return {'restored': [], 'purged': [], 'deleted_files': []}
+        restored = self.restore(
+            [entry['geometry_id'] for entry in removed
+             if entry['geometry_id'] in referenced])
+        document = self._document()
+        entries = list(document.get('geometries', ()))
+        purged = [entry['geometry_id'] for entry in document.get('removed', ())]
+        if not purged:
+            return {'restored': restored, 'purged': [], 'deleted_files': []}
+        # The manifest stops naming them before any file goes.
+        self._save(entries, removed=[])
+        root = self.root.resolve()
+        keep = set()
+        for entry in entries:
+            for record in [entry, *entry.get('revisions', ())]:
+                for key in ('artifact', 'cad_artifact'):
+                    if record.get(key):
+                        keep.add(Path(record[key]).resolve())
+        deleted = []
+        for geometry_id in purged:
+            folder = (self.root / geometry_id).resolve()
+            if folder == root or not folder.is_relative_to(root) \
+                    or not folder.is_dir():
+                continue
+            for path in sorted(folder.rglob('*'), reverse=True):
+                if path.is_file() and path.resolve() not in keep:
+                    path.unlink()
+                    deleted.append(str(path))
+                elif path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            if not any(folder.iterdir()):
+                folder.rmdir()
+        return {'restored': restored, 'purged': purged, 'deleted_files': deleted}
+
+    def _forget_readiness(self, geometry_ids: set[str]) -> None:
+        """Drop cached diagnostics of these ids, keeping the rest (DP-1211)."""
+        try:
+            document = json.loads(self.readiness_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return
+        if not isinstance(document, dict) or not isinstance(
+                document.get('geometries'), list):
+            return
+        document['geometries'] = [
+            item for item in document['geometries']
+            if not (isinstance(item, dict)
+                    and item.get('geometry_id') in geometry_ids)]
+        document['geometry_fingerprint'] = self.geometry_fingerprint()
+        temporary = self.readiness_path.with_suffix('.tmp')
+        temporary.write_text(
+            json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temporary, self.readiness_path)
 
     def garbage_collect_revisions(self, keep_recent: int = 3) -> dict:
         """After an explicit case save, retain r1, current, and newest revisions.
@@ -884,6 +1011,15 @@ class GeometryArtifactStore:
                 reports.append({**item, 'fingerprint': fingerprint,
                                 'diagnostics': remembered['diagnostics']})
                 continue
+            # The tessellation is what is graded; a CAD file that is gone
+            # fails its B-Rep checks below as an absent CAD runtime does,
+            # and the prepared store refuses the entry by name.
+            missing = self.missing_artifacts(item, keys=('artifact',))
+            if missing:
+                reports.append({**item, 'fingerprint': fingerprint,
+                                'diagnostics': self._missing_diagnostics(
+                                    item, missing, engine)})
+                continue
             imported = import_surface(item['artifact'])
             polydata = imported.surfaces[0].polydata
             health = assess(polydata, target_cell_size=target_cell_size,
@@ -933,8 +1069,12 @@ class GeometryArtifactStore:
                 'fingerprint': fingerprint,
                 'diagnostics': health.to_dict(),
             })
+        # DP-1211. Only what is still in the active set is carried: a removed
+        # geometry's record otherwise rode along in the cache for ever.
+        active = {item['geometry_id'] for item in self.entries()}
         carried = [entry for key, entry in cached.items()
-                   if key not in {item['geometry_id'] for item in selected}]
+                   if key not in {item['geometry_id'] for item in selected}
+                   and key in active]
         self._persist_readiness(reports, carried, target_cell_size, engine)
         # DP-660. Graded after the cache, not stored in it: whether a body is
         # enclosed depends on the other geometries, which the per-entry
@@ -998,7 +1138,47 @@ class GeometryArtifactStore:
         return f'sha256:{digest.hexdigest()}'
 
     @staticmethod
+    def missing_artifacts(entry: dict,
+                          keys=('artifact', 'cad_artifact')) -> list[str]:
+        """The stored files this entry names that are not on disk (DP-1212)."""
+        return [str(entry[key]) for key in keys
+                if entry.get(key) and not Path(str(entry[key])).is_file()]
+
+    @staticmethod
+    def _missing_diagnostics(entry: dict, missing: list[str],
+                             engine: str | None) -> dict:
+        """A readiness verdict for an entry whose stored file is gone (DP-1212).
+
+        MEASURED: with a geometry's ``rev1.stl`` deleted, `readiness_report`,
+        `geometry_fingerprint` and the prepared store's `current()` and
+        `materialize()` all raised ``FileNotFoundError`` -- the Preparation
+        page could not draw and nothing could be meshed, for every geometry
+        in the case and not only the one that had lost its file. It is one
+        blocking finding on that one geometry now, named like any other.
+        """
+        from .diagnostics.checks import Finding, Severity
+        from .diagnostics.readiness import classify
+        from .diagnostics.report import GeometryHealth
+
+        name = entry.get('name') or entry.get('geometry_id')
+        finding = Finding(
+            'artifact_missing', len(missing), Severity.ERROR,
+            f'The stored copy of {name} is missing ({", ".join(missing)}). '
+            'Remove it and import the file again.',
+            details={'paths': list(missing)})
+        health = GeometryHealth(findings=[finding], watertight=False)
+        health.readiness = classify([finding], cell_count=1, engine=engine)
+        health.score = score_for(health.findings, watertight=False)
+        return health.to_dict()
+
+    @staticmethod
     def entry_fingerprint(entry: dict) -> str:
+        missing = GeometryArtifactStore.missing_artifacts(entry)
+        if missing:
+            # DP-1212. A name for the absence, so the set can still be
+            # fingerprinted and compared; it never equals a content hash.
+            digest = hashlib.sha256('\0'.join(missing).encode('utf-8'))
+            return f'missing:{digest.hexdigest()}'
         if entry.get('cad_artifact'):
             return GeometryArtifactStore._combined_fingerprint(
                 (entry['cad_artifact'], entry['artifact']))
@@ -2557,10 +2737,21 @@ class GeometryArtifactStore:
         """
         self._save(entries)
 
-    def _save(self, entries: list[dict]) -> None:
+    def _save(self, entries: list[dict], *, removed=None) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        # DP-1211. Every writer of the active list goes through here, and
+        # most of them know nothing of removed entries, so those are carried
+        # over unless the caller says what they are now.
+        if removed is None:
+            removed = self.removed_entries()
+        active = {entry.get('geometry_id') for entry in entries}
+        removed = [entry for entry in removed
+                   if entry.get('geometry_id') not in active]
+        document = {'schema_version': 1, 'geometries': entries}
+        if removed:
+            document['removed'] = removed
         temporary = self.manifest_path.with_suffix('.tmp')
         temporary.write_text(
-            json.dumps({'schema_version': 1, 'geometries': entries},
-                       indent=2, sort_keys=True) + '\n', encoding='utf-8')
+            json.dumps(document, indent=2, sort_keys=True) + '\n',
+            encoding='utf-8')
         os.replace(temporary, self.manifest_path)

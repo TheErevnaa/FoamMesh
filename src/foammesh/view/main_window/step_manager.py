@@ -2295,9 +2295,11 @@ class StepManager(QObject):
         manager, and a seed off the geometry grew the written block.
         """
         manager = app.window.geometryManager
-        bounds = getattr(manager, 'getSurfaceBounds',
-                         manager.getBounds)().toTuple()
-        values = [float(value) for value in bounds]
+        bounds = getattr(manager, 'getSurfaceBounds', manager.getBounds)()
+        # DP-1214. No surfaces answer None, and `.toTuple()` on it raised
+        # AttributeError before the refusal below could say what is wrong.
+        values = ([] if bounds is None
+                  else [float(value) for value in bounds.toTuple()])
         if (len(values) != 6
                 or any(math.isnan(v) or math.isinf(v) for v in values)
                 or any(values[i + 1] <= values[i] for i in (0, 2, 4))):
@@ -2398,8 +2400,15 @@ class StepManager(QObject):
         return (humanise_option(engine_id) if str(engine_id)
                 else self.tr('The meshing engine'))
 
-    async def _finishPipeline(self, engine_id: str) -> None:
+    async def _finishPipeline(self, engine_id: str,
+                              resume: bool = False) -> None:
         """Run this case's whole mesh and report it, whichever engine it is.
+
+        DP-1262. *resume* runs it with ``{'resume': True}``: the facade starts
+        after the last stage a stopped or failed run kept (DP-1234/DP-1236),
+        through this same path, so a resumed run is reported, drawn and
+        cancelled like any other. The report of a stopped or failed run
+        offers it when the run's own payload says a resume is available.
 
         Plan 30 F-03. There were two of these, one per engine, and they
         differed in three things: the operation they submitted, the name in
@@ -2423,6 +2432,7 @@ class StepManager(QObject):
         self.batchStarted.emit()
         console = app.consoleView
         unsubscribe = None
+        resumeChosen = False
         try:
             if self._needsGeneratedDictionaries(engine_id):
                 await self._generateDictionaries()
@@ -2436,11 +2446,14 @@ class StepManager(QObject):
             # at all, and the only record of the split was the processor
             # directories the run left on disk.
             await self._announceRunPlan()
+            parameters = {
+                'timeout_seconds':
+                    app.settings.getOpenFoamRuntime()['stage_timeout'],
+            }
+            if resume:
+                parameters['resume'] = True
             result = await app.facadeClient.run(
-                'workflow.run_pipeline', {
-                    'timeout_seconds':
-                        app.settings.getOpenFoamRuntime()['stage_timeout'],
-                })
+                'workflow.run_pipeline', parameters)
             payload = getattr(result, 'payload', {}) or {}
             self._showPipelineVerdict(payload)
             # R210. A run that built a mesh and then failed it on quality is
@@ -2494,15 +2507,21 @@ class StepManager(QObject):
                     self._contentStack, self.tr('Process completed'),
                     self.tr('The %s pipeline completed.') % name)
             elif cancelled:
-                await self._reportPipelineCancelled(name, payload, handle)
+                resumeChosen = await self._reportPipelineCancelled(
+                    name, payload, handle)
             else:
-                await self._reportPipelineFailure(
+                resumeChosen = await self._reportPipelineFailure(
                     name, str(payload.get('reason') or ''), built=built,
                     log=str(payload.get('log') or ''),
-                    details=str(payload.get('details') or ''))
+                    details=str(payload.get('details') or ''),
+                    resume=payload.get('resume'))
         except Exception as error:
-            await self._reportPipelineFailure(
-                self._engineDisplayName(engine_id), str(error))
+            if resume and self._resumeUnavailable(error):
+                await self._reportResumeUnavailable(
+                    self._engineDisplayName(engine_id), error)
+            else:
+                await self._reportPipelineFailure(
+                    self._engineDisplayName(engine_id), str(error))
         finally:
             if unsubscribe is not None:
                 unsubscribe()
@@ -2510,6 +2529,90 @@ class StepManager(QObject):
             self._updateControlButtons(self._navigation.currentStep())
             self.batchStopped.emit()
             self._refreshBranch()
+        if resumeChosen is True:
+            # After the finally: the stopped run's state is fully settled
+            # (buttons, strip, branch) before the resumed one starts.
+            await self._finishPipeline(engine_id, resume=True)
+
+    # -- DP-1262: resume a stopped or failed Run to end -------------------- #
+
+    #: What each kept stage is called on screen (the workflow's own names).
+    RESUME_STAGE_NAMES = {
+        'blockMesh': 'Base grid', 'castellation': 'Castellation',
+        'snap': 'Snap', 'layers': 'Boundary layers',
+        'checkMesh': 'the mesh check',
+    }
+
+    @classmethod
+    def _resumeStageName(cls, stage) -> str:
+        return cls.RESUME_STAGE_NAMES.get(str(stage or ''), str(stage or ''))
+
+    @classmethod
+    def _resumeOffer(cls, resume) -> dict | None:
+        """``{'label', 'kept'}`` when the run's payload says it can resume."""
+        if not isinstance(resume, dict) or not resume.get('available'):
+            return None
+        kept = [cls._resumeStageName(item.get('stage'))
+                for item in resume.get('kept') or ()
+                if isinstance(item, dict) and item.get('stage')]
+        start = resume.get('next_stage') or resume.get('from_stage')
+        return {'label': 'Resume from {0}'.format(cls._resumeStageName(start)),
+                'kept': kept}
+
+    def _resumeSentence(self, offer: dict) -> str:
+        kept = offer.get('kept') or ()
+        if not kept:
+            return ''
+        return self.tr('Kept from this run: {0}. {1} starts after them '
+                       'without meshing them again.').format(
+            ', '.join(kept), offer['label'])
+
+    async def _askResume(self, kind: str, headline: str, detail: str,
+                         offer: dict, **extra) -> bool:
+        """Show the report with a "Resume from <stage>" button; True if
+        it was pressed. Retry is the button's role, relabelled."""
+        buttons = (QMessageBox.StandardButton.Retry
+                   | QMessageBox.StandardButton.Close)
+        box = AsyncMessageBox()
+        future = getattr(box, kind)(
+            self._contentStack, headline, detail, buttons=buttons,
+            defaultButton=QMessageBox.StandardButton.Retry, **extra)
+        shown = getattr(box, '_mbox', None)
+        if shown is not None:
+            button = shown.button(QMessageBox.StandardButton.Retry)
+            if button is not None:
+                button.setText(offer['label'])
+                button.setAccessibleName(offer['label'])
+        answer = await future
+        return answer == QMessageBox.StandardButton.Retry
+
+    @staticmethod
+    def _resumeUnavailable(error) -> bool:
+        details = getattr(error, 'details', None) or {}
+        return (isinstance(details, dict)
+                and details.get('error') == 'resume_unavailable') or (
+            'nothing to resume' in str(error).lower())
+
+    async def _reportResumeUnavailable(self, engine: str, error) -> None:
+        """The kept stages went stale between the offer and the press.
+
+        Not a failure of the mesh: nothing ran, nothing changed. Said as
+        such, with the reason the facade gave, and Run to end is the way on.
+        """
+        details = getattr(error, 'details', None) or {}
+        why = str(((details.get('resume') or {}) if isinstance(details, dict)
+                   else {}).get('reason') or '')
+        headline = self.tr('{0} run cannot resume').format(engine)
+        detail = self.tr('Nothing was meshed: the stages kept by the stopped '
+                         'run can no longer be resumed{0}. Run to end meshes '
+                         'from the start.').format(
+            ' ({0})'.format(why) if why else '')
+        self._ui.statusbar.showMessage(detail, 10000)
+        console = app.consoleView
+        if console is not None:
+            console.append('{0}: {1}'.format(headline, detail))
+        await AsyncMessageBox().information(
+            self._contentStack, headline, detail)
 
     async def _announceRunPlan(self) -> None:
         """Put the run's own plan on the status strip, with its Cancel.
@@ -2669,7 +2772,7 @@ class StepManager(QObject):
         return bool(payload.get('cancelled'))
 
     async def _reportPipelineCancelled(self, engine: str, payload: dict,
-                                       handle) -> None:
+                                       handle) -> bool:
         """Say the user's own cancel landed, worded as a cancel.
 
         Plan 37 UF20 follow-up, MEASURED live (BUDGETS.md section 3): a
@@ -2692,12 +2795,22 @@ class StepManager(QObject):
             status(self.tr('{0} · cancelled · {1}').format(
                 getattr(handle, 'run_id', '') or engine, detail),
                 log=str(payload.get('log') or ''))
+        # DP-1262. A stopped Run to end keeps its finished stages; say which,
+        # and offer to carry on from them.
+        offer = self._resumeOffer(payload.get('resume'))
+        if offer is not None:
+            kept = self._resumeSentence(offer)
+            return await self._askResume(
+                'information', headline,
+                '{0} {1}'.format(detail, kept) if kept else detail, offer)
         await AsyncMessageBox().information(
             self._contentStack, headline, detail)
+        return False
 
     async def _reportPipelineFailure(self, engine: str, reason: str,
                                      *, built: bool = False, log: str = '',
-                                     details: str = '') -> None:
+                                     details: str = '',
+                                     resume=None) -> bool:
         """Say a run did not finish, where the user is already looking (R204).
 
         MEASURED on tee_gmsh_r2: Compute Mesh refused because no prepared
@@ -2747,8 +2860,18 @@ class StepManager(QObject):
         if callable(status) and getattr(strip, 'state', 'running') in (
                 'running', 'cancelling'):
             status('{0}: {1}'.format(headline, detail), failed=True, log=log)
+        # DP-1262. A failed Run to end keeps the stages that finished before
+        # the failure; offer to resume from them once the cause is fixed.
+        offer = self._resumeOffer(resume)
+        if offer is not None:
+            kept = self._resumeSentence(offer)
+            return await self._askResume(
+                'warning', headline,
+                '{0}\n\n{1}'.format(detail, kept) if kept else detail,
+                offer, **extra)
         await AsyncMessageBox().warning(
             self._contentStack, headline, detail, **extra)
+        return False
 
     @qasync.asyncSlot()
     async def _cancelFinishSteps(self):
@@ -2789,6 +2912,12 @@ class StepManager(QObject):
     def _geometryRemoved(self):
         self._pages[Step.CASTELLATION].unload()
         self._pages[Step.BOUNDARY_LAYER].unload()
+        # DP-1213. Preparation drew the set before the removal, the removed
+        # body still in it; it is redrawn from the store when next shown.
+        forget = getattr(self._pages[Step.GEOMETRY_REPAIR],
+                         'forgetRemovedGeometry', None)
+        if forget is not None:
+            forget()
 
     def _onIntermediateStepCompleted(self):
         if self._navigation.currentStep() < Step.LAST_STEP:

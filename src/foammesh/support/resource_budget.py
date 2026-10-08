@@ -331,9 +331,12 @@ def memory_refusal(what: str, needed: int,
 #: gmsh: MEASURED 2026-10-01 on this machine, a unit box meshed by Gmsh
 #: 4.15.2 in WSL: Delaunay (the default) 2.37 M elements peaked at 1.30 GB
 #: and 5.44 M at 2.82 GB (520-560 bytes an element, 495 at the margin); HXT
-#: 2.07 M at 0.46 GB, 220 an element. snappy: NOT measured
-#: here -- the usual rule of about 1 GB per million cells of snappyHexMesh.
-MESHER_BYTES_PER_CELL = {'gmsh': 600.0, 'snappy': 1000.0}
+#: 2.07 M at 0.46 GB, 220 an element. snappy: MEASURED 2026-10-05 (plan 37
+#: #7) on OpenFOAM 13 in WSL, castellation of a 0.5 x 0.5 x 0.15 m box: a
+#: 751,060-cell background filled at 40 mm peaked at 911 MB maximum RSS
+#: (1,242 bytes a background cell); a 94,987-cell coarse far field refined to
+#: 285,105 cells peaked at 452 MB. Rounded to 1,200 bytes a cell.
+MESHER_BYTES_PER_CELL = {'gmsh': 600.0, 'snappy': 1200.0}
 #: What a mesher costs before its cells: the process and the geometry.
 MESHER_FIXED_BYTES = 256 * MIB
 

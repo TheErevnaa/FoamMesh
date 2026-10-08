@@ -231,6 +231,8 @@ class GeometryPage(StepPage):
         self._farfieldDialog = None
         self._farfieldMenu = None
         self._farfieldActors = ()
+        #: DP-1183. One line under the tree: how big the whole model is.
+        self._modelSize = None
 
         self._connectSignalsSlots()
 
@@ -269,6 +271,7 @@ class GeometryPage(StepPage):
         self._ensureInterfacePairPanel()
         self._ensureSplitInterfacesButton()
         self._ensureFarfieldButton()
+        self._ensureModelSize()
 
         # Whatever selected the geometry - a viewport pick, the display
         # control, an operation - the tree shows it.
@@ -294,6 +297,60 @@ class GeometryPage(StepPage):
         service.selection_changed.connect(self._mirrorSelection)
 
         self._loaded = True
+
+    def _ensureModelSize(self):
+        """Mount the line that says how big the whole model is (DP-1183)."""
+        if self._modelSize is None:
+            layout = self._widget.layout()
+            if layout is None:
+                return
+            label = QLabel(self._widget)
+            label.setObjectName('geometryModelSize')
+            label.setWordWrap(True)
+            # Under the list's own action row, which DP-511 keeps directly
+            # under the list.
+            index = layout.indexOf(self._ui.geometryList)
+            boundaries = self._boundaries
+            if boundaries is not None and layout.indexOf(boundaries) > -1:
+                index = layout.indexOf(boundaries)
+            layout.insertWidget(index + 1 if index > -1 else layout.count(),
+                                label)
+            self._modelSize = label
+        self._updateModelSize()
+
+    def modelSizeText(self) -> str:
+        """"Model size: 300 × 50 × 50 mm, diagonal 308.2 mm", or ''.
+
+        DP-1183. The page that holds the model never said how big it was:
+        a surface's own X/Y/Z range was two dialogs away, and the extent
+        readout left the viewport toolbar with DP-811. The box is every
+        surface the case holds, read from the actors the viewport draws,
+        so it moves with every import and removal.
+        """
+        from foammesh.core.geometry.measure import format_size
+
+        manager = self._geometryManager or getattr(
+            getattr(app, 'window', None), 'geometryManager', None)
+        surfaces = getattr(manager, 'getSurfaceBounds', None)
+        try:
+            extent = surfaces() if surfaces is not None else None
+            size = format_size(extent.toTuple()) if extent is not None else ''
+        except Exception:                                    # noqa: BLE001
+            size = ''
+        return self.tr('Model size: {0}').format(size) if size else ''
+
+    def _updateModelSize(self):
+        if self._modelSize is None:
+            return
+        text = self.modelSizeText()
+        self._modelSize.setText(text)
+        self._modelSize.setVisible(bool(text))
+
+    def _updateNextStepAvailable(self):
+        # Every import, removal and reload of the tree passes through here,
+        # which is every change to what the model is.
+        super()._updateNextStepAvailable()
+        self._updateModelSize()
 
     def _selectedGeometryIds(self):
         """The geometry rows the tree has selected, in the order they read.

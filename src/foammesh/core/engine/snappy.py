@@ -885,6 +885,65 @@ class SnappyMeshingEngine:
     def collect_quality(self, case_path):
         return MeshCheckService.load_report(case_path)
 
+    #: Plan 37 #2(b). Where the unrefined-surfaces note is shown: the page
+    #: that owns the refinement groups, so the fix is on the page that says it.
+    UNREFINED_SURFACES_TASK = 'snappy.castellation'
+
+    def derivation_warnings(self, db, *, bbox=None) -> dict:
+        """Say which surfaces are written unrefined, at feature level 0.
+
+        Plan 37 #2(b). MEASURED: a new case writes every surface at level
+        (0 0) and its feature edges at ``level 0``. That is deliberate -- a
+        surface with no refinement group asks for no refinement, and level 0
+        still hands snappyHexMesh the edges to snap to -- but nothing said
+        so, and ``level 0`` in the dictionary reads like a lost setting. The
+        note names the surfaces and what adding a group changes. It is a
+        note on the page, never a refusal, and a status it does not change.
+        """
+        try:
+            groups = {str(key) for key in
+                      dict(db.getElements('castellation/refinementSurfaces'))}
+            surfaces = [row for row in
+                        dict(db.getElements('geometry')).values()
+                        if _row_value(row, 'gType') == 'surface']
+        except Exception:                                   # noqa: BLE001
+            return {}
+        if bbox is None and not surfaces:
+            return {}
+
+        def consequence(one: bool) -> str:
+            its, them = ('its', 'it') if one else ('their', 'them')
+            return (
+                f'{its} surface level is (0 0) and {its} feature edges are '
+                'written at level 0: snappyHexMesh snaps to those edges but '
+                f'does not refine at them. Add a refinement group to refine '
+                f"{them} (a new group's feature level is 1).")
+
+        if not groups:
+            return {self.UNREFINED_SURFACES_TASK: [
+                'No surface refinement group exists yet, so the surfaces are '
+                'not refined; ' + consequence(False)]}
+        bare = sorted({str(_row_value(row, 'name') or '?') for row in surfaces
+                       if str(_row_value(row, 'castellationGroup') or '')
+                       not in groups})
+        if not bare:
+            return {}
+        shown = ', '.join(bare[:6]) + (
+            f' and {len(bare) - 6} more' if len(bare) > 6 else '')
+        return {self.UNREFINED_SURFACES_TASK: [
+            f'{shown} {"has" if len(bare) == 1 else "have"} no surface '
+            f'refinement group, so {"it is" if len(bare) == 1 else "they are"}'
+            ' not refined; ' + consequence(len(bare) == 1)]}
+
+
+def _row_value(row, name):
+    """One field of a configuration row, or ``None``."""
+    try:
+        value = row.value(name)
+    except Exception:                                       # noqa: BLE001
+        return None
+    return getattr(value, 'value', value)
+
 
 def _db_value(db):
     """Read a configuration key tolerantly, the way the facade always has."""

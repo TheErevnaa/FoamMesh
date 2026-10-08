@@ -231,6 +231,196 @@ def box_cuts_geometry(box, geometry_bounds) -> bool:
                for axis in range(3))
 
 
+# -- Plan 37 #1 / #2: where the regions are placed -------------------------- #
+
+#: The six faces of the domain box, in bounds order.
+BOX_SIDES = ('xMin', 'xMax', 'yMin', 'yMax', 'zMin', 'zMax')
+#: How many base cells of clear space the suggested standoff aims for.
+STANDOFF_CELLS = 4
+#: The smallest standoff (a fraction of the largest span) ever suggested.
+MIN_SUGGESTED_STANDOFF = 0.1
+
+FLUSH_BOX = 'flush_box'
+BOTH_SIDES = 'both_sides'
+EXTERNAL_DUCT = 'external_duct'
+
+
+def flush_sides(box, geometry_bounds, base_cell=None) -> list[str]:
+    """The box faces that sit on the geometry, or within one base cell of it.
+
+    Plan 37 #1. MEASURED: an external case on a box flush with the geometry
+    (standoff 0) meshed 4.44 % less surface than the geometry has, left 168
+    points off it and 24 bad cells, because the outside fluid touches the
+    box walls there. A face the geometry reaches past is not listed here:
+    that is ``box_cuts_geometry``'s, a different fault.
+    """
+    if box is None or geometry_bounds is None:
+        return []
+    try:
+        spans = [float(box[2 * axis + 1]) - float(box[2 * axis])
+                 for axis in range(3)]
+        tiny = 1e-6 * max(spans + [0.0])
+        cell = float(base_cell) if base_cell is not None else 0.0
+    except (TypeError, ValueError, IndexError):
+        return []
+    if not math.isfinite(cell) or cell < 0:
+        cell = 0.0
+    sides = []
+    for index, name in enumerate(BOX_SIDES):
+        if index % 2 == 0:
+            gap = float(geometry_bounds[index]) - float(box[index])
+        else:
+            gap = float(box[index]) - float(geometry_bounds[index])
+        if gap < -tiny:
+            continue
+        if gap <= tiny or gap < cell:
+            sides.append(name)
+    return sides
+
+
+def suggested_standoff(geometry_bounds, base_cell=None) -> float:
+    """A Base grid standoff that clears the geometry by a few base cells.
+
+    A fraction of the geometry's largest span (what the Base grid page
+    takes), never under ``MIN_SUGGESTED_STANDOFF``, rounded up to 0.05.
+    """
+    try:
+        span = max(float(geometry_bounds[2 * axis + 1])
+                   - float(geometry_bounds[2 * axis]) for axis in range(3))
+    except (TypeError, ValueError, IndexError):
+        return MIN_SUGGESTED_STANDOFF
+    wanted = MIN_SUGGESTED_STANDOFF
+    if span > 0 and base_cell and math.isfinite(float(base_cell)):
+        wanted = max(wanted, STANDOFF_CELLS * float(base_cell) / span)
+    return math.ceil(round(wanted / 0.05, 6)) * 0.05
+
+
+def flush_box_message(sides, standoff) -> str:
+    """The flush-box warning, naming the faces and the stray patches."""
+    named = ', '.join(sides)
+    return (
+        f'The domain box is flush with the geometry on {named} (within one '
+        'base cell), and the outside of the geometry is to be meshed. There '
+        'the outside fluid touches the box walls: snappy meshes only a sliver '
+        'or patches of it, leaves part of the surface unreached, and the box '
+        f'faces it touches stay in the mesh as stray patches ({named}). Add '
+        'standoff: raise Standoff on the Base grid page (try '
+        f'{standoff:.2f}), or pick a bounding Hex6 that stands off the '
+        'geometry.')
+
+
+def enclosing_surface(space, closed_surfaces, h=0.0):
+    """The smallest closed surface whose box holds *space*, or ``None``.
+
+    *closed_surfaces* is ``[{'name', 'bbox', ...}]``. An enclosed space is
+    the inside of the tightest closed surface around it; the voxel bounds
+    are allowed a voxel or two past the surface's own box.
+    """
+    bounds = getattr(space, 'bounds', None)
+    if bounds is None:
+        return None
+    slack = 2.0 * float(h or 0.0)
+    best = None
+    for surface in closed_surfaces:
+        bbox = surface.get('bbox')
+        if not bbox:
+            continue
+        if all(bounds[2 * axis] >= bbox[2 * axis] - slack
+               and bounds[2 * axis + 1] <= bbox[2 * axis + 1] + slack
+               for axis in range(3)):
+            size = _box_volume(bbox)
+            if best is None or size < best[0]:
+                best = (size, surface)
+    return None if best is None else best[1]
+
+
+def placement_warnings(field, seeds, *, box=None, geometry_bounds=None,
+                       base_cell=None, closed_surfaces=(),
+                       farfield=False, external=False) -> list[dict]:
+    """What the region seeds will mesh that the user may not expect.
+
+    Plan 37 #1 and #2. *seeds* is ``[(label, type, point), ...]`` and each
+    warning is ``{'code', 'message', ...}``:
+
+    * ``flush_box``: a seed is in the outside space and the box sits on the
+      geometry -- the outside is cut into slivers and stray patches;
+    * ``both_sides``: a seed is outside and a fluid seed is inside closed
+      surface *S*, so both the inside and the outside of *S* are meshed. A
+      Solid seed inside a body with the fluid around it is the ordinary
+      conjugate case and is not warned about;
+    * ``external_duct``: a seed is outside, and closed surface *S* has inlet
+      or outlet faces (a duct or a container) with no seed inside: its
+      outside shell is meshed, not its inside.
+
+    *external* says the outside is asked for even when no seed is in it
+    yet -- a detection with External ticked -- so a box flush all round,
+    which leaves no outside space at all, is still warned about.
+
+    Warnings, never refusals: each can be what the user meant.
+    """
+    if field is None:
+        return []
+    h = float(getattr(field, 'h', 0.0) or 0.0)
+    outside, inside = [], {}
+    for label, kind, point in seeds:
+        try:
+            found = field.space_at(tuple(float(value) for value in point))
+        except Exception:  # noqa: BLE001 - an unreadable seed is no space
+            found = None
+        if found is None or int(found.label) == 0:
+            continue
+        space = field.space(int(found.label))
+        if space is None:
+            continue
+        if space.outside:
+            outside.append(str(label))
+            continue
+        surface = enclosing_surface(space, closed_surfaces, h)
+        if surface is not None:
+            inside.setdefault(str(surface['name']), []).append(
+                (str(label), str(kind).lower()))
+    if not outside and not external:
+        return []
+    warnings = []
+    sides = [] if farfield else flush_sides(box, geometry_bounds, base_cell)
+    if sides:
+        standoff = suggested_standoff(geometry_bounds, base_cell)
+        warnings.append({'code': FLUSH_BOX, 'sides': sides,
+                         'standoff': standoff, 'regions': outside,
+                         'message': flush_box_message(sides, standoff)})
+    if not outside:
+        return warnings
+    outer = ', '.join(outside)
+    for name, members in sorted(inside.items()):
+        fluids = [label for label, kind in members if kind != 'solid']
+        if not fluids:
+            continue
+        warnings.append({
+            'code': BOTH_SIDES, 'surface': name,
+            'inside': fluids, 'outside': list(outside),
+            'message': (
+                f'Both the inside and outside of {name} will be meshed: '
+                f'{", ".join(fluids)} is inside it and {outer} is outside '
+                'it. If only one side is the fluid, remove the other seed '
+                '(or untick External).')})
+    for surface in closed_surfaces:
+        name = str(surface.get('name'))
+        openings = list(surface.get('openings') or ())
+        if not openings or name in inside:
+            continue
+        warnings.append({
+            'code': EXTERNAL_DUCT, 'surface': name, 'openings': openings,
+            'outside': list(outside),
+            'message': (
+                f'{name} has inlet or outlet faces ({", ".join(openings)}), '
+                'so it looks like a duct or a container, but the flow is '
+                f'set as external ({outer} is outside every closed surface). '
+                f'The outside shell of {name} will be meshed, not its '
+                'inside. If the fluid is inside it, untick External and put '
+                'the seed inside.')})
+    return warnings
+
+
 # -- the proposal ----------------------------------------------------------- #
 
 def too_thin(space, cell) -> bool:

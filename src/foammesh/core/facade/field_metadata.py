@@ -672,17 +672,29 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # counts), and both sets stayed live whichever sizing mode was chosen.
     'meshing.base_grid.cells.x': {
         'title': 'Cells X',
-        'documentation': 'Number of background mesh cells along X.',
+        'documentation': (
+            'Number of background mesh cells along X, across the block '
+            '(the geometry plus the standoff). Read when Sizing mode is '
+            'counts only; with target_size the count follows from the '
+            'target.'),
         'applies_when': ('meshing.base_grid.sizing_mode == counts',),
     },
     'meshing.base_grid.cells.y': {
         'title': 'Cells Y',
-        'documentation': 'Number of background mesh cells along Y.',
+        'documentation': (
+            'Number of background mesh cells along Y, across the block '
+            '(the geometry plus the standoff). Read when Sizing mode is '
+            'counts only; with target_size the count follows from the '
+            'target.'),
         'applies_when': ('meshing.base_grid.sizing_mode == counts',),
     },
     'meshing.base_grid.cells.z': {
         'title': 'Cells Z',
-        'documentation': 'Number of background mesh cells along Z.',
+        'documentation': (
+            'Number of background mesh cells along Z, across the block '
+            '(the geometry plus the standoff). Read when Sizing mode is '
+            'counts only; with target_size the count follows from the '
+            'target.'),
         'applies_when': ('meshing.base_grid.sizing_mode == counts',),
     },
     'meshing.base_grid.target_cell_size': {
@@ -690,6 +702,47 @@ FIELD_OVERRIDES: dict[str, dict] = {
         # DP-587 (field audit 0924 shared-and-harness D-SH-08): metres after
         # the import conversion, like the Gmsh target size beside it.
         'unit': 'm',
+        'documentation': (
+            'Edge length of a background cell, in metres. Each axis gets '
+            'span / size cells, rounded up, so the cells are this size or '
+            'just under. Auto (empty) uses the block diagonal / 40. Read when '
+            'Sizing mode is target_size only.'),
+    },
+    # Plan 37 #9. The fields below reached the user with no unit and no
+    # words in describe_fields.
+    'meshing.base_grid.sizing_mode': {
+        'documentation': (
+            'How the background block is divided: counts takes the number '
+            'of cells along each axis; target_size takes one edge length '
+            'and derives the counts from it.'),
+    },
+    'meshing.base_grid.standoff': {
+        'unit': 'ratio',
+        'documentation': (
+            'Gap between the geometry and the derived block, as a fraction of '
+            'the largest span of the geometry, added on all six faces: 0.1 on a '
+            'part 2 m long puts each face 0.2 m out. 0 makes the block the '
+            'bounding box of the geometry. Not applied to a bounding Hex6 or to '
+            'blocks written by hand.'),
+    },
+    'meshing.base_grid.scale': {
+        'unit': 'ratio',
+        'documentation': (
+            'Multiplies the vertices you typed by hand: blockMesh builds '
+            'every vertex times Scale, in metres, so vertices typed in '
+            'millimetres take 0.001. Held at 1 for the one block around the '
+            'geometry and for a bounding Hex6 (Plan 37 #9): their vertices '
+            'are already in metres — the geometry is put in metres when it '
+            'is imported — so any other value moved and resized the block '
+            'off the geometry. There a stored value other than 1 is kept so '
+            'old projects open, reported, and not applied.'),
+    },
+    'meshing.base_grid.bounding_hex6': {
+        'documentation': (
+            'A Hex6 volume from the geometry list to use as the background '
+            'block instead of the derived box; its two corners, in metres, '
+            'are the block. Empty derives the block from the geometry and '
+            'the standoff.'),
     },
     # Plan 37 UF12. The ratio is always the largest cell over the smallest,
     # and the side the small cells go on is its own control, so nobody types
@@ -1120,6 +1173,18 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # column that also said cells has gone. The rule the whole registry is
     # now held to is that a control names its quantity once: either the
     # label carries the noun or the column does, and never both.
+    # DP-1264. Users looked for a curvature refinement setting and found
+    # none; OpenFOAM v13's snappyHexMesh has no separate one, and this is
+    # the control that does that job.
+    'meshing.castellation.resolve_feature_angle': {
+        'documentation': (
+            'Cells whose surface intersections differ in normal by more than '
+            'this angle are refined up to the surface maximum level. OpenFOAM '
+            'v13 has no separate curvature refinement: curvature-driven '
+            'refinement is controlled by resolveFeatureAngle together with '
+            'the surface min/max levels. A smaller angle refines more of a '
+            'curved surface.'),
+    },
     'meshing.castellation.max_global_cells': {
         'documentation': 'Hard ceiling on total cell count across all processors.',
     },

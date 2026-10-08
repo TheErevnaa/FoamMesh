@@ -241,6 +241,8 @@ class RegionDetectionPanel(QFrame):
         self._client = client
         self._existingNames = set(existing_names)
         self._existingCount = int(existing_count)
+        # Plan 37 #1(b): Accept all replaces the regions already defined.
+        self._keepExisting = False
         self._jobId = None
         #: RP13 #7: the request in flight and the case it was asked of; an
         #: answer for any other is late and dropped.
@@ -738,11 +740,11 @@ class RegionDetectionPanel(QFrame):
         are; colours follow the order the regions will be written in, after
         the case's existing regions (RP8's numeric order).
         """
-        taken = set(self._existingNames)
+        taken = set(self._existingNames) if self.keepsExisting() else set()
         for _index, _space, item, ticked in self._rows():
             if ticked and id(item) in self._edited:
                 taken.add(item.text().strip())
-        slot = self._existingCount
+        slot = self._existingSlot()
         self._filling = True
         try:
             for _index, space, item, ticked in self._rows():
@@ -807,9 +809,17 @@ class RegionDetectionPanel(QFrame):
             text = (self.tr('Found %s. Tick the ones to keep, rename them if '
                             'you like, then Accept all.')
                     % (_spaces(count)))
+        # Plan 37 #1 / #2: External on a box flush with the geometry, on both
+        # sides of one closed surface, or around a duct -- said before Accept.
+        placement = [str(one.get('message'))
+                     for one in payload.get('placement_warnings') or ()
+                     if isinstance(one, dict) and one.get('message')]
+        if placement:
+            text = '\n\n'.join([text] + [self.tr('Warning: %s') % line
+                                         for line in placement])
         self._message.setText(text)
-        set_status(self._message, 'warning' if mismatch and
-                   reason != 'more_spaces' else None)
+        set_status(self._message, 'warning' if (mismatch and
+                   reason != 'more_spaces') or placement else None)
         for button in (self._use, self._useExternal, self._treatExternal,
                        self._openEdges):
             button.hide()
@@ -996,13 +1006,39 @@ class RegionDetectionPanel(QFrame):
                                       first['name']))
         return True
 
+    def setKeepsExisting(self, keep: bool) -> None:
+        """Add the rows beside the regions already defined, not over them."""
+        self._keepExisting = bool(keep)
+        self._renumber()
+
+    def keepsExisting(self) -> bool:
+        """True when Accept all adds to the regions already defined."""
+        return self._existingCount > 0 and self._keepExisting
+
+    def replacesExisting(self) -> bool:
+        """True when Accept all replaces regions the case already has."""
+        return self._existingCount > 0 and not self._keepExisting
+
+    def _existingSlot(self) -> int:
+        """The colour slot the first written row takes."""
+        return self._existingCount if self.keepsExisting() else 0
+
     def acceptAll(self) -> None:
-        """Write the ticked rows in one `apply`: one Undo takes them back."""
+        """Write the ticked rows in one `apply`: one Undo takes them back.
+
+        Plan 37 #1(b): the rows replace the regions already defined (of the
+        types written) -- detecting again is asking again; one Ctrl+Z brings
+        the old ones back, and Add in the regions table still adds by hand. Before, detecting
+        a second time added beside the first answer, so the stale seeds
+        stayed -- or the new ones were refused as holding a taken space.
+        """
         regions = self.ticked()
         if not regions:
             return
         self._accept.setEnabled(False)
         parameters = {'regions': regions}
+        if not self.keepsExisting():
+            parameters['replace'] = True
         detection = (self._payload or {}).get('detection_id')
         if detection and (self._payload or {}).get('source') != 'solids':
             # RP13 #3: the rows came from this detection; the facade refuses
@@ -1029,7 +1065,7 @@ class RegionDetectionPanel(QFrame):
         if self._stack.currentIndex() != self.REVIEW or not self._payload:
             return []
         listed = []
-        slot = self._existingCount
+        slot = self._existingSlot()
         for _index, space, item, ticked in self._rows():
             if space is None:
                 continue

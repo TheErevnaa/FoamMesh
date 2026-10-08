@@ -301,8 +301,12 @@ class AppSettings:
     def updateOpenFoamRuntime(self, *, profile_id: str, wsl_distro: str,
                               wsl_user: str, bashrc: str,
                               stage_timeout: int = 3600):
-        if int(stage_timeout) <= 0:
-            raise ValueError('OpenFOAM stage timeout must be positive')
+        # Plan 37 #7. 0 is "no limit": a far field of millions of cells can
+        # castellate for longer than any fixed limit, and the product never
+        # refuses on size -- so the user may take the limit away.
+        if int(stage_timeout) < 0:
+            raise ValueError(
+                'OpenFOAM stage timeout must be positive, or 0 for no limit')
         self._settings.update({
             SettingKey.OPENFOAM_PROFILE_ID.value: str(profile_id),
             SettingKey.OPENFOAM_WSL_DISTRO.value: str(wsl_distro),

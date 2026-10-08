@@ -104,7 +104,9 @@ CONTROLS = _register(
              'a fraction of its largest span, before the vertices are '
              'written; ignored while a bounding hex6 is chosen'),
     SnappyControl('baseGrid/scale', WRITER, BLOCK, 'scale',
-                  note='factor from the vertex unit to metres'),
+                  note='held at 1 (Plan 37 #9): the vertices are already in '
+                       'metres, so any other stored value is reported and '
+                       'not applied'),
     SnappyControl('baseGrid/grading/x', WRITER, BLOCK_BLOCKS, 'simpleGrading'),
     SnappyControl('baseGrid/grading/y', WRITER, BLOCK_BLOCKS, 'simpleGrading'),
     SnappyControl('baseGrid/grading/z', WRITER, BLOCK_BLOCKS, 'simpleGrading'),

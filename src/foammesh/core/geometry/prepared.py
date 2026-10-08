@@ -561,6 +561,15 @@ class PreparedGeometryStore:
         records = []
         used_names = set()
         for entry in _ordered_sources(entries):
+            # DP-1212. A stored file that has gone is refused by name here;
+            # it used to escape as a bare FileNotFoundError from the hash.
+            missing = GeometryArtifactStore.missing_artifacts(entry)
+            if missing:
+                raise PreparedGeometryError(
+                    'the stored copy of {} is missing ({}); remove it and '
+                    'import the file again'.format(
+                        entry.get('name') or entry['geometry_id'],
+                        ', '.join(missing)))
             surface = Path(entry['artifact']).resolve()
             # A wrapped or feature-split CAD entry keeps its `cad_artifact`
             # as provenance, but the surface beside it is what it now means.

@@ -15,7 +15,6 @@ from widgets.async_message_box import AsyncMessageBox
 from widgets.multi_selector_dialog import MultiSelectorDialog, SelectorItem
 
 from foammesh.app import app
-from foammesh.core.quantities import format_group
 from foammesh.db.configurations_schema import (
     GeometryType, GapRefinementMode, RefinementRegionMode)
 from foammesh.view.theming.metrics import (
@@ -445,15 +444,23 @@ class VolumeRefinementDialog(QDialog):
         self._updateCellSize()
 
     def _updateCellSize(self):
-        d = 2 ** int(self._ui.volumeRefinementLevel.text())
+        from foammesh.view.snappy_workflow.level_cell_size import cell_text
+
         # DP-179. This said the same thing as the surface editor and said
         # it differently: `{:g}` is six significant figures per component
         # where that one had settled on four, so one cell size read two
         # ways depending on which editor was open. Both now go through the
         # house helper, which also supplies the unit neither of them had.
+        # DP-1251. The shared helper, as the surface editor and the guided
+        # row editor use it; still `format_group` underneath.
+        text = cell_text((self._xCellSize, self._yCellSize, self._zCellSize),
+                         self._ui.volumeRefinementLevel.text())
+        if not text:
+            self._ui.cellSize.setText(self.tr(
+                'cell size available once the base grid is set'))
+            return
         self._ui.cellSize.setText(self.tr('cell size <b>({0})</b>').format(
-            format_group((self._xCellSize / d, self._yCellSize / d,
-                          self._zCellSize / d))))
+            text))
 
     def _selectVolumes(self):
         self._dialog = MultiSelectorDialog(

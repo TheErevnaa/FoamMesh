@@ -81,6 +81,29 @@ class DictionaryManifest:
         }
 
 
+def _stl_solid_blocks(path) -> dict:
+    """``{solid name: [block bytes, ...]}`` of an ASCII STL (Plan 37 #2(a))."""
+    blocks: dict = {}
+    name = None
+    current: list = []
+    with Path(path).open('rb') as stream:
+        for raw in stream:
+            line = raw.strip()
+            lowered = line.lower()
+            if name is None and (lowered[:6] == b'solid ' or lowered == b'solid'):
+                name = line[5:].strip().decode('utf-8', 'replace')
+                current = [raw if raw.endswith(b'\n') else raw + b'\n']
+                continue
+            if name is None:
+                continue
+            current.append(raw if raw.endswith(b'\n') else raw + b'\n')
+            if lowered.startswith(b'endsolid'):
+                blocks.setdefault(name, []).append(b''.join(current))
+                name = None
+                current = []
+    return blocks
+
+
 def group_manifest_path(case_dir) -> Path:
     """The generated case's own group manifest.
 
@@ -323,6 +346,9 @@ class CaseBuilder:
             options = self._surface_feature_option_fingerprint()
             if options:
                 payloads[stage]['options'] = options
+            pieces = self._feature_piece_fingerprint()
+            if pieces:
+                payloads[stage]['feature_pieces'] = pieces
         if stage in ('blockMesh', 'castellation', 'snappyHexMesh'):
             # Plan 37 UF14. The farfield's shape, dimensions, transform and
             # role, and the geometry extent an auto centre follows -- the
@@ -523,6 +549,67 @@ class CaseBuilder:
         background cells, and the cell depends on the block, so the block is
         found by a few fixed-point steps. Never raises: a farfield that cannot
         be built leaves the block alone, and the dictionary writer says why.
+
+        Plan 37 #7. With a typed target cell size the far field is meshed
+        coarser than the target (`farfield_plan`), and the block returned is
+        that coarse block, snapped to whole coarse cells.
+        """
+        plan = self.farfield_plan(base)
+        return None if plan is None else plan['block']
+
+    #: Plan 37 #7. The box refined back to the target around the bodies
+    #: reaches this fraction of the geometry's largest span past it ...
+    NEAR_BODY_MARGIN = 0.25
+    #: ... and is written to ``geometry{}`` under this key.
+    NEAR_BODY_KEY = 'farfield_near_bodies'
+    #: The far field keeps at least this many coarse cells across its
+    #: smallest span (twice the farfield's own "too coarse" line).
+    FARFIELD_MIN_COARSE_ACROSS = 16
+    _MAX_FARFIELD_LEVEL = 10
+
+    def _typed_target(self) -> float | None:
+        """The target cell size the user typed, or ``None`` (Auto or counts)."""
+        mode = self._enum_value(self._v('baseGrid/sizingMode', 'counts'))
+        if mode != 'target_size':
+            return None
+        stored = self._v('baseGrid/targetCellSize')
+        if stored is None or str(stored).strip() == '':
+            return None
+        try:
+            target = float(stored)
+        except (TypeError, ValueError):
+            return None
+        return target if math.isfinite(target) and target > 0 else None
+
+    def _uniform_grading(self) -> bool:
+        try:
+            return all(
+                float(self._v(f'baseGrid/grading/{axis}', 1) or 1) == 1.0
+                for axis in 'xyz')
+        except (TypeError, ValueError):
+            return False
+
+    def farfield_plan(self, base) -> dict | None:
+        """How the block holding the farfield is meshed, or ``None``.
+
+        Plan 37 #7. MEASURED: a 0.5 x 0.5 x 0.15 m quadcopter in the default
+        farfield (two diagonals of padding) at a typed 20 mm target wrote a
+        3.7 m block filled at 20 mm -- 5.9 M background cells -- and
+        castellation ran for over 50 minutes before failing. The far field
+        needs no target-size cells, so the block is meshed at ``2^k`` times
+        the target, the smallest ``k`` whose block holds no more cells than
+        the box around the bodies does at the target, and a ``searchableBox``
+        refinement region (``inside``, level ``k``) brings the cells around
+        the bodies back to exactly the target. Every refinement level the
+        user set is raised by ``k`` in the dictionary, so each physical size
+        on the bodies is unchanged.
+
+        Only a typed target with uniform grading is coarsened: Auto already
+        scales with the block, and counts are the user's own. Keys: ``block``
+        (builder order), ``level`` (``k``), ``cell`` (the block's cell edge),
+        ``target``, ``near`` (the box), ``block_cells``, ``near_cells`` (the
+        box at the target) and ``uniform_cells`` (the block filled at the
+        target -- what was written before).
         """
         if base is None:
             return None
@@ -544,7 +631,194 @@ class CaseBuilder:
                    for a, b in zip(grown, block)):
                 break
             block = grown
-        return tuple(float(f'{value:.12g}') for value in block)
+        block = tuple(float(f'{value:.12g}') for value in block)
+        plan = {'block': block, 'level': 0,
+                'cell': self._farfield_cell(block), 'target': None,
+                'near': None, 'block_cells': None, 'near_cells': None,
+                'uniform_cells': None}
+        target = self._typed_target()
+        if target is not None and self._uniform_grading():
+            plan.update(self._coarsened(base, block, farfield, target))
+        return plan
+
+    @staticmethod
+    def _cells_at(bounds, cell) -> int:
+        total = 1
+        for axis in range(3):
+            span = float(bounds[2 * axis + 1]) - float(bounds[2 * axis])
+            total *= max(1, math.ceil(span / cell - 1e-9))
+        return total
+
+    def _coarsened(self, base, block, farfield, target) -> dict:
+        from foammesh.core.mesh import snappy_farfield
+
+        reach = self.NEAR_BODY_MARGIN * max(
+            base[2 * axis + 1] - base[2 * axis] for axis in range(3))
+        near = tuple(float(f'{value:.12g}') for axis in range(3)
+                     for value in (
+                         max(block[2 * axis], base[2 * axis] - reach),
+                         min(block[2 * axis + 1], base[2 * axis + 1] + reach)))
+        near_cells = self._cells_at(near, target)
+        uniform_cells = self._cells_at(block, target)
+
+        def snapped(level):
+            cell = target * 2 ** level
+            raw = snappy_farfield.enclosing_bounds(
+                base, farfield.primitive, cell)
+            result = []
+            for axis in range(3):
+                low, high = raw[2 * axis], raw[2 * axis + 1]
+                count = max(1, math.ceil((high - low) / cell - 1e-9))
+                pad = (count * cell - (high - low)) / 2.0
+                result.extend((low - pad, low - pad + count * cell))
+            return tuple(float(f'{value:.12g}') for value in result), cell
+
+        chosen = 0
+        for level in range(1, self._MAX_FARFIELD_LEVEL + 1):
+            if (snappy_farfield.cells_across(
+                    farfield.primitive, target * 2 ** level)
+                    < self.FARFIELD_MIN_COARSE_ACROSS):
+                break
+            chosen = level
+            coarse_block, cell = snapped(level)
+            if self._cells_at(coarse_block, cell) <= near_cells:
+                break
+        if chosen == 0:
+            return {'target': target, 'near': near, 'near_cells': near_cells,
+                    'block_cells': uniform_cells,
+                    'uniform_cells': uniform_cells}
+        coarse_block, cell = snapped(chosen)
+        return {'block': coarse_block, 'level': chosen, 'cell': cell,
+                'target': target, 'near': near,
+                'block_cells': self._cells_at(coarse_block, cell),
+                'near_cells': near_cells, 'uniform_cells': uniform_cells}
+
+    def _authored_background(self):
+        return background_mesh.from_records(
+            lambda name: self._elements(f'baseGrid/{name}'),
+            scale=self.authored_scale())
+
+    def authored_scale(self) -> str:
+        """The ``scale`` hand-written vertices are written with: the user's.
+
+        Plan 37 #9 follow-up. Vertices typed by hand are typed in whatever
+        unit the user chose, and blockMesh's ``scale`` is how OpenFOAM
+        converts them (millimetre vertices with ``scale 0.001`` build a block
+        in metres). So the stored Scale applies here, exactly as typed, and
+        every reader of the authored box (`domain_box`, the drawn box, the
+        launch gate, the cell-size helper) multiplies the vertices by it too.
+        A value that is not a positive number is said once and written as 1.
+        """
+        stored = self._v('baseGrid/scale', None)
+        text = self._number('baseGrid/scale', 1)
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value) or value <= 0:
+            self.warn(
+                'baseGrid.scale.invalid',
+                f'the base-grid Scale {stored} is not a positive number, so '
+                f'the hand-written vertices were written at scale 1.',
+                field_id='meshing.base_grid.scale',
+                requested=str(stored), applied=self.BLOCK_SCALE)
+            return self.BLOCK_SCALE
+        return text
+
+    #: Plan 37 #9. blockMeshDict's ``scale`` is held at this.
+    BLOCK_SCALE = '1'
+
+    def _block_scale(self) -> str:
+        """The ``scale`` a derived or Hex6 background block is written with: 1.
+
+        Plan 37 #9. ``baseGrid/scale`` was written as blockMeshDict's
+        ``scale``, and blockMesh multiplies every vertex by it -- but the
+        vertices are already in metres: the derived block and a bounding
+        Hex6 are taken from the geometry, which the import put in metres
+        (Geometry > Import unit). The surfaces are never scaled. So any
+        other value moved and resized the block off the geometry it meshes.
+        MEASURED (OpenFOAM 13 blockMesh): a part at x = 10..11 with scale 2
+        got a block at x = 20..22; a target cell of 0.1 m became 0.2 m; a
+        0.5 standoff became a 4 m block. A stored value other than 1 -- an
+        old project's -- is read, not applied, and said once. Hand-written
+        vertices are the exception: `authored_scale` applies the user's.
+        """
+        stored = self._v('baseGrid/scale', None)
+        try:
+            requested = (1.0 if stored is None or str(stored).strip() == ''
+                         else float(stored))
+        except (TypeError, ValueError):
+            requested = None
+        if requested != 1.0:
+            self.warn(
+                'baseGrid.scale.held_at_one',
+                f'the base-grid Scale {stored} was not applied: the '
+                f'background block is written in metres around the geometry, '
+                f'which its import unit already put in metres, and a second '
+                f'factor would move and resize the block off it. Re-import '
+                f'the geometry with the right unit instead. Scale applies '
+                f'only to vertices written by hand.',
+                field_id='meshing.base_grid.scale',
+                requested=str(stored), applied=self.BLOCK_SCALE)
+        return self.BLOCK_SCALE
+
+    def _farfield_coarsening(self) -> dict | None:
+        """The farfield plan when the derived block is coarsened, else None."""
+        try:
+            if (self._authored_background() is not None
+                    or self._bounding_hex6_key() is not None):
+                return None
+        except Exception:  # noqa: BLE001 - an authored set the writer refuses
+            return None
+        plan = self.farfield_plan(self._stood_off_bbox())
+        return plan if plan is not None and plan['level'] > 0 else None
+
+    @staticmethod
+    def _coarse_counts(plan) -> tuple[int, int, int]:
+        block, cell = plan['block'], plan['cell']
+        return tuple(max(1, int(round(
+            (block[2 * axis + 1] - block[2 * axis]) / cell)))
+            for axis in range(3))
+
+    def background_plan(self) -> dict:
+        """The background this builder writes, counted. Plan 37 #7.
+
+        ``estimate`` is the cells castellation starts from before any surface
+        or region refinement: the block, with the box around the bodies
+        refined back to the target when the far field is coarsened. Keys as
+        `farfield_plan`, plus ``counts`` (per axis; ``None`` for authored
+        blocks), ``estimate`` and ``source`` (``blocks``, ``hex6``,
+        ``farfield`` or ``geometry``).
+        """
+        empty = {'level': 0, 'near': None, 'target': self._typed_target(),
+                 'near_cells': None}
+        authored = self._authored_background()
+        if authored is not None:
+            cells = sum(block.count(0) * block.count(1) * block.count(2)
+                        for block in authored.blocks)
+            return dict(empty, source='blocks', block=None, counts=None,
+                        cell=None, block_cells=cells, estimate=cells,
+                        uniform_cells=cells)
+        plan = self._farfield_coarsening()
+        if plan is not None:
+            counts = self._coarse_counts(plan)
+            block_cells = counts[0] * counts[1] * counts[2]
+            estimate = block_cells + int(round(
+                plan['near_cells'] * (1.0 - 1.0 / 8 ** plan['level'])))
+            plan.update(source='farfield', counts=counts,
+                        block_cells=block_cells, estimate=estimate)
+            return plan
+        source = 'hex6' if self._bounding_hex6_key() is not None else (
+            'farfield' if self.farfield_plan(self._stood_off_bbox())
+            else 'geometry')
+        b = self._effective_bbox()
+        bounds = self._bbox_tuple(b)
+        counts = tuple(int(value) for value in self._background_cell_counts(b))
+        cells = counts[0] * counts[1] * counts[2]
+        return dict(empty, source=source, block=bounds, counts=counts,
+                    cell=max((bounds[2 * axis + 1] - bounds[2 * axis])
+                             / counts[axis] for axis in range(3)),
+                    block_cells=cells, estimate=cells, uniform_cells=cells)
 
     def _farfield_checks(self, farfield, seeds, excludes) -> None:
         """Refuse what the farfield makes certainly wrong; warn of the rest.
@@ -930,17 +1204,23 @@ class CaseBuilder:
         box this has always written, with the same numbers rendered the same
         way, so its dictionary is byte-identical.
         """
-        scale = self._number('baseGrid/scale', 1)
-        authored = background_mesh.from_records(
-            lambda name: self._elements(f'baseGrid/{name}'), scale=scale)
+        authored = self._authored_background()
         if authored is None:
+            scale = self._block_scale()
             b = self._effective_bbox()
-            nx, ny, nz = self._background_cell_counts(b)
+            # Plan 37 #7. A coarsened far field is written at its coarse
+            # cell; the box around the bodies is refined back to the target.
+            coarse = self._farfield_coarsening()
+            if coarse is not None:
+                nx, ny, nz = self._coarse_counts(coarse)
+            else:
+                nx, ny, nz = self._background_cell_counts(b)
             # The background block used to be written with these three things
             # hard-coded: unit scale, uniform grading, and every face a plain
-            # patch. Each is now a control, and each still defaults to what
-            # was hard-coded, so a project that never opens the page writes
-            # the same file it wrote before.
+            # patch. Grading and the faces are controls, and each still
+            # defaults to what was hard-coded, so a project that never opens
+            # the page writes the same file it wrote before. The scale of
+            # this derived block is 1 again (Plan 37 #9, `_block_scale`).
             # Plan 37 UF12: the ratio is the largest cell over the smallest
             # and the side is chosen beside it. Start (and every ratio of
             # one) writes the ratio exactly as typed, so the default is
@@ -1015,6 +1295,15 @@ class CaseBuilder:
             }
             for item in self.surfaces
         }
+        # Plan 37 #2(a). Solids of one staged surface that want different
+        # feature levels are extracted from their own piece as well, so each
+        # gets an eMesh -- and a level -- of its own (see `_feature_pieces`).
+        for item in self.surfaces:
+            for piece in self._feature_pieces(item):
+                d[piece['name']] = {
+                    'surfaces': [f'"{piece["file"]}"'],
+                    'includedAngle': d[item['name']]['includedAngle'],
+                }
         # C31-08. A span refinement region reads
         # `<surface>.closeness.internalPointCloseness` MUST_READ, and this
         # utility is the only thing that writes it. The names line up because
@@ -1457,6 +1746,21 @@ class CaseBuilder:
         entries = []
         attached = False
         for item in self.surfaces:
+            pieces = self._feature_pieces(item)
+            if pieces:
+                # Plan 37 #2(a): each piece carries its own groups' level.
+                for piece in pieces:
+                    entry = {'file': f'"{piece["name"]}.eMesh"'}
+                    kind, value = piece['spec']
+                    if kind == 'levels':
+                        attached = True
+                        entry['levels'] = [[distance, level]
+                                           for distance, level in value]
+                    else:
+                        entry['level'] = value
+                    entries.append(entry)
+                continue
+            self._warn_inherited_feature_level(item)
             entry = {'file': f'"{Path(item["file"]).stem}.eMesh"'}
             bands = self._surface_feature_bands(item)
             # C31-11. ``refinementFeatures.C:188-231`` reads ``levels`` when
@@ -1543,6 +1847,216 @@ class CaseBuilder:
                 f'{surface["file"]} into per-group sources or use one ramp '
                 f'(configured: {authored})')
         return authored[0] if authored else ()
+
+    #: Plan 37 #2(a). The infix of a feature piece's name: the solids of one
+    #: staged surface that share a feature level, written as an STL of their
+    #: own so surfaceFeatures gives them an eMesh -- and a level -- of their
+    #: own. ``<surface stem>_features_<n>``.
+    FEATURE_PIECE_INFIX = '_features_'
+
+    def _feature_spec(self, group: dict, bindings: dict) -> tuple:
+        """``(spec, own)``: the feature level one group asks for.
+
+        ``spec`` is ``('level', n)`` or ``('levels', ramp)``. A group with no
+        refinement row of its own asks for level 0 -- capture its edges, do
+        not refine at them -- and ``own`` is False.
+        """
+        _, refinement = self._surface_refinement(group, bindings)
+        if refinement is None:
+            return ('level', 0), False
+        ramp = self._feature_band_ramp(
+            self._item_value(refinement, 'groupName', ''))
+        if ramp:
+            return ('levels', ramp), True
+        return ('level', int(self._item_value(
+            refinement, 'featureEdgeRefinementLevel', 0))), True
+
+    def _feature_partitions(self, surface: dict) -> list:
+        """``[(spec, [(group, own), ...])]`` for one staged surface.
+
+        One row when every group on the file wants the same feature level,
+        which is every case before Plan 37 #2(a) bar the two below. Rows are
+        ordered by their first solid name, not by level, so a piece keeps its
+        name -- and its eMesh -- when only a level changes.
+        """
+        if not surface.get('groups'):
+            return []
+        bindings = self._group_geometry_bindings()
+        parts: dict = {}
+        for group in self._surface_groups(surface):
+            spec, own = self._feature_spec(group, bindings)
+            parts.setdefault(spec, []).append((group, own))
+        return sorted(parts.items(), key=lambda pair: min(
+            name for group, _own in pair[1]
+            for name in group['source_regions']))
+
+    def _feature_piece_fingerprint(self) -> list:
+        """Which solids go to which piece, for the extraction fingerprint.
+
+        Plan 37 UF20 keeps refinement levels out of the surfaceFeatures
+        fingerprint. A level that splits a file, or joins it again, changes
+        the files surfaceFeatures has to write, so the grouping goes in --
+        and only when some file is split, so every other project keeps the
+        fingerprint it recorded.
+        """
+        rows = []
+        try:
+            for item in self.surfaces:
+                partitions = self._feature_partitions(item)
+                if len(partitions) > 1:
+                    rows.append([item['file'], [
+                        sorted(name for group, _own in members
+                               for name in group['source_regions'])
+                        for _spec, members in partitions]])
+        except ValueError:
+            return []
+        return rows
+
+    _staged_solid_cache: dict = {}
+
+    def _staged_solids(self, surface: dict):
+        """The solid names of a staged ASCII STL, or ``None``.
+
+        ``None`` when the case is not known, the file is not there, or it is
+        not an ASCII STL with named solids -- a piece is then not possible.
+        """
+        if not self.case_dir or Path(surface['file']).suffix.lower() != '.stl':
+            return None
+        path = Path(self.case_dir) / 'constant' / 'triSurface' / surface['file']
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        cached = CaseBuilder._staged_solid_cache.get(key)
+        if cached is not None:
+            return cached
+        names: list = []
+        try:
+            with path.open('rb') as stream:
+                if not stream.read(5).lower().startswith(b'solid'):
+                    return None
+                stream.seek(0)
+                for raw in stream:
+                    line = raw.strip()
+                    if line[:6].lower() == b'solid ' or line.lower() == b'solid':
+                        names.append(line[5:].strip().decode(
+                            'utf-8', 'replace'))
+        except OSError:
+            return None
+        solids = frozenset(names)
+        CaseBuilder._staged_solid_cache = {key: solids}
+        return solids
+
+    def _feature_pieces(self, surface: dict) -> list:
+        """The pieces one staged surface is extracted as, or ``[]``.
+
+        Plan 37 #2(a). OpenFOAM 13 takes one feature level per eMesh file and
+        surfaceFeatures writes one eMesh per surface file, named after it. So
+        a surface whose groups wanted different levels either stopped the
+        writer (two levels) or -- a group with no refinement row of its own
+        beside one with a level -- silently gave every group the one level.
+        MEASURED: the inlet and outlet edges of a duct were refined to the
+        wall's feature level 3. Each set of solids that shares a level is now
+        also written as its own STL, extracted to its own eMesh, and listed
+        with its own level.
+        """
+        partitions = self._feature_partitions(surface)
+        if len(partitions) < 2:
+            return []
+        solids = self._staged_solids(surface)
+        if not solids:
+            return []
+        stem = Path(surface['file']).stem
+        pieces = []
+        for index, (spec, members) in enumerate(partitions, start=1):
+            names = list(dict.fromkeys(
+                name for group, _own in members
+                for name in group['source_regions']))
+            if not names or any(name not in solids for name in names):
+                return []
+            name = f'{stem}{self.FEATURE_PIECE_INFIX}{index}'
+            pieces.append({
+                'name': name, 'file': f'{name}.stl', 'source': surface['file'],
+                'solids': names, 'spec': spec,
+                'groups': [group['display_name'] for group, _own in members]})
+        return pieces
+
+    def _warn_inherited_feature_level(self, surface: dict) -> None:
+        """Say which groups take another group's feature level (Plan 37 #2(a)).
+
+        Only when the file could not be split into pieces: a group with no
+        refinement row of its own shares an eMesh file with groups that have
+        one, and OpenFOAM 13 refines the whole file's edges to that level.
+        """
+        try:
+            partitions = self._feature_partitions(surface)
+        except ValueError:
+            return
+        if len(partitions) < 2:
+            return
+        inheriting = [group['display_name'] for _spec, members in partitions
+                      for group, own in members if not own]
+        owners = [group['display_name'] for _spec, members in partitions
+                  for group, own in members if own]
+        specs = sorted({spec for spec, members in partitions
+                        if any(own for _group, own in members)})
+        if not inheriting or not owners or len(specs) != 1:
+            return
+        kind, value = specs[0]
+        level = (f'level {value}' if kind == 'level'
+                 else f'the ramp {[list(pair) for pair in value]}')
+        self.warn(
+            'refinement.feature_level.inherited',
+            f'{", ".join(inheriting)} '
+            f'{"has" if len(inheriting) == 1 else "have"} no refinement '
+            f'group of its own but share {surface["file"]} with '
+            f'{", ".join(owners)}; OpenFOAM 13 refines every feature edge of '
+            f'one file to one level, so their feature edges are refined to '
+            f'{level} too. The file could not be split per solid (it is not '
+            f'an ASCII STL with named solids); give them a refinement group '
+            f'of their own to choose their level',
+            field_id='castellation/refinementSurfaces',
+            requested={name: 0 for name in inheriting}, applied=level,
+            severity='warning')
+
+    def stage_feature_pieces(self, case_dir) -> list:
+        """Write each feature piece next to the surface it is cut from.
+
+        The piece is the surface's own ``solid ... endsolid`` blocks, copied
+        byte for byte. Pieces no longer asked for are removed; nothing else in
+        the directory is touched.
+        """
+        case_dir = Path(case_dir)
+        self.case_dir = case_dir
+        tri_surface = case_dir / 'constant' / 'triSurface'
+        keep = set()
+        written = []
+        for item in self.surfaces:
+            pieces = self._feature_pieces(item)
+            if not pieces:
+                continue
+            blocks = _stl_solid_blocks(tri_surface / item['file'])
+            for piece in pieces:
+                destination = tri_surface / piece['file']
+                temporary = destination.with_suffix('.stl.tmp')
+                with temporary.open('wb') as stream:
+                    for name in piece['solids']:
+                        for block in blocks.get(name, ()):
+                            stream.write(block)
+                os.replace(temporary, destination)
+                keep.add(destination.name)
+                written.append(destination)
+        if tri_surface.is_dir():
+            # Pieces of the staged surfaces, and of any staged surface
+            # (``surface_<id>``) since removed; nothing a user put here.
+            stems = {Path(item['file']).stem for item in self.surfaces}
+            for old in tri_surface.glob(f'*{self.FEATURE_PIECE_INFIX}*.stl'):
+                stem = old.name.rsplit(self.FEATURE_PIECE_INFIX, 1)[0]
+                if old.name not in keep and (
+                        stem in stems or stem.startswith('surface_')):
+                    old.unlink(missing_ok=True)
+        return written
 
     def interface_pairs(self) -> list[dict]:
         """The enabled ``interfacePairs`` rows, in group-manifest shape.
@@ -3257,6 +3771,82 @@ class CaseBuilder:
                 field_id='meshing.castellation.max_local_cells',
                 requested=local, applied=local)
 
+    def _refine_coarse_farfield(self, d: dict) -> None:
+        """Bring a coarsened far field back to the target around the bodies.
+
+        Plan 37 #7. When `farfield_plan` meshed the block at ``2^k`` times the
+        target, a ``searchableBox`` around the bodies is refined ``inside`` to
+        level ``k`` -- exactly the target -- and every level the user set is
+        raised by ``k``, so each physical size on the bodies is the one asked
+        for. The farfield surface keeps level 0: it is cut by coarse cells.
+        """
+        plan = self._farfield_coarsening()
+        if plan is None:
+            return
+        from foammesh.core.mesh import snappy_farfield
+
+        k = int(plan['level'])
+        castellated = d['castellatedMeshControls']
+        for name, entry in castellated['refinementSurfaces'].items():
+            if name == snappy_farfield.GEOMETRY_KEY:
+                continue
+            self._raise_surface_level(entry, k)
+        for entry in castellated['features']:
+            if 'levels' in entry:
+                entry['levels'] = [[distance, int(level) + k]
+                                   for distance, level in entry['levels']]
+            elif 'level' in entry:
+                entry['level'] = int(entry['level']) + k
+        for entry in castellated['refinementRegions'].values():
+            if 'levels' in entry:
+                entry['levels'] = [[distance, int(level) + k]
+                                   for distance, level in entry['levels']]
+            elif isinstance(entry.get('level'), (list, tuple)):
+                distance, level = entry['level']
+                entry['level'] = [distance, int(level) + k]
+            elif 'level' in entry:
+                entry['level'] = int(entry['level']) + k
+        key = self.NEAR_BODY_KEY
+        taken = set(d['geometry']) | set(castellated['refinementRegions'])
+        suffix = 1
+        while key in taken:
+            key = f'{self.NEAR_BODY_KEY}_{suffix}'
+            suffix += 1
+        near = plan['near']
+        d['geometry'][key] = {
+            'type': 'searchableBox',
+            'min': [near[0], near[2], near[4]],
+            'max': [near[1], near[3], near[5]]}
+        castellated['refinementRegions'][key] = {'mode': 'inside', 'level': k}
+        self.warn(
+            'base_grid.farfield.coarsened',
+            f'the far field is meshed at {plan["cell"]:.4g} m cells (2^{k} x '
+            f'the {plan["target"]:g} m target) and refined back to '
+            f'{plan["target"]:g} m inside a box {self._extent_text(near)} '
+            f'around the bodies; every refinement level is written {k} '
+            f'higher so the sizes on the bodies are the ones set. Filling '
+            f'the far field at the target would have been '
+            f'{plan["uniform_cells"]:,} background cells',
+            field_id='meshing.base_grid.target_cell_size',
+            requested=plan['target'], applied=plan['cell'], severity='info')
+
+    @staticmethod
+    def _raise_surface_level(entry: dict, k: int) -> None:
+        level = entry.get('level')
+        if isinstance(level, (list, tuple)) and len(level) == 2:
+            entry['level'] = [int(level[0]) + k, int(level[1]) + k]
+        for region in (entry.get('regions') or {}).values():
+            if isinstance(region, dict):
+                CaseBuilder._raise_surface_level(region, k)
+
+    @staticmethod
+    def _extent_text(bounds) -> str:
+        # DP-165: one triple, one unit, one precision -- the shared writer.
+        from foammesh.core.mesh.presentation import extent_text
+
+        return extent_text([bounds[2 * axis + 1] - bounds[2 * axis]
+                            for axis in range(3)])
+
     def snappy_hex_mesh_dict(self, *, castellation=True, snap=True, layers=True) -> str:
         buffer_layer_enabled = not bool(
             self._v('snap/bufferLayer/disabled', True))
@@ -3443,6 +4033,7 @@ class CaseBuilder:
             'meshQualityControls': quality,
             'mergeTolerance': self._v('meshQuality/mergeTolerance', '1e-6'),
         }
+        self._refine_coarse_farfield(d)
         # C31-11. ``snappyHexMesh.C:715`` reads ``keepPatches`` off the top
         # level; with it on, a patch that ended the run with no faces survives
         # into ``constant/polyMesh/boundary`` instead of being deleted at
@@ -3640,6 +4231,7 @@ class CaseBuilder:
         try:
             generated = self.write_case(staging)
             self.stage_added_features(case_dir)
+            self.stage_feature_pieces(case_dir)
             staged_system = staging / 'system'
             entries = []
             for name in sorted(generated):
@@ -3908,6 +4500,7 @@ class CaseBuilder:
                     raise
         if stage == 'surfaceFeatures':
             self.stage_added_features(case_dir)
+            self.stage_feature_pieces(case_dir)
         entries_by_name = {
             str(item['name']): dict(item)
             for item in previous.get('files', ())}

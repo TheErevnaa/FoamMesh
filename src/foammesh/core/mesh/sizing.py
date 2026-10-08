@@ -61,6 +61,34 @@ def stand_off_bounds(bounds, standoff: float):
             values[4] - margin, values[5] + margin)
 
 
+def base_cell_size(bounds, *, mode, target=None, counts=None):
+    """The base cell, per axis in metres, that castellation refines from.
+
+    Plan 37 #9. In target-size mode the cell is the target the user typed --
+    or, left Auto, the size :func:`auto_target_cell_size` derives -- and the
+    cell counts stored beside it are not read: they belong to the other mode
+    and can be anything. In counts mode it is the block span over the counts.
+    *bounds* are the block, in metres; no scale enters, because none is
+    applied to the block (it is held at 1).
+    """
+    values = [float(value) for value in bounds]
+    if len(values) != 6:
+        raise ValueError('six bounds are required')
+    if getattr(mode, 'value', mode) == 'target_size':
+        size = None
+        if target is not None and str(target).strip() != '':
+            try:
+                size = float(target)
+            except (TypeError, ValueError):
+                size = None
+        if size is None or not math.isfinite(size) or size <= 0:
+            size = auto_target_cell_size(values)
+        if size is not None:
+            return (size, size, size)
+    return tuple((values[2 * axis + 1] - values[2 * axis]) / float(counts[axis])
+                 for axis in range(3))
+
+
 def background_estimate(bounds, counts) -> dict:
     lengths = (bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4])
     cells = tuple(lengths[i] / int(counts[i]) for i in range(3))

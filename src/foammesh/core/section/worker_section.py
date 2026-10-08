@@ -668,7 +668,7 @@ def run_batch(args: dict) -> dict:
     recorded and the next job is cut. Only the jobs named are cut: a stage
     with no snapshot is never in the batch, so nothing stands in for it.
     """
-    import gc
+    from foammesh.support import gc_policy
 
     jobs = args.get('jobs')
     if not isinstance(jobs, list) or not all(isinstance(job, dict)
@@ -695,7 +695,9 @@ def run_batch(args: dict) -> dict:
                          details={})
         entry['seconds'] = round(time.perf_counter() - started, 4)
         stages.append(entry)
-        gc.collect()           # the next stage starts from the floor
+        # The next stage starts from the floor (Plan 35 CR3: the policy
+        # module is the collector's one caller).
+        gc_policy.collect_full('section batch stage')
     return {'schema': BATCH_SCHEMA, 'stages': stages,
             'peak_rss_bytes': _peak_rss()}
 

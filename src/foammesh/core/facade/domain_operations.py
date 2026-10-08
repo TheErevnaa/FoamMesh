@@ -41,6 +41,13 @@ from .session import CaseSession
 logger = logging.getLogger(__name__)
 
 
+def out_of_memory_message(name: str, *, noun: str = 'file') -> str:
+    """What a geometry check that ran out of memory says (DP-1160)."""
+    return (f'This {noun} ({name}) needs more memory to check than is '
+            'available. Close other programs and try again, or simplify '
+            'the surface first.')
+
+
 def _to_payload(value) -> dict:
     if value is None:
         return {}
@@ -50,6 +57,20 @@ def _to_payload(value) -> dict:
         return value
     return {'value': str(value)}
 
+
+
+def _stage_timeout(parameters, default):
+    """The seconds a run may take; ``None`` is no limit. Plan 37 #7.
+
+    ``timeout_seconds`` is the Preferences stage time limit every guided
+    press sends; 0 there is "No limit", which the job manager reads as
+    ``None`` -- never ``wait_for(..., 0)``, which would stop the run at once.
+    """
+    value = parameters.get('timeout_seconds', default)
+    if value is None:
+        return None
+    value = float(value)
+    return None if value <= 0 else value
 
 
 def _gmsh_runner_path():
@@ -639,6 +660,43 @@ def _meshing_intent(configuration: dict, native_section: str = ''):
     )
 
 
+def _mpi_launch_options(registry, ranks: int, *, host=None):
+    """``(options, warning)`` for an ``mpirun`` of *ranks* processes.
+
+    DP-1263. Open MPI 4.1.2 (OpenFOAM 13's) gives a host one slot per
+    physical core and refuses a run that asks for more (MEASURED in
+    OpenFOAM13Runtime, recorded in ``resources.py``: 16 physical cores, 32
+    logical, a 32-rank ``mpirun -np`` refused outright). The launcher clamps
+    ranks to the *logical* cores, so 17..32 ranks passed the clamp and were
+    refused at launch. A count the user typed above the physical cores
+    is theirs to ask for -- there is no fixed limit, only RAM -- so the launch
+    passes ``--oversubscribe`` and the run says the ranks share cores, rather
+    than failing at launch. The host is the cached reading; nothing is probed
+    here. ``warning`` is ``''`` when no flag was needed.
+    """
+    options = tuple(registry.mpi_options()) if (
+        ranks > 1 and hasattr(registry, 'mpi_options')) else ()
+    if ranks <= 1:
+        return options, ''
+    if host is None:
+        from foammesh.core.execution.resources import meshing_host
+        try:
+            host = meshing_host()
+        except Exception:  # noqa: BLE001 - no reading, no flag
+            return options, ''
+    slots = int(getattr(host, 'physical_cores', 0)
+                or getattr(host, 'logical_cores', 0) or 0)
+    if not slots or ranks <= slots:
+        return options, ''
+    if '--oversubscribe' not in options:
+        options = (*options, '--oversubscribe')
+    warning = (f'{ranks} ranks asked for on a host with {slots} physical '
+               'cores: Open MPI is started with --oversubscribe, so ranks '
+               'share cores and each runs slower.')
+    logger.warning('DP-1263: %s', warning)
+    return options, warning
+
+
 def _resource_policy(configuration: dict) -> dict:
     execution = ((configuration.get('mesh') or {}).get('execution') or {})
     maximum = int(execution.get('maxCpuCores') or 0)
@@ -934,6 +992,11 @@ def _ensure_prepared_geometry(session, *, producer: str,
         boundary_categories=_prepared_boundary_categories(
             session.state.db, entries),
         fluid_seed=_prepared_fluid_seed(session.state.db, entries))
+
+
+#: DP-1230. Which case-root mesh the processor cases were split from;
+#: see `DomainOperations._stale_decomposition`.
+DECOMPOSITION_RECORD = 'foammesh/decomposition.json'
 
 
 class DomainOperations:
@@ -1837,7 +1900,7 @@ class DomainOperations:
         the first place.
         """
         from foammesh.core.execution import (
-            ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
+            ResourceMode, ResourcePolicy, ResourceRequest,
             allocate_resources,
         )
         from foammesh.core.execution.resources import (
@@ -1856,9 +1919,21 @@ class DomainOperations:
         # in local.cfg, a second input the page never showed. Meshing
         # resources is the only input now; an old case's count was carried
         # onto it when the case was opened.
-        requested = requested_cpu_count(
-            configuration,
-            requested=int(command.parameters.get('cores') or 0)) or 1
+        # DP-1231. Nothing asked is Auto, answered the way the run answers
+        # it. ``refresh_host`` starts a WSL reading on a worker thread when
+        # the one held is cold or old; this call never waits for it.
+        from foammesh.core.execution.resources import meshing_host
+        host = meshing_host(refresh=bool(
+            command.parameters.get('refresh_host')))
+        auto_cpu, host = self._snappy_cpu(
+            session.case_path, configuration,
+            cores=int(command.parameters.get('cores') or 0), host=host)
+        requested = (1 if mode is ResourceMode.SERIAL
+                     else max(1, auto_cpu.count))
+        if not auto_cpu.auto:
+            requested = requested_cpu_count(
+                configuration,
+                requested=int(command.parameters.get('cores') or 0)) or 1
         policy = ResourcePolicy(
             mode, configuration['max_cpu_cores'],
             configuration['max_memory_bytes'],
@@ -1869,14 +1944,23 @@ class DomainOperations:
             'requested_cores': requested,
             'max_cpu_cores': configuration['max_cpu_cores'] or 0,
             'source': ('the run' if 'cores' in command.parameters
+                       else 'automatic' if auto_cpu.auto
                        else 'the execution ceiling'),
+            # DP-1231. How the count was reached: ``source`` serial /
+            # requested / recorded / auto, the host's cores and their kind,
+            # the headroom, the memory limit and which of them bound it.
+            'auto': auto_cpu.to_dict(),
+            'host': host.to_dict(),
+            # DP-1236. Whether ``workflow.run_pipeline`` with ``resume``
+            # would carry on a stopped run, from which stage, and why not.
+            'resume': self._pipeline_resume_point(session, command),
         }
         try:
             allocation = allocate_resources(
                 policy,
                 ResourceRequest(requested, backend_id='openfoam-mpi',
                                 explicit='cores' in command.parameters),
-                ResourceFacts.local())
+                host.resource_facts())
         except (ResourceError, ValueError, TypeError) as error:
             document.update({
                 'effective_ranks': 0, 'parallel': False, 'backend_id': '',
@@ -2563,29 +2647,54 @@ class DomainOperations:
         # Plan 37 UF5 DP-1040. A task holding a published result is locked:
         # reopening it here would leave the mesh on disk claiming settings
         # it was not made from. `mesh.workflow.unlock` is the way back.
-        if store.is_locked(task_id):
-            if transition == 'accept':
+        #
+        # DP-1200. The lock check and the write both read and fsync the task
+        # state on disk; on a busy disk that held the owner loop for 2.1 s
+        # after Yes on an unlock. They run in a worker; the scheduler still
+        # awaits this command before the next one, so the order is unchanged.
+        def locked_or_applied():
+            if store.is_locked(task_id):
+                if transition == 'accept':
+                    return 'accepted', store.snapshot()
+                return 'locked', store.descriptor.task(task_id).title
+            try:
+                return 'applied', store.apply(task_id, transition)
+            except (TaskStateError, ValueError, KeyError) as error:
+                return 'invalid', error
+
+        def answer(outcome, value):
+            if outcome == 'accepted':
                 # Accepting what is already accepted changes nothing; going
                 # through configure->finish would stale every result below.
-                snapshot = store.snapshot()
                 return self._read_result(session, command, {
-                    'transition': None, 'tasks': snapshot['tasks'],
+                    'transition': None, 'tasks': value['tasks'],
                     'locked': True, 'engine_id': engine_id,
-                    'workflow_reset_notice': snapshot.get('workflow_reset_notice')})
-            title = store.descriptor.task(task_id).title
-            raise TaskLockedError(
-                f'{title} is locked: the mesh on disk was made from its '
-                'settings. Unlock it (discarding the results after it) '
-                'before changing it.',
-                details={'tasks': [task_id], 'titles': [title],
-                         'engine_id': engine_id, 'transition': transition,
-                         'unlock_operation': 'mesh.workflow.unlock'})
+                    'workflow_reset_notice': value.get('workflow_reset_notice')})
+            if outcome == 'locked':
+                raise TaskLockedError(
+                    f'{value} is locked: the mesh on disk was made from its '
+                    'settings. Unlock it (discarding the results after it) '
+                    'before changing it.',
+                    details={'tasks': [task_id], 'titles': [value],
+                             'engine_id': engine_id, 'transition': transition,
+                             'unlock_operation': 'mesh.workflow.unlock'})
+            if outcome == 'invalid':
+                raise ValidationFailedError(str(value)) from value
+            return self._read_result(session, command, dict(
+                value, engine_id=engine_id))
+
         try:
-            result = store.apply(task_id, transition)
-        except (TaskStateError, ValueError, KeyError) as error:
-            raise ValidationFailedError(str(error)) from error
-        return self._read_result(session, command, dict(
-            result, engine_id=engine_id))
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop runs on this thread (the CLI's and tests' synchronous
+            # `execute_sync`, or a page before the loop starts): there is
+            # nothing to keep drawing, so the write is made here.
+            return answer(*locked_or_applied())
+
+        async def run():
+            return answer(*await asyncio.to_thread(locked_or_applied))
+
+        return run()
 
     # -- Plan 37 UF5: unlock and undo ------------------------------------- #
 
@@ -2633,6 +2742,22 @@ class DomainOperations:
         surfaces = self._surface_snapshot(session)
 
         async def run():
+            gather = None
+            if self._gather_pending(session.case_path):
+                # DP-1203. A parallel stage left its result in the processor
+                # cases; the case root still held the mesh before it, and
+                # that is what the undo copy kept -- an undo then put back a
+                # mesh no stage had produced. The result is gathered first,
+                # so the copy is of the mesh the run made.
+                try:
+                    await self._ensure_reconstructed(session, command)
+                    gather = {'gathered': True}
+                except PreconditionFailedError as error:
+                    # The unlock still goes ahead; the copy is then of the
+                    # case root as it stands and the processor cases (with
+                    # their pending marker) are left alone, so an undo puts
+                    # the case back exactly as it was.
+                    gather = {'gathered': False, 'message': str(error)}
             try:
                 result = await asyncio.to_thread(
                     unlock_transaction.unlock, session.case_path, store, task_id,
@@ -2645,6 +2770,8 @@ class DomainOperations:
             session.state.bus.publish(
                 Event.ARTIFACT_QUALITY_CHANGED, operation=command.operation,
                 job_id=None, artifacts=[], quality=task_id)
+            if gather is not None:
+                result = dict(result, gather=gather)
             return self._read_result(session, command, dict(
                 result, engine_id=engine_id, state=store.snapshot()))
 
@@ -2850,7 +2977,8 @@ class DomainOperations:
             stage = transaction.stage_path(session.case_path, transaction_id)
             relative = stage.relative_to(session.case_path).as_posix()
             np = int(manifest['np'])
-            mpi = tuple(registry.mpi_options()) if hasattr(registry, 'mpi_options') else ()
+            # DP-1263. --oversubscribe when np exceeds the physical cores.
+            mpi, crowded = _mpi_launch_options(registry, np)
             await asyncio.to_thread(
                 transaction.mark, session.case_path, transaction_id,
                 transaction.LAUNCHED)
@@ -2877,8 +3005,10 @@ class DomainOperations:
                     transaction.validate, session.case_path, transaction_id)
             except transaction.RedistributeError as error:
                 raise self._redistribute_refused(error) from None
+            check_mpi, check_crowded = _mpi_launch_options(registry, target)
             check_launch = registry.command(
-                'mpirun', (*mpi, '-np', str(target), 'checkMesh', '-parallel'),
+                'mpirun', (*check_mpi, '-np', str(target), 'checkMesh',
+                           '-parallel'),
                 cwd=stage)
             check = await self._context(session).executor.execute(
                 session, OperationSpec(
@@ -2905,10 +3035,14 @@ class DomainOperations:
                 Event.ARTIFACT_QUALITY_CHANGED, operation=command.operation,
                 job_id=execution.job.job_id, artifacts=[], quality='redistributed')
             dropped = validated['dropped']
+            crowding = tuple(dict.fromkeys(
+                text for text in (crowded, check_crowded) if text))
             return OperationResult(
                 'accepted', command.operation, session.revisions,
                 invalidated_outputs=('quality',),
+                warnings=crowding,
                 payload={
+                    **({'oversubscribed': True} if crowding else {}),
                     'transaction_id': transaction_id,
                     'source_ranks': manifest['source_ranks'],
                     'target_ranks': target, 'np': np,
@@ -3148,7 +3282,7 @@ class DomainOperations:
         spec = OperationSpec(
             operation=command.operation,
             argv=launch.argv, cwd=session.case_path,
-            timeout=float(command.parameters.get('timeout_seconds', 3600)),
+            timeout=_stage_timeout(command.parameters, 3600),
             max_output_bytes=8 * 1024 * 1024,
             log_path=layout.log,
             cleanup_argv=launch.cleanup_argv,
@@ -3721,9 +3855,25 @@ class DomainOperations:
         """
         from foammesh.core.mesh.emesh_reader import discover_feature_edges
 
-        surfaces = discover_feature_edges(session.case_path)
+        found = discover_feature_edges(session.case_path)
         labels = self._staged_surface_labels(session.case_path)
         include = bool(command.parameters.get('include_segments'))
+        # Plan 37 #2(a). A surface whose solids take different feature levels
+        # is also extracted piece by piece (``<stem>_features_<n>.eMesh``).
+        # The pieces are the same edges again, cut along the solids, so they
+        # are listed apart: as rows of their own they doubled the edge count
+        # and showed the uuid stem the table exists to hide.
+        stems = {item.name for item in found}
+        pieces, surfaces = [], []
+        for item in found:
+            base, infix, index = item.name.rpartition('_features_')
+            if infix and base in stems and index.isdigit():
+                pieces.append({
+                    **item.to_dict(), 'piece_of': base,
+                    'display_name': '%s, feature piece %s' % (
+                        labels.get(base, base), index)})
+            else:
+                surfaces.append(item)
         payload = {
             # R136. The row is keyed by the staged file's stem, which is the
             # prepared-geometry uuid; the name beside it is what the user
@@ -3735,6 +3885,7 @@ class DomainOperations:
             # A binary .eMesh is listed but not counted; saying so is the
             # difference between "no edges" and "edges we did not read".
             'unreadable': [item.name for item in surfaces if item.binary],
+            'pieces': pieces,
         }
         if include:
             payload['segments'] = {
@@ -5917,6 +6068,30 @@ runTimeModifiable true;
                 Event.JOB_FAILED, job_id=job_id, name=command.operation,
                 error=str(error))
             raise ValidationFailedError(str(error)) from error
+        except MemoryError as error:
+            # DP-1160. MEASURED: a 0.56 MB OBJ ran the import thread out of
+            # memory in the shell-pair check, and MemoryError is neither a
+            # RuntimeError nor an OSError, so it left this handler with the
+            # job STARTED and never ended -- the status bar showed the import
+            # running forever and the page's handler, which catches the
+            # facade's errors, never saw it.
+            message = out_of_memory_message(source.name)
+            session.state.bus.publish(
+                Event.JOB_FAILED, job_id=job_id, name=command.operation,
+                error=message)
+            raise ValidationFailedError(message, details={
+                'error': 'out_of_memory'}) from error
+        except Exception as error:  # noqa: BLE001 - the job must end
+            # DP-1160. Whatever else escapes the reader or the checks, the job
+            # it started has to be ended, and the page has to be told in a
+            # form its handler catches.
+            message = f'{source.name} could not be imported: {error}'
+            logger.exception('geometry import of %s failed', source)
+            session.state.bus.publish(
+                Event.JOB_FAILED, job_id=job_id, name=command.operation,
+                error=message)
+            raise ValidationFailedError(message, details={
+                'error': 'import_failed'}) from error
         finally:
             budget_module.unregister(job_id)
         session.state.bus.publish(
@@ -5932,16 +6107,30 @@ runTimeModifiable true;
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('mesh', 'quality'), payload=imported)
 
-    def _geometry_diagnostics(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _geometry_diagnostics(self, session: CaseSession, command: Command) -> OperationResult:
+        import asyncio
+
         from foammesh.core.geometry import GeometryArtifactStore
+        # DP-1160. Off the owner loop: `diagnose` re-reads and re-assesses
+        # every geometry its cache does not hold, which is the same work the
+        # import runs on a thread, and run here it held the loop -- and in
+        # the desktop the GUI -- for as long as that took.
+        # The arguments are still read here, on the loop, before the thread.
         try:
-            reports = GeometryArtifactStore(session.case_path).diagnose(
+            reports = await asyncio.to_thread(
+                GeometryArtifactStore(session.case_path).diagnose,
                 command.parameters.get('geometry_id'),
                 target_cell_size=self._readiness_target_cell_size(session),
                 engine=self._readiness_engine(session))
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
                 'geometry_id': str(error.args[0])}) from error
+        except MemoryError as error:
+            raise ValidationFailedError(
+                out_of_memory_message(
+                    command.parameters.get('geometry_id') or 'all geometry',
+                    noun='geometry'),
+                details={'error': 'out_of_memory'}) from error
         return self._read_result(session, command, {
             'geometry_count': len(reports), 'geometries': reports})
 
@@ -7311,6 +7500,16 @@ runTimeModifiable true;
         except ValueError as error:
             raise ValidationFailedError(
                 str(error), details={'stage': stage}) from error
+        # DP-1230. The reset put another mesh in the case root, so processor
+        # cases split from the one it replaced -- and a result still waiting
+        # in them to be gathered -- are no stage's input any more. Left, the
+        # next parallel run meshed them, and the next reader gathered them
+        # back over the mesh the reset had just restored.
+        for root in {Path(session.case_path), Path(case_root)}:
+            if (any(root.glob('processor[0-9]*'))
+                    or (root / self.PENDING_GATHER).exists()):
+                self._discard_decomposition(root)
+                (root / self.PENDING_GATHER).unlink(missing_ok=True)
 
         return self._read_result(session, command, payload)
 
@@ -7330,6 +7529,7 @@ runTimeModifiable true;
                 'unknown meshing stage', details={'stage': stage}) from error
         # DP-354. Before anything on this path asks the runtime a question.
         await self._warm_utility_probes()
+        await self._warm_meshing_host()
         feature_payload = None
         seed_warnings: list[str] = []
         if definition.stage in {'castellation', 'snappyHexMesh'}:
@@ -7364,6 +7564,23 @@ runTimeModifiable true;
                 warning=bool(execution.warnings),
                 reasons=tuple(execution.warnings))
             if (getattr(definition, 'mutation', True)
+                    and payload.get('left_decomposed')
+                    and self._keeps_stage_snapshots(engine, definition.stage)):
+                # DP-1201. A parallel stage was never kept: its result stayed
+                # in the processor cases, so a later replay found no snapshot
+                # and regenerated it. It is gathered now -- the processor
+                # cases stay, so the next parallel stage still runs off them
+                # -- and the gather keeps it under its own name.
+                gather = await self._gather_stage_result(
+                    session, command, definition.stage)
+                if gather.get('gathered'):
+                    payload['left_decomposed'] = False
+                    payload['reconstructed'] = gather.get('execution')
+                    if gather.get('stage_snapshot') is not None:
+                        payload['stage_snapshot'] = gather['stage_snapshot']
+                else:
+                    payload['stage_snapshot'] = gather.get('stage_snapshot')
+            if (getattr(definition, 'mutation', True)
                     and not payload.get('left_decomposed')):
                 # The tree route runs snappy one stage at a time and used to
                 # leave no trace beside the mesh: no snap checkpoint (so the
@@ -7373,8 +7590,9 @@ runTimeModifiable true;
                 # A stage left decomposed binds when it is reconstructed.
                 payload.update(self._trace_mesh_state(
                     session, definition.stage, execution))
-                payload['stage_snapshot'] = await self._capture_stage_snapshot(
-                    session, engine, definition.stage, execution)
+                if payload.get('stage_snapshot') is None:
+                    payload['stage_snapshot'] = await self._capture_stage_snapshot(
+                        session, engine, definition.stage, execution)
         else:
             # R92. The task state was recorded only on success, so a stage
             # that failed left the tree holding whatever it said before.
@@ -7400,7 +7618,8 @@ runTimeModifiable true;
         return OperationResult(
             'accepted' if execution.succeeded else 'failed', command.operation,
             session.revisions, invalidated_outputs=('quality',),
-            warnings=tuple(seed_warnings) + tuple(execution.warnings or ()),
+            warnings=(tuple(seed_warnings) + tuple(execution.warnings or ())
+                      + tuple(payload.get('launch_warnings') or ())),
             payload=payload)
 
     # -- Plan 37 UF5: stage snapshots and predecessor replay --------------- #
@@ -7464,6 +7683,47 @@ runTimeModifiable true;
             'captured', 'skipped', 'stage', 'revision', 'path', 'bytes',
             'digest', 'copy_seconds', 'verify_seconds', 'reason',
             'consequence') if key in captured}
+
+    async def _gather_stage_result(self, session: CaseSession,
+                                   command: Command, stage: str) -> dict:
+        """Gather a parallel *stage*'s result into the case root (DP-1201).
+
+        ``{'gathered': True, 'execution', 'stage_snapshot'}`` once the case
+        root holds it, or ``{'gathered': False, 'stage_snapshot': why}`` when
+        the gather failed: the stage stays decomposed and is not kept, and
+        the next reader gathers it as before.
+        """
+        try:
+            gathered = await self._ensure_reconstructed(session, command)
+        except PreconditionFailedError as error:
+            return {'gathered': False, 'stage_snapshot': {
+                'captured': False, 'stage': stage,
+                'reason': 'reconstruct_failed', 'message': str(error),
+                'consequence': 'a re-run that starts from it regenerates it'}}
+        gathered = dict(gathered or {})
+        return {'gathered': not self._gather_pending(session.case_path),
+                'execution': {key: value for key, value in gathered.items()
+                              if key != 'stage_snapshot'},
+                'stage_snapshot': gathered.get('stage_snapshot')}
+
+    async def _keep_gathered_stage(self, session: CaseSession,
+                                   stage: str) -> dict | None:
+        """Keep a stage the gather has just put in the case root (DP-1201).
+
+        A lazy gather (an export, a serial stage, ``mesh.reconstruct``, an
+        unlock) is the first moment a parallel stage's result is the case
+        root, so it is kept then, under that stage's name. Never fails the
+        gather.
+        """
+        from foammesh.core.engine import resolve_engine
+
+        try:
+            engine = resolve_engine(session.state.db)
+        except Exception:  # noqa: BLE001 - no engine, nothing to keep
+            return None
+        if not self._keeps_stage_snapshots(engine, stage):
+            return None
+        return await self._capture_stage_snapshot(session, engine, stage)
 
     def _stage_validity(self, session: CaseSession, command: Command,
                         stage: str) -> tuple[list | None, bool]:
@@ -7627,12 +7887,15 @@ runTimeModifiable true;
             # step is kept as its own input (MEASURED: the kept castellation
             # held the base grid's 1000 cells, and an unlocked Snap re-run
             # "snapped" that grid and passed Quality on it).
+            kept = None
             if self._gather_pending(session.case_path):
-                await self._ensure_reconstructed(session, command)
+                kept = (await self._ensure_reconstructed(session, command)
+                        or {}).get('stage_snapshot')
             self._trace_mesh_state(session, step, execution)
             summary['regenerated'].append({
                 'stage': step,
-                'snapshot': await self._capture_stage_snapshot(
+                'snapshot': kept if kept is not None else
+                await self._capture_stage_snapshot(
                     session, engine, step, execution)})
         self._drop_stage_inputs(case, stage)
         return summary
@@ -7755,37 +8018,48 @@ runTimeModifiable true;
         clamped by the machine. Stages used to ignore it entirely and always
         build a serial command line, so a case configured for sixteen cores
         still meshed on one. DP-691: the Parallel Environment dialog's
-        ``local.cfg`` count is no longer a second input.
+        ``local.cfg`` count is no longer a second input. DP-1231: Auto (no
+        count asked) is the WSL host's cores less one, within its free RAM --
+        see :meth:`_stage_cpu`.
+        """
+        return cls._stage_cpu(session, command, definition)[0]
+
+    @classmethod
+    def _stage_cpu(cls, session: CaseSession, command: Command,
+                   definition=None):
+        """``(ranks, CpuCount | None)`` for one snappy stage.
+
+        Every snappy phase decomposes. Measured directly against OpenFOAM 13
+        on a 1M-cell annulus, 16 ranks meshed in 34s against 139s serial and
+        agreed to 0.03% -- so there is no phase that has to be held back, and
+        no reason for a mode that decomposes only some of them.
+
+        Plan 33 DP-X2 put the ceiling in this precedence and
+        ``requested_cpu_count`` keeps the preview, the page and the launcher
+        on one rule. DP-1231: that rule answered 0 for "nobody asked" and
+        this read 0 as one rank, so an Auto case meshed serially on a
+        sixteen-core machine. Auto now asks
+        :func:`~foammesh.core.execution.resources.meshing_cpu_count` -- the
+        same function the plan preview returns as ``auto`` -- and Snap and
+        Layers keep the count Castellation ran on (DP-1232).
         """
         from foammesh.core.execution import (
-            ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
-            allocate_resources,
+            ResourceMode, ResourcePolicy, ResourceRequest, allocate_resources,
         )
-        from foammesh.core.execution.resources import (
-            ResourceError, requested_cpu_count,
-        )
+        from foammesh.core.execution.resources import ResourceError
 
         policy_values = _resource_policy(session.configuration())
-        # Every snappy phase decomposes. Measured directly against OpenFOAM 13
-        # on a 1M-cell annulus, 16 ranks meshed in 34s against 139s serial and
-        # agreed to 0.03% -- so there is no phase that has to be held back, and
-        # no reason for a mode that decomposes only some of them.
         if str(policy_values['mode'] or '').lower() == 'serial':
-            return 1
-        # Plan 33 DP-X2. The ceiling belongs in this precedence. It was left
-        # out, and an unopened Parallel Environment dialog answers 1, so a
-        # case whose page said three cores built a serial command line -- the
-        # ceiling could take ranks away from a number set elsewhere and never
-        # ask for any. `requested_cpu_count` is the same rule the preview and
-        # the page read, so the three cannot drift apart again.
+            return 1, None
         try:
-            requested = requested_cpu_count(
-                policy_values,
-                requested=int(command.parameters.get('cores') or 0))
+            cpu, host = cls._snappy_cpu(
+                session.case_path, policy_values,
+                cores=int(command.parameters.get('cores') or 0),
+                stage=getattr(definition, 'stage', None))
         except (TypeError, ValueError):
-            return 1
-        if requested <= 1:
-            return 1
+            return 1, None
+        if cpu.count <= 1:
+            return 1, cpu
         try:
             allocation = allocate_resources(
                 ResourcePolicy(
@@ -7793,11 +8067,72 @@ runTimeModifiable true;
                     policy_values['max_cpu_cores'],
                     policy_values['max_memory_bytes'],
                     policy_values['allow_distributed'], 'openfoam-mpi'),
-                ResourceRequest(requested, backend_id='openfoam-mpi'),
-                ResourceFacts.local())
+                ResourceRequest(cpu.count, backend_id='openfoam-mpi'),
+                host.resource_facts())
         except (ResourceError, ValueError, TypeError):
-            return 1
-        return max(1, int(allocation.effective_ranks))
+            return 1, cpu
+        return max(1, int(allocation.effective_ranks)), cpu
+
+    @classmethod
+    def _snappy_cpu(cls, case_path: Path, policy_values: dict, *,
+                    cores: int = 0, stage: str | None = None, host=None):
+        """``(CpuCount, MeshingHost)``: what a snappy run asks for, and of
+        which machine (DP-1231).
+
+        The host is the last WSL reading (never probed here: this runs on
+        the loop) narrowed to the Meshing-resources memory ceiling, and the
+        cells are the largest mesh this case already holds, so Auto leaves
+        RAM for the mesh it is about to grow.
+        """
+        from dataclasses import replace
+
+        from foammesh.core.execution.resources import (
+            meshing_cpu_count, meshing_host, recorded_auto_count,
+        )
+
+        host = host or meshing_host()
+        ceiling = policy_values.get('max_memory_bytes')
+        if ceiling and (host.memory_available_bytes is None
+                        or int(ceiling) < host.memory_available_bytes):
+            host = replace(host, memory_available_bytes=int(ceiling))
+        cpu = meshing_cpu_count(
+            policy_values, engine='snappy', requested=int(cores or 0),
+            cells=cls._known_cells(case_path),
+            recorded=recorded_auto_count(case_path, stage) if stage else 0,
+            host=host)
+        return cpu, host
+
+    @classmethod
+    def _known_cells(cls, case_path) -> int | None:
+        """The largest cell count this case holds: the live mesh and every
+        kept stage, read from the ``owner`` headers (DP-1231). ``None`` when
+        nothing has been meshed yet."""
+        from foammesh.core.jobs import stage_snapshots
+
+        case_path = Path(case_path)
+        meshes = [case_path / 'constant' / 'polyMesh']
+        try:
+            for stage, revision in stage_snapshots.resolve(case_path).items():
+                meshes.append(stage_snapshots.stages_root(case_path)
+                              / revision / stage / 'constant' / 'polyMesh')
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        counts = [count for count in map(cls._polymesh_cell_count, meshes)
+                  if count]
+        return max(counts) if counts else None
+
+    async def _warm_meshing_host(self) -> None:
+        """DP-1231. Read the WSL host's cores and free memory on a worker
+        thread before a run asks for them. Skipped where the capability
+        registry is a stand-in (no ``utility``): there is no runtime there
+        to ask, and a test's count must not depend on this machine's WSL."""
+        if not hasattr(self._capabilities_registry(), 'utility'):
+            return
+        from foammesh.core.execution.resources import warm_meshing_host
+        try:
+            await warm_meshing_host()
+        except Exception:                                   # noqa: BLE001
+            pass
 
     #: Written when a parallel stage leaves its result in the processor cases,
     #: removed once the case root has been gathered from them. An explicit
@@ -7867,6 +8202,80 @@ runTimeModifiable true;
         from foammesh.support.utils import rmtree
         for processor in case_path.glob('processor[0-9]*'):
             rmtree(processor)
+        # DP-1230. What they were split from goes with them.
+        try:
+            (Path(case_path) / DECOMPOSITION_RECORD).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    #: DP-1230. Which case-root mesh the processor cases were split from.
+    DECOMPOSITION_RECORD = DECOMPOSITION_RECORD
+
+    @classmethod
+    def _record_decomposition(cls, case_path: Path, ranks: int) -> None:
+        """Note that the processor cases now hold the case-root mesh.
+
+        Written after ``decomposePar`` and again after a gather: both leave
+        the processor cases and the case root holding the same mesh, and the
+        identity read here is the one a later reuse has to find again.
+        """
+        from foammesh.core.workflow.task_state_store import mesh_identity
+        record = Path(case_path) / cls.DECOMPOSITION_RECORD
+        try:
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({
+                'root_identity': mesh_identity(case_path),
+                'ranks': int(ranks)}, indent=2), encoding='utf-8')
+        except OSError:
+            record.unlink(missing_ok=True)
+
+    @classmethod
+    def _stale_decomposition(cls, case_path: Path, ranks: int,
+                             stage: str | None = None) -> str | None:
+        """Why the processor cases on disk cannot be *stage*'s input.
+
+        ``None`` when they can. DP-1230: the count used to be the only test,
+        so processor cases holding a mesh the case root no longer holds were
+        reused whenever their number matched. Read off the sequence: a
+        parallel Snap is gathered and kept (DP-1201) and its processor cases
+        stay; Reset Snap puts the castellated mesh back in the case root; the
+        replay finds the root already is Snap's input (UF20 early return) and
+        changes nothing; `_ensure_decomposed` saw N processor cases for N
+        ranks and Snap ran on the snapped mesh. The identity of the root they
+        were split from is now kept beside them and has to match the live
+        root.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+        from foammesh.core.workflow.task_state_store import mesh_identity
+        case_path = Path(case_path)
+        existing = tuple(case_path.glob('processor[0-9]*'))
+        if not existing:
+            return 'none'
+        if len(existing) != int(ranks):
+            return 'rank_count'
+        pending = case_path / cls.PENDING_GATHER
+        if pending.is_file():
+            # A result not yet gathered is a later stage's input only.
+            try:
+                held = json.loads(pending.read_text(encoding='utf-8')).get(
+                    'stage')
+            except (OSError, ValueError, AttributeError):
+                held = None
+            if (not held or stage is None
+                    or snapshots._stage_rank(str(stage))
+                    <= snapshots._stage_rank(str(held))):
+                return 'pending_result_superseded'
+        try:
+            record = json.loads((case_path / cls.DECOMPOSITION_RECORD)
+                                .read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return 'unrecorded'
+        if not isinstance(record, dict):
+            return 'unrecorded'
+        live = mesh_identity(case_path)
+        if not live or record.get('root_identity') != live:
+            return 'root_changed'
+        return None
 
     @classmethod
     def _pending_gather_ranks(cls, case_path: Path) -> int | None:
@@ -7981,6 +8390,9 @@ runTimeModifiable true;
         except (OSError, ValueError, AttributeError):
             gathered_stage = 'parallel'
         marker.unlink(missing_ok=True)
+        # DP-1230. The root now holds what the processor cases hold.
+        self._record_decomposition(
+            case_path, len(tuple(case_path.glob('processor[0-9]*'))))
         # Plan 37 UF20. The parallel stage recorded the mesh as the
         # workflow's own while the root still held the mesh before it; the
         # gather has just replaced the root, so the record has to follow, or
@@ -7991,6 +8403,9 @@ runTimeModifiable true;
             'generated_by': f'reconstructPar:{gathered_stage}'})
         payload = execution.to_payload()
         payload['trace'] = self._trace_mesh_state(session, 'reconstruct')
+        if gathered_stage != 'parallel':
+            payload['stage_snapshot'] = await self._keep_gathered_stage(
+                session, gathered_stage)
         return payload
 
     async def _mesh_reconstruct(self, session: CaseSession,
@@ -8005,11 +8420,18 @@ runTimeModifiable true;
                      'execution': payload})
 
     async def _ensure_decomposed(self, session: CaseSession, command: Command,
-                                 engine, ranks: int) -> list:
-        """Decompose the case once, so later stages continue on processor meshes."""
+                                 engine, ranks: int, *,
+                                 stage: str | None = None) -> list:
+        """Decompose the case once, so later stages continue on processor meshes.
+
+        Processor cases are reused only while they still hold the case-root
+        mesh they were split from (DP-1230); *stage* is the stage about to
+        read them.
+        """
         case_root = session.case_path
         existing = tuple(case_root.glob('processor[0-9]*'))
-        if existing and len(existing) == int(ranks):
+        stale = self._stale_decomposition(case_root, ranks, stage)
+        if existing and stale is None:
             # DP-663. Regenerating the dictionaries between phases writes the
             # serial default, and a reused decomposition kept it -- so the
             # gather that followed read one processor case of twelve.
@@ -8020,9 +8442,11 @@ runTimeModifiable true;
             return []
         if existing:
             # Processor cases from an earlier run with a different rank count
-            # would be picked up by mpirun as if they were this run's. Remove
-            # them and decompose for the ranks actually requested.
+            # would be picked up by mpirun as if they were this run's, and
+            # ones split from another root mesh would be meshed in its place
+            # (DP-1230). Remove them and decompose the live root.
             self._discard_decomposition(case_root)
+            (case_root / self.PENDING_GATHER).unlink(missing_ok=True)
         engine.write_parallel_config(session.state.db, case_root, ranks)
         execution = await self._run_openfoam_utility(
             session, command, 'decomposePar',
@@ -8032,6 +8456,7 @@ runTimeModifiable true;
             raise PreconditionFailedError(
                 'the case could not be decomposed for parallel meshing',
                 details={'error': 'decompose_failed', 'ranks': ranks})
+        self._record_decomposition(case_root, ranks)
         return [execution.to_payload()]
 
     async def _run_stage_definition(self, session: CaseSession, command: Command,
@@ -8065,23 +8490,52 @@ runTimeModifiable true;
                  if definition.utility == 'snappyHexMesh' else 1)
         if definition.utility == 'snappyHexMesh':
             # DP-678. The cap and the ranks it gave this stage, on disk.
+            # DP-1232. And, for Auto, how Auto came to that count: Snap and
+            # Layers read it back, so one mesh is meshed on one rank count.
             from foammesh.core.execution.resources import (
                 execution_record, record_stage_execution,
             )
             try:
+                cpu = self._snappy_cpu(
+                    session.case_path,
+                    _resource_policy(session.configuration()),
+                    cores=int(command.parameters.get('cores') or 0),
+                    stage=definition.stage)[0]
+            except (TypeError, ValueError):
+                cpu = None
+            try:
                 record_stage_execution(
                     session.case_path, definition.stage, execution_record(
                         _resource_policy(session.configuration()),
-                        effective=ranks, unit='ranks'))
+                        effective=ranks, unit='ranks',
+                        auto=(cpu.to_dict() if cpu is not None and cpu.auto
+                              else None)))
             except OSError:
                 pass
         decomposition: list = []
+        if (self._gather_pending(session.case_path)
+                and self._stale_decomposition(
+                    session.case_path,
+                    len(tuple(session.case_path.glob('processor[0-9]*'))),
+                    definition.stage) == 'pending_result_superseded'):
+            # DP-1230. The ungathered result is this stage's own earlier
+            # output (or a later stage's), and the input it starts from has
+            # just been put back. Gathering it now would write that output
+            # over the input.
+            self._discard_decomposition(session.case_path)
+            (session.case_path / self.PENDING_GATHER).unlink(missing_ok=True)
         if ranks == 1 and self._gather_pending(session.case_path):
             # A serial phase reads the case root, so an earlier decomposed
             # phase has to be gathered first. The processor cases then hold a
             # mesh this phase is about to supersede; leaving them would let a
             # later parallel phase pick up a stale decomposition.
             await self._ensure_reconstructed(session, command)
+            self._discard_decomposition(session.case_path)
+        elif (ranks == 1 and definition.utility != 'surfaceFeatures'
+              and any(session.case_path.glob('processor[0-9]*'))):
+            # DP-1201. A parallel stage is now gathered as soon as it ends,
+            # and its processor cases are kept for the next parallel stage.
+            # A serial stage supersedes them just the same.
             self._discard_decomposition(session.case_path)
         if ranks > 1:
             await self._utilities_ready(
@@ -8094,13 +8548,19 @@ runTimeModifiable true;
                         'parallel meshing needs the full OpenFOAM runtime',
                         details={'utility': name, 'reason': capability.reason})
             decomposition = await self._ensure_decomposed(
-                session, command, engine, ranks)
+                session, command, engine, ranks, stage=definition.stage)
 
+        launch_warning = ''
         if hasattr(registry, 'command'):
             if ranks > 1:
+                # DP-1263. This launch passed no MPI options at all -- not
+                # even the probed `--allow-run-as-root` the pipeline and the
+                # redistribute pass -- and nothing for a count above the
+                # host's physical cores, which Open MPI refuses.
+                mpi, launch_warning = _mpi_launch_options(registry, ranks)
                 launch = registry.command(
                     'mpirun',
-                    ('-np', str(ranks), definition.utility, '-parallel',
+                    (*mpi, '-np', str(ranks), definition.utility, '-parallel',
                      *stage_run.argv[1:]),
                     cwd=stage_run.cwd)
             else:
@@ -8134,8 +8594,8 @@ runTimeModifiable true;
             argv=launch.argv,
             cwd=stage_run.cwd,
             mutation=True,
-            timeout=command.parameters.get(
-                'timeout_seconds', definition.timeout_seconds),
+            timeout=_stage_timeout(command.parameters,
+                                   definition.timeout_seconds),
             max_output_bytes=4 * 1024 * 1024,
             expected_artifacts=(ExpectedArtifact(
                 poly_mesh, kind='feature-edges' if feature_stage else 'polyMesh',
@@ -8164,6 +8624,9 @@ runTimeModifiable true;
             'profile_id': launch.profile_id,
             'ranks': ranks,
         })
+        if launch_warning:
+            payload['oversubscribed'] = True
+            payload['launch_warnings'] = [launch_warning]
         if ranks > 1 and not execution.succeeded:
             # Plan 35 D8. A failed parallel run leaves processor cases that
             # are neither the old mesh nor a new one; the next run would
@@ -8486,6 +8949,259 @@ runTimeModifiable true;
         await self._warm_utility_probes()
         return await engine.run(EngineRunRequest(session, command, self))
 
+    @staticmethod
+    def _pipeline_stage_keeps(nodes) -> dict[str, str]:
+        """``{node id: stage}``: after which pipeline node each stage is kept.
+
+        DP-1202. A stage is kept only where the case root holds that stage's
+        own, complete result:
+
+        * ``blockMesh`` after its node, on every route;
+        * the serial split route (one ``snappyHexMesh`` per phase, each
+          overwriting the case root): each phase after its node;
+        * the MPI split route: Castellation after ``reconstructCastellation``
+          (DP-1234 added that gather), Snap after ``reconstructSnap``, and
+          Layers after the final ``reconstructPar`` (before any interface
+          couple rewrites the mesh).
+
+        Not kept, by design: the combined route's three phases -- one
+        invocation, so only its finished mesh exists; it is kept whole as
+        ``snappyHexMesh``. DP-1234: ``workflow.run_pipeline`` no longer
+        takes the combined route.
+        """
+        ids = [node.node_id for node in nodes]
+        keeps = {'blockMesh': 'blockMesh'} if 'blockMesh' in ids else {}
+        # DP-1236. A resumed run starts part-way, so any phase counts.
+        if not any(phase in ids for phase in ('castellation', 'snap',
+                                              'layers')):
+            return keeps
+        if 'decomposePar' not in ids:
+            keeps.update({phase: phase for phase in
+                          ('castellation', 'snap', 'layers') if phase in ids})
+            return keeps
+        if 'reconstructCastellation' in ids:
+            keeps['reconstructCastellation'] = 'castellation'
+        if 'reconstructSnap' in ids:
+            keeps['reconstructSnap'] = 'snap'
+        if 'layers' in ids and 'reconstructPar' in ids:
+            keeps['reconstructPar'] = 'layers'
+        return keeps
+
+    #: DP-1236. What a stopped or failed pipeline run left to resume from.
+    PIPELINE_RESUME_RECORD = 'foammesh/pipeline-resume.json'
+
+    @classmethod
+    def _park_root_for_gather(cls, case_path: Path) -> Path | None:
+        """Move the case-root mesh out of ``reconstructPar``'s sight (DP-1235).
+
+        DP-70 measured that a gather over a complete case-root mesh, with
+        ``cellProcAddressing`` in the processor cases, gathers the points
+        only and exits 0. ``_ensure_reconstructed`` parks the root for that
+        reason; the pipeline's own gathers did not, and the split route
+        gathers three times over a root that holds the previous stage's mesh
+        while every earlier gather has written ``cellProcAddressing`` back.
+        """
+        from foammesh.support.utils import rmtree
+        root = Path(case_path) / 'constant' / 'polyMesh'
+        parked = Path(case_path) / cls.PARKED_ROOT_MESH
+        if parked.exists():
+            rmtree(parked)
+        if not root.is_dir():
+            return None
+        root.rename(parked)
+        return parked
+
+    @classmethod
+    def _settle_gather(cls, case_path: Path, parked: Path | None,
+                       succeeded: bool) -> str:
+        """Keep the gather, or put the parked root back; ``''`` when kept.
+
+        A gather that exits 0 is read back: the case root must hold every
+        cell the processor cases do, or it is not the stage's result.
+        """
+        from foammesh.support.utils import rmtree
+        root = Path(case_path) / 'constant' / 'polyMesh'
+        problem = ''
+        if succeeded:
+            if not root.is_dir():
+                problem = ('the gather reported success and left no mesh in '
+                           'the case root')
+            else:
+                gathered = cls._polymesh_cell_count(root)
+                decomposed = cls._decomposed_cell_count(Path(case_path))
+                if (gathered is not None and decomposed is not None
+                        and gathered != decomposed):
+                    problem = (
+                        f'the gathered mesh holds {gathered} cells and the '
+                        f'processor cases {decomposed}, so the case root is '
+                        'not this stage result')
+        if parked is not None and parked.is_dir():
+            if succeeded and not problem:
+                rmtree(parked)
+            else:
+                if root.is_dir():
+                    rmtree(root)
+                parked.rename(root)
+        return problem
+
+    @classmethod
+    def _read_pipeline_resume(cls, case_path: Path) -> dict | None:
+        try:
+            document = json.loads((Path(case_path) / cls.PIPELINE_RESUME_RECORD)
+                                  .read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    @classmethod
+    def _clear_pipeline_resume(cls, case_path: Path) -> None:
+        try:
+            (Path(case_path) / cls.PIPELINE_RESUME_RECORD).unlink(
+                missing_ok=True)
+        except OSError:
+            pass
+
+    @classmethod
+    def _write_pipeline_resume(cls, case_path: Path, document: dict) -> None:
+        path = Path(case_path) / cls.PIPELINE_RESUME_RECORD
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(document, indent=2, sort_keys=True),
+                            encoding='utf-8')
+        except OSError:
+            logger.warning('could not record where the run stopped',
+                           exc_info=True)
+
+    def _keep_interrupted_run(self, session: CaseSession, command: Command,
+                              record, failed_node: str, stopped: bool,
+                              stage_snapshots, resumed) -> dict:
+        """Record what a stopped or failed pipeline run finished (DP-1236).
+
+        Before this, a run stopped in Layers recorded nothing: the tree read
+        as though no stage had run, though the base grid, Castellation and
+        Snap were each kept on disk, and the only way on was to run all of
+        it again. Each stage kept by this run is recorded done (its chain,
+        never across a gate); stages a resumed run started from were recorded
+        when they were kept. Processor cases are discarded -- they hold the
+        interrupted step, which is not kept -- so the case root, the last
+        kept stage, is the case's mesh. Returns ``{kept_stages, recorded,
+        resume}``; ``resume`` is :meth:`_pipeline_resume_point`'s answer.
+        """
+        from datetime import datetime, timezone
+
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        kept = []
+        if resumed:
+            limit = snapshots._stage_rank(resumed['from_stage'])
+            kept.extend(item for item in resumed.get('kept') or ()
+                        if snapshots._stage_rank(item['stage']) <= limit)
+        fresh = [{'stage': item['stage'], 'revision': item['revision']}
+                 for item in stage_snapshots
+                 if isinstance(item, dict) and item.get('captured')
+                 and item.get('revision') and item.get('stage')
+                 in snapshots.STAGE_ORDER]
+        kept = [item for item in kept
+                if item['stage'] not in {new['stage'] for new in fresh}]
+        kept.extend(fresh)
+        recorded = []
+        for item in fresh:
+            if self._record_stage_run_success(
+                    session, command,
+                    snapshots.STAGE_TASKS[item['stage']]) is not None:
+                recorded.append(item['stage'])
+        if any(session.case_path.glob('processor[0-9]*')):
+            self._discard_decomposition(session.case_path)
+        if kept:
+            self._write_pipeline_resume(session.case_path, {
+                'run_id': self._run_manifest_id(record),
+                'failed_node': failed_node, 'stopped': bool(stopped),
+                'kept': kept, 'at': datetime.now(timezone.utc).isoformat()})
+        else:
+            self._clear_pipeline_resume(session.case_path)
+        return {'kept_stages': [item['stage'] for item in kept],
+                'recorded': recorded,
+                'resume': self._pipeline_resume_point(session, command)}
+
+    def _pipeline_resume_point(self, session: CaseSession, command: Command,
+                               *, engine=None) -> dict:
+        """Where a stopped ``workflow.run_pipeline`` can carry on from.
+
+        DP-1236. ``{available, from_stage, revision, next_stage, kept,
+        failed_node, stopped, reason, settings_checked}``. A stage counts only
+        when the stopped run kept it, the kept copy still resolves, the task
+        tree still has it published (an edit or reset unpublishes it), every
+        stage before it counts, and its dictionary is the one it ran from:
+        ``blockMeshDict`` always, and with *engine* (the resume itself) each
+        phase's ``snappyHexMeshDict`` regenerated from the current settings.
+        The query (no *engine*) writes nothing and leaves the phase
+        dictionaries to the resume, which falls back to an earlier stage when
+        one changed.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        case = session.case_path
+        answer = {'available': False, 'from_stage': None, 'revision': None,
+                  'next_stage': None, 'kept': [], 'failed_node': None,
+                  'stopped': False, 'settings_checked': engine is not None,
+                  'reason': 'no run was stopped part-way'}
+        record = self._read_pipeline_resume(case)
+        if not record:
+            return answer
+        kept = {str(item.get('stage')): str(item.get('revision'))
+                for item in record.get('kept') or ()
+                if isinstance(item, dict) and item.get('revision')}
+        answer.update(kept=[{'stage': stage, 'revision': kept[stage]}
+                            for stage in snapshots.STAGE_ORDER
+                            if stage in kept],
+                      failed_node=record.get('failed_node'),
+                      stopped=bool(record.get('stopped')))
+        try:
+            resolved = snapshots.resolve(case)
+        except (OSError, ValueError, KeyError):
+            resolved = {}
+        valid, _later = self._stage_validity(session, command, 'layers')
+        chosen = None
+        why = 'the stopped run kept no stage'
+        for stage in snapshots.STAGE_ORDER:
+            revision = kept.get(stage)
+            if not revision:
+                break
+            if resolved.get(stage) != revision:
+                why = f'the kept {stage} mesh is no longer on disk'
+                break
+            if valid is not None and stage not in valid:
+                why = f'{stage} has changed or been reset since the run stopped'
+                break
+            manifest = snapshots.read_manifest(case, stage, revision) or {}
+            ran_from = str(manifest.get('settings_fingerprint') or '')
+            if stage == 'blockMesh' or engine is not None:
+                if engine is not None and stage != 'blockMesh':
+                    try:
+                        engine.write_phase_dictionary(
+                            session.state.db, case, stage)
+                    except (OSError, ValueError, KeyError) as error:
+                        why = f'the {stage} dictionary could not be written: {error}'
+                        break
+                if not ran_from or ran_from != snapshots.settings_fingerprint(
+                        case, stage):
+                    why = (f'the {stage} settings changed since the run '
+                           'stopped')
+                    break
+            chosen = stage
+        if chosen is None:
+            answer['reason'] = why
+            return answer
+        order = snapshots.STAGE_ORDER
+        following = order[order.index(chosen) + 1:]
+        answer.update(available=True, from_stage=chosen,
+                      revision=kept[chosen],
+                      next_stage=following[0] if following else 'checkMesh',
+                      reason=(f'resumes after {chosen}' if chosen == order[-1]
+                              or kept.get(following[0]) is None
+                              else f'resumes after {chosen}: {why}'))
+        return answer
+
     async def run_snappy_pipeline(self, session: CaseSession,
                                   command: Command) -> OperationResult:
         """Execute the serial/MPI DAG and publish a validated mesh-state ref.
@@ -8495,7 +9211,7 @@ runTimeModifiable true;
         session.require_writable()
         from foammesh.core.engine import resolve_engine
         from foammesh.core.execution import (
-            ResourceFacts, ResourceMode, ResourcePolicy, ResourceRequest,
+            ResourceMode, ResourcePolicy, ResourceRequest,
             allocate_resources, openfoam_meshing_dag,
         )
         from foammesh.core.execution.resources import execution_record
@@ -8530,12 +9246,15 @@ runTimeModifiable true;
         # 1, and 1 used to outrank the ceiling here, so "Run to end" meshed a
         # case whose page said six cores on one rank while the Plan preview
         # said six. The same rule the preview and ``_stage_ranks`` ask.
-        from foammesh.core.execution.resources import requested_cpu_count
-
+        # DP-1231. Nothing asked is Auto -- the WSL host's cores less one,
+        # within its free RAM -- not one rank.
+        await self._warm_meshing_host()
         try:
-            requested_cores = requested_cpu_count(
-                configuration,
-                requested=int(command.parameters.get('cores') or 0)) or 1
+            auto_cpu, meshing_host = self._snappy_cpu(
+                session.case_path, configuration,
+                cores=int(command.parameters.get('cores') or 0))
+            requested_cores = (1 if mode is ResourceMode.SERIAL
+                               else max(1, auto_cpu.count))
         except (TypeError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
         policy = ResourcePolicy(
@@ -8549,7 +9268,7 @@ runTimeModifiable true;
                 ResourceRequest(
                     requested_cores, backend_id='openfoam-mpi',
                     explicit='cores' in command.parameters),
-                ResourceFacts.local())
+                meshing_host.resource_facts())
         except (ValueError, TypeError) as error:
             raise ValidationFailedError(str(error)) from error
         # F-13. The interface pairs the Geometry page authored reach the run
@@ -8621,9 +9340,10 @@ runTimeModifiable true;
         # profile ``mesh.check`` uses, so both write the same report.
         # CP-07 item 6. What the launcher needs to actually start the ranks
         # it was asked for, taken from the probed runtime rather than assumed.
-        mpi_options = ()
-        if allocation.effective_ranks > 1 and hasattr(registry, 'mpi_options'):
-            mpi_options = tuple(registry.mpi_options())
+        # DP-1263. --oversubscribe when the ranks exceed the physical cores.
+        mpi_options, launch_warning = _mpi_launch_options(
+            registry, allocation.effective_ranks)
+        launch_warnings = (launch_warning,) if launch_warning else ()
         from foammesh.core.quality.checkmesh_service import checkmesh_request
 
         # DP-591. A skipped Boundary layers task grows nothing: the
@@ -8632,8 +9352,15 @@ runTimeModifiable true;
         layers_skipped = bool(getattr(
             engine, 'layers_skipped', lambda _path: False)(session.case_path))
         await self._checkmesh_help_ready()
+        # DP-1234. Every run is split into its stages, so each finished stage
+        # is kept as it lands and a run stopped in Layers has lost Layers,
+        # not the whole mesh. MEASURED in plans/evidence/plan23-wp7a-spike:
+        # the split and combined routes give the same 22,178 cells (serial
+        # and MPI x2), and the facade run on the curved pipe 10,234 cells
+        # either way. Only enforcing qualification pauses at Snap.
         dag = openfoam_meshing_dag(
-            session.case_path, allocation, split_at_snap=mode.enforces,
+            session.case_path, allocation, split_at_snap=True,
+            pause_at_snap=mode.enforces,
             layers=not layers_skipped,
             mpi_options=mpi_options,
             check_profile=self._checkmesh_profile()[0],
@@ -8646,6 +9373,43 @@ runTimeModifiable true;
             interface_couples=tuple(
                 (pair['master_patch'], pair['slave_patch'])
                 for pair in couples))
+        # DP-1236. ``resume`` carries on from the last stage a stopped run
+        # kept: that mesh is put back and only the nodes after it run.
+        resumed = None
+        if command.parameters.get('resume'):
+            from foammesh.core.execution.dag import resume_dag
+            from foammesh.core.jobs import stage_snapshots as snapshots
+
+            resumed = self._pipeline_resume_point(
+                session, command, engine=engine)
+            if not resumed['available']:
+                raise PreconditionFailedError(
+                    f'There is nothing to resume: {resumed["reason"]}.',
+                    details={'error': 'resume_unavailable',
+                             'resume': resumed})
+            keeps_at = {stage: node for node, stage
+                        in self._pipeline_stage_keeps(dag.nodes).items()}
+            # A stage this route does not keep (Layers, now skipped) is
+            # resumed from the stage before it.
+            from_stage = resumed['from_stage']
+            while from_stage not in keeps_at:
+                from_stage = snapshots.PREDECESSOR[from_stage]
+            if from_stage != resumed['from_stage']:
+                resumed = dict(resumed, from_stage=from_stage, revision=(
+                    {item['stage']: item['revision']
+                     for item in resumed['kept']}[from_stage]))
+            if snapshots.live_mesh_is(session.case_path, from_stage,
+                                      resumed['revision']):
+                self._discard_decomposition(session.case_path)
+                (session.case_path / self.PENDING_GATHER).unlink(
+                    missing_ok=True)
+            else:
+                await self._restore_stage_snapshot(
+                    session, {'stage': from_stage,
+                              'revision': resumed['revision']})
+            dag = resume_dag(dag, keeps_at[from_stage])
+        else:
+            self._clear_pipeline_resume(session.case_path)
         # Plan 30 F-15. Both engines leave the same record behind. Gmsh wrote
         # a run manifest for every run and snappy wrote none, so the Runs
         # surface could only ever show half a case's history -- which is why
@@ -8663,6 +9427,8 @@ runTimeModifiable true;
         checkpoints = []
         executions = []
         check_execution = None
+        keeps = self._pipeline_stage_keeps(dag.nodes)
+        stage_snapshots = []
         for node in dag.nodes:
             if node.node_id in getattr(engine, 'SPLIT_PHASES', ()):
                 # The three phases share a command line and differ only in the
@@ -8678,21 +9444,32 @@ runTimeModifiable true;
                         utility, str(error), kind='pipeline utility'),
                     details={'utility': utility,
                              'reason': str(error)}) from error
-            execution = await self._context(session).executor.execute(
-                session, OperationSpec(
-                    operation=f'workflow.pipeline.{node.node_id}',
-                    argv=launch.argv, cwd=node.cwd,
-                    mutation=node.mutates_mesh,
-                    timeout=float(command.parameters.get(
-                        'timeout_seconds', 3600)),
-                    max_output_bytes=10 * 1024 * 1024,
-                    recover_mesh=node.mutates_mesh,
-                    cleanup_argv=launch.cleanup_argv),
-                on_line=command.parameters.get('on_line'))
+            # DP-1235. Every gather runs with the case root parked.
+            gathers = tuple(node.argv[:1]) == ('reconstructPar',)
+            parked = (self._park_root_for_gather(session.case_path)
+                      if gathers else None)
+            try:
+                execution = await self._context(session).executor.execute(
+                    session, OperationSpec(
+                        operation=f'workflow.pipeline.{node.node_id}',
+                        argv=launch.argv, cwd=node.cwd,
+                        mutation=node.mutates_mesh,
+                        timeout=_stage_timeout(command.parameters, 3600),
+                        max_output_bytes=10 * 1024 * 1024,
+                        recover_mesh=node.mutates_mesh,
+                        cleanup_argv=launch.cleanup_argv),
+                    on_line=command.parameters.get('on_line'))
+            except BaseException:
+                if gathers:
+                    self._settle_gather(session.case_path, parked, False)
+                raise
+            gather_problem = (self._settle_gather(
+                session.case_path, parked, execution.succeeded)
+                if gathers else '')
             executions.append(execution.to_payload())
             if node.node_id == 'checkMesh':
                 check_execution = execution
-            if not execution.succeeded:
+            if not execution.succeeded or gather_problem:
                 failure = execution.to_payload()
                 job = failure.get('job') or {}
                 stopped = str(job.get('status') or '') == 'cancelled'
@@ -8706,19 +9483,36 @@ runTimeModifiable true;
                     self._stage_failure(node.node_id, job), job,
                     ranks=allocation.effective_ranks,
                     attempt=attempt_of(command.parameters))
+                if gather_problem and not stopped:
+                    explained = dict(explained, reason=gather_problem,
+                                     details=gather_problem)
                 reason = ('the run was cancelled before it finished' if stopped
                           else explained['reason'])
                 self._close_run_manifest(
                     record, status='cancelled' if stopped else 'failed',
                     reason=reason)
+                # DP-1236. What finished stays finished: each stage this run
+                # kept is recorded done, the interrupted node alone was rolled
+                # back (the executor's recovery point, or the parked root),
+                # and the run can be resumed from the last of them.
+                interrupted = self._keep_interrupted_run(
+                    session, command, record, node.node_id, stopped,
+                    stage_snapshots, resumed)
                 return OperationResult(
                     'failed', command.operation, session.revisions,
                     invalidated_outputs=('quality', 'exports'),
-                    warnings=tuple(seed_warnings),
+                    warnings=tuple(seed_warnings) + launch_warnings,
                     payload={'allocation': allocation.to_dict(),
                              'dag': dag.to_dict(), 'executions': executions,
                              'checkpoints': checkpoints,
                              'failed_node': node.node_id,
+                             'stage_snapshots': [
+                                 kept for kept in stage_snapshots
+                                 if kept is not None],
+                             'kept_stages': interrupted['kept_stages'],
+                             'recorded_stages': interrupted['recorded'],
+                             'resume': interrupted['resume'],
+                             **({'resumed': resumed} if resumed else {}),
                              'run_id': self._run_manifest_id(record),
                              **self._region_warnings_payload(seed_warnings),
                              # One failure shape, whichever engine wrote it
@@ -8739,6 +9533,11 @@ runTimeModifiable true;
                 # this, and a blocked run will name its fingerprint.
                 checkpoints.append(self._save_snap_checkpoint(
                     session, run_id=str(execution.to_payload().get('job_id') or '')))
+            if node.node_id in keeps:
+                # DP-1202. The case root holds this stage's own result now and
+                # the next node is about to overwrite it.
+                stage_snapshots.append(await self._capture_stage_snapshot(
+                    session, engine, keeps[node.node_id], execution))
         divergence = SnappyMeshingEngine.seal_divergence(
             revision_seal, SnappyMeshingEngine.revision_seal(
                 session.case_path,
@@ -8806,8 +9605,17 @@ runTimeModifiable true;
         # Plan 37 UF5. One pipeline run leaves only its finished mesh; that
         # is kept as the all-in-one stage, so it can be compared and a later
         # single-stage re-run knows the live mesh is not a stage input.
-        stage_snapshot = await self._capture_stage_snapshot(
-            session, engine, 'snappyHexMesh')
+        if resumed or any(stage in keeps.values()
+                          for stage in ('castellation', 'snap', 'layers')):
+            # DP-1202. The split route kept each stage as it finished.
+            # DP-1236: so did the run a resume carries on.
+            stage_snapshot = stage_snapshots[-1] if stage_snapshots else None
+        else:
+            stage_snapshot = await self._capture_stage_snapshot(
+                session, engine, 'snappyHexMesh')
+            stage_snapshots.append(stage_snapshot)
+        # DP-1236. A finished mesh leaves nothing to resume.
+        self._clear_pipeline_resume(session.case_path)
         self._close_run_manifest(
             record, status='succeeded',
             publication={'status': 'published',
@@ -8817,12 +9625,16 @@ runTimeModifiable true;
         return OperationResult(
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('quality', 'exports'),
-            warnings=tuple(seed_warnings),
+            warnings=tuple(seed_warnings) + launch_warnings,
             payload={'allocation': allocation.to_dict(), 'dag': dag.to_dict(),
+                     **({'oversubscribed': True} if launch_warnings else {}),
                      **self._region_warnings_payload(seed_warnings),
                      'run_manifest': record.document if record else {},
                      'stage_snapshot': stage_snapshot,
+                     'stage_snapshots': [kept for kept in stage_snapshots
+                                         if kept is not None],
                      'executions': executions,
+                     **({'resumed': resumed} if resumed else {}),
                      'qualification_mode': mode.value,
                      'checkpoints': checkpoints,
                      'mesh_state': reference.to_dict(),
@@ -9256,7 +10068,25 @@ runTimeModifiable true;
                 field.surface_key, box),
             box=box, h=field.h, external=external, field_key=field.key,
             spaces=payload['spaces']))
+        # Plan 37 #1 / #2: what the proposal would mesh that may surprise --
+        # the outside on a box flush with the geometry, both sides of one
+        # closed surface, or the outside shell of a duct.
+        # The key is there only when there is something to say.
+        placement = self._proposal_placement(
+            session, field, payload, inputs) if external else []
+        if placement:
+            payload['placement_warnings'] = placement
         return self._read_result(session, command, {**payload, **tags})
+
+    def _proposal_placement(self, session: CaseSession, field, payload,
+                            inputs) -> list[dict]:
+        """The placement warnings for the spaces a detection proposes."""
+        rows = {int(row['id']): row for row in payload.get('spaces') or ()}
+        seeds = [(f'space {space_id}', 'fluid', rows[space_id]['seed'])
+                 for space_id in payload.get('proposed') or ()
+                 if space_id in rows]
+        return self._placement_warnings(session, field, seeds, inputs,
+                                        external=True)
 
     @staticmethod
     def _detection_tags(session: CaseSession, command: Command) -> dict:
@@ -9509,8 +10339,19 @@ runTimeModifiable true;
             if len({rows[key]['type'] for key in group}) > 1:
                 for key in group:
                     rows[key]['clash'] = True
-        return self._read_result(session, command,
-                                 {'labelled': True, 'regions': rows})
+        # Plan 37 #1 / #2: the page says what the launch will warn about.
+        seeds = []
+        for key in sorted(regions, key=order):
+            try:
+                point = [float(value) for value in regions[key].vector('point')]
+            except Exception:  # noqa: BLE001 - an unreadable seed is no space
+                continue
+            seeds.append((rows[str(key)]['name'], rows[str(key)]['type'],
+                          point))
+        return self._read_result(session, command, {
+            'labelled': True, 'regions': rows,
+            'warnings': self._placement_warnings(
+                session, field, seeds, inputs)})
 
     async def _geometry_fluid_regions_apply(self, session: CaseSession,
                                             command: Command) -> OperationResult:
@@ -10373,6 +11214,9 @@ runTimeModifiable true;
         if excludes:
             warnings.extend(self._exclude_point_gate(session, excludes))
         warnings.extend(self._farfield_seed_gate(session, excludes))
+        # Plan 37 #1 / #2: a flush box under an outside seed, seeds on both
+        # sides of one closed surface, External on a duct -- said, not refused.
+        warnings.extend(self._placement_seed_gate(session))
         self._record_retained_estimate(session, excludes)
         return warnings
 
@@ -10533,6 +11377,88 @@ runTimeModifiable true;
                          'findings': [one.to_dict()
                                       for one in report.findings]})
         return [one.message for one in report.warnings]
+
+    @staticmethod
+    def _closed_surface_rows(session: CaseSession) -> list[dict]:
+        """``[{name, bbox, openings}]`` of every closed (watertight) geometry.
+
+        Plan 37 #2(c): ``openings`` are its faces named as an inlet or an
+        outlet, which make a closed surface a duct or a container rather
+        than a body the flow goes around.
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.geometry.patches.ops import (
+            boundary_category_for_name,
+        )
+
+        try:
+            entries = GeometryArtifactStore(session.case_path).entries()
+        except Exception:  # noqa: BLE001 - no geometry, nothing to name
+            return []
+        rows = []
+        for entry in entries:
+            diagnostics = entry.get('diagnostics') or {}
+            bbox = entry.get('bbox')
+            if not diagnostics.get('watertight') or not bbox:
+                continue
+            openings = []
+            for patch in entry.get('patches') or ():
+                name = str((patch or {}).get('name') or '')
+                category = boundary_category_for_name(
+                    name.strip().lower().replace(' ', '_'), default='wall')
+                if category in ('inlet', 'outlet'):
+                    openings.append(name)
+            try:
+                bbox = [float(value) for value in bbox]
+            except (TypeError, ValueError):
+                continue
+            rows.append({'name': str(entry.get('name')
+                                     or entry.get('geometry_id')),
+                         'bbox': bbox, 'openings': openings})
+        return rows
+
+    def _placement_warnings(self, session: CaseSession, field, seeds,
+                            inputs, *, external=False) -> list[dict]:
+        """Plan 37 #1 / #2: the flush-box, both-sides and duct warnings."""
+        from foammesh.core.mesh import fluid_regions, snappy_farfield
+
+        if field is None or inputs is None or not (seeds or external):
+            return []
+        _surfaces, geometry_bounds, box, base_cell = inputs
+        db = getattr(session.state, 'db', None)
+        try:
+            farfield = (snappy_farfield.active(db) is not None
+                        if db is not None else False)
+        except Exception:  # noqa: BLE001 - the case writer refuses the record
+            farfield = False
+        try:
+            return fluid_regions.placement_warnings(
+                field, seeds, box=box, geometry_bounds=geometry_bounds,
+                base_cell=base_cell,
+                closed_surfaces=self._closed_surface_rows(session),
+                farfield=farfield, external=external)
+        except Exception as error:  # noqa: BLE001 - never stops a launch
+            logger.warning('region placement not judged: %s', error)
+            return []
+
+    def _placement_seed_gate(self, session: CaseSession) -> list[str]:
+        """Plan 37 #1 / #2: what the launch's seeds mesh, said before it runs.
+
+        Warnings only: an outside seed on a box flush with the geometry, seeds
+        on both sides of one closed surface, and External on a duct.
+        """
+        try:
+            inputs = self._fluid_space_inputs(session)
+        except Exception:  # noqa: BLE001 - judged without the geometry
+            inputs = None
+        if inputs is None:
+            return []
+        seeds = self._region_seed_rows(session)
+        if not seeds:
+            return []
+        field = self._seed_space_field(session, inputs)
+        return [one['message'] for one in self._placement_warnings(
+            session, field, seeds, inputs)]
 
     @staticmethod
     def _exclude_point_rows(session: CaseSession) -> list:
@@ -10928,7 +11854,7 @@ runTimeModifiable true;
             operation=command.operation,
             argv=launch.argv,
             cwd=session.case_path,
-            timeout=command.parameters.get('timeout_seconds', 900),
+            timeout=_stage_timeout(command.parameters, 900),
             max_output_bytes=4 * 1024 * 1024,
             expected_artifacts=(ExpectedArtifact(
                 report_path, kind='quality-report',

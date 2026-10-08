@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QLabel
 from foammesh.view.facade_client import submit
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
 
+from . import background_estimate_label, level_cell_size
 from .base import SnappyTaskPage
 from .refinement_membership import (
     SURFACE, VOLUME, RefinementMembership, bound_groups, unbind_group,
@@ -61,16 +62,26 @@ class RefinementGroupPanel(ChildControlPanel):
             group = (payload.get('entity_id') if kind == 'create'
                      else parameters.get('entity_id'))
 
+            # DP-1190. A binding the facade refused (a step that locked
+            # while the editor was open) is reported, not dropped: the table
+            # is re-read either way, so it shows what the case holds.
+            refusals = []
+
             def finished() -> None:
                 self.refresh()
                 self.childrenChanged.emit()
-                self._close_write(write, True)
+                if refusals:
+                    self._close_write(write, False, refusals[0])
+                else:
+                    self._close_write(write, True)
 
             if kind == 'remove':
                 unbind_group(self._client, self._kind,
-                             parameters.get('entity_id'), then=finished)
+                             parameters.get('entity_id'), then=finished,
+                             refused=refusals.append)
             else:
-                self.membership.commit(group, then=finished)
+                self.membership.commit(group, then=finished,
+                                       refused=refusals.append)
 
         self._track_write(write, submit(self._client, operation, parameters,
                                         then=ran))
@@ -101,8 +112,19 @@ class SnappyCastellationPage(SnappyTaskPage):
     #: C31-11. A band grades the feature refinement of one surface group with
     #: distance, so it is read next to that group's row.
     BAND_COLUMNS = ('group_name', 'distance', 'level')
+    #: DP-1251. The level fields each collection's row editor carries, every
+    #: one of which gets a live "Cell size at level N" readout under it and a
+    #: tooltip on its table column.
+    SURFACE_LEVELS = ('surface_refinement.minimum_level',
+                      'surface_refinement.maximum_level',
+                      'feature_edge_refinement_level')
+    VOLUME_LEVELS = ('volume_refinement_level',)
+    BAND_LEVELS = ('level',)
 
     def build_sections(self, layout) -> None:
+        # DP-1251. One base cell for the four tables, re-read on each page
+        # refresh and each time a row editor opens (see `level_cell_size`).
+        self.cell_size_source = level_cell_size.BaseCellSource()
         # Plan 33 OF-05. The three tables open the column, in front of the
         # ceilings and flags the task declares: what is refined is the
         # decision this page is for, and how far the refiner may go before it
@@ -160,6 +182,18 @@ class SnappyCastellationPage(SnappyTaskPage):
         self.volume_panel.childrenChanged.connect(self.sync_volume_band_groups)
         layout.insertWidget(3, self.volume_band_panel)
 
+        # DP-1251. MEASURED before: the four row editors asked for six level
+        # fields between them and said nothing about the cell any of them
+        # makes; the legacy dialogs had said it since R175.
+        self.level_readouts = {}
+        for panel, keys in ((self.surface_panel, self.SURFACE_LEVELS),
+                            (self.volume_panel, self.VOLUME_LEVELS),
+                            (self.band_panel, self.BAND_LEVELS),
+                            (self.volume_band_panel, self.BAND_LEVELS)):
+            self.level_readouts[panel.collection_id] = (
+                level_cell_size.attach_readouts(
+                    panel, keys, self.cell_size_source))
+
         # DP-490. A group bound to no geometry is saved, listed with its
         # levels, and never written: said here, where the list reads as
         # though it were configured. Hidden while every group refines
@@ -170,10 +204,33 @@ class SnappyCastellationPage(SnappyTaskPage):
         self.unbound_label.setVisible(False)
         layout.insertWidget(4, self.unbound_label)  # DP-586: after the bands
         self.sync_unbound_groups()
+        # Plan 37 #7. The cells this stage starts from and the RAM they take,
+        # the same estimate the base-grid page shows.
+        self.estimate_label = QLabel(self)
+        background_estimate_label.prepare(self.estimate_label, 'castellationBackgroundEstimate')
+        layout.insertWidget(5, self.estimate_label)
+        self.refresh_estimate()
 
     def refresh(self) -> None:
+        source = getattr(self, 'cell_size_source', None)
+        if source is not None:
+            # DP-1251. The base grid may have changed since the last visit;
+            # if it has, the level tooltips on the four tables are re-said.
+            before = source.base()
+            if source.refresh() != before:
+                for name in ('surface_panel', 'volume_panel', 'band_panel',
+                             'volume_band_panel'):
+                    panel = getattr(self, name, None)
+                    if panel is not None:
+                        panel.refresh()
         super().refresh()
         self.sync_unbound_groups()
+        self.refresh_estimate()
+
+    def refresh_estimate(self):
+        """Plan 37 #7: the base-grid page's estimate, said here too."""
+        return background_estimate_label.show(
+            getattr(self, 'estimate_label', None), self._client)
 
     def unbound_groups(self) -> list:
         """The names of the refinement rows no geometry row is bound to."""

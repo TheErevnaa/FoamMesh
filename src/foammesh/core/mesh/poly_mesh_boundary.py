@@ -713,7 +713,16 @@ def _read_boundary(mesh: Path, *,
         payload = _payload(raw, _FOAMFILE.search(raw).end())
     else:
         _header, payload = _open_member(mesh, 'boundary')
-    count, open_at = _leading_count(payload, 'boundary')
+    try:
+        count, open_at = _leading_count(payload, 'boundary')
+    except PolyMeshReadError as error:
+        # PyFoam rewrites a patch table as a bare ``( ... )`` with no count
+        # (an edited patch type does), and OpenFOAM reads that form too: a
+        # PtrList without a size is read to its closing paren.
+        open_at = payload.find(b'(')
+        if open_at < 0 or payload[:open_at].split():
+            raise error
+        count = None
     patches = []
     for name, body in _NAMED_DICT.findall(payload[open_at:]):
         entries = {
@@ -733,7 +742,7 @@ def _read_boundary(mesh: Path, *,
             start_face=start_face, n_faces=n_faces,
             neighbour_patch=entries.get('neighbourPatch'),
             entries=entries))
-    if len(patches) != count:
+    if count is not None and len(patches) != count:
         raise PolyMeshReadError(
             'malformed_boundary',
             f'boundary declares {count} patches but holds {len(patches)}')

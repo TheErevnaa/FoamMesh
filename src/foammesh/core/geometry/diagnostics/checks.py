@@ -443,22 +443,19 @@ def shells_and_fragments(polydata) -> Finding:
     connectivity = vtkPolyDataConnectivityFilter()
     connectivity.SetInputData(polydata)
     connectivity.SetExtractionModeToAllRegions()
+    # DP-1161. Each shell used to be extracted again with its own
+    # SpecifiedRegions pass over the whole surface, so S shells cost S full
+    # passes: 8000 separate cubes took 74 s here. The coloured pass already
+    # says which shell every point is in, so the counts and areas are read off
+    # it in one go, summed in the same cell order the extraction used.
+    connectivity.ColorRegionsOn()
     connectivity.Update()
     regions = int(connectivity.GetNumberOfExtractedRegions())
+    cells, areas = _shell_cells_and_areas(connectivity, regions)
     sizes, region_metrics = [], []
     for region in range(regions):
-        selected = vtkPolyDataConnectivityFilter()
-        selected.SetInputData(polydata)
-        selected.SetExtractionModeToSpecifiedRegions()
-        selected.AddSpecifiedRegion(region)
-        selected.Update()
-        region_surface = selected.GetOutput()
-        cell_count = int(region_surface.GetNumberOfCells())
-        area = sum(_triangle_area(
-            *(region_surface.GetPoint(region_surface.GetCell(cell_id).GetPointId(i))
-              for i in range(3)))
-            for cell_id in range(region_surface.GetNumberOfCells())
-            if region_surface.GetCell(cell_id).GetNumberOfPoints() == 3)
+        cell_count = int(cells[region])
+        area = areas[region]
         sizes.append(cell_count)
         region_metrics.append({'region_id': region, 'cells': cell_count, 'area': area})
     small_limit = max(10, int(polydata.GetNumberOfCells() * .001))
@@ -475,6 +472,59 @@ def shells_and_fragments(polydata) -> Finding:
         repairable_by=('tess.drop_fragments',) if fragments else (),
         engine_impact={'snappy': 'Small disconnected shells can create unwanted refinement.'},
         details={'regions': region_metrics})
+
+
+def _shell_cells_and_areas(connectivity, regions: int):
+    """Cells and triangle area of each shell of a coloured connectivity pass.
+
+    The same numbers the per-shell extraction gave: every cell counts, and
+    every cell with exactly three points adds its triangle area, taken in the
+    order that extraction visited them (verts, lines, polys, strips, each in
+    input order) so the float sums come out bit for bit the same (DP-1161).
+    """
+    import numpy as np
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    surface = connectivity.GetOutput()
+    cells = np.zeros(regions, dtype=np.int64)
+    areas: list = [0] * regions
+    points = surface.GetPoints()
+    named = surface.GetPointData().GetArray('RegionId')
+    if regions == 0 or points is None or named is None:
+        return cells, areas
+    coordinates = vtk_to_numpy(points.GetData()).astype(float)
+    point_region = vtk_to_numpy(named).astype(np.int64)
+    triangle_region, triangle_corners = [], []
+    for getter in ('GetVerts', 'GetLines', 'GetPolys', 'GetStrips'):
+        kind = getattr(surface, getter)()
+        if kind is None or kind.GetNumberOfCells() == 0:
+            continue
+        offsets = vtk_to_numpy(kind.GetOffsetsArray()).astype(np.int64)
+        corners = vtk_to_numpy(kind.GetConnectivityArray()).astype(np.int64)
+        lengths = np.diff(offsets)
+        filled = lengths > 0
+        region = np.full(lengths.size, -1, dtype=np.int64)
+        region[filled] = point_region[corners[offsets[:-1][filled]]]
+        known = (region >= 0) & (region < regions)
+        cells += np.bincount(region[known], minlength=regions)
+        three = known & (lengths == 3)
+        starts = offsets[:-1][three]
+        triangle_region.append(region[three])
+        triangle_corners.append(np.stack(
+            (corners[starts], corners[starts + 1], corners[starts + 2]), axis=1))
+    if triangle_region:
+        region = np.concatenate(triangle_region)
+        corners = np.concatenate(triangle_corners)
+        a, b, c = (coordinates[corners[:, i]] for i in range(3))
+        u, v = b - a, c - a
+        x = u[:, 1] * v[:, 2] - u[:, 2] * v[:, 1]
+        y = u[:, 2] * v[:, 0] - u[:, 0] * v[:, 2]
+        z = u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]
+        area = .5 * np.sqrt(x * x + y * y + z * z)
+        total = np.bincount(region, weights=area, minlength=regions)
+        present = np.bincount(region, minlength=regions) > 0
+        areas = [float(total[i]) if present[i] else 0 for i in range(regions)]
+    return cells, areas
 
 
 def unit_sanity(polydata) -> Finding:
@@ -727,6 +777,200 @@ def _within_shell_intersections(polydata, budget, *, sample_limit: int = 50):
     return found, locations, cells
 
 
+def _cancelled_before_pairs(count, total_pairs, region):
+    """The finding for a Cancel pressed while the shells were being scanned."""
+    return Finding(
+        'self_intersections', 0, Severity.INFO,
+        f'Not evaluated: cancelled after {region:,} of {count:,} shells.',
+        evaluated=False,
+        details={'cancelled': True, 'pairs_tested': 0,
+                 'pairs_total': total_pairs, 'shells': count,
+                 'within_shell_evaluated': False, 'within_shell': 0,
+                 'triangles_tested': 0},
+        engine_impact={'snappy': 'Intersecting skins can make region selection ambiguous.'})
+
+
+class _ShellIndex:
+    """The shells of a surface, cut out one at a time and only when asked.
+
+    DP-1159. Built from the output of a ``ColorRegions`` connectivity filter:
+    the cells of each shell are found by a stable sort on their region id, so
+    a shell keeps its cells in the order the surface had them -- the order a
+    ``SpecifiedRegions`` extraction gave -- and it carries only the points its
+    own cells use. Sizes and bounds are numpy reductions over the whole
+    surface, so neither needs any shell built.
+    """
+
+    _CELL_KINDS = (('GetVerts', 'SetVerts'), ('GetLines', 'SetLines'),
+                   ('GetPolys', 'SetPolys'), ('GetStrips', 'SetStrips'))
+
+    #: Shells kept built at once. A pair needs two, and the sweep reuses the
+    #: lower one across its whole run.
+    _CACHED = 16
+
+    def __init__(self, connectivity, count):
+        import numpy as np
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        surface = connectivity.GetOutput()
+        self._count = int(count)
+        points = surface.GetPoints()
+        self._coordinates = (vtk_to_numpy(points.GetData()) if points is not None
+                             else np.zeros((0, 3)))
+        point_region = vtk_to_numpy(
+            surface.GetPointData().GetArray('RegionId')).astype(np.int64)
+        owner = np.full(self._coordinates.shape[0], -1, dtype=np.int64)
+        sizes = np.zeros(self._count, dtype=np.int64)
+        self._kinds = []
+        for getter, setter in self._CELL_KINDS:
+            cells = getattr(surface, getter)()
+            if cells is None or cells.GetNumberOfCells() == 0:
+                continue
+            offsets = vtk_to_numpy(cells.GetOffsetsArray()).astype(np.int64)
+            corners = vtk_to_numpy(cells.GetConnectivityArray()).astype(np.int64)
+            lengths = np.diff(offsets)
+            region = np.full(lengths.size, -1, dtype=np.int64)
+            filled = lengths > 0
+            region[filled] = point_region[corners[offsets[:-1][filled]]]
+            region[(region < 0) | (region >= self._count)] = -1
+            owner[corners] = np.repeat(region, lengths)
+            sizes += np.bincount(region[region >= 0], minlength=self._count)
+            order = np.argsort(region, kind='stable')
+            edges = np.searchsorted(region[order], np.arange(self._count + 1),
+                                    side='left')
+            self._kinds.append((setter, offsets, corners, order, edges))
+        self.sizes = sizes
+        lower = np.full((self._count, 3), np.inf)
+        upper = np.full((self._count, 3), -np.inf)
+        used = np.flatnonzero(owner >= 0)
+        if used.size:
+            by_region = used[np.argsort(owner[used], kind='stable')]
+            regions = owner[by_region]
+            starts = np.flatnonzero(np.r_[True, regions[1:] != regions[:-1]])
+            values = self._coordinates[by_region].astype(float)
+            lower[regions[starts]] = np.minimum.reduceat(values, starts, axis=0)
+            upper[regions[starts]] = np.maximum.reduceat(values, starts, axis=0)
+        self.lower, self.upper = lower, upper
+        self._cache: dict = {}
+
+    def shell(self, region: int):
+        """One shell as its own compact surface."""
+        cached = self._cache.get(region)
+        if cached is not None:
+            return cached
+        import numpy as np
+        from vtkmodules.util.numpy_support import (numpy_to_vtk,
+                                                   numpy_to_vtkIdTypeArray)
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkCommonDataModel import vtkCellArray
+
+        pieces = []
+        for setter, offsets, corners, order, edges in self._kinds:
+            chosen = order[edges[region]:edges[region + 1]]
+            lengths = offsets[chosen + 1] - offsets[chosen]
+            total = int(lengths.sum())
+            steps = np.arange(total) - np.repeat(np.cumsum(lengths) - lengths,
+                                                 lengths)
+            ids = corners[np.repeat(offsets[chosen], lengths) + steps]
+            pieces.append((setter, lengths, ids))
+        used = np.unique(np.concatenate([ids for _, _, ids in pieces])
+                         if pieces else np.zeros(0, dtype=np.int64))
+        shell = vtkPolyData()
+        points = vtkPoints()
+        points.SetData(numpy_to_vtk(
+            np.ascontiguousarray(self._coordinates[used]), deep=True))
+        shell.SetPoints(points)
+        for setter, lengths, ids in pieces:
+            if lengths.size == 0:
+                continue
+            offsets = np.concatenate(([0], np.cumsum(lengths))).astype(np.int64)
+            cells = vtkCellArray()
+            cells.SetData(
+                numpy_to_vtkIdTypeArray(offsets, deep=True),
+                numpy_to_vtkIdTypeArray(
+                    np.searchsorted(used, ids).astype(np.int64), deep=True))
+            getattr(shell, setter)(cells)
+        if len(self._cache) >= self._CACHED:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[region] = shell
+        return shell
+
+    def forget(self) -> None:
+        self._cache.clear()
+
+    def sweep(self) -> '_BoundsSweep':
+        return _BoundsSweep(self.lower, self.upper, self.sizes)
+
+
+class _BoundsSweep:
+    """Shell pairs whose bounding boxes meet, without listing every pair.
+
+    DP-1159. Sort and sweep: with the boxes ordered by their low edge on one
+    axis, the only later boxes that can reach box ``p`` are the run up to the
+    first one starting beyond its high edge, which ``searchsorted`` finds for
+    every box at once. The axis is the one that leaves the shortest runs. The
+    full three-axis overlap test then runs over each run as a numpy mask, so
+    memory is one run at a time, never the pair list. Boxes that only touch
+    count as meeting, so no pair that could share a point is skipped.
+    """
+
+    def __init__(self, lower, upper, sizes):
+        import numpy as np
+
+        self.lower, self.upper = lower, upper
+        self.sizes = np.asarray(sizes, dtype=float)
+        count = lower.shape[0]
+        best = None
+        for axis in range(3):
+            order = np.argsort(lower[:, axis], kind='stable')
+            ends = np.searchsorted(lower[order, axis], upper[order, axis],
+                                   side='right')
+            runs = int(np.maximum(ends - np.arange(count) - 1, 0).sum())
+            if best is None or runs < best[0]:
+                best = (runs, order, ends)
+        _, self.order, self.ends = best
+
+    def _run(self, position):
+        import numpy as np
+
+        index = int(self.order[position])
+        others = self.order[position + 1:max(int(self.ends[position]),
+                                             position + 1)]
+        if others.size:
+            meets = (np.all(self.lower[others] <= self.upper[index], axis=1)
+                     & np.all(self.upper[others] >= self.lower[index], axis=1))
+            others = others[meets]
+        return index, others
+
+    def count(self, budget):
+        """How many pairs meet and their work units; stops on Cancel."""
+        pairs, units = 0, 0.0
+        for position in range(self.order.size):
+            if position % 1024 == 0 and budget.cancelled:
+                break
+            index, others = self._run(position)
+            pairs += int(others.size)
+            units += self.sizes[index] * float(self.sizes[others].sum())
+        return pairs, units
+
+    def pairs(self, budget):
+        """The meeting pairs, lowest shell first within each, made lazily."""
+        import numpy as np
+
+        for position in range(self.order.size):
+            # Only Cancel is polled here. The sweep is the cheap part, already
+            # run once by `count`; the allowance is spent on the pairs it
+            # yields, and the caller checks in before each of those.
+            if position % 1024 == 0 and budget.cancelled:
+                from .budget import Cancelled
+
+                raise Cancelled(f'{budget.check} cancelled by request')
+            index, others = self._run(position)
+            for other in np.sort(others):
+                other = int(other)
+                yield (index, other) if index < other else (other, index)
+
+
 def self_intersections(polydata, *, triangle_limit: int | None = None,
                        budget=None) -> Finding:
     """Pairwise shell intersections, under a budget.
@@ -753,6 +997,9 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
     connectivity = vtkPolyDataConnectivityFilter()
     connectivity.SetInputData(polydata)
     connectivity.SetExtractionModeToAllRegions()
+    # DP-1159. The region id of every point, so each shell can be cut out on
+    # its own -- and only when it is needed -- instead of copied up front.
+    connectivity.ColorRegionsOn()
     connectivity.Update()
     count = int(connectivity.GetNumberOfExtractedRegions())
 
@@ -789,43 +1036,72 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
                      'triangles_tested': tested,
                      'shells': count, 'pairs_tested': 0},
             engine_impact={'snappy': 'Intersecting skins can make region selection ambiguous.'})
-    regions = []
-    for region in range(count):
-        selected = vtkPolyDataConnectivityFilter()
-        selected.SetInputData(polydata)
-        selected.SetExtractionModeToSpecifiedRegions()
-        selected.AddSpecifiedRegion(region)
-        selected.Update()
-        copy = vtkPolyData()
-        copy.DeepCopy(selected.GetOutput())
-        regions.append(copy)
+    # DP-1159. One shell at a time, and only the pairs whose boxes meet.
+    # This used to keep a `SpecifiedRegions` copy of every shell, and each
+    # copy carried every point of the whole surface, so memory was shells x
+    # points x 24 bytes; it then wrote out every shell pair as a Python list
+    # before the first budget check. MEASURED: a 1 MB triangle-soup OBJ
+    # peaked at 10.3 GB and 8,000 separate cubes at 9.2 GB, and either could
+    # die in DeepCopy or raise MemoryError on the import thread.
+    shells = _ShellIndex(connectivity, count)
+    if budget is None:
+        from .budget import budget_from_settings
+
+        budget = budget_from_settings('self_intersections')
+    budget.check = budget.check or 'self_intersections'
+    sizes = shells.sizes
+    total_pairs = count * (count - 1) // 2
 
     within = 0, [], 0
-    for shell in regions:
-        one = _within_shell_intersections(shell, within_budget)
+    for region in range(count):
+        if budget.cancelled:
+            return _cancelled_before_pairs(count, total_pairs, region)
+        try:
+            within_budget.check_in(
+                progress=f'{region:,} of {count:,} shells')
+        except (BudgetExceeded, Cancelled):
+            within = None
+            break
+        if sizes[region] < 2:
+            # Nothing to cross; this is what the scan would say without
+            # building the shell at all.
+            within = within[0], within[1], within[2] + int(sizes[region])
+            continue
+        one = _within_shell_intersections(shells.shell(region), within_budget)
         if one is None:
             within = None
             break
         within = (within[0] + one[0],
                   within[1] + one[1][:max(0, 50 - len(within[1]))],
                   within[2] + one[2])
+    shells.forget()
 
-    sizes = [float(item.GetNumberOfCells()) for item in regions]
-    if budget is None:
-        from .budget import budget_from_settings
-
-        budget = budget_from_settings('self_intersections')
-    budget.check = budget.check or 'self_intersections'
-    budget.workload = pairwise_workload(sizes)
-    pairs = [(left, right) for left in range(len(regions))
-             for right in range(left + 1, len(regions))]
+    # Two shells whose boxes do not meet cannot cross, so those pairs are
+    # decided without running the intersection. The sweep runs along the axis
+    # that leaves the fewest boxes overlapping, and the pairs are counted
+    # first and generated lazily second, so nothing here is O(shells^2) in
+    # memory.
+    sweep = shells.sweep()
+    candidate_pairs, candidate_units = sweep.count(budget)
+    budget.workload = candidate_units
+    by_bounds = total_pairs - candidate_pairs
     budget.report(
-        f'checking {count_text(len(pairs), "shell pair")} across '
+        f'checking {count_text(candidate_pairs, "shell pair")} whose bounds '
+        f'meet, of {count_text(total_pairs, "shell pair")} across '
         f'{cells:,} triangles', 0.0)
 
     intersections = 0
-    locations = []
+    found_at: dict[tuple[int, int], list] = {}
     done_units = 0.0
+    tested = 0
+
+    def sampled_locations():
+        points = []
+        for key in sorted(found_at):
+            points.extend(found_at[key][:max(0, 50 - len(points))])
+            if len(points) >= 50:
+                break
+        return points
 
     def partial_finding(said, extra):
         """DP-435. What the within-shell half found is knowledge too.
@@ -838,7 +1114,7 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
         been looked at. Each half now says for itself whether it ran.
         """
         crossed = 0 if within is None else within[0]
-        points = list(locations)
+        points = sampled_locations()
         if within is not None:
             points.extend(within[1][:max(0, 50 - len(points))])
         if crossed:
@@ -849,7 +1125,9 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
         details.update({'within_shell_evaluated': within is not None,
                         'within_shell': crossed,
                         'triangles_tested': 0 if within is None else within[2],
-                        'shells': count})
+                        'shells': count,
+                        'pairs_by_bounds': by_bounds,
+                        'pairs_intersected': tested})
         return Finding(
             'self_intersections', intersections + crossed,
             Severity.ERROR if crossed else Severity.INFO,
@@ -857,40 +1135,52 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
             repairable_by=('tess.detect_intersections',) if crossed else (),
             evaluated=False, details=details,
             engine_impact={'snappy': 'Intersecting skins can make region selection ambiguous.'})
-    for index, (left, right) in enumerate(pairs, 1):
-        progress = f'{index - 1} of {len(pairs)} shell pairs'
+
+    pending = sweep.pairs(budget)
+    while True:
+        progress = f'{tested} of {candidate_pairs} shell pairs'
         try:
+            # The next pair first: when every pair was decided by its bounds
+            # there is nothing left to spend an allowance on, and checking in
+            # before finding that out reported a finished check as unrun.
+            pair = next(pending, None)
+            if pair is None:
+                break
             budget.check_in(progress=progress)
         except BudgetExceeded as error:
             # Partial knowledge is still knowledge: report what was found and
             # say plainly that the rest was not looked at, and why.
             return partial_finding(
                 budget.not_evaluated_reason(progress),
-                {'partial': True, 'pairs_tested': index - 1,
-                 'pairs_total': len(pairs), 'workload': budget.workload,
+                {'partial': True, 'pairs_tested': by_bounds + tested,
+                 'pairs_total': total_pairs, 'workload': budget.workload,
                  'limited_by': budget.limited_by, 'reason': str(error)})
         except Cancelled:
             return partial_finding(
                 f'Not evaluated: cancelled after {progress}.',
-                {'cancelled': True, 'pairs_tested': index - 1,
-                 'pairs_total': len(pairs)})
-
-        outcome = _intersect_pair(regions[left], regions[right], budget)
+                {'cancelled': True, 'pairs_tested': by_bounds + tested,
+                 'pairs_total': total_pairs})
+        left, right = pair
+        outcome = _intersect_pair(shells.shell(left), shells.shell(right),
+                                  budget)
         if outcome is None:
             return partial_finding(
                 budget.not_evaluated_reason(progress),
-                {'partial': True, 'pairs_tested': index - 1,
-                 'pairs_total': len(pairs), 'workload': budget.workload,
+                {'partial': True, 'pairs_tested': by_bounds + tested,
+                 'pairs_total': total_pairs, 'workload': budget.workload,
                  'limited_by': budget.limited_by,
                  'reason': 'a single shell pair exceeded the budget'})
         found, sampled = outcome
+        tested += 1
         intersections += found
-        locations.extend(
-            tuple(point) for point in sampled[:max(0, 50 - len(locations))])
-        done_units += sizes[left] * sizes[right]
+        if found or sampled:
+            found_at[pair] = [tuple(point) for point in sampled[:50]]
+        done_units += float(sizes[left]) * float(sizes[right])
         budget.observe(done_units)
-        budget.report(f'{index} of {len(pairs)} shell pairs',
-                      index / max(len(pairs), 1))
+        budget.report(f'{tested} of {candidate_pairs} shell pairs',
+                      tested / max(candidate_pairs, 1))
+    shells.forget()
+    locations = sampled_locations()
 
     crossings = 0 if within is None else within[0]
     if within is not None:
@@ -918,8 +1208,9 @@ def self_intersections(polydata, *, triangle_limit: int | None = None,
         # (band 0), so suggesting it is never destructive.
         tuple(locations[:50]), repairable_by=('tess.detect_intersections',),
         evaluated=within is not None,
-        details={'pairs_tested': len(pairs), 'workload': budget.workload,
-                 'shells': count,
+        details={'pairs_tested': total_pairs, 'workload': budget.workload,
+                 'shells': count, 'pairs_by_bounds': by_bounds,
+                 'pairs_intersected': tested,
                  'within_shell_evaluated': within is not None,
                  'within_shell': crossings,
                  'triangles_tested': 0 if within is None else within[2]},

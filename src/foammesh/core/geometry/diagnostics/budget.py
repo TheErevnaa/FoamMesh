@@ -667,9 +667,9 @@ def pairwise_workload(sizes) -> float:
     over the pairs -- not the total triangle count, which is what the guard
     this replaces used and why it protected the wrong models.
     """
+    # DP-1159. The sum of products over pairs is ((sum)^2 - sum of squares)/2,
+    # which is one pass rather than a Python double loop over every pair --
+    # 8,000 shells made that loop 32 million iterations before anything ran.
     sizes = [float(value) for value in sizes]
-    total = 0.0
-    for left in range(len(sizes)):
-        for right in range(left + 1, len(sizes)):
-            total += sizes[left] * sizes[right]
-    return total
+    total = sum(sizes)
+    return max(0.0, (total * total - sum(value * value for value in sizes)) / 2.0)

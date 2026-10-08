@@ -43,6 +43,7 @@ from foammesh.view.workflow_controls.conditional_fields import (
     condition_context,
 )
 
+from . import background_estimate_label
 from .base import SnappyTaskPage
 
 
@@ -156,6 +157,12 @@ class SnappyBaseGridPage(SnappyTaskPage):
         # now, where it is read by someone who wants it and skipped by
         # someone who does not.
         layout.insertWidget(0, self._build_mode_choice())
+        # Plan 37 #7. What the sizing above costs, under the choice it
+        # follows from: the far-field and near-body cells, the cells
+        # castellation starts from, and the RAM that takes.
+        self._estimate_label = QLabel(self)
+        background_estimate_label.prepare(self._estimate_label, 'baseGridBackgroundEstimate')
+        layout.insertWidget(1, self._estimate_label)
         self._grading_box = self._build_grading()
         layout.addWidget(self._grading_box)
         self._faces_box = self._build_faces()
@@ -217,7 +224,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
         collections are not read while the box is derived, so each set is
         here only while the run reads it. DP-580: so are the fields that size
         the derived box -- blocks written by hand carry their own counts and
-        grading, and only Scale is read in both modes (``background_topology``).
+        grading. Plan 37 #9: Scale is read only for the blocks written by
+        hand, and its label says what it does to them in that mode.
         """
         custom = self.authoring_is_chosen()
         for name in ('_faces_box', '_grading_box'):
@@ -450,9 +458,10 @@ class SnappyBaseGridPage(SnappyTaskPage):
     #: DP-579. The field whose value decides which of the two sizings apply.
     SIZING_MODE = 'meshing.base_grid.sizing_mode'
     #: DP-580 (field audit 0924 snappy-front D7). What sizes the one derived
-    #: box, and is not read once the blocks are written by hand. Scale is
-    #: read by both; the bounding Hex6 still keeps its volume out of
-    #: ``geometry{}``.
+    #: box, and is not read once the blocks are written by hand. The
+    #: bounding Hex6 still keeps its volume out of ``geometry{}``. Scale is
+    #: the other way round: read only for the blocks written by hand
+    #: (`SCALE`).
     DERIVED_BOX_FIELDS = (
         'meshing.base_grid.sizing_mode', 'meshing.base_grid.target_cell_size',
         'meshing.base_grid.cells.x', 'meshing.base_grid.cells.y',
@@ -462,12 +471,46 @@ class SnappyBaseGridPage(SnappyTaskPage):
         'meshing.base_grid.grading_fine.z',
         'meshing.base_grid.standoff')
 
+    #: Plan 37 #9. blockMeshDict's ``scale``. The one block around the
+    #: geometry is held at 1 by the writer (`CaseBuilder._block_scale`): its
+    #: vertices are already metres, and a factor moved the block off the
+    #: geometry, which is never scaled, so Scale is off in that mode with the
+    #: reason, the way the Gmsh import scaling is (DP-631). Vertices written
+    #: by hand are typed in the user's unit, and Scale converts them
+    #: (`CaseBuilder.authored_scale`), so it is on in that mode and its own
+    #: row label says what it does there (the column carries no paragraphs).
+    SCALE = 'meshing.base_grid.scale'
+    SCALE_REASON = (
+        'Held at 1 for the one block around the geometry. The geometry is put '
+        'in metres when it is imported, and the block is written in metres '
+        'around it; a factor here moved and resized the block off the '
+        'geometry. To mesh a part drawn in another unit, re-import it with '
+        'that unit. Scale applies to blocks you write yourself.')
+    SCALE_IGNORED = 'This case saved a Scale of {value}; it is not applied.'
+    SCALE_LABEL = 'Scale × typed vertices'
+    SCALE_APPLIES = (
+        'Scale multiplies the vertices you typed: blockMesh builds every '
+        'vertex times Scale, in metres. Typed in millimetres, set it to '
+        '0.001.')
+
+    def scale_reason(self, stored) -> str:
+        """Why Scale is off, naming an old project's value once it differs."""
+        reason = self.tr(self.SCALE_REASON)
+        try:
+            ignored = stored not in (None, '') and float(stored) != 1.0
+        except (TypeError, ValueError):
+            ignored = True
+        if ignored:
+            reason += ' ' + self.tr(self.SCALE_IGNORED).format(value=stored)
+        return reason
+
     def reload_values(self) -> None:
         super().reload_values()
         # DP-580. The shared rule judged the clauses from the saved values
         # only; the hand-written-blocks choice is this page's, so it is
         # applied again over it.
         self._refresh_sizing_rows()
+        self.refresh_estimate()
 
     def _on_field_changed(self, field_id: str, value) -> None:
         super()._on_field_changed(field_id, value)
@@ -476,6 +519,28 @@ class SnappyBaseGridPage(SnappyTaskPage):
         if field_id in GRADING_FIELDS or field_id == self.SIZING_MODE \
                 or field_id.startswith('meshing.base_grid.cells.'):
             self._refresh_grading_report()
+        if field_id in self.DERIVED_BOX_FIELDS:
+            self.refresh_estimate()
+
+    def refresh_derived(self) -> None:
+        """Re-judge the sizing rows and the estimate against the edits.
+
+        DP-1222. `refresh_keeping_edits` puts the typed values back after the
+        re-read and then applies the shared applicability rule, which knows
+        nothing of this page's hand-written-blocks choice (DP-580) and judges
+        a typed sizing mode as if it were not typed; and the estimate it had
+        just drawn was the stored sizing's. Both are this page's to redo.
+        """
+        if getattr(self, '_editors', None):
+            self._refresh_sizing_rows()
+            self._refresh_grading_report()
+        super().refresh_derived()
+
+    def refresh_estimate(self):
+        """Plan 37 #7: say what the background will hold, edits included."""
+        return background_estimate_label.show(
+            getattr(self, '_estimate_label', None), self._client,
+            getattr(self, '_pending', None))
 
     def _refresh_sizing_rows(self) -> None:
         """Judge the page's clauses against the mode as it is being edited.
@@ -505,11 +570,28 @@ class SnappyBaseGridPage(SnappyTaskPage):
                     'This sizes the one block around the geometry. The '
                     'blocks written by hand carry their own cell counts and '
                     'grading, so the run will not read it.')
+            if field_id == self.SCALE and not custom:
+                applies, reason = False, self.scale_reason(
+                    self._stored_scale(editor))
             editor.setApplicability(applies, reason)
+            if field_id == self.SCALE and applies:
+                editor.label.setText(self.tr(self.SCALE_LABEL))
+                editor._editor.setToolTip(self.tr(self.SCALE_APPLIES))
+                editor.label.setToolTip(self.tr(self.SCALE_APPLIES))
+                editor._editor.setAccessibleDescription(
+                    self.tr(self.SCALE_APPLIES))
             if not applies:
                 inactive[field_id] = reason
                 self._pending.pop(field_id, None)
         self._inactive_fields = inactive
+
+    def _stored_scale(self, editor):
+        """The Scale this case saved, or ``None`` when it cannot be read."""
+        try:
+            return self._client.field_values((self.SCALE,))[self.SCALE]
+        except Exception:                                    # noqa: BLE001
+            value = getattr(editor, 'value', None)
+            return value() if callable(value) else None
 
     # -- the authored multi-block topology --------------------------------- #
 
@@ -611,6 +693,7 @@ class SnappyBaseGridPage(SnappyTaskPage):
     def refresh(self) -> None:
         super().refresh()
         self.sync_authoring()
+        self.refresh_estimate()
 
 
 class BlockPanel(ChildControlPanel):

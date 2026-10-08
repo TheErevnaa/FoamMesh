@@ -502,6 +502,14 @@ QGroupBox#groupBox_9 {
     background: {{background.surface}};
     border: none;
 }
+/* DP-1208. The base grid's faces are framed cards inside "Background faces",
+   so under this stylesheet they sat inside two 1 px borders where every other
+   form on the page sits inside one: MEASURED, their editors at x=123 against
+   the page's 122. The cards carry frames of their own and the title says
+   where the section starts, so the outer box keeps its title and no frame. */
+QGroupBox#baseGridFacesBox {
+    border: none;
+}
 /* One place decides how a page heading is set, so that every heading
  * on every page is set the same way and no page has to pin a size of
  * its own.  A label named as a page heading belongs in this list. */

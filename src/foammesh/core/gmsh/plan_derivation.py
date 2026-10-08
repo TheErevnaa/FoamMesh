@@ -1291,10 +1291,21 @@ def resolve_parallel_threads(resource_policy, *, requested: int = 0) -> int:
     the user had set. The count is asked of the shared policy function so that
     the page, the plan and the job cannot answer differently.
     """
-    from foammesh.core.execution.resources import effective_cpu_count
+    from foammesh.core.execution.resources import (
+        effective_cpu_count, meshing_cpu_count, meshing_host,
+    )
 
-    return max(1, min(64, int(effective_cpu_count(
-        resource_policy, requested=max(0, int(requested or 0))))))
+    # DP-1233. Auto was this process's logical CPUs capped at 64. Gmsh runs
+    # in WSL, so Auto is that host's cores less one (``meshing_cpu_count``,
+    # the snappy rule's thread form), and there is no thread cap: a count
+    # asked for is clamped only by the CPUs the host has.
+    host = meshing_host()
+    cpu = meshing_cpu_count(resource_policy, engine='gmsh',
+                            requested=max(0, int(requested or 0)), host=host)
+    if cpu.auto:
+        return max(1, int(cpu.count))
+    return max(1, int(effective_cpu_count(
+        resource_policy, requested=cpu.count, facts=host.resource_facts())))
 
 
 def derive_parallel(values: dict, algorithms: Algorithms | None = None,
@@ -1311,8 +1322,8 @@ def derive_parallel(values: dict, algorithms: Algorithms | None = None,
         # decides. Either way one function answers.
         threads = resolve_parallel_threads(
             resource_policy, requested=threads if threads > 1 else 0)
-    if not 1 <= threads <= 64:
-        raise PlanDerivationError(f'threads {threads} is outside 1-64')
+    if threads < 1:
+        raise PlanDerivationError(f'threads {threads} is below 1')
     volume_threaded = (algorithms is None
                        or algorithms.volume in THREADED_VOLUME_ALGORITHMS)
     return Parallel(threads=threads, volume_threaded=volume_threaded)

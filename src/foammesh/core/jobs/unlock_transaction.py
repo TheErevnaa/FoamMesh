@@ -141,6 +141,38 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, copy_function=shutil.copy2)
 
 
+def _copy_tree_hashing(source: Path, destination: Path) -> dict:
+    """:func:`_copy_tree` and :func:`tree_files` of the copy in one read.
+
+    DP-1203. The undo copy was written and then read back whole to hash it,
+    so every unlock read the mesh twice. Each file is hashed as it is copied
+    instead; the result is what ``tree_files(destination)`` returns.
+    """
+    if destination.exists():
+        shutil.rmtree(destination)
+    files = {}
+    for path in sorted(source.rglob('*')):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not path.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        with open(path, 'rb') as reader, open(target, 'xb') as writer:
+            for block in iter(lambda: reader.read(1 << 20), b''):
+                writer.write(block)
+                digest.update(block)
+                size += len(block)
+        shutil.copystat(path, target)
+        files[relative.as_posix()] = (size, digest.hexdigest())
+    destination.mkdir(parents=True, exist_ok=True)
+    return files
+
+
 def _remove(path: Path) -> None:
     try:
         if path.is_dir():
@@ -365,15 +397,13 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
                 if text is not None:
                     _write_text(folder / name, text)
             if mesh.is_dir():
-                _copy_tree(mesh, folder / 'mesh')
                 manifest['mesh_files'] = {
                     name: list(value) for name, value in
-                    tree_files(folder / 'mesh').items()}
+                    _copy_tree_hashing(mesh, folder / 'mesh').items()}
             if geometry.is_dir():
-                _copy_tree(geometry, folder / 'geometry')
                 manifest['geometry_files'] = {
                     name: list(value) for name, value in
-                    tree_files(folder / 'geometry').items()}
+                    _copy_tree_hashing(geometry, folder / 'geometry').items()}
             if capture_surfaces is not None:
                 capture_surfaces(folder / 'surfaces')
                 manifest['surfaces'] = True

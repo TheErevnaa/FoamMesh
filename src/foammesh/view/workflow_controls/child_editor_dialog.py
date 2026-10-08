@@ -336,6 +336,13 @@ class ChildEditorDialog(QDialog):
                 if widget is None:
                     continue
                 widget.setParent(form_host)
+                # DP-1251. `releaseEditors` hides a note when the panel drops
+                # this dialog (every band-picker rebuild does), and a panel
+                # with no relevance rule never shows a row again -- so the
+                # second form a band panel opened had lost its notes. Shown
+                # here; `applyRelevance` below still hides a row that does
+                # not apply.
+                widget.setVisible(True)
                 form.addRow('', widget)
                 self._rowKeys.append(frozenset(keys))
                 rows += 1
@@ -364,9 +371,36 @@ class ChildEditorDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel, self)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        # DP-1190. Set while the step this row belongs to is locked.
+        self._lockedNoteText = ''
         outer.addWidget(self.buttons)
 
         self._connectRelevance()
+
+    def setLockedNote(self, note: str) -> None:
+        """DP-1190. Say the step is locked and take OK away (or give it back).
+
+        A run that finishes while this form is open locks the step under it;
+        OK would send an edit the facade refuses. Cancel stays. The note is
+        OK's tooltip and the panel's answer to any press that gets through.
+        """
+        note = str(note or '')
+        self._lockedNoteText = note
+        ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok is not None:
+            ok.setEnabled(not note)
+            ok.setToolTip(note)
+            ok.setAccessibleDescription(note)
+
+    def lockedNote(self) -> str:
+        return self._lockedNoteText
+
+    def accept(self) -> None:
+        # DP-1190. A locked step's form only closes by Cancel, whatever
+        # pressed OK (Enter included).
+        if self._lockedNoteText:
+            return
+        super().accept()
 
     # -- Plan 36 RP2: shown without blocking the viewport ------------------ #
 

@@ -646,7 +646,77 @@ def capture(case_path, stage: str, *, engine_id: str = 'snappy',
         'mesh_identity': manifest['mesh_identity'], 'at': _now()})
     if fault:
         fault('active')
-    return dict(manifest, captured=True, skipped=False, path=str(target))
+    try:
+        pruned = prune(case)
+    except Exception:  # noqa: BLE001 - pruning never fails a capture
+        logger.exception('could not prune superseded stage snapshots')
+        pruned = []
+    return dict(manifest, captured=True, skipped=False, path=str(target),
+                pruned=pruned)
+
+
+#: How many superseded copies of a stage :func:`prune` leaves (DP-1204):
+#: the one the newest copy replaced, so a re-run can be compared with it.
+SUPERSEDED_KEPT = 1
+
+
+def _referenced(case_path) -> set[tuple[str, str]]:
+    """Every ``(revision, stage)`` something still reads.
+
+    The newest revision's whole resolution (the stages a replay restores
+    from), every revision's ``inherits`` (a kept stage's input), and
+    ``active.json`` (the snapshot the live mesh is a copy of).
+    """
+    case = Path(case_path)
+    keep = {(holder, stage) for stage, holder in resolve(case).items()}
+    for folder in _revision_dirs(case):
+        keep.update((holder, stage) for stage, holder in
+                    _revision_record(folder)['inherits'].items())
+    record = active(case)
+    if record and record.get('revision') and record.get('stage'):
+        keep.add((str(record['revision']), str(record['stage'])))
+    return keep
+
+
+def prune(case_path) -> list[str]:
+    """Remove superseded snapshots; ``['rNNNN/<stage>', ...]`` removed.
+
+    DP-1204. Every re-run started a revision and nothing was ever removed, so
+    a case grew by a whole mesh per edit until the quota began skipping the
+    stages a replay needs. Conservative: a stage folder goes only when more
+    than :data:`SUPERSEDED_KEPT` *newer* revisions hold the same stage
+    themselves -- the newest copy and the one it replaced stay, so "Compare
+    stages" can still show a stage as it was before its last re-run (UF11) --
+    and nothing references it (:func:`_referenced`: the newest revision's
+    stages, any ``inherits``, the live mesh's ``active.json``). An older revision left with no stage of its
+    own, that nothing inherits from, goes too; the newest revision folder is
+    never removed, so revision numbers keep counting up. The unlock undo
+    keeps its own copy of the mesh, never a snapshot, so it is not affected.
+    """
+    case = Path(case_path)
+    folders = _revision_dirs(case)
+    if len(folders) < 2:
+        return []
+    keep = _referenced(case)
+    newer_holds: dict[str, int] = {}
+    removed = []
+    for folder in reversed(folders):
+        own = _own_stages(folder)
+        for stage in own:
+            if (newer_holds.get(stage, 0) > SUPERSEDED_KEPT
+                    and (folder.name, stage) not in keep):
+                _remove(folder / stage)
+                if not (folder / stage).exists():
+                    removed.append(f'{folder.name}/{stage}')
+        for stage in own:
+            newer_holds[stage] = newer_holds.get(stage, 0) + 1
+    inherited_from = {holder for holder, _stage in keep}
+    for folder in folders[:-1]:
+        if (not _own_stages(folder) and folder.name not in inherited_from
+                and not any(path.name.startswith('.')
+                            for path in folder.iterdir())):
+            _remove(folder)
+    return removed
 
 
 # -- reading (UF11) ------------------------------------------------------- #

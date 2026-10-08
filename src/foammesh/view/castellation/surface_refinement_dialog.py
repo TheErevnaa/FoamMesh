@@ -15,7 +15,6 @@ from widgets.multi_selector_dialog import MultiSelectorDialog, SelectorItem
 from widgets.validation.validation import FormValidator, NotGreaterValidator
 
 from foammesh.app import app
-from foammesh.core.quantities import format_group
 from foammesh.db.configurations_schema import GeometryType, ZoneMode
 from foammesh.view.geometry.display_name import readable_geometry_name
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
@@ -614,12 +613,20 @@ class SurfaceRefinementDialog(QDialog):
         self._showTheRowsThatAreRead()
 
     def _updateCellSize(self, level, cellSize):
-        d = 2 ** int(level.text())
+        from foammesh.view.snappy_workflow.level_cell_size import cell_text
+
         # R23. Six significant digits per axis is what pushed this line past
         # the panel edge; four still names the cell. DP-179. The house
         # helper does the rest: one decimal count for all three, so the
         # three components of one cell can be compared with each other,
         # and the unit they are in, which this line never carried.
-        cellSize.setText(self.tr('cell size <b>({0})</b>').format(
-            format_group((self._xCellSize / d, self._yCellSize / d,
-                          self._zCellSize / d))))
+        # DP-1251. The arithmetic and the rendering are the shared helper's,
+        # which the guided row editor's readout reads too, so the two editors
+        # of one level cannot print two cells. It is still `format_group`.
+        text = cell_text((self._xCellSize, self._yCellSize, self._zCellSize),
+                         level.text())
+        if not text:
+            cellSize.setText(self.tr(
+                'cell size available once the base grid is set'))
+            return
+        cellSize.setText(self.tr('cell size <b>({0})</b>').format(text))

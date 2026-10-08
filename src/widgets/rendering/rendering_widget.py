@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget)
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from vtkmodules.util.misc import calldata_type
-from vtkmodules.vtkCommonCore import VTK_STRING, vtkCommand
+from vtkmodules.vtkCommonCore import VTK_STRING, vtkCommand, vtkStringArray
 # load implementations for rendering and interaction factory classes
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkInteractionWidgets import vtkLogoRepresentation, vtkLogoWidget, vtkOrientationMarkerWidget
@@ -37,6 +37,7 @@ from foammesh.rendering import (
     gl_health, gpu_profile, interaction_lod, render_style)
 from foammesh.view.theming.metrics import apply_prose_measure
 from foammesh.view.theming.vtk_theme import apply_vtk_theme
+from foammesh.core.quantities import format_group
 from app_properties import meshAppProperties
 from foammesh.core.branding import watermark_geometry
 
@@ -225,15 +226,57 @@ def cubeAxisLabelsFit(pixels: float, lo: float, hi: float,
     return float(pixels) >= len(labels) * (width + LABEL_GAP)
 
 
+def _blankAxisLabels():
+    """A label list the actor repeats for every tick: one empty string."""
+    labels = vtkStringArray()
+    labels.InsertNextValue('')
+    return labels
+
+
+#: DP-1180. An axis shorter than this on screen is seen end-on: it has no
+#: room for even its two end values, and its title says how long it is.
+END_LABEL_MIN_PIXELS = 40
+
+
+def cubeAxisTitle(axis: str, lo: float, hi: float, mode: str) -> str:
+    """The title one cube axis carries: its name, its span, and maybe its ends.
+
+    DP-1180. An axis whose tick labels did not fit used to lose every
+    number it had, so a 1 m pipe seen at a normal size said nothing about
+    how thick it was, and a 1 m cube in a docked pane said nothing at all.
+    The span is now always in the title, in the one unit ladder the rest
+    of the window measures with (``foammesh.core.quantities``); an axis
+    whose ticks do not fit (``mode == 'ends'``) carries its two end values
+    there instead of dropping them.
+    """
+    lo, hi = float(lo), float(hi)
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi < lo:
+        return axis
+    span = hi - lo
+    if span <= 0:
+        return f'{axis}  {format_group([lo])}' if lo else axis
+    title = f'{axis}  {format_group([span])}'
+    if mode == 'ends':
+        title += f':  {format_group([lo, hi], " to ")}'
+    return title
+
+
 def fitCubeAxesLabels(actor, renderer, policy: dict) -> dict:
-    """Show each axis's labels only where they fit; returns axis -> shown.
+    """Label each axis as fully as it has room for; returns axis -> mode.
+
+    ``'ticks'`` -- the actor's own tick labels fit along the axis and are
+    drawn. ``'ends'`` -- they would run into one block (DP-704), so they are
+    off and the title carries the two end values instead (DP-1180; an axis
+    used to drop every number it had here). ``'span'`` -- the axis is seen
+    end-on, or the viewport has no room for labels at all: the title still
+    says how long the axis is.
 
     Measured on screen, from the actor's bounds through the renderer's
     current camera, so it has to run again whenever the camera moves --
     the rendering widget runs it at the start of every render.
     """
     bounds = actor.GetBounds()
-    shown = {}
+    modes = {}
     origin = (bounds[0], bounds[2], bounds[4])
 
     def display(point):
@@ -247,13 +290,76 @@ def fitCubeAxesLabels(actor, renderer, policy: dict) -> dict:
         end[index] = bounds[2 * index + 1]
         tip = display(end)
         pixels = math.hypot(tip[0] - start[0], tip[1] - start[1])
-        visible = bool(policy.get('labels')) and cubeAxisLabelsFit(
-            pixels, bounds[2 * index], bounds[2 * index + 1],
-            policy['screen_size'])
-        if bool(getattr(actor, f'Get{axis}AxisLabelVisibility')()) != visible:
-            getattr(actor, f'Set{axis}AxisLabelVisibility')(1 if visible else 0)
-        shown[axis] = visible
-    return shown
+        lo, hi = bounds[2 * index], bounds[2 * index + 1]
+        if not policy.get('labels') or pixels < END_LABEL_MIN_PIXELS:
+            mode = 'span'
+        elif cubeAxisLabelsFit(pixels, lo, hi, policy['screen_size']):
+            mode = 'ticks'
+        else:
+            mode = 'ends'
+        # The actor draws an axis's title only while its labels are
+        # visible (measured offscreen, VTK 9.5), so an axis that cannot fit
+        # its ticks keeps its labels on and blanks them instead.
+        if not getattr(actor, f'Get{axis}AxisLabelVisibility')():
+            getattr(actor, f'Set{axis}AxisLabelVisibility')(1)
+        blank = actor.GetAxisLabels(index) is not None
+        if blank != (mode != 'ticks'):
+            actor.SetAxisLabels(index, None if mode == 'ticks'
+                                else _blankAxisLabels())
+        title = cubeAxisTitle(axis, lo, hi, mode)
+        if getattr(actor, f'Get{axis}Title')() != title:
+            getattr(actor, f'Set{axis}Title')(title)
+        modes[axis] = mode
+    return modes
+
+
+def visibleBoundsWithout(renderer, excluded) -> Optional[tuple]:
+    """The bounds of the visible props in *renderer*, leaving *excluded* out.
+
+    DP-1181. ``ComputeVisiblePropBounds`` counts the cube axes themselves,
+    which would keep the box at the size it was first given; this is the
+    same union without them, or None when nothing visible has bounds.
+    """
+    props = renderer.GetViewProps()
+    props.InitTraversal()
+    found = None
+    for _ in range(props.GetNumberOfItems()):
+        prop = props.GetNextProp()
+        if prop is None or prop is excluded:
+            continue
+        if not prop.GetVisibility() or not prop.GetUseBounds():
+            continue
+        bounds = prop.GetBounds()
+        if bounds is None or len(bounds) != 6:
+            continue
+        if not all(math.isfinite(value) for value in bounds):
+            continue
+        if bounds[0] > bounds[1] or abs(bounds[0]) >= 1e299:
+            continue
+        if found is None:
+            found = list(bounds)
+        else:
+            for i in range(3):
+                found[2 * i] = min(found[2 * i], bounds[2 * i])
+                found[2 * i + 1] = max(found[2 * i + 1], bounds[2 * i + 1])
+    return tuple(found) if found is not None else None
+
+
+def refreshCubeAxesBounds(actor, renderer) -> bool:
+    """Fit the cube axes to what is visible now; True when they moved.
+
+    DP-1181. The box was given its bounds once, when it was switched on or
+    the camera was fitted after an import, so hiding a part, showing one
+    again or adding one left the axes measuring a model no longer on
+    screen. The rendering widget runs this at the start of every render.
+    """
+    bounds = visibleBoundsWithout(renderer, actor)
+    if bounds is None:
+        return False
+    if tuple(actor.GetBounds()) == tuple(bounds):
+        return False
+    actor.SetBounds(bounds)
+    return True
 
 
 def _quietly(call, *args):
@@ -1782,10 +1888,13 @@ class RenderingWidget(QWidget):
                     f'{"On" if policy["gridlines"] else "Off"}')()
 
     def _fitCubeAxesLabels(self):
-        """DP-704. Hide the labels of any axis too short on screen for them."""
+        """DP-704/DP-1180/DP-1181. Refit the box and label each axis."""
         if self._cubeAxesActor is None:
             return
         try:
+            # DP-1181. Parts hidden, shown, added or removed since the box
+            # was built change what it should measure.
+            refreshCubeAxesBounds(self._cubeAxesActor, self._renderer)
             fitCubeAxesLabels(self._cubeAxesActor, self._renderer,
                               cubeAxesPolicy(self.width(), self.height()))
         except (AttributeError, TypeError):

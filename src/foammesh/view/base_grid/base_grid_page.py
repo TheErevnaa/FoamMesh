@@ -16,7 +16,7 @@ from foammesh.view.outside_task import modal
 from foammesh.db.configurations_schema import (
     BaseGridSizingMode, BoundaryPatchType, GeometryType, Shape, CFDType,
     schema)
-from foammesh.core.mesh.domain_box import domain_box
+from foammesh.core.mesh.domain_box import domain_box, has_authored_blocks
 from foammesh.core.mesh.sizing import (background_estimate,
                                        derive_background_counts)
 from foammesh.rendering.vtk_loader import hexPolyData, polyDataToFeatureActor
@@ -95,15 +95,31 @@ class BaseGridPage(StepPage):
     # A background block graded towards the geometry, or an outer face that has
     # to be ``symmetry`` or ``empty`` for the case to run at all, meant hand
     # editing the dictionary after every generate.
+    def _applyScaleMode(self, authored: bool) -> None:
+        """Scale applies to hand-written vertices only (Plan 37 #9)."""
+        self._scale.setEnabled(bool(authored))
+        self._scale.setToolTip(self.tr(
+            'Multiplies the vertices you typed: blockMesh builds every vertex '
+            'times Scale, in metres. Typed in millimetres, set it to 0.001.')
+            if authored else self.tr(
+            'Held at 1 for the block around the geometry. The geometry is put '
+            'in metres when it is imported, and the block is written in metres '
+            'around it; a factor here moved and resized the block off the '
+            'geometry. Scale applies to blocks written by hand.'))
+
     def _buildBlockControls(self, ui):
         self._scale = CompactDoubleSpinBox(ui.groupBox_2)
         self._scale.setObjectName('baseGridScale')
         self._scale.setDecimals(8)
         self._scale.setRange(1e-12, 1e12)
         self._scale.setValue(1.0)
-        self._scale.setToolTip(self.tr(
-            'blockMeshDict convertToMeters. Multiplies every vertex, so the '
-            'bounds above are read in these units.'))
+        # Plan 37 #9. Held at 1 for the block this page derives: the writer
+        # writes ``scale 1`` for it (`CaseBuilder._block_scale`), because the
+        # bounds above are already metres and the geometry is never scaled
+        # with the block. Vertices written by hand are the exception -- Scale
+        # converts them (`CaseBuilder.authored_scale`) -- so it is enabled
+        # whenever the case has them (`_applyScaleMode`).
+        self._applyScaleMode(False)
         ui.formLayout.addRow(self.tr('Scale to metres'),
                              unit_cell(self._scale))
 
@@ -605,6 +621,11 @@ class BaseGridPage(StepPage):
         self._applySizingMode()
 
         self._scale.setValue(float(client.field_value('meshing.base_grid.scale')))
+        try:
+            authored = has_authored_blocks(app.facadeClient.checkout())
+        except Exception:  # noqa: BLE001 - no case: the derived block
+            authored = False
+        self._applyScaleMode(authored)
         self._standoff.setValue(
             float(client.field_value('meshing.base_grid.standoff') or 0.0))
         for axis, box in self._grading.items():

@@ -68,3 +68,57 @@ def format_measurements(measurements: dict | None) -> str:
         for i, axis in enumerate(('X', 'Y', 'Z')))
     return '{0} facets, area {1:.4g}, {2}'.format(
         measurements['facets'], measurements['area'], box)
+
+
+def union_bounds(boxes) -> tuple | None:
+    """The box around every ``(x0, x1, y0, y1, z0, z1)`` in *boxes*.
+
+    Empty, inverted and non-finite boxes are left out, so a caller can pass
+    what its readers returned without filtering; ``None`` when none is left.
+    """
+    import math
+
+    found = None
+    for box in boxes or ():
+        try:
+            box = tuple(float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+        if len(box) != 6 or not all(math.isfinite(value) for value in box):
+            continue
+        if box[0] > box[1] or box[2] > box[3] or box[4] > box[5]:
+            continue
+        if found is None:
+            found = list(box)
+            continue
+        for axis in range(3):
+            found[2 * axis] = min(found[2 * axis], box[2 * axis])
+            found[2 * axis + 1] = max(found[2 * axis + 1], box[2 * axis + 1])
+    return tuple(found) if found is not None else None
+
+
+def format_size(bounds, scale: float = 1.0) -> str:
+    """"300 × 50 × 50 mm, diagonal 308.2 mm" -- a whole model's size in one line.
+
+    DP-1182. Only a per-surface X/Y/Z range was ever on screen (the Edit
+    Surface dialog's line above), and the import dialog said only which
+    unit the diagonal suggested; nothing said how big the whole model was.
+    *scale* converts the numbers in *bounds* to metres -- the import unit's
+    factor before import, 1.0 for what the case already holds -- and the
+    unit shown is the one the window's own ladder picks for the result
+    (``foammesh.core.quantities``), so it reads like every other length.
+    """
+    import math
+
+    from foammesh.core.quantities import format_group
+
+    box = union_bounds([bounds]) if bounds is not None else None
+    if box is None:
+        return ''
+    sizes = [(box[2 * axis + 1] - box[2 * axis]) * float(scale)
+             for axis in range(3)]
+    if max(sizes) <= 0:
+        return ''
+    diagonal = math.sqrt(sum(size * size for size in sizes))
+    return '{0}, diagonal {1}'.format(format_group(sizes),
+                                      format_group([diagonal]))

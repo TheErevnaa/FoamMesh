@@ -27,7 +27,7 @@ from foammesh.core.facade.fields import REGISTRY
 from foammesh.view.facade_client import query, query_async, submit
 
 from .conditional_fields import refresh_applicability
-from foammesh.view.theming.metrics import (align_unit_column,
+from foammesh.view.theming.metrics import (MARGIN_NONE, align_unit_column,
                                            apply_form_metrics)
 from .field_widgets import FieldEditor
 
@@ -141,6 +141,14 @@ class FieldGroupPage(QWidget):
                                  choices=self.choices_for(field_id))
             editor.valueChanged.connect(self._on_changed)
             row = QHBoxLayout()
+            # DP-1250. Zero, as `unit_cell` has been since DP-198: this cell
+            # sits inside a form field that already has the form's margin.
+            # MEASURED on Surface features under the real theme: the layout
+            # default of 8 above and below put a 30 px spin box in a 46 px
+            # cell, so every registry row stood ~50 px apart against the
+            # ~34 px of a row built with `unit_cell` on the same page.
+            row.setContentsMargins(
+                MARGIN_NONE, MARGIN_NONE, MARGIN_NONE, MARGIN_NONE)
             row.addWidget(editor.editor, 1)
             # DP-156, as on the task page: the cell always ends with the unit
             # label so the column can be given one width.
@@ -148,6 +156,14 @@ class FieldGroupPage(QWidget):
             container = QWidget(self._form)
             container.setLayout(row)
             layout.addRow(editor.label, container)
+            # DP-1250. Hand the editor its row, so an inapplicable field
+            # takes the row off the form (`setRowVisible`) and hides this
+            # cell with it. Only `ExecutionPreferencesPage` did this, so on
+            # every other panel the label and editor hid and the form kept
+            # the line -- MEASURED, the six subset-plane rows of Surface
+            # features left ~124 px of blank between "Keep feature edges
+            # crossing a plane" and "Add feature edges from file".
+            editor.setRow(layout, container)
             self._editors[field_id] = editor
         # DP-339. A rebuild replaces the editors; it is not a write, so an
         # edit that has not reached the case yet is carried onto the new ones.
@@ -215,13 +231,22 @@ class FieldGroupPage(QWidget):
         # one and the body's -- were adding 18 px on top of it. MEASURED on
         # Surface features at a 635 px settings column: the page's own form
         # put its labels at x=31 and the two embedded panels put theirs at
-        # x=44, one page, two label columns. The panel keeps its vertical
-        # margins, which separate it from what is above and below it.
+        # x=44, one page, two label columns.
+        #
+        # DP-1250. The vertical margins went the same way. W-O2 kept them on
+        # the reasoning that they separate the panel from its neighbours --
+        # but both layouts kept them, so each embedded group box had 16 px
+        # above and 16 px below it on top of the page's own spacing. MEASURED
+        # on Surface features: 22 px from the page's own "Feature
+        # extraction" box to the first panel's box and 38 px between the two
+        # stacked panels, against 6 px between the page's own boxes. The
+        # page's layout spacing is what separates sections on a page, so an
+        # embedded panel adds none of its own.
         for layout in (self._outer, body.layout()):
             if layout is None:
                 continue
-            margins = layout.contentsMargins()
-            layout.setContentsMargins(0, margins.top(), 0, margins.bottom())
+            layout.setContentsMargins(
+                MARGIN_NONE, MARGIN_NONE, MARGIN_NONE, MARGIN_NONE)
         for button in (self._apply, self._revert):
             button.hide()
 
@@ -477,6 +502,13 @@ class ExecutionPreferencesPage(FieldGroupPage):
             if mode == 'parallel':
                 shown.update(self.DECOMPOSITION_FIELDS)
                 shown.update(self.METHOD_FIELDS.get(method, ()))
+            elif mode != 'serial':
+                # DP-1260. Automatic mode reads the count too: a count typed
+                # here is what `requested_cpu_count` hands the run, and zero is
+                # Auto. The row also carries the count Auto came out as, and
+                # hiding it in Auto mode left the page silent on the one
+                # number that mode decides.
+                shown.add('mesh.execution.max_cpu_cores')
         else:
             # No mesher is chosen yet: ask only what both of them read, and
             # let the rest arrive with the answer to which mesher this is.
@@ -486,6 +518,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
 
     def __init__(self, facade_client, parent=None):
         super().__init__(facade_client, parent)
+        self._mountAutoBasis()
         self._mountRedistribute()
 
     def setEngine(self, engine_id: str) -> None:
@@ -540,8 +573,30 @@ class ExecutionPreferencesPage(FieldGroupPage):
         value, accepted = QInputDialog.getInt(
             self, self.tr('Change core count'),
             self.tr('Spread the decomposed mesh over (cores)'),
-            max(int(current or 2), 2), 2, 4096, 1)
+            self.redistributeDefault(current), 2, 4096, 1)
         return int(value) if accepted else None
+
+    def redistributeDefault(self, current: int = 0) -> int:
+        """The count the redistribute dialog opens on.
+
+        DP-1261. This was ``max(int(current or 2), 2)``: with the ceiling at
+        zero (Auto) the dialog offered 2 on a host whose Auto is fifteen
+        ranks, so the obvious OK moved a mesh onto two cores. Zero now opens
+        on the count Auto resolves to, the number the row above shows; two is
+        only the floor, because a redistribute onto one rank is a
+        reconstruct, not a split.
+        """
+        try:
+            current = int(current or 0)
+        except (TypeError, ValueError):
+            current = 0
+        if current <= 0:
+            policy = dict(self._policyNow())
+            if policy['mode'] == 'serial':
+                policy['mode'] = 'parallel'
+            host, _measured = self._hostReading()
+            current = self._snappyCount(policy, host)[0]
+        return max(int(current), 2)
 
     def _confirm(self, text: str) -> bool:
         answer = QMessageBox.question(
@@ -671,26 +726,14 @@ class ExecutionPreferencesPage(FieldGroupPage):
     # -- construction ------------------------------------------------------ #
 
     def build(self) -> None:
-        """Build the rows, then hand each one to its editor.
+        """Build the rows, then add the count the run will use.
 
-        `FieldEditor.setApplicability` can only take a row off the form if it
-        knows which form the row is in -- otherwise the widgets hide and
-        `QFormLayout` keeps the empty line. The generic page does not hand the
-        layout over, so this does, for its own rows.
+        The generic page hands each editor its form row (DP-1250), so an
+        inapplicable field here leaves no empty line either.
         """
         super().build()
-        self._registerRows()
         self._mountEffectiveCount()
         self._applyRoute()
-
-    def _registerRows(self) -> None:
-        layout = self.form_layout()
-        for editor in self._editors.values():
-            row, _role = layout.getWidgetPosition(editor.label)
-            if row < 0:
-                continue
-            item = layout.itemAt(row, QFormLayout.ItemRole.FieldRole)
-            editor.setRow(layout, item.widget() if item is not None else None)
 
     def _cellFor(self, field_id: str):
         editor = self._editors.get(field_id)
@@ -785,25 +828,25 @@ class ExecutionPreferencesPage(FieldGroupPage):
         DP-691. This asked `effective_cpu_count` with the ceiling alone and
         read `Automatic` for zero, while the snappy launcher also read the
         Parallel Environment dialog and started one rank for an automatic
-        case, and Gmsh took every thread the machine had. The page and the
-        run now ask the same two rules: `_stage_ranks`'s for snappy (nothing
-        asked stays serial) and `resolve_parallel_threads` for Gmsh.
+        case, and Gmsh took every thread the machine had.
+
+        DP-1260. The snappy half still asked `effective_cpu_count(unasked=1)`
+        and said `1 rank` for Auto while the run (DP-1231) meshed on the WSL
+        host's cores less one -- MEASURED on the stand-in 16-core host: page
+        `1 rank`, run 15 ranks. It now asks `DomainOperations._snappy_cpu`,
+        the function the stage launcher and the plan preview ask, with the
+        cached host reading (never the probe itself: that boots WSL). Gmsh
+        asks `resolve_parallel_threads`, which its job asks. How Auto got
+        there is said in a line under the group.
         """
-        from foammesh.core.execution.resources import effective_cpu_count
         from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
 
         label = getattr(self, '_effective', None)
         if label is None:
             return
-        try:
-            ceiling = int(
-                self._currentValue('mesh.execution.max_cpu_cores') or 0)
-        except (TypeError, ValueError):
-            ceiling = 0
-        mode = str(self._currentValue('mesh.execution.mode') or 'auto')
-        policy = {'mode': mode.rsplit('.', 1)[-1].lower(),
-                  'max_cpu_cores': max(ceiling, 0) or None}
-        ranks = effective_cpu_count(policy, unasked=1)
+        policy = self._policyNow()
+        host, measured = self._hostReading()
+        ranks, cpu = self._snappyCount(policy, host)
         threads = resolve_parallel_threads(policy)
         rank_text = (self.tr('1 rank') if ranks == 1
                      else self.tr('{0} ranks').format(ranks))
@@ -816,6 +859,191 @@ class ExecutionPreferencesPage(FieldGroupPage):
         else:
             label.setText(self.tr('snappy: {0} \u00b7 Gmsh: {1}').format(
                 rank_text, thread_text))
+        if self._engine_id == 'gmsh':
+            from foammesh.core.execution.resources import meshing_cpu_count
+            cpu = meshing_cpu_count(policy, engine='gmsh', host=host)
+            count = threads
+        else:
+            count = ranks
+        basis = self._basisText(cpu, count, host, measured)
+        if cpu is not None and cpu.auto and not measured:
+            self._warmHost()
+        self._setBasis(basis)
+        label.setToolTip(' '.join(part for part in (
+            label.accessibleDescription(), basis) if part))
+
+    # -- DP-1260: how Auto came to its count ------------------------------- #
+
+    def _policyNow(self) -> dict:
+        """The policy the run would read, from what is typed on the page."""
+        def number(field_id):
+            try:
+                return max(int(self._currentValue(field_id) or 0), 0)
+            except (TypeError, ValueError):
+                return 0
+        mode = str(self._currentValue('mesh.execution.mode') or 'auto')
+        return {'mode': mode.rsplit('.', 1)[-1].lower(),
+                'max_cpu_cores': number('mesh.execution.max_cpu_cores') or None,
+                'max_memory_bytes':
+                    number('mesh.execution.max_memory_bytes') or None}
+
+    @staticmethod
+    def _hostReading():
+        """``(MeshingHost, measured)`` without waiting for anything.
+
+        ``meshing_host()`` answers from the cache and falls back to this
+        PC's own facts until the WSL distribution has been read; *measured*
+        is False for that fallback, which is not the machine the mesher runs
+        on.
+        """
+        from foammesh.core.execution import resources
+
+        host = resources.meshing_host()
+        if str(host.source) != 'local':
+            return host, True
+        try:
+            return host, resources._runtime_target() is None
+        except Exception:                                   # noqa: BLE001
+            return host, False
+
+    def _casePath(self):
+        try:
+            return self._client.case_path
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _snappyCount(self, policy: dict, host):
+        """``(ranks, CpuCount | None)`` the next snappy stage would run on."""
+        from foammesh.core.execution.resources import (
+            effective_cpu_count, meshing_cpu_count,
+        )
+
+        if policy['mode'] == 'serial':
+            return 1, None
+        case_path = self._casePath()
+        try:
+            if case_path is not None:
+                from foammesh.core.facade.domain_operations import (
+                    DomainOperations,
+                )
+                # ``stage='snap'``: the count Snap and Layers will run on,
+                # which is Castellation's own when it ran on Auto (DP-1232).
+                cpu, host = DomainOperations._snappy_cpu(
+                    case_path, policy, stage='snap', host=host)
+            else:
+                cpu = meshing_cpu_count(policy, engine='snappy', host=host)
+        except (TypeError, ValueError, OSError):
+            return 1, None
+        if cpu.auto:
+            return max(1, int(cpu.count)), cpu
+        return max(1, int(effective_cpu_count(
+            policy, requested=cpu.count, facts=host.resource_facts()))), cpu
+
+    def _basisText(self, cpu, count: int, host, measured: bool) -> str:
+        """One sentence on where the count came from, or '' when it is
+        simply the number typed."""
+        if cpu is None:
+            return ''
+        unit = cpu.unit
+        if not cpu.auto:
+            cores = int(host.physical_cores or 0)
+            if measured and unit == 'ranks' and cores and count > cores:
+                # DP-1263. Open MPI gives one slot per physical core.
+                return self.tr(
+                    'More ranks than the host\'s {0} physical cores: the '
+                    'run starts Open MPI with --oversubscribe, so ranks '
+                    'share cores.').format(cores)
+            return ''
+        if cpu.source == 'recorded':
+            return self.tr(
+                'Auto: {0} {1}, the count Castellation of this mesh ran on. '
+                'It stays fixed for Snap and Layers, so the mesh is not '
+                're-split midway.').format(count, unit)
+        if not measured:
+            return self.tr(
+                'Auto: measuring the WSL host\u2026 Until it answers this is '
+                'this PC\'s count, {0} {1}.').format(count, unit)
+        where = (self.tr('the WSL host') if str(host.source).startswith('wsl')
+                 else self.tr('this machine'))
+        text = self.tr('Auto: {0} {1} cores on {2}, less {3}').format(
+            cpu.cores, cpu.core_kind, where, cpu.headroom)
+        free = host.memory_available_bytes
+        if free:
+            text += self.tr('; {0:.0f} GiB free').format(free / (1 << 30))
+        if cpu.limited_by == 'memory':
+            text += self.tr(', which holds {0} {1}').format(
+                cpu.memory_limit, unit)
+        return text + '.'
+
+    def _mountAutoBasis(self) -> None:
+        """A wrapped line under the group: how Auto reached its count."""
+        label = QLabel(self._body)
+        label.setObjectName('executionAutoBasis')
+        label.setWordWrap(True)
+        label.setAccessibleDescription(self.tr(
+            'How the automatic core count was reached.'))
+        label.setVisible(False)
+        layout = self._body.layout()
+        layout.insertWidget(max(layout.count() - 1, 0), label)
+        self._basis = label
+        self._refreshEffectiveCount()
+
+    def _setBasis(self, text: str) -> None:
+        label = getattr(self, '_basis', None)
+        if label is None:
+            return
+        label.setText(text)
+        editor = self._editors.get('mesh.execution.max_cpu_cores')
+        label.setVisible(bool(text) and editor is not None
+                         and editor.applies())
+
+    def autoBasisText(self) -> str:
+        """What the page says about how Auto reached its count."""
+        label = getattr(self, '_basis', None)
+        return '' if label is None or label.isHidden() else label.text()
+
+    #: Set while a WSL host reading is out, so a refresh does not start a
+    #: second one.
+    _hostWarming = False
+
+    def _warmHost(self) -> None:
+        """Read the WSL host off the GUI thread, then say the real count.
+
+        Only inside the running loop, and only once the OpenFOAM runtime has
+        answered this window (`utility_if_known`): the distribution is then
+        already up and the reading costs a second, and a page built without
+        an application -- a test's -- never boots WSL to draw a label.
+        """
+        if self._hostWarming:
+            return
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            from foammesh.app import app
+            known = app.capabilities.utility_if_known('snappyHexMesh')
+        except Exception:                                   # noqa: BLE001
+            known = None
+        if known is None or not getattr(known, 'available', False):
+            return
+        from foammesh.core.execution.resources import warm_meshing_host
+        self._hostWarming = True
+
+        async def warm():
+            try:
+                await warm_meshing_host()
+            except Exception:                               # noqa: BLE001
+                pass
+            finally:
+                self._hostWarming = False
+            try:
+                self._refreshEffectiveCount()
+            except RuntimeError:
+                pass                    # the page was closed meanwhile
+
+        loop.create_task(warm())
 
     def _on_changed(self, field_id: str, value) -> None:
         super()._on_changed(field_id, value)

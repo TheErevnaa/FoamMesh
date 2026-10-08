@@ -91,6 +91,7 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
                          check_profile=None,
                          check_request=None,
                          layers: bool = True,
+                         pause_at_snap: bool | None = None,
                          ) -> ExecutionDag:
     """The snappy pipeline, optionally decomposed so it can pause after snapping.
 
@@ -134,7 +135,16 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
     skipped the optional Boundary layers task, and that phase exists only to
     grow them (DP-591). The combined route needs nothing here, because its one
     invocation reads the enable flag the dictionary already carries.
+
+    ``pause_at_snap`` (default: ``split_at_snap``) marks the snap pause. DP-1234
+    runs every pipeline split so each finished stage can be kept and a stopped
+    run resumed from it; only enforcing qualification pauses, so the split
+    route is asked for without the pause in report-only. In MPI the split
+    route gathers Castellation too (``reconstructCastellation``), so it reaches
+    the case root and can be kept before Snap overwrites the processor cases.
     """
+    if pause_at_snap is None:
+        pause_at_snap = split_at_snap
     from foammesh.core.quality.checkmesh_service import checkmesh_command
 
     case = Path(case_path).resolve()
@@ -176,7 +186,7 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
             # The pause. `constant/polyMesh` now holds the snapped boundary,
             # and nothing has overwritten it yet.
             ExecutionNode('snap', snappy, case, ('castellation',),
-                          mutates_mesh=True, pauses_after=True),
+                          mutates_mesh=True, pauses_after=pause_at_snap),
             *grow,
             ExecutionNode('checkMesh', check_argv(False),
                           case, ('layers' if layers else 'snap',),
@@ -204,14 +214,20 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
         decompose,
         ExecutionNode('castellation', parallel_snappy, case, ('decomposePar',),
                       mutates_mesh=True),
-        ExecutionNode('snap', parallel_snappy, case, ('castellation',),
-                      mutates_mesh=True),
+        # DP-1234. Gathered so the castellated mesh can be kept: Snap
+        # overwrites it in the processor cases, and a run stopped in Snap
+        # resumes from this rather than from the base grid.
+        ExecutionNode('reconstructCastellation',
+                      ('reconstructPar', '-constant', '-case', str(case)),
+                      case, ('castellation',)),
+        ExecutionNode('snap', parallel_snappy, case,
+                      ('reconstructCastellation',), mutates_mesh=True),
         # GF1 measures a reconstructed boundary, so MPI has to reconstruct
         # mid-run. This writes the case-root mesh and leaves `processor*/`
         # untouched, so the layers phase continues on the decomposed meshes.
         ExecutionNode('reconstructSnap',
                       ('reconstructPar', '-constant', '-case', str(case)),
-                      case, ('snap',), pauses_after=True),
+                      case, ('snap',), pauses_after=pause_at_snap),
         *((ExecutionNode('layers', parallel_snappy, case, ('reconstructSnap',),
                          mutates_mesh=True),) if layers else ()),
         ExecutionNode('checkMesh', check_argv(True), case,
@@ -221,3 +237,41 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
             ('reconstructPar', '-constant', '-case', str(case)),
             case, ('checkMesh',), mutates_mesh=True, publishes_mesh=True),
     ))
+
+
+#: Nodes a resumed run repeats although they ran before the kept stage:
+#: feature edges are read by Snap, and an MPI phase reads processor cases
+#: split from the mesh just restored, not from whatever the stopped run left.
+_RESUME_REPEATS = ('surfaceFeatures', 'decomposePar')
+_SNAPPY_PHASES = ('castellation', 'snap', 'layers', 'snappyHexMesh')
+
+
+def resume_dag(dag: ExecutionDag, after: str) -> ExecutionDag:
+    """The rest of *dag* once node *after*'s kept stage is back in the case.
+
+    DP-1236. A run stopped in Snap keeps the base grid and the castellated
+    mesh; resuming restores the castellated mesh and runs only what comes
+    after the node that kept it. ``surfaceFeatures`` is repeated when a
+    snappy phase remains (it is seconds, and Snap reads its edges), and
+    ``decomposePar`` when a parallel node remains, so the ranks start from
+    the restored mesh. A dependency on a node that is not repeated becomes a
+    dependency on the node before it.
+    """
+    ids = [node.node_id for node in dag.nodes]
+    if after not in ids:
+        raise ValueError(f'{after!r} is not a node of this run')
+    position = ids.index(after)
+    rest = list(dag.nodes[position + 1:])
+    phases = any(node.node_id in _SNAPPY_PHASES for node in rest)
+    parallel = any('-parallel' in node.argv for node in rest)
+    wanted = {'surfaceFeatures': phases, 'decomposePar': parallel}
+    ahead = [node for node in dag.nodes[:position]
+             if node.node_id in _RESUME_REPEATS and wanted[node.node_id]]
+    nodes, known = [], set()
+    for node in (*ahead, *rest):
+        depends = tuple(name for name in node.depends_on if name in known)
+        if not depends and nodes:
+            depends = (nodes[-1].node_id,)
+        nodes.append(replace(node, depends_on=depends))
+        known.add(node.node_id)
+    return ExecutionDag(tuple(nodes))

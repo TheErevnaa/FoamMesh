@@ -141,6 +141,74 @@ def _changed_geometry_files(session, data) -> list:
                   if theirs.get(key) is not value)
 
 
+def _referenced_geometry_ids(session) -> set[str]:
+    """Artifact ids the project tree's geometry rows stand for (DP-1211)."""
+    try:
+        rows = session.state.db.getElements(
+            'geometry', lambda _key, row: bool(row.get('geometryId')))
+    except Exception:  # noqa: BLE001 - no tree, nothing to follow
+        return set()
+    return {str(row.value('geometryId')) for row in rows.values()}
+
+
+def _sync_geometry_store(session, before: set[str]) -> None:
+    """Bring the artifact store into line with the tree after a change.
+
+    DP-1211. Removing a geometry, on the page or through `geometry.delete`,
+    edited the tree and left the artifact store holding the entry, so the
+    readiness report, the geometry fingerprint and the next prepared
+    revision went on carrying a geometry the user had removed. An id the
+    change stopped referencing is removed from the store; one it started
+    referencing again -- an undo of the removal, or a redo of the import --
+    is restored. An id only some rows dropped is still referenced and stays,
+    and an entry no row has ever named (a headless import) is untouched,
+    because only a change in reference moves anything.
+    """
+    after = _referenced_geometry_ids(session)
+    gone, back = before - after, after - before
+    if not (gone or back) or getattr(session, 'read_only', False):
+        return
+    from foammesh.core.geometry import GeometryArtifactStore
+    try:
+        store = GeometryArtifactStore(session.case_path)
+        if gone:
+            store.remove(gone)
+        if back:
+            store.restore(back)
+    except (OSError, ValueError):
+        logger.warning('the geometry store could not follow the tree in %s',
+                       session.case_path, exc_info=True)
+
+
+def _settle_removed_geometry(session) -> None:
+    """At open, drop what no undo can bring back (DP-1268).
+
+    Undo history starts empty with the session, so a removed geometry the
+    opened tree does not name can never return; its folder goes. One the
+    tree still names (closed without saving) is put back. While unsaved
+    changes are waiting to be restored or discarded the tree on disk is not
+    the one the user will work on, so nothing is touched until a later open.
+    """
+    autosave = getattr(session, 'autosave', None)
+    try:
+        if autosave is not None and autosave.pending_recovery() is not None:
+            return
+    except Exception:  # noqa: BLE001 - an unreadable journal: leave the store
+        return
+    from foammesh.core.geometry import GeometryArtifactStore
+    try:
+        result = GeometryArtifactStore(session.case_path).settle_removed(
+            _referenced_geometry_ids(session))
+    except (OSError, ValueError):
+        logger.warning('removed geometry could not be settled in %s',
+                       session.case_path, exc_info=True)
+        return
+    if result['purged'] or result['restored']:
+        logger.info('removed geometry settled in %s: %d purged, %d restored',
+                    session.case_path, len(result['purged']),
+                    len(result['restored']))
+
+
 _LOCK_PATHS: dict = {}
 
 
@@ -665,6 +733,7 @@ class FoamMeshFacade:
                 reconcile_interrupted_publications(session.case_path)
             except OSError:                                  # noqa: BLE001
                 pass
+            _settle_removed_geometry(session)
         if attach_presentation:
             session.attach_presentation(PresentationState())
         return self.attach(session)
@@ -1010,6 +1079,7 @@ class FoamMeshFacade:
             raise ValidationFailedError('commit_working_copy requires an editable working copy')
         action = command.parameters.get('action') or 'gui edit'
         reason = command.parameters.get('reason') or f'actor={command.actor.id}'
+        before = _referenced_geometry_ids(session)
         try:
             refuse_locked_edit(session, data)
             transaction = session.state.commit(
@@ -1022,6 +1092,7 @@ class FoamMeshFacade:
             raise RevisionConflictError(
                 'another change landed while this working copy was open',
                 details={'paths': list(error.paths)}) from error
+        _sync_geometry_store(session, before)
         latest = session.latest_change_set()
         # Plan 32 W4 (DP-242). A working copy handed in whole says nothing
         # about which fields moved, so there is no stage to scope to and the
@@ -1377,9 +1448,13 @@ class FoamMeshFacade:
                     'collection': collection_id, 'entity_id': key})
             data.removeElement(adapter.storage_path, key)
             refuse_locked_edit(session, data)
+            before = _referenced_geometry_ids(session)
             transaction = session.state.commit(
                 data, action=f'remove {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
+            # DP-1211. `geometry.delete` is this handler, and the tree is not
+            # the only place a geometry lives.
+            _sync_geometry_store(session, before)
             return self._collection_result(session, command, collection_id, key, transaction)
         return handler
 
@@ -1431,7 +1506,9 @@ class FoamMeshFacade:
         if command.actor.kind is not ActorKind.HUMAN or command.source is not CommandSource.GUI:
             raise UndoNotAllowedError('only the local human GUI owner may use generic undo')
         session.require_writable()
+        before = _referenced_geometry_ids(session)
         transaction = session.state.undo()
+        _sync_geometry_store(session, before)
         return OperationResult('accepted', command.operation, session.revisions,
                                payload={'undone': transaction is not None,
                                         'transaction_id': transaction.tx_id if transaction else None})
@@ -1440,7 +1517,9 @@ class FoamMeshFacade:
         if command.actor.kind is not ActorKind.HUMAN or command.source is not CommandSource.GUI:
             raise UndoNotAllowedError('only the local human GUI owner may use generic redo')
         session.require_writable()
+        before = _referenced_geometry_ids(session)
         transaction = session.state.redo()
+        _sync_geometry_store(session, before)
         return OperationResult('accepted', command.operation, session.revisions,
                                payload={'redone': transaction is not None,
                                         'transaction_id': transaction.tx_id if transaction else None})
@@ -1473,11 +1552,13 @@ class FoamMeshFacade:
                 break
             count += 1
         transactions = []
+        before = _referenced_geometry_ids(session)
         for _ in range(count):
             transaction = session.state.undo()
             if transaction is None:
                 break
             transactions.append(transaction)
+        _sync_geometry_store(session, before)
         return transactions
 
     async def _cancel_active_jobs(self, session: CaseSession,

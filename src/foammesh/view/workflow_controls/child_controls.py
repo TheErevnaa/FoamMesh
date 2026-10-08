@@ -203,6 +203,8 @@ class ChildControlPanel(QGroupBox):
         self._annotations = {key: widget
                              for key, widget in dict(annotations or {}).items()
                              if widget is not None}
+        #: DP-1251. ``{key: detail(value) -> str}``, a cell's tooltip.
+        self._cellDetails: dict = {}
         # FIELD-07/CURVE-05. What one field is called on this page, where the
         # registry title names the store rather than the thing. `Surface id`
         # is the import order of a surface and `Geometry scope` is any scope
@@ -252,7 +254,9 @@ class ChildControlPanel(QGroupBox):
         self.table.setHorizontalHeaderLabels(
             [self._heading(name) for name in self._columns])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # DP-1193. Several rows may be selected and removed together; Edit
+        # still opens on one (it is offered only while one is selected).
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAccessibleName(title)
         self.table.verticalHeader().setVisible(False)
@@ -291,6 +295,8 @@ class ChildControlPanel(QGroupBox):
         # DP-559. Re-fit the headings whenever the width they share changes.
         self.table.viewport().installEventFilter(self)
         self.table.itemSelectionChanged.connect(self._load_selected)
+        # DP-1193. Delete / Backspace on the table is the Remove button.
+        self.table.installEventFilter(self)
         layout.addWidget(self.table)
 
         # The editors are built here, not in the dialog, so a headless caller
@@ -339,6 +345,7 @@ class ChildControlPanel(QGroupBox):
         self._add.clicked.connect(self.open_add_dialog)
         self._edit.clicked.connect(self.open_edit_dialog)
         self._remove.clicked.connect(self.remove_selected)
+        self.table.itemSelectionChanged.connect(self._syncRowButtons)
         for button in (self._add, self._edit, self._remove):
             buttons.addWidget(button)
         buttons.addStretch(1)
@@ -406,6 +413,38 @@ class ChildControlPanel(QGroupBox):
     def editor(self, key):
         """The live editor for one relative id, so a page can watch it."""
         return self._editors.get(key)
+
+    def editorHost(self):
+        """The hidden widget the editors wait in between openings.
+
+        DP-1251. A widget a page builds for the row editor is parented here
+        until the editor lays it out, so it is never drawn on the panel.
+        """
+        return self._form
+
+    def addAnnotation(self, key: str, widget) -> None:
+        """Show *widget* under *key* in the row editor (C31-11), added late.
+
+        DP-1251. A note that needs the panel's own editor -- a readout that
+        follows the value typed -- can only be built after the panel has
+        built its editors, which is after the constructor's `annotations`
+        were read. The editor is laid out again on its next opening.
+        """
+        if widget is None:
+            return
+        self._annotations[key] = widget
+        self._discard_dialog()
+
+    def setCellDetail(self, key: str, detail) -> None:
+        """Give *key*'s table cells a tooltip, ``detail(value) -> str``.
+
+        DP-1251. A level column showed `3` and nothing else; the cell that
+        level makes is what the reader is choosing, so the cell says it when
+        asked. Applied on the next refresh, which is done here.
+        """
+        self._cellDetails[key] = detail
+        if self._live:
+            self.refresh()
 
     def set_choices(self, key: str, options) -> None:
         """Re-offer one field as a picker over *options*.
@@ -541,6 +580,8 @@ class ChildControlPanel(QGroupBox):
                 self.title(), self._editors, self,
                 relevance=relevance_rules(self.collection_id),
                 annotations=self._annotations)
+            if self._rowsLocked:
+                self._dialog.setLockedNote(self._lockNote)
         return self._dialog
 
     def open_add_dialog(self) -> None:
@@ -631,8 +672,7 @@ class ChildControlPanel(QGroupBox):
         empty = not self._rows
         self.table.setAccessibleDescription(
             self._emptyDescription if empty else '')
-        self._edit.setEnabled(not empty)
-        self._remove.setEnabled(not empty)
+        self._syncRowButtons()
         self._updateScopeReadiness()
         self._fit_headings()
         self._fit_table_height()
@@ -681,7 +721,60 @@ class ChildControlPanel(QGroupBox):
         if (event.type() == QEvent.Type.Resize
                 and watched is self.table.viewport()):
             self._fit_headings()
+        # DP-1193. Delete / Backspace on a selected row did nothing: the
+        # only way to drop a row was the Remove button. The key now takes
+        # the same path, confirmation and lock check included.
+        if (event.type() == QEvent.Type.KeyPress
+                and watched is self.table
+                and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                and event.modifiers() in (Qt.KeyboardModifier.NoModifier,
+                                          Qt.KeyboardModifier.KeypadModifier)):
+            if self.selected_keys():
+                self.remove_selected()
+                return True
         return super().eventFilter(watched, event)
+
+    # -- DP-1190: a step that locks under an open editor --------------------- #
+
+    _rowsLocked = False
+    _lockNote = ''
+
+    def _syncRowButtons(self) -> None:
+        """Add / Edit / Remove as the rows, the selection and the lock allow."""
+        empty = not self._rows
+        locked = self._rowsLocked
+        selected = len(self.selected_keys())
+        self._add.setEnabled(not locked)
+        self._edit.setEnabled(not empty and not locked and selected <= 1)
+        self._remove.setEnabled(not empty and not locked)
+
+    def setRowsLocked(self, locked: bool, note: str = '') -> None:
+        """Refuse row edits while the step that owns this table is locked.
+
+        DP-1190. A run that finishes while the row editor is open locks the
+        step under it; OK then sent an edit (and the binding writes after it)
+        that the facade refused, and the binding refusals were never read.
+        The editor now says the step is locked and offers only Cancel, and
+        Add / Edit / Remove (and the Delete key) say why they do nothing.
+        """
+        from .lock_refusal import locked_sentence
+
+        self._rowsLocked = bool(locked)
+        self._lockNote = (str(note) or locked_sentence()) if locked else ''
+        self._syncRowButtons()
+        dialog = self._dialog
+        if dialog is not None and hasattr(dialog, 'setLockedNote'):
+            dialog.setLockedNote(self._lockNote)
+
+    def rowsLocked(self) -> bool:
+        return self._rowsLocked
+
+    def _refuseWhileLocked(self) -> bool:
+        """True (after saying so) when the step is locked."""
+        if not self._rowsLocked:
+            return False
+        QMessageBox.warning(self, self.tr('Step locked'), self._lockNote)
+        return True
 
     def _column_need(self, column: int, wrap: bool) -> int:
         """The width one column asks for: its heading or its widest cell."""
@@ -756,6 +849,13 @@ class ChildControlPanel(QGroupBox):
         text = _display(value)
         if not text:
             return text, ''
+        detail = self._cellDetails.get(key)
+        if detail is not None:
+            # DP-1251. A page-supplied tooltip, the level's cell size.
+            try:
+                return text, str(detail(value) or '')
+            except Exception:                               # noqa: BLE001
+                return text, ''
         supplied = self._choices.get(key)
         if supplied is not None:
             for label, option, status_label, _enabled in supplied:
@@ -828,6 +928,22 @@ class ChildControlPanel(QGroupBox):
                if item is not None else None)
         return key if key is not None else self._rows[index].get(
             '__key__', index)
+
+    def selected_keys(self) -> list:
+        """DP-1193. The keys of every selected row, in table order."""
+        model = self.table.selectionModel()
+        rows = sorted({index.row() for index in model.selectedRows()}
+                      if model is not None else ())
+        keys = []
+        for index in rows:
+            if not 0 <= index < len(self._rows):
+                continue
+            item = self.table.item(index, 0)
+            key = (item.data(Qt.ItemDataRole.UserRole)
+                   if item is not None else None)
+            keys.append(key if key is not None
+                        else self._rows[index].get('__key__', index))
+        return keys
 
     def _load_selected(self) -> None:
         index = self._selected_index()
@@ -923,6 +1039,8 @@ class ChildControlPanel(QGroupBox):
         # The collection handlers read 'fields' and 'entity_id'
         # (facade._make_collection_create/_patch/_remove); anything else is
         # silently dropped or rejected as a missing entity.
+        if self._refuseWhileLocked():
+            return
         values = self._validated_child_values()
         if values is not None:
             self._run(f'{self.collection_id}.create', {'fields': values})
@@ -931,22 +1049,34 @@ class ChildControlPanel(QGroupBox):
         key = self.selected_key()
         if key is None:
             return
+        if self._refuseWhileLocked():
+            return
         values = self._validated_child_values()
         if values is not None:
             self._run(f'{self.collection_id}.patch',
                       {'entity_id': str(key), 'fields': values})
 
     def remove_selected(self) -> None:
-        key = self.selected_key()
-        if key is None:
+        keys = self.selected_keys()
+        if not keys:
             return
-        confirm = QMessageBox.question(
-            self, self.tr('Remove item'),
+        if self._refuseWhileLocked():
+            return
+        question = (
             self.tr('Remove the selected item? Downstream mesh artifacts '
-                    'become stale.'))
+                    'become stale.') if len(keys) == 1 else
+            self.tr('Remove the %n selected items? Downstream mesh artifacts '
+                    'become stale.', '', len(keys)))
+        if len(keys) == 1:
+            confirm = QMessageBox.question(
+                self, self.tr('Remove item'), question)
+        else:
+            confirm = QMessageBox.question(
+                self, self.tr('Remove items'), question)
         if confirm != QMessageBox.Yes:
             return
-        self._run(f'{self.collection_id}.remove', {'entity_id': str(key)})
+        for key in keys:
+            self._run(f'{self.collection_id}.remove', {'entity_id': str(key)})
 
     def _run(self, operation: str, parameters: dict) -> None:
         # C31-12. Create/patch/remove of a child row is scheduled rather than
@@ -1008,10 +1138,14 @@ class ChildControlPanel(QGroupBox):
         if write in pending:
             pending.remove(write)
         if not ok and result is not None:
-            QMessageBox.warning(
-                self, self.tr('Operation failed'),
-                str(getattr(result, 'message', '')
-                    or self.tr('The facade rejected the change.')))
+            # DP-1190. A locked step's refusal says which step and how out.
+            from .lock_refusal import locked_titles, refusal_message
+            text = refusal_message(
+                result, self.tr('The facade rejected the change.'))
+            if locked_titles(result) is not None:
+                QMessageBox.warning(self, self.tr('Step locked'), text)
+            else:
+                QMessageBox.warning(self, self.tr('Operation failed'), text)
         if ok:
             self.editCommitted.emit()
             host = self.parent()

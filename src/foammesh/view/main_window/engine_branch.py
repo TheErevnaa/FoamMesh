@@ -36,6 +36,21 @@ from foammesh.view.outside_task import modal
 from .run_narration import describe_result, newest_log
 
 
+def stage_timeout_parameters() -> dict:
+    """``timeout_seconds`` from Preferences > OpenFOAM runtime > Stage time
+    limit, for every stage a guided press runs. Plan 37 #7: the presses sent
+    none, so the operation's own 3600 s applied whatever the user had set,
+    and castellating a 5.9 M-cell far field was killed at the hour. 0 is no
+    limit."""
+    try:
+        from foammesh.app import app
+
+        seconds = int(app.settings.getOpenFoamRuntime()['stage_timeout'])
+    except Exception:                                       # noqa: BLE001
+        return {}
+    return {'timeout_seconds': max(0, seconds)}
+
+
 #: Engine id -> {task_id: page class}. An engine with no entry renders no
 #: branch pages, which is how Snappy keeps its existing legacy step pages.
 BRANCH_PAGES: dict[str, dict] = {
@@ -87,6 +102,69 @@ def _stage_writer(view):
     return writers.get(getattr(view, '_engine_id', ''))
 
 
+def _page_of(view, task_id: str):
+    """The page ``task_id`` is edited on, or None (stand-ins have none)."""
+    return (getattr(view, '_pages', None) or {}).get(task_id)
+
+
+def _page_needs_save(view, task_id: str) -> bool:
+    """Whether a run of ``task_id`` has edits on its page to wait for."""
+    page = _page_of(view, task_id)
+    if page is None:
+        return False
+    pending = getattr(page, 'save_pending', None)
+    if pending is None:
+        pending = getattr(page, 'is_dirty', False)
+    return bool(pending)
+
+
+async def _save_page_edits(view, task_id: str, stage: str) -> str:
+    """Save what is typed on ``task_id``'s page; '' when it was saved.
+
+    DP-1220. MEASURED by reading the two run routes through: "Run this
+    step" emitted the run straight from the page, and neither route saved
+    the page first, so the dictionaries were written from the stored values
+    while the editors showed the typed ones -- and the re-read after the run
+    put the stored values back over them. A run meshes what is on the page,
+    or it does not run and says why.
+    """
+    page = _page_of(view, task_id)
+    if page is None or not _page_needs_save(view, task_id):
+        return ''
+    saver = getattr(page, 'save', None)
+    if saver is None:
+        return ''
+    tr = getattr(view, 'tr', None) or (lambda text: text)
+    try:
+        saved = await saver()
+    except Exception as error:                               # noqa: BLE001
+        logger.exception('the %s page could not be saved before a run',
+                         task_id)
+        saved, reason = False, str(error)
+    else:
+        reason = str(getattr(page, 'last_save_refusal', '') or '')
+    if saved:
+        return ''
+    text = tr('The edits on this page were not saved, so %s did not run.'
+              ) % (stage or tr('the step'))
+    return text + ('\n\n' + reason if reason else '')
+
+
+def _reload_page_keeping_edits(page) -> None:
+    """Re-read a page after a run without throwing away what is typed.
+
+    DP-1220. The run's re-read used plain `refresh`, which puts every stored
+    value back and clears the unsaved edits; an edit made while the stage ran
+    was gone when it finished.
+    """
+    if page is None:
+        return
+    reload = getattr(page, 'refresh_keeping_edits', None)
+    if not callable(reload):
+        reload = page.refresh
+    reload()
+
+
 class _ShownPageStack(QStackedWidget):
     """A task stack as wide at least as the task it shows, and no wider.
 
@@ -127,6 +205,14 @@ class EngineBranchView(QWidget):
     #: Plan 37 UF5 DP-1084. The result-locked task set differs from the one
     #: last applied, so a page shown outside this branch can re-read it.
     resultLocksChanged = Signal()
+    #: DP-1221. The stored case changed (a write, an undo, a geometry
+    #: import); delivered queued so the bus never repaints a page directly.
+    _storedStateChanged = Signal()
+
+    #: DP-1221. Pages whose body has not been re-read since the case last
+    #: changed under them; each is re-read, keeping its edits, when it opens.
+    _staleBodies: frozenset = frozenset()
+    _derivedRefreshQueued = False
 
     #: Plan 32 §7.3. Mirrors `MeshingMethodBranch.lockBypass`, which is the
     #: only thing that ever writes it, so both doors into a task page answer
@@ -238,6 +324,7 @@ class EngineBranchView(QWidget):
         self._empty.setWordWrap(True)
         layout.addWidget(self._empty)
 
+        self._subscribeToStoredState()
         self.refresh()
 
     # -- state ------------------------------------------------------------- #
@@ -285,6 +372,7 @@ class EngineBranchView(QWidget):
             # State-only refreshes must not destroy an in-progress editor.
             self._graph = self._build_graph(engine_id)
             self._apply_states()
+            self._refresh_page_bodies()
         if changed:
             self.engineChanged.emit(engine_id)
 
@@ -295,6 +383,7 @@ class EngineBranchView(QWidget):
             widget.deleteLater()
         self.tasks.clear()
         self._pages.clear()
+        self._staleBodies = frozenset()
         self._order.clear()
 
         page_classes = BRANCH_PAGES.get(engine_id, {})
@@ -645,6 +734,121 @@ class EngineBranchView(QWidget):
         except RuntimeError:
             pass                           # the branch was deleted meanwhile
 
+    def _refresh_page_bodies(self) -> None:
+        """Re-read the page on screen, keeping its edits; mark the others.
+
+        DP-1221. MEASURED offscreen (audit probe, snappy Base grid): the
+        background estimate stayed hidden after a geometry import and went
+        on reading the old count after the geometry was replaced. Import,
+        replace and remove reach this branch as a refresh with an unchanged
+        workflow, which only repainted the task states, so nothing on a page
+        that is worked out from the case was worked out again. The page on
+        screen is re-read now -- `refresh_keeping_edits`, so nothing typed is
+        lost -- and every other page is re-read when it is next opened rather
+        than ten re-reads on every write.
+        """
+        current = self.stack.currentWidget() if self._pages else None
+        stale = set(self._staleBodies)
+        for task_id, page in self._pages.items():
+            if page is current:
+                self._reread_body(task_id, page)
+                stale.discard(task_id)
+            else:
+                stale.add(task_id)
+        self._staleBodies = frozenset(stale)
+
+    def _reread_body(self, task_id: str, page) -> None:
+        """One page re-read with its edits kept; a page that raises is
+        skipped and named, as `_refresh_page_status` does (DP-142)."""
+        try:
+            _reload_page_keeping_edits(page)
+        except Exception:                                    # noqa: BLE001
+            logger.exception('the %s page could not re-read the case; it '
+                             'keeps what it showed', task_id)
+
+    def _refresh_derived(self, page) -> None:
+        """What ``page`` works out from the case, worked out again."""
+        derived = getattr(page, 'refresh_derived', None)
+        if not callable(derived):
+            return
+        try:
+            derived()
+        except Exception:                                    # noqa: BLE001
+            logger.exception('a page could not recompute its derived values')
+
+    def _open_page(self, task_id: str, page) -> None:
+        """DP-1221. A page opens on the case as it is now: re-read if the
+        case changed while it was away, its estimate recomputed if not."""
+        if task_id in self._staleBodies:
+            self._staleBodies = self._staleBodies - {task_id}
+            self._reread_body(task_id, page)
+        else:
+            self._refresh_derived(page)
+
+    def _subscribeToStoredState(self) -> None:
+        """Hear every change to the stored case (DP-1221).
+
+        The pattern `domain_regions_page` uses: the bus is told to emit a
+        queued signal and nothing else, the subscriptions end with the
+        widget, and the callback holds the branch weakly so a branch nobody
+        keeps is not kept alive by the bus.
+        """
+        import weakref
+
+        try:
+            from foammesh.app import app
+            from foammesh.core.project import Event
+
+            subscribe = getattr(getattr(app, 'events', None), 'subscribe',
+                                None)
+        except Exception:                                    # noqa: BLE001
+            return
+        if not callable(subscribe):
+            return
+        this = weakref.ref(self)
+
+        def changed(**_payload):
+            branch = this()
+            if branch is None:
+                return
+            try:
+                branch._storedStateChanged.emit()
+            except RuntimeError:                  # the branch has gone
+                pass
+
+        self._storedStateChanged.connect(
+            self._queueDerivedRefresh, Qt.ConnectionType.QueuedConnection)
+        try:
+            unsubscribes = [subscribe(event, changed) for event in (
+                Event.TRANSACTION_APPLIED, Event.UNDONE, Event.REDONE,
+                Event.ARTIFACT_RESTORED, Event.ARTIFACT_GEOMETRY_CHANGED,
+                Event.PROJECT_OPENED)]
+        except Exception:                                    # noqa: BLE001
+            return
+        self.destroyed.connect(
+            lambda *_args, gone=unsubscribes: [undo() for undo in gone])
+
+    def _queueDerivedRefresh(self) -> None:
+        """Coalesce a burst of stored-state events into one recompute."""
+        if self._derivedRefreshQueued:
+            return
+        self._derivedRefreshQueued = True
+        QTimer.singleShot(0, self._onStoredStateChanged)
+
+    def _onStoredStateChanged(self) -> None:
+        """The case changed: the page on screen recomputes what it derives
+        from it, and the others are re-read when they open (DP-1221)."""
+        self._derivedRefreshQueued = False
+        try:
+            current = self.stack.currentWidget() if self._pages else None
+        except RuntimeError:
+            return                              # the branch was deleted
+        self._staleBodies = frozenset(
+            task_id for task_id, page in self._pages.items()
+            if page is not current) | self._staleBodies
+        if current is not None:
+            self._refresh_derived(current)
+
     def _refresh_page_status(self) -> None:
         """Tell the visible page that the graph moved under it.
 
@@ -969,6 +1173,17 @@ class EngineBranchView(QWidget):
             # page, not a traceback: `_snappyDomainBounds` raises it in those
             # words and this is the one place it can be said out loud.
             return str(error)
+        except Exception as error:                           # noqa: BLE001
+            # DP-1223. MEASURED by reading the route through: anything else
+            # the writer raised (an AttributeError from a window half torn
+            # down, say) escaped the run before the guard was released, so
+            # the progress modal stayed up over a run that never started and
+            # every later press was refused as "already running". It is a
+            # failure like the others, said like them, with the trace logged.
+            logger.exception('writing the %s dictionaries failed', stage)
+            tr = getattr(self, 'tr', None) or (lambda text: text)
+            return tr('The dictionaries for %s could not be written: %s: %s'
+                      ) % (stage, type(error).__name__, error)
         return ''
 
     def _on_run_requested(self, task_id: str) -> None:
@@ -1046,7 +1261,8 @@ class EngineBranchView(QWidget):
 
         # The run operations have async facade handlers; run_sync raises.
         task = _submit(self._client, operation,
-                       dict(self.RUN_PARAMETERS.get(self._engine_id) or {}),
+                       {**(self.RUN_PARAMETERS.get(self._engine_id) or {}),
+                        **stage_timeout_parameters()},
                        on_result)
         if task is not None:
             self._run_task = task
@@ -1065,6 +1281,7 @@ class EngineBranchView(QWidget):
         operation = (self._qa_operation_name() if is_check
                      else 'workflow.run_stage')
         parameters = {} if is_check else {'stage': stage}
+        parameters.update(stage_timeout_parameters())
         # R101. "Run this step" runs exactly what `Run & Proceed` runs and was
         # just as silent about it, so it gets the same modal and the same
         # one-press-one-run guard.
@@ -1100,9 +1317,8 @@ class EngineBranchView(QWidget):
             self._publish_verdict(payload)
             if getattr(result, 'status', '') == 'accepted' and not is_check:
                 self._reload_mesh()
-            page = self._pages.get(task_id)
-            if page is not None:
-                page.refresh()
+            # DP-1220: the re-read keeps what was typed while it ran.
+            _reload_page_keeping_edits(self._pages.get(task_id))
             self._graph = self._build_graph(self._engine_id)
             self._apply_states()
             self._noticeSkippedSnapshots(baseline, payload)
@@ -1129,18 +1345,36 @@ class EngineBranchView(QWidget):
         # had the same hole: the stage was submitted against whatever
         # dictionaries happened to be on disk, which on a case that has never
         # been meshed is none at all.
-        if is_check or _stage_writer(self) is None:
+        # DP-1220. And it ran without saving the page it was pressed on, so
+        # an edit not yet saved is saved first -- awaited, which is why a
+        # page with one takes the asynchronous road even with no writer.
+        needs_save = _page_needs_save(self, task_id)
+        if not needs_save and (is_check or _stage_writer(self) is None):
             start()
             return
 
         async def generate_then_run() -> None:
-            failure = await self._write_stage_dictionaries(stage)
+            started = False
+            failure = ''
+            try:
+                failure = await _save_page_edits(self, task_id, stage)
+                if not failure and not is_check:
+                    failure = await self._write_stage_dictionaries(stage)
+                if not failure:
+                    start()
+                    started = True
+            except Exception as error:                       # noqa: BLE001
+                # DP-1223. Whatever goes wrong before the run starts, the
+                # guard and the modal are given back and the reason is said.
+                logger.exception('the %s run could not start', stage)
+                failure = self.tr('The stage could not run: %s: %s') % (
+                    type(error).__name__, error)
+            finally:
+                if not started:
+                    released()
             if failure:
-                released()
                 await modal(lambda: QMessageBox.warning(
                     self, self.tr('Stage run'), failure))
-                return
-            start()
 
         self._stage_task = asyncio.ensure_future(generate_then_run())
 
@@ -1405,11 +1639,16 @@ class EngineBranchView(QWidget):
         baseline = self._skipBaseline()
         published_before = self.publicationRevision(task_id, active_only=False)
         try:
+            # DP-1220. What is typed on the page is what the run meshes: it
+            # is saved first, and a refused save is a run that does not start.
+            failure = await _save_page_edits(self, task_id, stage)
             # DP-256. The dictionaries this stage meshes from, written the
             # way every other route to a run writes them, before the run.
-            failure = await self._write_stage_dictionaries(stage)
             if not failure:
-                result = await runner('workflow.run_stage', {'stage': stage})
+                failure = await self._write_stage_dictionaries(stage)
+            if not failure:
+                result = await runner('workflow.run_stage', {
+                    'stage': stage, **stage_timeout_parameters()})
         except FacadeError as error:
             failure = (self.insufficientDiskText(
                 getattr(error, 'details', None),
@@ -1444,9 +1683,8 @@ class EngineBranchView(QWidget):
             # base grid, castellation, snap and layers. The tree row's own
             # run (`_on_stage_run_requested`) has always drawn it.
             self._reload_mesh()
-        page = self._pages.get(task_id)
-        if page is not None:
-            page.refresh()
+        # DP-1220: the re-read keeps what was typed while it ran.
+        _reload_page_keeping_edits(_page_of(self, task_id))
         self.refresh_states()
         if accepted:
             # Plan 37 F5. A re-run after Back, edit, Proceed has to be told
@@ -1595,9 +1833,8 @@ class EngineBranchView(QWidget):
                 self, self.tr('Mesh check'), text))
         payload = getattr(result, 'payload', {}) or {}
         self._publish_verdict(payload)
-        page = self._pages.get(task_id)
-        if page is not None:
-            page.refresh()
+        # DP-1220: the re-read keeps what was typed while the check ran.
+        _reload_page_keeping_edits(_page_of(self, task_id))
         self.refresh_states()
         self.taskChanged.emit(task_id)
         accepted = result is not None and self.is_accepted(task_id)
@@ -2258,6 +2495,10 @@ class EngineBranchView(QWidget):
         if row < 0 or row >= len(self._order):
             return
         self.stack.setCurrentIndex(row)
+        task_id = self._order[row]
+        page = self._pages.get(task_id)
+        if page is not None:
+            self._open_page(task_id, page)
         self._updateHeading()
         self._gradeRunAll()
         self.taskSelected.emit(self._order[row])

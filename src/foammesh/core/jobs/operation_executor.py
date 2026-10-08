@@ -226,7 +226,10 @@ class OperationExecutor:
             mutation=spec.mutation,
             environment=spec.environment,
             log_path=log_path,
-            timeout=spec.timeout,
+            # Plan 37 #7. 0 is the Preferences "No limit": the job manager
+            # waits without a deadline rather than refusing it.
+            timeout=(None if spec.timeout is not None and spec.timeout <= 0
+                     else spec.timeout),
             max_output_bytes=spec.max_output_bytes,
             expected_outputs=tuple(
                 item.path for item in spec.expected_artifacts
