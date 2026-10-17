@@ -1,5 +1,32 @@
 # FoamMesh Release Notes
 
+## 1.1.1 — 2026-10-17
+
+- **A viewport-first window.** The 3-D view takes most of the window. Its tools
+  float over it on folding edges (a top bar, a bottom bar and a side rail),
+  each of which can be pinned open. Settings sit in one column beside the
+  view, and the step tabs carry each step's state and figures.
+- **Viewport inspection.** Deviation colouring measures the walls against the
+  reference geometry, in millimetres and with the run's own tolerance. The
+  corner triad and the origin axes are separate controls. Worst cells, failed cells, fidelity
+  and a cell inspector are reached from the viewport.
+- **Gmsh as a mesher in its own right.** The native Gmsh 4.15.2 controls and
+  every Gmsh output format are exposed, not just those an OpenFOAM case needs.
+- **Themes.** Light and dark themes are drawn from one token set. Icons are
+  tinted to the theme and mesh lines follow it.
+- **Fixes.**
+  - Imports, mesh loads and the post-run mesh record run off the GUI thread,
+    so the window keeps answering while a large model loads.
+  - Failed cells works on a reopened case whose mesh check wrote cell sets.
+  - The side-rail buttons no longer overlap at start-up, and their icons are
+    drawn with a readable stroke.
+  - The Parts chip opens on any press inside it, and pressing an open
+    panel's own button closes it.
+  - Display rows show when they are on, and clicking a row's label toggles
+    it.
+  - The origin axes' X/Y/Z labels are small and coloured.
+  - VTK no longer logs "Too many props" on hover picks.
+
 ## 1.1.0 — 2026-09-26
 
 - **Detect the fluid regions.** Domain & regions asks how many fluid regions
