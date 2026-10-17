@@ -84,10 +84,18 @@ def _gmsh_commands() -> list:
 
     path = (Path(__file__).resolve().parent.parent / 'gmsh_workflow'
             / 'gmsh_keys.py')
-    spec = importlib.util.spec_from_file_location(
-        'foammesh_shortcut_registry_gmsh_keys', path)
-    gmsh_keys = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gmsh_keys)
+    if path.is_file():
+        spec = importlib.util.spec_from_file_location(
+            'foammesh_shortcut_registry_gmsh_keys', path)
+        gmsh_keys = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gmsh_keys)
+    else:
+        # DP-2726. A frozen build keeps no .py files on disk, so the path
+        # read stopped the packaged app at start-up; it imports the module.
+        import importlib
+
+        gmsh_keys = importlib.import_module(
+            'foammesh.view.gmsh_workflow.gmsh_keys')
 
     made = []
     for key, what, binding in gmsh_keys.KEYS:
