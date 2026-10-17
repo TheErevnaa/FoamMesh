@@ -117,3 +117,14 @@ def humanise_option(value) -> str:
         return ''
     return ' '.join(_spell(word, index == 0)
                     for index, word in enumerate(words))
+
+
+#: DP-226 / UXB1. What a user calls the runtime behind each engine (the thing
+#: the probe looks for), as against the mesher's own name above. Held here so
+#: no page keeps a second table of engine names.
+_RUNTIME_NAMES: dict[str, str] = {'snappy': 'OpenFOAM', 'gmsh': 'Gmsh'}
+
+
+def runtime_name(engine_id, default: str = '') -> str:
+    """The runtime a probe for *engine_id* looks for, or *default*."""
+    return _RUNTIME_NAMES.get(str(engine_id), default)

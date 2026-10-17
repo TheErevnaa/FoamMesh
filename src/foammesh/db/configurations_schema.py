@@ -102,12 +102,15 @@ class InterfaceTransform(Enum):
 class GmshSurfaceAlgorithm(Enum):
     """Gmsh ``Mesh.Algorithm`` values, by name rather than magic number.
 
-    Plan 31 FC-B. The last two are the quad surfacers, and they are gated the
-    way recombination is: offered for an SU2 target and cleared with a warning
-    for every other one, because a quadrilateral surface is what the OpenFOAM
-    route refuses. MEASURED on the catalogue rather than assumed -- see
+    Plan 31 FC-B. The last two are the quad surfacers.  MEASURED on the
+    catalogue rather than assumed -- see
     ``plans/evidence/plan31/fcb-algorithms/surface.json`` for the element
     families each one wrote.
+
+    Plan 41 GN2 (DP-1388). All nine of Gmsh's 2D algorithms are offered, and
+    none is swapped for another because of the target solver: a quad surface
+    is the Gmsh route's to make, and the OpenFOAM publisher declines it at
+    export, with the reason.
     """
 
     MESHADAPT = 'meshadapt'
@@ -119,6 +122,11 @@ class GmshSurfaceAlgorithm(Enum):
     FRONTAL_DELAUNAY_QUADS = 'frontal_delaunay_quads'
     #: ``Mesh.Algorithm`` 11. Writes quadrilaterals on its own.
     QUASI_STRUCTURED_QUAD = 'quasi_structured_quad'
+    #: ``Mesh.Algorithm`` 3. Plan 41 GN2: meshes the boundary only, from the
+    #: discrete entity's own initial mesh.
+    INITIAL_MESH_ONLY = 'initial_mesh_only'
+    #: ``Mesh.Algorithm`` 7. Plan 41 GN2: the anisotropic 2D mesher.
+    BAMG = 'bamg'
 
 
 class GmshVolumeAlgorithm(Enum):
@@ -151,6 +159,10 @@ class GmshVolumeAlgorithm(Enum):
     #: ``Mesh.Algorithm3D`` 7. Best angles measured, at twice the wall clock,
     #: and it refuses some geometry the other two mesh.
     MMG3D = 'mmg3d'
+    #: ``Mesh.Algorithm3D`` 3. Plan 41 GN2 (DP-1388): the initial mesh only.
+    INITIAL_MESH_ONLY = 'initial_mesh_only'
+    #: ``Mesh.Algorithm3D`` 9. Plan 41 GN2 (DP-1388): the R-tree mesher.
+    RTREE = 'rtree'
 
 
 class GmshSealedCavityPolicy(Enum):
@@ -191,6 +203,20 @@ class FarfieldCentreMode(Enum):
     AUTO = 'auto'
     #: The ``centre`` vector, in metres.
     EXPLICIT = 'explicit'
+
+
+class GmshRenumberMethod(Enum):
+    """The node renumbering methods Gmsh 4.15.2 offers.
+
+    ``gmsh.model.mesh.computeRenumbering(method)`` documents exactly three:
+    "RCMK" (reverse Cuthill-McKee), "Hilbert" (along a Hilbert curve) and
+    "Metis". DP-1471: Generate's Renumber action offered all three while the
+    export-time renumber ran RCMK only; both now read this one list.
+    """
+
+    RCMK = 'rcmk'
+    HILBERT = 'hilbert'
+    METIS = 'metis'
 
 
 class GmshRecombinationAlgorithm(Enum):
@@ -437,6 +463,8 @@ class GmshLayerPatchMode(Enum):
 class GmshPeriodicTransform(Enum):
     TRANSLATION = 'translation'
     ROTATION = 'rotation'
+    # Plan 41 GN11 (M-33): any invertible 3x3 plus a translation.
+    AFFINE = 'affine'
 
 
 class GeometryPreparationDecision(Enum):
@@ -450,6 +478,14 @@ class GeometryPreparationDecision(Enum):
 class BaseGridSizingMode(Enum):
     COUNTS = 'counts'
     TARGET_SIZE = 'target_size'
+
+
+class MeshSizePreset(Enum):
+    """Plan 40 UXA1: one choice that sizes both engines (core/sizing)."""
+    COARSE = 'coarse'
+    MEDIUM = 'medium'
+    FINE = 'fine'
+    CUSTOM = 'custom'
 
 
 class GradingFine(Enum):
@@ -828,6 +864,9 @@ geometry = {
     'point1': VectorComposite().schema(),
     'point2': VectorComposite().setDefault(1, 1, 1).schema(),
     'radius': FloatType().setDefault(1),
+    # LY13-D3 (A-088a). A cylinder's bore: 0 is the solid cylinder, a positive
+    # value makes a pipe wall between `innerRadius` and `radius` (the outer).
+    'innerRadius': FloatType().setLowLimit(0).setOptional().setDefault(0),
     'castellationGroup': IntType().setOptional().setDefault(None),
     'layerGroup': IntType().setOptional().setDefault(None),
     'slaveLayerGroup': IntType().setOptional().setDefault(None),
@@ -922,6 +961,10 @@ surfaceRefinement = {
     # mandatory (``lookup<point>("insidePoint", dimLength)``), so it is
     # written whenever that mode is chosen and never otherwise.
     'zoneInsidePoint': VectorComposite().schema(),
+    # LY13-D1 (DP-2372). The point above starts at (0 0 0), which is also a
+    # place a seed can be. This is set when a coordinate is given, so an
+    # unplaced seed is told from one typed at the origin.
+    'zoneInsidePointSet': BoolType(False),
 }
 
 #: One ``(distance level)`` pair of a ``refinementRegions`` distance ramp.
@@ -1204,6 +1247,11 @@ gmshPeriodicPair = {
     'rotationCentre': VectorComposite().setDefault(0.0, 0.0, 0.0).schema(),
     'rotationAxis': VectorComposite().setDefault(0.0, 0.0, 1.0).schema(),
     'rotationAngleDegrees': FloatType().setRange(-360, 360).setDefault(0.0),
+    # Plan 41 GN11 (M-33). The linear part of an affine pair, one row each;
+    # the translation above is its fourth column.
+    'affineRowX': VectorComposite().setDefault(1.0, 0.0, 0.0).schema(),
+    'affineRowY': VectorComposite().setDefault(0.0, 1.0, 0.0).schema(),
+    'affineRowZ': VectorComposite().setDefault(0.0, 0.0, 1.0).schema(),
     'matchTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
 }
 
@@ -1220,6 +1268,17 @@ schema = {
         # project simply reads the default.
         'targetSolver': EnumType(TargetSolver).setDefault(
             TargetSolver.UNSELECTED),
+        # Plan 40 UXA1 (F1a, F1b). Coarse / Medium / Fine resolve every size
+        # the user left unset (core/sizing/derive.py). A saved case that holds
+        # no preset opens on Coarse, which is the rule it always ran on
+        # (diagonal / 40), so nothing changes under it.
+        'sizePreset': EnumType(MeshSizePreset).setDefault(
+            MeshSizePreset.MEDIUM),
+        # Plan 40 UXA2 (#31, F1c). The one feature angle of the project, in
+        # degrees of turn from flat: an edge that turns by more than this is a
+        # feature. core/facade/feature_angle.py derives the five places that
+        # used to hold their own number (30 / 60 / 150 / 60 / 30) from it.
+        'featureAngle': FloatType().setRange(1, 179).setDefault(30),
         'execution': {
             'mode': EnumType(ExecutionMode).setDefault(ExecutionMode.AUTO),
             'maxCpuCores': IntType().setLowLimit(0).setDefault(0),
@@ -1301,6 +1360,25 @@ schema = {
         'qualificationToleranceM': FloatType().setLowLimit(0, True).setDefault(
             0.0),
     },
+    # Plan 41 GN25b. The inputs of the automatic size field
+    # (`foammesh-sizefield`). A size of 0 means "from the model length": the
+    # run resolves it to hbulk = L/20, hmin = L/1000, hmax = hbulk, so the
+    # defaults follow the geometry and a typed value always wins. The feature
+    # angle is the project's own (`mesh/featureAngle`), not a copy.
+    'sizeField': {
+        'minimumSize': FloatType().setLowLimit(0).setDefault(0.0),
+        'maximumSize': FloatType().setLowLimit(0).setDefault(0.0),
+        'bulkSize': FloatType().setLowLimit(0).setDefault(0.0),
+        'gradation': FloatType().setLowLimit(1).setDefault(1.1),
+        'nodesPerTwoPi': IntType().setLowLimit(3).setDefault(20),
+        'nodesPerGap': IntType().setLowLimit(0).setDefault(4),
+        'smoothing': BoolType(True),
+        'anisotropic': BoolType(False),
+        # Plan 41 GN25f. Gmsh only: the saved field is the run's background
+        # size field (the "Automatic" tier). Off by default so no project's
+        # mesh changes until it is switched on.
+        'useAsBackground': BoolType(False),
+    },
     'geometry': IntKeyList(geometry),
     # Shared geometry-level interface pairing.  Both engines consume this
     # connector model; it is not an engine-specific duplicate.
@@ -1347,7 +1425,8 @@ schema = {
             'minimumSize': FloatType().setOptional().setDefault(None)
             .setLowLimit(0, False),
             'sizeFactor': FloatType().setRange(0.01, 100).setDefault(1.0),
-            'fromCurvature': IntType().setRange(0, 50).setDefault(12),
+            'fromCurvature': IntType().setRange(0, 50).setOptional()
+            .setDefault(None),
             'fromPoints': BoolType(True),
             'extendFromBoundary': BoolType(True),
             # Plan 31 FC-B. The curve-discretisation floors: how few elements
@@ -1428,6 +1507,48 @@ schema = {
         # Plan 31 FC-C. Structure asked for by the model rather than face by
         # face. The curve and volume controls make one named scope structured;
         # this asks Gmsh to find every volume it can structure by itself.
+        # Plan 41 GN2 (T-01, G3). The Gmsh options the user set from the
+        # option catalogue, as one JSON object of name: value. Every option of
+        # the installed Gmsh is reachable here; a value reaches Gmsh as set,
+        # after every page control, and the ledger shows what it read back.
+        # Stored as text because the set of names is the build's, not the
+        # schema's: a name added by a Gmsh upgrade needs no schema change.
+        'options': {
+            'overrides': TextType().setOptional().setDefault(''),
+        },
+        # Plan 41 GN6 (M-02..M-20, M-22). The size fields the user made from
+        # any of Gmsh's 29 field types, as one JSON list of rows (name, type,
+        # on/off, background, params).  Text for the same reason as the
+        # options: the set of types and parameters is the build's, and a
+        # reference from one field to another is a name, so the rows form a
+        # graph the page draws.  Validated in core/gmsh/field_catalogue.py.
+        'nativeFields': {
+            'rows': TextType().setOptional().setDefault(''),
+        },
+        # Plan 41 GN9 (M-28..M-32, A-17). Embedded entities and the
+        # per-entity meshing constraints, as one JSON list of rows (name,
+        # kind, dim, tags, params). Text for the same reason as the size
+        # fields: the kinds are Gmsh's. Validated in
+        # core/gmsh/entity_controls.py.
+        'entityControls': {
+            'rows': TextType().setOptional().setDefault(''),
+        },
+        # Plan 41 GN8 (M-24..M-26). Transfinite surfaces and volumes with
+        # picked corners and the triangle arrangement, and automatic
+        # transfinite with its corner angle and recombine flag, as one JSON
+        # list of rows (name, kind, dim, tags, corners, params). Text for the
+        # same reason as the entity controls. Validated in
+        # core/gmsh/structure.py.
+        'structure': {
+            'rows': TextType().setOptional().setDefault(''),
+        },
+        # Plan 41 GN7 (M-01). Sizes at points picked in the viewport, as one
+        # JSON list of rows (name, point tag, position, size, on/off).  Text
+        # for the same reason as the rows above; validated in
+        # core/gmsh/point_sizes.py.
+        'pointSizes': {
+            'rows': TextType().setOptional().setDefault(''),
+        },
         'structuring': {
             # `mesh.setTransfiniteAutomatic`. MEASURED on Gmsh 4.15.2
             # through the shipped runner: a one-metre box at a 0.25 m target
@@ -1635,6 +1756,11 @@ schema = {
             # non-positive quality is an inverted or zero-volume element and no
             # user may accept one. Not the same control as minQuality.
             'hardFloor': FloatType().setRange(0, 1).setDefault(0.0),
+            # Plan 41 GN14. Further measures, each judged on its own limit and
+            # allowance beside the one above. A JSON list of the same
+            # `{measure, minQuality, allowedFraction, allowedCount,
+            # hardFloor}` blocks; the Generate mesh page edits it as a table.
+            'extraLimits': TextType().setOptional().setDefault(''),
         },
         'boundaryLayers': {
             # R118. Gmsh grows layers by extruding boundary surfaces and
@@ -1654,15 +1780,29 @@ schema = {
             # revalidation, which is the path undo/redo, reopen and
             # delta-commit all take (38 suite failures, one cause).
             'patches': TextType().setOptional().setDefault(''),
+            # Plan 40 UXA1 (U1): a new case grows layers on every eligible
+            # wall; a saved case keeps what it had (migrateDocument).
             'patchMode': EnumType(GmshLayerPatchMode).setDefault(
-                GmshLayerPatchMode.SELECTED),
-            'enabled': BoolType(False),
+                GmshLayerPatchMode.ALL_ELIGIBLE_WALLS),
+            'enabled': BoolType(True),
             'mode': EnumType(GmshLayerMode).setDefault(GmshLayerMode.FIRST_AND_RATIO),
-            'firstHeight': FloatType().setLowLimit(0, False).setDefault(0.0006),
+            # Unset: the first layer comes from the Mesh size choice
+            # (core/sizing/derive.py). A saved 0.0006 stays typed.
+            'firstHeight': FloatType().setOptional().setLowLimit(0, False)
+            .setDefault(None),
             'ratio': FloatType().setRange(1.0, 5.0).setDefault(1.2),
             'layerCount': IntType().setRange(1, 100).setDefault(3),
             'totalThickness': FloatType().setLowLimit(0, False).setDefault(0.002),
             'quads': BoolType(True),
+            # Plan 41 GN10 (M-34). Each layer divided into this many
+            # elements (`extrudeBoundaryLayer`'s numElements per layer).
+            'elementsPerLayer': IntType().setRange(1, 20).setDefault(1),
+            # Plan 41 GN10 (M-34). One stack per patch, as a JSON list of
+            # rows (patch, mode, layerCount, firstHeight, ratio,
+            # totalThickness, elementsPerLayer, quads, enabled); a value a
+            # row leaves out is the one above. Validated in
+            # core/gmsh/layers.py.
+            'stacks': TextType().setOptional().setDefault(''),
         },
         # Plan 29 WP8, corrected by CP-01. Element order is an exporter-facing
         # choice, not a mesher preference: Gmsh meshes at 1 or 2, and both
@@ -1698,6 +1838,10 @@ schema = {
             # Off by default: it changes every node number in the file, and a
             # mesh whose numbering is stable between runs is easier to diff.
             'renumber': BoolType(False),
+            # DP-1471. Which of Gmsh 4.15.2's three renumbering methods the
+            # export-time renumber runs; read only when 'renumber' is on.
+            'renumberMethod': EnumType(GmshRenumberMethod).setDefault(
+                GmshRenumberMethod.RCMK),
         },
         'sizeFields': IntKeyList(gmshSizeField),
         'surfaceSizes': IntKeyList(gmshSurfaceSize),
@@ -1745,7 +1889,12 @@ schema = {
         'gapWidth': FloatType().setLowLimit(0, False).setDefault(0.0001),
     },
     'baseGrid': {
-        'sizingMode': EnumType(BaseGridSizingMode).setDefault(BaseGridSizingMode.COUNTS),
+        # Plan 40 UXA3 (#42). A new case divides the block by a target cell
+        # size (Auto: bounding-box diagonal / 40) instead of 10 x 10 x 10.
+        # A saved case keeps its stored mode: `migrateDocument` writes
+        # `counts` into a 1.1.0 document that holds no mode.
+        'sizingMode': EnumType(BaseGridSizingMode).setDefault(
+            BaseGridSizingMode.TARGET_SIZE),
         # DP-669 (DP-587 left it). Unset ("Auto") in a new project: the
         # block is divided at its bounding-box diagonal / 40, as the Gmsh
         # global size is (DP-614). The old 1 m default wrote one cell across
@@ -1841,6 +1990,10 @@ schema = {
     'castellation': {
         'nCellsBetweenLevels': IntType().setDefault(3).setLowLimit(1),
         'resolveFeatureAngle': FloatType().setRange(0, 180).setDefault(30),
+        # Plan 40 UXA2. Whether the case has had its default "walls"
+        # refinement group, made once so a group the user removes stays
+        # removed. The mesher never reads it.
+        'defaulted': BoolType(False),
         'maxGlobalCells': IntType().setLowLimit(1).setDefault('1e8'),
         'maxLocalCells': IntType().setLowLimit(1).setDefault('1e7'),
         'minRefinementCells': IntType().setLowLimit(0).setDefault(0),
@@ -1909,7 +2062,7 @@ schema = {
     'addLayers': {
         # Plan 29 WP7.3. Layer thickness is per group, not per case: the six
         # keys that used to sit here commented out live in the ``layer``
-        # schema above, which is what ThicknessForm reads and writes.
+        # schema above, which the layer group editor reads and writes.
         'layers': IntKeyList(layer),
         # Plan 37 UF2 (DP-1028). Whether the case has already been given its
         # "Walls" layer group by the snappy layers page. The page defaults a
@@ -1918,12 +2071,25 @@ schema = {
         # input: nothing the writer reads, so writing it stales nothing.
         'defaulted': BoolType(False),
         'nGrow': IntType().setLowLimit(0).setDefault(0),
-        'featureAngle': FloatType().setRange(0, 180).setDefault(60),
+        # Plan 40 U1 (DEF, 2026-10-11). The six layer defaults below marked
+        # "U1" were measured on the footer-only defaults walks (layer stage
+        # rerun on the walk's own snapped meshes, OpenFOAM 13): the old
+        # 60 / 0.3 / 90 / 1 / 10 / default gave 86.6 % on the duct and 60.1 %
+        # on the heat-sink body; these give 96.8 % and 96.5 %, with pipe
+        # 98.9, elbow 97.9, expansion 97.9, max non-orthogonality <= 65 and
+        # plain checkMesh "Mesh OK" on all five. A saved case keeps what it
+        # stored (`migrateDocument` writes the old values into a document
+        # that holds none), so no existing project changes mesh.
+        # U1: 100 is OpenFOAM 13's own default (snappyHexMeshDict.cfg); 60
+        # stopped layers at every rim the duct and the fins turn through.
+        'featureAngle': FloatType().setRange(0, 180).setDefault(100),
         # v13 medialAxisMeshMover defaults this to featureAngle/2; carrying it
         # explicitly matches the Foundation tutorials, which all set it.
         'slipFeatureAngle': FloatType().setRange(0, 180).setDefault(30),
         'maxFaceThicknessRatio': FloatType().setRange(0, 1).setDefault(0.5),
-        'nSmoothSurfaceNormals': IntType().setLowLimit(0).setDefault(1),
+        # U1: three passes smooth the normals round the fin tips, so fewer
+        # faces are refused for a bad extrusion direction.
+        'nSmoothSurfaceNormals': IntType().setLowLimit(0).setDefault(3),
         'nSmoothThickness': IntType().setLowLimit(0).setDefault(10),
         # OpenFOAM 13's medialAxisMeshMover reads this through
         # ``lookupBackwardsCompatible({"minMedialAxisAngle",
@@ -1932,10 +2098,15 @@ schema = {
         # schema carried the misspelling, so every project and every
         # dictionary FoamMesh wrote spelled it the way the release
         # merely tolerates. ``migrateDocument`` renames it on load.
-        'minMedialAxisAngle': FloatType().setRange(0, 180).setDefault(90),
-        'maxThicknessToMedialRatio': FloatType().setRange(0, 1).setDefault(0.3),
+        # U1: 130 keeps the medial axis off the 90-degree fin roots, where
+        # at 90 the mover treated the root as thin and shrank the layer.
+        'minMedialAxisAngle': FloatType().setRange(0, 180).setDefault(130),
+        # U1: 0.6 is OpenFOAM 13's own default; 0.3 collapsed the layer in
+        # the gaps between fins and in the duct corners.
+        'maxThicknessToMedialRatio': FloatType().setRange(0, 1).setDefault(0.6),
         'nSmoothNormals': IntType().setLowLimit(0).setDefault(3),
-        'nRelaxIter': IntType().setLowLimit(0).setDefault(10),
+        # U1: twenty relaxation passes before a face is given up.
+        'nRelaxIter': IntType().setLowLimit(0).setDefault(20),
         'nBufferCellsNoExtrude': IntType().setLowLimit(0).setDefault(0),
         'nLayerIter': IntType().setLowLimit(0).setDefault(50),
         'nRelaxedIter': IntType().setLowLimit(0).setDefault(20),
@@ -1944,8 +2115,11 @@ schema = {
         # thin feature is usually short of nMedialAxisIter.
         'nMedialAxisIter': IntType().setLowLimit(0).setOptional().setDefault(None),
         'nSmoothDisplacement': IntType().setLowLimit(0).setOptional().setDefault(None),
+        # U1: on, a face whose neighbours all extrude is extruded with them
+        # instead of being left an island; on the heat-sink body this alone
+        # took coverage from 85.0 to 91.3 % (with the five values above).
         'detectExtrusionIsland': EnumType(OptionalToggle).setDefault(
-            OptionalToggle.DEFAULT),
+            OptionalToggle.ON),
         'additionalReporting': EnumType(OptionalToggle).setDefault(
             OptionalToggle.DEFAULT),
         # Plan 37 UF15. How far a face merged over one cell's layer faces may
@@ -2279,6 +2453,19 @@ def _resetOutOfRange(values: dict, node: dict) -> None:
                            else None)
 
 
+#: Plan 40 U1 (DEF, 2026-10-11). The addLayers defaults before the U1
+#: change. ``migrateDocument`` writes them into a saved document that holds
+#: no value, because that document was meshed with them.
+LAYER_DEFAULTS_BEFORE_U1 = {
+    'featureAngle': 60,
+    'maxThicknessToMedialRatio': 0.3,
+    'minMedialAxisAngle': 90,
+    'nSmoothSurfaceNormals': 1,
+    'nRelaxIter': 10,
+    'detectExtrusionIsland': OptionalToggle.DEFAULT.value,
+}
+
+
 def migrateDocument(document):
     """Rewrite a saved document onto the current field names, in place.
 
@@ -2307,6 +2494,9 @@ def migrateDocument(document):
     One meaning is handled: a Gmsh layer block saved before the surfaces
     were a choice. ``foammesh.core.gmsh.layer_migration`` reads it, because
     the reading has to be the same one the derivation and the page apply.
+
+    One move is handled: a volume's ``bands`` ramp becomes rows of
+    ``castellation/volumeBands`` (DP-2210), see ``foammesh.db.volume_bands``.
 
     One removal is handled: ``mesh/intent`` (Plan 30 WP-09, F-23). Validation
     would drop it anyway; it is dropped here so that a case saved with the six
@@ -2345,10 +2535,55 @@ def migrateDocument(document):
         implicit = str(stored) == FeatureSnapType.IMPLICIT.value
         snap.setdefault('implicitFeatureSnap', implicit)
         snap.setdefault('explicitFeatureSnap', not implicit)
+    # DP-2210 (Plan 43 LY13 D1). A volume's distance ramp used to be saved
+    # inside the volume (``refinementVolumes/<id>/bands``); the guided editor
+    # and the case builder use ``castellation/volumeBands``, so a saved ramp
+    # moves there and a live edit is never beaten by a hidden second copy.
+    castellationSection = document.get('castellation')
+    if isinstance(castellationSection, dict):
+        from foammesh.db.volume_bands import migrate_legacy_bands
+        migrate_legacy_bands(castellationSection)
+    if 'version' in document:
+        # Plan 40 UXA2. A saved case has had its say about refinement groups.
+        castellation = document.get('castellation')
+        if isinstance(castellation, dict):
+            castellation.setdefault('defaulted', True)
+        elif castellation is None:
+            document['castellation'] = {'defaulted': True}
+        # Plan 40 UXA1. A saved case ran on diagonal / 40 = Coarse.
+        meshSection = document.get('mesh')
+        if not isinstance(meshSection, dict):
+            meshSection = document['mesh'] = {}
+        meshSection.setdefault('sizePreset', MeshSizePreset.COARSE.value)
+        # Plan 40 UXA1. A saved case ran with layers off and a 0.6 mm first
+        # layer; it reopens that way.
+        gmshSection = document.get('gmsh')
+        if isinstance(gmshSection, dict):
+            layerBlock = gmshSection.get('boundaryLayers')
+            if not isinstance(layerBlock, dict):
+                layerBlock = gmshSection['boundaryLayers'] = {}
+            layerBlock.setdefault('enabled', False)
+            layerBlock.setdefault('patchMode',
+                                  GmshLayerPatchMode.SELECTED.value)
+            layerBlock.setdefault('firstHeight', 0.0006)
     baseGrid = document.get('baseGrid')
     if isinstance(baseGrid, dict):
+        # Plan 40 UXA3. Before this the default mode was `counts`, so a
+        # document that holds no mode was running on counts.
+        baseGrid.setdefault('sizingMode', BaseGridSizingMode.COUNTS.value)
         _migrateGrading(baseGrid)
+    elif baseGrid is None and 'version' in document:
+        document['baseGrid'] = {
+            'sizingMode': BaseGridSizingMode.COUNTS.value}
     addLayers = document.get('addLayers')
+    if isinstance(addLayers, dict):
+        # Plan 40 U1 (DEF). The layer defaults changed; a saved case that
+        # stored none of these ran on the old ones and keeps them.
+        for key, old in LAYER_DEFAULTS_BEFORE_U1.items():
+            if key not in addLayers and not (
+                    key == 'minMedialAxisAngle'
+                    and 'minMedianAxisAngle' in addLayers):
+                addLayers[key] = old
     if isinstance(addLayers, dict) and 'minMedianAxisAngle' in addLayers:
         retired = addLayers.pop('minMedianAxisAngle')
         addLayers.setdefault('minMedialAxisAngle', retired)

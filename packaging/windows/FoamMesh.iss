@@ -1,5 +1,5 @@
 #define AppName "FoamMesh"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.1"
 #define AppPublisher "Erevnaa"
 #define AppExeName "FoamMesh.exe"
 
@@ -37,6 +37,11 @@ PrivilegesRequired=admin
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+
+; Plan 41 GN25e. Automatic sizing needs no component here: the size-field tool
+; is a 1 MB file inside the program folder (resources\sizefield) that the app
+; copies into the user's own WSL distribution when asked ("Set up automatic
+; sizing"). The installer imports no WSL distribution and downloads nothing.
 
 [Files]
 Source: "..\..\dist\FoamMesh\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

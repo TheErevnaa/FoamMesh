@@ -65,11 +65,17 @@ class CutCellsFilter(VTKPythonAlgorithmBase):
     keeps. *polyData* makes the output poly data (for a surface actor).
     """
 
-    def __init__(self, planes=(), polyData=False):
+    def __init__(self, planes=(), polyData=False, rule=None):
         VTKPythonAlgorithmBase.__init__(
             self, nInputPorts=1, nOutputPorts=1,
             outputType='vtkPolyData' if polyData else 'vtkUnstructuredGrid')
         self._polyData = polyData
+        # Plan 39 VI10b. How the masks keep a cell: as the section tool set it
+        # for this clip unless the caller says.
+        if rule is None:
+            from foammesh.rendering import combine_clip
+            rule = combine_clip.options().rule
+        self._rule = getattr(rule, 'value', rule)
         self._planes = [(tuple(plane.GetOrigin()), tuple(plane.GetNormal()))
                         for plane in planes]
 
@@ -89,7 +95,8 @@ class CutCellsFilter(VTKPythonAlgorithmBase):
             return 1
         points = vtk_to_numpy(source.GetPoints().GetData()).astype(float)
         offsets, connectivity = cellLayout(source)
-        keep = cut_cells_mask(points, offsets, connectivity, self._planes)
+        keep = cut_cells_mask(points, offsets, connectivity, self._planes,
+                              rule=self._rule)
 
         # The mask rides on a shallow copy as a cell array and a threshold
         # takes the cells it marks (this VTK's vtkExtractCells wants a

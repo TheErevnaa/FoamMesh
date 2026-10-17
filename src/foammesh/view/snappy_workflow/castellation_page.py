@@ -11,13 +11,19 @@ from __future__ import annotations
 from PySide6.QtWidgets import QLabel
 
 from foammesh.view.facade_client import submit
+from foammesh.view.widgets.folded_note import FoldedNote
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
 
 from . import background_estimate_label, level_cell_size
 from .base import SnappyTaskPage
+from .refinement_outline import (
+    FEATURE_BAND, SURFACE as SURFACE_ROW, VOLUME as VOLUME_ROW, VOLUME_BAND,
+    RefinementOutline,
+)
 from .refinement_membership import (
     SURFACE, VOLUME, RefinementMembership, bound_groups, unbind_group,
 )
+from .walls_default import ensure_walls_group
 
 
 class RefinementGroupPanel(ChildControlPanel):
@@ -87,6 +93,21 @@ class RefinementGroupPanel(ChildControlPanel):
                                         then=ran))
 
 
+class BandPanel(ChildControlPanel):
+    """A band table whose new row starts on the group it was added under.
+
+    Plan 40 UXD9 (#44). The outline sets ``preferred_group`` to the group the
+    reader had selected before it opens the editor.
+    """
+
+    preferred_group = ''
+
+    def fresh_value(self, key: str, descriptor):
+        if key == 'group_name' and self.preferred_group:
+            return self.preferred_group
+        return super().fresh_value(key, descriptor)
+
+
 class SnappyCastellationPage(SnappyTaskPage):
     """Refinement levels and the cell-count ceilings that bound them."""
 
@@ -120,6 +141,55 @@ class SnappyCastellationPage(SnappyTaskPage):
                       'feature_edge_refinement_level')
     VOLUME_LEVELS = ('volume_refinement_level',)
     BAND_LEVELS = ('level',)
+
+    #: Plan 40 UXD9 (#38). How the surfaces are searched and how narrow a gap
+    #: counts as closed act when castellation intersects the base grid with
+    #: them, so they are edited here; they sat on Domain & regions, a page
+    #: that runs before the base grid exists. Written into every ``geometry``
+    #: entry of snappyHexMeshDict.
+    extra_field_ids = (
+        'meshing.geometry.gap_detection',
+        'meshing.geometry.gap_width',
+        'meshing.geometry.tolerance',
+        'meshing.geometry.max_tree_depth',
+        'meshing.geometry.min_quality',
+    )
+
+    #: DP-517. `CaseBuilder._gap_width` reads the width only while the
+    #: switch is on, so the box is live only then.
+    _GAP_SWITCH = 'meshing.geometry.gap_detection'
+    _GAP_WIDTH = 'meshing.geometry.gap_width'
+    _MAX_GLOBAL = 'meshing.castellation.max_global_cells'
+
+    def reload_values(self) -> None:
+        super().reload_values()
+        self._syncGapWidth()
+
+    def _on_field_changed(self, field_id: str, value) -> None:
+        super()._on_field_changed(field_id, value)
+        if field_id == self._GAP_SWITCH:
+            self._syncGapWidth()
+        if field_id == self._MAX_GLOBAL:
+            # DP-2401. The budget advisory follows the number as it is typed.
+            self.refresh_estimate()
+
+    def _syncGapWidth(self) -> None:
+        """Gap width is editable only while Close narrow gaps is on.
+
+        The switch's own box is read, not the stored value, so ticking it
+        enables the width before Apply. The row stays -- a greyed width says
+        what the switch will bring -- and applicability
+        (`FieldEditor.setApplicability`) still owns whether it is shown.
+        """
+        switch = self._editors.get(self._GAP_SWITCH)
+        width = self._editors.get(self._GAP_WIDTH)
+        if switch is None or width is None:
+            return
+        live = (bool(switch.value()) and width.applies()
+                and not width.descriptor.read_only)
+        width.editor.setEnabled(live)
+        width.label.setEnabled(live)
+        width.unit_label.setEnabled(live)
 
     def build_sections(self, layout) -> None:
         # DP-1251. One base cell for the four tables, re-read on each page
@@ -155,7 +225,7 @@ class SnappyCastellationPage(SnappyTaskPage):
         self.volume_panel.childrenChanged.connect(self.refresh_keeping_edits)
         layout.insertWidget(1, self.volume_panel)
 
-        self.band_panel = ChildControlPanel(
+        self.band_panel = BandPanel(
             self._client, 'meshing.castellation.feature_bands',
             self.tr('Feature refinement bands'), columns=self.BAND_COLUMNS,
             parent=self, choices={'group_name': self._group_choices()})
@@ -169,7 +239,7 @@ class SnappyCastellationPage(SnappyTaskPage):
 
         # DP-586 (field audit 0924 snappy-front D13). The volume distance
         # ramp was in the schema and the writer with no workflow control.
-        self.volume_band_panel = ChildControlPanel(
+        self.volume_band_panel = BandPanel(
             self._client, 'meshing.castellation.volume_bands',
             self.tr('Volume distance bands'), columns=self.BAND_COLUMNS,
             parent=self, choices={'group_name': self._volume_group_choices()})
@@ -194,6 +264,18 @@ class SnappyCastellationPage(SnappyTaskPage):
                 level_cell_size.attach_readouts(
                     panel, keys, self.cell_size_source))
 
+        # Plan 40 UXD9 (#44). One outline and one *Add refinement* chooser
+        # stand for the four tables; the tables stay as the editors behind
+        # it and are not drawn.
+        for panel in (self.surface_panel, self.volume_panel, self.band_panel,
+                      self.volume_band_panel):
+            panel.setVisible(False)
+        self.outline = RefinementOutline({
+            SURFACE_ROW: self.surface_panel, VOLUME_ROW: self.volume_panel,
+            FEATURE_BAND: self.band_panel, VOLUME_BAND: self.volume_band_panel,
+        }, self)
+        layout.insertWidget(0, self.outline)
+
         # DP-490. A group bound to no geometry is saved, listed with its
         # levels, and never written: said here, where the list reads as
         # though it were configured. Hidden while every group refines
@@ -202,14 +284,33 @@ class SnappyCastellationPage(SnappyTaskPage):
         self.unbound_label.setObjectName('castellationUnboundGroups')
         self.unbound_label.setWordWrap(True)
         self.unbound_label.setVisible(False)
-        layout.insertWidget(4, self.unbound_label)  # DP-586: after the bands
+        layout.insertWidget(5, self.unbound_label)  # DP-586: after the bands
         self.sync_unbound_groups()
         # Plan 37 #7. The cells this stage starts from and the RAM they take,
         # the same estimate the base-grid page shows.
-        self.estimate_label = QLabel(self)
+        # Plan 44 FX2. One line until opened: its four wrapped lines took
+        # Castellation past the 300 px sheet on a meshed case (G-FITS-1).
+        self.estimate_label = FoldedNote(self)
         background_estimate_label.prepare(self.estimate_label, 'castellationBackgroundEstimate')
-        layout.insertWidget(5, self.estimate_label)
+        layout.insertWidget(6, self.estimate_label)
         self.refresh_estimate()
+        # Plan 41 GN25c. The Automatic Sizing card opens the page: the field
+        # proposes the levels, bands and limits the tables and the ceilings
+        # below carry, and badges them.
+        from foammesh.view.sizing.automatic_sizing_card import (
+            AutomaticSizingCard)
+        self.sizing_card = AutomaticSizingCard(self._client, 'snappy', self)
+        self.sizing_card.applied.connect(self.refresh_keeping_edits)
+        layout.insertWidget(0, self.sizing_card)
+        # Plan 44 MF27. The card is a tool a reader opens on purpose; open,
+        # its 309 px took this step past the 300 px sheet. One press away.
+        from .sheet_folds import fold_sizing_card
+        self._sizingFold = fold_sizing_card(self, layout, self.sizing_card)
+
+    def sizingBadgePanels(self) -> list:
+        return [getattr(self, name) for name in (
+            'surface_panel', 'volume_panel', 'band_panel',
+            'volume_band_panel') if hasattr(self, name)]
 
     def refresh(self) -> None:
         source = getattr(self, 'cell_size_source', None)
@@ -224,13 +325,32 @@ class SnappyCastellationPage(SnappyTaskPage):
                     if panel is not None:
                         panel.refresh()
         super().refresh()
+        # Plan 40 UXA2. The walls group is made on whichever of the two
+        # pages is opened first, once per case.
+        ensure_walls_group(self._client, then=self._refresh_groups)
         self.sync_unbound_groups()
         self.refresh_estimate()
+        outline = getattr(self, 'outline', None)
+        if outline is not None:
+            outline.refresh()
+        card = getattr(self, 'sizing_card', None)
+        if card is not None:
+            card.refresh()
+
+    def _refresh_groups(self) -> None:
+        panel = getattr(self, 'surface_panel', None)
+        if panel is not None:
+            panel.refresh()
+        self.sync_unbound_groups()
+        outline = getattr(self, 'outline', None)
+        if outline is not None:
+            outline.refresh()
 
     def refresh_estimate(self):
         """Plan 37 #7: the base-grid page's estimate, said here too."""
         return background_estimate_label.show(
-            getattr(self, 'estimate_label', None), self._client)
+            getattr(self, 'estimate_label', None), self._client,
+            getattr(self, '_pending', None), budget=True)
 
     def unbound_groups(self) -> list:
         """The names of the refinement rows no geometry row is bound to."""

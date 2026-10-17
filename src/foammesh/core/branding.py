@@ -77,6 +77,8 @@ class RuntimeDiagnostics:
     platform: str
     openfoam_target: str
     capabilities: tuple[tuple[str, bool, str], ...]
+    #: GPUPREF: plain lines on the graphics in use and the dedicated-GPU option.
+    graphics: tuple[str, ...] = ()
 
     @classmethod
     def collect(cls, product: str, version: str, capability_registry=None,
@@ -108,7 +110,17 @@ class RuntimeDiagnostics:
             platform=f'{platform.system()} {platform.release()} ({platform.machine()})',
             openfoam_target=DEFAULT_OPENFOAM_TARGET,
             capabilities=tuple(capabilities),
+            graphics=cls._graphics_lines(),
         )
+
+    @staticmethod
+    def _graphics_lines() -> tuple[str, ...]:
+        try:
+            from foammesh.app import app
+            from foammesh.rendering import gpu_preference
+            return tuple(gpu_preference.diagnostic_lines(app.settings))
+        except Exception:                                  # noqa: BLE001
+            return ()
 
     def as_text(self) -> str:
         available = ', '.join(name for name, present, _detail in self.capabilities if present) or 'none'
@@ -125,7 +137,7 @@ class RuntimeDiagnostics:
             f'OpenFOAM target: {self.openfoam_target}',
             f'Utilities available: {available}',
             f'Utilities unavailable: {missing}',
-        )
+        ) + tuple(self.graphics)
         return '\n'.join(lines)
 
 
@@ -144,18 +156,38 @@ def _build_identity(environment: dict[str, str]) -> tuple[str, str]:
     return 'development', 'unknown'
 
 
-def watermark_geometry(width: int, height: int, device_pixel_ratio: float = 1.0
-                       ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return a bottom-right, square-in-pixels VTK logo rectangle."""
+#: Plan 44 MF15 / U5. The watermark is small, and always in the bottom-right
+#: corner of what the user can see, at any aspect ratio.
+WATERMARK_MAX = 40.0
+WATERMARK_INSET = 12.0
+
+
+def watermark_geometry(width: int, height: int, device_pixel_ratio: float = 1.0,
+                       clear=None) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return a bottom-right, square-in-pixels VTK logo rectangle.
+
+    ``width`` and ``height`` are the render window in device pixels.
+    ``clear`` is the clear area ``(x0, y0, x1, y1)`` in LOGICAL pixels, y down
+    (what the sheet and the console leave free); without it the whole view is
+    clear. The logo is at most ``WATERMARK_MAX`` logical pixels, its
+    bottom-right is ``WATERMARK_INSET`` from the clear area's bottom-right,
+    and it is shrunk (never moved off the corner or clipped) when the clear
+    area is smaller than it.
+    """
     width = max(int(width), 1)
     height = max(int(height), 1)
     dpr = max(float(device_pixel_ratio), 1.0)
-    logical_short_edge = min(width, height) / dpr
-    logical_size = min(max(logical_short_edge * 0.12, 48.0), 112.0)
-    size = logical_size * dpr
-    margin = 12.0 * dpr
-    normalized_width = min(size / width, 0.25)
-    normalized_height = min(size / height, 0.25)
-    x = max(0.0, 1.0 - normalized_width - margin / width)
-    y = min(max(margin / height, 0.0), 1.0 - normalized_height)
-    return (x, y), (normalized_width, normalized_height)
+    logical_w, logical_h = width / dpr, height / dpr
+    if clear is None:
+        x0, y0, x1, y1 = 0.0, 0.0, logical_w, logical_h
+    else:
+        x0, y0, x1, y1 = (float(v) for v in clear)
+        x0, x1 = max(0.0, min(x0, logical_w)), max(0.0, min(x1, logical_w))
+        y0, y1 = max(0.0, min(y0, logical_h)), max(0.0, min(y1, logical_h))
+    room = min(x1 - x0, y1 - y0) - WATERMARK_INSET
+    size = max(min(WATERMARK_MAX, room), 1.0)
+    left = max(x0, x1 - WATERMARK_INSET - size)
+    bottom_from_top = max(y1 - WATERMARK_INSET, size)
+    x = left * dpr / width
+    y = (logical_h - bottom_from_top) * dpr / height
+    return (x, y), (size * dpr / width, size * dpr / height)

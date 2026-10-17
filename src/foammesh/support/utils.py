@@ -5,12 +5,42 @@ import asyncio
 import os
 import platform
 import shutil
+import time
 import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QRect
 
 _backgroundTasks = set()
+
+#: Plan 39 VI14b. How long a rename of a directory is retried when Windows
+#: says it is in use. A virus scanner or the search indexer keeps a handle on
+#: a freshly written file for a moment after the writer closed it; the rename
+#: of the folder holding it is refused until the handle is gone.
+RENAME_RETRY_SECONDS = 4.0
+RENAME_RETRY_FIRST_DELAY = 0.05
+
+
+def rename_retrying(source, target, *, seconds=None, sleep=time.sleep,
+                    clock=time.monotonic):
+    """``Path(source).rename(target)``, retried briefly on a sharing refusal.
+
+    Only ``PermissionError`` is retried (``[WinError 5]`` access denied and
+    ``[WinError 32]`` sharing violation both are one): every other error, and
+    a refusal that outlasts ``seconds``, is raised as it came, so a real
+    holder is never hidden behind a pause. The wait grows from 50 ms.
+    """
+    limit = RENAME_RETRY_SECONDS if seconds is None else seconds
+    began = clock()
+    delay = RENAME_RETRY_FIRST_DELAY
+    while True:
+        try:
+            return Path(source).rename(target)
+        except PermissionError:
+            if clock() - began + delay > limit:
+                raise
+            sleep(delay)
+            delay = min(delay * 2, 0.5)
 
 
 def rmtree(path, ignore_errors=False, onerror=None):
@@ -31,7 +61,7 @@ def rmtree(path, ignore_errors=False, onerror=None):
         return
 
     target = p.parent / ('delete_me_' + str(uuid.uuid4()))
-    p.rename(target)
+    rename_retrying(p, target)
 
     try:
         loop = asyncio.get_running_loop()

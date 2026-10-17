@@ -431,9 +431,13 @@ def seed_face_clearance(point, grid: BackgroundGrid | None,
 
 
 def nudge_off_faces(point, grid: BackgroundGrid | None, max_level: int = 0,
-                    *, minimum: float = MIN_CLEARANCE) -> tuple:
+                    *, minimum: float = MIN_CLEARANCE,
+                    fraction: float = SNAP_FRACTION) -> tuple:
     """*point*, moved a third of a finest cell off any face nearer than
     *minimum* of that cell, along the axis of each such face.
+
+    *fraction* is the share of the finest cell moved (DP-2639 takes a
+    smaller one when a third would carry the seed across a wall).
 
     The move is inward, away from the block's nearer end, so it never leaves
     the block. Unchanged when the point is clear, or outside every block.
@@ -459,7 +463,7 @@ def nudge_off_faces(point, grid: BackgroundGrid | None, max_level: int = 0,
         while position < len(faces) - 2 and t > faces[position + 1]:
             position += 1
         width = faces[position + 1] - faces[position]
-        step = width / (2 ** level) * SNAP_FRACTION
+        step = width / (2 ** level) * fraction
         # Land a third of a finest cell from the face the point is on, on
         # the side that stays in this base cell -- so the cell size the
         # third was taken from is the one the point ends up in.
@@ -478,6 +482,72 @@ def nudge_off_faces(point, grid: BackgroundGrid | None, max_level: int = 0,
     if not changed:
         return point
     return block.point(moved)
+
+
+#: DP-2639. The shares of the finest cell a seed on a face is moved, largest
+#: first: a third, as the snap does; then a thirtieth and a three-hundredth,
+#: for a seed nearer a wall than a third of a cell. None is a dyadic fraction,
+#: so each lands clear of every face at every level.
+NUDGE_FRACTIONS = (SNAP_FRACTION, SNAP_FRACTION / 10, SNAP_FRACTION / 100)
+
+#: DP-2639. A move must be shorter than this share of the distance from the
+#: seed to the nearest surface: then no surface lies between the two points.
+ROOM_SHARE = 0.5
+
+
+@dataclass(frozen=True)
+class SeedNudge:
+    """What `nudge_seed` did with one seed on a face of the mesh."""
+
+    #: The seed as typed.
+    point: tuple
+    #: The seed to write: moved off the face, or ``point`` when it could not
+    #: be moved provably within its own space (``fraction`` is then 0).
+    moved: tuple
+    #: The share of the finest cell it was moved.
+    fraction: float
+    #: How far it was moved, in model units.
+    distance: float
+    #: Its clearance before the move.
+    clearance: Clearance
+    #: The distance from the seed to the nearest surface (``None`` unknown).
+    room: float | None
+
+
+def nudge_seed(point, grid: BackgroundGrid | None, max_level: int,
+               room: float | None, *,
+               minimum: float = MIN_CLEARANCE) -> SeedNudge | None:
+    """A seed on a face of the mesh, moved a sliver into its own space.
+
+    DP-2639. snappy looks for the cell holding each seed; a seed exactly on
+    a blockMesh face (or a face castellation adds) is in two cells or none,
+    and the run stops with "Point ... is not inside the mesh or on a face".
+
+    ``None`` when the seed is clear of every face (or off the grid). Else the
+    largest `NUDGE_FRACTIONS` share of the finest cell whose move both clears
+    every face by *minimum* and is shorter than `ROOM_SHARE` of *room*, the
+    seed's distance to the nearest surface. That is the proof it stays in
+    its space: no surface comes within *room* of the seed, so none crosses
+    the segment it moves along. With no *room* or no such share the seed is
+    kept where it is (``fraction`` 0) and the caller says so.
+    """
+    point = tuple(float(value) for value in point[:3])
+    clearance = seed_face_clearance(point, grid, max_level)
+    if clearance is None or clearance.relative >= minimum:
+        return None
+    if room is not None and room > 0 and math.isfinite(room):
+        for fraction in NUDGE_FRACTIONS:
+            moved = nudge_off_faces(point, grid, max_level,
+                                    minimum=minimum, fraction=fraction)
+            distance = math.dist(point, moved)
+            if moved == point or distance >= ROOM_SHARE * room:
+                continue
+            after = seed_face_clearance(moved, grid, max_level)
+            if after is None or after.relative < minimum:
+                continue
+            return SeedNudge(point, tuple(moved), fraction, distance,
+                             clearance, room)
+    return SeedNudge(point, point, 0.0, 0.0, clearance, room)
 
 
 def snap_value(value: float, origin: float, step: float) -> float:

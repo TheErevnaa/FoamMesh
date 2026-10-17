@@ -1,8 +1,12 @@
 """Gmsh workflow page: gmsh.boundary_layers."""
 from __future__ import annotations
 
+from foammesh.core import display_unit
+
+from foammesh.view.widgets.folded_note import FoldedNote
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView, QHeaderView, QTableWidget,
     QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QVBoxLayout,
     QWidget)
 
@@ -12,10 +16,12 @@ from foammesh.core.geometry.boundary_roles import (
 from foammesh.core.gmsh.layer_targets import (
     MODE_ALL_WALLS, boundary_category, eligible_wall_names, normalise_mode)
 from foammesh.core.gmsh.execution import nothing_chosen_layer_refusal
-from foammesh.view.theming.metrics import apply_form_metrics
+from foammesh.view.theming.metrics import MARGIN_TIGHT, apply_form_metrics
 from foammesh.view.theming.status_colors import apply_color_swatch
+from foammesh.view.workflow_controls.y_plus_helper import YPlusButton, fill_editor
 
 from .base import GmshTaskPage
+from .folds import add_fold, clip_header, count_fold, fold_rows
 
 
 class GmshBoundaryLayersPage(GmshTaskPage):
@@ -136,12 +142,50 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         # R118. The selection the runner honours, offered as the patch names
         # the user gave the boundaries two steps earlier rather than as tags,
         # each beside the colour its boundary is drawn in.
-        self._patchLayout = QVBoxLayout()
+        # Plan 40 UXD9 (#46). A table, the way the snappy layer pages pick
+        # their boundaries, and the only place the selection is edited: the
+        # stored text field below it is kept for the job file and is not
+        # shown (see `field_form`).
+        self._patchTable = QTableWidget(0, 2, self._surfaceBox)
+        self._patchTable.setObjectName('gmshLayerPatchTable')
+        self._patchTable.setHorizontalHeaderLabels(
+            [self.tr('Colour'), self.tr('Grow layers on')])
+        self._patchTable.verticalHeader().setVisible(False)
+        self._patchTable.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._patchTable.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self._patchTable.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._patchTable.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        header = self._patchTable.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._patchTable.setVisible(False)
         self._patchChecks = {}
         self._patchSwatches = {}
-        surfaces.addLayout(self._patchLayout)
+        # Plan 44 FIT (DP-2668). While the list is locked (All eligible
+        # walls) it is a read-out, not a choice; the count under it is the
+        # line and the list is one press away. It is open whenever the reader
+        # has to tick something.
+        from foammesh.view.widgets.folder_header import FolderHeader
+        self._patchFold = FolderHeader(self.tr('Surface list'), self._surfaceBox)
+        self._patchFold.setObjectName('gmshLayerPatchFold')
+        self._patchFold.setChecked(False)
+        self._patchFold.setVisible(False)
+        self._patchFold.toggled.connect(lambda _on: self._syncPatchTable())
+        surfaces.addWidget(self._patchFold)
+        surfaces.addWidget(self._patchTable)
+        # The stored text of the selection lives in an editor nobody sees.
+        self._patchStore = QWidget(self)
+        self._patchStore.setObjectName('gmshLayerPatchStore')
+        self._patchStoreForm = QFormLayout(self._patchStore)
+        self._patchStore.setVisible(False)
 
-        self._selectedCount = QLabel(self._surfaceBox)
+        # Plan 44 CHR2 (G-FITG-1): the count is the line; the locked-list
+        # essay behind it opens on a press (FX2 idiom).
+        self._selectedCount = FoldedNote(self._surfaceBox)
         self._selectedCount.setObjectName('gmshLayerSelectedCount')
         self._selectedCount.setWordWrap(True)
         surfaces.addWidget(self._selectedCount)
@@ -160,7 +204,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         self._catalogueNote.setVisible(False)
         surfaces.addWidget(self._catalogueNote)
 
-        self._patchNote = QLabel(self._surfaceBox)
+        self._patchNote = FoldedNote(self._surfaceBox)
         self._patchNote.setObjectName('gmshLayerPatchNote')
         self._patchNote.setWordWrap(True)
         surfaces.addWidget(self._patchNote)
@@ -169,8 +213,18 @@ class GmshBoundaryLayersPage(GmshTaskPage):
 
         self._stackBox = QGroupBox(self.tr('How thick the layers are'), self)
         self._stackBox.setObjectName('gmshLayerStackBox')
-        self._stackForm = QFormLayout(self._stackBox)
+        # Plan 43 LY13 D1 (C-134). The form sits inside a box layout so the
+        # y+ helper can stand under the rows without being a row of the form
+        # the shared code fills; it carries the margin the box layout would
+        # have given it (the DP-154 arrangement of the surface box).
+        stackOuter = QVBoxLayout(self._stackBox)
+        self._stackForm = QFormLayout()
         apply_form_metrics(self._stackForm)
+        stackOuter.setContentsMargins(self._stackForm.contentsMargins())
+        self._stackForm.setContentsMargins(0, 0, 0, 0)
+        stackOuter.addLayout(self._stackForm)
+        self.yplus_button = YPlusButton(self._fillFirstHeight, self._stackBox)
+        stackOuter.addWidget(self.yplus_button)
 
         # W-O1. This stood under the stack box as a paragraph promising a
         # measurement that is made somewhere else. It explains one field --
@@ -187,7 +241,9 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         # R117. `Total Thickness` stayed at its shipped 0.002 while first
         # height / ratio / count implied 0.001444, and nothing on the page
         # marked it inactive or recomputed it.
-        self._stackNote = QLabel(self)
+        # Plan 44 FIT (DP-2668): one line until opened, as the other run
+        # read-outs of the page; the whole text is its tooltip.
+        self._stackNote = FoldedNote(self)
         self._stackNote.setObjectName('gmshLayerStackNote')
         self._stackNote.setWordWrap(True)
         self._stackNote.setVisible(False)
@@ -196,14 +252,53 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         # ticked patch bounds the same volume, and the run seam refuses
         # anything else. Grading the selection here means the answer is
         # met before the stack is filled in rather than after.
-        self._assemblyNote = QLabel(self)
+        self._assemblyNote = FoldedNote(self)
         self._assemblyNote.setObjectName('gmshLayerAssemblyNote')
         self._assemblyNote.setWordWrap(True)
         self._assemblyNote.setVisible(False)
 
+        # Plan 41 GN10 (M-34). Layers per patch: a stack of its own for any
+        # patch, beside the one above.
+        from .layer_stacks_panel import LayerStacksPanel
+
+        self.stacks_panel = self.adoptPanel(
+            LayerStacksPanel(self._client, self, self))
+        self._perPatchBox = QGroupBox(self.tr('Layers per patch'), self)
+        self._perPatchBox.setObjectName('gmshLayerPerPatchBox')
+        QVBoxLayout(self._perPatchBox).addWidget(self.stacks_panel)
+
         index = layout.indexOf(self._guided) + 1
-        for widget in (self._surfaceBox, self._stackBox,
-                       self._stackNote, self._assemblyNote):
+        layout.insertWidget(index, self._surfaceBox)
+        index += 1
+        # Plan 44 GFIT (DP-2668, user decision 2026-10-16). The stack is the
+        # secondary section of the step -- its defaults let the user proceed
+        # -- so it stands behind a fold that opens closed; the header says
+        # the current values in one line. Nothing is removed.
+        self._foldStack = add_fold(
+            self, layout, name='LayerStack',
+            title=self.tr('How thick the layers are'),
+            description=self.tr(
+                'The first layer height, growth ratio, layer count and total '
+                'thickness of the boundary layers.'),
+            panel=self._stackBox, index=index)
+        clip_header(self._foldStack)
+        index += 2
+        # Plan 44 FIT-G (MF27). The per-patch stacks override the one stack
+        # above for chosen patches, so they are the secondary section of the
+        # step. MEASURED at b59ac794 in the 300 px sheet of a 1280x800 window:
+        # the box's 326 px ran the page 43 px past its 491 px scroller, and
+        # with layers on the stack box adds its rows above it. It is one press
+        # away, and the header counts the stacks behind it. The box keeps its
+        # own title so the panel reads the same open.
+        self._foldLayerStacks = add_fold(
+            self, layout, name='LayerStacks',
+            title=self.tr('Layers per patch'),
+            description=self.tr(
+                'A layer stack of its own for any patch, beside the one '
+                'above.'),
+            panel=self._perPatchBox, index=index)
+        index += 2
+        for widget in (self._stackNote, self._assemblyNote):
             layout.insertWidget(index, widget)
             index += 1
 
@@ -220,16 +315,23 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             return None
         if field_id == self.PATCH_MODE_FIELD:
             return self._surfaceForm
-        if field_id in self._STACK_FIELDS.values():
+        if field_id in self._STACK_FIELDS.values() or field_id == (
+                'gmsh.boundary_layers.elements_per_layer'):
             return self._stackForm
         if field_id == self.PATCH_FIELD:
-            # LAYER-02. The alternative, not the answer: a patch the prepared
-            # geometry cannot name still has to be typeable, and that is an
-            # advanced need rather than the first thing the step asks.
-            if field_id not in self._advanced_fields:
-                self._advanced_fields.append(field_id)
-            return self._advanced.layout()
+            # Plan 40 UXD9 (#46). The selection is made in the table; the
+            # field is its storage, so its editor exists (the table reads and
+            # writes through it) and is never drawn. A name in it that no
+            # prepared patch answers to shows in the table as "not in the
+            # prepared geometry", where it can be unticked.
+            return self._patchStoreForm
         return None
+
+    def renders_field(self, field_id: str) -> bool:
+        """Plan 41 GN10. The per-patch stacks are the panel's rows."""
+        if field_id == 'gmsh.boundary_layers.stacks':
+            return False
+        return super().renders_field(field_id)
 
     def field_forms(self):
         return ((self._surfaceForm, self._stackForm)
@@ -238,6 +340,14 @@ class GmshBoundaryLayersPage(GmshTaskPage):
     def advancedHolds(self, editor) -> bool:
         """Whether the Advanced box is what draws this editor's row."""
         return self._advanced.isAncestorOf(editor.editor)
+
+    def _fillFirstHeight(self, metres: float) -> bool:
+        """Plan 43 LY13 D1. The y+ estimate goes into First height."""
+        editor = self._editors.get('gmsh.boundary_layers.first_height')
+        if editor is None:
+            return False
+        fill_editor(editor, metres)
+        return True
 
     def derived_quantities(self) -> tuple:
         """LAYER-04. The total the four inputs add up to, in metres.
@@ -251,10 +361,14 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         if stack is None:
             return ()
         return ((self.tr('Total thickness'),
-                 '%.6g' % stack.total_thickness, 'm'),)
+                 display_unit.significant(
+                     display_unit.to_display(stack.total_thickness)),
+                 display_unit.current()),)
 
     def refresh(self) -> None:
         super().refresh()
+        if hasattr(self, '_foldLayerStacks'):
+            count_fold(self._foldLayerStacks, fold_rows(self.stacks_panel))
         if not hasattr(self, '_stackNote'):
             return
         editor = self._editors.get(self.PATCH_MODE_FIELD)
@@ -270,6 +384,36 @@ class GmshBoundaryLayersPage(GmshTaskPage):
                 editor.valueChanged.connect(self._onStackFieldChanged)
         self.updateStackNote()
         self.updateAssemblyNote()
+        switch = self._editors.get(self.SWITCH_FIELD)
+        if switch is not None:
+            switch.valueChanged.connect(self.followLayerSwitch)
+        self.followLayerSwitch()
+
+    SWITCH_FIELD = 'gmsh.boundary_layers.enabled'
+
+    def followLayerSwitch(self, *_args) -> None:
+        """Plan 40 UXB6 (#47). The page's own boxes follow the switch.
+
+        The thickness rows leave through their registry clause; the box they
+        sit in leaves with its last row. The tick list keeps its selection
+        and is disabled, because a proposed selection is stored while the
+        switch is off.
+        """
+        if not hasattr(self, '_surfaceBox'):
+            return
+        editor = self._editors.get(self.SWITCH_FIELD)
+        on = bool(editor.value()) if editor is not None else True
+        self._surfaceBox.setEnabled(on)
+        live = [self._editors[field_id] for field_id in self._STACK_FIELDS.values()
+                if field_id in self._editors]
+        applies = not live or any(item.applies() for item in live)
+        fold = getattr(self, '_foldStack', None)
+        if fold is None:
+            self._stackBox.setVisible(applies)
+        else:
+            # GFIT: the box stands behind its fold, which leaves with it.
+            fold.setVisible(applies)
+            self._stackBox.setVisible(applies and fold.isChecked())
 
     # -- which patches grow layers ----------------------------------------- #
 
@@ -555,16 +699,16 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             self._storingProposal = False
 
     def rebuildPatchChecks(self, patches, selected, regions=()) -> None:
-        while self._patchLayout.count():
-            item = self._patchLayout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                # Unparented before it is queued for deletion: `deleteLater`
-                # alone leaves the row in the widget tree until the event
-                # loop next runs, so a refresh that renamed every boundary
-                # showed both namings at once.
-                widget.setParent(None)
-                widget.deleteLater()
+        # Cleared row by row, the cell widgets unparented first: `deleteLater`
+        # alone leaves a widget in the tree until the event loop next runs, so
+        # a refresh that renamed every boundary showed both namings at once.
+        for row in range(self._patchTable.rowCount()):
+            for column in range(self._patchTable.columnCount()):
+                widget = self._patchTable.cellWidget(row, column)
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+        self._patchTable.setRowCount(0)
         self._patchChecks = {}
         self._patchSwatches = {}
         chosen = set(selected)
@@ -592,6 +736,18 @@ class GmshBoundaryLayersPage(GmshTaskPage):
                     str(self.tr('%s — not in the prepared geometry'))
                     % name,
                     True, '', locked)
+        self._patchLocked = locked
+        self._syncPatchTable()
+
+    def _syncPatchTable(self) -> None:
+        """The table shows when it has rows and is a choice, or is asked for."""
+        rows = self._patchTable.rowCount() > 0
+        locked = bool(getattr(self, '_patchLocked', False))
+        fold = getattr(self, '_patchFold', None)
+        if fold is not None:
+            fold.setVisible(rows and locked)
+        self._patchTable.setVisible(
+            rows and (not locked or fold is None or fold.isChecked()))
 
     def addPatchCheck(self, name: str, label: str, checked: bool,
                       geometry_id: str = '', locked: bool = False) -> None:
@@ -602,16 +758,19 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         rather than assigned here, so a row cannot show a colour the surface
         is not drawn in.
         """
-        row = QWidget(self._surfaceBox)
-        line = QHBoxLayout(row)
-        line.setContentsMargins(0, 0, 0, 0)
-        swatch = QLabel(row)
+        table = self._patchTable
+        row = table.rowCount()
+        table.insertRow(row)
+        swatch = QLabel(table)
         swatch.setObjectName('gmshLayerSwatch')
         swatch.setFixedSize(16, 16)
         swatch.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         apply_color_swatch(swatch, self.surfaceColour(geometry_id))
-        line.addWidget(swatch)
-        box = QCheckBox(label, row)
+        holder = QWidget(table)
+        QHBoxLayout(holder).addWidget(swatch)
+        holder.layout().setContentsMargins(MARGIN_TIGHT, 0, MARGIN_TIGHT, 0)
+        table.setCellWidget(row, 0, holder)
+        box = QCheckBox(label, table)
         box.setObjectName('gmshLayerPatch')
         box.setProperty('foammeshLayerPatch', name)
         box.setAccessibleName(str(self.tr('Grow layers on %s')) % name)
@@ -622,8 +781,11 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             box.setToolTip(self.lockedListText())
         box.toggled.connect(
             lambda state, key=name: self._onPatchToggled(key, state))
-        line.addWidget(box, 1)
-        self._patchLayout.addWidget(row)
+        table.setCellWidget(row, 1, box)
+        table.setVisible(True)
+        height = table.horizontalHeader().height() + 2 + sum(
+            table.rowHeight(index) for index in range(table.rowCount()))
+        table.setFixedHeight(height)
         self._patchChecks[name] = box
         self._patchSwatches[name] = swatch
 
@@ -668,6 +830,8 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         if mode == MODE_ALL_WALLS:
             text += ' ' + self.lockedListText()
         self._selectedCount.setText(text)
+        self._selectedCount.setSummary(
+            str(self.tr('%d of %d surfaces chosen')) % (chosen, total))
         # W-O1. A count of a list that has no rows counts nothing: on a case
         # with no prepared geometry this read "0 of 0 surfaces chosen" over
         # an empty box. It is a derived quantity once there is something to
@@ -765,6 +929,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             # user to press Update for.
             text += ' ' + defaulted_targets_sentence(proposed)
         self._patchNote.setText(text)
+        self._patchNote.setSummary(text.split('. ')[0])
         self._patchNote.setVisible(True)
 
     def categoriesRead(self, patches) -> str:
@@ -1084,7 +1249,29 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             style.unpolish(self._assemblyNote)
             style.polish(self._assemblyNote)
 
+    def stackSummary(self) -> str:
+        """The current stack in one line, for the closed fold's header."""
+        stack, values = self.derivedStack()
+        if stack is None:
+            return ''
+        return self.tr('first %s, ratio %.4g, %d layers') % (
+            display_unit.format_length(stack.first_height), stack.ratio,
+            stack.layer_count)
+
+    def updateStackFoldHeader(self) -> None:
+        fold = getattr(self, '_foldStack', None)
+        if fold is None:
+            return
+        title = str(fold.property('foammeshFoldTitle') or '')
+        said = self.stackSummary()
+        fold.setText(f'{title}: {said}' if said else title)
+        fold.setToolTip(f'{title}: {said}' if said else title)
+
     def updateStackNote(self) -> None:
+        self.updateStackFoldHeader()
+        self._updateStackNote()
+
+    def _updateStackNote(self) -> None:
         """Name the derived member of the stack and print its value.
 
         R61/R117/R154. In `First and ratio` mode the total is fully determined
@@ -1099,7 +1286,10 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         for field_id in self._STACK_FIELDS.values():
             editor = self._editors.get(field_id)
             if editor is not None:
-                editor.editor.setEnabled(field_id != derived_id)
+                # A setting the run will not read stays off (UXD4 made the
+                # mode one of them when layers are off).
+                editor.editor.setEnabled(
+                    field_id != derived_id and editor.applies())
         editor = self._editors.get(derived_id) if derived_id else None
         if stack is None or editor is None:
             self._stackNote.setVisible(False)
@@ -1113,15 +1303,17 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         name = editor.descriptor.title or derived_id.rsplit('.', 1)[-1]
         if mode == 'first_and_ratio':
             self._stackNote.setText(self.tr(
-                '%s is derived in this mode: %d layers from %.6g m growing at '
-                '%.6g stack to %.6g m. The mesher uses that, not a value '
-                'typed here.') % (name, stack.layer_count, stack.first_height,
-                                  stack.ratio, stack.total_thickness))
+                '%s is derived in this mode: %d layers from %s growing at '
+                '%.6g stack to %s. The mesher uses that, not a value '
+                'typed here.') % (name, stack.layer_count,
+                                  display_unit.format_length(stack.first_height),
+                                  stack.ratio,
+                                  display_unit.format_length(stack.total_thickness)))
         else:
             self._stackNote.setText(self.tr(
                 '%s is derived in this mode: %d layers growing at %.6g to a '
-                'total of %.6g m start at %.6g m. The mesher uses that, not a '
+                'total of %s start at %s. The mesher uses that, not a '
                 'value typed here.') % (name, stack.layer_count, stack.ratio,
-                                        stack.total_thickness,
-                                        stack.first_height))
+                                        display_unit.format_length(stack.total_thickness),
+                                        display_unit.format_length(stack.first_height)))
         self._stackNote.setVisible(True)

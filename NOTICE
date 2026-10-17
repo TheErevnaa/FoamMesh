@@ -25,3 +25,12 @@ Third-party components
 ----------------------
 FoamMesh bundles and depends on third-party software. See THIRD_PARTY.md for a
 list of components and their licenses.
+
+The automatic mesh size field (`vendor/gmsh_sizefield/`, built as the
+`foammesh-sizefield` tool) is derived from Gmsh 4.15.2's AutomaticMeshSizeField
+(Copyright (C) 1997-2025 C. Geuzaine and J.-F. Remacle; contributed by Arthur
+Bawin) and from HXT (Copyright (C) 2017-2018 Universite catholique de Louvain),
+both provided under the GNU General Public License version 2 or later and
+redistributed here under GPL-3.0-or-later. Their licence and credit files are
+kept verbatim beside the sources. Gmsh is not endorsed by, and does not endorse,
+FoamMesh.

@@ -31,7 +31,8 @@ _INVALIDATED = {
         'common.export',
     ),
     'gmsh': (
-        'gmsh.describe_geometry', 'gmsh.global_sizing', 'gmsh.size_fields',
+        'gmsh.describe_geometry', 'gmsh.geometry', 'gmsh.global_sizing',
+        'gmsh.size_fields',
         'gmsh.curve_controls', 'gmsh.volume_controls', 'gmsh.boundary_layers',
         'gmsh.periodic', 'gmsh.compute', 'gmsh.publish', 'gmsh.qa',
         'common.export',

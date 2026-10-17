@@ -667,6 +667,57 @@ def _not_wound(shell) -> str:
             'without changing the geometry, or remove the surface.')
 
 
+#: CHT1. How many more of the inner shell's own triangles are asked when
+#: its first one lies on the outer shell.
+REFERENCE_CANDIDATES = 12
+
+
+def _triangle_key(triangle, coordinates, tolerance):
+    return tuple(sorted(tuple(round(value / tolerance)
+                              for value in coordinates[node])
+                        for node in triangle))
+
+
+def _contained(inner, outer, owned_triangles, coordinates, scale):
+    """Whether *inner* lies in *outer*: ``True``, ``False`` or ``None``.
+
+    CHT1. The question was put at one point, the centre of the inner shell's
+    first triangle. A conformal assembly -- the hot fluid, the pipe wall and
+    the cold fluid of a conjugate case, one closed STL each -- shares its
+    walls, and that first triangle lay on the r = 10 mm wall both the hot
+    fluid and the pipe are bounded by: the point was on the pipe's surface,
+    no ray could be trusted, and three shells that nest perfectly well were
+    refused as touching. When the first point cannot be decided, the centres
+    of up to `REFERENCE_CANDIDATES` of the inner shell's triangles that are
+    not also the outer shell's are asked; every one that is decided must
+    agree, and one that disagrees means the two surfaces cross.
+    """
+    target = owned_triangles[outer.name]
+    verdict = point_in_shell(inner.reference_point, target, coordinates,
+                             box=outer.box, length_scale=scale)
+    if verdict is not None:
+        return verdict
+    tolerance = 1e-9 * scale
+    shared = {_triangle_key(triangle, coordinates, tolerance)
+              for triangle in target}
+    own = [triangle for triangle in owned_triangles.get(inner.name, ())
+           if _triangle_key(triangle, coordinates, tolerance) not in shared]
+    if not own:
+        return None
+    step = max(1, len(own) // REFERENCE_CANDIDATES)
+    verdicts = set()
+    for triangle in own[::step][:REFERENCE_CANDIDATES]:
+        centre = tuple(sum(coordinates[node][axis] for node in triangle) / 3.0
+                       for axis in range(3))
+        answer = point_in_shell(centre, target, coordinates, box=outer.box,
+                                length_scale=scale)
+        if answer is not None:
+            verdicts.add(answer)
+    if len(verdicts) != 1:
+        return None
+    return verdicts.pop()
+
+
 def nest_shells(shells, owned_triangles, coordinates):
     """Set ``parent`` and ``depth`` from containment, refusing what it cannot read."""
     for shell in shells:
@@ -684,9 +735,8 @@ def nest_shells(shells, owned_triangles, coordinates):
                         for axis in range(3)) or 1.0
             if not _box_within(inner.box, outer.box, 1e-9 * scale):
                 continue
-            verdict = point_in_shell(
-                inner.reference_point, owned_triangles[outer.name],
-                coordinates, box=outer.box, length_scale=scale)
+            verdict = _contained(inner, outer, owned_triangles, coordinates,
+                                 scale)
             if verdict is None:
                 raise ShellTopologyError(
                     f'cannot decide whether shell {inner.name!r} from '

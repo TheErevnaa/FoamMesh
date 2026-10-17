@@ -132,6 +132,14 @@ class StepPage(QObject):
         return submit(app.facadeClient, 'artifact.stage.clear',
                       {'output_time': self.OUTPUT_TIME})
 
+    def resetForRefresh(self):
+        """Reset after a reload of the shell; an unlock uses `clearResult`.
+
+        The default is the same reset. A page whose `clearResult` also
+        throws away what the reader recorded overrides this to repaint only.
+        """
+        return self.clearResult()
+
     def updateWorkingStatus(self):
         self.updateMesh()
         self._updateControlButtons()

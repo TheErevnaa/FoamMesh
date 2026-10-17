@@ -171,6 +171,59 @@ CONTROLS = _register(
                 note='value 3; refused when the cell shape already claims '
                      'this option'),
 
+    # -- options ----------------------------------------------------------- #
+    # Plan 41 GN2 (T-01, G3). Every option of the installed Gmsh, set from the
+    # catalogue. Derived into the job's `options` list and applied by the
+    # runner last, so it wins over a page control that sets the same option.
+    GmshControl('gmsh/options/overrides', DERIVATION, 'option.set*',
+                'gmsh.options.v1', native_kind=API,
+                note='JSON object of Gmsh option name: value; validated '
+                     'against core/gmsh/option_catalogue.py before any run'),
+
+    # -- size fields of any Gmsh type ---------------------------------------- #
+    # Plan 41 GN6 (M-02..M-20, M-22). Rows of any of the 29 field types, each
+    # with every parameter; derived into the job's `nativeFields` and built by
+    # the runner (and the session) in dependency order, those marked
+    # background combined into the one background field.
+    GmshControl('gmsh/nativeFields/rows', DERIVATION, 'field.add*',
+                'gmsh.native_fields.v1', native_kind=API,
+                note='JSON list of rows (name, type, background, params); '
+                     'validated against core/gmsh/field_catalogue.py before '
+                     'any run'),
+
+    # -- size at picked points --------------------------------------------- #
+    # Plan 41 GN7 (M-01). Rows of picked points with a size each; derived into
+    # the job's `pointSizes` and applied with `mesh.setSize`, whatever the
+    # global "From points" says (the runner switches it on and ledgers it).
+    GmshControl('gmsh/pointSizes/rows', DERIVATION, 'mesh.setSize',
+                'gmsh.point_sizes.v1', native_kind=API,
+                note='JSON list of rows (name, tag, x, y, z, size, enabled); '
+                     'validated against core/gmsh/point_sizes.py before any '
+                     'run'),
+
+    # -- per-entity meshing controls ------------------------------------- #
+    # Plan 41 GN9 (M-28..M-32, A-17). Embedded entities, per-surface
+    # recombine / algorithm / smoothing / size from boundary, reverse,
+    # outward orientation and compounds; derived into the job's
+    # `entityControls` and applied by the runner (and the session) before
+    # meshing.
+    GmshControl('gmsh/entityControls/rows', DERIVATION, 'mesh.embed*',
+                'gmsh.entity_controls.v1', native_kind=API,
+                note='JSON list of rows (name, kind, dim, tags, params); '
+                     'validated against core/gmsh/entity_controls.py '
+                     'before any run'),
+
+    # -- structured meshing ------------------------------------------------ #
+    # Plan 41 GN8 (M-24..M-26). Transfinite surfaces and volumes with picked
+    # corners and the triangle arrangement, and automatic transfinite with its
+    # corner angle and recombine flag; derived into the job's `structure` and
+    # applied by the runner (and the session) before meshing.
+    GmshControl('gmsh/structure/rows', DERIVATION, 'mesh.setTransfinite*',
+                'gmsh.structure.v1', native_kind=API,
+                note='JSON list of rows (name, kind, dim, tags, corners, '
+                     'params); validated against core/gmsh/structure.py '
+                     'before any run'),
+
     # -- algorithms ------------------------------------------------------ #
     GmshControl('gmsh/algorithms/surface', RUNNER, 'Mesh.Algorithm'),
     GmshControl('gmsh/algorithms/volume', RUNNER, 'Mesh.Algorithm3D'),
@@ -395,6 +448,10 @@ CONTROLS = _register(
     GmshControl('gmsh/optimization/hardFloor', GATE,
                 calculation_version='gmsh.quality.v2',
                 note='never acceptable below this, whatever the allowance'),
+    GmshControl('gmsh/optimization/extraLimits', GATE,
+                calculation_version='gmsh.quality.v2',
+                note='JSON list of further measures, each with its own '
+                     'limit and allowance (Plan 41 GN14)'),
 
     # -- boundary layers -------------------------------------------------- #
     # R118. Which patches grow layers. MEASURED on the venturi: prisms sat on
@@ -424,6 +481,14 @@ CONTROLS = _register(
                 'geo.extrudeBoundaryLayer.heights', 'gmsh.layers.v1', native_kind=API),
     GmshControl('gmsh/boundaryLayers/quads', RUNNER,
                 'geo.extrudeBoundaryLayer.recombine', native_kind=API),
+    # Plan 41 GN10 (M-34). Elements per layer, and one stack per patch.
+    GmshControl('gmsh/boundaryLayers/elementsPerLayer', RUNNER,
+                'geo.extrudeBoundaryLayer.numElements', native_kind=API),
+    GmshControl('gmsh/boundaryLayers/stacks', RUNNER,
+                'geo.extrudeBoundaryLayer', native_kind=API,
+                note='JSON list of per-patch stack rows (patch, layerCount, '
+                     'firstHeight, ratio, totalThickness, elementsPerLayer, '
+                     'quads); validated in core/gmsh/layers.py'),
 
     # -- size fields ------------------------------------------------------ #
     GmshControl('gmsh/sizeFields/{id}/name', DERIVATION, 'field.name',
@@ -529,6 +594,11 @@ CONTROLS = _register(
                 note='reverse Cuthill-McKee over the nodes, after the order '
                      'is raised and the duplicates merged'),
 
+    GmshControl('gmsh/output/renumberMethod', RUNNER,
+                'mesh.computeRenumbering(method)', native_kind=API,
+                note='RCMK, Hilbert or Metis: the three methods Gmsh 4.15.2 '
+                     'documents; read only when the renumber is on'),
+
     # -- curve controls ---------------------------------------------------- #
     GmshControl('gmsh/curveControls/{id}/name', DERIVATION, 'curve.name',
                 'gmsh.curves.v1', native_kind=API),
@@ -617,6 +687,24 @@ CONTROLS = _register(
     GmshControl('gmsh/periodicPairs/{id}/rotationAxis/z', DERIVATION,
                 'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
     GmshControl('gmsh/periodicPairs/{id}/rotationAngleDegrees', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowX/x', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowX/y', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowX/z', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowY/x', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowY/y', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowY/z', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowZ/x', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowZ/y', DERIVATION,
+                'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
+    GmshControl('gmsh/periodicPairs/{id}/affineRowZ/z', DERIVATION,
                 'mesh.setPeriodic.affineTransform', 'gmsh.periodic.v1', native_kind=API),
     GmshControl('gmsh/periodicPairs/{id}/matchTolerance', PUBLISH,
                 'cyclic.matchTolerance', native_kind=API),

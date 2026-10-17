@@ -20,9 +20,11 @@ from vtkmodules.vtkRenderingCore import vtkPolyDataMapper, vtkDataSetMapper, vtk
 from vtkmodules.vtkRenderingLOD import vtkQuadricLODActor
 
 from foammesh.support import disposal
-from foammesh.support.vtk_threads import vtk_run_in_thread
+from foammesh.support.vtk_threads import (
+    vtk_run_in_background, vtk_run_in_thread)
 from foammesh.support.mesh import Bounds
-from foammesh.support.colormap import qualityBandLut, sequentialRedLut
+from foammesh.support import colour_standard
+from foammesh.rendering import quality_scale
 from foammesh.app import app
 from foammesh.view.theming.tokens import PALETTE_FAMILIES, PATCH_TOKENS
 from foammesh.view.theming.patch_palette import palette_colours, slot_colour
@@ -50,7 +52,11 @@ BASE_SPECULAR_POWER = 30
 #: nothing let them turn it up. The default is now 0.6 in a colour picked to
 #: contrast with the surface the lines lie on, and the Mesh lines control
 #: sets opacity, colour and width for every actor (see `setMeshLineStyle`).
-EDGE_OPACITY = 0.6
+#:
+#: Plan 44 MF15 / U1. The mockup draws the grid at ``viewport.lines`` .35 and
+#: 0.8 px, and the colour is a THEME token (light on dark, dark on light) that
+#: flips with the theme instead of being picked from the surface colour.
+EDGE_OPACITY = 0.35
 HIGHLIGHT_EDGE_OPACITY = 0.45
 
 
@@ -68,24 +74,43 @@ def applySurfaceMaterial(prop) -> None:
     prop.SetSpecularPower(BASE_SPECULAR_POWER)
 
 
+#: The colour array of a field coloured by its size (Plan 43 LY12).
+MAGNITUDE_SUFFIX = '|d|'
+
+
+MESH_LINE_DEFAULT_WIDTH = 0.8
+
+
 @dataclass(frozen=True)
 class MeshLineStyle:
     """How interior mesh edges are drawn, on every actor at once.
 
-    ``color`` is ``'auto'`` -- dark lines on a light surface, light lines on a
-    dark one -- or a ``#rrggbb`` the user chose.
+    ``color`` is ``'auto'`` -- the theme's ``viewport.lines`` token, light on
+    the dark theme and dark on the light one -- or a ``#rrggbb`` the user
+    chose.
     """
     opacity: float = EDGE_OPACITY
     color: str = 'auto'
-    width: float = 1.0
+    width: float = MESH_LINE_DEFAULT_WIDTH
 
 
-MESH_LINE_WIDTH_RANGE = (1.0, 3.0)
+MESH_LINE_WIDTH_RANGE = (0.5, 3.0)
+#: DP-2675. A patch with more faces than this draws its mesh lines no stronger
+#: than the defaults, whatever the saved style says. Each face of such a patch
+#: is a few pixels across, so lines at full opacity and 1.5 px are not a grid
+#: any more: they are a solid dark fill, drawn in front of the patch colours
+#: and the quality colours the volume wears underneath. The user's saved
+#: style (a persisted 100 % / 1.5 px) turned every meshed model near-black
+#: in the live app and left no colour to see.
+DENSE_SKIN_FACES = 5_000
 #: Auto colours: what a line reads as against a light and a dark surface.
 MESH_LINE_DARK = '#1c2530'
 MESH_LINE_LIGHT = '#eef2f7'
 
 _meshLineStyle = MeshLineStyle()
+#: MF15 / U1. The ``viewport.lines`` token of the theme in force, once a theme
+#: has been applied. ``None`` before that (a bare actor in a test).
+_themeLineColor = None
 #: Every live actor, so one change of style reaches all of them without each
 #: caller having to know which manager owns which actor.
 _liveActors = weakref.WeakSet()
@@ -143,11 +168,28 @@ def setMeshLineStyle(opacity=None, color=None, width=None) -> MeshLineStyle:
     return _meshLineStyle
 
 
+def themeMeshLineColor():
+    """The theme's ``viewport.lines`` colour, or ``None`` before any theme."""
+    return _themeLineColor
+
+
+def setThemeMeshLineColor(color) -> None:
+    """MF15 / U1. Record the theme's grid colour for 'auto' lines.
+
+    Each actor re-reads it on its own ``applyTheme``; nothing is repainted
+    here because the theme pass already visits every actor.
+    """
+    global _themeLineColor
+    _themeLineColor = str(color) if color else None
+
+
 def meshLineColorFor(surface: QColor, style: MeshLineStyle = None) -> str:
     """The colour interior edges take on a surface of colour *surface*."""
     style = style or _meshLineStyle
     if style.color != 'auto':
         return style.color
+    if _themeLineColor is not None:
+        return _themeLineColor
     lum = (0.2126 * surface.redF() + 0.7152 * surface.greenF()
            + 0.0722 * surface.blueF())
     return MESH_LINE_DARK if lum >= 0.45 else MESH_LINE_LIGHT
@@ -187,6 +229,18 @@ HIGHLIGHT_ROLE_COLORS = {
     'invalid': '#ef4444',
 }
 
+#: MF15. A selected part wears ``accent.default`` with a WHITE outline (the
+#: mockup's selection); the other roles keep their own colour on both.
+HIGHLIGHT_SILHOUETTE_COLOR = '#ffffff'
+ACCENT_ROLES = (None, 'selected')
+
+
+def _accentOr(tokens, fallback: str) -> str:
+    try:
+        return tokens.value('accent.default')
+    except Exception:                                      # noqa: BLE001
+        return fallback
+
 #: Past this many displayed cells, wireframe stops being information. Every
 #: cell edge drawn at a few pixels a cell is a grey rectangle, so wireframe
 #: falls back to feature edges -- and says that it has.
@@ -224,14 +278,38 @@ class MeshQualityIndex(Enum):
     NON_ORTHO_ANGLE = 'nonOrthoAngle'
     SKEWNESS = 'skewness'
     VOLUME = 'cellVolume'
+    #: Plan 41 GN13. Gmsh's own measures, carried as cell arrays by the
+    #: session hand-over. The value is the array name.
+    GMSH_SICN = 'gmshSICN'
+    GMSH_SIGE = 'gmshSIGE'
+    GMSH_GAMMA = 'gmshGamma'
+    GMSH_ISOTROPY = 'gmshMinIsotropy'
+    GMSH_MIN_JACOBIAN = 'gmshMinDetJac'
+    GMSH_VOLUME = 'gmshVolume'
 
     @classmethod
     def values(cls):
         return [c.value for c in cls]
 
+    @classmethod
+    def openfoam(cls):
+        """The four metrics OpenFOAM's polyMesh is measured by."""
+        return [c for c in cls if not c.value.startswith('gmsh')]
 
-#: DP-714. Metrics whose bad cells are the low values: the tiny cells.
-QUALITY_WORST_IS_LOW = frozenset({MeshQualityIndex.VOLUME})
+    @classmethod
+    def gmsh(cls):
+        """Gmsh's measures, in the order they are offered."""
+        return [c for c in cls if c.value.startswith('gmsh')]
+
+    @property
+    def isGmsh(self) -> bool:
+        return self.value.startswith('gmsh')
+
+
+#: DP-714. Metrics whose bad cells are the low values: the tiny cells. Every
+#: Gmsh measure is a quality in 0..1 (or a size) whose bad end is low.
+QUALITY_WORST_IS_LOW = frozenset({MeshQualityIndex.VOLUME,
+                                  *MeshQualityIndex.gmsh()})
 
 #: DP-737. The relative polygon offset of the poor-cell overlay. A flagged
 #: cell on the boundary has a face exactly where the patch face over it is;
@@ -273,6 +351,10 @@ class ActorInfo(QObject):
     colorChanged = Signal()
     #: Plan 35 CR3 step 10. The outline computed on the VTK thread is in.
     silhouetteChanged = Signal()
+    #: Plan 39 VI4 (F1e). How this actor looks changed in a way the patch skin
+    #: cares about: shown or hidden, faded, selected, painted by a field,
+    #: moved, cut, drawn another way. (A colour change is `colorChanged`.)
+    appearanceChanged = Signal()
 
     def __init__(self, dataSet, id_, name, type_):
         super().__init__()
@@ -299,7 +381,7 @@ class ActorInfo(QObject):
         self._mapper.ScalarVisibilityOff()
         self._mapper.SetScalarModeToUseCellFieldData()
         self._mapper.SetColorModeToMapScalars()
-        self._mapper.SetLookupTable(sequentialRedLut)
+        self._mapper.SetLookupTable(colour_standard.lookup_table('quality', 0.0, 1.0))
         #: Standing depth-test bias, in polygon-offset units. Restored
         #: whenever something that suspends it is taken back off.
         self._depthBias = 0.0
@@ -312,13 +394,7 @@ class ActorInfo(QObject):
 
         # The outline follows the same pipeline output as the surface, so a
         # clip, a slice or a quality threshold reshapes both together.
-        self._silhouetteFilter = vtkFeatureEdges()
-        self._silhouetteFilter.BoundaryEdgesOn()
-        self._silhouetteFilter.FeatureEdgesOn()
-        self._silhouetteFilter.SetFeatureAngle(SILHOUETTE_FEATURE_ANGLE)
-        self._silhouetteFilter.ManifoldEdgesOff()
-        self._silhouetteFilter.NonManifoldEdgesOff()
-        self._silhouetteFilter.ColoringOff()
+        self._silhouetteFilter = self._newSilhouetteFilter()
         self._silhouetteFilter.SetInputConnection(
             self._cutFilters[0].GetOutputPort())
         self._silhouetteMapper = vtkPolyDataMapper()
@@ -347,6 +423,7 @@ class ActorInfo(QObject):
         self._precomputedSurface = None
         self._precomputedEdges = None
         self._highlightRole = None
+        self._themeAccent = None
         #: Slot in a categorical palette, or None for the neutral surface
         #: colour. Held as an index into a named family rather than as a colour
         #: so a theme change recolours the actor instead of stranding it on the
@@ -451,6 +528,18 @@ class ActorInfo(QObject):
     def color(self):
         return self._properties.color
 
+    @staticmethod
+    def _newSilhouetteFilter():
+        """The outline filter: boundary and feature edges, no colouring."""
+        outline = vtkFeatureEdges()
+        outline.BoundaryEdgesOn()
+        outline.FeatureEdgesOn()
+        outline.SetFeatureAngle(SILHOUETTE_FEATURE_ANGLE)
+        outline.ManifoldEdgesOff()
+        outline.NonManifoldEdgesOff()
+        outline.ColoringOff()
+        return outline
+
     def usePrecomputed(self, surface=None, edges=None):
         """Draw ``surface`` and ``edges`` in place of this actor's own filters.
 
@@ -499,6 +588,7 @@ class ActorInfo(QObject):
         self._properties.visibility = visibility
         self._actor.SetVisibility(visibility)
         self._silhouette.SetVisibility(visibility)
+        self.appearanceChanged.emit()
 
     def setOpacity(self, opacity):
         self._properties.opacity = opacity
@@ -506,6 +596,7 @@ class ActorInfo(QObject):
         # An outline at full strength around a surface faded to 20% reads as a
         # wireframe cage, so the outline fades with what it outlines.
         self._silhouette.GetProperty().SetOpacity(opacity)
+        self.appearanceChanged.emit()
 
     def _applyDepthBias(self, units: float):
         self._mapper.SetResolveCoincidentTopologyToPolygonOffset()
@@ -543,7 +634,7 @@ class ActorInfo(QObject):
 
     def setFaceScalars(self, name: str, face_ids, values, *,
                        start_face: int | None = None, value_range=None,
-                       lookup_table=None) -> bool:
+                       lookup_table=None, magnitude: bool = False) -> bool:
         """Colour this actor by a per-face field.
 
         ``face_ids`` are the mesh's own face labels. A patch's cells are its
@@ -562,6 +653,11 @@ class ActorInfo(QObject):
         everywhere. Faces with no measurement stay ``nan`` and are drawn in
         the lookup table's nan colour -- absent, not zero, because zero on a
         deviation field is a claim of perfection.
+
+        Plan 43 LY12. With ``magnitude`` the signed values stay in the array
+        named ``name`` (the labels and the hover read them) and the colours
+        follow ``|value|`` through a second array, so a surface pushed out and
+        one pulled in by the same amount get the same colour.
         """
         import numpy as np
         from vtkmodules.util.numpy_support import numpy_to_vtk
@@ -595,20 +691,35 @@ class ActorInfo(QObject):
         array.SetName(name)
         data.GetCellData().AddArray(array)
         data.GetCellData().SetActiveScalars(name)
+        colour_name = name
+        if magnitude:
+            colour_name = name + MAGNITUDE_SUFFIX
+            shown = numpy_to_vtk(np.abs(scalars), deep=True)
+            shown.SetName(colour_name)
+            data.GetCellData().AddArray(shown)
+            data.GetCellData().SetActiveScalars(colour_name)
 
         if value_range is None:
             value_range = (float(finite.min()), float(finite.max()))
         low, high = (float(value_range[0]), float(value_range[1]))
         if lookup_table is not None:
-            lookup_table.SetTableRange(low, high)
+            if magnitude:
+                # The table may span a narrower window (Around the limit).
+                low, high = lookup_table.GetTableRange()
+            else:
+                lookup_table.SetTableRange(low, high)
             self._mapper.SetLookupTable(lookup_table)
         self._mapper.SetScalarModeToUseCellFieldData()
-        self._mapper.SelectColorArray(name)
+        self._mapper.SelectColorArray(colour_name)
         self._mapper.SetScalarRange(low, high)
-        self._mapper.UseLookupTableScalarRangeOff()
+        if magnitude:
+            self._mapper.UseLookupTableScalarRangeOn()
+        else:
+            self._mapper.UseLookupTableScalarRangeOff()
         self._mapper.ScalarVisibilityOn()
         self._mapper.Update()
         self._faceScalarName = name
+        self.appearanceChanged.emit()
         return True
 
     def faceScalars(self, name: str | None = None):
@@ -631,9 +742,10 @@ class ActorInfo(QObject):
         self._mapper.ScalarVisibilityOff()
         # DP-713. The deviation scale is lent for the colouring only; the
         # quality colouring shares this mapper and expects its own back.
-        self._mapper.SetLookupTable(sequentialRedLut)
+        self._mapper.SetLookupTable(colour_standard.lookup_table('quality', 0.0, 1.0))
         self._faceScalarName = None
         self._mapper.Update()
+        self.appearanceChanged.emit()
 
     def faceScalarName(self):
         return getattr(self, '_faceScalarName', None)
@@ -668,6 +780,7 @@ class ActorInfo(QObject):
         """
         self._actor.SetPosition(*offset)
         self._silhouette.SetPosition(*offset)
+        self.appearanceChanged.emit()
 
     def setCutMode(self, mode: CutMode):
         """Choose whether a clip truncates cells or keeps them whole.
@@ -700,6 +813,7 @@ class ActorInfo(QObject):
             self._highlightOn()
         else:
             self._applyDisplayMode(mode)
+        self.appearanceChanged.emit()
 
     def setCutEnabled(self, enabled):
         self._properties.cutEnabled = enabled
@@ -711,6 +825,7 @@ class ActorInfo(QObject):
                 self._highlightOn()
             else:
                 self._highlightOff()
+            self.appearanceChanged.emit()
 
     def setHighlightRole(self, role):
         """Apply a predictable selection-state cue in addition to status text."""
@@ -724,6 +839,12 @@ class ActorInfo(QObject):
             self.setHighlighted(False)
             return
         self._highlightColor = HIGHLIGHT_ROLE_COLORS[role]
+        if role in ACCENT_ROLES:
+            if app.themeManager is not None and app.themeManager.tokens is not None:
+                self._highlightColor = _accentOr(
+                    app.themeManager.tokens, self._highlightColor)
+            elif self._themeAccent:
+                self._highlightColor = self._themeAccent
         if self._properties.highlighted:
             # R44. Display Control turns the highlight on the moment its row is
             # selected, which is *before* the role reaches here, so
@@ -736,9 +857,12 @@ class ActorInfo(QObject):
             self.setHighlighted(True)
 
     def applyTheme(self, tokens):
-        self._highlightColor = (
-            HIGHLIGHT_ROLE_COLORS.get(self._highlightRole)
-            or tokens.value('accent.default'))
+        setThemeMeshLineColor(tokens.value('viewport.lines'))
+        self._themeAccent = tokens.value('accent.default')
+        if self._highlightRole in ACCENT_ROLES:
+            self._highlightColor = self._themeAccent
+        else:
+            self._highlightColor = HIGHLIGHT_ROLE_COLORS[self._highlightRole]
         # DP-710. Interior edges no longer wear a fixed muted grey; their
         # colour follows the Mesh lines style and the surface they lie on.
         self._surfaceColor = tokens.value('viewport.surface')
@@ -750,10 +874,18 @@ class ActorInfo(QObject):
         self._applySurfaceColor()
         if self._properties.highlighted:
             self._actor.GetProperty().SetEdgeColor(*rgb(self._highlightColor))
-            self._silhouette.GetProperty().SetColor(*rgb(self._highlightColor))
+            self._silhouette.GetProperty().SetColor(*rgb(self._highlightSilhouette()))
         else:
             self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
             self._silhouette.GetProperty().SetColor(*rgb(self._silhouetteColor))
+        # U1. The grid colour changed with the theme; wireframe skins and
+        # edge modes pick it up from the same pass, with no reload.
+        self.applyMeshLineStyle()
+
+    def _highlightSilhouette(self) -> str:
+        if self._highlightRole in ACCENT_ROLES:
+            return HIGHLIGHT_SILHOUETTE_COLOR
+        return self._highlightColor
 
     def _paletteColor(self) -> str:
         """The themed colour this actor should wear when it has not been set."""
@@ -787,24 +919,58 @@ class ActorInfo(QObject):
             self.colorChanged.emit()
 
     def clip(self, planes):
+        if self._staysUncut(planes):
+            self.appearanceChanged.emit()
+            return
+        self._dropCutFilters()
+        built, inputFilter = self._clipStage(planes, self._cutFilters[0])
+        self._cutFilters.extend(built)
+        self._connectMapper(inputFilter)
+        self._mapper.Update()
+        self.appearanceChanged.emit()
+
+    def _staysUncut(self, planes) -> bool:
+        """Plan 39 VI14c. Taking a cut off an actor that has none.
+
+        Re-pointing a filter at the same input marks it modified, so the next
+        pull re-runs it over the whole patch. A patch with no cut stages and
+        nothing to cut by keeps its pipeline as it is.
+        """
+        return (len(self._cutFilters) == 1
+                and not (planes and self._properties.cutEnabled))
+
+    def _dropCutFilters(self):
+        """Take the cut stages down, leaving the pass-through they hang on."""
         for i in reversed(range(1, len(self._cutFilters))):
             self._cutFilters[i].RemoveAllInputConnections(0)
             self._cutFilters.pop()
 
-        inputFilter = self._cutFilters[0]
+    def _clipStage(self, planes, inputFilter):
+        """``(new stages, the last one)`` clipping *inputFilter* by *planes*.
+
+        Plan 39 VI2. The stages are built apart from the actor's own chain so
+        a volume can run them on the VTK thread and swap them in finished.
+        """
         if planes and self._properties.cutEnabled:
             # Plan 37 UF7. Cut cells is one stage over all the planes (the
             # first is the one cutting, the rest mask), not a chain of clips.
             cells = (self._cutCellsFilter(planes)
                      if self._cutMode is CutMode.CUT_CELLS else None)
+            # Plan 39 VI10b. How the planes combine and which whole cells
+            # survive (None: the chain of single clips below, as before).
+            from foammesh.rendering import combine_clip
+            built = (combine_clip.stages(self, planes, inputFilter)
+                     if cells is None else None)
+            if built is not None:
+                return list(built.filters), built.output
+            stages = []
             for f in ([cells] if cells is not None
                       else [self._clipFilter(c) for c in planes]):
                 f.SetInputConnection(inputFilter.GetOutputPort())
-                self._cutFilters.append(f)
+                stages.append(f)
                 inputFilter = f
-
-        self._connectMapper(inputFilter)
-        self._mapper.Update()
+            return stages, inputFilter
+        return [], inputFilter
 
     def slice(self, planes):
         """Cut the actor with one or more planes.
@@ -814,16 +980,22 @@ class ActorInfo(QObject):
         once. ``None`` and a bare plane are still accepted, because that is what
         every existing caller passes.
         """
+        if self._staysUncut(planes if planes is not None else []):
+            self.appearanceChanged.emit()
+            return
+        self._dropCutFilters()
+        built, inputFilter = self._sliceStage(planes, self._cutFilters[0])
+        self._cutFilters.extend(built)
+        self._connectMapper(inputFilter)
+        self._mapper.Update()
+        self.appearanceChanged.emit()
+
+    def _sliceStage(self, planes, inputFilter):
         if planes is None:
             planes = []
         elif isinstance(planes, vtkPlane):
             planes = [planes]
 
-        for i in reversed(range(1, len(self._cutFilters))):
-            self._cutFilters[i].RemoveAllInputConnections(0)
-            self._cutFilters.pop()
-
-        inputFilter = self._cutFilters[0]
         if planes and self._properties.cutEnabled:
             # Independent cuts of the same source, unioned. Chaining them would
             # cut the first slice's surface with the second plane and leave a
@@ -837,18 +1009,12 @@ class ActorInfo(QObject):
                 cutters.append(f)
 
             if len(cutters) == 1:
-                self._cutFilters.append(cutters[0])
-                inputFilter = cutters[0]
-            else:
-                union = vtkAppendPolyData()
-                for f in cutters:
-                    union.AddInputConnection(f.GetOutputPort())
-                self._cutFilters.extend(cutters)
-                self._cutFilters.append(union)
-                inputFilter = union
-
-        self._connectMapper(inputFilter)
-        self._mapper.Update()
+                return [cutters[0]], cutters[0]
+            union = vtkAppendPolyData()
+            for f in cutters:
+                union.AddInputConnection(f.GetOutputPort())
+            return [*cutters, union], union
+        return [], inputFilter
 
     def _connectMapper(self, input_filter):
         self._mapper.SetInputConnection(input_filter.GetOutputPort())
@@ -983,7 +1149,7 @@ class ActorInfo(QObject):
         # 3px line, and so a tree selection changes something the eye lands on.
         self._actor.GetProperty().SetColor(*rgb(self._highlightColor))
         self._actor.GetProperty().SetAmbient(HIGHLIGHT_AMBIENT)
-        self._silhouette.GetProperty().SetColor(*rgb(self._highlightColor))
+        self._silhouette.GetProperty().SetColor(*rgb(self._highlightSilhouette()))
         self._silhouette.GetProperty().SetLineWidth(HIGHLIGHT_SILHOUETTE_WIDTH)
 
     def _highlightOff(self):
@@ -1021,7 +1187,141 @@ class ActorInfo(QObject):
         return None
 
 
+#: Plan 39 VI16 (I9). How many times a volume's geometry filter (the
+#: exterior surface of the cells) has run, in this process. The count is a
+#: gate: a display-mode switch, a filter clear or a level-of-detail rebuild
+#: after a load must add nothing, because the exterior of a revision is
+#: worked out once and kept.
+GEOMETRY_FILTER_RUNS = [0]
+
+
+def geometryFilterRuns() -> int:
+    return GEOMETRY_FILTER_RUNS[0]
+
+
+def _watchGeometry(owner, geometry, outline=None):
+    """Count the runs of *geometry* and keep what an uncut run produced.
+
+    The observers hold the actor weakly: a filter that referred to the actor
+    it hangs off would put a cycle in every volume (Plan 35 CR3 step 7).
+    """
+    import weakref
+
+    ref = weakref.ref(owner)
+
+    def ran(_caller, _event):
+        GEOMETRY_FILTER_RUNS[0] += 1
+        actor = ref()
+        if actor is not None and outline is not None:
+            actor._exteriorRan(geometry)
+
+    geometry.AddObserver('EndEvent', ran)
+    if outline is not None:
+        def edgesRan(_caller, _event):
+            actor = ref()
+            if actor is not None:
+                actor._edgesRan(outline)
+
+        outline.AddObserver('EndEvent', edgesRan)
+
+
+#: Closing round 2026-10-12 (VI14). While a section plane is being dragged,
+#: a cut that has been worked out waits to go on screen: putting each one in
+#: costs a render that uploads the whole new surface (about 100 ms for 1.9 M
+#: faces on the integrated GPU), and only the last one of a drag is wanted.
+_installHolds = 0
+_HOLD_LIMIT_SECONDS = 10.0
+
+
+def hold_cut_installs(hold: bool) -> None:
+    global _installHolds
+    _installHolds = max(0, _installHolds + (1 if hold else -1))
+
+
+def cut_installs_held() -> bool:
+    return _installHolds > 0
+
+
+async def _installsAllowed() -> None:
+    """Wait (at most ten seconds) until no plane drag is in progress."""
+    waited = 0.0
+    while _installHolds > 0 and waited < _HOLD_LIMIT_SECONDS:
+        await asyncio.sleep(0.03)
+        waited += 0.03
+
+
+def _updateBoth(surface, outline) -> None:
+    """Run a cut's two ends (the VTK thread)."""
+    surface.Update()
+    outline.Update()
+
+
+def _releaseStages(stages) -> None:
+    for stage in reversed(stages):
+        try:
+            stage.RemoveAllInputConnections(0)
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+class _ShadowCut:
+    """Plan 39 VI2. The volume's pipeline as a cut or a quality band would
+    leave it, built apart from the one on screen and run on the VTK thread.
+
+    The picture keeps drawing from the old pipeline until this one has been
+    run to the end; a cancel throws this one away and nothing on screen
+    changed.
+    """
+
+    def __init__(self, cell, cuts, surface, outline, precomputed):
+        self.cell = cell
+        self.cuts = cuts
+        self.surface = surface
+        self.outline = outline
+        #: The uncut volume's surface and outline are handed over ready
+        #: (CR3 step 10): nothing to run.
+        self.precomputed = precomputed
+        #: No cut and no band: the whole volume's exterior (Plan 39 VI16).
+        self.uncut = False
+
+    def _all(self):
+        return [self.cell, *self.cuts, self.surface, self.outline]
+
+    def update(self):
+        if self.precomputed:
+            return
+        self.surface.Update()
+        self.outline.Update()
+
+    def abort(self):
+        for stage in self._all():
+            try:
+                stage.SetAbortExecute(1)
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def release(self):
+        for stage in reversed(self._all()):
+            try:
+                stage.RemoveAllInputConnections(0)
+            except Exception:                               # noqa: BLE001
+                pass
+
+
 class MeshActor(ActorInfo):
+    #: Plan 39 VI2. A cut or quality filter over the volume started (True)
+    #: or has come to its end, swapped in or thrown away (False).
+    cutBusy = Signal(bool)
+
+    #: What the next pipeline is built from, and what the one on screen was.
+    _cutSpec = None
+    _cellSpec = None
+    _shownSpecs = (None, None)
+    _cutWanted = False
+    _cutRunning = None
+    _cutTask = None
+    _cutGeneration = 0
+
     def __init__(self, dataSet, id_, name):
         super().__init__(dataSet, id_, name, ActorType.MESH)
         # Keep the complete volume dataset for quality thresholds and clipping,
@@ -1034,6 +1334,449 @@ class MeshActor(ActorInfo):
         # after the geometry filter, so the outline hangs off the surface too.
         self._silhouetteFilter.SetInputConnection(
             self._surfaceFilter.GetOutputPort())
+        _watchGeometry(self, self._surfaceFilter, self._silhouetteFilter)
+
+    # -- Plan 39 VI16 (I9): the exterior, once per revision --------------- #
+
+    def _exteriorRan(self, geometry):
+        """The pipeline's own geometry filter just ran: keep its exterior.
+
+        The exterior of the uncut, unfiltered volume is the same polygons for
+        every display mode, filter clear and level-of-detail rebuild of this
+        revision, so it is kept as the precomputed surface (the worker's own
+        takes the same place) and drawn from there. ``setDataSet`` drops it:
+        a new revision has a new exterior. The mapper is not re-pointed here
+        (this runs inside the pipeline's own update); the next cut or clear
+        takes it from ``_precomputedSurface``.
+        """
+        if self._precomputedSurface is not None:
+            return
+        if geometry is not self._surfaceFilter or not self._isUncut():
+            return
+        output = geometry.GetOutput()
+        if output is None or output.GetNumberOfCells() <= 0:
+            return
+        surface = vtkPolyData()
+        surface.ShallowCopy(output)
+        self._precomputedSurface = surface
+
+    def _edgesRan(self, outline):
+        """The outline filter ran over the whole exterior: keep its edges."""
+        if self._precomputedEdges is not None or outline is not self._silhouetteFilter:
+            return
+        if self._precomputedSurface is None or not self._isUncut():
+            return
+        output = outline.GetOutput()
+        if output is None:
+            return
+        edges = vtkPolyData()
+        edges.ShallowCopy(output)
+        self._precomputedEdges = edges
+
+    def _isUncut(self) -> bool:
+        return self._precomputedActive()
+
+    def exteriorKept(self) -> bool:
+        """Whether this revision's exterior is held (worker's or worked out)."""
+        return self._precomputedSurface is not None
+
+    # -- Plan 39 VI16 (I6): Colour mesh by, on the exterior ----------------- #
+
+    _paintedSurface = None
+    _paintColouring = None
+
+    def exteriorSurfaceWith(self, arrays):
+        """The volume's exterior with the cell arrays *arrays* on its faces.
+
+        The worker's own exterior carries only ``patchId``; a face of the
+        geometry filter's output takes its cell's data, so this is made over
+        the whole dataset once and kept for the revision (``setDataSet`` drops
+        it). Returns ``None`` when the dataset lacks an array.
+        """
+        data = self._dataSet
+        if data is None or data.GetNumberOfCells() <= 0:
+            return None
+        cells = data.GetCellData()
+        if any(cells.GetArray(name) is None for name in arrays):
+            return None
+        kept = self._paintedSurface
+        if kept is not None and all(
+                kept.GetCellData().GetArray(name) is not None
+                for name in arrays):
+            return kept
+        geometry = vtkGeometryFilter()
+        geometry.SetInputData(data)
+        geometry.Update()
+        surface = vtkPolyData()
+        surface.ShallowCopy(geometry.GetOutput())
+        self._paintedSurface = surface
+        return surface
+
+    def paintExterior(self, mapped, colouring) -> bool:
+        """Colour the exterior by *mapped* (`section_colour.mapping`).
+
+        Not while a cut or band is on: that picture is the section's, coloured
+        by *Colour cut by*. Returns whether it was painted.
+        """
+        if not self._precomputedActive() or self.isCutting():
+            return False
+        surface = self.exteriorSurfaceWith([mapped['array']])
+        if surface is None:
+            return False
+        self.dropSkin()
+        self._mapper.SetInputData(surface)
+        colouring.colour(self._mapper, mapped)
+        self._paintColouring = colouring
+        self._actor.Modified()
+        self.appearanceChanged.emit()
+        return True
+
+    def exteriorPainted(self) -> bool:
+        return self._paintColouring is not None
+
+    def clearExteriorPaint(self) -> bool:
+        """Take the colour off and draw the plain exterior again."""
+        colouring = self._paintColouring
+        if colouring is None:
+            return False
+        self._paintColouring = None
+        colouring.restore(self._mapper)
+        if self._precomputedActive():
+            self._wirePrecomputed()
+        self._actor.Modified()
+        self.appearanceChanged.emit()
+        return True
+
+    # -- Plan 39 VI4 (F1e): the exterior wears the patches' colours --------- #
+
+    _skinOn = False
+    _skinLut = None
+    _skinCount = None
+
+    def canCarrySkin(self, count: int) -> bool:
+        """Whether this exterior can be coloured by the patch each face is.
+
+        It needs the worker's exterior with its ``patchId`` for *count*
+        patches, shown, opaque, not selected, drawn as a surface, with nothing
+        cutting, filtering or painting it.
+        """
+        surface = self._precomputedSurface
+        props = self._properties
+        if (surface is None or props is None or not props.visibility
+                or props.opacity < 1.0 or props.highlighted
+                or props.displayMode is DisplayMode.WIREFRAME
+                or not self._precomputedActive() or self.isCutting()
+                or self._paintColouring is not None
+                or any(self._actor.GetPosition())):
+            return False
+        ids = surface.GetCellData().GetArray('patchId')
+        if ids is None or ids.GetNumberOfTuples() != surface.GetNumberOfCells():
+            return False
+        low, high = ids.GetRange()
+        return low >= 0 and high < count
+
+    def carriesPatchIds(self) -> bool:
+        """Whether the exterior on hand says which patch each face is."""
+        surface = self._precomputedSurface
+        return (surface is not None
+                and surface.GetCellData().GetArray('patchId') is not None)
+
+    def neutralSkinColour(self) -> tuple:
+        colour = self._currentSurfaceColor()
+        return (colour.redF(), colour.greenF(), colour.blueF())
+
+    def skinApplied(self) -> bool:
+        return self._skinOn
+
+    def applySkin(self, colours) -> bool:
+        """Colour the exterior's faces by ``patchId``: ``colours[i]`` is the
+        RGB of patch *i*. The exterior's own mesh lines go (the patches draw
+        theirs)."""
+        from vtkmodules.vtkCommonCore import vtkLookupTable
+
+        surface = self._precomputedSurface
+        if surface is None or not colours:
+            return False
+        table = self._skinLut
+        if table is None:
+            table = self._skinLut = vtkLookupTable()
+        table.SetNumberOfTableValues(len(colours))
+        for index, (red, green, blue) in enumerate(colours):
+            table.SetTableValue(index, red, green, blue, 1.0)
+        table.SetRange(-0.5, len(colours) - 0.5)
+        table.Modified()
+        mapper = self._mapper
+        mapper.SetInputData(surface)
+        mapper.SetLookupTable(table)
+        mapper.SetScalarModeToUseCellFieldData()
+        mapper.SelectColorArray('patchId')
+        mapper.UseLookupTableScalarRangeOn()
+        mapper.ScalarVisibilityOn()
+        self._skinOn = True
+        self._actor.GetProperty().EdgeVisibilityOff()
+        self._invalidateLevelOfDetail()
+        return True
+
+    def setSkinColour(self, index: int, colour) -> None:
+        """Change the colour of one patch's faces on the exterior."""
+        table = self._skinLut
+        if table is None or not self._skinOn:
+            return
+        table.SetTableValue(index, colour[0], colour[1], colour[2], 1.0)
+        table.Modified()
+        self._actor.Modified()
+
+    def dropSkin(self) -> None:
+        """Draw the plain exterior again, mesh lines and all."""
+        if not self._skinOn:
+            return
+        self._skinOn = False
+        self._mapper.ScalarVisibilityOff()
+        self._mapper.SetLookupTable(colour_standard.lookup_table('quality', 0.0, 1.0))
+        self._mapper.SetScalarModeToUseCellFieldData()
+        if self._properties.highlighted:
+            self._highlightOn()
+        else:
+            self._applyDisplayMode(self._properties.displayMode)
+        self._invalidateLevelOfDetail()
+
+    def _applySurfaceEdgeMode(self):
+        super()._applySurfaceEdgeMode()
+        if self._skinOn:
+            self._actor.GetProperty().EdgeVisibilityOff()
+
+    # -- Plan 39 VI2: cuts and bands over the volume, off the GUI thread ----- #
+
+    def clip(self, planes):
+        self._cutSpec = ('clip', planes)
+        self._submitCut()
+
+    def slice(self, planes):
+        self._cutSpec = ('slice', planes)
+        self._submitCut()
+
+    def recut(self):
+        """Work the cut or band in force out again from the volume as it is.
+
+        VI14 (hover) cuts a shallow copy of the volume taken when the cut is
+        built, so an array put on the volume afterwards (a colour's cell id,
+        a case's refinement level) is not on the surface until the cut is
+        built again. Does nothing when nothing is cut.
+        """
+        if self._cutSpec is not None or self._cellSpec is not None:
+            self._submitCut()
+
+    def isCutting(self) -> bool:
+        """Whether a cut or band is still being worked out (the picture on
+        screen is the one before it)."""
+        return self._cutRunning is not None or self._cutWanted
+
+    def cancelCut(self) -> bool:
+        """Stop the cut being worked out and keep the picture on screen.
+
+        ``False`` when nothing was running.
+        """
+        if not self.isCutting():
+            return False
+        self._cutWanted = False
+        self._cutGeneration += 1
+        self._cutSpec, self._cellSpec = self._shownSpecs
+        if self._cutRunning is not None:
+            self._cutRunning.abort()
+        self.appearanceChanged.emit()
+        return True
+
+    _originalIds = None
+
+    def _ensureOriginalIds(self):
+        """The array of cell indices, made once per revision.
+
+        Plan 39 VI14c. 4 bytes a cell (10 ms on 6.6 M cells); ``_runCuts``
+        makes it on a thread before the first cut is built, so the GUI
+        thread does not.
+        """
+        data = self._dataSet
+        count = int(data.GetNumberOfCells())
+        ids = self._originalIds
+        if ids is None or ids.GetNumberOfTuples() != count:
+            from vtkmodules.util.numpy_support import numpy_to_vtk
+            import numpy as np
+            ids = numpy_to_vtk(np.arange(count, dtype=np.int32),
+                               deep=True)
+            ids.SetName('vtkOriginalCellIds')
+            self._originalIds = ids
+        return ids
+
+    def _dataWithOriginalIds(self):
+        """The volume, as a shallow copy that also carries each cell's own
+        index as ``vtkOriginalCellIds``.
+
+        VI14 (hover). A clip, cut or band keeps every cell array through to
+        the surface it draws, so a cell picked on the cut can name the volume
+        cell it stands for. The copy shares the volume's arrays (the volume
+        itself is not given the array, so nothing that writes or lists it
+        sees one); the ids are 4 bytes a cell and are kept for the revision.
+        """
+        data = self._dataSet
+        ids = self._ensureOriginalIds()
+        carrier = data.NewInstance()
+        carrier.ShallowCopy(data)
+        carrier.GetCellData().AddArray(ids)
+        return carrier
+
+    def _buildShadow(self) -> _ShadowCut:
+        """The pipeline the specs ask for, as filters nothing has run yet."""
+        if self._cellSpec is None:
+            cell = vtkPassThrough()
+        else:
+            low, high, index = self._cellSpec
+            cell = vtkThreshold()
+            cell.AllScalarsOff()
+            cell.SetThresholdFunction(vtkThreshold.THRESHOLD_BETWEEN)
+            cell.SetLowerThreshold(low)
+            cell.SetUpperThreshold(high)
+            cell.SetInputArrayToProcess(
+                0, 0, 0, vtkDataObject.FIELD_ASSOCIATION_CELLS, index.value)
+        cell.SetInputData(self._dataWithOriginalIds())
+        base = vtkPassThrough()
+        base.SetInputConnection(cell.GetOutputPort())
+        cuts, last = [base], base
+        if self._cutSpec is not None:
+            kind, planes = self._cutSpec
+            stage = self._clipStage if kind == 'clip' else self._sliceStage
+            built, last = stage(planes, base)
+            cuts.extend(built)
+        surface = vtkGeometryFilter()
+        surface.SetInputConnection(last.GetOutputPort())
+        outline = self._newSilhouetteFilter()
+        outline.SetInputConnection(surface.GetOutputPort())
+        # Plan 39 VI16 (I9). Handed over ready only once an exterior is kept;
+        # until then the uncut pipeline is run here (off the GUI thread) and
+        # its exterior is kept at install, so the next clear runs nothing.
+        uncut = len(cuts) == 1 and self._cellSpec is None
+        precomputed = uncut and self._precomputedSurface is not None
+        shadow = _ShadowCut(cell, cuts, surface, outline, precomputed)
+        shadow.uncut = uncut
+        _watchGeometry(self, surface, outline)
+        return shadow
+
+    def _submitCut(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # No event loop to run it on (a test, a shutdown): worked out
+            # here, as it always was.
+            self.appearanceChanged.emit()
+            shadow = self._buildShadow()
+            shadow.update()
+            self._installShadow(shadow)
+            return
+        self._cutWanted = True
+        self.appearanceChanged.emit()
+        if self._cutRunning is not None:
+            # The latest request wins; the one running is of no use now.
+            self._cutRunning.abort()
+            return
+        if self._cutTask is None or self._cutTask.done():
+            self._cutTask = loop.create_task(self._runCuts())
+
+    async def _runCuts(self):
+        self.cutBusy.emit(True)
+        try:
+            while self._cutWanted and not self._disposed:
+                self._cutWanted = False
+                generation = self._cutGeneration
+                specs = (self._cutSpec, self._cellSpec)
+                if self._originalIds is None:
+                    await asyncio.to_thread(self._ensureOriginalIds)
+                    if self._disposed:
+                        break
+                shadow = self._buildShadow()
+                self._cutRunning = shadow
+                try:
+                    await vtk_run_in_thread(shadow.update)
+                except Exception:                           # noqa: BLE001
+                    logging.getLogger(__name__).exception(
+                        'cut of %s not worked out', self._id)
+                    shadow.release()
+                    continue
+                finally:
+                    self._cutRunning = None
+                await _installsAllowed()
+                if (self._cutWanted or self._disposed
+                        or generation != self._cutGeneration):
+                    shadow.release()
+                    continue
+                self._installShadow(shadow, specs)
+        finally:
+            self._cutRunning = None
+            if not self._disposed:
+                self.cutBusy.emit(False)
+
+    def _installShadow(self, shadow: _ShadowCut, specs=None):
+        """Put a finished pipeline on screen in place of the old one."""
+        old = [self._cellFilter, *self._cutFilters, self._surfaceFilter,
+               self._silhouetteFilter]
+        self._cellFilter = shadow.cell
+        self._cutFilters = shadow.cuts
+        self._surfaceFilter = shadow.surface
+        self._silhouetteFilter = shadow.outline
+        self._shownSpecs = specs or (self._cutSpec, self._cellSpec)
+        if shadow.uncut and not shadow.precomputed                 and self._precomputedSurface is None:
+            # Plan 39 VI16 (I9). Worked out here once; every later clear and
+            # mode switch of this revision draws this.
+            kept = vtkPolyData()
+            kept.ShallowCopy(shadow.surface.GetOutput())
+            if kept.GetNumberOfCells() > 0:
+                self._precomputedSurface = kept
+                edges = vtkPolyData()
+                edges.ShallowCopy(shadow.outline.GetOutput())
+                self._precomputedEdges = edges
+        self._mapper.SetInputConnection(shadow.surface.GetOutputPort())
+        self._silhouetteMapper.SetInputConnection(
+            shadow.outline.GetOutputPort())
+        self._wirePrecomputed()
+        # The cell state below turns the mapper's colouring off.
+        self._skinOn = False
+        self._applyCellState()
+        self._mapper.Update()
+        self._invalidateLevelOfDetail()
+        for stage in reversed(old):
+            stage.RemoveAllInputConnections(0)
+        self.appearanceChanged.emit()
+
+    def _applyCellState(self):
+        """The mapper's colouring and depth bias for the band on screen."""
+        if self._cellSpec is None:
+            self._mapper.ScalarVisibilityOff()
+            # DP-714. The band's scale was lent for the colouring only.
+            self._mapper.SetLookupTable(colour_standard.lookup_table('quality', 0.0, 1.0))
+            # Whatever suspended the standing bias is off too, so it comes
+            # back.
+            self._applyDepthBias(self._depthBias)
+            return
+        low, high, index = self._cellSpec
+        self._mapper.ScalarVisibilityOn()
+        # DP-714. A scale of its own on the band, not the shared table's 0-1
+        # range, which painted every value above 1 the same red.
+        table = colour_standard.lookup_table(
+            'quality', low, high, index not in QUALITY_WORST_IS_LOW,
+            limit=quality_scale.limit(index.value))
+        self._mapper.SetLookupTable(table)
+        self._mapper.SetScalarRange(*table.GetTableRange())
+        self._mapper.UseLookupTableScalarRangeOn()
+        self._mapper.SelectColorArray(index.value)
+        # A thresholded volume is no longer a duplicate of its own skin -- it
+        # is the subset of cells the user asked to be shown, and asking to see
+        # the worst cells and then being shown the patches that cover them is
+        # not an answer. So the bias that keeps the whole volume behind its
+        # patches (DP-141) stands down for as long as the filter is on --
+        # and turns round (DP-737): at zero a boundary cell's face tied with
+        # the patch face over it and shimmered through it, so the cells are
+        # pulled in front instead. clearCellFilter puts the standing bias back.
+        self._applyDepthBias(POOR_CELL_DEPTH_BIAS)
 
     def _connectMapper(self, input_filter):
         self._surfaceFilter.SetInputConnection(input_filter.GetOutputPort())
@@ -1078,6 +1821,16 @@ class MeshActor(ActorInfo):
     def setDataSet(self, dataSet, *, like=None):
         # DP-814. A reloaded mesh is new data under the same actor.
         self._invalidateLevelOfDetail()
+        self._paintedSurface = None
+        self._skinOn = False
+        if self._paintColouring is not None:
+            self._paintColouring.restore(self._mapper)
+            self._paintColouring = None
+        # Plan 39 VI2. A cut worked out over the old data is of no use.
+        self._cutGeneration += 1
+        self._originalIds = None
+        if self._cutRunning is not None:
+            self._cutRunning.abort()
         super().setDataSet(dataSet, like=like)
 
     def _createActor(self):
@@ -1134,7 +1887,9 @@ class MeshActor(ActorInfo):
         # else already did.
         cut = self._cutFilters[-1]
         cut.Update()
-        return cut.GetOutput().GetNumberOfCells()
+        # WALK-2. A Python algorithm (the Cut cells filter) has no
+        # GetOutput(); every vtkAlgorithm has GetOutputDataObject.
+        return cut.GetOutputDataObject(0).GetNumberOfCells()
 
     def hasScalar(self, index: MeshQualityIndex) -> bool:
         return self._dataSet.GetCellData().GetScalars(index.value) is not None
@@ -1147,6 +1902,74 @@ class MeshActor(ActorInfo):
 
         left, right = scalars.GetRange()
         return left, right
+
+    def metricValues(self, index: MeshQualityIndex):
+        """Plan 43 LY11. The per-cell values of a metric, or None if absent.
+
+        Read from the arrays already attached; ``nan`` marks a cell the
+        metric was not measured on. The legend's statistics come from here.
+        """
+        import numpy as np
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+
+        data = self._dataSet
+        array = data.GetCellData().GetArray(index.value) if data else None
+        if array is None:
+            return None
+        return vtk_to_numpy(array).astype(np.float64, copy=True)
+
+    def rankedCells(self, index: MeshQualityIndex, count: int) -> list[dict]:
+        """The ``count`` worst cells of a metric on this volume, worst first.
+
+        Plan 39 VI8. Read from the arrays already attached, so asking costs a
+        partition and not a second measurement. Each row is what the Quality
+        tab shows and the camera needs: id, value, centroid and a length for
+        the cell. The zone is not known to a dataset, so it is left blank here;
+        the worker's ranking names it.
+        """
+        import numpy as np
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        from vtkmodules.vtkCommonCore import vtkIdList
+
+        from foammesh.core.quality.cell_fields import rank_cells
+
+        data = self._dataSet
+        array = data.GetCellData().GetArray(index.value) if data else None
+        if array is None:
+            return []
+        values = vtk_to_numpy(array).astype(np.float64, copy=False)
+        cells = rank_cells(values, count,
+                           worst_is_high=index not in QUALITY_WORST_IS_LOW)
+        volumes = data.GetCellData().GetArray(MeshQualityIndex.VOLUME.value)
+        if volumes is None:
+            volumes = data.GetCellData().GetArray(
+                MeshQualityIndex.GMSH_VOLUME.value)
+        volume = vtk_to_numpy(volumes) if volumes is not None else None
+        points = vtkIdList()
+        # Plan 42 SG14 (DP-1419). On a Gmsh mesh the row's tag is the
+        # element's Gmsh tag, which Save listed cells keeps; the dataset
+        # position is the tag only on a mesh that carries no tags.
+        tag_array = data.GetCellData().GetArray('gmshElementTag')
+        tags = vtk_to_numpy(tag_array) if tag_array is not None else None
+        rows = []
+        for cell in cells:
+            data.GetCellPoints(int(cell), points)
+            ids = [points.GetId(i) for i in range(points.GetNumberOfIds())]
+            if ids:
+                coordinates = np.array([data.GetPoint(i) for i in ids])
+                centroid = coordinates.mean(axis=0)
+                extent = float(np.ptp(coordinates, axis=0).max())
+            else:
+                centroid, extent = np.zeros(3), 0.0
+            size = (float(np.cbrt(abs(volume[cell])))
+                    if volume is not None else extent)
+            rows.append({'tag': str(int(tags[cell]) if tags is not None
+                                    else int(cell)),
+                         'cell': int(cell),
+                         'metric': index.value, 'value': float(values[cell]),
+                         'centroid': [float(x) for x in centroid],
+                         'size': size, 'zone': ''})
+        return rows
 
     def setScalar(self, index: MeshQualityIndex):
         self._mqIndex = index
@@ -1195,69 +2018,223 @@ class MeshActor(ActorInfo):
         return True
 
     def clearCellFilter(self):
-        self._cellFilter = vtkPassThrough()
-
-        self._cellFilter.SetInputData(self._dataSet)
-
-        self._cutFilters[0].RemoveAllInputConnections(0)
-        self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
-        self._wirePrecomputed()
-
-        self._mapper.ScalarVisibilityOff()
-        # DP-714. The band's scale was lent for the colouring only.
-        self._mapper.SetLookupTable(sequentialRedLut)
-
-        # Whatever suspended the standing bias is off too, so it comes back.
-        self._applyDepthBias(self._depthBias)
-
-        self._mapper.Update()
-        self._invalidateLevelOfDetail()
+        self._cellSpec = None
+        self._submitCut()
 
     def applyCellFilter(self):
-        self._cellFilter = vtkThreshold()
-        self._cellFilter.AllScalarsOff()
-        self._cellFilter.SetThresholdFunction(vtkThreshold.THRESHOLD_BETWEEN)
-
-        self._cellFilter.SetLowerThreshold(self._mqLow)
-        self._cellFilter.SetUpperThreshold(self._mqHigh)
-        self._cellFilter.SetInputArrayToProcess(0, 0, 0, vtkDataObject.FIELD_ASSOCIATION_CELLS, self._mqIndex.value)
-
-        self._cellFilter.SetInputData(self._dataSet)
-
-        self._cutFilters[0].RemoveAllInputConnections(0)
-        self._cutFilters[0].SetInputConnection(self._cellFilter.GetOutputPort())
-        self._wirePrecomputed()
-
-        self._mapper.ScalarVisibilityOn()
-        # DP-714. A scale of its own on the band, not the shared table's 0-1
-        # range, which painted every value above 1 the same red.
-        self._mapper.SetLookupTable(qualityBandLut(
-            self._mqLow, self._mqHigh,
-            worstIsHigh=self._mqIndex not in QUALITY_WORST_IS_LOW))
-        self._mapper.SetScalarRange(self._mqLow, self._mqHigh)
-        self._mapper.UseLookupTableScalarRangeOn()
-        self._mapper.SelectColorArray(self._mqIndex.value)
-
-        # A thresholded volume is no longer a duplicate of its own skin -- it
-        # is the subset of cells the user asked to be shown, and asking to see
-        # the worst cells and then being shown the patches that cover them is
-        # not an answer. So the bias that keeps the whole volume behind its
-        # patches (DP-141) stands down for as long as the filter is on --
-        # and turns round (DP-737): at zero a boundary cell's face tied with
-        # the patch face over it and shimmered through it, so the cells are
-        # pulled in front instead. clearCellFilter puts the standing bias back.
-        self._applyDepthBias(POOR_CELL_DEPTH_BIAS)
-
-        self._mapper.Update()
-        self._invalidateLevelOfDetail()
+        self._cellSpec = (self._mqLow, self._mqHigh, self._mqIndex)
+        self._submitCut()
 
 
 class BoundaryActor(ActorInfo):
+    #: Closing round 2026-10-12 (VI14). A patch of at least this many faces is
+    #: cut on the VTK thread, as the volume is: the cut of one patch of the
+    #: 6.6 M-cell impeller held the GUI thread for about 100 ms, and a
+    #: section plane moved it once per step.
+    CUT_OFF_THREAD_CELLS = 20000
+
+    _boundarySpec = None
+    _boundaryRunning = None
+    _boundaryTask = None
+    _boundaryGeneration = 0
+
     def __init__(self, dataSet, id_, name):
         super().__init__(dataSet, id_, name, ActorType.BOUNDARY)
 
+    # -- VI14: a large patch's cut, off the GUI thread ------------------------ #
+
+    def clip(self, planes):
+        if not self._cutOffThread(planes):
+            self._boundaryCancel()
+            super().clip(planes)
+            return
+        self._boundarySubmit(('clip', planes))
+
+    def slice(self, planes):
+        if isinstance(planes, vtkPlane):
+            planes = [planes]
+        if not self._cutOffThread(planes):
+            self._boundaryCancel()
+            super().slice(planes)
+            return
+        self._boundarySubmit(('slice', planes))
+
+    def _cutOffThread(self, planes) -> bool:
+        data = self._dataSet
+        if (not planes or data is None or self._disposed
+                or self._properties is None
+                or not self._properties.cutEnabled
+                or data.GetNumberOfCells() < self.CUT_OFF_THREAD_CELLS):
+            return False
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def isCutting(self) -> bool:
+        """Whether a cut of this patch is still being worked out."""
+        return self._boundaryRunning is not None or self._boundarySpec is not None
+
+    def _boundaryCancel(self) -> None:
+        self._boundarySpec = None
+        self._boundaryGeneration += 1
+        running = self._boundaryRunning
+        if running is not None:
+            for stage in running[0]:
+                try:
+                    stage.SetAbortExecute(1)
+                except Exception:                           # noqa: BLE001
+                    pass
+
+    def _boundarySubmit(self, spec) -> None:
+        self._boundarySpec = spec
+        self._boundaryGeneration += 1
+        running = self._boundaryRunning
+        if running is not None:
+            for stage in running[0]:
+                try:
+                    stage.SetAbortExecute(1)
+                except Exception:                           # noqa: BLE001
+                    pass
+            return
+        if self._boundaryTask is None or self._boundaryTask.done():
+            self._boundaryTask = asyncio.get_running_loop().create_task(
+                self._runBoundaryCuts())
+
+    async def _runBoundaryCuts(self):
+        while self._boundarySpec is not None and not self._disposed:
+            kind, planes = self._boundarySpec
+            self._boundarySpec = None
+            generation = self._boundaryGeneration
+            base = vtkPassThrough()
+            base.SetInputData(self._dataSet)
+            stage = self._clipStage if kind == 'clip' else self._sliceStage
+            built, last = stage(planes, base)
+            outline = self._newSilhouetteFilter()
+            outline.SetInputConnection(last.GetOutputPort())
+            stages = [base, *built, outline]
+            self._boundaryRunning = (stages, base, built, last, outline)
+            try:
+                await vtk_run_in_thread(_updateBoth, last, outline)
+                await _installsAllowed()
+            except Exception:                               # noqa: BLE001
+                logging.getLogger(__name__).exception(
+                    'cut of %s not worked out', self._id)
+                _releaseStages(stages)
+                continue
+            finally:
+                self._boundaryRunning = None
+            if (self._boundarySpec is not None or self._disposed
+                    or generation != self._boundaryGeneration):
+                _releaseStages(stages)
+                continue
+            self._installBoundaryCut(base, built, last, outline)
+
+    def _installBoundaryCut(self, base, built, last, outline) -> None:
+        """Put a cut that has been worked out on screen in place of the old."""
+        oldOutline = self._silhouetteFilter
+        self._dropCutFilters()
+        self._cutFilters.extend([base, *built])
+        self._silhouetteFilter = outline
+        self._mapper.SetInputConnection(last.GetOutputPort())
+        self._wirePrecomputed()
+        oldOutline.RemoveAllInputConnections(0)
+        self._mapper.Update()
+        self.appearanceChanged.emit()
+
     def _initMapper(self) -> vtkPolyDataMapper:
         return vtkPolyDataMapper()
+
+    # -- Plan 39 VI4 (F1e): edges only over the volume's exterior ------------ #
+
+    _skinned = False
+
+    def isSkinned(self) -> bool:
+        """Whether this patch draws only its edges, its faces being drawn by
+        the volume's exterior in its colour."""
+        return self._skinned
+
+    def isPlain(self) -> bool:
+        """Whether the exterior can draw this patch's faces for it.
+
+        Shown, opaque, not selected, not painted by a field, not moved, not
+        cut, and drawn as a surface (with or without edges). Anything else is
+        a cue only the patch's own faces can give.
+        """
+        props = self._properties
+        return bool(
+            props is not None and props.visibility and props.opacity >= 1.0
+            and not props.highlighted
+            and props.displayMode is not DisplayMode.WIREFRAME
+            and self._faceScalarName is None
+            and self._precomputedActive()
+            and not any(self._actor.GetPosition()))
+
+    def skinColour(self) -> tuple:
+        colour = self._currentSurfaceColor()
+        return (colour.redF(), colour.greenF(), colour.blueF())
+
+    def setSkinned(self, skinned: bool) -> None:
+        skinned = bool(skinned)
+        if skinned == self._skinned:
+            return
+        self._skinned = skinned
+        prop = self._actor.GetProperty()
+        # A skinned patch is not what a click lands on: the exterior is, and
+        # the picker hands the click back to the patch (`MeshManager`).
+        self._actor.SetPickable(not skinned)
+        if not skinned:
+            prop.SetLighting(True)
+            prop.SetOpacity(self._properties.opacity)
+            self._actor.SetVisibility(self._properties.visibility)
+            colour = self._currentSurfaceColor()
+            prop.SetColor(colour.redF(), colour.greenF(), colour.blueF())
+        if self._properties.highlighted:
+            self._highlightOn()
+        else:
+            self._applyDisplayMode(self._properties.displayMode)
+
+    def _applySkinLines(self):
+        """Only this patch's mesh lines, as the surface-with-edges mode drew
+        them: same colour, width and strength, no faces."""
+        style = meshLineStyle()
+        prop = self._actor.GetProperty()
+        width, opacity = style.width, style.opacity
+        if self._dataSet.GetNumberOfCells() > DENSE_SKIN_FACES:
+            # DP-2675: see DENSE_SKIN_FACES.
+            width = min(width, MESH_LINE_DEFAULT_WIDTH)
+            opacity = min(opacity, EDGE_OPACITY)
+        prop.SetRepresentationToWireframe()
+        prop.EdgeVisibilityOff()
+        prop.SetLighting(False)
+        prop.SetColor(*rgb(self._meshLineColor()))
+        prop.SetLineWidth(width)
+        # Without per-edge opacity (VTK < 9.3) the edges were solid.
+        prop.SetOpacity(opacity if hasattr(prop, 'SetEdgeOpacity') else 1.0)
+        self._actor.SetVisibility(self._properties.visibility)
+        self._silhouette.SetVisibility(self._properties.visibility)
+
+    def _applySurfaceMode(self):
+        super()._applySurfaceMode()
+        if self._skinned:
+            self._actor.SetVisibility(False)
+
+    def _applySurfaceEdgeMode(self):
+        if self._skinned:
+            self._applySkinLines()
+            return
+        super()._applySurfaceEdgeMode()
+
+    def setColor(self, color: QColor):
+        super().setColor(color)
+        if self._skinned:
+            self._applyDisplayMode(self._properties.displayMode)
+
+    def _applySurfaceColor(self):
+        super()._applySurfaceColor()
+        if self._skinned:
+            self._applyDisplayMode(self._properties.displayMode)
 
     def _clipFilter(self, cutter: vtkPlane):
         if self._cutMode is CutMode.CRINKLE:
@@ -1411,7 +2388,15 @@ class GeometryActor(ActorInfo):
         from foammesh.core.mesh.mesh_preview import feature_edges
 
         try:
-            edges = await vtk_run_in_thread(feature_edges, data)
+            # DP-2711: ``data`` is what the mapper draws, and vtkFeatureEdges
+            # builds links/cells on its input, so it works on a private
+            # shallow copy (own link/cell bookkeeping, shared read-only
+            # arrays) taken here on the GUI thread.  Nothing a paint touches
+            # is mutated, so the job needs no rendering hold; the result is
+            # attached below, back on the GUI thread.
+            private = vtkPolyData()
+            private.ShallowCopy(data)
+            edges = await vtk_run_in_background(feature_edges, private)
         except Exception:                                   # noqa: BLE001
             logging.getLogger(__name__).exception(
                 'outline of %s not computed', self._id)

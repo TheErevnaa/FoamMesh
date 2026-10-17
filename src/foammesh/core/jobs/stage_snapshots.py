@@ -660,6 +660,25 @@ def capture(case_path, stage: str, *, engine_id: str = 'snappy',
 SUPERSEDED_KEPT = 1
 
 
+_PINS: dict[str, frozenset] = {}
+
+
+def set_pins(case_path, pairs) -> None:
+    """Keep these ``(revision, stage)`` snapshots while the history names them.
+
+    UXD7. Undo of a stage run goes back to the snapshot the run replaced, and
+    redo to the one it made; :func:`prune` must not remove either while the
+    undo history can still reach it. The facade replaces the whole set
+    whenever the history changes, so an entry that falls off it is released.
+    """
+    key = _case_key(case_path)
+    pairs = frozenset((str(revision), str(stage)) for revision, stage in pairs)
+    if pairs:
+        _PINS[key] = pairs
+    else:
+        _PINS.pop(key, None)
+
+
 def _referenced(case_path) -> set[tuple[str, str]]:
     """Every ``(revision, stage)`` something still reads.
 
@@ -669,6 +688,7 @@ def _referenced(case_path) -> set[tuple[str, str]]:
     """
     case = Path(case_path)
     keep = {(holder, stage) for stage, holder in resolve(case).items()}
+    keep.update(_PINS.get(_case_key(case), ()))
     for folder in _revision_dirs(case):
         keep.update((holder, stage) for stage, holder in
                     _revision_record(folder)['inherits'].items())
@@ -708,6 +728,7 @@ def prune(case_path) -> list[str]:
                 _remove(folder / stage)
                 if not (folder / stage).exists():
                     removed.append(f'{folder.name}/{stage}')
+                    (folder / f'{stage}.documents.json').unlink(missing_ok=True)
         for stage in own:
             newer_holds[stage] = newer_holds.get(stage, 0) + 1
     inherited_from = {holder for holder, _stage in keep}

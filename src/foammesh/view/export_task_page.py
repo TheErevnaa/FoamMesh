@@ -16,9 +16,14 @@ export path rather than two that can disagree about what "Export" means.
 """
 from __future__ import annotations
 
+import html
 import logging
+from pathlib import Path
 
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QWidget)
 
 from foammesh.app import app
 from foammesh.core.import_export.authored import (
@@ -50,6 +55,30 @@ NOTHING_EXPORTED = 'Nothing has been exported from this case yet.'
 DESTINATION_MISSING = 'Destination missing: nothing is at that path now.'
 
 
+#: UXA7 (#56). The longest path the sentence prints before its middle is
+#: elided; the whole path stays in the link's tooltip and the Details route.
+PATH_SHOWN = 64
+
+
+def elide_middle(text: str, limit: int = PATH_SHOWN) -> str:
+    """*text* cut in the middle to at most *limit* characters.
+
+    The start of a path says which disk and project, the end says which
+    file; the middle is the part nobody reads.
+    """
+    if len(text) <= limit:
+        return text
+    keep = max(limit - 1, 2)
+    head = keep // 2
+    return text[:head] + '…' + text[len(text) - (keep - head):]
+
+
+def folder_of(destination) -> Path:
+    """The folder to show for an export: the case folder, or the file's."""
+    path = Path(str(destination))
+    return path if path.is_dir() else path.parent
+
+
 class ExportTaskPage(EngineTaskPage):
     """Write the finished mesh out, in the format the target solver reads."""
 
@@ -72,6 +101,11 @@ class ExportTaskPage(EngineTaskPage):
         #: or ``''``. Held rather than written straight to the label, because
         #: `_refreshReadiness` owns that label and runs after every read.
         self._entriesFailure: str = ''
+        #: UXA7 (#56). The destination this page wrote and the form has not
+        #: been changed since: while it is set, the footer's primary opens the
+        #: folder instead of exporting again.
+        self._writtenTo: str = ''
+        self._section: bool = False
         super().__init__(facade_client, self.task_id_default, parent,
                          engine_id=engine_id or self.engine_id)
 
@@ -100,6 +134,41 @@ class ExportTaskPage(EngineTaskPage):
         layout.addWidget(self._quality)
 
         entries, recommended = self.exportEntries()
+        # Plan 40 UXB8 (#6). The target solver is chosen once, on Mesh setup.
+        # Export reads it back and offers the way there; the format below
+        # starts on what that target reads.
+        self._targetRow = QWidget(self)
+        self._targetRow.setObjectName('exportTargetRow')
+        targetLayout = QHBoxLayout(self._targetRow)
+        targetLayout.setContentsMargins(0, 0, 0, 0)
+        caption = QLabel(self.tr('Target solver'), self._targetRow)
+        targetLayout.addWidget(caption)
+        self._target = QLabel('', self._targetRow)
+        self._target.setObjectName('exportTarget')
+        # Plan 44 F4. "Not chosen: Mesh setup sets it" on one line pushed the
+        # row to 274 px in the 241 px a 1280 px window's sheet gives it; the
+        # words wrap beside the caption instead.
+        self._target.setWordWrap(True)
+        self._target.setAccessibleName(self.tr('Target solver'))
+        self._target.setAccessibleDescription(self.tr(
+            'The solver this mesh is for, as chosen on Mesh setup.'))
+        caption.setBuddy(self._target)
+        targetLayout.addWidget(self._target, 1)
+        self._changeTarget = QPushButton(self.tr('Change target'),
+                                         self._targetRow)
+        self._changeTarget.setObjectName('exportChangeTarget')
+        self._changeTarget.setFlat(True)
+        # Plan 44 F4 (MF20). Going to Mesh setup is a secondary action: a
+        # text link the width of its words, not a 111 px button, so the row
+        # fits the 257 px a 1280 px window's sheet gives it.
+        from foammesh.view.widgets.link_button import as_link
+        as_link(self._changeTarget)
+        self._changeTarget.setToolTip(self.tr(
+            'The target solver is set on Mesh setup. Go there to change it.'))
+        self._changeTarget.clicked.connect(self.changeTarget)
+        targetLayout.addWidget(self._changeTarget)
+        layout.addWidget(self._targetRow)
+        self._showTarget()
         self._form = ExportForm(self, entries, recommended)
         # W-O1. The derived "Will be created in ..." line restates the two
         # destination fields above it and stood on the form before the reader
@@ -110,6 +179,12 @@ class ExportTaskPage(EngineTaskPage):
         # Destination row of this step's Details view.
         self._form.setDestinationShown(False)
         layout.addWidget(self._form)
+        self._form.pathChanged.connect(self._formWasEdited)
+        self._form.formatChanged.connect(self._formWasEdited)
+        self._form.findChild(QComboBox, 'exportDimensionality'
+                             ).currentIndexChanged.connect(self._formWasEdited)
+        self._form.findChild(QCheckBox, 'exportOverwrite'
+                             ).toggled.connect(self._formWasEdited)
         # EXPORT-04. The footer's press arrives at the legacy page, which is
         # what the step manager holds; this is how it finds the form the
         # reader is actually looking at.
@@ -120,6 +195,10 @@ class ExportTaskPage(EngineTaskPage):
         self._record = QLabel('', self)
         self._record.setObjectName('exportRecord')
         self._record.setWordWrap(True)
+        # UXA7 (#56). The path is a link to the folder it names.
+        self._record.setTextFormat(Qt.RichText)
+        self._record.setOpenExternalLinks(False)
+        self._record.linkActivated.connect(lambda _href: self.openFolder())
         self._record.setAccessibleName(self.tr(
             'What the last export of this case wrote'))
         layout.addWidget(self._record)
@@ -210,11 +289,38 @@ class ExportTaskPage(EngineTaskPage):
         form = getattr(self, '_form', None)
         return form.forms() if form is not None else ()
 
+    def targetText(self) -> str:
+        """The target solver as Mesh setup chose it, in words."""
+        return getattr(self, '_targetName', '') or self.tr(
+            'Not chosen: Mesh setup sets it')
+
+    def _showTarget(self) -> None:
+        label = getattr(self, '_target', None)
+        if label is not None:
+            label.setText(self.targetText())
+
+    def changeTarget(self) -> bool:
+        """Stand on Mesh setup, the one place the target is set (UXB8)."""
+        from foammesh.view.main_window.meshing_method_branch import (
+            METHOD_TOKEN)
+        window = getattr(app, 'window', None)
+        manager = getattr(window, '_stepManager', None)
+        navigation = getattr(manager, '_navigation', None)
+        request = getattr(navigation, 'requestBranch', None)
+        if request is None:
+            return False
+        request(METHOD_TOKEN)
+        return True
+
     def refresh(self) -> None:
         super().refresh()
         form = getattr(self, '_form', None)
         if form is not None:
             entries, recommended = self.exportEntries()
+            self._showTarget()
+            section = getattr(form, 'setSection', None)
+            if section is not None:
+                section(getattr(self, '_section', False))
             form.setEntries(entries, recommended)
         self._refreshReadiness()
 
@@ -247,6 +353,10 @@ class ExportTaskPage(EngineTaskPage):
             self._entriesFailure = str(error)
             return (), 'openfoam'
         self._entriesFailure = ''
+        self._section = bool(payload.get('meshes_a_section'))
+        solver = str(payload.get('target_solver') or 'unselected')
+        self._targetName = (str(payload.get('target_solver_name') or '')
+                            if solver != 'unselected' else '')
         entries = tuple(entry for entry in payload.get('entries', ())
                         if entry.get('entry_id') in MESH_FORMATS)
         return entries, str(payload.get('recommended_entry_id') or 'openfoam')
@@ -269,7 +379,7 @@ class ExportTaskPage(EngineTaskPage):
             # indistinguishable from a broken control.
             self._say(refusal)
             return False
-        parameters = {'destination': str(form.projectPath())}
+        parameters = form.operationParameters()
         replacing = await self._confirmOverwrite(form)
         if replacing is None:
             return False
@@ -286,7 +396,53 @@ class ExportTaskPage(EngineTaskPage):
             # says what was written, and the form offers a free name.
             form.destinationWasWritten()
             self.refresh()
+            # D10: an in-place entry names no destination to open.
+            self._writtenTo = str(parameters.get('destination', ''))
+            self._syncFooter()
         return written
+
+    # -- after an export (UXA7, #56) ---------------------------------------- #
+
+    def openFolderMode(self) -> bool:
+        """Whether the footer's press opens the folder rather than exports.
+
+        True from a successful export until the reader changes anything the
+        form asks, and only while what was written is still there.
+        """
+        written = getattr(self, '_writtenTo', '')
+        return bool(written) and Path(written).exists()
+
+    def proceedOverride(self):
+        """The footer's label and tooltip after an export, or ``None``."""
+        if not self.openFolderMode():
+            return None
+        return (self.tr('Open folder'),
+                self.tr('Open the folder the mesh was exported to. Change '
+                        'the format or the name to export again.'))
+
+    def openFolder(self) -> bool:
+        """Show the exported mesh's folder in the file manager."""
+        target = getattr(self, '_writtenTo', '') or (self._record_now or {}).get(
+            'destination') or ''
+        if not target:
+            return False
+        return bool(QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(folder_of(target)))))
+
+    def _formWasEdited(self, *_args) -> None:
+        if getattr(self, '_writtenTo', ''):
+            self._writtenTo = ''
+            self._syncFooter()
+
+    def _syncFooter(self) -> None:
+        window = getattr(app, 'window', None)
+        manager = getattr(window, '_stepManager', None)
+        update = getattr(manager, '_updateWizardActions', None)
+        if update is not None:
+            try:
+                update()
+            except Exception:                                # noqa: BLE001
+                logger.debug('footer not refreshed', exc_info=True)
 
     async def _confirmOverwrite(self, form):
         """``True`` to replace the destination, ``False`` for nothing to
@@ -395,7 +551,12 @@ class ExportTaskPage(EngineTaskPage):
             label.setVisible(False)
             self._showMissing(False)
             return
-        label.setText(self.tr('Exported to {0}.').format(destination))
+        shown = html.escape(elide_middle(str(destination)))
+        label.setText(self.tr('Exported to {0}.').format(
+            '<a href="#open-folder">%s</a>' % shown))
+        tip = getattr(label, 'setToolTip', None)
+        if tip is not None:
+            tip(str(destination))
         label.setVisible(True)
         self._showMissing(export_destination_missing(self._record_now))
 
@@ -468,10 +629,34 @@ class ExportTaskPage(EngineTaskPage):
         self._say('' if exportable else nothing + reason,
                   self.tr(FORMATS_UNREADABLE)
                   if getattr(self, '_entriesFailure', '') else '')
-        warnings = [line for line in (self.failedCheckLine(),
+        warnings = [line for line in (self.thinRegionLine(),
+                                      self.failedCheckLine(),
                                       self.layerShortfallLine()) if line]
         self._showFailedChecks('\n'.join(warnings) if exportable else '')
         self._refreshRecord()
+
+    def _reportVerdict(self) -> dict:
+        try:
+            payload = query(self._client, 'quality.report').payload or {}
+        except Exception:                                    # noqa: BLE001
+            return {}
+        data = payload.get('report')
+        if not data:
+            return {}
+        from foammesh.core.quality import QualityReport, verdict_from_report
+        try:
+            return verdict_from_report(QualityReport.from_dict(data))
+        except Exception:                                    # noqa: BLE001
+            logger.debug('unreadable quality report', exc_info=True)
+            return {}
+
+    def thinRegionLine(self) -> str:
+        """DP-2635. The regions the mesh did not resolve, or ''."""
+        verdict = self._reportVerdict()
+        line = '' if verdict.get('stale') else str(
+            verdict.get('thinLine') or '')
+        return (str(self.tr('{0}. See the Quality step.')).format(line)
+                if line else '')
 
     def failedCheckLine(self) -> str:
         """DP-542. checkMesh's failed-check tally for the loaded mesh, or ''.
@@ -535,6 +720,147 @@ class SnappyExportPage(ExportTaskPage):
     mesh_task_id = 'snappy.base_grid'
 
 
+class _RunMeshHost:
+    """SG15A. What the writer panel asks the page for to load the run's mesh."""
+
+    def __init__(self, page):
+        self._page = page
+
+    def case_path(self):
+        try:
+            return self._page._client.case_path
+        except Exception:                                    # noqa: BLE001
+            return None
+
+    def controller(self):
+        """The session controller; made when none exists yet (the guided
+        Generate runs through the facade, not the session)."""
+        found = self._page.sessionController()
+        if found is not None:
+            return found
+        from foammesh.view.gmsh_workflow.compute_page import (
+            sharedGenerateController)
+        return sharedGenerateController(self._page._client)
+
+
 class GmshExportPage(ExportTaskPage):
     engine_id = 'gmsh'
     mesh_task_id = 'gmsh.compute'
+
+    def build_sections(self, layout) -> None:
+        """Plan 41 GN15. The form above, then every Gmsh writer under it.
+
+        The form writes what the accepted run produced, through the facade.
+        The panel writes what the resident session holds, in any format Gmsh
+        writes, with that format's options, and refuses with the reason a
+        format that cannot carry the mesh (GN15, section 4.4).
+        """
+        super().build_sections(layout)
+        from PySide6.QtWidgets import QLabel
+
+        from foammesh.view.export.gmsh_writer_panel import GmshWriterPanel
+
+        heading = QLabel(self.tr('Gmsh formats'), self)
+        heading.setObjectName('gmshWriterHeading')
+        # Plan 44 GFIT (DP-2668, user decision 2026-10-16). The extra Gmsh
+        # writers are a secondary section -- the form above exports the
+        # accepted run, so the defaults let the user proceed -- and stand
+        # behind a fold that opens closed; its header names the format now
+        # chosen. The heading label stays (hidden) for what finds it.
+        heading.setVisible(False)
+        layout.addWidget(heading)
+        self._writerPanel = GmshWriterPanel(
+            self.sessionController, self, default_folder=self._exportFolder,
+            run_mesh=_RunMeshHost(self))
+        from foammesh.view.gmsh_workflow.folds import add_fold, clip_header
+
+        self._writerFold = add_fold(
+            self, layout, name='Writers', title=self.tr('Gmsh formats'),
+            description=self.tr(
+                'Write the model open in the Gmsh session, or the accepted '
+                'run, in any format Gmsh writes, with that format options.'),
+            panel=self._writerPanel)
+        clip_header(self._writerFold)
+        self._writerFold.toggled.connect(self._writerFoldToggled)
+        self._writerPanel._format.currentIndexChanged.connect(
+            self._writerFoldSummary)
+        self._writerFoldSummary()
+        self._writerPanel.setRunAvailable(self.canExport())
+        # DP-154: the writer's rows are rebuilt with each format; their
+        # labels go back into the page's one column each time.
+        self._writerPanel.formsChanged.connect(self._align_field_columns)
+
+        # Plan 41 GN19: the script of the model (Python / .geo), Run script
+        # and the ONELAB parameters of an opened .geo; a closed tier.
+        from PySide6.QtWidgets import QPushButton
+
+        from foammesh.view.gmsh_workflow.script_panel import GmshScriptPanel
+
+        self._scriptHeader = QPushButton(self.tr('Script of the model'), self)
+        self._scriptHeader.setObjectName('gmshScriptHeader')
+        self._scriptHeader.setCheckable(True)
+        self._scriptHeader.setFlat(True)
+        self._scriptHeader.setAccessibleDescription(self.tr(
+            'The Python and .geo script that rebuilds the model in bare '
+            'Gmsh; edit and reload a .geo; run a script on the model; '
+            'the parameters of an opened .geo.'))
+        self._scriptPanel = GmshScriptPanel(self.sessionController, self)
+        self._scriptPanel.setVisible(False)
+        self._scriptHeader.toggled.connect(self._scriptPanel.setVisible)
+        layout.addWidget(self._scriptHeader)
+        layout.addWidget(self._scriptPanel)
+
+    def _writerFoldSummary(self, *_args) -> None:
+        fold = getattr(self, '_writerFold', None)
+        panel = getattr(self, '_writerPanel', None)
+        if fold is None or panel is None:
+            return
+        title = str(fold.property('foammeshFoldTitle') or '')
+        said = panel._format.currentText()
+        fold.setText(f'{title}: {said}' if said else title)
+
+    def _writerFoldToggled(self, opened: bool) -> None:
+        # `refresh` skips a hidden panel, so opening the fold brings it up to
+        # date at once.
+        panel = getattr(self, '_writerPanel', None)
+        if opened and panel is not None:
+            panel.setRunAvailable(self.canExport())
+            panel.refresh()
+            panel.loadRunMesh()
+
+    def aligned_forms(self):
+        """The writer panel's forms join the export form's column (DP-154)."""
+        panel = getattr(self, '_writerPanel', None)
+        own = tuple(super().aligned_forms())
+        return own + (panel.forms() if panel is not None else ())
+
+    def _exportFolder(self):
+        try:
+            return str(Path(self._client.case_path) / 'exports')
+        except Exception:                                    # noqa: BLE001
+            return ''
+
+    def sessionController(self):
+        """The Generate page's session controller, once a stage has run."""
+        from foammesh.view.gmsh_workflow.compute_page import GmshComputePage
+
+        window = getattr(app, 'window', None)
+        if window is None:
+            return None
+        for page in window.findChildren(GmshComputePage):
+            controller = getattr(page, '_generateController', None)
+            if controller is not None:
+                return controller
+        # SG15A: the controller the Export page made to load the run's mesh.
+        from foammesh.view.gmsh_workflow.compute_page import (
+            residentGenerateController)
+        return residentGenerateController(self._client)
+
+    def refresh(self) -> None:
+        super().refresh()
+        panel = getattr(self, '_writerPanel', None)
+        if panel is not None:
+            panel.setRunAvailable(self.canExport())
+            if panel.isVisible():
+                panel.refresh()
+                panel.loadRunMesh()

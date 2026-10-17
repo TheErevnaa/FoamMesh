@@ -708,7 +708,11 @@ class SnapFidelityPage(QualificationTaskPage):
 
     task_id_default = 'snappy.fidelity_snap'
     blocking = True
-    evidence_title = 'Snapped boundary against the reference'
+    # FIX-H (DP-573's rule). A group box title cannot wrap: in Pretendard
+    # Bold, as the themed app draws it, "Snapped boundary against the
+    # reference" asked 311 px and the page 327 inside the 326 px compact
+    # scroller, cut on its right.
+    evidence_title = 'Snapped boundary vs reference'
 
 
 class NativeFidelityPage(QualificationTaskPage):

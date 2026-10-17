@@ -1142,6 +1142,30 @@ def build_job(intent: JobIntent, *, geometry, outputs: dict,
     }
 
 
+def _size_preset(db):
+    """Plan 40 UXA1: the Mesh size choice, or None when it cannot be read."""
+    try:
+        return db.getValue('mesh/sizePreset')
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _with_automatic_field(intent, db, case_path, profile):
+    from dataclasses import replace
+
+    from foammesh.core.sizing import background
+
+    if not background.is_on(db):
+        return intent
+    try:
+        block = background.block(
+            case_path, True, background.state_for(db, case_path),
+            profile.translate_host_path if profile is not None else None)
+    except background.AutomaticFieldRefusal as error:
+        raise ExecutionError(str(error)) from None
+    return replace(intent, automatic_field=block)
+
+
 def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
               run_id: str = '', formats=('msh',)) -> dict:
     """Derive and persist one run's job. Returns the created run manifest."""
@@ -1157,11 +1181,16 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     intent = derive_from_native(
         _native_section(db), bbox=bbox,
         target_solver=configured_target_solver(db),
+        size_preset=_size_preset(db),
         # Plan 33 W-G1. Per-surface size rows name a prepared boundary; which
         # Gmsh tag that is belongs to the revision being written, not to the
         # saved row.
         prepared_geometry=prepared_geometry,
         metadata={'engine_id': 'gmsh', 'run_id': run_id})
+    # Plan 41 GN25f. The automatic size field as the background field: a
+    # field that is switched on and cannot be used refuses here, with the
+    # reason, rather than meshing without it.
+    intent = _with_automatic_field(intent, db, case_path, profile)
     # DP-52/DP-53. The runner refuses this, and it refuses it after WSL has
     # booted and the geometry has been imported -- MEASURED at 71 s on
     # `annulus_shell`, and graded against the geometry rather than against
@@ -1180,6 +1209,32 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     refusal = layer_selection_refusal(
         prepared_geometry, intent.layers.enabled, intent.layers.patches,
         intent.layers.patch_mode)
+    if refusal:
+        raise ExecutionError(refusal)
+    # Plan 42 SG22 Q2. A pair was authored before the engine was chosen with
+    # an intent; if Gmsh cannot honour it, the run is refused here with the
+    # reason rather than meshed as the other coupling.
+    from foammesh.core.engine.interface_intent import intent_refusal
+
+    pairs = interface_pair_rows(db)
+    refusal = intent_refusal('gmsh', configured_target_solver(db), pairs)
+    if not refusal and any(str(pair.get('coupling')) == 'non_conformal'
+                           for pair in pairs):
+        # The two bodies of a pair are kept apart by not fusing the copies of
+        # their shared CAD face. A surface mesh has no such copies to keep
+        # apart (its coincident triangles are one merged triangulation), so
+        # the intent cannot be honoured and is refused rather than dropped.
+        tessellated = [Path(str(item)).name for item in geometry
+                       if Path(str(item)).suffix.lower()
+                       in ('.stl', '.obj', '.ply')]
+        if tessellated:
+            refusal = (
+                'a non-conformal interface pair is met on the Gmsh route by '
+                'meshing its two solids apart, and ' + ', '.join(tessellated)
+                + ' ' + ('is a surface mesh' if len(tessellated) == 1
+                         else 'are surface meshes') + ', which has no solids '
+                'to keep apart. Make the pair conformal, or import the solid '
+                'model.')
     if refusal:
         raise ExecutionError(refusal)
     if intent.export.mesh_format == 'su2' and 'su2' not in formats:

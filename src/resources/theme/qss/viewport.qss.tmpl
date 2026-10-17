@@ -1,0 +1,133 @@
+/* Indicator-as-icon controls opt out of the box-and-tick indicator above. */
+QCheckBox#rendering::indicator {
+    width: 32px; height: 32px;
+    border: none; background: transparent; border-radius: 0;
+}
+QCheckBox#rendering::indicator:unchecked { image: url(:/images/toggle_off); padding: 0; }
+QCheckBox#rendering::indicator:checked { image: url(:/images/toggle_on); padding: 0; }
+/* DP-230. The '?' beside a step's heading, and the panel it opens. The
+   button takes the QToolButton rule above for its height, its hover, its
+   checked fill and its focus ring -- it is a tool button and should look
+   like the others -- and asks only for even padding, because a one-character
+   label under the shared 4px/6px inset sits off-centre in its own box. */
+QToolButton#taskHelp { padding: 4px 7px; }
+QFrame#taskHelpPopup {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+}
+QFrame#taskHelpPopup QLabel {
+    background: transparent;
+    color: {{foreground.primary}};
+}
+/* The prerequisite line is the quieter of the two sentences: it says what
+   has to be true, not what the step is for. */
+QFrame#taskHelpPopup QLabel#taskHelpRequires { color: {{foreground.secondary}}; }
+
+FolderHeader { spacing: 5px; }
+/* DP-150. The chevron is now painted as the button own icon, through
+   `load_themed_icon`, so that it follows the palette instead of arriving as
+   raw `stroke:#000` straight out of the resource file.  On this canvas that
+   was black ink on `#1e1f22` and no chevron was visible at all.  The
+   indicator is retired rather than restyled: left with a box of its own it
+   drew an empty 14px square, and `QCheckBox::indicator:checked` above filled
+   that square with `accent.default`, so opening a section turned its chevron
+   slot into a blue chip. */
+FolderHeader::indicator {
+    width: 0; height: 0; margin: 0; border: none;
+    background: transparent; border-radius: 0; image: none;
+}
+
+/* Body text, like FoamFlow's outline. It used to be 12pt DemiBold -- declared
+ * both here and in navigation code -- which made the one tree a user reads
+ * most look like it belonged to a different application. */
+QTreeView#workflowStepTree {
+    background: transparent;
+    border: none;
+    font-weight: 500;
+    outline: none;
+}
+QTreeView#workflowStepTree::item {
+    padding: 4px 6px;
+    border-radius: 6px;
+    margin: 1px 4px;
+    /* 18 + 8 padding + 2 margin = 28. */
+    min-height: 18px;
+}
+QTreeView#workflowStepTree::item:selected {
+    background: {{selection.background}};
+    border-left: 3px solid {{accent.default}};
+}
+QTreeView#workflowStepTree::item:hover:!selected {
+    background: {{background.elevated}};
+}
+QTreeView#workflowStepTree::item:disabled {
+    color: {{disabled.foreground}};
+}
+/* The native Windows 11 style washes the indentation strip of the current
+   row with a subtle light fill.  That fill is square, full-height and sits
+   outside the rounded pill the ::item rule draws, so it reads as a second
+   grey chip parked beside the selected row.  With no renderable ::branch
+   rule the stylesheet defers PE_IndicatorBranch to the base style, which is
+   how the fill got in.  Giving the selected state a real background takes
+   the cell back -- but only for the cells that carry no expand mark, since
+   a background makes the stylesheet own the whole cell and the mark would
+   go with the wash.  `transparent` is not a renderable background and
+   changes nothing. */
+QTreeView#workflowStepTree::branch:selected:!has-children {
+    background: {{background.canvas}};
+}
+QGroupBox#groupBox_9 {
+    background: {{background.surface}};
+    border: none;
+}
+/* DP-1208. The base grid's faces are framed cards inside "Background faces",
+   so under this stylesheet they sat inside two 1 px borders where every other
+   form on the page sits inside one: MEASURED, their editors at x=123 against
+   the page's 122. The cards carry frames of their own and the title says
+   where the section starts, so the outer box keeps its title and no frame. */
+QGroupBox#baseGridFacesBox {
+    border: none;
+}
+/* One place decides how a page heading is set, so that every heading
+ * on every page is set the same way and no page has to pin a size of
+ * its own.  A label named as a page heading belongs in this list. */
+QLabel#emptyCaseTitle,
+QLabel#engineBranchHeading,
+QLabel#engineTaskTitle,
+QLabel#externalMeshTitle,
+QLabel#fieldGroupHeading,
+QLabel#gmshEntityControlsTitle,
+QLabel#gmshQualityLimitsTitle,
+QLabel#gmshScriptConsoleHeading,
+QLabel#gmshStructureGridTitle,
+QLabel#gmshWriterHeading,
+QLabel#meshingMethodTitle,
+QLabel#nativeFieldsTitle,
+QLabel#overlayGmshEntitiesHeading,
+QLabel#pointSizesTitle,
+QLabel#popoverTitle,
+QLabel#preparationTitle,
+QLabel#viewportPlaceholderTitle {
+    font-size: 12pt;
+    font-weight: 600;
+}
+
+/* The parts/section overlay floats over the viewport, so it needs a surface
+ * of its own rather than inheriting the transparent render window. */
+QFrame#viewportOverlay {
+    background: {{background.surface}};
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+}
+QLabel#overlayChip { color: {{foreground.muted}}; }
+/* Plan 44 F1 (MF21, mockup .prow small): a part row's role text. */
+QLabel#overlayPartRole { color: {{foreground.muted}}; padding-left: 2px; }
+QLabel#overlayChip[partial="true"] { color: {{status.warning}}; font-weight: 600; }
+QLabel#viewportScale { color: {{foreground.muted}}; padding: 0 8px; }
+QLabel#captureStale { color: {{status.warning}}; }
+
+QLabel[foammeshColourHeading="true"] { font-weight: 600; padding: 6px 8px 2px 8px; }
+QLabel[foammeshColourNote="true"] { padding: 4px 8px; }
+QToolButton[foammeshColourRow="true"] { text-align: left; padding: 3px 8px; }

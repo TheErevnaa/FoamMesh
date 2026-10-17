@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from foammesh.core.section.pieces import CellRule, Combine, region_value
 from foammesh.core.section.section_geometry import (
     ABOVE, BELOW, MEETS, ON_OR_ABOVE, HalfSpace, Loops, Polygons,
     SectionGeometry, _ranges, clip_polygon, lookup, polygon_area_vectors)
@@ -411,10 +412,20 @@ def _masked_contacts(geometry, active, masks, tol, candidates) -> np.ndarray:
 
 
 def cut_cells_section(geometry: SectionGeometry, active: HalfSpace, masks,
-                      tol: float, limits: dict) -> ModeResult:
-    """Every cell whose closed volume meets the active plane (masked), whole."""
+                      tol: float, limits: dict,
+                      rule=CellRule.ANY) -> ModeResult:
+    """Every cell whose closed volume meets the active plane (masked), whole.
+
+    *rule* (VI10b, F2g) is how the other planes' masks keep a cell the active
+    plane meets: any part of it on their kept sides (the default), its
+    centre, or all of it.
+    """
+    rule = CellRule(rule)
     _value, codes = geometry.plane(active, tol)
     selected = geometry.cells_of_faces(meeting_faces(codes))
+    if masks and rule is not CellRule.ANY and selected.any():
+        return _whole(geometry, selected & _mask_rule(
+            geometry, masks, tol, rule), limits, {'cell_rule': rule.value})
     if not masks:
         # the masks only remove cells: unmasked, this is the selection
         _preflight('selected_cells', int(selected.sum()), limits,
@@ -435,6 +446,19 @@ def cut_cells_section(geometry: SectionGeometry, active: HalfSpace, masks,
                                                ambiguous)
     return _whole(geometry, selected, limits,
                   {'exact_checked_cells': exact_checked})
+
+
+def _mask_rule(geometry, masks, tol: float, rule) -> np.ndarray:
+    """The cells every mask keeps by *rule* (centroid or entirely)."""
+    if rule is CellRule.CENTROID:
+        centres, _volume = geometry.cell_centres_volumes()
+        inside = np.ones(geometry.n_cells, dtype=bool)
+        for mask in masks:
+            inside &= mask.kept(centres) > tol
+        return inside
+    value = np.min([mask.kept(geometry.points) for mask in masks], axis=0)
+    cmin, _cmax = geometry.cell_range(value)
+    return cmin >= -tol
 
 
 def _whole(geometry, selected, limits, counts) -> ModeResult:
@@ -464,11 +488,19 @@ def frozen_cells_section(geometry: SectionGeometry, selected, limits: dict
 
 
 def whole_cells_section(geometry: SectionGeometry, spaces, tol: float,
-                        limits: dict) -> ModeResult:
+                        limits: dict, combine=Combine.COMMON,
+                        rule=CellRule.ANY) -> ModeResult:
     """Every cell with positive volume in the kept region, whole (stepped).
 
     A plane lying on a face therefore keeps the cell on its kept side only.
+    *combine* and *rule* (VI10b, F2f, F2g) say what the region is when
+    several planes keep it and which cells of its boundary survive.
     """
+    combine, rule = Combine(combine), CellRule(rule)
+    if combine is not Combine.COMMON or rule is not CellRule.ANY:
+        return _whole(geometry, _region_cells(geometry, spaces, tol, combine,
+                                              rule), limits,
+                      {'combine': combine.value, 'cell_rule': rule.value})
     selected = np.ones(geometry.n_cells, dtype=bool)
     touching = np.zeros(geometry.n_cells, dtype=bool)
     score = None
@@ -512,57 +544,125 @@ def whole_cells_section(geometry: SectionGeometry, spaces, tol: float,
                   {'exact_checked_cells': exact_checked})
 
 
+def flipped(space: HalfSpace) -> HalfSpace:
+    """The same plane keeping the other side."""
+    return HalfSpace(space.normal, space.offset, -space.keep)
+
+
+def _region_cells(geometry, spaces, tol, combine, rule) -> np.ndarray:
+    """The cells the planes keep for *combine* by *rule*, other than the
+    default pair (common part, any part)."""
+    if rule is CellRule.ANY:
+        # a union of half-spaces has volume in a cell iff one of them has
+        sides = [flipped(s) for s in spaces]             if combine is Combine.REMOVE_COMMON else list(spaces)
+        selected = np.zeros(geometry.n_cells, dtype=bool)
+        for side in sides:
+            _kept, codes = geometry.plane(side, tol)
+            selected |= geometry.cells_of_faces(_has(codes, ABOVE))
+        return selected
+    if rule is CellRule.CENTROID:
+        centres, _volume = geometry.cell_centres_volumes()
+        kept = np.array([s.kept(centres) for s in spaces])
+        return region_value(kept, combine) > tol
+    kept = np.array([s.kept(geometry.points) for s in spaces])
+    cmin, _cmax = geometry.cell_range(region_value(kept, combine))
+    return cmin >= -tol
+
+
 def clip_section(geometry: SectionGeometry, spaces, tol: float,
-                 limits: dict) -> ModeResult:
-    """The surface of the mesh inside every kept half-space (smooth).
+                 limits: dict, combine=Combine.COMMON) -> ModeResult:
+    """The surface of the mesh inside the region the planes keep (smooth).
 
     The kept part of the boundary, plus on each plane the section of the
     mesh masked by the other half-spaces, all facing out of the kept region.
     A boundary face lying on a plane is left to that plane's cap, which the
     kept cell behind it supplies.
+
+    *combine* (VI10b, F2f) says what the region is: ``COMMON``, the
+    intersection of the kept half-spaces; ``REMOVE_COMMON``, everything
+    outside it (the union of the removed sides, drawn as the disjoint
+    convex pieces ``H1^c``, ``H1 & H2^c``, ... with each plane's cap masked
+    by the other planes' *kept* sides, where the region ends); ``EACH``,
+    every plane clipping on its own, the results drawn together.
     """
+    combine = Combine(combine)
+    spaces = list(spaces)
+    if combine is Combine.EACH and len(spaces) > 1:
+        return _merged([clip_section(geometry, [space], tol, limits)
+                        for space in spaces])
+    if combine is Combine.REMOVE_COMMON:
+        pieces = [spaces[:i] + [flipped(space)]
+                  for i, space in enumerate(spaces)]
+        caps = [(flipped(space), spaces[:i] + spaces[i + 1:])
+                for i, space in enumerate(spaces)]
+    else:
+        pieces = [spaces]
+        caps = [(space, spaces[:i] + spaces[i + 1:])
+                for i, space in enumerate(spaces)]
+    return _clip(geometry, pieces, caps, tol, limits)
+
+
+def _merged(results) -> ModeResult:
+    """The pictures of several results drawn together."""
+    polygons = Polygons.concatenate([r.polygons for r in results])
+    approximate = {}
+    for result in results:
+        for reason, count in result.approximate.items():
+            approximate[reason] = approximate.get(reason, 0) + count
+    return ModeResult(polygons, np.unique(polygons.cells), approximate,
+                      sum(r.triangulated for r in results), {})
+
+
+def _clip(geometry, pieces, caps, tol: float, limits: dict) -> ModeResult:
+    """Boundary of each convex *piece* (a list of half-spaces), plus the
+    *caps* ``(space, masks)``: the plane of ``space`` cut through the mesh,
+    masked by ``masks``, facing out of ``space``'s kept side."""
     area_tol = tol * tol
     assembly = Assembly()
     boundary = np.arange(geometry.n_internal, geometry.n_faces)
-    status = np.ones(boundary.size, dtype=np.int8)       # 1 in, 0 out, 2 cut
-    planes = [geometry.plane(space, tol) for space in spaces]
-    kept_values = [value for value, _codes in planes]
-    for _value, codes in planes:
-        face = codes[geometry.n_internal:]
-        on_plane = lookup(_LOOKUP['flat'], face)
-        out = ~_has(face, ON_OR_ABOVE) | on_plane
-        cut = _has(face, BELOW)
-        status = np.where(out, 0, np.where(cut & (status != 0), 2, status))
-    kept_faces = boundary[status != 0]
-    estimate = int(kept_faces.size)
-    corners = int(geometry.sizes[kept_faces].sum())
-    for value, codes in planes:
+    staged = []
+    estimate = corners = 0
+    for spaces in pieces:
+        status = np.ones(boundary.size, dtype=np.int8)   # 1 in, 0 out, 2 cut
+        planes = [geometry.plane(space, tol) for space in spaces]
+        for _value, codes in planes:
+            face = codes[geometry.n_internal:]
+            on_plane = lookup(_LOOKUP['flat'], face)
+            out = ~_has(face, ON_OR_ABOVE) | on_plane
+            cut = _has(face, BELOW)
+            status = np.where(out, 0, np.where(cut & (status != 0), 2, status))
+        kept_faces = boundary[status != 0]
+        estimate += int(kept_faces.size)
+        corners += int(geometry.sizes[kept_faces].sum())
+        staged.append((spaces, status))
+    for space, _masks in caps:
+        value, codes = geometry.plane(space, tol)
         estimate += int(contact_cells(geometry, value, tol, codes).sum())
         corners += segment_count(geometry, codes, -1)
     early_caps(limits, polygons=estimate, points=corners,
                connectivity=corners)
-    whole = boundary[status == 1]
-    if whole.size:
-        sizes = geometry.sizes[whole]
-        slots = _ranges(geometry.face_offsets[whole], sizes)
-        vertices = geometry.face_vertices[slots]
-        used, inverse = np.unique(vertices, return_inverse=True)
-        assembly.parts.append(Polygons(
-            geometry.points[used],
-            np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64),
-            inverse.astype(np.int64), geometry.owner[whole]))
-    for f in boundary[status == 2]:
-        piece = clip_polygon(geometry.face_points(int(f)), spaces, tol)
-        if len(piece) >= 3 and np.linalg.norm(_area(piece)) > area_tol:
-            assembly.add(piece, geometry.owner[f])
-    for i, space in enumerate(spaces):
-        others = [s for j, s in enumerate(spaces) if j != i]
-        loops = geometry.loops(space, tol, bias=-1, value=kept_values[i],
-                               codes=planes[i][1])
+    for spaces, status in staged:
+        whole = boundary[status == 1]
+        if whole.size:
+            sizes = geometry.sizes[whole]
+            slots = _ranges(geometry.face_offsets[whole], sizes)
+            vertices = geometry.face_vertices[slots]
+            used, inverse = np.unique(vertices, return_inverse=True)
+            assembly.parts.append(Polygons(
+                geometry.points[used],
+                np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64),
+                inverse.astype(np.int64), geometry.owner[whole]))
+        for f in boundary[status == 2]:
+            piece = clip_polygon(geometry.face_points(int(f)), spaces, tol)
+            if len(piece) >= 3 and np.linalg.norm(_area(piece)) > area_tol:
+                assembly.add(piece, geometry.owner[f])
+    for space, masks in caps:
+        value, codes = geometry.plane(space, tol)
+        loops = geometry.loops(space, tol, bias=-1, value=value, codes=codes)
         if loops.broken_cells.size:
             assembly.note('open_section_loops', int(loops.broken_cells.size))
         # a cap faces out of the kept region: its loops' own sense already
-        emit_loops(assembly, loops, -space.inward, others, tol, area_tol,
+        emit_loops(assembly, loops, -space.inward, masks, tol, area_tol,
                    reverse=False)
     polygons = assembly.result()
     return ModeResult(polygons, np.unique(polygons.cells),

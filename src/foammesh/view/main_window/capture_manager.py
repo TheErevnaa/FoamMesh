@@ -17,9 +17,12 @@ from PySide6.QtCore import QObject, Signal
 
 from foammesh.app import app
 from foammesh.view.facade_client import NoOpenCaseError
+from foammesh.core import snapshot as snapshot_core
+from foammesh.view.widget_factory import compose
 from foammesh.core.capture import (
-    CaptureRecord, capture_paths, ensure_captures_dir, list_captures,
-    new_stamp, write_record)
+    CaptureRecord, capture_paths, captures_dir, ensure_captures_dir,
+    list_captures,
+    new_stamp, sidecar_for, write_record)
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 class CaptureManager(QObject):
     captured = Signal(str)
+    #: What the last ``snapshot`` said: the line for the status bar, or why it
+    #: wrote nothing.
+    snapshotMessage = ''
 
     def __init__(self, view, displayControl):
         super().__init__()
@@ -68,6 +74,94 @@ class CaptureManager(QObject):
         write_record(sidecar, self.buildRecord(image.name, label))
         self.captured.emit(str(image))
         return image
+
+    def suggestedName(self, fmt: str = 'PNG', directory=None) -> str:
+        """The next numbered name, for the popover's File name placeholder."""
+        root = self.caseRoot()
+        folder = Path(directory) if directory else (
+            captures_dir(root) if root is not None else Path('.'))
+        return snapshot_core.numbered_name(
+            folder, snapshot_core.suggest_stem(self._caseName(), self._scalar()),
+            fmt)
+
+    def snapshot(self, options) -> Path | None:
+        """Write the picture the snapshot popover describes, and its sidecar.
+
+        One writer for the three things that used to be separate: the numbered
+        capture in the case, the saved view and the saved image.  *options* is
+        a :class:`foammesh.core.snapshot.SnapshotOptions`.  Returns the file
+        written, or None when there was nowhere to write it or the view cannot
+        draw (safe mode, a render hold); ``snapshotMessage`` says what happened.
+        """
+        opts = options.normalised()
+        self.snapshotMessage = ''
+        if opts.directory:
+            directory, where = Path(opts.directory), Path(opts.directory).name
+        else:
+            root = self.caseRoot()
+            if root is None:
+                self.snapshotMessage = self.tr(
+                    'Open a case before taking a snapshot, or choose a folder.')
+                return None
+            directory = ensure_captures_dir(root)
+            where = self.tr('case › captures')
+        suffix = snapshot_core.SUFFIX[opts.format]
+        stem = Path(opts.name).stem if opts.name else ''
+        if stem:
+            path = snapshot_core.unique_path(directory, stem + suffix)
+        else:
+            path = directory / snapshot_core.numbered_name(
+                directory, snapshot_core.suggest_stem(
+                    self._caseName(), self._scalar()), opts.format)
+        view = self._view
+        wanted = (opts.font, opts.text_size)
+        style = view.labelStyle()
+        if (style.font, style.size) != wanted:
+            view.setLabelStyle(font=opts.font, size=opts.text_size)
+        includes = dict(opts.includes)
+        written = self._writeSnapshot(path, opts, includes)
+        if written is None:
+            self.snapshotMessage = self.tr(
+                'The viewport is not drawing, so there is nothing to save.')
+            return None
+        size = self._pixelSize(opts)
+        record = self.buildRecord(Path(written).name)
+        from dataclasses import replace
+
+        record = replace(record, **snapshot_core.sidecar_fields(opts, size))
+        write_record(sidecar_for(written), record)
+        self.snapshotMessage = snapshot_core.status_line(
+            written, opts, size, where)
+        self.captured.emit(str(written))
+        return Path(written)
+
+    def _writeSnapshot(self, path: Path, opts, includes):
+        from .view_capture import composeView
+
+        raster = snapshot_core.is_raster(opts.format)
+        if raster and (includes.get('transparent') or opts.overlay):
+            image = compose(
+                composeView, self._view, scale=opts.scale,
+                transparent=bool(includes.get('transparent')),
+                legends=bool(includes.get('legend', True)),
+                overlay=bool(opts.overlay), includes=includes)
+            if image is None:
+                return None
+            return path if image.save(str(path), opts.format) else None
+        return self._view.saveImage(path, opts.format, scale=opts.scale,
+                                    includes=includes)
+
+    def _pixelSize(self, opts) -> tuple:
+        try:
+            width, height = (int(v) for v in
+                             self._view.renderWindow().GetSize())
+        except Exception:                                     # noqa: BLE001
+            width, height = self._view.width(), self._view.height()
+        return snapshot_core.pixel_size(width, height, opts.scale)
+
+    def _caseName(self) -> str:
+        root = self.caseRoot()
+        return root.name if root is not None else ''
 
     def buildRecord(self, imageName: str, label: str = '') -> CaptureRecord:
         from datetime import datetime, timezone

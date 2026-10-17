@@ -75,7 +75,23 @@ def hexPolyData(point1, point2):
     return geometryFilter.GetOutput()
 
 
-def cylinderPolyData(point1, point2, radius):
+def _annulusPolyData(point1, point2, radius, innerRadius):
+    from foammesh.core.geometry.annulus import annulus_triangles
+
+    points, cells = vtkPoints(), vtkCellArray()
+    for triangle in annulus_triangles(point1, point2, radius, innerRadius):
+        ids = [points.InsertNextPoint(*vertex) for vertex in triangle]
+        cells.InsertNextCell(3, ids)
+    polyData = vtkPolyData()
+    polyData.SetPoints(points)
+    polyData.SetPolys(cells)
+    return polyData
+
+
+def cylinderPolyData(point1, point2, radius, innerRadius=0):
+    # LY13-D3 (A-088a): a positive inner radius makes a hollow pipe.
+    if float(innerRadius or 0) > 0:
+        return _annulusPolyData(point1, point2, float(radius), float(innerRadius))
     line = vtkLineSource()
     line.SetPoint1(*point1)
     line.SetPoint2(*point2)

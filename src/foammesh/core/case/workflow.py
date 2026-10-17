@@ -7,7 +7,8 @@ from foammesh.core.mesh.recovery import MeshRecoveryService
 
 from .model import (
     ArtifactState, MeshOrigin, WorkflowMode, classify_case,
-    fingerprint_poly_mesh, load_case_metadata, save_case_metadata,
+    fingerprint_poly_mesh, load_case_metadata, resolve_workflow,
+    save_case_metadata,
 )
 from .artifact_history import record_artifact_event
 
@@ -19,9 +20,33 @@ class WorkflowTransitionService:
     def start_authored(self, case_path: str | Path):
         case = Path(case_path)
         metadata = load_case_metadata(case)
+        classification = None
+        if metadata.workflow is WorkflowMode.NONE:
+            # A sidecar with no workflow mode beside a polyMesh is shown as
+            # an external mesh (``resolve_workflow``); record it as one so
+            # Start meshing workflow can leave it, as it offers to.
+            classification = classify_case(case)
+            if classification.poly_mesh_path is not None:
+                metadata = metadata.with_external_mesh(
+                    fingerprint_poly_mesh(classification.poly_mesh_path),
+                    origin=MeshOrigin.OPENED_NATIVE)
+        elif metadata.workflow is WorkflowMode.AUTHORED:
+            # DP-1439. An authored case whose polyMesh no longer matches the
+            # fingerprint it recorded (the kept quadcopter's does not) is shown as a STALE external
+            # mesh by ``resolve_workflow``, and that page offers Start meshing
+            # workflow. The stored mode is "authored", so the transition used
+            # to refuse with a status line that lasted 8 s and the page stayed
+            # external for good. Take the mesh on disk as the external mesh it
+            # is shown as, then leave it as the button says.
+            classification = classify_case(case)
+            if classification.poly_mesh_path is not None:
+                current = fingerprint_poly_mesh(classification.poly_mesh_path)
+                if resolve_workflow(metadata, current).workflow                         is WorkflowMode.MESH_EXTERNAL:
+                    metadata = metadata.with_external_mesh(
+                        current, origin=MeshOrigin.OPENED_NATIVE)
         if metadata.workflow is not WorkflowMode.MESH_EXTERNAL:
             raise ValueError('Start meshing workflow requires mesh_external mode')
-        classification = classify_case(case)
+        classification = classification or classify_case(case)
         if classification.poly_mesh_path is None:
             raise ValueError('no external polyMesh is available to retain')
         recovery = self._recovery.snapshot(case, operation='start-authored-workflow')

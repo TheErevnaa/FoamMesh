@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from foammesh.core.section.pieces import SCALE_LABELS, ScalePolicy
+
 #: The id of the original cell on every piece of a section.
 SOURCE_CELL_ID = 'sourceCellId'
 #: The mesh revision a section was cut from (field data), when known.
@@ -56,6 +58,8 @@ class ColourChoice:
     categorical: bool = False
     #: The array name the section worker is asked for (``None``: none).
     worker: str | None = None
+    #: Plan 41 GN13. Carried by a Gmsh session mesh's cells and by no other.
+    gmsh: bool = False
     #: Only the section worker has it (not the local volume).
     workerOnly: bool = False
 
@@ -65,6 +69,14 @@ CELL_TYPE = 'cell_type'
 CELL_LEVEL = 'cell_level'
 CELL_ZONE = 'cell_zone'
 QUALITY_PREFIX = 'quality.'
+GMSH_PREFIX = 'gmsh.'
+
+#: Gmsh's own measures (`core.quality.cell_fields.GMSH_FIELD_NAMES`).
+GMSH_QUALITY_FIELDS = (('gmshSICN', 'SICN'), ('gmshSIGE', 'SIGE'),
+                       ('gmshGamma', 'Gamma'),
+                       ('gmshMinIsotropy', 'Isotropy'),
+                       ('gmshMinDetJac', 'Smallest Jacobian'),
+                       ('gmshVolume', 'Element volume'))
 
 #: The quality fields of `core.quality.cell_fields`, with their labels.
 QUALITY_FIELDS = (('cellAspectRatio', 'Aspect ratio'),
@@ -77,6 +89,9 @@ CHOICES = (
     *(ColourChoice(QUALITY_PREFIX + name, f'Quality: {label}', name,
                    worker=QUALITY_PREFIX + name)
       for name, label in QUALITY_FIELDS),
+    *(ColourChoice(GMSH_PREFIX + name, f'Gmsh: {label}', name, gmsh=True,
+                   worker=GMSH_PREFIX + name)
+      for name, label in GMSH_QUALITY_FIELDS),
     ColourChoice(CELL_TYPE, 'Cell type', 'cellType', categorical=True,
                  worker=CELL_TYPE),
     ColourChoice(CELL_LEVEL, 'Refinement level', 'cellLevel',
@@ -110,15 +125,25 @@ SOURCE_WORKER = 'worker'
 REASON_NO_SECTION = 'There is no section to colour.'
 REASON_BOUNDARY = ('The section is a boundary-only preview: there are no '
                    'cells in it to colour. Load cells for the cut first.')
+
+REASON_NOT_GMSH = ('Only a mesh from the Gmsh session carries the Gmsh '
+                   'quality measures.')
+REASON_GMSH_NOT_IN_WORKER = ('The section worker cuts an OpenFOAM polyMesh; '
+                             'the Gmsh measures are on the session mesh.')
 REASON_WORKER_ONLY = ('Only the section worker reads this from the case; '
                       'use Load cells for the cut.')
 
 
-def availability(key, source, *, unavailable=None):
+def availability(key, source, *, unavailable=None, gmshQuality=False,
+                 native=False, volumeHas=()):
     """``(allowed, reason)`` for colouring a section from *source* by *key*.
 
     *unavailable* is the worker's ``unavailable_arrays`` {worker name:
-    reason} (a mesh without cellLevel, without cellZones).
+    reason} (a mesh without cellLevel, without cellZones). Plan 41 GN23:
+    *native* is a Gmsh mesh (no polyMesh), whose section worker serves the
+    Gmsh measures too, and *volumeHas* the cell arrays its local volume
+    carries (its entity/partition level and physical-group zone among them,
+    so those two need no worker there).
     """
     item = choice(key)
     if item.key == NONE:
@@ -127,7 +152,12 @@ def availability(key, source, *, unavailable=None):
         return False, REASON_NO_SECTION
     if source == SOURCE_BOUNDARY:
         return False, REASON_BOUNDARY
-    if source == SOURCE_VOLUME and item.workerOnly:
+    if item.gmsh:
+        if source == SOURCE_WORKER and not native:
+            return False, REASON_GMSH_NOT_IN_WORKER
+        if source != SOURCE_WORKER and not gmshQuality:
+            return False, REASON_NOT_GMSH
+    if source == SOURCE_VOLUME and item.workerOnly             and item.array not in volumeHas:
         return False, REASON_WORKER_ONLY
     reason = (unavailable or {}).get(item.worker)
     if reason:
@@ -195,11 +225,21 @@ def cellTypesFromFaces(owner, neighbour, faceSizes, nCells) -> np.ndarray:
 # -- the legend ---------------------------------------------------------------- #
 
 class ColourRange:
-    """A scalar range that holds still while a plane is dragged."""
+    """A scalar range that holds still while a plane is dragged.
+
+    Plan 39 VI10b (F2h) adds the policy it is fitted by (`ScalePolicy`):
+    *whole mesh* (the default) uses the whole mesh's values where the caller
+    has them and the cut's otherwise, *this cut* the cells on screen,
+    *fixed* holds the range it has until :meth:`rescale` fits it again.
+    """
 
     def __init__(self):
         self._range = None
         self._frozen = False
+        self._policy = ScalePolicy.CUT
+        self._refit = False
+        #: What the last :meth:`rangeFor` used: 'whole', 'cut' or 'fixed'.
+        self.scope = 'cut'
 
     def freeze(self):
         self._frozen = True
@@ -213,23 +253,72 @@ class ColourRange:
     def reset(self):
         self._range = None
         self._frozen = False
+        self._refit = False
 
-    def rangeFor(self, values):
-        """The range to map *values* with: theirs, unless frozen."""
-        if self._frozen and self._range is not None:
-            return self._range
+    def policy(self) -> ScalePolicy:
+        return self._policy
+
+    def setPolicy(self, policy, fixed=None):
+        """Fit by *policy*; *fixed* is the ``(low, high)`` a fixed scale
+        starts from (a saved section's)."""
+        self._policy = ScalePolicy(policy)
+        if fixed is not None and self._policy is ScalePolicy.FIXED:
+            self._range = (float(fixed[0]), float(fixed[1]))
+        elif self._policy is not ScalePolicy.FIXED:
+            self._refit = False
+
+    def fixedRange(self):
+        """The range a fixed scale holds, else None."""
+        return self._range if self._policy is ScalePolicy.FIXED else None
+
+    def rescale(self):
+        """Fit to the cells on screen at the next mapping and hold that: a
+        whole-mesh scale becomes a fixed one."""
+        if self._policy is ScalePolicy.WHOLE:
+            self._policy = ScalePolicy.FIXED
+        self._refit = True
+
+    @staticmethod
+    def _fit(values):
         values = np.asarray(values, dtype=np.float64)
         values = values[np.isfinite(values)] if values.size else values
         if not values.size:
-            return self._range or (0.0, 1.0)
+            return None
         low, high = float(values.min()), float(values.max())
         if high <= low:
             high = low + (abs(low) * 1e-6 or 1.0)
-        self._range = (low, high)
-        return self._range
+        return low, high
+
+    def rangeFor(self, values, whole=None):
+        """The range to map *values* with: theirs, unless frozen or by the
+        policy (*whole*: the whole mesh's values, when known)."""
+        if self._refit:
+            self._refit = False
+            fitted = self._fit(values)
+            if fitted is not None:
+                self._range = fitted
+            self.scope = 'fixed'
+            return self._range or (0.0, 1.0)
+        if self._policy is ScalePolicy.FIXED and self._range is not None:
+            self.scope = 'fixed'
+            return self._range
+        if self._frozen and self._range is not None:
+            return self._range
+        if self._policy is ScalePolicy.WHOLE and whole is not None:
+            fitted = self._fit(whole)
+            if fitted is not None:
+                self._range = fitted
+                self.scope = 'whole'
+                return fitted
+        fitted = self._fit(values)
+        if fitted is None:
+            return self._range or (0.0, 1.0)
+        self._range = fitted
+        self.scope = 'cut'
+        return fitted
 
 
-def mapping(key, values=None, *, colourRange=None, names=None):
+def mapping(key, values=None, *, colourRange=None, names=None, whole=None):
     """What the legend shows for *key* over *values*.
 
     ``{'kind': 'none'}``, ``{'kind': 'categorical', 'array', 'label',
@@ -261,9 +350,14 @@ def mapping(key, values=None, *, colourRange=None, names=None):
         return {'kind': 'categorical', 'array': item.array,
                 'label': item.label, 'categories': categories}
     colourRange = colourRange or ColourRange()
-    return {'kind': 'scalar', 'array': item.array, 'label': item.label,
-            'range': colourRange.rangeFor(values if values is not None
-                                          else [])}
+    fitted = colourRange.rangeFor(values if values is not None else [],
+                                  whole)
+    mapped = {'kind': 'scalar', 'array': item.array, 'label': item.label,
+              'range': fitted}
+    # VI10b. The legend names the policy once it is not the plain default.
+    if colourRange.policy() is not ScalePolicy.CUT:
+        mapped['scale'] = colourRange.scope
+    return mapped
 
 
 def legendText(mapped) -> str:
@@ -273,5 +367,9 @@ def legendText(mapped) -> str:
             name for _code, name in mapped['categories']))
     if kind == 'scalar':
         low, high = mapped['range']
-        return f'{mapped["label"]}: {low:.4g} – {high:.4g}'
+        text = f'{mapped["label"]}: {low:.4g} – {high:.4g}'
+        scale = mapped.get('scale')
+        if not scale:
+            return text
+        return f'{text} ({SCALE_LABELS[ScalePolicy(scale)].lower()})'
     return ''

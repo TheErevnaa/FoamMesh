@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QLabel, QProgressBar, QPushButton, QSpinBox, QStackedWidget, QStyle,
     QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
+from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
 from foammesh.core.mesh.presentation import count_text
 from foammesh.view.facade_client import query, submit
 from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT, CompactSpinBox
@@ -242,7 +243,6 @@ class RegionDetectionPanel(QFrame):
         self._existingNames = set(existing_names)
         self._existingCount = int(existing_count)
         # Plan 37 #1(b): Accept all replaces the regions already defined.
-        self._keepExisting = False
         self._jobId = None
         #: RP13 #7: the request in flight and the case it was asked of; an
         #: answer for any other is late and dropped.
@@ -402,12 +402,14 @@ class RegionDetectionPanel(QFrame):
         self._adjust = QPushButton(self.tr('Adjust…'), page)
         self._adjust.setObjectName('regionDetectionAdjust')
         self._adjust.setShortcut(QKeySequence(self.ADJUST_SHORTCUT))
+        adoptShortcut('detection.adjust', self._adjust)
         self._adjust.setToolTip(self.tr(
             'Open the selected row in the regions editor, to drag its seed, '
             'rename or retype it (%s).') % self.ADJUST_SHORTCUT)
         self._merge = QPushButton(self.tr('Merge'), page)
         self._merge.setObjectName('regionDetectionMerge')
         self._merge.setShortcut(QKeySequence(self.MERGE_SHORTCUT))
+        adoptShortcut('detection.merge', self._merge)
         self._merge.setToolTip(self.tr(
             'Make two selected rows one region: the second seed is dropped, '
             'but only when both seeds are in the same space (%s).')
@@ -423,6 +425,7 @@ class RegionDetectionPanel(QFrame):
         self._accept = QPushButton(self.tr('Accept all'), page)
         self._accept.setObjectName('regionDetectionAccept')
         self._accept.setShortcut(QKeySequence(self.ACCEPT_SHORTCUT))
+        adoptShortcut('detection.accept', self._accept)
         self._accept.setToolTip(self.tr(
             'Write every ticked row as a region, in one step: one Undo '
             '(Ctrl+Z) takes them all back (%s).') % self.ACCEPT_SHORTCUT)
@@ -740,7 +743,7 @@ class RegionDetectionPanel(QFrame):
         are; colours follow the order the regions will be written in, after
         the case's existing regions (RP8's numeric order).
         """
-        taken = set(self._existingNames) if self.keepsExisting() else set()
+        taken: set = set()
         for _index, _space, item, ticked in self._rows():
             if ticked and id(item) in self._edited:
                 taken.add(item.text().strip())
@@ -1006,22 +1009,13 @@ class RegionDetectionPanel(QFrame):
                                       first['name']))
         return True
 
-    def setKeepsExisting(self, keep: bool) -> None:
-        """Add the rows beside the regions already defined, not over them."""
-        self._keepExisting = bool(keep)
-        self._renumber()
-
-    def keepsExisting(self) -> bool:
-        """True when Accept all adds to the regions already defined."""
-        return self._existingCount > 0 and self._keepExisting
-
     def replacesExisting(self) -> bool:
         """True when Accept all replaces regions the case already has."""
-        return self._existingCount > 0 and not self._keepExisting
+        return self._existingCount > 0
 
     def _existingSlot(self) -> int:
         """The colour slot the first written row takes."""
-        return self._existingCount if self.keepsExisting() else 0
+        return 0
 
     def acceptAll(self) -> None:
         """Write the ticked rows in one `apply`: one Undo takes them back.
@@ -1037,8 +1031,10 @@ class RegionDetectionPanel(QFrame):
             return
         self._accept.setEnabled(False)
         parameters = {'regions': regions}
-        if not self.keepsExisting():
-            parameters['replace'] = True
+        # Plan 43 LY13 (D4, D-088). There is no "keep the existing regions"
+        # switch: Accept all replaces (one Undo brings the old ones back) and
+        # Add in the regions table adds by hand.
+        parameters['replace'] = True
         detection = (self._payload or {}).get('detection_id')
         if detection and (self._payload or {}).get('source') != 'solids':
             # RP13 #3: the rows came from this detection; the facade refuses

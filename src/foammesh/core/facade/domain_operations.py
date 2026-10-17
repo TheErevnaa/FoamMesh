@@ -28,12 +28,14 @@ from foammesh.core.jobs import ExpectedArtifact, OperationContext, OperationSpec
 from foammesh.openfoam.decomposition import DecompositionSettings
 from foammesh.core.project import Event
 from foammesh.core.mesh import detection_record  # RP13 #3
+from foammesh.core.quantities import aligned, count_text
 
 from .commands import Command
 from .errors import (CapabilityUnavailableError, CheckOverBudgetError,
                      CheckUnavailableError, FacadeError,
                      PreconditionFailedError, ValidationFailedError,
                      unavailable_utility_text)
+from . import stage_history
 from .probe_cache import ProbeCache
 from .results import OperationResult
 from .session import CaseSession
@@ -317,6 +319,23 @@ def _job_periodic_pairs(record) -> list:
             for pair in pairs]
 
 
+def _kept_apart_pairs(record) -> list:
+    """The non-conformal pairs the Gmsh run kept apart, by patch name.
+
+    Plan 42 SG22 Q2. Read from the runner's own record of what it built
+    (state ``non_conformal``), not from the request: a pair the run could not
+    keep apart is not declared here.
+    """
+    rows = ((_read_runner_result(record.layout).get('statistics') or {})
+            .get('interfacePairs') or {}).get('pairs') or ()
+    return [{'name': str(row.get('name') or ''),
+             'masterSolverName': str(row['masterPatch']),
+             'slaveSolverName': str(row['slavePatch'])}
+            for row in rows
+            if isinstance(row, dict) and row.get('state') == 'non_conformal'
+            and row.get('masterPatch') and row.get('slavePatch')]
+
+
 def _job_extrusion(record):
     """The section extrusion this run was launched with, or ``None``.
 
@@ -384,6 +403,24 @@ def _job_is_planar(record) -> bool:
         return False
     intent = job.get('intent') if isinstance(job, dict) else None
     return bool(((intent or {}).get('dimensionality') or {}).get('planar'))
+
+
+#: Plan 40 UXA4 (F6f, #N6). Sentences the quality gate writes that tell the
+#: reader what was counted or substituted. They describe the run; there is
+#: nothing in them to repair, so they never set a task's warning glyph.
+_VERDICT_INFORMATION_NOTES = (
+    'counted beside this judgement rather than inside it',
+    'per element, so the gate judged',
+    'volume algorithm is single-threaded',
+)
+
+
+def _real_verdict_warnings(warnings) -> tuple:
+    """The gate's warnings that are faults, not information."""
+    return tuple(
+        text for text in (str(item) for item in (warnings or ()))
+        if text.strip() and not any(
+            note in text for note in _VERDICT_INFORMATION_NOTES))
 
 
 def _job_configured_tasks(record) -> frozenset:
@@ -655,7 +692,8 @@ def _meshing_intent(configuration: dict, native_section: str = ''):
         # gates element order on it, and the request is all that reaches
         # `derive_job_intent`.
         native=({native_section: dict(native),
-                 'targetSolver': mesh.get('targetSolver') or 'unselected'}
+                 'targetSolver': mesh.get('targetSolver') or 'unselected',
+                 'sizePreset': mesh.get('sizePreset')}
                 if native_section else {}),
     )
 
@@ -1041,6 +1079,7 @@ class DomainOperations:
         'geometry.repair.rollback', 'geometry.wrap.apply',
         'geometry.patches.merge', 'geometry.patches.split',
         'geometry.patches.split_by_angle', 'geometry.split_interfaces',
+        'geometry.cad.convert_to_surface',
         'geometry.prepared.create', 'geometry.prepared.select',
     })
 
@@ -1059,7 +1098,50 @@ class DomainOperations:
                 handler = self._refusing_on_locked_geometry(operation, handler)
             if operation in self._PROVENANCE_EXPORTS:
                 handler = self._recording_export_provenance(operation, handler)
+            if operation in stage_history.GEOMETRY_STEPS:
+                handler = self._recording_geometry_step(operation, handler)
             register(operation, handler)
+
+    @staticmethod
+    def _recording_geometry_step(operation: str, handler):
+        """Make a geometry operation one step of the undo history (UXD7).
+
+        The geometry store keeps every result in its manifest and writes each
+        revision as a new file, so the step is the manifest before and after.
+        The settings the operation commits on the way (reopening the
+        preparation decision) fold into the same step.
+        """
+        from functools import wraps
+
+        def begin(session):
+            return (session.state.history_mark(),
+                    stage_history.manifest_text(session.case_path))
+
+        def end(session, result, started):
+            if getattr(result, 'status', '') == 'accepted':
+                mark, before = started
+                stage_history.record_geometry_step(
+                    session, operation, before,
+                    stage_history.manifest_text(session.case_path), mark)
+            return result
+
+        if inspect.iscoroutinefunction(handler):
+            @wraps(handler)
+            async def kept(session, command, *args, **kwargs):
+                started = begin(session)
+                return end(session, await handler(
+                    session, command, *args, **kwargs), started)
+        else:
+            @wraps(handler)
+            def kept(session, command, *args, **kwargs):
+                started = begin(session)
+                result = handler(session, command, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    async def later():
+                        return end(session, await result, started)
+                    return later()
+                return end(session, result, started)
+        return kept
 
     @staticmethod
     def _recording_export_provenance(operation: str, handler):
@@ -1161,6 +1243,7 @@ class DomainOperations:
             'geometry.patches.split': self._geometry_patches_split,
             'geometry.patches.split_by_angle': self._geometry_patches_split_by_angle,
             'geometry.split_interfaces': self._geometry_split_interfaces,
+            'geometry.cad.convert_to_surface': self._geometry_cad_convert_to_surface,
             'geometry.prepare.cancel': self._geometry_prepare_cancel,
             'geometry.prepared.create': self._geometry_prepared_create,
             'geometry.prepared.load': self._geometry_prepared_load,
@@ -1181,6 +1264,7 @@ class DomainOperations:
             'mesh.plan.derive': self._mesh_plan_derive,
             'mesh.gmsh.run': self._mesh_gmsh_run,
             'mesh.gmsh.runs': self._mesh_gmsh_runs,
+            'mesh.runs': self._mesh_runs,
             'mesh.workflow.task_state': self._mesh_workflow_task_state,
             'mesh.workflow.task_page': self._mesh_workflow_task_page,
             'mesh.workflow.task_transition': self._mesh_workflow_task_transition,
@@ -1209,6 +1293,17 @@ class DomainOperations:
             'quality.canonical.failed_set.export': self._quality_canonical_failed_set_export,
             'mesh.canonical.selection_capabilities': self._canonical_selection_capabilities,
             'mesh.check': self._mesh_check,
+            # Plan 41 GN25b S3. The automatic size field.
+            'sizing.field.status': self._sizing_field_status,
+            'sizing.tool.status': self._sizing_tool_status,
+            'sizing.tool.setup': self._sizing_tool_setup,
+            'sizing.field.compute': self._sizing_field_compute,
+            'sizing.proposals.get': self._sizing_proposals_get,
+            'sizing.proposals.apply': self._sizing_proposals_apply,
+            'sizing.proposals.lock': self._sizing_proposals_lock,
+            'sizing.field.preview': self._sizing_field_preview,
+            'sizing.conformity': self._sizing_conformity,
+            'sizing.refine_to_field': self._sizing_refine_to_field,
             'quality.su2_readiness': self._quality_su2_readiness,
             'mesh.reconstruct': self._mesh_reconstruct,
             'mesh.feature_edges': self._mesh_feature_edges,
@@ -1286,7 +1381,7 @@ class DomainOperations:
             'cancel_requested': token is not None,
             'state': ('finishing_current_sub_step' if token is not None else 'idle')})
 
-    def _geometry_prepared_create(self, session: CaseSession,
+    async def _geometry_prepared_create(self, session: CaseSession,
                                   command: Command) -> OperationResult:
         session.require_writable()
         from foammesh.core.geometry import PreparedGeometryError, PreparedGeometryStore
@@ -1309,16 +1404,21 @@ class DomainOperations:
             preparation = preparation_with_topology(
                 prepare_readiness(store),
                 command.parameters.get('preparation'))
-            result = store.materialize(
-                preparation=preparation,
-                boundary_categories=categories,
-                fluid_seed=command.parameters.get('fluid_seed'),
-                transform=command.parameters.get('transform'))
+            # UXB10 (F6e): materializing and building the validation
+            # reference ran 139-3,349 ms on the loop; they run in a worker.
+            def build():
+                return store.materialize(
+                    preparation=preparation,
+                    boundary_categories=categories,
+                    fluid_seed=command.parameters.get('fluid_seed'),
+                    transform=command.parameters.get('transform'))
+
+            result = await asyncio.to_thread(build)
         except (PreparedGeometryError, TypeError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
         payload = result.to_dict()
-        payload['geometry_reference'] = self._materialize_geometry_reference(
-            session, result,
+        payload['geometry_reference'] = await asyncio.to_thread(
+            self._materialize_geometry_reference, session, result,
             tolerance=command.parameters.get('fidelity_tolerance_m'))
         _publish_prepared_catalogue(session)
         return self._artifact_result(
@@ -2016,6 +2116,13 @@ class DomainOperations:
         from foammesh.core.workflow.task_state_store import EngineTaskStateStore
         engine_id = str(command.parameters.get('engine_id') or
                         configured_engine_id(session.state.db)).strip().lower()
+        if (engine_id in ('', 'unselected') and str(
+                command.parameters.get('task_id') or '').startswith('setup.')):
+            # Plan 43 LY9. Geometry and Preparation are finished before an
+            # engine is chosen, and the completion lock they leave belongs to
+            # the case, not to an engine: any engine's store reads and writes
+            # the same file.
+            engine_id = 'snappy'
         try:
             descriptor = ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
         except Exception as error:
@@ -2033,10 +2140,19 @@ class DomainOperations:
             # persisted task state, so a field that changes whenever a warning
             # appears would wipe the user's progress on every status change.
             'warnings': self._task_warnings(session, engine_id),
+            # Plan 40 UXA5. What each finished step left: the mesh's own
+            # counts and the run's time, for the page header and the outline.
+            'strips': self._stage_strips(session, engine_id),
             # Plan 35 CR2. Checks run in workers now, so "running" is a
             # state a task can be in between two reads, and "could not run"
             # is an answer that is not a verdict.
             **self._check_status(session)})
+
+    @staticmethod
+    def _stage_strips(session: CaseSession, engine_id: str) -> dict:
+        from foammesh.core.mesh import stage_strip
+
+        return stage_strip.load(session.case_path, engine_id)
 
     def _check_status(self, session: CaseSession) -> dict:
         checks = self._checks_for(session)
@@ -2652,7 +2768,29 @@ class DomainOperations:
         # state on disk; on a busy disk that held the owner loop for 2.1 s
         # after Yes on an unlock. They run in a worker; the scheduler still
         # awaits this command before the next one, so the order is unchanged.
+        # UXD7 (DP-1381): accepting, finishing, skipping or reopening a step
+        # is a step of the undo history. The documents are read in the worker
+        # beside the write they bracket; the entry is made on the loop.
+        documents = {}
+        mark = session.state.history_mark()
+
         def locked_or_applied():
+            documents['before'] = stage_history.task_documents(store)
+            try:
+                return changed_or_refused()
+            finally:
+                documents['after'] = stage_history.task_documents(store)
+
+        def changed_or_refused():
+            if transition == 'lock':
+                # Plan 43 LY9. Proceed finished the step: lock it. Setup
+                # steps (`setup.geometry` and the others) are steps of the
+                # lock's order, not engine tasks, so the id is not checked
+                # against the descriptor here.
+                try:
+                    return 'locked_now', store.lock_completed(task_id)
+                except (TaskStateError, ValueError, KeyError) as error:
+                    return 'invalid', error
             if store.is_locked(task_id):
                 if transition == 'accept':
                     return 'accepted', store.snapshot()
@@ -2662,7 +2800,27 @@ class DomainOperations:
             except (TaskStateError, ValueError, KeyError) as error:
                 return 'invalid', error
 
+        def kept_step(outcome):
+            if outcome not in ('locked_now', 'applied'):
+                return
+            try:
+                title = store.step_title(task_id)
+            except (KeyError, LookupError, ValueError):
+                title = task_id
+            label = {'lock': 'Finish {}', 'accept': 'Accept {}',
+                     'skip': 'Skip {}', 'revert': 'Reopen {}',
+                     'configure': 'Edit {}'}.get(transition, '{}').format(title)
+            stage_history.record_task_step(
+                session, store, task_id, label, documents['before'],
+                documents['after'], mark)
+
         def answer(outcome, value):
+            kept_step(outcome)
+            if outcome == 'locked_now':
+                return self._read_result(session, command, dict(
+                    value, transition='lock', engine_id=engine_id,
+                    tasks=store.snapshot()['tasks'],
+                    locked_steps=value.get('locked')))
             if outcome == 'accepted':
                 # Accepting what is already accepted changes nothing; going
                 # through configure->finish would stale every result below.
@@ -2734,7 +2892,7 @@ class DomainOperations:
         if not task_id:
             raise ValidationFailedError('task_id is required')
         try:
-            store.descriptor.task(task_id)
+            store.step_title(task_id)
         except KeyError as error:
             raise ValidationFailedError(f'unknown task: {task_id}') from error
         expected = command.parameters.get('expected_revision')
@@ -3214,6 +3372,9 @@ class DomainOperations:
 
         The body of :meth:`GmshMeshingEngine.run`, which is what reaches it.
         """
+        import time as _time
+
+        started_at = _time.monotonic()
         session.require_writable()
         import asyncio
         import uuid
@@ -3443,14 +3604,15 @@ class DomainOperations:
         return await self._finish_gmsh_run(
             session, command, record, prepared, payload,
             accepted=verdict.accepted,
-            warning=bool(verdict.warnings if hasattr(verdict, 'warnings')
-                         else False))
+            warning=bool(_real_verdict_warnings(
+                getattr(verdict, 'warnings', ()))),
+            seconds=_time.monotonic() - started_at)
 
 
     async def _finish_gmsh_run(self, session: CaseSession, command: Command,
                                record, prepared, payload: dict, *,
-                               accepted: bool, warning: bool = False
-                               ) -> OperationResult:
+                               accepted: bool, warning: bool = False,
+                               seconds=None) -> OperationResult:
         """Turn one judged Gmsh run into the case's mesh, exports and tasks.
 
         Lifted out of :meth:`run_gmsh_pipeline` unchanged so that accepting a
@@ -3512,6 +3674,18 @@ class DomainOperations:
             else:
                 published = True
         if published:
+            try:
+                couples = await self._couple_gmsh_non_conformal_pairs(
+                    session, command, record, target)
+            except ValidationFailedError as error:
+                RunBuilder.record_publication_failure(record, str(error))
+                payload.update(failure_payload(
+                    task='gmsh.publish', reason=str(error),
+                    log=str(record.layout.log), built=True))
+                return OperationResult('failed', command.operation,
+                                       session.revisions, payload=payload)
+            if couples:
+                payload['interface_couples'] = couples
             check = await self._check_published_gmsh_mesh(session, command)
             payload['check_mesh'] = check
         else:
@@ -3570,12 +3744,44 @@ class DomainOperations:
         # defines was never drawn for the one case it exists for.
         waived = () if accepted else ('gmsh.compute',)
         payload['task_state'] = self._record_engine_run_success(
-            session, command, warning=warning, waived=waived,
+            session, command, warning=warning, waived=waived, seconds=seconds,
             warning_for=tuple(sorted(warning_for)), reasons=tuple(reasons),
             configured=_job_configured_tasks(record),
-            exclude=() if check.get('ran') else ('gmsh.qa',))
+            exclude=() if check.get('ran') else ('gmsh.qa',),
+            # Plan 40 UXA6 (#1). checkMesh did not rate this mesh (the SU2
+            # readiness check judged it, or checkMesh gave no verdict): the
+            # outline says evidenced, not done.
+            evidenced=('gmsh.qa',) if check.get('ran') and (
+                check.get('check') == 'quality.su2_readiness'
+                or check.get('severity') == 'incomplete') else ())
         return self._artifact_result(session, command, payload,
                                      invalidates=('quality', 'exports'))
+
+    async def _couple_gmsh_non_conformal_pairs(
+            self, session: CaseSession, command: Command, record,
+            target: str) -> list[dict]:
+        """Couple the pairs the Gmsh run kept apart, after the conversion.
+
+        Plan 42 SG22 Q2. The runner meshed each non-conformal pair's two
+        bodies separately and recorded the two boundary patches it left
+        (state ``non_conformal``). For an OpenFOAM target they are coupled
+        here with OpenFOAM 13 ``createNonConformalCouples`` on the published
+        polyMesh. For any other output nothing is coupled and the runner has
+        already labelled the pair ``unmatched surfaces``; no coupling is
+        claimed either way.
+        """
+        if str(target).lower() != 'openfoam':
+            return []
+        rows = ((_read_runner_result(record.layout).get('statistics') or {})
+                .get('interfacePairs') or {}).get('pairs') or ()
+        pairs = [
+            {'pair_id': str(row.get('name') or ''),
+             'master_patch': str(row['masterPatch']),
+             'slave_patch': str(row['slavePatch'])}
+            for row in rows
+            if isinstance(row, dict) and row.get('state') == 'non_conformal'
+            and row.get('masterPatch') and row.get('slavePatch')]
+        return await self._run_non_conformal_couples(session, command, pairs)
 
     @staticmethod
     def _census_native_gmsh_mesh(record):
@@ -3911,8 +4117,8 @@ class DomainOperations:
             PolyMeshReadError, read_poly_mesh,
         )
         from foammesh.core.quality.cell_fields import (
-            CALCULATION_VERSION, FIELD_NAMES, compute_cell_fields, histogram,
-            summarise,
+            CALCULATION_VERSION, FIELD_NAMES, compute_cell_fields_and_centres,
+            histogram, ranked_worst_cells, summarise,
         )
 
         try:
@@ -3921,7 +4127,7 @@ class DomainOperations:
             raise PreconditionFailedError(
                 f'the case has no readable mesh to measure: {error}') from error
 
-        fields = compute_cell_fields(mesh)
+        fields, centres = compute_cell_fields_and_centres(mesh)
         metric = str(command.parameters.get('metric') or FIELD_NAMES[1])
         if metric not in fields:
             raise ValidationFailedError(
@@ -3939,6 +4145,13 @@ class DomainOperations:
             # -writeAllFields; the arrays are ours.
             'source': 'foammesh',
         }
+        # Plan 39 VI8. ``rank_n`` asks for the worst N cells of every metric,
+        # with the cell id, value, centroid and zone, instead of the arrays:
+        # a hundred rows rather than eight megabytes a metric.
+        rank_n = int(command.parameters.get('rank_n') or 0)
+        if rank_n > 0:
+            payload['ranked'] = ranked_worst_cells(
+                fields, centres, rank_n, mesh=mesh)
         if command.parameters.get('include_values'):
             # `tolist()` rather than a comprehension over `float()`: same JSON
             # -safe Python floats, measured four times faster, and this array
@@ -4235,7 +4448,8 @@ class DomainOperations:
                                    configured=(),
                                    waived: tuple = (),
                                    warning_for=None,
-                                   reasons=()) -> dict | None:
+                                   reasons=(), evidenced: tuple = (),
+                                   seconds=None) -> dict | None:
         """Advance the tasks this engine's atomic run actually performed.
 
         Bounded by what the engine declares it does, not by which tasks happen
@@ -4264,15 +4478,32 @@ class DomainOperations:
             if reasons:
                 attribution['reasons'] = tuple(reasons)
             staled = self._stale_checks_for_rerun(session, store, covered)
-            return self._with_staled(staled, store.record_atomic_run_success(
-                covered, warning=warning, **attribution,
-                # DP-228. The optional tasks the job this run consumed carried
-                # settings for. The graph answers the same question from a page
-                # save that may have been refused, so it is not asked.
-                configured=tuple(configured),
-                # R119/R158. Only tasks this run actually covered: a waiver
-                # names a gate the run reached, never one it skipped.
-                waived=tuple(task for task in waived if task in covered)))
+            recorded = self._with_staled(
+                staled, store.record_atomic_run_success(
+                    covered, warning=warning, **attribution,
+                    # DP-228. The optional tasks the job this run consumed
+                    # carried settings for. The graph answers the same
+                    # question from a page save that may have been refused,
+                    # so it is not asked.
+                    configured=tuple(configured),
+                    # R119/R158. Only tasks this run actually covered: a
+                    # waiver names a gate the run reached, never one it
+                    # skipped.
+                    waived=tuple(task for task in waived if task in covered),
+                    **({'evidenced': tuple(
+                        task for task in evidenced if task in covered)}
+                       if evidenced else {})))
+            # Plan 40 UXA5. The run wrote one mesh, the last mesh-writing
+            # step's; the steps before it are not given its numbers.
+            writers = [task.task_id for task in
+                       ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
+                       .ordered_tasks()
+                       if task.task_id in covered and task.engine_stage
+                       not in (None, '', 'checkMesh', 'surfaceFeatures')]
+            if writers:
+                self._record_stage_strip(session, command, writers[-1],
+                                         seconds=seconds)
+            return recorded
         except (FacadeError, TaskStateError, LookupError, OSError, ValueError):
             # A workflow that cannot be advanced must not invalidate a mesh
             # that was produced and published. `FacadeError` belongs here for
@@ -4285,7 +4516,8 @@ class DomainOperations:
 
     def _record_stage_run_success(self, session: CaseSession, command: Command,
                                   task_id: str | None, *, warning: bool = False,
-                                  reasons=()) -> dict | None:
+                                  reasons=(), seconds=None,
+                                  from_snapshot: bool = False) -> dict | None:
         """Advance the task a ``workflow.run_stage`` call just performed.
 
         The legacy step pages run stages one at a time and never touch the
@@ -4303,9 +4535,104 @@ class DomainOperations:
             # DP-817. The warning's text, passed only when there is one.
             extra = {'reasons': tuple(reasons)} if reasons else {}
             staled = self._stale_checks_for_rerun(session, store, (task_id,))
-            return self._with_staled(staled, store.record_stage_chain_success(
-                task_id, warning=warning, **extra))
+            recorded = self._with_staled(
+                staled, store.record_stage_chain_success(
+                    task_id, warning=warning, **extra))
         except (TaskStateError, LookupError, OSError, ValueError):
+            return None
+        self._record_stage_strip(session, command, task_id, seconds=seconds,
+                                 from_snapshot=from_snapshot)
+        return recorded
+
+    def _record_stage_strip(self, session: CaseSession, command: Command,
+                            task_id: str, *, seconds=None,
+                            from_snapshot: bool = False) -> None:
+        """Keep the counts of the mesh a step wrote (Plan 40 UXA5).
+
+        Read from the mesh itself, never a second tally. A step of a run to
+        end is read from the copy kept for its stage, because the case root
+        holds only the last stage's mesh by then; a single run is read from
+        the case root. Nonessential: whatever goes wrong, no strip is kept.
+        """
+        try:
+            from foammesh.core.jobs import stage_snapshots as snapshots
+            from foammesh.core.mesh import stage_strip
+
+            from foammesh.core.engine.registry import ENGINE_REGISTRY
+
+            engine_id, _store = self._task_state_store(session, command)
+            written = ENGINE_REGISTRY.get(engine_id).workflow_descriptor()
+            # Gmsh's compute step makes its mesh in memory (the case folder
+            # holds a mesh only once it is published), and surface features
+            # extract edges: neither writes the mesh a strip would count.
+            if any(task.task_id == task_id
+                   and task.engine_stage in ('compute', 'surfaceFeatures')
+                   for task in written.ordered_tasks()):
+                return
+            folder = None
+            if from_snapshot:
+                stage = next((name for name, task in
+                              snapshots.STAGE_TASKS.items()
+                              if task == task_id), None)
+                folder = (snapshots.stage_mesh_path(session.case_path, stage)
+                          if stage else None)
+            if folder is None:
+                folder = Path(session.case_path) / 'constant' / 'polyMesh'
+            counts = stage_strip.mesh_counts(folder)
+            if getattr(ENGINE_REGISTRY.get(engine_id),
+                       'publishes_native_mesh_file', False):
+                counts = self._gmsh_native_strip(
+                    session.case_path, folder, counts, stage_strip)
+            if counts:
+                stage_strip.record(session.case_path, engine_id, task_id,
+                                   counts, seconds)
+        except Exception:                                    # noqa: BLE001
+            logger.debug('no result strip kept for %s', task_id, exc_info=True)
+
+    @staticmethod
+    def _gmsh_native_strip(case_path, folder, counts, stage_strip):
+        """Counts for a Gmsh run that published no polyMesh.
+
+        The SU2 route and a second-order mesh leave the run's native file and
+        no new polyMesh. The newest run's mesh is counted when it was written
+        after the case's polyMesh, so a polyMesh left by an earlier run for
+        another target is never reported as this run's.
+        """
+        runs = Path(case_path) / 'foammesh' / 'runs'
+        newest, stamp = None, 0.0
+        for run in runs.glob('gmsh-*') if runs.is_dir() else ():
+            for name in ('mesh.su2', 'mesh.msh'):
+                candidate = run / name
+                try:
+                    modified = candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if modified > stamp:
+                    newest, stamp = candidate, modified
+                break
+        if newest is None:
+            return counts
+        try:
+            published = (Path(folder) / 'owner').stat().st_mtime
+        except OSError:
+            published = 0.0
+        if counts is not None and published >= stamp:
+            return counts
+        return stage_strip.native_counts(newest) or counts
+
+    @staticmethod
+    def _execution_seconds(execution) -> float | None:
+        """Wall seconds of a finished job, from its own timestamps."""
+        job = getattr(execution, 'job', None)
+        try:
+            from datetime import datetime
+
+            def moment(value):
+                return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+
+            return max(0.0, (moment(job.finished_at)
+                             - moment(job.started_at)).total_seconds())
+        except (AttributeError, TypeError, ValueError):
             return None
 
     def _stale_checks_for_rerun(self, session: CaseSession, store,
@@ -4661,6 +4988,7 @@ class DomainOperations:
                 identities=_gmsh_patch_identities(prepared),
                 region_metadata=self._gmsh_volume_types(session, prepared),
                 periodic_pairs=_job_periodic_pairs(record),
+                non_conformal_pairs=_kept_apart_pairs(record),
                 extrusion=_job_extrusion(record),
                 source_fingerprint=record.document.get('job_digest', ''))
         except PublishError as error:
@@ -4983,6 +5311,14 @@ runTimeModifiable true;
             'runs': [item for item in list_runs(session.case_path)
                      if item.get('engine_id')]})
 
+    def _mesh_runs(self, session: CaseSession,
+                   command: Command) -> OperationResult:
+        """Plan 42 SG16 (D9). One run listing for both engines."""
+        from foammesh.core.jobs.run_listing import list_runs
+
+        return self._read_result(session, command, {
+            'runs': list_runs(session.case_path)})
+
     def _mesh_plan_derive(self, session: CaseSession,
                           command: Command) -> OperationResult:
         """Derive the selected engine's complete immutable execution plan."""
@@ -5187,7 +5523,19 @@ runTimeModifiable true;
             raise ValidationFailedError(
                 'group manifest could not be read for interface pairing') \
                 from error
-        pairs = non_conformal_couples(manifest)
+        return await self._run_non_conformal_couples(
+            session, parent, non_conformal_couples(manifest))
+
+    async def _run_non_conformal_couples(
+            self, session: CaseSession, parent: Command,
+            pairs) -> list[dict]:
+        """Run ``createNonConformalCouples`` once per ``pairs`` entry.
+
+        Shared by the snappy pipeline (pairs from the group manifest) and the
+        Gmsh run (pairs from the runner's record of the bodies it kept
+        apart, Plan 42 SG22 Q2): the utility is the same, so it is one
+        function. Each pair names its two published patches.
+        """
         if not pairs:
             return []
 
@@ -5269,6 +5617,10 @@ runTimeModifiable true;
             # shows the dry run's refusal beside the method; the Gmsh job
             # would otherwise refuse the same case only at the run.
             self._refuse_mixed_sources_for_gmsh(session)
+        # SG22b. The farfield is an intent authored on Geometry with any
+        # engine or none; what this engine cannot build is refused here,
+        # dry run included, with the reason (never silently at the run).
+        self._refuse_farfield_for_engine(session, engine_id)
         if command.parameters.get('dry_run', False):
             return self._read_result(session, command, {'preview': preview.to_dict()})
         session.require_writable()
@@ -5296,6 +5648,22 @@ runTimeModifiable true;
             invalidated_outputs=preview.invalidated_tasks,
             payload={'preview': preview.to_dict(),
                      'transaction': transaction.to_dict() if transaction else None})
+
+    @staticmethod
+    def _refuse_farfield_for_engine(session: CaseSession,
+                                    engine_id: str) -> None:
+        """SG22b: raise when *engine_id* cannot build the case's farfield."""
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.mesh import farfield_spec
+        try:
+            entries = GeometryArtifactStore(session.case_path).entries()
+        except (OSError, ValueError):
+            entries = []
+        reason = farfield_spec.engine_refusal(
+            session.state.db, engine_id, entries)
+        if reason:
+            raise PreconditionFailedError(reason, details={
+                'error': 'farfield_not_buildable', 'engine': engine_id})
 
     @staticmethod
     def _refuse_mixed_sources_for_gmsh(session: CaseSession,
@@ -5755,7 +6123,9 @@ runTimeModifiable true;
         try:
             retention = int(command.parameters.get('geometry_revision_keep', 3))
             revisions = GeometryArtifactStore(
-                session.case_path).garbage_collect_revisions(retention)
+                session.case_path).garbage_collect_revisions(
+                    retention,
+                    protect=stage_history.protected_geometry_paths(session))
         except (TypeError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
         return self._read_result(session, command, {'saved': True,
@@ -5826,7 +6196,9 @@ runTimeModifiable true;
                      ArtifactHistoryStore(session.case_path).entries()][-int(limit):]
         return self._read_result(session, command, {
             'transactions': transactions, 'artifacts': artifacts,
-            'change_sets': list(session.change_sets)})
+            'change_sets': list(session.change_sets),
+            # UXD7. The steps Undo and Redo walk, for the History panel.
+            'undo_history': session.state.history.entries()})
 
     async def _parallel_redistribute(self, session: CaseSession, command: Command) -> OperationResult:
         case_root = (session.case_path if (session.case_path / 'constant').is_dir()
@@ -5942,7 +6314,7 @@ runTimeModifiable true;
             'runtime_fingerprint': registry.runtime_fingerprint('blockMesh'),
         })
 
-    def _stage_clear(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _stage_clear(self, session: CaseSession, command: Command) -> OperationResult:
         try:
             output_time = int(command.parameters['output_time'])
         except (KeyError, TypeError, ValueError) as error:
@@ -5967,11 +6339,17 @@ runTimeModifiable true;
         # had built one. Redistribution is the parallel-environment operation's
         # job, not stage clearing's.
         targets.extend(case_root.glob(f'processor*/{output_time}'))
-        removed = []
-        for target in targets:
-            if target.exists():
-                rmtree(target)
-                removed.append(str(target))
+        def remove():
+            # UXB10 (F6e): deleting a stage's output held the loop for up to
+            # 354 ms; the scheduler still awaits it before the next command.
+            done = []
+            for target in targets:
+                if target.exists():
+                    rmtree(target)
+                    done.append(str(target))
+            return done
+
+        removed = await asyncio.to_thread(remove)
         if not removed:
             # Clearing a stage that had nothing staged is not a mesh change.
             # Announcing one anyway is a closed loop: the desktop window
@@ -5996,13 +6374,8 @@ runTimeModifiable true;
             raise ValidationFailedError('unsupported geometry format', details={
                 'suffix': source.suffix,
                 'supported': sorted(self._GEOMETRY_EXTENSIONS)})
-        from foammesh.core.engine.registry import (
-            ENGINE_REGISTRY, configured_engine_id)
-        engine_id = configured_engine_id(session.state.db)
-        if engine_id in ENGINE_REGISTRY.ids() and not getattr(
-                ENGINE_REGISTRY.get(engine_id), 'mixes_cad_and_surfaces', True):
-            # DP-638: a STEP beside an STL is a case Gmsh cannot mesh.
-            self._refuse_mixed_sources_for_gmsh(session, (source,))
+        # SG22: import is engine-blind. A mix of CAD and surfaces is refused
+        # when a mesher that cannot take it is chosen (mesh.engine.select).
         from foammesh.core.geometry import GeometryArtifactStore
         from foammesh.core.geometry.diagnostics import budget as budget_module
 
@@ -6163,24 +6536,33 @@ runTimeModifiable true;
         engine = configured_engine_id(session.state.db)
         return engine if engine in ('snappy', 'gmsh') else None
 
-    def _geometry_readiness(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _geometry_readiness(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.geometry import GeometryArtifactStore
-        store = GeometryArtifactStore(session.case_path)
+        # Read on the loop (the db belongs to it); the diagnosis, which reads
+        # and may write every geometry on disk, runs in a worker (UXB10, F6e:
+        # 1,250 and 1,386 ms on the Gmsh import).
+        target = self._readiness_target_cell_size(session)
+        engine = self._readiness_engine(session)
+        geometry_id = command.parameters.get('geometry_id')
+        destination = command.parameters.get('destination')
+
+        def work():
+            report = GeometryArtifactStore(session.case_path).readiness_report(
+                geometry_id, target_cell_size=target, engine=engine)
+            if destination:
+                path = Path(str(destination))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + '\n',
+                    encoding='utf-8')
+                report = {**report, 'exported_to': str(path)}
+            return report
+
         try:
-            report = store.readiness_report(
-                command.parameters.get('geometry_id'),
-                target_cell_size=self._readiness_target_cell_size(session),
-                engine=self._readiness_engine(session))
+            report = await asyncio.to_thread(work)
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
                 'geometry_id': str(error.args[0])}) from error
-        destination = command.parameters.get('destination')
-        if destination:
-            destination = Path(str(destination))
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(
-                json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-            report = {**report, 'exported_to': str(destination)}
         return self._read_result(session, command, report)
 
     def _geometry_preparation_decide(
@@ -6487,6 +6869,49 @@ runTimeModifiable true;
             invalidated_outputs=('mesh', 'quality'),
             payload={'geometry_id': geometry_id, 'revision': result.get('revision'),
                      'split': report, 'patches': rows,
+                     'geometry_rows': reconciled})
+
+    def _geometry_cad_convert_to_surface(self, session: CaseSession,
+                                         command: Command) -> OperationResult:
+        """Turn the chosen solid-model sources into surface files, on request.
+
+        Plan 42 SG22 Q1. Gmsh refuses a case that mixes CAD with surfaces
+        (DP-638); this is the explicit button that makes the case surface-only
+        for both engines. ``tessellation`` (``linear_deflection`` in metres,
+        ``angular_deflection_deg``) states how finely the solid is faceted;
+        ``preview`` reports the numbers and writes nothing. Never called
+        implicitly.
+        """
+        from foammesh.core.geometry import GeometryArtifactStore
+
+        preview = bool(command.parameters.get('preview', False))
+        if not preview:
+            session.require_writable()
+        store = GeometryArtifactStore(session.case_path)
+        before = self._patch_rows(self._patch_editor(session))
+        ids = command.parameters.get('geometry_ids') or None
+        try:
+            result = store.convert_cad_to_surface(
+                ids, tessellation=command.parameters.get('tessellation'),
+                preview=preview)
+        except KeyError as error:
+            raise PreconditionFailedError('geometry artifact does not exist', details={
+                'geometry_id': str(error.args[0])}) from error
+        except (OSError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
+        if preview:
+            return self._read_result(session, command, result)
+        rows = self._patch_editor(session).rows()
+        reconciled = self._reconcile_geometry_rows(session, before, rows)
+        self._invalidate_geometry_preparation(session)
+        session.state.bus.publish(
+            Event.ARTIFACT_GEOMETRY_CHANGED, operation=command.operation,
+            count=len(result['converted']))
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            invalidated_outputs=('mesh', 'quality'),
+            payload={'converted': result['converted'],
+                     'files_written': result['files_written'],
                      'geometry_rows': reconciled})
 
     def _geometry_split_interfaces(self, session: CaseSession,
@@ -7562,7 +7987,8 @@ runTimeModifiable true;
             payload['task_state'] = self._record_stage_run_success(
                 session, command, getattr(definition, 'task_id', None),
                 warning=bool(execution.warnings),
-                reasons=tuple(execution.warnings))
+                reasons=tuple(execution.warnings),
+                seconds=self._execution_seconds(execution))
             if (getattr(definition, 'mutation', True)
                     and payload.get('left_decomposed')
                     and self._keeps_stage_snapshots(engine, definition.stage)):
@@ -7665,6 +8091,7 @@ runTimeModifiable true;
                    else 'snappyHexMesh',
                    'executable': str(argv[0]) if argv else ''}
         token = snapshots.cancel_token(session.case_path)
+        previous = snapshots.active(session.case_path)
         try:
             captured = await asyncio.to_thread(
                 snapshots.capture, session.case_path, stage,
@@ -7679,10 +8106,28 @@ runTimeModifiable true;
                     'message': str(error)}
         finally:
             snapshots.release_token(session.case_path, token)
+        if captured.get('captured'):
+            self._record_stage_history(session, engine, stage, captured, previous)
         return {key: captured.get(key) for key in (
             'captured', 'skipped', 'stage', 'revision', 'path', 'bytes',
             'digest', 'copy_seconds', 'verify_seconds', 'reason',
             'consequence') if key in captured}
+
+    def _record_stage_history(self, session: CaseSession, engine, stage: str,
+                              captured: dict, previous: dict | None) -> None:
+        """UXD7: the run is a step in the one undo history. Never fails it."""
+        from . import stage_history
+        from foammesh.core.workflow.task_state_store import EngineTaskStateStore
+        try:
+            store = EngineTaskStateStore(
+                session.case_path, engine.workflow_descriptor())
+            stage_history.record_stage_run(
+                session, store, stage, captured, previous,
+                self._polymesh_cell_count(
+                    Path(session.case_path) / 'constant' / 'polyMesh'))
+        except Exception:  # noqa: BLE001 - history is a convenience
+            logger.warning('stage run of %s not added to the history', stage,
+                           exc_info=True)
 
     async def _gather_stage_result(self, session: CaseSession,
                                    command: Command, stage: str) -> dict:
@@ -8309,6 +8754,14 @@ runTimeModifiable true;
             settings = None
         decomposition.write(case_path, ranks, settings)
 
+    @staticmethod
+    def _readers_quiet(session):
+        """``session.jobs.quiesce_readers()``; a stand-in session has none."""
+        import contextlib
+        jobs = getattr(session, 'jobs', None)
+        quiesce = getattr(jobs, 'quiesce_readers', None)
+        return quiesce() if quiesce is not None else contextlib.nullcontext()
+
     async def _ensure_reconstructed(self, session: CaseSession,
                                     command: Command) -> dict | None:
         """Rebuild the case-root mesh from the processor cases, if it is stale.
@@ -8320,7 +8773,7 @@ runTimeModifiable true;
         """
         if not self._gather_pending(session.case_path):
             return None
-        from foammesh.support.utils import rmtree
+        from foammesh.support.utils import rename_retrying, rmtree
         case_path = session.case_path
         root_mesh = case_path / 'constant' / 'polyMesh'
         parked = case_path / self.PARKED_ROOT_MESH
@@ -8345,10 +8798,13 @@ runTimeModifiable true;
         # rather than left where it decides on it. Parked, not deleted: if the
         # gather does not produce a mesh to replace it, it goes back.
         self._align_gather_ranks(session)
-        if parked.exists():
-            rmtree(parked)
-        if root_mesh.is_dir():
-            root_mesh.rename(parked)
+        # DP-1441. A viewer read of the stage before is waited out: it holds
+        # the mesh files open, and Windows refuses the rename under it.
+        async with self._readers_quiet(session):
+            if parked.exists():
+                rmtree(parked)
+            if root_mesh.is_dir():
+                rename_retrying(root_mesh, parked)
         try:
             execution = await self._run_openfoam_utility(
                 session, command, 'reconstructPar',
@@ -8379,7 +8835,7 @@ runTimeModifiable true;
             if parked.is_dir():
                 if root_mesh.is_dir():
                     rmtree(root_mesh)
-                parked.rename(root_mesh)
+                rename_retrying(parked, root_mesh)
             raise
         if parked.exists():
             rmtree(parked)
@@ -8661,8 +9117,12 @@ runTimeModifiable true;
             # save re-opened our own freshly meshed case as an import and
             # collapsed the workflow outline to Scene / Display.
             from foammesh.core.case import record_generated_mesh
-            record_generated_mesh(session.case_path, provenance={
-                'generated_by': f'{engine.engine_id}:{definition.stage}'})
+            # DP-2712. It fingerprints the whole polyMesh and rewrites the
+            # sidecar: file work only, and it ran on the GUI thread under the
+            # stage's progress modal. A worker takes it.
+            await asyncio.to_thread(
+                record_generated_mesh, session.case_path, provenance={
+                    'generated_by': f'{engine.engine_id}:{definition.stage}'})
         if feature_stage and execution.succeeded:
             import hashlib
 
@@ -8709,8 +9169,12 @@ runTimeModifiable true;
             payload['provenance'] = provenance
             payload['feature_warnings'] = advisories
         if execution.succeeded and definition.stage in {'layers', 'snappyHexMesh'}:
+            # DP-2402. Layers run on their own are a staged mesh; the
+            # combined pass is not, and the record says which it was.
             payload.update(
-                self._layer_coverage_payload(session, engine, payload))
+                self._layer_coverage_payload(
+                    session, engine, payload,
+                    staged=definition.stage == 'layers'))
         if execution.succeeded and hasattr(engine, 'snapshot_run_config'):
             snapshot = engine.snapshot_run_config(session.case_path)
             payload['dictionary_snapshot'] = str(snapshot)
@@ -8759,7 +9223,7 @@ runTimeModifiable true;
 
     @classmethod
     def _layer_coverage_payload(cls, session: CaseSession, engine,
-                                payload: dict) -> dict:
+                                payload: dict, *, staged: bool = False) -> dict:
         """Report the prism layers snappy actually produced, not the request.
 
         Snappy exits successfully even when every layer was rejected, so a
@@ -8794,6 +9258,9 @@ runTimeModifiable true;
                 'how many layers reached the mesh could not be read from its '
                 'log']}
         document = report.to_dict()
+        # DP-2402. Said on the layers page: a mesh built stage by stage is
+        # not the one handed to a solver.
+        document['staged'] = bool(staged)
         # Plan 26 WP6.1. Only the warning list was ever consumed, and only for
         # patches below the 50% floor -- so a patch that got its layers was
         # never reported at all, and no figure survived the completion dialog
@@ -9001,14 +9468,14 @@ runTimeModifiable true;
         gathers three times over a root that holds the previous stage's mesh
         while every earlier gather has written ``cellProcAddressing`` back.
         """
-        from foammesh.support.utils import rmtree
+        from foammesh.support.utils import rename_retrying, rmtree
         root = Path(case_path) / 'constant' / 'polyMesh'
         parked = Path(case_path) / cls.PARKED_ROOT_MESH
         if parked.exists():
             rmtree(parked)
         if not root.is_dir():
             return None
-        root.rename(parked)
+        rename_retrying(root, parked)
         return parked
 
     @classmethod
@@ -9019,7 +9486,7 @@ runTimeModifiable true;
         A gather that exits 0 is read back: the case root must hold every
         cell the processor cases do, or it is not the stage's result.
         """
-        from foammesh.support.utils import rmtree
+        from foammesh.support.utils import rename_retrying, rmtree
         root = Path(case_path) / 'constant' / 'polyMesh'
         problem = ''
         if succeeded:
@@ -9041,7 +9508,7 @@ runTimeModifiable true;
             else:
                 if root.is_dir():
                     rmtree(root)
-                parked.rename(root)
+                rename_retrying(parked, root)
         return problem
 
     @classmethod
@@ -9108,7 +9575,8 @@ runTimeModifiable true;
         for item in fresh:
             if self._record_stage_run_success(
                     session, command,
-                    snapshots.STAGE_TASKS[item['stage']]) is not None:
+                    snapshots.STAGE_TASKS[item['stage']],
+                    from_snapshot=True) is not None:
                 recorded.append(item['stage'])
         if any(session.case_path.glob('processor[0-9]*')):
             self._discard_decomposition(session.case_path)
@@ -9427,6 +9895,7 @@ runTimeModifiable true;
         checkpoints = []
         executions = []
         check_execution = None
+        layers_payload = None
         keeps = self._pipeline_stage_keeps(dag.nodes)
         stage_snapshots = []
         for node in dag.nodes:
@@ -9446,8 +9915,11 @@ runTimeModifiable true;
                              'reason': str(error)}) from error
             # DP-1235. Every gather runs with the case root parked.
             gathers = tuple(node.argv[:1]) == ('reconstructPar',)
-            parked = (self._park_root_for_gather(session.case_path)
-                      if gathers else None)
+            parked = None
+            if gathers:
+                # DP-1441. A viewer read of the stage before is waited out.
+                async with self._readers_quiet(session):
+                    parked = self._park_root_for_gather(session.case_path)
             try:
                 execution = await self._context(session).executor.execute(
                     session, OperationSpec(
@@ -9469,6 +9941,9 @@ runTimeModifiable true;
             executions.append(execution.to_payload())
             if node.node_id == 'checkMesh':
                 check_execution = execution
+            if (execution.succeeded
+                    and node.node_id in ('layers', 'snappyHexMesh')):
+                layers_payload = executions[-1]
             if not execution.succeeded or gather_problem:
                 failure = execution.to_payload()
                 job = failure.get('job') or {}
@@ -9573,6 +10048,13 @@ runTimeModifiable true;
         stage_state = engine.mark_pipeline_run(
             session.state.db, session.case_path)
         quality_report = self._persist_pipeline_check(session, check_execution)
+        # VI14 (LIVEV). The stage route writes foammesh/quality/layer-
+        # coverage.json from the layers log; the pipeline route never did, so
+        # after a run to end the file (and the Layers grown colouring that
+        # reads it) still held the previous run's figures.
+        layer_coverage = (
+            self._layer_coverage_payload(session, engine, layers_payload)
+            if layers_payload is not None else {})
         from foammesh.core.quality import QualityReport
         from foammesh.core.quality.verdict import verdict_from_report
         quality_verdict = verdict_from_report(
@@ -9645,7 +10127,8 @@ runTimeModifiable true;
                      'quality_verdict': quality_verdict,
                      'patch_identity': patch_identity_state,
                      'evidence': evidence_state,
-                     'task_state': task_state})
+                     'task_state': task_state,
+                     **layer_coverage})
 
     @staticmethod
     def _assembled_surface(session: CaseSession):
@@ -9711,16 +10194,23 @@ runTimeModifiable true;
         """
         from foammesh.core.mesh.sizing import validate_fluid_seed
 
+        return self._read_result(session, command,
+                                 self._suggest_seed_payload(session))
+
+    def _suggest_seed_payload(self, session: CaseSession) -> dict:
+        """The payload of ``geometry.fluid_seed.suggest`` (UXA1 shares it)."""
+        from foammesh.core.mesh.sizing import validate_fluid_seed
+
         surface = self._assembled_surface(session)
         if surface is None:
-            return self._read_result(session, command, {
+            return {
                 'point': None, 'inside': False, 'source': 'none',
-                'reason': 'this case has no staged geometry to search'})
+                'reason': 'this case has no staged geometry to search'}
         # Plan 36 RP7: the deepest point of the largest enclosed space, when
         # the domain can be labelled; the lattice below is the fallback.
         delegated = self._suggest_from_fluid_spaces(session, surface)
         if delegated is not None:
-            return self._read_result(session, command, delegated)
+            return delegated
         bounds = surface.GetBounds()
         candidates = self._seed_candidates(bounds)
         centre = list(candidates[0])
@@ -9730,17 +10220,17 @@ runTimeModifiable true;
             except (ValueError, RuntimeError):              # noqa: PERF203
                 continue
             if probe.get('valid'):
-                return self._read_result(session, command, {
+                return {
                     'point': [float(value) for value in candidate],
                     'inside': True,
                     'source': ('bounding_box_centre'
                                if candidate == candidates[0] else 'search'),
                     'distance_to_surface': probe.get('distance_to_surface'),
-                    'reason': 'a point inside the assembled surface'})
-        return self._read_result(session, command, {
+                    'reason': 'a point inside the assembled surface'}
+        return {
             'point': centre, 'inside': False, 'source': 'bounding_box_centre',
             'reason': 'no interior point was found — the surface is probably '
-                      'open, so place the seed yourself'})
+                      'open, so place the seed yourself'}
 
     #: Seconds a synchronous suggestion waits for a detection that is not
     #: cached before it falls back to the lattice ("over budget", RP7 point
@@ -10335,19 +10825,18 @@ runTimeModifiable true;
                     row['same_as'] = rows[group[0]]['name']
                 group.append(str(key))
             rows[str(key)] = row
-        for group in members.values():
-            if len({rows[key]['type'] for key in group}) > 1:
-                for key in group:
-                    rows[key]['clash'] = True
         # Plan 37 #1 / #2: the page says what the launch will warn about.
-        seeds = []
-        for key in sorted(regions, key=order):
-            try:
-                point = [float(value) for value in regions[key].vector('point')]
-            except Exception:  # noqa: BLE001 - an unreadable seed is no space
-                continue
-            seeds.append((rows[str(key)]['name'], rows[str(key)]['type'],
-                          point))
+        seeds = self._region_seeds(regions)
+        # DP-2638: the clash is the launch gate's own verdict and sentence,
+        # so what the page warns about is what Run to end refuses.
+        by_name = {row['name']: key for key, row in rows.items()}
+        for group in fluid_regions.seed_clashes(field, seeds):
+            message = fluid_regions.clash_message(group)
+            for name in group['regions']:
+                key = by_name.get(name)
+                if key is not None:
+                    rows[key]['clash'] = True
+                    rows[key]['clash_message'] = message
         return self._read_result(session, command, {
             'labelled': True, 'regions': rows,
             'warnings': self._placement_warnings(
@@ -11004,6 +11493,25 @@ runTimeModifiable true;
         kind = getattr(kind, 'value', kind)
         return str(kind).lower() if kind else 'fluid'
 
+    def _region_seeds(self, regions) -> list:
+        """``[(label, type, point)]`` for every readable region seed, in id
+        order: the one list the Domain & regions page and the launch gate
+        judge (DP-2638), so both name a clash in the same order."""
+        def order(key):
+            text = str(key)
+            return (0, int(text), '') if text.isdigit() else (1, 0, text)
+
+        seeds = []
+        for key in sorted(regions, key=order):
+            region = regions[key]
+            try:
+                point = [float(value) for value in region.vector('point')]
+            except Exception:  # noqa: BLE001 - an unreadable seed is no space
+                continue
+            seeds.append((self._region_label(key, region),
+                          self._region_type(region), point))
+        return seeds
+
     def _seed_space_field(self, session: CaseSession, inputs):
         """The fluid-space field for the launch gate, or ``None``.
 
@@ -11035,9 +11543,14 @@ runTimeModifiable true;
         snappy looks for the cell holding each seed; on a face it finds two
         or none. The gizmo and detect keep seeds off the faces, but a typed
         point or an older case can still sit on one: the launch says so.
+
+        DP-2639: and says what the case writer will write instead -- the
+        same `face_clearance.nudge_seed` move, a sliver into the seed's own
+        space, proved by its distance to the surface -- or that it has to
+        write the seed as typed.
         """
         from foammesh.core.mesh.face_clearance import (
-            MIN_CLEARANCE, seed_face_clearance,
+            MIN_CLEARANCE, nudge_seed, seed_face_clearance,
         )
 
         try:
@@ -11057,12 +11570,37 @@ runTimeModifiable true;
             if clearance is None or clearance.relative >= MIN_CLEARANCE:
                 continue
             label = self._region_label(key, region)
+            where = (f'{label} seed lies on a face of the mesh (along '
+                     f'{"xyz"[clearance.axis]}, {clearance.relative:.3g} of '
+                     f'a {clearance.cell:.4g} m cell from it)')
+            nudge = nudge_seed(point, grid, level,
+                               self._surface_room(surface, point))
+            if nudge is not None and nudge.fraction:
+                moved = ', '.join(aligned(nudge.moved))  # DP-165
+                warnings.append(
+                    f'{where}; it is written {nudge.distance:.3g} m off the '
+                    f'face, at ({moved}), still in its own space.')
+                continue
             warnings.append(
-                f'{label} seed lies on a face of the mesh (along '
-                f'{"xyz"[clearance.axis]}, {clearance.relative:.3g} of a '
-                f'{clearance.cell:.4g} m cell from it); snappy may not find '
-                'the cell it is in. Nudge the seed off the face.')
+                f'{where}; snappy may not find the cell it is in, and it is '
+                'too near a wall to be moved off the face provably within '
+                'its own space. Nudge the seed off the face.')
         return warnings
+
+    @staticmethod
+    def _surface_room(surface, point) -> float | None:
+        """DP-2639. Distance from *point* to *surface*, or ``None``."""
+        if surface is None:
+            return None
+        try:
+            from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+
+            implicit = vtkImplicitPolyDataDistance()
+            implicit.SetInput(surface)
+            return abs(float(implicit.EvaluateFunction(
+                tuple(float(value) for value in point))))
+        except Exception:  # noqa: BLE001 - no room measured: no move said
+            return None
 
     @staticmethod
     def _allows_region_clash(command: Command) -> bool:
@@ -11123,11 +11661,12 @@ runTimeModifiable true;
         A Fluid and a Solid seed there cannot both be honoured: refused,
         naming both, before snappy silently meshes one of them.
 
-        RP13 #1: the voxels only approximate the connectivity. Every conflict
-        is graded against a second field at h/2 (`graded_conflicts`); only a
-        ``confirmed`` clash refuses, and ``allow_region_clash`` overrides
-        even that. An approximate or unresolved one -- including two seeds
-        only the finer field joins through a narrow neck (DP-861) -- warns.
+        DP-2638: a clash is `fluid_regions.seed_clashes` on the field at h,
+        the verdict the Domain & regions page shows, so the launch refuses
+        what the page warns about, whatever the h/2 grading says (it rides
+        along as ``confidence``); ``allow_region_clash`` overrides it. RP13
+        #1 still grades the rest: two seeds only the finer field joins
+        through a narrow neck (DP-861), and same-type groups, warn.
         """
         from foammesh.core.mesh import fluid_regions
 
@@ -11140,16 +11679,43 @@ runTimeModifiable true;
         if field is None:
             return []
         finer = self._seed_space_finer(session, inputs, field)
-        seeds = []
-        for key, region in regions.items():
-            try:
-                point = [float(value) for value in region.vector('point')]
-            except Exception:  # noqa: BLE001 - the loop above refuses it
+        seeds = self._region_seeds(regions)
+        graded = fluid_regions.graded_conflicts(field, seeds, finer)
+        warnings, handled = [], []
+        # DP-2638: the clash the Domain & regions page warns about -- the
+        # field at h puts a Fluid and a Solid seed in one space -- refuses
+        # every launch, in the page's own words. Only allow_region_clash
+        # lets it through. The h/2 grading says how sure the voxels are.
+        for clash in fluid_regions.seed_clashes(field, seeds):
+            members = set(clash['regions'])
+            handled.append(members)
+            confidence = next(
+                (group['confidence'] for group in graded
+                 if members <= set(group['regions'])),
+                fluid_regions.UNRESOLVED)
+            message = fluid_regions.clash_message(clash)
+            if not allow_region_clash:
+                raise PreconditionFailedError(
+                    message,
+                    details={'error': 'region_space_clash',
+                             'regions': clash['regions'],
+                             'types': clash['types'],
+                             'space': clash['space'],
+                             'outside': clash['outside'],
+                             'confidence': confidence})
+            named = ' and '.join(
+                f'{label} ({kind})'
+                for label, kind in zip(clash['regions'], clash['types']))
+            where = ('the space around the geometry' if clash['outside']
+                     else 'one enclosed space')
+            warnings.append(
+                f'{named} are seeded in {where}; a fluid and a solid '
+                'cannot share it, and the launch goes ahead only because '
+                'allow_region_clash was given. snappy will keep one.')
+        for group in graded:
+            if group['clash'] and any(members <= set(group['regions'])
+                                      for members in handled):
                 continue
-            seeds.append((self._region_label(key, region),
-                          self._region_type(region), point))
-        warnings = []
-        for group in fluid_regions.graded_conflicts(field, seeds, finer):
             named = ' and '.join(
                 f'{label} ({kind})'
                 for label, kind in zip(group['regions'], group['types']))
@@ -11157,23 +11723,9 @@ runTimeModifiable true;
                      else 'one enclosed space')
             confirmed = group['confidence'] == fluid_regions.CONFIRMED
             doubt = self._CONFLICT_DOUBT.get(group['confidence'], '')
-            if group['clash'] and confirmed and not allow_region_clash:
-                raise PreconditionFailedError(
-                    f'{named} are seeded in {where}; snappy keeps a space '
-                    'as one region, so a fluid and a solid cannot share it. '
-                    'Move one seed into its own space.',
-                    details={'error': 'region_space_clash',
-                             'regions': group['regions'],
-                             'types': group['types'],
-                             'space': group['space'],
-                             'outside': group['outside'],
-                             'confidence': group['confidence']})
-            if group['clash'] and confirmed:
-                warnings.append(
-                    f'{named} are seeded in {where}; a fluid and a solid '
-                    'cannot share it, and the launch goes ahead only because '
-                    'allow_region_clash was given. snappy will keep one.')
-            elif group['clash']:
+            if group['clash']:
+                # Only the finer field joins them (DP-861): a narrow neck
+                # the voxels at h closed. The page cannot see it; a warning.
                 warnings.append(
                     f'{named} may be seeded in {where} ({doubt}). If they '
                     'are, snappy keeps it as one region and a fluid and a '
@@ -11206,11 +11758,14 @@ runTimeModifiable true;
         ``payload['region_warnings']``.
         """
         excludes = self._exclude_point_rows(session)
+        adopted = self._default_fluid_region(session)
         # Plan 37 UF18: an exclude point is judged against the labelled
         # domain even with one region, so the field is primed for it too.
         await self._prime_seed_spaces(session, force=bool(excludes))
         warnings = list(self._validate_fluid_seed(
             session, allow_region_clash=allow_region_clash) or ())
+        if adopted:
+            warnings.insert(0, adopted)
         if excludes:
             warnings.extend(self._exclude_point_gate(session, excludes))
         warnings.extend(self._farfield_seed_gate(session, excludes))
@@ -11219,6 +11774,51 @@ runTimeModifiable true;
         warnings.extend(self._placement_seed_gate(session))
         self._record_retained_estimate(session, excludes)
         return warnings
+
+    def _default_fluid_region(self, session: CaseSession) -> str | None:
+        """UXA1 / U1: a footer-only snappy case gets a fluid region.
+
+        A case with no region at all was refused at Castellation, so the
+        first mesh could not be made without opening Domain & regions. The
+        seed is the suggested point (inside the geometry, judged as the
+        launch judges it); a region the user typed is never touched, because
+        this runs only when there is none. An unusable suggestion adds
+        nothing and the gate refuses as before.
+
+        The seed feature itself was built in Plan 36 (voxel detection, the
+        panel's Accept, Add's pre-filled point); ``geometry.fluid_seed.suggest``
+        answers with the detected space when there is one and the lattice
+        point otherwise. Only the adoption on Proceed was missing. Returns the
+        sentence naming the adopted seed (the launch carries it as a warning),
+        or ``None`` when nothing was adopted.
+        """
+        try:
+            if session.state.db.getElements('region'):
+                return None
+            payload = self._suggest_seed_payload(session)
+        except Exception:  # noqa: BLE001 - the gate reports what is wrong
+            return None
+        point = payload.get('point')
+        if not (payload.get('inside') and point and len(point) == 3):
+            return None
+        from foammesh.core.project import Source
+        data = session.state.checkout()
+        key, element = data.addNewElement('region')
+        element.setValue('name', 'fluid')
+        element.setValue('type', 'fluid')
+        for axis, value in zip('xyz', point):
+            element.setValue(f'point/{axis}', str(float(value)))
+        session.state.commit(
+            data, action='default fluid region', source=Source.SYSTEM,
+            target='region', reason='proposed: no region was set')
+        from foammesh.core.quantities import aligned
+        where = ', '.join(aligned(point))
+        source = ('the largest enclosed space the geometry has'
+                  if payload.get('source') == 'fluid_spaces'
+                  else 'a point inside the geometry')
+        return (f'No fluid region was set, so one named "fluid" was added at '
+                f'({where}) m, {source}. Move it on Domain & regions if the '
+                'fluid is elsewhere.')
 
     def _region_seed_rows(self, session: CaseSession) -> list:
         """``(label, type, xyz)`` of every region seed with a point."""
@@ -11290,8 +11890,12 @@ runTimeModifiable true;
                     str(row.get('name')) for row in
                     estimate.get('excludes') or ()] != names:
                 estimate = None
+            seeds = self._region_seed_rows(session)
             return {'case_path': session.case_path,
-                    'seeds': len(self._region_seed_rows(session)),
+                    'seeds': len(seeds),
+                    # DP-2635: each region is named by the seed it holds.
+                    'seed_points': [(label, point)
+                                    for label, _kind, point in seeds],
                     'excludes': names, 'estimate': estimate}
         except Exception as error:  # noqa: BLE001 - judged without it
             logger.warning('retained-region context not read: %s', error)
@@ -11321,6 +11925,27 @@ runTimeModifiable true;
                 estimate=context.get('estimate'), counted=counted))
         except Exception as error:  # noqa: BLE001 - the check still files
             logger.warning('retained regions not judged: %s', error)
+        DomainOperations._apply_thin_regions(context, parsed)
+
+    @staticmethod
+    def _apply_thin_regions(context: dict | None, parsed) -> None:
+        """DP-2635: judge each seeded region for being too thin to resolve.
+
+        Both snappy routes reach it through `_apply_retained_regions`: the
+        QA check and the pipeline's own checkMesh. A region under
+        `thin_regions.FAIL_CELLS_ACROSS` cells across is filed as a failure
+        naming it; Accept anyway records a decision to keep it.
+        """
+        if not context or parsed is None or parsed.incomplete:
+            return
+        from foammesh.core.quality import thin_regions
+
+        try:
+            thin_regions.apply(parsed, thin_regions.assess(
+                thin_regions.measure(context['case_path'],
+                                     context.get('seed_points') or ())))
+        except Exception as error:  # noqa: BLE001 - the check still files
+            logger.warning('thin regions not judged: %s', error)
 
     def _farfield_seed_gate(self, session: CaseSession, excludes) -> list[str]:
         """Plan 37 UF14: with a farfield, the seeds against it and the bodies.
@@ -11767,6 +12392,415 @@ runTimeModifiable true;
                 '-allTopology -allGeometry -writeSets profile.')
         return CheckMeshProfile.fallback(), warnings
 
+    # -- Plan 41 GN25b S3: the automatic size field ------------------------ #
+
+    def _sizing_status_payload(self, session: CaseSession) -> dict:
+        from foammesh.core.sizing import field_runner, service
+        from foammesh.core.sizing.staging import (
+            StagingError, geometry_digest)
+        payload = field_runner.status(session.case_path)
+        try:
+            staged, fingerprint, bounds = service.stage_case(session.case_path)
+            inputs = service.resolve_inputs(session.state.db, bounds)
+            key = field_runner.reuse_key(geometry_digest(staged), inputs)
+        except (StagingError, ValueError) as error:
+            payload['geometry'] = str(error)
+            return payload
+        payload = field_runner.status(session.case_path, key)
+        payload['current_key'] = key
+        payload['inputs'] = inputs.to_dict()
+        payload['prepared_fingerprint'] = fingerprint
+        return payload
+
+    def _sizing_field_status(self, session: CaseSession,
+                             command: Command) -> OperationResult:
+        """none / ready / stale, with the inputs a run would use now."""
+        return self._read_result(
+            session, command, self._sizing_status_payload(session))
+
+    async def _sizing_tool_status(self, session: CaseSession,
+                                  command: Command) -> OperationResult:
+        """Where ``foammesh-sizefield`` is in the OpenFOAM 13 runtime."""
+        import asyncio
+        from foammesh.core.gmsh.launch_profiles import configured_profiles
+        from foammesh.core.sizing import tool_setup
+        profiles = configured_profiles()
+        if not profiles:
+            raise CapabilityUnavailableError(tool_setup.MISSING_TOOL)
+        found = await asyncio.to_thread(tool_setup.status, profiles[0])
+        return self._read_result(session, command, found)
+
+    async def _sizing_tool_setup(self, session: CaseSession,
+                                 command: Command) -> OperationResult:
+        """Copy the shipped tool into the runtime (the "Set up automatic
+        sizing" action): one file, under the runtime user's home, checked by
+        SHA-256 and ``--version``. Never silent, never a download."""
+        import asyncio
+        from foammesh.core.gmsh.launch_profiles import configured_profiles
+        from foammesh.core.sizing import tool_setup
+        profiles = configured_profiles()
+        if not profiles:
+            raise CapabilityUnavailableError(tool_setup.MISSING_TOOL)
+        try:
+            found = await asyncio.to_thread(tool_setup.set_up, profiles[0])
+        except tool_setup.ToolSetupError as error:
+            return OperationResult(
+                'failed', command.operation, session.revisions,
+                warnings=(str(error),), payload={})
+        found['message'] = tool_setup.record(found)
+        return OperationResult('accepted', command.operation,
+                               session.revisions, payload=found)
+
+    async def _sizing_field_compute(self, session: CaseSession,
+                                    command: Command) -> OperationResult:
+        """Run ``foammesh-sizefield`` (or Reuse the saved field) and propose.
+
+        Reuse is on unless ``reuse`` is false; a saved field is reused only
+        when the geometry digest and the inputs are the ones it was made
+        from. The proposals of the active route are recorded in
+        ``foammesh/sizing/proposals.json``; a value the user typed is never
+        replaced by a re-derive.
+        """
+        from foammesh.core.gmsh.launch_profiles import configured_profiles
+        from foammesh.core.engine.registry import configured_engine_id
+        from foammesh.core.sizing import field_runner, service
+        from foammesh.core.sizing.field_model import SizeField, SizeFieldError
+        from foammesh.core.sizing.staging import (
+            StagingError, geometry_digest)
+        session.require_writable()
+        try:
+            staged, fingerprint, bounds = service.stage_case(session.case_path)
+            overrides = {k: command.parameters[k] for k in (
+                'hmin', 'hmax', 'hbulk', 'gradation', 'nodes_per_two_pi',
+                'nodes_per_gap', 'feature_angle', 'smoothing', 'aniso')
+                if k in command.parameters}
+            inputs = service.resolve_inputs(
+                session.state.db, bounds, overrides)
+        except (StagingError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
+        key = field_runner.reuse_key(geometry_digest(staged), inputs)
+        folder = field_runner.field_dir(session.case_path)
+        reused = bool(command.parameters.get('reuse', True)) \
+            and field_runner.reusable(session.case_path, key)
+        payload = {'key': key, 'inputs': inputs.to_dict(), 'reused': reused}
+        if not reused:
+            profiles = configured_profiles()
+            if not profiles:
+                raise CapabilityUnavailableError(field_runner.MISSING_TOOL)
+            folder.mkdir(parents=True, exist_ok=True)
+            argv = field_runner.build_argv(profiles[0], staged, folder, inputs)
+            execution = await self._context(session).executor.execute(
+                session, OperationSpec(
+                    operation=command.operation, argv=argv,
+                    cwd=session.case_path, timeout=_stage_timeout(
+                        command.parameters, 3600),
+                    log_path=field_runner.sizing_dir(
+                        session.case_path) / 'field.log',
+                    expected_artifacts=(ExpectedArtifact(
+                        folder / 'field.json', kind='sizing-field',
+                        validator=lambda path: path.is_file()
+                        and path.stat().st_size > 0),),
+                    artifact_event=Event.ARTIFACT_QUALITY_CHANGED,
+                    expects_mesh_change=False),
+                on_line=command.parameters.get('on_line'))
+            payload['job'] = execution.to_payload()
+            if not execution.succeeded:
+                tail = execution.job.output or ''
+                refusal = field_runner.refusal_for(
+                    tail, execution.job.returncode)
+                return OperationResult(
+                    'failed', command.operation, session.revisions,
+                    warnings=(refusal or execution.job.error
+                              or 'the size field run did not finish',),
+                    payload=payload)
+        try:
+            field = SizeField.load(folder)
+        except SizeFieldError as error:
+            raise ValidationFailedError(str(error)) from error
+        if not reused:
+            field_runner.write_record(
+                session.case_path, key, geometry_digest(staged), inputs,
+                staged, field)
+        engine = configured_engine_id(session.state.db)
+        settings = service.stored_inputs(session.state.db)
+        settings.update(inputs.to_dict())
+        store = service.store_for(session.case_path)
+        # FIX-H. A grid the user typed or already ran is respected, and
+        # every level is computed against the cell it really gives (Plan 41
+        # 4.8.3), not against the field's own grid. The service decides which
+        # engines have such a grid.
+        extra = service.grid_extras(engine, session.state.db,
+                                    session.case_path, bounds)
+        # GN25f. Curves and volumes of the prepared geometry (Gmsh rows).
+        extra.update(service.gmsh_extras(
+            engine, session.state.db, session.case_path, staged, settings))
+        notes = list(extra.pop('notes', ()))
+        rows = service.proposals_for(engine, field, staged, bounds, settings,
+                                     **extra)
+        # Plan 41 GN25c. The case refines groups, not surfaces.
+        # GN25f. A split STL stages its solids (face0) but the groups are bound
+        # to the patches cut from them (elbow_1): say which is which.
+        aliases = {}
+        try:
+            for patch in self._patch_editor(session).rows():
+                for ref in patch.get('source_refs') or ():
+                    if ref.get('original_name') and patch.get('name'):
+                        aliases[service._safe(ref['original_name'])] =                             service._safe(patch['name'])
+        except Exception:                                    # noqa: BLE001
+            aliases = {}
+        rows, unbound = service.regroup(session.state.db, rows, aliases)
+        changed = store.propose(rows, field_digest=key)
+        store.notes = notes
+        store.save()
+        payload.update({
+            'engine': engine, 'leaves': field.leaf_count,
+            'estimated_hex_cells': field.estimated_hex_cells(),
+            'estimated_tets': field.estimated_tets(),
+            'proposals': len(store.entries), 'changed': changed,
+            'unbound_surfaces': unbound, 'notes': notes,
+            'badges': store.badges()})
+        return OperationResult(
+            'accepted', command.operation, session.revisions, payload=payload)
+
+    def _sizing_proposals_get(self, session: CaseSession,
+                              command: Command) -> OperationResult:
+        from foammesh.core.sizing import service
+        store = service.store_for(session.case_path)
+        if command.parameters.get('badges_only'):
+            # Plan 41 GN25c. Pages ask for the badges on every refresh; the
+            # current values are only needed to apply.
+            return self._read_result(session, command, {
+                'field_digest': store.field_digest,
+                'badges': store.badges(), 'notes': list(store.notes),
+                'locked': [t for t, e in store.entries.items() if e.locked]})
+        values, unresolved = service.current_values(
+            session.state.db, list(store.entries))
+        return self._read_result(session, command, {
+            'field_digest': store.field_digest,
+            'proposals': [item.to_dict() for item in store.entries.values()],
+            'badges': store.badges(), 'current': values,
+            'unresolved': unresolved})
+
+    def _sizing_proposals_apply(self, session: CaseSession,
+                                command: Command) -> OperationResult:
+        """Fill the empty or field-sourced controls; leave typed ones alone."""
+        from foammesh.core.sizing import service
+        from foammesh.core.project import Source
+        session.require_writable()
+        store = service.store_for(session.case_path)
+        wanted = command.parameters.get('targets')
+        wanted = set(wanted) if wanted else None
+        values, unresolved = service.current_values(
+            session.state.db, list(store.entries))
+        writes, skipped = store.apply(
+            values, targets=wanted, defaults=service.defaults_for(values))
+        skipped.update(unresolved)
+        # GN25f. The grid's counts are read in counts mode only. A target cell
+        # size the user typed keeps the mode it was typed for.
+        # FIX-H. And keeps its grid: the counts beside a typed target size
+        # are not read by blockMesh, but they are in its fingerprint, so
+        # writing them staled a blockMesh that had run on the typed size.
+        from foammesh.core.sizing.proposals import (
+            SKIP_STAGE_RAN, SKIP_TYPED)
+        ran = service.stages_run(session.case_path)
+        typed_grid = service.base_grid_is_users(
+            session.state.db, session.case_path)
+        for target in list(writes):
+            stage = service.owning_stage(target)
+            if stage is None:
+                continue
+            if stage in ran:
+                # FIX-H. A control of a stage that already ran upstream of
+                # the page applying (Base grid: blockMesh, the features
+                # angle: surfaceFeatures) is not rewritten from Castellation:
+                # the write staled that stage and Castellate refused. The
+                # proposal stays as the badge on the owning page, where an
+                # edit reruns the stage through the normal path.
+                reason = SKIP_STAGE_RAN
+            elif typed_grid and target.startswith('meshing.base_grid.'):
+                reason = SKIP_TYPED
+            else:
+                continue
+            writes.pop(target)
+            skipped[target] = reason
+            entry = store.entries.get(target)
+            if entry is not None:
+                entry.applied = None
+        data = session.state.checkout()
+        done, failed = service.write_values(data, session.state.db, writes)
+        skipped.update(failed)
+        for target in failed:
+            entry = store.entries.get(target)
+            if entry is not None:
+                entry.applied = None
+        if done:
+            source_map = {
+                'gui': Source.GUI, 'rest': Source.API, 'cli': Source.CLI,
+                'automation': Source.AGENT, 'system': Source.SYSTEM}
+            session.state.commit(
+                data, action='apply size field proposals',
+                source=source_map[command.source.value],
+                target='sizing/proposals',
+                reason=f'{count_text(len(done), "control")} set from the '
+                       'size field')
+        store.save()
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            payload={'applied': done, 'skipped': skipped})
+
+    def _sizing_proposals_lock(self, session: CaseSession,
+                               command: Command) -> OperationResult:
+        from foammesh.core.sizing import service
+        target = str(command.parameters.get('target') or '')
+        locked = bool(command.parameters.get('locked', True))
+        store = service.store_for(session.case_path)
+        if not store.lock(target, locked):
+            raise ValidationFailedError(f'no size proposal for {target!r}')
+        store.save()
+        return self._read_result(session, command, {
+            'target': target, 'locked': locked})
+
+    # -- Plan 41 GN25c: the card's preview, conformity and Refine to field -- #
+
+    def _sizing_loaded_field(self, session: CaseSession):
+        """``(field, staged, bounds, settings, engine)`` or a refusal."""
+        from foammesh.core.engine.registry import configured_engine_id
+        from foammesh.core.sizing import field_runner, service
+        from foammesh.core.sizing.field_model import SizeField, SizeFieldError
+        from foammesh.core.sizing.staging import StagingError
+        try:
+            field = SizeField.load(field_runner.field_dir(session.case_path))
+        except SizeFieldError as error:
+            raise PreconditionFailedError(
+                'Compute the size field first: ' + str(error)) from error
+        try:
+            staged, _fingerprint, bounds = service.stage_case(
+                session.case_path)
+        except (StagingError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
+        settings = service.stored_inputs(session.state.db)
+        settings.update(field.settings)
+        return (field, staged, bounds, settings,
+                configured_engine_id(session.state.db))
+
+    def _sizing_field_preview(self, session: CaseSession,
+                              command: Command) -> OperationResult:
+        """What the card shows, and the arrays the viewport overlay draws.
+
+        The overlay arrays are saved beside the field as ``preview.npz`` so
+        the viewport reads them without the field in memory.
+        """
+        import numpy as np
+        from foammesh.core.sizing import field_runner, preview
+        try:
+            field, staged, bounds, settings, engine = \
+                self._sizing_loaded_field(session)
+        except PreconditionFailedError as error:
+            return self._read_result(session, command, {
+                'available': False, 'reason': str(error)})
+        payload = preview.summary(field, staged, bounds, engine)
+        thin = tuple(item['patch'] for item in payload['thin'])
+        arrays = preview.overlay_arrays(
+            field, staged, float(settings.get('feature_angle') or 30.0), thin)
+        folder = field_runner.sizing_dir(session.case_path)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / 'preview.npz'
+        np.savez(path, **arrays)
+        payload.update({'available': True, 'overlay': str(path),
+                        'features': int(len(arrays['features'])),
+                        'thin_faces': int(arrays['thin'].sum())})
+        return self._read_result(session, command, payload)
+
+    async def _sizing_conformity(self, session: CaseSession,
+                                 command: Command) -> OperationResult:
+        """Cell size over field size for each cell of the mesh on disk."""
+        import asyncio
+        import numpy as np
+        from foammesh.core.mesh.poly_mesh_boundary import (
+            PolyMeshReadError, read_poly_mesh)
+        from foammesh.core.sizing import conformity, field_runner, mesh_cells
+        try:
+            field, _staged, _bounds, _settings, _engine = \
+                self._sizing_loaded_field(session)
+        except PreconditionFailedError as error:
+            return self._read_result(session, command, {
+                'available': False, 'reason': str(error)})
+        case_path = session.case_path
+        folder = field_runner.sizing_dir(case_path)
+
+        def measure():
+            poly = read_poly_mesh(case_path)
+            centres, volumes = mesh_cells.cell_geometry(poly)
+            found = conformity.conformity(
+                field, centres, mesh_cells.cell_sizes(poly, volumes))
+            keep = np.nonzero(found.under | found.over)[0]
+            if len(keep) > 200000:
+                keep = keep[np.linspace(0, len(keep) - 1, 200000).astype(int)]
+            folder.mkdir(parents=True, exist_ok=True)
+            np.savez(folder / 'conformity.npz', centres=centres[keep],
+                     ratio=found.ratio[keep], cells=keep)
+            return found
+
+        try:
+            found = await asyncio.to_thread(measure)
+        except (PolyMeshReadError, OSError) as error:
+            return self._read_result(session, command, {
+                'available': False,
+                'reason': f'there is no mesh to measure: {error}'})
+        payload = found.to_dict()
+        payload.update({
+            'available': True, 'overlay': str(folder / 'conformity.npz'),
+            'under_limit': conformity.UNDER_RESOLVED,
+            'over_limit': conformity.OVER_RESOLVED,
+            'worst': mesh_cells.worst_cells(found, 50)})
+        return self._read_result(session, command, payload)
+
+    async def _sizing_refine_to_field(self, session: CaseSession,
+                                      command: Command) -> OperationResult:
+        """``refineMesh`` on the cells larger than 1.5 x the field there."""
+        import asyncio
+        from foammesh.core.sizing import refine
+        session.require_writable()
+        field, _staged, _bounds, _settings, _engine = \
+            self._sizing_loaded_field(session)
+        try:
+            labels, total = await asyncio.to_thread(
+                refine.cells_to_refine, field, session.case_path)
+        except refine.RefineError as error:
+            raise PreconditionFailedError(str(error)) from error
+        payload = {'cells': int(total), 'to_refine': int(len(labels))}
+        if not len(labels):
+            return OperationResult(
+                'accepted', command.operation, session.revisions,
+                warnings=('no cell is larger than 1.5 times the field, so '
+                          'nothing was refined',), payload=payload)
+        utility = await self._utility_ready('refineMesh')
+        refine.write_files(session.case_path, labels)
+        registry = self._capabilities_registry()
+        semantic = refine.argv(session.case_path)
+        if hasattr(registry, 'command'):
+            launch = registry.command('refineMesh', semantic,
+                                      cwd=session.case_path)
+            argv = launch.argv
+        else:
+            argv = (utility, *semantic)
+        execution = await self._context(session).executor.execute(
+            session, OperationSpec(
+                operation=command.operation, argv=argv,
+                cwd=session.case_path, mutation=True,
+                timeout=_stage_timeout(command.parameters, 3600),
+                max_output_bytes=4 * 1024 * 1024,
+                log_path=session.case_path / 'foammesh' / 'logs'
+                / 'refineMesh.log',
+                invalidated_outputs=('quality',)),
+            on_line=command.parameters.get('on_line'))
+        payload['job'] = execution.to_payload()
+        return OperationResult(
+            'accepted' if execution.succeeded else 'failed',
+            command.operation, session.revisions,
+            invalidated_outputs=('quality',),
+            warnings=tuple(execution.warnings), payload=payload)
+
     async def _mesh_check(self, session: CaseSession,
                           command: Command) -> OperationResult:
         """Qualify this mesh the way the saved Mesh setup selection asks.
@@ -11783,8 +12817,12 @@ runTimeModifiable true;
         pressing it. What changed is that the run now reads
         :func:`core.facade.quality_routes.quality_checks_for` and executes
         every check that selection names, in the order it names them.
+
+        Plan 41 GN16. On the Gmsh route the button is an optional action: a
+        check the preset does not name runs on its own.
         """
-        return await self._run_route_checks(session, command)
+        return await self._run_route_checks(
+            session, command, pressed='checkmesh')
 
     async def _run_checkmesh(self, session: CaseSession,
                              command: Command) -> OperationResult:
@@ -11967,8 +13005,11 @@ runTimeModifiable true;
         same reason: a Gmsh project targeting SU2 needs the native element
         check as well as the readiness check, and a readiness pass on its own
         never stood for both.
+
+        Plan 41 GN16: optional on the Gmsh route (see :meth:`_mesh_check`).
         """
-        return await self._run_route_checks(session, command)
+        return await self._run_route_checks(
+            session, command, pressed='su2-readiness')
 
     async def _run_su2_readiness(self, session: CaseSession,
                                  command: Command) -> OperationResult:
@@ -12001,7 +13042,8 @@ runTimeModifiable true;
             warnings=tuple(verdict['warnings']), payload=payload)
 
     def _record_qa_run(self, session: CaseSession, command: Command,
-                       *, warning: bool, waived: bool = False) -> dict | None:
+                       *, warning: bool, waived: bool = False,
+                       evidenced: bool = False) -> dict | None:
         """Advance ``<engine>.qa`` on the strength of a checkMesh that ran.
 
         ``waived`` is R119's distinction: a check a human overrode is recorded
@@ -12017,6 +13059,9 @@ runTimeModifiable true;
             if waived:
                 return store.record_atomic_run_success(
                     [task_id], warning=warning, waived=(task_id,))
+            if evidenced:
+                return store.record_atomic_run_success(
+                    [task_id], warning=warning, evidenced=(task_id,))
             return store.record_stage_success(task_id, warning=warning)
         except (TaskStateError, FacadeError, LookupError, OSError,
                 ValueError) as error:
@@ -12027,7 +13072,9 @@ runTimeModifiable true;
     # -- QA-06: the route decides which checks run ------------------------- #
 
     async def _run_route_checks(self, session: CaseSession,
-                                command: Command) -> OperationResult:
+                                command: Command,
+                                pressed: str | None = None
+                                ) -> OperationResult:
         """Run every check the saved Mesh setup selection asks for, in order.
 
         Plan 33 QA-06. The selection is the single source of truth about
@@ -12051,6 +13098,11 @@ runTimeModifiable true;
         target = configured_target_solver(session.state.db)
         engine = self._engine_id(session)
         required = quality_checks_for(target, engine)
+        if pressed is not None and pressed not in required:
+            # Plan 41 GN16 (G2). The check was asked for by name and the
+            # preset does not name it: it runs alone, writes its own report,
+            # and moves no row and no route record.
+            return await self._run_optional_check(session, command, pressed)
         route = route_key(target, engine)
         previous = load_route_record(session.case_path)
         terminal = required[-1]
@@ -12101,15 +13153,37 @@ runTimeModifiable true;
                 'reason': reason, 'missing': [str(name) for name in missing]}}
             payload['message'] = reason
         else:
+            # Plan 40 UXA6 (#1). checkMesh was not among the checks that
+            # rated this mesh: the row says evidenced, not done.
+            extra = ({'evidenced': True}
+                     if any(e.get('check') == 'su2-readiness'
+                            for e in entries)
+                     and not any(e.get('check') == 'checkmesh'
+                                 for e in entries) else {})
             payload['task_state'] = self._record_qa_run(
                 session, command, warning=verdict != PASSED or bool(blemished),
-                waived='quality_override' in payload)
+                waived='quality_override' in payload, **extra)
         warnings = tuple(outcome.warnings) if outcome is not None else ()
         return OperationResult(
             'accepted' if verdict == PASSED else 'failed',
             command.operation, session.revisions,
             invalidated_outputs=('quality',), warnings=warnings,
             payload=payload)
+
+    async def _run_optional_check(self, session: CaseSession,
+                                  command: Command,
+                                  check: str) -> OperationResult:
+        """Run one check the preset does not name, and nothing else."""
+        if check == 'checkmesh':
+            produced = await self._run_checkmesh(session, command)
+        else:
+            produced = await self._run_su2_readiness(session, command)
+        payload = dict(produced.payload or {})
+        payload['optional_check'] = check
+        return OperationResult(
+            produced.status, command.operation, session.revisions,
+            invalidated_outputs=('quality',),
+            warnings=tuple(produced.warnings), payload=payload)
 
     @staticmethod
     def _missing_route_reason(entries: list, missing: list) -> str:
@@ -12321,8 +13395,13 @@ runTimeModifiable true;
         # the report is rewritten by every run, so a decision taken against an
         # earlier mesh lapses here exactly as §8.6 says it should.
         waivers = self._binding_waivers(session, waiver_module)
+        # Plan 41 GN14 (F5d). The Gmsh element gate's own stored report, with
+        # the elements it named, beside the target check's.
+        from foammesh.core.gmsh.quality import REPORT_TASK_ID as _GATE_TASK
+
         return self._read_result(session, command, {
             'report': _to_payload(report) if report else None,
+            'gate': self._current_report(session, _GATE_TASK) or None,
             'waivers': waivers,
             'route_checks': self._route_checks_payload(session)})
 
@@ -12793,8 +13872,23 @@ runTimeModifiable true;
         evidence = self._current_evidence(session)
 
         refusals: list = []
-        model = self._boundary_model(session, patch_identity,
-                                     boundary_only=True, refusals=refusals)
+        # Plan 41 GN23. The diagnostic native task measures the Gmsh mesh
+        # itself -- the session's hand-over, or the file named -- with no
+        # polyMesh behind it; the report names the file it measured.
+        native = self._native_mesh_path(session, command, task_id)
+        if native is not None:
+            from foammesh.core.mesh import native_mesh as native_module
+            try:
+                evidence = {**evidence,
+                            'native_mesh_digest': native_module.digest(native)}
+            except OSError as error:
+                refusals.append({'reason': 'unreadable',
+                                 'message': f'{native}: {error}'})
+                native = None
+        model = (self._native_boundary_model(session, native, refusals)
+                 if native is not None else
+                 self._boundary_model(session, patch_identity,
+                                      boundary_only=True, refusals=refusals))
         if model is None:
             report = report_module.build(
                 task_id, (), evidence=evidence, policy=policy)
@@ -13011,6 +14105,62 @@ runTimeModifiable true;
             if records:
                 drawable[name] = records
         return drawable
+
+    @staticmethod
+    def _native_mesh_path(session: CaseSession, command: Command,
+                          task_id: str):
+        """Plan 41 GN23. The Gmsh mesh file ``task_id`` measures, or ``None``.
+
+        Only the diagnostic native task reads a mesh file: the one named by
+        the ``native_mesh`` parameter, else the session's hand-over.
+        """
+        if task_id != 'gmsh.fidelity_native':
+            return None
+        named = command.parameters.get('native_mesh')
+        candidate = Path(named) if named else (
+            Path(session.case_path) / 'foammesh' / 'gmsh' / 'handover'
+            / 'mesh.vtu')
+        return candidate if candidate.is_file() else None
+
+    def _native_boundary_model(self, session: CaseSession, native,
+                               refusals=None):
+        """The reconciled boundary of a native Gmsh mesh, or ``None``.
+
+        The identity is joined in memory against the current prepared groups;
+        the published mesh's sidecar is neither read nor rewritten, because it
+        describes the polyMesh the accepted run published.
+        """
+        from foammesh.core.mesh import native_mesh as native_module
+        from foammesh.core.quality import patch_identity
+        from foammesh.core.quality.geometry_fidelity import boundary
+
+        try:
+            mesh = native_module.read_native_mesh(native)
+            _flat, _offsets, patches = native_module.boundary_faces(mesh)
+            prepared = self._current_prepared(session)
+            categories = _gmsh_patch_categories(prepared) if prepared else {}
+            reference = getattr(prepared, 'reference', None)
+            manifest = (getattr(prepared, 'group_manifest', None)
+                        or getattr(reference, 'group_manifest', None))
+            identity = patch_identity.build(
+                'gmsh',
+                published_patches=[
+                    {'name': patch.name, 'solver_name': patch.name,
+                     'category': categories.get(patch.name) or ''}
+                    for patch in patches],
+                group_manifest=manifest,
+                prepared_revision_id=getattr(reference, 'revision_id', None),
+                prepared_fingerprint=getattr(reference, 'fingerprint', None))
+            return boundary.load_native_mesh(native, identity)
+        except MemoryError:
+            raise
+        except Exception as error:                          # noqa: BLE001
+            if refusals is not None:
+                refusals.append({
+                    'reason': str(getattr(error, 'reason', '')
+                                  or type(error).__name__),
+                    'message': str(error)})
+            return None
 
     def _boundary_model(self, session: CaseSession, patch_identity, *,
                         boundary_only: bool = False, refusals=None):
@@ -13810,6 +14960,9 @@ runTimeModifiable true;
             'target_solver': target,
             'target_solver_name': solver_display_name(target),
             'recommended_entry_id': recommended,
+            # UXA7 (#57). The extrusion choice is offered only for a case
+            # that is a 2D or axisymmetric section.
+            'meshes_a_section': bool(_meshes_a_section(session.state.db)),
         })
 
     def _export_native(self, session: CaseSession, command: Command) -> OperationResult:

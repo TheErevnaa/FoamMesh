@@ -51,20 +51,6 @@ SHAPE = PREFIX + 'shape'
 CENTRE_MODE = PREFIX + 'centre_mode'
 ALWAYS = ('enabled', 'shape', 'centreMode')
 
-ENGINE_FIELD = 'mesh.engine'
-UNSELECTED = 'unselected'
-
-
-def engine_of(client) -> str:
-    """The case's meshing engine id, or ``''`` when it cannot be read."""
-    try:
-        value = client.field_values((ENGINE_FIELD,))[ENGINE_FIELD]
-    except Exception:                                        # noqa: BLE001
-        return ''
-    value = getattr(value, 'value', value)
-    return str(value or '').strip().lower()
-
-
 def spec_from_values(values: dict) -> farfield_spec.FarfieldSpec:
     """A ``FarfieldSpec`` from field-id values (the dialog's or the store's)."""
     leaves: dict = {}
@@ -113,8 +99,7 @@ class FarfieldDialog(QDialog):
     #: Emitted after the facade accepted the edit.
     farfieldChanged = Signal()
 
-    def __init__(self, client, parent=None, *, bounds=None, engine='',
-                 geometry_kind=farfield_spec.CAD):
+    def __init__(self, client, parent=None, *, bounds=None):
         """*bounds* is the model extent in Gmsh order (``xmin ymin zmin xmax
         ymax zmax``, metres) or ``None`` when there is no geometry yet."""
         super().__init__(parent)
@@ -122,8 +107,6 @@ class FarfieldDialog(QDialog):
         self.setWindowTitle(self.tr('Farfield'))
         self._client = client
         self._bounds = list(bounds) if bounds is not None else None
-        self._engine = str(engine or '')
-        self._kind = geometry_kind
         self._editors: dict[str, FieldEditor] = {}
         self._loaded: dict = {}
 
@@ -136,8 +119,9 @@ class FarfieldDialog(QDialog):
         intro = QLabel(self.tr(
             'The outer boundary of an external-flow domain: a box, sphere or '
             'cylinder around the geometry, with the bodies cut out of it. '
-            'Both engines build this one farfield; the Gmsh import settings '
-            'on Preparation edit the same values.'), self)
+            'This is the intent only, stored with the case: whichever '
+            'meshing engine you choose afterwards builds it, and says there '
+            'if it cannot.'), self)
         intro.setWordWrap(True)
         intro.setObjectName('farfieldDialogIntro')
         outer.addWidget(intro)
@@ -163,13 +147,6 @@ class FarfieldDialog(QDialog):
         self._fitNote.setWordWrap(True)
         self._fitNote.hide()
         outer.addWidget(self._fitNote)
-
-        self._supportNote = QLabel(self)
-        self._supportNote.setObjectName('farfieldDialogSupportNote')
-        self._supportNote.setWordWrap(True)
-        self._supportNote.setProperty('foammeshStatus', 'warning')
-        self._supportNote.hide()
-        outer.addWidget(self._supportNote)
 
         self._problems = QLabel(self)
         self._problems.setObjectName('farfieldDialogProblems')
@@ -306,13 +283,6 @@ class FarfieldDialog(QDialog):
         self._problems.setVisible(bool(problems))
         self._ok.setEnabled(not problems)
 
-        note = ''
-        if spec.enabled and self._engine and self._engine != UNSELECTED:
-            answer = farfield_spec.support(spec, self._engine, self._kind)
-            if not answer.supported and not problems:
-                note = answer.reason[:1].upper() + answer.reason[1:] + '.'
-        self._supportNote.setText(note)
-        self._supportNote.setVisible(bool(note))
         self._fitContents()
         # Rows just shown settle their heights on the next pass of the
         # event loop; fit again once they have.

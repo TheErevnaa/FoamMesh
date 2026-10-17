@@ -199,9 +199,20 @@ def _skewness(mesh, face_ids, face_centre, face_area, owner_centre, separation,
 
 def compute_cell_fields(mesh) -> dict[str, np.ndarray]:
     """The four arrays, keyed by the names the renderer already asks for."""
+    return compute_cell_fields_and_centres(mesh)[0]
+
+
+def compute_cell_fields_and_centres(mesh):
+    """The four arrays and the cell centroids they were measured from.
+
+    Plan 39 VI8. The ranked worst-cell list names where each cell is, and the
+    centroid is a by-product of the volume the arrays already need; asking for
+    it separately would run the pyramid decomposition a second time.
+    """
     cell_count = mesh.cell_count
     if not cell_count:
-        return {name: np.zeros(0, dtype=np.float64) for name in FIELD_NAMES}
+        return ({name: np.zeros(0, dtype=np.float64) for name in FIELD_NAMES},
+                np.zeros((0, 3), dtype=np.float64))
 
     face_centre, face_area = _face_geometry(mesh)
     cell_centre, volume = _cell_geometry(mesh, face_centre, face_area)
@@ -254,12 +265,12 @@ def compute_cell_fields(mesh) -> dict[str, np.ndarray]:
                          owner_centre, along, precomputed_vector=offset - along)
         np.maximum.at(skewness, owner[internal:], skew)
 
-    return {
+    return ({
         'cellAspectRatio': aspect,
         'nonOrthoAngle': non_ortho,
         'skewness': skewness,
         'cellVolume': volume,
-    }
+    }, cell_centre)
 
 
 class _FaceSubset:
@@ -444,3 +455,98 @@ def histogram(values, bins: int = 40) -> dict:
     return {'edges': [float(edge) for edge in edges],
             'counts': [int(count) for count in counts],
             'total': int(values.size)}
+
+
+#: Metrics where a small number is the bad one: the cells that hurt are the
+#: tiny (or inverted) ones. Every other metric is worst when large.
+#: Plan 41 GN13. Gmsh's measures (the cell arrays of the session hand-over)
+#: are all qualities, or sizes, whose bad end is low.
+GMSH_FIELD_NAMES = ('gmshSICN', 'gmshSIGE', 'gmshGamma', 'gmshMinIsotropy',
+                    'gmshMinDetJac', 'gmshVolume')
+WORST_IS_LOW = frozenset({'cellVolume', *GMSH_FIELD_NAMES})
+
+#: How many cells a ranked list holds unless the caller asks otherwise (Plan 39
+#: Q5, decided 2026-10-09).
+DEFAULT_RANK_COUNT = 100
+
+
+def rank_cells(values, count: int = DEFAULT_RANK_COUNT, *,
+               worst_is_high: bool = True) -> np.ndarray:
+    """Cell ids of the ``count`` worst values, worst first.
+
+    ``np.partition`` so a 20 M-cell mesh is not sorted to find a hundred of
+    them; only the survivors are ordered. Ties break on the lower cell id so the
+    list is the same every time it is asked. A value that is not a number is
+    not ranked: it cannot be called worse than a measured one, and a NaN sorted
+    to the front would put an unmeasured cell above the cell that fails.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    count = max(int(count), 0)
+    if values.size == 0 or count == 0:
+        return np.zeros(0, dtype=np.int64)
+    finite = np.isfinite(values)
+    if finite.all():
+        candidates = values
+        ids = None
+    else:
+        ids = np.flatnonzero(finite)
+        candidates = values[ids]
+    if candidates.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    key = -candidates if worst_is_high else candidates
+    if count < key.size:
+        # Keep everything tied with the count-th value, so the cut between two
+        # equal values is made by cell id and not by the partition's whim.
+        cut = np.partition(key, count - 1)[count - 1]
+        keep = np.flatnonzero(key <= cut)
+    else:
+        keep = np.arange(key.size)
+    order = np.lexsort((keep, key[keep]))
+    chosen = keep[order][:count]
+    return (chosen if ids is None else ids[chosen]).astype(np.int64)
+
+
+def _zone_names(mesh, cells: np.ndarray) -> list[str]:
+    """The cell zone each listed cell belongs to, '' where it has none."""
+    names = [''] * int(cells.size)
+    for zone in getattr(mesh, 'cell_zones', ()) or ():
+        labels = np.sort(np.asarray(zone.labels, dtype=np.int64))
+        if labels.size == 0:
+            continue
+        place = np.searchsorted(labels, cells)
+        place[place >= labels.size] = labels.size - 1
+        for position in np.flatnonzero(labels[place] == cells):
+            if not names[position]:
+                names[position] = str(zone.name)
+    return names
+
+
+def ranked_worst_cells(fields: dict[str, np.ndarray], centres,
+                       count: int = DEFAULT_RANK_COUNT, *, mesh=None,
+                       ) -> dict[str, list[dict]]:
+    """The worst ``count`` cells of every metric, as rows a table can show.
+
+    Each row carries what the viewport needs to go there: the cell id, its
+    value, its centroid (model units, the frame the mesh is in) and a length
+    for the cell, ``|V|^(1/3)``, to frame it by. ``mesh`` is only for the zone
+    names.
+    """
+    centres = np.asarray(centres, dtype=np.float64)
+    volume = np.abs(np.asarray(fields.get('cellVolume', ()), dtype=np.float64))
+    out: dict[str, list[dict]] = {}
+    for name in FIELD_NAMES:
+        values = fields.get(name)
+        if values is None:
+            continue
+        cells = rank_cells(values, count,
+                           worst_is_high=name not in WORST_IS_LOW)
+        zones = (_zone_names(mesh, cells) if mesh is not None
+                 else [''] * int(cells.size))
+        out[name] = [
+            {'tag': str(int(cell)), 'cell': int(cell), 'metric': name,
+             'value': float(values[cell]),
+             'centroid': [float(x) for x in centres[cell]],
+             'size': float(np.cbrt(volume[cell])) if volume.size else 0.0,
+             'zone': zones[position]}
+            for position, cell in enumerate(cells)]
+    return out

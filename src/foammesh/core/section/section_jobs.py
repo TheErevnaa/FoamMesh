@@ -62,6 +62,12 @@ class SectionRequest:
     #: UF11. A frozen layer: runs ``((first, last), ...)`` of the cells to
     #: draw whole, wherever the planes are (``None``: a section).
     cells: tuple | None = None
+    #: Plan 39 VI10b. How several planes combine, the whole-cell rule, and a
+    #: one-shot ``'larger'`` / ``'smaller'`` asking the worker to choose the
+    #: planes' keep sides (``None``: as the planes say).
+    combine: str | None = None
+    cell_rule: str | None = None
+    prefer: str | None = None
 
     def key(self, revision=None) -> tuple:
         return section_key(self.case_id, revision or self.mesh_revision,
@@ -81,6 +87,9 @@ class SectionRequest:
             args['tolerance'] = self.tolerance
         if self.cells is not None:
             args['cells'] = [list(run) for run in self.cells]
+        for name in ('combine', 'cell_rule', 'prefer'):
+            if getattr(self, name):
+                args[name] = getattr(self, name)
         return args
 
 

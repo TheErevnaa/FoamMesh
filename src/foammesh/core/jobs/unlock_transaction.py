@@ -1,11 +1,13 @@
 """Unlock a step and undo the unlock (Plan 37 UF5, DP-1041/DP-1042).
 
-Unlocking a step reopens it and every step that depends on it. The mesh on
-disk stays where it is ("previous result -- edits not applied"); what changes
-is the record of which settings it was made from. Undo -- **Restore previous
+Unlocking a step reopens it and every step after it. Plan 43 LY9 (the
+completion lock): the mesh and the quality results are deleted from the case,
+so the mesh that exists always matches the locked settings and cannot be out
+of date; the later steps keep their values and go back to not done. The copy
+this transaction keeps is what makes that safe. Undo -- **Restore previous
 mesh and settings** -- puts the settings, the task states, the publication
-record and the mesh back together, and stays available until a new mesher
-run is admitted.
+record, the completion locks, the quality results and the mesh back together,
+and stays available until a new mesher run is admitted.
 
 Neither can be one filesystem transaction, so both are written as an
 explicit, durable two-phase operation under ``foammesh/workflow/pending``::
@@ -16,7 +18,9 @@ explicit, durable two-phase operation under ``foammesh/workflow/pending``::
         settings.yaml      the authored settings at unlock
         tasks.json         the task-state file at unlock (absent = none)
         publications.json  the publication record at unlock (absent = none)
+        completion.json    the completion locks at unlock (absent = none)
         mesh/              an independent copy of constant/polyMesh
+        quality/           an independent copy of foammesh/quality
         geometry/          an independent copy of foammesh/geometry (the
                            imported, repaired and prepared surfaces)
         surfaces/          the project's in-memory geometry surfaces, as the
@@ -41,6 +45,7 @@ from uuid import uuid4
 
 from . import case_lease
 from .run_records import _write_durably
+from foammesh.core.workflow.task_state_store import GEOMETRY_STEP
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,24 @@ def _mesh_dir(case_path) -> Path:
 
 def _geometry_dir(case_path) -> Path:
     return Path(case_path) / 'foammesh' / 'geometry'
+
+
+def _quality_dir(case_path) -> Path:
+    return Path(case_path) / 'foammesh' / 'quality'
+
+
+def remove_results(case_path) -> dict:
+    """Delete the mesh and the quality results of the case (Plan 43 LY9).
+
+    Idempotent: what is not there is not an error. Returns what was removed.
+    """
+    removed = {'mesh': False, 'quality': False}
+    for key, folder in (('mesh', _mesh_dir(case_path)),
+                        ('quality', _quality_dir(case_path))):
+        if folder.exists():
+            _remove(folder)
+            removed[key] = not folder.exists()
+    return removed
 
 
 def _now() -> str:
@@ -212,18 +235,24 @@ def undo_available(case_path) -> dict | None:
 def preview_unlock(case_path, store, task_id: str) -> dict:
     """The tasks, the artifacts and the disk cost of unlocking *task_id*."""
     descriptor = store.descriptor
-    descriptor.task(task_id)
-    locked = store.locked_tasks()
+    store.step_title(task_id)
+    locked = store.locked_steps()
     scope = store.unlock_scope(task_id)
     lock_state = store.lock_state()
     mesh = _mesh_dir(case_path)
     mesh_bytes = tree_bytes(mesh)
+    quality = _quality_dir(case_path)
+    quality_bytes = tree_bytes(quality)
     geometry_bytes = tree_bytes(_geometry_dir(case_path))
     artifacts = []
     if mesh.is_dir():
         artifacts.append({'path': 'constant/polyMesh', 'bytes': mesh_bytes,
-                          'becomes': 'previous result — kept on disk, edits '
-                                     'not applied, restorable by undo'})
+                          'becomes': 'deleted; a copy is kept so undo '
+                                     'restores it'})
+    if quality.is_dir():
+        artifacts.append({'path': 'foammesh/quality', 'bytes': quality_bytes,
+                          'becomes': 'deleted; a copy is kept so undo '
+                                     'restores it'})
     if geometry_bytes:
         artifacts.append({'path': 'foammesh/geometry', 'bytes': geometry_bytes,
                           'becomes': 'kept as it is; a copy is kept so undo '
@@ -237,17 +266,22 @@ def preview_unlock(case_path, store, task_id: str) -> dict:
     exported = _exports_of_live_mesh(case_path)
     return {
         'task_id': task_id,
-        'title': descriptor.task(task_id).title,
+        'title': store.step_title(task_id),
         'locked': task_id in locked,
         'scope': scope,
-        'titles': [descriptor.task(item).title for item in scope],
+        'titles': [store.step_title(item) for item in scope],
+        'deletes_mesh': mesh.is_dir(),
+        'deletes_quality': quality.is_dir(),
+        'resets_values': task_id == GEOMETRY_STEP,
+        'completion_locked': [item for item in scope
+                              if item in store.completion_locked_steps()],
         'published': [item for item in scope
                       if (lock_state.get(item) or {}).get('locked')],
         'artifacts': artifacts,
-        'disk_cost_bytes': mesh_bytes + geometry_bytes,
+        'disk_cost_bytes': mesh_bytes + quality_bytes + geometry_bytes,
         'free_bytes': free,
-        'fits': free is None or free >= (mesh_bytes + geometry_bytes
-                                         + reserve),
+        'fits': free is None or free >= (mesh_bytes + quality_bytes
+                                         + geometry_bytes + reserve),
         'reserve_bytes': reserve,
         'replaces_undo': existing,
         'publication_revision': int(store.publications().get('revision') or 0),
@@ -351,9 +385,9 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
         recover(case_path, store)
         _preflight(case_path, UNLOCK_OPERATION, recovery)
         descriptor = store.descriptor
-        descriptor.task(task_id)
-        if not store.is_locked(task_id):
-            raise UnlockError(f'{descriptor.task(task_id).title} is not locked',
+        store.step_title(task_id)
+        if not store.is_step_locked(task_id):
+            raise UnlockError(f'{store.step_title(task_id)} is not locked',
                               code='not_locked', details={'task_id': task_id})
         revision = int(store.publications().get('revision') or 0)
         if expected_revision is not None and int(expected_revision) != revision:
@@ -363,13 +397,15 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
                 details={'expected': int(expected_revision), 'actual': revision})
         mesh = _mesh_dir(case_path)
         mesh_bytes = tree_bytes(mesh)
+        quality = _quality_dir(case_path)
+        quality_bytes = tree_bytes(quality)
         geometry = _geometry_dir(case_path)
         geometry_bytes = tree_bytes(geometry)
         try:
             free = disk_usage(case_path).free
         except OSError:
             free = None
-        required = mesh_bytes + geometry_bytes + _reserve_bytes()
+        required = mesh_bytes + quality_bytes + geometry_bytes + _reserve_bytes()
         if free is not None and free < required:
             raise UnlockError(
                 'not enough free disk space to keep the previous mesh for undo',
@@ -383,10 +419,11 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
             'schema_version': SCHEMA_VERSION, 'operation': UNLOCK_OPERATION,
             'operation_id': operation_id, 'state': PREPARED,
             'engine_id': descriptor.engine_id, 'task_id': task_id,
-            'title': descriptor.task(task_id).title, 'scope': scope,
-            'titles': [descriptor.task(item).title for item in scope],
+            'title': store.step_title(task_id), 'scope': scope,
+            'titles': [store.step_title(item) for item in scope],
             'created_at': _now(), 'publication_revision': revision,
             'mesh_bytes': mesh_bytes, 'geometry_bytes': geometry_bytes,
+            'quality_bytes': quality_bytes, 'results_removed': False,
         }
         try:
             folder.mkdir(parents=True)
@@ -396,6 +433,13 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
                                ('publications.json', publications_text)):
                 if text is not None:
                     _write_text(folder / name, text)
+            completion_text = store.completion_text()
+            if completion_text is not None:
+                _write_text(folder / 'completion.json', completion_text)
+            if quality.is_dir():
+                manifest['quality_files'] = {
+                    name: list(value) for name, value in
+                    _copy_tree_hashing(quality, folder / 'quality').items()}
             if mesh.is_dir():
                 manifest['mesh_files'] = {
                     name: list(value) for name, value in
@@ -423,7 +467,7 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
         result = store.unlock(task_id, operation_id=operation_id)
         try:
             staled = export_provenance.mark_stale(
-                case_path, reason=f'unlocked {descriptor.task(task_id).title}',
+                case_path, reason=f'unlocked {store.step_title(task_id)}',
                 operation_id=operation_id)
         except (OSError, ValueError):
             staled = []
@@ -433,8 +477,16 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
                         staled_exports=[item['destination'] for item in staled])
         _write_durably(folder / 'manifest.json', manifest)
         _adopt(case_path, operation_id)
+        # Plan 43 LY9. The copy is durable and the unlock is committed: only
+        # now are the mesh and the quality results taken away. A crash before
+        # this line is finished by `recover` (the manifest says they are
+        # still to go).
+        removed = remove_results(case_path)
+        manifest.update(results_removed=True)
+        _write_durably(folder / 'manifest.json', manifest)
         return dict(result, operation_id=operation_id,
-                    undo=undo_available(case_path), staled_exports=staled)
+                    undo=undo_available(case_path), staled_exports=staled,
+                    removed=removed)
 
 
 def _adopt(case_path: Path, operation_id: str) -> None:
@@ -487,7 +539,8 @@ def undo(case_path, store, *, restore_settings, recovery=None,
             raise UnlockError('there is no unlock to undo', code='undo_unavailable')
         _preflight(case_path, UNDO_OPERATION, recovery)
         folder = Path(record['folder'])
-        for key, name in (('mesh_files', 'mesh'), ('geometry_files', 'geometry')):
+        for key, name in (('mesh_files', 'mesh'), ('geometry_files', 'geometry'),
+                          ('quality_files', 'quality')):
             expected = record.get(key)
             if expected is None:
                 continue
@@ -524,6 +577,7 @@ def _finish_undo(case_path: Path, store, folder: Path, manifest: dict,
     """Idempotent: a crash anywhere in here is finished by :func:`recover`."""
     restored_mesh = _swap_in(folder / 'mesh', _mesh_dir(case_path))
     restored_geometry = _swap_in(folder / 'geometry', _geometry_dir(case_path))
+    restored_quality = _swap_in(folder / 'quality', _quality_dir(case_path))
     if restore_surfaces is not None and (folder / 'surfaces').is_dir():
         restore_surfaces(folder / 'surfaces')
     settings_text = (folder / 'settings.yaml').read_text(encoding='utf-8')
@@ -533,6 +587,9 @@ def _finish_undo(case_path: Path, store, folder: Path, manifest: dict,
     store.restore_documents(
         tasks.read_text(encoding='utf-8') if tasks.is_file() else None,
         publications.read_text(encoding='utf-8') if publications.is_file() else None)
+    completion = folder / 'completion.json'
+    store.restore_completion(
+        completion.read_text(encoding='utf-8') if completion.is_file() else None)
     from . import export_provenance
     try:
         export_provenance.unmark(case_path, manifest['operation_id'])
@@ -544,6 +601,7 @@ def _finish_undo(case_path: Path, store, folder: Path, manifest: dict,
             'task_id': manifest.get('task_id'),
             'restored_mesh': restored_mesh,
             'restored_geometry': restored_geometry,
+            'restored_quality': restored_quality,
             'locked': store.locked_tasks()}
 
 
@@ -609,6 +667,10 @@ def recover(case_path, store=None, *, restore_settings=None,
                 tasks.read_text(encoding='utf-8') if tasks.is_file() else None,
                 publications.read_text(encoding='utf-8')
                 if publications.is_file() else None)
+            completion = folder / 'completion.json'
+            target.restore_completion(
+                completion.read_text(encoding='utf-8')
+                if completion.is_file() else None)
             _remove(folder)
             report['rolled_back'].append(folder.name)
         elif state == RESTORING:
@@ -620,6 +682,13 @@ def recover(case_path, store=None, *, restore_settings=None,
             report['resumed'].append(folder.name)
         elif state == COMMITTED and folder.name != current:
             committed.append((str(manifest.get('committed_at') or ''), folder.name))
+        if (state == COMMITTED and manifest.get('results_removed') is False
+                and (folder.name == current or not current)):
+            # Plan 43 LY9. A crash between the commit and the deletion: the
+            # steps are unlocked, so the mesh has to go with them.
+            remove_results(case_path)
+            manifest['results_removed'] = True
+            _write_durably(folder / 'manifest.json', manifest)
     if committed:
         current_manifest = _read_json(root / str(current) / 'manifest.json') if current else None
         current_at = str((current_manifest or {}).get('committed_at') or '')

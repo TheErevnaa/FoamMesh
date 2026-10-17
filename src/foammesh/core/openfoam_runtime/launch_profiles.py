@@ -117,9 +117,14 @@ class OpenFoamLaunchProfile:
         if windows.drive.startswith('\\\\'):
             raise LaunchProfileError(
                 'UNC paths require an explicit local-copy workspace profile')
-        drive = windows.drive.rstrip(':').lower()
-        parts = [part for part in windows.parts[1:] if part not in {'\\', '/'}]
-        return str(PurePosixPath('/mnt', drive, *parts))
+        # DP-1440. OpenFOAM refuses a space or a quote in a path.
+        from foammesh.core.wsl_paths import WslPathError, runtime_path
+        try:
+            return runtime_path(
+                path, distribution=self.distribution,
+                wsl_executable=self.wsl_executable)
+        except WslPathError as error:
+            raise LaunchProfileError(str(error)) from error
 
     @property
     def fingerprint(self) -> str:

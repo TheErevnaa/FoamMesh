@@ -1,0 +1,148 @@
+/*
+ * FoamMesh global theme. All colour values are strict semantic tokens.
+ *
+ * Deliberately NOT a blanket `QWidget { background }` rule. Window and text
+ * base colours come from QPalette (see palette.py), so screens that still
+ * carry local styles keep reading correctly and owner-drawn Qt widgets adapt
+ * on their own. A blanket rule painted every container the same flat tone,
+ * which flattened the surface/elevated hierarchy and was most of why FoamMesh
+ * and FoamFlow read as different applications despite sharing this system.
+ *
+ * Metrics are shared with FoamFlow on purpose: 6px radii, 5px/14px on buttons,
+ * 4px/8px inside fields, 16px indicators. Two apps in one suite should not
+ * disagree about the size of a button.
+ */
+
+QMainWindow, QDialog {
+    background: {{background.canvas}};
+}
+
+QToolTip {
+    background: {{background.raised}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.group}}px;
+    padding: 4px 6px;
+}
+
+/* -- buttons ------------------------------------------------------------- */
+/* Buttons are raised surfaces, not input fields. Lumping them into one rule
+ * with QLineEdit made a button and a text box indistinguishable.
+ * Plan 44 MF2 (mockup .btn): control fill, 1px border, radius 3, 3px 12px,
+ * 12.5px. The height stays 28 (DP-189) until MF19 owns the density switch:
+ * 20 content + 2 border + 6 padding = 28. */
+
+QPushButton, QToolButton {
+    background: {{background.control}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    padding: 3px 12px;
+    color: {{foreground.primary}};
+    font-size: {{type.body}}px;
+    /* DP-189. 20 + 2 border + 6 padding = 28, the one control height. */
+    min-height: 20px;
+}
+QToolButton {
+    padding: 4px 6px;
+    /* The windows11 style adds 3px of its own to a tool button, so
+     * 15 + 3 + 2 border + 8 padding = 28. */
+    min-height: 15px;
+}
+QPushButton:hover, QToolButton:hover {
+    background: {{background.control}};
+    border-color: {{accent.default}};
+    color: {{foreground.strong}};
+}
+/* Pressed and checked read as the selected state. They set no colour of
+ * their own: the words stay the page ink (the strong ink under the pointer),
+ * which reads on the pale light selection where white would be 1.3:1. */
+QPushButton:pressed, QToolButton:pressed,
+QPushButton:checked, QToolButton:checked {
+    background: {{selection.background}};
+    border-color: {{accent.default}};
+}
+/* Focus is a 2px accent ring that takes its pixel from the padding, so the
+ * box keeps its size. A tool button has 4px above and below to give; a push
+ * button 3px. */
+QPushButton:focus {
+    border: 2px solid {{accent.default}};
+    padding: 2px 11px;
+}
+QToolButton:focus {
+    border: 2px solid {{accent.default}};
+    padding: 3px 5px;
+}
+QPushButton:disabled, QToolButton:disabled {
+    color: {{disabled.foreground}};
+    background: {{disabled.background}};
+    border-color: {{border.default}};
+}
+/* DP-193. The accent's two jobs want opposite lightnesses: the border is
+   the bright line colour so the button's edge stands off the page, and
+   the fill is dark enough to carry white words. */
+QPushButton:default {
+    background: {{accent.fill}};
+    color: {{accent.text}};
+    border: 1px solid {{accent.default}};
+}
+QPushButton:default:hover {
+    background: {{accent.fill.hover}};
+    border-color: {{accent.hover}};
+}
+QPushButton:default:focus {
+    border: 2px solid {{accent.hover}};
+    padding: 2px 11px;
+}
+/* R4. A disabled default button read as enabled: `:default` and `:disabled`
+   have equal specificity, and the later rule wins, so the Import STL dialog's
+   OK button -- disabled from the moment it opens, while the Files list is
+   still empty -- was painted in the accent colour and invited a click that
+   could do nothing. Restated after the `:default` rules so a disabled button
+   looks disabled whichever else applies. */
+QPushButton:default:disabled, QPushButton:default:disabled:hover {
+    color: {{disabled.foreground}};
+    background: {{disabled.background}};
+    border: 1px solid {{border.default}};
+}
+QToolButton::menu-indicator { image: none; width: 0; }
+
+/* Plan 44 F1 (MF20). A secondary action drawn as a text link
+   (widgets/link_button.py): accent words on no fill and no border,
+   underlined under the pointer or with the keyboard focus, muted when
+   disabled. Restated for :default so a dialog's default button that is a
+   link keeps the link look.
+   SG2: the words are `foreground.link` at rest, on hover and pressed. The
+   accent itself is 3.8:1 on the light surface and `accent.hover` 4.1:1 on
+   the raised one; the link ink holds 4.5:1 on every ground in both themes,
+   and the underline is what marks the hover. */
+QPushButton[foammeshRole="link"],
+QPushButton[foammeshRole="link"]:default {
+    background: transparent;
+    border: 0;
+    padding: 0 2px;
+    min-height: 0;
+    color: {{foreground.link}};
+    text-align: left;
+}
+QPushButton[foammeshRole="link"]:hover,
+QPushButton[foammeshRole="link"]:focus,
+QPushButton[foammeshRole="link"]:default:hover {
+    background: transparent;
+    border: 0;
+    padding: 0 2px;
+    color: {{foreground.link}};
+    text-decoration: underline;
+}
+QPushButton[foammeshRole="link"]:pressed {
+    background: transparent;
+    border: 0;
+    color: {{foreground.link}};
+}
+QPushButton[foammeshRole="link"]:disabled,
+QPushButton[foammeshRole="link"]:default:disabled {
+    background: transparent;
+    border: 0;
+    color: {{disabled.foreground}};
+    text-decoration: none;
+}
+

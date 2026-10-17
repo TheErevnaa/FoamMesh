@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.core.gmsh import fields as _gmsh_fields
+from widgets import async_message_box as messages
+from foammesh.view.theming.status_colors import set_status
 from foammesh.db.configurations_schema import (
     GmshPeriodicTransform, InterfaceTransform, ThicknessModel,
 )
@@ -107,6 +109,19 @@ RELEVANCE: dict = {
             'zone_inside_point.z'}),
         'none': frozenset(),
     }),
+    # Plan 43 LY13 D1. The legacy volume dialog showed only what the chosen
+    # mode reads (`VolumeRefinementDialog._modeChanged`): the span is read
+    # by the two span modes alone, and the distance by distance mode (the
+    # single-band fallback when no ramp rows exist) and the span modes. The
+    # level is read by every mode and is named in no branch. A hidden box
+    # keeps its value; the editor is only taken off the form.
+    'meshing.castellation.volume_refinements': ('mode', {
+        'inside': frozenset(),
+        'outside': frozenset(),
+        'distance': frozenset({'distance'}),
+        'insideSpan': frozenset({'distance', 'cells_across_span'}),
+        'outsideSpan': frozenset({'distance', 'cells_across_span'}),
+    }),
     # C31-11. A layer group either follows its geometry binding or matches
     # patch names with an expression. Showing the expression box on a group
     # that is bound to geometry invites someone to fill it in and expect it
@@ -131,6 +146,12 @@ RELEVANCE: dict = {
             'rotation_centre.x', 'rotation_centre.y', 'rotation_centre.z',
             'rotation_axis.x', 'rotation_axis.y', 'rotation_axis.z',
             'rotation_angle_degrees'}),
+        # Plan 41 GN11. A matrix and its translation column.
+        GmshPeriodicTransform.AFFINE.value: frozenset({
+            'translation.x', 'translation.y', 'translation.z',
+            'affine_row_x.x', 'affine_row_x.y', 'affine_row_x.z',
+            'affine_row_y.x', 'affine_row_y.y', 'affine_row_y.z',
+            'affine_row_z.x', 'affine_row_z.y', 'affine_row_z.z'}),
     }),
 }
 
@@ -158,6 +179,33 @@ ALSO_RELEVANT: dict = {
             'first_layer_thickness', 'final_layer_thickness'}),
     }),),
 }
+# Plan 43 LY13 D1. `firstAndRelativeFinal` is itself the relative form, so
+# the legacy thickness form hid the relative-sizes flag under it
+# (`ThicknessForm._thicknessModelChanged`).
+_THICKNESS = dict(ALSO_RELEVANT['meshing.layers.groups'][0][1])
+ALSO_RELEVANT['meshing.layers.groups'] = (('thickness_model', {
+    _model: (_keys if _model == ThicknessModel.FIRST_AND_RELATIVE_FINAL.value
+             else _keys | {'relative_sizes'})
+    for _model, _keys in _THICKNESS.items()}),)
+
+
+#: Plan 43 LY13 D1. Rows that are *greyed*, not hidden, unless a field holds
+#: a value: ``collection -> (controlling field, value, fields)``. The legacy
+#: layer dialog disabled the count and the thickness controls unless the
+#: policy was Grow (`BoundarySettingDialog._layerPolicyChanged`); a frozen
+#: group is `nSurfaceLayers 0` whatever the box holds. The values are kept.
+GREYED_UNLESS: dict = {
+    'meshing.layers.groups': ('layer_policy', 'grow', frozenset({
+        'surface_layers', 'thickness_model', 'relative_sizes',
+        'first_layer_thickness', 'final_layer_thickness', 'thickness',
+        'expansion_ratio', 'min_thickness'})),
+}
+
+
+def greying_rules(collection_id: str) -> tuple:
+    """The ``(controlling, value, fields)`` greying rules of a collection."""
+    rule = GREYED_UNLESS.get(collection_id)
+    return (rule,) if rule else ()
 
 
 def relevance_rules(collection_id: str) -> tuple:
@@ -227,6 +275,23 @@ def check_relevance(relevance: dict) -> None:
                     f'no such field')
 
 
+def _check_greying() -> None:
+    from foammesh.core.facade.field_adapters import EntityAdapter
+    from foammesh.core.facade.fields import REGISTRY
+
+    for collection_id, (controlling, value, keys) in GREYED_UNLESS.items():
+        fields = EntityAdapter(REGISTRY.collections[collection_id]).fields
+        descriptor = getattr(fields.get(controlling), 'descriptor', None)
+        if descriptor is None or value not in (descriptor.enum or ()):
+            raise ValueError(
+                f'{collection_id} is greyed by {controlling}={value!r}, '
+                f'which is not one of its values')
+        unknown = sorted(key for key in keys if key not in fields)
+        if unknown:
+            raise ValueError(f'{collection_id} greys {unknown}: no such field')
+
+
+_check_greying()
 check_relevance(RELEVANCE)
 for _collection, _rules in ALSO_RELEVANT.items():
     for _rule in _rules:
@@ -293,7 +358,8 @@ class ChildEditorDialog(QDialog):
     """
 
     def __init__(self, title: str, editors: dict, parent=None,
-                 relevance=None, annotations=None):
+                 relevance=None, annotations=None, hidden=None,
+                 greyed=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setObjectName('childEditorDialog')
@@ -302,8 +368,17 @@ class ChildEditorDialog(QDialog):
         # DP-596: one rule or several, held as a tuple of rules.
         self._relevance = _as_rules(relevance)
         self._annotations = dict(annotations or {})
+        #: Plan 43 LY13 D1. A callable returning the field keys the panel
+        #: knows are not read right now (beyond the choice rules above), and
+        #: the greying rules; both are re-judged by `applyRelevance`.
+        self._hidden = hidden
+        self._greyed = tuple(greyed or ())
         self._form = None
         self._rowKeys: list = []
+        #: The note on each annotation row (None on a field row), and the
+        #: notes this dialog itself hid, so a note its owner hid stays hidden.
+        self._rowNotes: dict = {}
+        self._hiddenByRules: set = set()
         #: DP-922. The x/y/z row of each vector, stacked when docked.
         self._vectorRows: list = []
 
@@ -344,6 +419,7 @@ class ChildEditorDialog(QDialog):
                 # not apply.
                 widget.setVisible(True)
                 form.addRow('', widget)
+                self._rowNotes[len(self._rowKeys)] = widget
                 self._rowKeys.append(frozenset(keys))
                 rows += 1
 
@@ -373,7 +449,21 @@ class ChildEditorDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         # DP-1190. Set while the step this row belongs to is locked.
         self._lockedNoteText = ''
+        #: A panel may refuse OK with a sentence: ``acceptGuard()`` returns
+        #: it (or ``''``), and it is said above the buttons, in place.
+        self.acceptGuard = None
+        self.refusal = QLabel(self)
+        self.refusal.setObjectName('childEditorRefusal')
+        self.refusal.setWordWrap(True)
+        set_status(self.refusal, 'error')
+        self.refusal.setVisible(False)
+        outer.addWidget(self.refusal)
         outer.addWidget(self.buttons)
+
+        # Plan 44 MF26. The sheet look: a caps title, the 78 px label column
+        # and the buttons on the right, Cancel then OK.
+        self.sheetTitle = messages.makeSheet(self, title)
+        messages.labelGrid(form)
 
         self._connectRelevance()
 
@@ -400,6 +490,12 @@ class ChildEditorDialog(QDialog):
         # pressed OK (Enter included).
         if self._lockedNoteText:
             return
+        if self.acceptGuard is not None:
+            problem = str(self.acceptGuard() or '')
+            self.refusal.setText(problem)
+            self.refusal.setVisible(bool(problem))
+            if problem:
+                return
         super().accept()
 
     # -- Plan 36 RP2: shown without blocking the viewport ------------------ #
@@ -446,13 +542,18 @@ class ChildEditorDialog(QDialog):
     # -- show only the fields the chosen kind actually has ------------------ #
 
     def _connectRelevance(self):
-        if not self._relevance:
-            return
         self._relevance = tuple(
             rule for rule in self._relevance if rule[0] in self._editors)
+        self._greyed = tuple(
+            rule for rule in self._greyed if rule[0] in self._editors)
         self._relevanceSources = []
-        for controlling, _branches in self._relevance:
+        if not (self._relevance or self._greyed or self._hidden):
+            return
+        for controlling in ([rule[0] for rule in self._relevance]
+                            + [rule[0] for rule in self._greyed]):
             editor = self._editors[controlling]
+            if editor in self._relevanceSources:
+                continue
             self._relevanceSources.append(editor)
             editor.valueChanged.connect(self._relevanceChanged)
         self.applyRelevance()
@@ -504,7 +605,9 @@ class ChildEditorDialog(QDialog):
         pair edited as rotational and then reopened on a translational one
         would otherwise still be showing the rotation rows.
         """
-        if not self._relevance or self._form is None:
+        if self._form is None:
+            return
+        if not (self._relevance or self._greyed or self._hidden):
             return
         judged = []
         for controlling, branches in self._relevance:
@@ -519,12 +622,51 @@ class ChildEditorDialog(QDialog):
             conditional = frozenset().union(*branches.values()) if branches \
                 else frozenset()
             judged.append((conditional, applicable))
+        forced = (frozenset(self._hidden() or ()) if self._hidden
+                  else frozenset())
         for row, keys in enumerate(self._rowKeys):
             # DP-596: a row stays only if every rule naming it keeps it.
             visible = all(not (keys & conditional) or bool(keys & applicable)
                           for conditional, applicable in judged)
+            if visible and forced and keys & forced:
+                visible = False
+            note = self._rowNotes.get(row)
+            if note is not None:
+                # Plan 43 LY13 D1 (P1). A note its owner hid (the extent line
+                # with no box) is not brought back by a rule that keeps its row.
+                if note.isHidden() and note not in self._hiddenByRules:
+                    visible = False
+                if visible:
+                    self._hiddenByRules.discard(note)
+                else:
+                    if not note.isHidden():
+                        self._hiddenByRules.add(note)
             self._form.setRowVisible(row, visible)
+        self._applyGreying()
         self.adjustSize()
+
+    def _applyGreying(self) -> None:
+        """Grey the rows a greying rule says are not read (values kept)."""
+        for controlling, wanted, keys in self._greyed:
+            value = self._editors[controlling].value()
+            value = getattr(value, 'value', value)
+            on = str(value) == str(wanted)
+            for key in keys:
+                editor = self._editors.get(key)
+                if editor is None:
+                    continue
+                for widget in (editor.editor, editor.label,
+                               editor.unit_label):
+                    try:
+                        if widget is None:
+                            continue
+                        if widget is editor.editor:
+                            widget.setEnabled(
+                                on and not editor.descriptor.read_only)
+                        else:
+                            widget.setEnabled(on)
+                    except RuntimeError:
+                        continue
 
     def _scalar(self, editor) -> QWidget:
         host = QWidget(self)

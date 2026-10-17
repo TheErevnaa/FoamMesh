@@ -12,6 +12,8 @@ import numpy as np
 from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.vtkCommonCore import vtkLookupTable
 
+from foammesh.rendering import quality_scale
+from foammesh.support import colour_standard
 from foammesh.core.section.section_colour import (
     SOURCE_CELL_ID, cellTypeCodes)
 
@@ -75,10 +77,13 @@ def lookupTable(mapped) -> vtkLookupTable:
             red, green, blue = CATEGORY_COLOURS[index % len(CATEGORY_COLOURS)]
             table.SetTableValue(index, red, green, blue, 1.0)
             table.SetAnnotation(int(code), name)
-    else:
-        table.SetHueRange(0.667, 0.0)
+    elif quality_scale.is_quality_array(mapped.get('array')):
+        # Plan 39 VI9: the table the Quality inspector paints the volume with.
         low, high = mapped['range']
-        table.SetRange(low, high)
+        return quality_scale.lookup_table(mapped['array'], low, high)
+    else:
+        low, high = mapped['range']
+        return colour_standard.lookup_table('section', low, high)
     table.Build()
     return table
 
@@ -90,6 +95,10 @@ class MapperColouring:
         self._saved = {}
 
     def colour(self, mapper, mapped) -> None:
+        # Plan 39 VI9: a metric the Quality inspector is colouring takes the
+        # inspector's band, so the cut and the volume agree. Updated in place:
+        # the caller words its legend from the same mapping.
+        mapped.update(quality_scale.share(mapped))
         key = id(mapper)
         if key not in self._saved:
             self._saved[key] = (mapper, mapper.GetScalarVisibility(),
@@ -97,11 +106,11 @@ class MapperColouring:
         mapper.SetLookupTable(lookupTable(mapped))
         mapper.SetScalarModeToUseCellFieldData()
         mapper.SelectColorArray(mapped['array'])
-        if mapped['kind'] == 'categorical':
-            mapper.UseLookupTableScalarRangeOn()
-        else:
-            mapper.UseLookupTableScalarRangeOff()
-            mapper.SetScalarRange(*mapped['range'])
+        # The table carries the range (it may be narrower than the data:
+        # Around the limit), so a change of the standard moves both.
+        mapper.UseLookupTableScalarRangeOn()
+        if mapped['kind'] != 'categorical':
+            mapper.SetScalarRange(*mapper.GetLookupTable().GetTableRange())
         mapper.ScalarVisibilityOn()
 
     def isColoured(self, mapper) -> bool:

@@ -4,7 +4,9 @@
 
 The request (``args``, JSON)::
 
-    case          the case directory (or its constant/polyMesh)
+    case          the case directory (or its constant/polyMesh); Plan 41
+                  GN23: or a Gmsh hand-over ``mesh.vtu`` / native ``.msh``,
+                  cut as the polyhedral mesh `core.mesh.native_mesh` makes
     case_id       the window's id for the case (echoed in the key)
     out_dir       job scratch: the result is published at out_dir/<job>/
     job           the job's name (default: a fresh uuid)
@@ -14,6 +16,15 @@ The request (``args``, JSON)::
                   'keep'} -- keep is the keep-side sign
     active        index of the active plane in ``planes``
     mode          'slice' | 'cut_cells' | 'clip' | 'clip_whole_cells'
+    combine       VI10b (F2f), the clip modes: 'common' (default, the
+                  intersection of the kept half-spaces) | 'remove_common'
+                  (everything outside it) | 'each' (every plane on its own)
+    cell_rule     VI10b (F2g), 'clip_whole_cells' and 'cut_cells': 'any'
+                  (default) | 'centroid' | 'entire'
+    prefer        VI10b (F2f): 'larger' | 'smaller' sets every enabled
+                  plane's keep side to the combination keeping the larger /
+                  smaller volume (cells counted by centre); the sides chosen
+                  come back in ``planes`` and ``resolved_keeps``
     arrays        source arrays wanted: 'cell_zone', 'cell_level',
                   'cell_type' (UF9, `section_colour` codes) and
                   'quality.<field>' (UF9, `core.quality.cell_fields`, computed
@@ -89,6 +100,7 @@ from pathlib import Path
 
 import numpy as np
 
+from foammesh.core.section import pieces
 from foammesh.core.section.modes import SectionMode
 from foammesh.core.section.plane_state import PlaneState
 from foammesh.core.section.section_geometry import (
@@ -126,11 +138,17 @@ READ_LIMITS = ('max_points', 'max_faces', 'max_cells', 'max_input_bytes',
 #: are the ones the local cut carries, so one colour mapping serves both.
 QUALITY_ARRAYS = ('cellAspectRatio', 'nonOrthoAngle', 'skewness',
                   'cellVolume')
+#: Plan 41 GN23: Gmsh's own measures, which a native mesh carries per cell
+#: (``gmsh.gmshSICN`` ...); no other mesh has them.
+GMSH_ARRAYS = ('gmshSICN', 'gmshSIGE', 'gmshGamma', 'gmshMinIsotropy',
+               'gmshMinDetJac', 'gmshVolume')
 KNOWN_ARRAYS = ('cell_zone', 'cell_level', 'cell_type',
-                *(f'quality.{name}' for name in QUALITY_ARRAYS))
+                *(f'quality.{name}' for name in QUALITY_ARRAYS),
+                *(f'gmsh.{name}' for name in GMSH_ARRAYS))
 VTK_ARRAY_NAMES = {'cell_zone': 'cellZone', 'cell_level': 'cellLevel',
                    'cell_type': 'cellType',
-                   **{f'quality.{name}': name for name in QUALITY_ARRAYS}}
+                   **{f'quality.{name}': name for name in QUALITY_ARRAYS},
+                   **{f'gmsh.{name}': name for name in GMSH_ARRAYS}}
 
 POLICY = {
     'clip': 'the intersection of every enabled plane\'s kept half-space',
@@ -359,7 +377,7 @@ def _quality(geometry, kept):
     return cell_fields.compute_cell_fields_for(mesh, kept)
 
 
-def _source_arrays(topology, wanted, geometry=None, kept=None):
+def _source_arrays(topology, wanted, geometry=None, kept=None, native=None):
     """``({name: per-cell array}, {name: reason}, zone names)``.
 
     ``kept``: the cells the section draws. Quality is computed for those
@@ -386,9 +404,24 @@ def _source_arrays(topology, wanted, geometry=None, kept=None):
                 continue
             arrays[name] = np.asarray(quality[field], dtype=np.float64)
             continue
+        if name.startswith('gmsh.'):
+            held = (native.cell_arrays if native is not None else {})
+            if name[len('gmsh.'):] in held:
+                arrays[name] = np.asarray(held[name[len('gmsh.'):]],
+                                          dtype=np.float64)
+            elif native is None:
+                unavailable[name] = ('only a Gmsh mesh carries the Gmsh '
+                                     'measures')
+            else:
+                unavailable[name] = ('the mesh was handed over without '
+                                     'quality arrays')
+            continue
         if name == 'cell_zone':
             if topology.cell_zones_status != 'read':
-                unavailable[name] = 'the mesh has no cellZones'
+                unavailable[name] = ('the mesh has no cellZones'
+                                     if native is None else
+                                     'the mesh has no physical volume '
+                                     'groups')
                 continue
             values = np.full(topology.n_cells, -1, dtype=np.int32)
             zone_names = []
@@ -433,6 +466,12 @@ def _import_solver_early() -> None:
                      daemon=True).start()
 
 
+def is_native_mesh(path) -> bool:
+    """Whether *path* names a Gmsh hand-over / ``.msh`` rather than a case."""
+    path = Path(str(path))
+    return path.suffix.lower() in ('.vtu', '.msh') and path.is_file()
+
+
 def run(args: dict) -> dict:
     """The worker body; returns the manifest (see the module docstring)."""
     from foammesh.core.mesh.poly_mesh_topology import (
@@ -451,6 +490,14 @@ def run(args: dict) -> dict:
         raise SectionRefused('bad_request',
                              f'the active plane {active_index} is not '
                              'enabled', active=active_index)
+    try:
+        combine = pieces.parse(pieces.Combine, args.get('combine'),
+                               pieces.Combine.COMMON)
+        rule = pieces.parse(pieces.CellRule, args.get('cell_rule'),
+                            pieces.CellRule.ANY)
+        prefer = pieces.parse(pieces.Prefer, args.get('prefer'), None)
+    except ValueError as error:
+        raise SectionRefused('bad_request', str(error)) from None
     wanted = list(dict.fromkeys(args.get('arrays') or ()))
     frozen = _frozen_runs(args)
     budgets = dict(args.get('budgets') or {})
@@ -475,13 +522,24 @@ def run(args: dict) -> dict:
         _import_solver_early()
     try:
         clock.check()
+        native = None
         try:
-            topology = read_mesh_topology(
-                args['case'], budget=read_budget,
-                include_cell_zones='cell_zone' in wanted,
-                include_cell_level='cell_level' in wanted,
-                snapshot_dir=(scratch / 'snapshot') if args.get('snapshot')
-                else None)
+            if is_native_mesh(args['case']):
+                # Plan 41 GN23: a Gmsh hand-over or .msh, read into the same
+                # topology a polyMesh gives.
+                from foammesh.core.mesh import native_mesh
+                try:
+                    native = native_mesh.read_native_mesh(args['case'])
+                    topology = native_mesh.topology(native)
+                except native_mesh.NativeMeshError as error:
+                    raise SectionRefused('bad_request', str(error)) from None
+            else:
+                topology = read_mesh_topology(
+                    args['case'], budget=read_budget,
+                    include_cell_zones='cell_zone' in wanted,
+                    include_cell_level='cell_level' in wanted,
+                    snapshot_dir=(scratch / 'snapshot')
+                    if args.get('snapshot') else None)
         except TopologyRefusal as error:
             detail = refusal_dict(error)
             extra = {('layout_reason' if key == 'reason' else
@@ -509,6 +567,12 @@ def run(args: dict) -> dict:
         diagonal = _diagonal(points)
         relative = float(args.get('tolerance') or RELATIVE_TOLERANCE)
         tol = relative * diagonal
+        resolved = None
+        if prefer is not None and mode.clips and frozen is None:
+            enabled, resolved = _prefer_sides(geometry, enabled, combine,
+                                              prefer)
+            active_state = next(st for i, st in enabled if i == active_index)
+            clock.stage('sides')
         active = HalfSpace.from_state(active_state)
         spaces = [HalfSpace.from_state(s) for _i, s in enabled]
         masks = [HalfSpace.from_state(s) for i, s in enabled
@@ -519,7 +583,10 @@ def run(args: dict) -> dict:
         if frozen is not None:
             region = 'ok'          # the cells are the answer, not the planes
         elif mode.clips:
-            region = (region_state(spaces, None, tol) if len(spaces) > 1
+            # only the common part can be empty or a sheet: what lies
+            # outside it, or in any one plane's side, always has volume
+            region = (region_state(spaces, None, tol)
+                      if len(spaces) > 1 and combine is pieces.Combine.COMMON
                       else 'ok')
         else:
             region = region_state(masks, active, tol) if masks else 'ok'
@@ -549,13 +616,13 @@ def run(args: dict) -> dict:
                         geometry, active, masks, tol, caps)
                 elif mode is SectionMode.CUT_CELLS:
                     result = section_modes.cut_cells_section(
-                        geometry, active, masks, tol, caps)
+                        geometry, active, masks, tol, caps, rule)
                 elif mode is SectionMode.CLIP:
                     result = section_modes.clip_section(
-                        geometry, spaces, tol, caps)
+                        geometry, spaces, tol, caps, combine)
                 else:
                     result = section_modes.whole_cells_section(
-                        geometry, spaces, tol, caps)
+                        geometry, spaces, tol, caps, combine, rule)
             except section_modes.OutputCap as cap:
                 raise _over(cap.quantity, cap.limit, cap.measured,
                             estimated=cap.estimated,
@@ -569,8 +636,8 @@ def run(args: dict) -> dict:
         kept = (np.unique(np.asarray(result.polygons.cells, dtype=np.int64))
                 if result is not None and empty is None
                 else np.zeros(0, dtype=np.int64))
-        arrays, unavailable, zone_names = _source_arrays(topology, wanted,
-                                                         geometry, kept)
+        arrays, unavailable, zone_names = _source_arrays(
+            topology, wanted, geometry, kept, native)
 
         files = {}
         counts = {'mesh_cells': topology.n_cells,
@@ -629,6 +696,13 @@ def run(args: dict) -> dict:
             'mode': mode.value,
             'active': active_index,
             'planes': [dict(state.to_dict(), index=i) for i, state in enabled],
+            'combine': combine.value if mode.clips else
+            pieces.Combine.COMMON.value,
+            'cell_rule': rule.value if mode in (
+                SectionMode.CUT_CELLS, SectionMode.CLIP_WHOLE_CELLS)
+            else pieces.CellRule.ANY.value,
+            'prefer': prefer.value if resolved is not None else None,
+            'resolved_keeps': resolved,
             'policy': POLICY,
             'tolerance': {'relative': relative, 'absolute': tol},
             'exact': not approximate,
@@ -658,6 +732,30 @@ def run(args: dict) -> dict:
         shutil.rmtree(scratch, ignore_errors=True)
         raise
     return manifest
+
+
+def _prefer_sides(geometry, enabled, combine, prefer):
+    """VI10b (F2f). ``(enabled with their keep sides chosen, {index: keep})``.
+
+    The volume each combination of sides would keep is summed over the cells
+    whose centre lies in it (:func:`pieces.choose_sides`).
+    """
+    if len(enabled) > pieces.MAX_SIDE_PLANES:
+        raise SectionRefused(
+            'bad_request', 'larger / smaller is decided for at most '
+            f'{pieces.MAX_SIDE_PLANES} planes, not {len(enabled)}',
+            planes=len(enabled))
+    centres, volumes = geometry.cell_centres_volumes()
+    spaces = [HalfSpace.from_state(state) for _i, state in enabled]
+    signed = np.array([HalfSpace(s.normal, s.offset, 1).signed(centres)
+                       for s in spaces])
+    keeps, _volume, _table = pieces.choose_sides(
+        signed, np.abs(volumes), combine, prefer,
+        current=[state.keep for _i, state in enabled])
+    chosen = [(index, state.with_keep(keep))
+              for (index, state), keep in zip(enabled, keeps)]
+    return chosen, {str(index): keep
+                    for (index, _s), keep in zip(enabled, keeps)}
 
 
 def run_batch(args: dict) -> dict:

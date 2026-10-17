@@ -81,6 +81,11 @@ def is_cad_entry(entry) -> bool:
     return bool(entry.get('cad_artifact')) and not entry.get('cad_superseded_by')
 
 
+#: The operation (and the ``cad_superseded_by`` mark) of the explicit
+#: 'Convert CAD to surface' button on the Geometry step (Plan 42 SG22 Q1).
+CONVERT_OPERATION = 'geometry.cad.convert_to_surface'
+
+
 def gmsh_mixed_sources_refusal(entries=(), new_sources=()) -> str | None:
     """Why Gmsh cannot mesh these sources together, or ``None``.
 
@@ -104,8 +109,9 @@ def gmsh_mixed_sources_refusal(entries=(), new_sources=()) -> str | None:
         return None
     return ('Gmsh cannot mesh solid models (STEP/IGES/BREP) and surface '
             'meshes (STL/OBJ) in one case: {} {} CAD and {} {}. '
-            'Import one kind only, split or wrap the CAD so it is meshed as '
-            'a surface, or use snappyHexMesh, which meshes both.').format(
+            'Import one kind only, press "Convert CAD to surface" on the '
+            'Geometry step so the CAD is meshed as a surface, or use '
+            'snappyHexMesh, which meshes both.').format(
                 ', '.join(cad), 'is' if len(cad) == 1 else 'are',
                 ', '.join(surfaces),
                 'is a surface' if len(surfaces) == 1 else 'are surfaces')
@@ -527,12 +533,16 @@ class GeometryArtifactStore:
             json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
         os.replace(temporary, self.readiness_path)
 
-    def garbage_collect_revisions(self, keep_recent: int = 3) -> dict:
+    def garbage_collect_revisions(self, keep_recent: int = 3,
+                                  protect=()) -> dict:
         """After an explicit case save, retain r1, current, and newest revisions.
 
         Manifest references are removed before files are unlinked.  Only files
         below this store's geometry root are eligible, so legacy/external paths
         can never be deleted by revision retention.
+
+        ``protect`` names files the undo history can still bring back (UXD7);
+        they stay on disk even when their revision leaves the manifest.
         """
         keep_recent = int(keep_recent)
         if keep_recent < 1:
@@ -562,6 +572,7 @@ class GeometryArtifactStore:
             self._save(entries)
         root = self.root.resolve()
         deleted = []
+        retained_paths.update(str(item) for item in protect or ())
         for value in sorted(candidate_paths - retained_paths):
             path = Path(value).resolve()
             if path.is_file() and path.is_relative_to(root):
@@ -638,6 +649,15 @@ class GeometryArtifactStore:
         # already carries it, so it is carried through to the conversion
         # below rather than being rebuilt from the file name.
         single = names[:1] if len(names) == 1 else []
+        if not names:
+            # CHT1. A binary STL whose 80-byte header is blank -- all three
+            # of the issue's conjugate-pipe files -- reads with no solid name
+            # at all, so `single` was empty and the converted artifact went
+            # out under vtkSTLWriter's own header, MEASURED: `solid
+            # Visualization Toolkit generated SLA File`, the name DP-64 says
+            # the user never chose. A solid the file does not name takes the
+            # file's, as a solver word.
+            single = [self._solver_word(source.stem)]
         if scale == 1.0 and not derived and (len(names) < 2 or solids == names):
             # No conversion, so the artifact stays a byte-for-byte copy of what
             # the user handed over -- the strongest provenance there is.
@@ -1381,6 +1401,82 @@ class GeometryArtifactStore:
         return self._replace_artifact_revision(
             entries, index, entry, result.polydata, metadata)
 
+    def convert_cad_to_surface(self, geometry_ids=None, *, tessellation=None,
+                               preview: bool = False) -> dict:
+        """Turn solid-model sources into surface files, on request.
+
+        Plan 42 SG22 Q1 (user, 2026-10-11). A case that mixes STEP/IGES/BREP
+        with STL/OBJ cannot go to Gmsh, which imports one kind per job. This
+        is the explicit way out: each chosen CAD source is faceted at a stated
+        chord tolerance and angle and written as a surface revision, after
+        which the entry counts as a surface (``cad_superseded_by``) and the
+        case is surface-only for both engines. Nothing is converted unless
+        this is called; the solid model stays in the entry as provenance and
+        ``converted_from_cad`` records what the surface was made from.
+
+        ``tessellation`` overrides the deflection the source was faceted at
+        (metres and degrees); without it the stored facets are kept. With
+        ``preview`` the numbers are measured and nothing is written.
+        """
+        entries = self.entries()
+        wanted = [str(item) for item in geometry_ids or ()]
+        for geometry_id in wanted:
+            self._entry(entries, geometry_id)
+        chosen = [entry['geometry_id'] for entry in entries
+                  if is_cad_entry(entry)
+                  and (not wanted or entry['geometry_id'] in wanted)]
+        if not chosen:
+            raise ValueError(
+                'there is no solid model (STEP, IGES or BREP) to convert: '
+                'every source in this case is already a surface')
+        converted = []
+        for geometry_id in chosen:
+            entries = self.entries()
+            index, entry = self._entry(entries, geometry_id)
+            stored = stored_tessellation(entry)
+            params = tessellation_params({**stored, **(tessellation or {})})
+            wanted_values = dataclasses.asdict(params)
+            refacet = bool(tessellation) and any(
+                key not in stored or stored[key] != value
+                for key, value in wanted_values.items()
+                if key in (tessellation or {}))
+            if refacet:
+                from .cad import read_cad
+                from .cad.tessellate import tessellate
+
+                shape, _model = read_cad(entry['cad_artifact'])
+                factor = self._unit_factor(read_back_unit(entry))
+                polydata = tessellate(
+                    _scaled_shape(shape, factor) if factor != 1.0 else shape,
+                    params)
+            else:
+                polydata = self._polydata(entry)
+            origin = {
+                'cad_artifact': str(entry['cad_artifact']),
+                'linear_deflection_m': float(wanted_values['linear_deflection']),
+                'angular_deflection_deg': float(
+                    wanted_values['angular_deflection_deg']),
+                'relative': bool(wanted_values['relative']),
+                'refaceted': refacet,
+                'triangles': int(polydata.GetNumberOfCells())}
+            record = {'geometry_id': geometry_id,
+                      'name': str(entry.get('name') or geometry_id),
+                      'revision': int(entry['revision']),
+                      'file': None, **origin}
+            if not preview:
+                updated = self._replace_artifact_revision(
+                    entries, index, entry, polydata, {
+                        'cad_superseded_by': CONVERT_OPERATION,
+                        'converted_from_cad': origin,
+                        'tessellation': wanted_values,
+                        'tessellation_unit': 'm'})
+                record['revision'] = int(updated['revision'])
+                record['file'] = str(updated['artifact'])
+            converted.append(record)
+        return {'preview': preview, 'converted': converted,
+                'files_written': [] if preview else [
+                    item['file'] for item in converted]}
+
     def split_interfaces(self, geometry_ids=None, *, preview: bool = False) -> dict:
         """Cut an assembly's shared walls away from the walls it shares with nobody.
 
@@ -1442,11 +1538,22 @@ class GeometryArtifactStore:
                 # that shares nothing would change its fingerprint, and every
                 # downstream record keyed on that fingerprint, to say the same
                 # thing it already said.
+                cut = self._polydata({'artifact': item['path']})
+                # CHT1. The kept skin stays under the solid name the manifest
+                # already keys it by. The cut's label is a word made from the
+                # entry's NAME, which is not the solid's: MEASURED live on
+                # `01_hot_fluid_r10mm_L500mm`, whose digit-led name became
+                # `body1` while the manifest went on calling its solid
+                # `solid_01_hot_fluid_r10mm_L500mm`, and castellation died on
+                # `Unknown region name ... Valid region names are 1(body1)`.
+                # The label stays the fallback for a body whose file names
+                # nothing the cut could keep.
+                kept = (self._artifact_solid_names(entry, cut)
+                        or {0: item['name']})
                 written = self._replace_artifact_revision(
-                    entries, index, entry,
-                    self._polydata({'artifact': item['path']}),
+                    entries, index, entry, cut,
                     {'kind': 'interface_split',
-                     'solid_names': {0: item['name']},
+                     'solid_names': kept,
                      'interface_split': {'removed': int(item['removed']),
                                          'kept': int(item['triangles'])}})
                 body['revision'] = int(written['revision'])
@@ -1589,6 +1696,14 @@ class GeometryArtifactStore:
             'boundary_patch_uuids': [item['patch_uuid'] for item in patches],
         }]
         return patches, regions
+
+    @staticmethod
+    def _solver_word(text: str) -> str:
+        """*text* reduced to a word a solver dictionary can key on."""
+        word = _SOLID_WORD.sub('_', str(text or '')).strip('_')
+        if not word:
+            return 'solid_1'
+        return word if word[0].isalpha() else f'solid_{word}'
 
     @staticmethod
     def _solid_names(surface) -> list[str]:
@@ -2630,6 +2745,9 @@ class GeometryArtifactStore:
             'provenance': {
                 'operation': ('geometry.repair.apply' if revision_kind == 'repaired'
                               else 'geometry.wrap.apply' if revision_kind == 'wrapped'
+                              else 'geometry.cad.convert_to_surface'
+                              if metadata.get('cad_superseded_by')
+                              == CONVERT_OPERATION
                               else 'geometry.patches.split_by_angle'
                               if revision_kind == 'split'
                               else 'geometry.split_interfaces'

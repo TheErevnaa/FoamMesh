@@ -174,6 +174,81 @@ def _spawn_kwargs() -> dict:
     return kwargs
 
 
+class _SpawnedProcess:
+    """A worker started on a thread, with the part of the asyncio process
+    interface :func:`run_worker` uses (``pid``, ``returncode``, ``wait()``
+    and a ``stdin`` with ``write``/``drain``/``close``).
+
+    Plan 39 VI14b. ``asyncio.create_subprocess_exec`` runs ``CreateProcess``
+    on the calling thread, and on this machine that call held the GUI thread
+    for about 100 ms every time a check or a preview started its worker.
+    ``subprocess.Popen`` on a worker thread costs the loop nothing; one
+    waiter thread reports the exit back to the loop.
+    """
+
+    def __init__(self, popen, loop):
+        self._popen = popen
+        self._loop = loop
+        self._done = loop.create_future()
+        self.pid = popen.pid
+        self.stdin = _SpawnedStdin(popen.stdin)
+        import threading
+        threading.Thread(target=self._watch, daemon=True,
+                         name='worker-exit-%d' % self.pid).start()
+
+    def _watch(self):
+        code = self._popen.wait()
+
+        def _set():
+            if not self._done.done():
+                self._done.set_result(code)
+        try:
+            self._loop.call_soon_threadsafe(_set)
+        except RuntimeError:                       # the loop is closed
+            pass
+
+    @property
+    def returncode(self):
+        return self._popen.returncode
+
+    async def wait(self):
+        return await asyncio.shield(self._done)
+
+
+class _SpawnedStdin:
+    def __init__(self, stream):
+        self._stream = stream
+        self._pending = []
+
+    def write(self, data):
+        self._pending.append(data)
+
+    async def drain(self):
+        data, self._pending = b''.join(self._pending), []
+        if not data:
+            return
+
+        def _send():
+            self._stream.write(data)
+            self._stream.flush()
+        await asyncio.to_thread(_send)
+
+    def close(self):
+        try:
+            self._stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+async def _spawn(command, *, stdout, env, cwd, **kwargs):
+    """Start the worker without running ``CreateProcess`` on the loop."""
+    popen = await asyncio.to_thread(
+        lambda: subprocess.Popen(
+            list(command), stdin=subprocess.PIPE, stdout=stdout,
+            stderr=subprocess.STDOUT, env=env, cwd=cwd, **kwargs))
+    return _SpawnedProcess(popen, asyncio.get_running_loop())
+
+
 def _log_tail(path: Path) -> str:
     try:
         with open(path, 'rb') as handle:
@@ -261,11 +336,10 @@ async def run_worker(operation: str, args: dict, *, cap_bytes: int = 0,
         log = open(log_path, 'wb')
         try:
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *worker_command(operation, args_path),
-                    stdin=asyncio.subprocess.PIPE, stdout=log,
-                    stderr=subprocess.STDOUT, env=worker_environment(),
-                    cwd=str(work), **_spawn_kwargs())
+                process = await _spawn(
+                    worker_command(operation, args_path), stdout=log,
+                    env=worker_environment(), cwd=str(work),
+                    **_spawn_kwargs())
             except (OSError, ValueError, NotImplementedError) as error:
                 return WorkerOutcome(
                     UNAVAILABLE, operation, reason='worker_unavailable',

@@ -14,6 +14,13 @@ class FlatPushButton(QPushButton):
         self.setProperty('foammeshFlat', True)
 
     def paintEvent(self, event):
+        if self.property('foammeshTile'):
+            # DP-2720. A tile's sheet draws its hover and checked grounds;
+            # the highlight below fell in the contents rectangle, a 2 px
+            # sliver in the Display popover, so a switch that was on did not
+            # look on.
+            super().paintEvent(event)
+            return
         option = QStyleOptionButton()
         self.initStyleOption(option)
         if option.state & QStyle.StateFlag.State_On:

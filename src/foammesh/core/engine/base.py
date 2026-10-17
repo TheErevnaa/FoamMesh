@@ -127,11 +127,23 @@ class MeshingEngine(Protocol):
     #: (DP-641), so the Geometry page disables the choice for it.
     builds_non_conformal_interfaces: bool = True
 
+    #: Plan 42 SG22 Q2. How this engine honours a ``non_conformal`` pair
+    #: intent: ``none`` (it cannot, and its page refuses the pair),
+    #: ``staged_ncc`` or ``separate_volumes`` (see
+    #: :mod:`foammesh.core.engine.interface_intent`). The pair is authored
+    #: before the engine is chosen; this is read at the engine's own page.
+    non_conformal_route: str = 'none'
+
     #: Plan 36 RP11. Whether this engine's regions are the solids of the
     #: geometry (Gmsh meshes each solid as its own volume) rather than spaces
     #: a seed point picks out of the domain (snappy). It decides what fluid-
     #: region detection answers from and what accepting a candidate writes.
     regions_are_solids: bool = False
+
+    #: Whether a run of this engine can leave its mesh only in its own native
+    #: file (SU2 route, second order) and no polyMesh, so the result strip
+    #: counts that file. Gmsh does; snappy always publishes a polyMesh.
+    publishes_native_mesh_file: bool = False
 
     #: What one whole-mesh run of this engine performs, in order.
     ATOMIC_RUN_TASKS: tuple = ()

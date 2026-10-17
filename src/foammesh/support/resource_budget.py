@@ -102,8 +102,17 @@ PEAK_FACTORS: dict[str, dict[str, float]] = {
     'mesh.preview.vtk': {'file': 3.0, 'faces': 60.0, 'points': 48.0,
                          'fixed': 128 * MIB},
     # "Load full volume": the reader's volume, its exterior and the .vtu.
-    'mesh.volume': {'file': 6.0, 'faces': 120.0, 'points': 48.0,
-                    'cells': 900.0, 'fixed': 128 * MIB},
+    # DP-1429: this row estimated 27.8 GB (6 file + 120 face + 48 point + 900
+    # cell) for the 15 M-cell mesh whose worker peaked at 3.35 GB commit /
+    # 2.9 GB working set, so the load was refused with 57-65 GB of RAM free.
+    # Re-set from the worker body run alone under the worker's thread
+    # settings (plans/evidence/plan39/closures/DP1429.md): the peak (commit)
+    # is 1.14 GiB at 5 M cells, 3.27 GiB at 15 M (binary hex boxes), 0.96 GiB
+    # at 3.4 M ASCII, and the estimate is 1.4-1.8x it on every measured box (2.2x on the
+    # 120-150 k-cell snappy meshes, where a fixed baseline dominates).
+    # Only this row changed: quality.* and mesh.preview.vtk keep their own.
+    'mesh.volume': {'file': 1.0, 'faces': 30.0, 'points': 48.0,
+                    'cells': 60.0, 'fixed': 64 * MIB},
     # Plan 37 UF10: an exact section in the worker (``worker_section``). It
     # reads the whole topology, never builds a VTK volume, and writes only
     # the polygons the planes meet. MEASURED (plans/evidence/plan37/
@@ -220,6 +229,37 @@ def physical_memory() -> tuple[int, int]:
         return 0, 0
 
 
+def _vm_working_set_from_tasklist() -> int | None:
+    """The WSL VM's working set read by ``tasklist`` (Windows), else ``None``.
+
+    Plan 39 VI14 closing round 2026-10-12. ``psutil.process_iter`` walks every
+    process on the machine (965 here: 6 to 9 s) and its Windows calls hold the
+    GIL for 100 to 270 ms at a time, so the GUI thread stood still behind it
+    while a 6.6 M-cell mesh loaded. A separate process holds no GIL.
+    """
+    if os.name != 'nt':
+        return None
+    import subprocess
+    try:
+        done = subprocess.run(
+            ['tasklist', '/FO', 'CSV', '/NH', '/FI', 'IMAGENAME eq vmmem*'],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except Exception:                                       # noqa: BLE001
+        return None
+    if done.returncode != 0:
+        return None
+    total = 0
+    for line in done.stdout.splitlines():
+        cells = [cell.strip('"') for cell in line.split('","')]
+        if len(cells) < 5 or cells[0].lower().removesuffix('.exe')                 not in ('vmmem', 'vmmemwsl'):
+            continue
+        digits = ''.join(ch for ch in cells[4] if ch.isdigit())
+        if digits:
+            total += int(digits) * 1024
+    return total
+
+
 _VM_NAMES = ('vmmem', 'vmmem.exe', 'vmmemwsl', 'vmmemwsl.exe')
 _vm_cache: tuple[float, int] | None = None
 
@@ -235,6 +275,10 @@ def wsl_vm_working_set(*, max_age: float = 2.0) -> int:
     now = time.monotonic()
     if _vm_cache is not None and now - _vm_cache[0] < max_age:
         return _vm_cache[1]
+    total = _vm_working_set_from_tasklist()
+    if total is not None:
+        _vm_cache = (now, total)
+        return total
     total = 0
     try:
         import psutil
@@ -390,6 +434,14 @@ def estimate_peak_bytes(operation: str, counts: dict | None) -> Estimate:
     in-process reader always did.
     """
     counts = dict(counts or {})
+    if (operation == 'mesh.volume' and counts.get('cells')
+            and not counts.get('faces') and not counts.get('points')):
+        # Callers that know only the cell count (the cut tool's offer of
+        # "Load full volume") are sized as a hex mesh: 3 faces, 1 point and
+        # ~110 bytes of binary list files a cell -- the measured boxes.
+        cells = int(counts['cells'])
+        counts.update(faces=3 * cells, points=cells,
+                      file_bytes={'lists': 110 * cells})
     factors = PEAK_FACTORS.get(operation, {'fixed': 64 * MIB})
     if operation == 'mesh.preview' and counts.get('bounded') is False:
         factors = PEAK_FACTORS['mesh.preview.vtk']

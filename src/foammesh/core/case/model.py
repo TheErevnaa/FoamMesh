@@ -96,6 +96,19 @@ class MeshFingerprint:
         return cls(digest=digest, files=files)
 
 
+def _without_mesh_frame(current, supplied):
+    """Provenance for a mesh that has just replaced the last one.
+
+    Plan 39 VI5. The recorded Mesh > Scale / Translate / Rotate matrix
+    describes the mesh it was made on; a new mesh is in the geometry's own
+    frame, so the record is dropped unless the caller states one.
+    """
+    merged = {**current, **dict(supplied or {})}
+    if 'mesh_transform' not in (supplied or {}):
+        merged.pop('mesh_transform', None)
+    return merged
+
+
 @dataclass(frozen=True)
 class CaseMetadata:
     """Persisted, sidecar-owned state needed before the configuration DB opens."""
@@ -198,7 +211,7 @@ class CaseMetadata:
             artifact_state=ArtifactState.CURRENT,
             mesh_fingerprint=fingerprint,
             authored_workflow_suspended=True,
-            provenance={**self.provenance, **dict(provenance or {})},
+            provenance=_without_mesh_frame(self.provenance, provenance),
         )
 
     def with_generated_mesh(self, fingerprint: MeshFingerprint, *,
@@ -215,7 +228,7 @@ class CaseMetadata:
             artifact_state=ArtifactState.CURRENT,
             mesh_fingerprint=fingerprint,
             authored_workflow_suspended=False,
-            provenance={**self.provenance, **dict(provenance or {})},
+            provenance=_without_mesh_frame(self.provenance, provenance),
         )
 
     @classmethod

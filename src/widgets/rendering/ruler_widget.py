@@ -5,6 +5,7 @@ from vtkmodules.util.misc import calldata_type
 from vtkmodules.vtkCommonCore import vtkCommand, VTK_INT
 from vtkmodules.vtkInteractionWidgets import vtkDistanceWidget, vtkDistanceRepresentation
 from vtkmodules.vtkRenderingCore import vtkPropPicker, vtkRenderer
+from foammesh.rendering.pick_alone import pick_prop
 from foammesh.view.theming.vtk_theme import rgb
 
 
@@ -85,7 +86,7 @@ class RulerWidget:
 
     def _pickActorPoint(self, dpx, dpy):
         picker = vtkPropPicker()
-        rv = picker.PickProp(dpx, dpy, self._renderer, self._renderer.GetActors())
+        rv = pick_prop(picker, dpx, dpy, self._renderer, self._renderer.GetActors())
         if rv == 0:  # No Prop picker
             return None
 

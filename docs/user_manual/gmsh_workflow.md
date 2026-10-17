@@ -12,6 +12,17 @@ two arrive by different routes and behave differently, which the
 Choose it on the **Mesh setup** step. The workflow that appears is Gmsh's
 own; Snappy's settings are kept untouched in case you switch back.
 
+## Help pages
+
+Two reference pages are generated from the program's own tables:
+
+- [Gmsh options reference](gmsh_options_reference.md): every option, by the page
+  whose Advanced section shows it, with default, unit, choices and Gmsh's own
+  help text.
+- [Keyboard and mouse](keyboard_and_mouse.md): every key (F1 in the program
+  shows the same list and lets you rebind), the Gmsh keys and what they do
+  here, and the mouse.
+
 ## Before you start
 
 Both methods need the qualified **OpenFOAM Foundation 13** WSL runtime. Gmsh

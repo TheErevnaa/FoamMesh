@@ -34,9 +34,14 @@ class RunStatusStrip(QFrame):
     #: the path, because the strip does not know how this build opens files.
     logRequested = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, docked: bool = False):
         super().__init__(parent)
-        self.setObjectName('runStatusStrip')
+        #: VI12 (F6c). A docked strip is the copy that sits under the page
+        #: footer. It shows only while a run is going, so the Cancel is where
+        #: the user is looking; the Run details strip keeps the sentence.
+        self._docked = bool(docked)
+        self._mirrors = []
+        self.setObjectName('runDockStrip' if docked else 'runStatusStrip')
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAccessibleName(self.tr('Run status'))
         self._state = 'idle'
@@ -47,12 +52,14 @@ class RunStatusStrip(QFrame):
         apply_bar_metrics(self, layout)
         layout.setSpacing(GAP)
         self._text = QLabel(self)
-        self._text.setObjectName('runStatusText')
+        self._text.setObjectName(
+            'runDockText' if docked else 'runStatusText')
         self._text.setWordWrap(True)
         self._text.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._cancel = QPushButton(self.tr('Cancel'), self)
-        self._cancel.setObjectName('runStatusCancel')
+        self._cancel.setObjectName(
+            'runDockCancel' if docked else 'runStatusCancel')
         # DP-186. The name a screen reader announces has to contain the
         # words painted on the button, or voice control cannot reach it:
         # `click Cancel` matched nothing while the name read `Stop the
@@ -62,14 +69,16 @@ class RunStatusStrip(QFrame):
             self.tr('Stop the running job.'))
         self._cancel.clicked.connect(self._onCancel)
         self._offer = QPushButton(self)
-        self._offer.setObjectName('runStatusOffer')
+        self._offer.setObjectName(
+            'runDockOffer' if docked else 'runStatusOffer')
         self._offer.clicked.connect(self._onOffer)
         # Plan 31 CP-07 item 6. The log path was in the run payload and on no
         # surface: a user whose parallel run failed was left to find it under
         # the case directory, which is where the processor* directories are --
         # the internals this work package exists to stop making them read.
         self._log = QPushButton(self.tr('Show log'), self)
-        self._log.setObjectName('runStatusLog')
+        self._log.setObjectName(
+            'runDockLog' if docked else 'runStatusLog')
         self._log.setAccessibleDescription(
             self.tr('Open the log of this run.'))
         self._log.setFlat(True)
@@ -82,6 +91,40 @@ class RunStatusStrip(QFrame):
         self.clear()
 
     # -- state ------------------------------------------------------------- #
+
+    def addMirror(self, other: 'RunStatusStrip') -> None:
+        """Keep ``other`` saying what this strip says (VI12).
+
+        The mirror's buttons act through this strip, so there is one Cancel,
+        one offer and one log whichever copy the user presses.
+        """
+        self._mirrors.append(other)
+        other.cancelRequested.connect(self._onCancel)
+        other.offerAccepted.connect(self._onOffer)
+        other.logRequested.connect(self.logRequested)
+        other._copyFrom(self)
+
+    def _copyFrom(self, source: 'RunStatusStrip') -> None:
+        self._state = source._state
+        self._render(source._text.text(), '')
+        self._text.setProperty(
+            'foammeshStatus', source._text.property('foammeshStatus'))
+        self._cancel.setVisible(source._cancel.isVisibleTo(source)
+                                if source._state in ('running', 'cancelling')
+                                else False)
+        self._cancel.setEnabled(source._cancel.isEnabled())
+        self._cancel.setText(source._cancel.text())
+        self._offer.setVisible(False)
+        self._setLog(source._logPath)
+        self._applyDock()
+
+    def _applyDock(self) -> None:
+        if self._docked:
+            self.setVisible(self._state in ('running', 'cancelling'))
+
+    def _forward(self, name: str, *args, **kwargs) -> None:
+        for mirror in self._mirrors:
+            getattr(mirror, name)(*args, **kwargs)
 
     @property
     def state(self) -> str:
@@ -112,6 +155,7 @@ class RunStatusStrip(QFrame):
         self._offer.setVisible(False)
         self._setLog('')
         self.hide()
+        self._forward('clear')
 
     def showRunning(self, message: str, *, cancelable: bool = True,
                     log: str = '') -> None:
@@ -123,7 +167,10 @@ class RunStatusStrip(QFrame):
         self._cancel.setVisible(bool(cancelable))
         self._offer.setVisible(False)
         self._setLog(log)
-        self.show()
+        self._applyDock()
+        if not self._docked:
+            self.show()
+        self._forward('showRunning', message, cancelable=cancelable, log=log)
 
     def showResult(self, message: str, *, failed: bool = False,
                    log: str = '') -> None:
@@ -133,7 +180,11 @@ class RunStatusStrip(QFrame):
         self._cancel.setVisible(False)
         self._offer.setVisible(False)
         self._setLog(log)
-        self.setVisible(bool(message))
+        if self._docked:
+            self._applyDock()
+        else:
+            self.setVisible(bool(message))
+        self._forward('showResult', message, failed=failed, log=log)
 
     def showOffer(self, message: str, action: str, *,
                   failed: bool = True, log: str = '') -> None:
@@ -157,12 +208,18 @@ class RunStatusStrip(QFrame):
         # survive the offer replacing the result line. Defaults to '', which
         # is what the CP-02 caller passed by hand.
         self._setLog(log)
-        self.setVisible(bool(message))
+        if self._docked:
+            self._applyDock()
+        else:
+            self.setVisible(bool(message))
+        self._forward('showOffer', message, action, failed=failed, log=log)
 
     def markCancelling(self) -> None:
         self._state = 'cancelling'
         self._cancel.setEnabled(False)
         self._cancel.setText(self.tr('Cancelling…'))
+        self._applyDock()
+        self._forward('markCancelling')
 
     # -- internals --------------------------------------------------------- #
 

@@ -42,13 +42,38 @@ def record_slices_to(path) -> None:
     _slice_record_path = str(path) if path else None
 
 
-def _record_slice(duration_ms: float, context: str | None) -> None:
+#: pytest names the test it is running here. A slice recorded under pytest
+#: carries that node id, so `scripts/check_slice_budget.py` can re-run the one
+#: test that produced an over-budget slice (Plan 44 SG6).
+PYTEST_TEST_ENV = 'PYTEST_CURRENT_TEST'
+
+
+def _current_test() -> str | None:
+    """The pytest node id now running, without its ``(call)`` phase suffix."""
+    value = os.environ.get(PYTEST_TEST_ENV)
+    if not value:
+        return None
+    return value.rsplit(' (', 1)[0]
+
+
+def _record_slice(duration_ms: float, context: str | None,
+                  cpu_ms: float | None = None) -> None:
     path = _slice_record_path
     if path is None:
         return
-    line = json.dumps({'op': context or UNATTRIBUTED,
-                       'duration_ms': round(duration_ms, 3),
-                       'thread': threading.current_thread().name}) + '\n'
+    record = {'op': context or UNATTRIBUTED,
+              'duration_ms': round(duration_ms, 3),
+              'thread': threading.current_thread().name}
+    if cpu_ms is not None:
+        # SG6: the CPU time the recording thread itself spent in the slice.
+        # Wall time minus this is time the thread was not running: blocked on
+        # a child, a lock or the disk, or runnable but not scheduled because
+        # the machine was busy. The budget check reads both.
+        record['cpu_ms'] = round(cpu_ms, 3)
+    test = _current_test()
+    if test:
+        record['test'] = test
+    line = json.dumps(record) + '\n'
     try:
         with _slice_record_lock, open(path, 'a', encoding='utf-8') as stream:
             stream.write(line)
@@ -111,10 +136,11 @@ class OwnerLoopMonitor:
         return _Measurement(self, name, context)
 
     def record(self, name: str, duration_ms: float, *,
-               context: str | None = None) -> None:
+               context: str | None = None,
+               cpu_ms: float | None = None) -> None:
         self._series.setdefault(name, _Series()).record(duration_ms)
         if name == 'owner_loop_slice':
-            _record_slice(duration_ms, context)
+            _record_slice(duration_ms, context, cpu_ms)
         if name == 'owner_loop_slice' and duration_ms > self.budget_max_ms:
             violation = {'metric': name, 'duration_ms': round(duration_ms, 3),
                          'budget_ms': self.budget_max_ms,
@@ -159,6 +185,7 @@ class _Measurement:
         self._name = name
         self._context = context
         self._started = 0.0
+        self._cpu_started = 0.0
 
     def __enter__(self):
         if self._context:
@@ -166,10 +193,13 @@ class _Measurement:
             # heartbeat block, so a hang dump or a death names the facade
             # operation without asking the frozen process.
             set_last_op(f'facade:{self._context}')
+        self._cpu_started = time.thread_time()
         self._started = self._monitor._clock()
         return self
 
     def __exit__(self, *_exc_info):
         duration = (self._monitor._clock() - self._started) * 1000.0
-        self._monitor.record(self._name, duration, context=self._context)
+        cpu = (time.thread_time() - self._cpu_started) * 1000.0
+        self._monitor.record(self._name, duration, context=self._context,
+                             cpu_ms=cpu)
         return False

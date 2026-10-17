@@ -274,6 +274,14 @@ class MeshTransformService:
         workflow, suspended = workflow_after_mesh_mutation(previous)
         provenance = dict(previous.provenance) if previous is not None else {}
         provenance['last_mesh_mutation'] = request.operation
+        # Plan 39 VI5: the frame the mesh is now in, so a distance to the
+        # geometry is measured against the geometry moved the same way.
+        from . import transform_record
+        provenance[transform_record.RECORD_KEY] = transform_record.dump(
+            transform_record.compose(
+                transform_record.parse(
+                    provenance.get(transform_record.RECORD_KEY)),
+                request))
         changes = dict(
             workflow=workflow,
             mesh_origin=MeshOrigin.DERIVED_MUTATION,

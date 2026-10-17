@@ -1,0 +1,93 @@
+/* -- item views ---------------------------------------------------------- */
+/* Plan 44 MF2. Radius 3, header sections in 10.5px caps. The outer frame
+ * stays: a view on a floating surface drops it locally. */
+
+QTreeView, QListView, QTableView {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    selection-background-color: {{selection.background}};
+    selection-color: {{foreground.strong}};
+    outline: none;
+}
+QAbstractItemView::item { padding: 3px; }
+QTreeView::item:hover, QListView::item:hover, QTableView::item:hover {
+    background: {{background.raised}};
+}
+QAbstractItemView::item:selected { background: {{selection.background}}; }
+QHeaderView::section {
+    background: {{background.canvas}};
+    color: {{foreground.secondary}};
+    border: none;
+    border-bottom: 1px solid {{border.default}};
+    /* 23 + 1 border + 4 padding = 28. */
+    padding: 2px 8px;
+    min-height: 23px;
+}
+/* SG44. The heading face is set on the header itself, not on its sections:
+ * Qt paints a section in the sub-control's font but measures it in the
+ * widget's, so a 10.5 px heading asked for the width of a 13 px bold one and
+ * the narrow settings column ran out of room (DP-559/569/570). */
+QHeaderView {
+    font-size: {{type.caps}}px;
+    font-weight: 600;
+}
+
+/* -- splitters and scrollbars (Plan 44 MF2) ------------------------------ */
+/* A splitter handle is invisible at rest and shows a 2px accent centre line
+ * under the pointer. The `QWidget` prefix outranks the bare rules in
+ * chrome.qss.tmpl, which comes later in the cascade (MF3 deletes them). */
+QSplitter::handle { background: transparent; }
+QSplitter::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 transparent, stop:0.35 transparent,
+        stop:0.36 {{accent.default}}, stop:0.64 {{accent.default}},
+        stop:0.65 transparent, stop:1 transparent);
+}
+QSplitter::handle:vertical:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 transparent, stop:0.35 transparent,
+        stop:0.36 {{accent.default}}, stop:0.64 {{accent.default}},
+        stop:0.65 transparent, stop:1 transparent);
+}
+
+/* An 8px handle on a transparent groove. */
+QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 0; }
+QScrollBar::handle:vertical {
+    background: {{border.default}};
+    border-radius: 4px;
+    min-height: 24px;
+}
+QScrollBar::handle:horizontal {
+    background: {{border.default}};
+    border-radius: 4px;
+    min-width: 24px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: {{foreground.muted}};
+}
+
+/* -- tabs ---------------------------------------------------------------- */
+
+QTabWidget::pane {
+    border: 1px solid {{border.default}};
+    top: -1px;
+}
+QTabBar::tab {
+    background: {{background.canvas}};
+    color: {{foreground.muted}};
+    border: 1px solid {{border.default}};
+    border-bottom: none;
+    border-top-left-radius: {{radius.control}}px;
+    border-top-right-radius: {{radius.control}}px;
+    padding: 6px 14px;
+    /* 15 + 1 border + 12 padding = 28. */
+    min-height: 15px;
+}
+QTabBar::tab:hover { background: {{background.raised}}; }
+QTabBar::tab:selected {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+}

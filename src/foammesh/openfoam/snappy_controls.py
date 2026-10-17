@@ -172,6 +172,10 @@ CONTROLS = _register(
     # -- castellation ---------------------------------------------------- #
     SnappyControl('castellation/nCellsBetweenLevels', WRITER, CASTELLATED,
                   'nCellsBetweenLevels'),
+    SnappyControl(
+        'castellation/defaulted', GATE,
+        note='set once the default walls refinement group was made, so a '
+             'user who removes it is never re-proposed; never written'),
     SnappyControl('castellation/resolveFeatureAngle', WRITER, CASTELLATED,
                   'resolveFeatureAngle'),
     SnappyControl('castellation/maxGlobalCells', WRITER, CASTELLATED,

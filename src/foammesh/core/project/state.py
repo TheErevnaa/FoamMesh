@@ -31,6 +31,16 @@ from .proposals import Proposal, ProposalStatus
 from .transactions import Transaction, TransactionLog, Source, TxStatus
 
 
+class StageStepError(RuntimeError):
+    """The next step moves more than the settings, which only the facade can do."""
+
+    def __init__(self, label: str):
+        super().__init__(f'{label!r} is a step that also moves the mesh, the '
+                         'geometry or the task state; it is undone '
+                         'with what it restores')
+        self.label = label
+
+
 class ProjectState:
     def __init__(self, db, *, bus: EventBus | None = None,
                  history: History | None = None,
@@ -78,6 +88,36 @@ class ProjectState:
         self.bus.publish(Event.TRANSACTION_APPLIED, transaction=tx)
         return tx
 
+    def record_stage(self, label: str, companion: dict, *,
+                     source: Source = Source.SYSTEM) -> Transaction:
+        """Put a mesh stage run in the one history (UXD7).
+
+        The settings do not change, but the run is a step Undo can take back:
+        the entry holds the settings as they stand with *companion*, the mesh
+        actions for each direction, so one Undo returns the previous stage and
+        the settings it was made from together.
+        """
+        self.history.record(self._snapshot(), label, companion)
+        # Not published as TRANSACTION_APPLIED: nothing authored changed, so
+        # the authored revision, the change sets and the autosave journal
+        # stay as they were.
+        return self.log.append(Transaction(
+            action=label, source=source, status=TxStatus.APPLIED))
+
+    def history_mark(self) -> int:
+        return self.history.mark()
+
+    def record_step(self, label: str, companion: dict, mark: int, *,
+                    source: Source = Source.SYSTEM) -> Transaction:
+        """Put an operation that moved more than the settings in the history.
+
+        *mark* is :meth:`history_mark` taken before it ran; any settings the
+        operation committed on the way fold into this one step (UXD7).
+        """
+        self.history.squash_since(mark, self._snapshot(), label, companion)
+        return self.log.append(Transaction(
+            action=label, source=source, status=TxStatus.APPLIED))
+
     # ----- undo / redo -----------------------------------------------------
     def can_undo(self) -> bool:
         return self.history.can_undo()
@@ -91,7 +131,16 @@ class ProjectState:
     def redo_label(self) -> str:
         return self.history.redo_label()
 
-    def undo(self) -> Transaction | None:
+    def undo(self, *, stage_applied: bool = False) -> Transaction | None:
+        """Undo the newest step.
+
+        A mesh stage step also moves the mesh on disk, which only the facade
+        can do; it passes ``stage_applied=True`` once it has. Anyone else
+        reaching such a step is refused rather than leave the settings and
+        the mesh disagreeing.
+        """
+        if self.history.undo_companion() and not stage_applied:
+            raise StageStepError(self.history.undo_label())
         label = self.history.undo_label()
         snap = self.history.undo(self._snapshot())
         if snap is None:
@@ -102,7 +151,9 @@ class ProjectState:
         self.bus.publish(Event.UNDONE, transaction=tx)
         return tx
 
-    def redo(self) -> Transaction | None:
+    def redo(self, *, stage_applied: bool = False) -> Transaction | None:
+        if self.history.redo_companion() and not stage_applied:
+            raise StageStepError(self.history.redo_label())
         label = self.history.redo_label()
         snap = self.history.redo(self._snapshot())
         if snap is None:

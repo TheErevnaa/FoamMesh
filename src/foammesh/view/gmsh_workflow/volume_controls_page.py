@@ -5,11 +5,14 @@ import dataclasses
 import math
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QDialog, QLabel, QMessageBox
+from PySide6.QtWidgets import QLabel
 
+from foammesh.core import display_unit
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
 
 from .base import GmshTaskPage
+from .folds import add_fold, count_fold, fold_rows
+from .session_tiers import SessionTiers
 
 
 class VolumeControlPanel(ChildControlPanel):
@@ -74,22 +77,23 @@ class VolumeControlPanel(ChildControlPanel):
         hint = ''
         size = self.globalTargetSize()
         if size is not None:
-            hint = self.tr(' The global target size is {0} m.').format(size)
+            # UXB3c. The sentence speaks the project display unit.
+            hint = self.tr(' The global target size is {0}.').format(
+                display_unit.format_length(size))
         return self.tr(
-            'Target size must be a positive length in metres (greater than '
-            '0 m).') + hint
+            'Target size must be a positive length (greater than '
+            '0 {0}).').format(display_unit.current()) + hint
 
     def add_child(self) -> None:
         if self._refuseSize():
-            if self.editor_dialog().exec() == QDialog.DialogCode.Accepted:
-                self.add_child()
+            # Plan 41 GN18: the form stays open beside the sentence.
+            self._run_editor(self.editor_dialog(), self.add_child)
             return
         super().add_child()
 
     def apply_selected(self) -> None:
         if self.selected_key() is not None and self._refuseSize():
-            if self.editor_dialog().exec() == QDialog.DialogCode.Accepted:
-                self.apply_selected()
+            self._run_editor(self.editor_dialog(), self.apply_selected)
             return
         super().apply_selected()
 
@@ -97,7 +101,7 @@ class VolumeControlPanel(ChildControlPanel):
         problem = self.sizeProblem(self.child_values())
         if not problem:
             return False
-        QMessageBox.warning(self, self.tr('Target size'), problem)
+        self._tell(self.tr('Target size'), problem)
         editor = self._editors.get(self.SIZE_KEY)
         widget = getattr(editor, '_editor', None)
         if widget is not None:
@@ -131,7 +135,7 @@ def _positive(value) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
-class GmshVolumeControlsPage(GmshTaskPage):
+class GmshVolumeControlsPage(SessionTiers, GmshTaskPage):
     """Per-volume sizing and inclusion, and where the mesh is structured.
 
     Plan 33 VOLUME-02/04/05. The step opened on a box headed `Guided` with
@@ -163,10 +167,15 @@ class GmshVolumeControlsPage(GmshTaskPage):
     #: took two lines' worth of width to say less than that.
     HEADINGS = {'scope_token': 'Volume'}
 
-    #: VOLUME-04. Drawn on the sizing step, beside the edge controls: how a
-    #: three-sided face is filled is an edge decision, and one field gets
-    #: one editor (DP-153).
-    HOSTED_FIELDS = ('gmsh.volume_controls.transfinite_tri',)
+    #: Plan 44 GFIT (DP-2693). The table needs 250 px of the 205-213 the
+    #: sheet gives it at 1280x800; the two long words are drawn short, and the
+    #: header tooltip (and the editor label) keep the full ones.
+    SHORT_HEADINGS = {'included': 'On', 'transfinite': 'Transf.'}
+
+    #: Plan 40 UXB1 (#52). How a three-sided face is filled is a structured
+    #: meshing choice, so it sits in the Structured meshing box with the
+    #: automatic switch (Plan 33 VOLUME-04 had drawn it on the sizing step).
+    STRUCTURED_FIELDS = ('gmsh.volume_controls.transfinite_tri',)
 
     #: W-O1. What the Included column does. It explains one column of the
     #: table below and names it, so it is said on the table and in the step
@@ -190,11 +199,35 @@ class GmshVolumeControlsPage(GmshTaskPage):
         self.panel = VolumeControlPanel(
             self._client, 'gmsh.volume_controls.controls',
             self.tr('Volume controls'), columns=self.COLUMNS, parent=self,
-            headings=self.HEADINGS, stretch='scope_token')
+            headings=self.HEADINGS, stretch='scope_token',
+            inline=True, short_headings=self.SHORT_HEADINGS)
         self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         self.panel.setToolTip(self.tr(self.INCLUDED_NOTE))
         self.panel.setAccessibleDescription(self.tr(self.INCLUDED_NOTE))
         layout.addWidget(self.panel)
+
+        # Plan 41 GN9 (M-28..M-32, A-17): embedded entities, per-surface
+        # recombine / algorithm / smoothing / reverse, outward orientation,
+        # compounds and size from boundary.
+        from .entity_controls_panel import EntityControlsPanel
+        title = QLabel(self.tr('Entity controls'), self)
+        title.setObjectName('gmshEntityControlsTitle')
+        # Plan 44 FIT-G (MF27). MEASURED at b59ac794 in the 300 px sheet of a
+        # 1280x800 window: the panel's 301 px under the volume table ran the
+        # page 279 px past its 491 px scroller. The fold header says the
+        # title, so the label stays built and hidden; the panel is one press
+        # away and its header counts the controls behind it.
+        title.setVisible(False)
+        self.entity_panel = self.adoptPanel(EntityControlsPanel(self._client,
+                                                                self))
+        self._foldEntityControls = add_fold(
+            self, layout, name='EntityControls',
+            title=self.tr('Entity controls'),
+            description=self.tr(
+                'Embedded entities, per-surface recombine, algorithm, '
+                'smoothing and reverse, outward orientation, compounds and '
+                'size from boundary.'),
+            panel=self.entity_panel)
 
         # Plan 36 RP11. On Gmsh every solid is a region: while this step is
         # up each is drawn as a translucent volume in its region colour, and
@@ -208,10 +241,17 @@ class GmshVolumeControlsPage(GmshTaskPage):
         layout.addWidget(solids)
         self._solidVolumes = None
 
+        # Plan 41 GN18 (section 4.1, row 3). Transfinite curves, surfaces and
+        # volumes with picked corners, the automatic request, the block grid
+        # on the model: they are structure, so they are on this row.
+        self.mountStructureTier(layout)
+
     def refresh(self) -> None:
         super().refresh()
         self._moveProseBehindHelp()
         self._retypeSolids()
+        if hasattr(self, '_foldEntityControls'):
+            count_fold(self._foldEntityControls, fold_rows(self.entity_panel))
 
     # -- Plan 36 RP11: the solids, drawn ------------------------------------ #
 
@@ -312,5 +352,12 @@ class GmshVolumeControlsPage(GmshTaskPage):
             self._description.setText(described)
         self._help.setDetail(described, self._prerequisites.text())
 
-    def renders_field(self, field_id: str) -> bool:
-        return field_id not in self.HOSTED_FIELDS
+    def field_form(self, field_id, classification):
+        """Put the triangular switch in Structured meshing, not Advanced.
+
+        It is a native runner control, which routes to the folded box; the
+        automatic switch it belongs with is in the guided one.
+        """
+        if field_id in self.STRUCTURED_FIELDS:
+            return self._guided.layout()
+        return None

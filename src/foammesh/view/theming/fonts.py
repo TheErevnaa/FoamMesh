@@ -3,6 +3,8 @@ from pathlib import Path
 
 from PySide6.QtGui import QFont, QFontDatabase
 
+from . import appearance
+
 _LOADED = False
 
 
@@ -26,11 +28,65 @@ def install_application_fonts(application) -> tuple[str, ...]:
         ]
         _LOADED = all(handle != -1 for handle in handles)
     families = ('Pretendard Variable', 'Pretendard', 'Segoe UI', 'Arial', 'sans-serif')
+    if appearance.current().font == appearance.FONT_SYSTEM:
+        # The desktop's own face: what the platform would have used.
+        families = (QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.GeneralFont).family() or 'Segoe UI',
+            'Arial', 'sans-serif')
     font = QFont()
     if hasattr(font, 'setFamilies'):
         font.setFamilies(list(families))
     else:
         font.setFamily(families[0])
-    font.setPointSize(10)
+    font.setPointSizeF(appearance.current().base_size)
     application.setFont(font)
     return families
+
+
+# -- Plan 44 MF1: mono, caps and heading faces -----------------------------
+# The fixed-pitch face is Cascadia Mono, which ships with Windows 11 (user
+# decision 2026-10-14: no font files are bundled). Consolas, then the generic
+# monospace family, cover older systems.
+
+MONO_FAMILIES = ('Cascadia Mono', 'Consolas', 'monospace')
+
+
+def _pixel_font(font: QFont, px) -> QFont:
+    font.setPixelSize(max(1, int(round(px))))
+    return font
+
+
+def mono_font(px: float = 12) -> QFont:
+    """The fixed-pitch face (digits of equal width) at ``px`` pixels."""
+    font = QFont()
+    if hasattr(font, 'setFamilies'):
+        font.setFamilies(list(MONO_FAMILIES))
+    else:
+        font.setFamily(MONO_FAMILIES[0])
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    font.setFixedPitch(True)
+    return _pixel_font(font, px)
+
+
+def caps_font(px: float = 10.5) -> QFont:
+    """Small-caps caption face: upper case with 108 % letter spacing."""
+    from PySide6.QtGui import QGuiApplication
+
+    font = QFont(QGuiApplication.font())
+    font.setCapitalization(QFont.Capitalization.AllUppercase)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 108)
+    font.setWeight(QFont.Weight.DemiBold)
+    return _pixel_font(font, px)
+
+
+def heading_font(level: int = 3) -> QFont:
+    """Section heading face: level 2 is 16 px, level 3 is 14 px, demibold."""
+    from PySide6.QtGui import QGuiApplication
+
+    from . import metrics
+
+    px = {2: getattr(metrics, 'TYPE_H2', 16), 3: getattr(metrics, 'TYPE_H3', 14)}.get(
+        level, getattr(metrics, 'TYPE_BODY', 12.5))
+    font = QFont(QGuiApplication.font())
+    font.setWeight(QFont.Weight.DemiBold)
+    return _pixel_font(font, px)

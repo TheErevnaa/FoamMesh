@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QDialog, QLabel
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.core.facade.errors import ValidationFailedError
+from foammesh.view import inline_error
 from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
 from widgets.async_message_box import AsyncMessageBox
@@ -117,8 +118,7 @@ class SurfaceDialog(QDialog):
                             'geometry_id': self._gIds[0],
                             'name': self._ui.name.text()})
                     except ValidationFailedError as error:
-                        await AsyncMessageBox().warning(
-                            self, self.tr('Input error'), str(error))
+                        inline_error.show(self, str(error))
                         return
 
                 db = app.facadeClient.checkout()
@@ -154,7 +154,7 @@ class SurfaceDialog(QDialog):
                 await AsyncMessageBox().warning(
                     self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                await AsyncMessageBox().warning(self, self.tr("Input error"), e.toMessage())
+                inline_error.show(self, e.toMessage())
 
     def _connectSignalsSlots(self):
         self._typeRadios.selectionChanged.connect(self._onTypeChanged)

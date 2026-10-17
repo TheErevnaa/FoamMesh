@@ -1,7 +1,7 @@
 """Gmsh workflow page: gmsh.size_fields."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QFormLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from foammesh.view.facade_client import query
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
@@ -69,14 +69,16 @@ class GmshSizeFieldsPage(GmshTaskPage):
     #: single picker where a reader expected to pick edges. A control takes
     #: every boundary curve of the faces in the group it names; the heading
     #: names the group and the help says what is taken.
-    CURVE_HEADINGS = {'scope_token': 'Face group'}
+    #:
+    #: Plan 40 UXB1 (#52). The column is headed *Curve group*: the row is
+    #: about curves, and the group is only how they are named.
+    CURVE_HEADINGS = {'scope_token': 'Curve group'}
 
-    #: Plan 33 VOLUME-04. `transfiniteTri` decides how a three-sided face is
-    #: filled, which is an edge decision, and it was drawn under a heading
-    #: about volumes behind a folded box. It is rendered here instead; the
-    #: volume step answers `renders_field` False for it, so there is still
-    #: one editor for the one field.
-    extra_field_ids = ('gmsh.volume_controls.transfinite_tri',)
+    #: Plan 40 UXB1 (#52). `transfiniteTri` was drawn here by Plan 33
+    #: VOLUME-04, as a stray checkbox under the edge table. It is a
+    #: structured-meshing choice and sits in Volume controls > Structured
+    #: meshing again, so this page hosts no field of another task.
+    extra_field_ids = ()
 
     #: Plan 32 check 12. MEASURED on the page widget before this moved: 220
     #: words across six labels with no input visible at all, because the
@@ -133,20 +135,34 @@ class GmshSizeFieldsPage(GmshTaskPage):
     #: Set while one table's selection is being reflected in the others.
     _selecting = False
 
+    def renders_field(self, field_id: str) -> bool:
+        """Plan 41 GN6. The native size-field rows are the panel's."""
+        from foammesh.core.gmsh.field_catalogue import FIELD_ID
+
+        if field_id == FIELD_ID:
+            return False
+        from foammesh.core.gmsh.point_sizes import FIELD_ID as POINT_ID
+
+        if field_id == POINT_ID:
+            return False
+        return super().renders_field(field_id)
+
     def build_sections(self, layout) -> None:
         self.surface_panel = ChildControlPanel(
             self._client, 'gmsh.surface_sizes.controls',
             self.tr('Surface sizing'), columns=self.SURFACE_COLUMNS,
             parent=self, choices={'surface_id': self.surfaceChoices()},
-            headings=self.SURFACE_HEADINGS)
+            headings=self.SURFACE_HEADINGS, inline=True)
         layout.addWidget(self.surface_panel)
 
         self.panel = ChildControlPanel(
             self._client, 'gmsh.size_fields.controls',
             self.tr('Spatial size fields'), columns=self.COLUMNS,
-            parent=self, stretch='name')
+            parent=self, stretch='name', inline=True)
         layout.addWidget(self.panel)
         layout.addWidget(self._buildEdgeSection())
+        layout.addWidget(self._buildPointSection())
+        layout.addWidget(self._buildNativeSection())
 
         for panel in self.scopePanels():
             panel.childrenChanged.connect(self.refresh_keeping_edits)
@@ -168,12 +184,52 @@ class GmshSizeFieldsPage(GmshTaskPage):
         self.curve_panel = ChildControlPanel(
             self._client, 'gmsh.curve_controls.controls',
             self.tr('Edge/curve controls'), columns=self.CURVE_COLUMNS,
-            parent=section, headings=self.CURVE_HEADINGS, stretch='name')
+            parent=section, headings=self.CURVE_HEADINGS, stretch='name',
+            inline=True)
         column.addWidget(self.curve_panel)
-        self._edgeForm = QFormLayout()
-        host = QWidget(section)
-        host.setLayout(self._edgeForm)
-        column.addWidget(host)
+        return section
+
+    def _buildPointSection(self) -> QWidget:
+        """Plan 41 GN7 (M-01). Size at points, picked in the viewport."""
+        from .point_sizes_panel import PointSizesPanel
+        from .shared_pick import SharedPick
+
+        # Plan 42 SG13. Points are picked with the one Pick tool; this page
+        # holds no entity panel of its own.
+        self.point_pick = SharedPick('point_sizes', parent=self)
+        self.point_panel = self.adoptPanel(
+            PointSizesPanel(self._client, self.point_pick, self))
+        title = QLabel(self.tr('Size at points'), self)
+        title.setObjectName('pointSizesTitle')
+        section = QWidget(self)
+        section.setObjectName('pointSizesSection')
+        column = QVBoxLayout(section)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.addWidget(title)
+        column.addWidget(self.point_panel)
+        return section
+
+    def _buildNativeSection(self) -> QWidget:
+        """Plan 41 GN6. Every Gmsh size-field type: rows, graph, preview."""
+        from .compute_page import sharedGenerateController
+        from .native_fields_panel import NativeFieldsPanel
+
+        def controller():
+            try:
+                return sharedGenerateController(self._client)
+            except Exception:                    # noqa: BLE001
+                return None
+
+        self.native_panel = self.adoptPanel(
+            NativeFieldsPanel(self._client, controller, self))
+        title = QLabel(self.tr('Gmsh size fields'), self)
+        title.setObjectName('nativeFieldsTitle')
+        section = QWidget(self)
+        section.setObjectName('nativeFieldsSection')
+        column = QVBoxLayout(section)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.addWidget(title)
+        column.addWidget(self.native_panel)
         return section
 
     def scopePanels(self) -> tuple:
@@ -183,22 +239,6 @@ class GmshSizeFieldsPage(GmshTaskPage):
             (getattr(self, name, None)
              for name in ('surface_panel', 'panel', 'curve_panel'))
             if panel is not None)
-
-    def field_form(self, field_id, classification):
-        """Draw the edge switch beside the edge table, not under Advanced.
-
-        The default routing reads the classification, and `transfiniteTri`
-        is a native runner control, so it would land in the folded box at
-        the foot of the page -- away from the only other controls on the
-        page that are about edges.
-        """
-        if field_id in self.extra_field_ids:
-            return getattr(self, '_edgeForm', None)
-        return None
-
-    def field_forms(self):
-        form = getattr(self, '_edgeForm', None)
-        return (form,) if form is not None else ()
 
     # -- one highlight at a time -------------------------------------------- #
 

@@ -261,5 +261,90 @@ class QualityPolicy:
         }
 
 
+#: Plan 40 UXD9 (N7, decided by the user 2026-10-10). Max non-orthogonality has
+#: three values, and they stay three: the ordering above is the policy. What
+#: changes is that the interface names them, so a number on screen says which
+#: tier it belongs to and a verdict says which tier judged it. Names only here;
+#: the numbers are read from the policy (or the case) where they are shown.
+TIER_STRICT = 'strict'
+TIER_REPORT = 'report'
+TIER_RELAXED = 'relaxed'
+TIERS: tuple[str, ...] = (TIER_STRICT, TIER_REPORT, TIER_RELAXED)
+
+TIER_NAMES: Mapping[str, str] = MappingProxyType({
+    TIER_STRICT: 'Strict gate',
+    TIER_REPORT: 'checkMesh report',
+    TIER_RELAXED: 'Relaxed gate',
+})
+
+#: What each tier is, in the words every surface uses.
+TIER_ROLES: Mapping[str, str] = MappingProxyType({
+    TIER_STRICT: 'the limit snappyHexMesh holds every Snap and Layers step to',
+    TIER_REPORT: 'where checkMesh reports a face and the verdict is judged',
+    TIER_RELAXED: 'the looser limit snappyHexMesh falls back to while adding '
+                  'layers',
+})
+
+#: ``meshQuality`` storage root -> tier, for the non-orthogonality value that
+#: carries all three. ``meshCheck/nonOrthThreshold`` is the report tier.
+_TIER_OF_PATH: Mapping[str, str] = MappingProxyType({
+    'meshQuality/maxNonOrtho': TIER_STRICT,
+    'meshCheck/nonOrthThreshold': TIER_REPORT,
+    'meshQuality/relaxed/maxNonOrtho': TIER_RELAXED,
+})
+
+
+def tier_name(tier: str) -> str:
+    return TIER_NAMES.get(tier, '')
+
+
+def tier_of_path(storage_path: str) -> str:
+    """The tier a non-orthogonality storage path belongs to, '' for others."""
+    return _TIER_OF_PATH.get(str(storage_path or ''), '')
+
+
+def tier_default_value(tier: str, policy: 'QualityPolicy | None' = None) -> float:
+    """The shipped non-orthogonality value of a tier, from the one policy."""
+    policy = policy or DEFAULT_POLICY
+    if tier == TIER_STRICT:
+        return float(policy.generator['maxNonOrtho'])
+    if tier == TIER_REPORT:
+        return float(policy.acceptance.max_non_ortho)
+    if tier == TIER_RELAXED:
+        return float(policy.generator_relaxed.get(
+            'maxNonOrtho', policy.generator['maxNonOrtho']))
+    raise KeyError(tier)
+
+
+def tier_label(tier: str, value=None) -> str:
+    """``Strict gate 65 deg`` -- the tier's name, with its value when known."""
+    name = tier_name(tier)
+    if not name:
+        return ''
+    if value in (None, ''):
+        return name
+    try:
+        shown = f'{float(value):g}'
+    except (TypeError, ValueError):
+        shown = str(value)
+    return f'{name} {shown} deg'
+
+
+def tier_legend(values: Mapping | None = None, *, current: str = '') -> str:
+    """The three tiers on one line, the one in force marked.
+
+    ``values`` maps a tier to the number to show (the case's own, when the
+    caller has it); a tier with none is named without a number.
+    """
+    values = values or {}
+    parts = []
+    for tier in TIERS:
+        text = tier_label(tier, values.get(tier))
+        if tier == current:
+            text += ' (this one)'
+        parts.append(text)
+    return 'Max non-orthogonality tiers: ' + ' | '.join(parts)
+
+
 #: The default policy, for the many callers that have no case in hand.
 DEFAULT_POLICY = QualityPolicy.for_solver(None)

@@ -41,6 +41,8 @@ ACTION_TO_OPERATION: dict[str, str] = {
     # Mesh inspection / QA / transforms / repair / recovery
     'mesh_info': 'mesh.info',
     'mesh_quality': 'quality.report',
+    # Plan 43 LY13 (D7): Settings > Mesh quality, the same thresholds dialog.
+    'settings_mesh_quality': 'quality.report',
     'mesh_check': 'mesh.check',
     'mesh_repair': 'mesh.repair',
     'mesh_restore': 'mesh.restore',
@@ -74,6 +76,7 @@ ACTION_TO_OPERATION: dict[str, str] = {
     'tutorials': CLIENT_SHELL,          # opens documentation in a browser
     'license': CLIENT_SHELL,            # shows an about/license dialog
     'about': CLIENT_SHELL,              # shows the about dialog
+    'start_window': CLIENT_SHELL,       # shows the start window (LY13, D7)
     'run_details': CLIENT_SHELL,        # shows the last run sentence and its log
 }
 
@@ -112,7 +115,8 @@ SERVICE_TO_OPERATIONS: dict[str, tuple[str, ...]] = {
                               'geometry.readiness', 'geometry.repair.rollback',
                               'geometry.wrap.estimate',
                               'geometry.patches.split_by_angle',
-                              'geometry.split_interfaces'),
+                              'geometry.split_interfaces',
+                              'geometry.cad.convert_to_surface'),
     'MeshTransformService': ('mesh.transform.rotate', 'mesh.transform.translate',
                              'mesh.transform.scale'),
     'MeshCheckService': ('mesh.check', 'quality.su2_readiness',
@@ -150,6 +154,14 @@ SUPPLEMENTAL_TO_OPERATION: dict[str, str] = {
     '_crashReportAction': CLIENT_SHELL,
     # Plan 37: the Farfield row's menu. Edit opens the dialog, which saves
     # through configuration.patch; Remove switches the one record off.
+    # FBOOK: Edit > History opens the run-details History tab (the data it
+    # shows is read through history.query); Help > Shortcuts opens the
+    # keyboard-shortcut list. Neither changes the case.
+    '_historyAction': CLIENT_SHELL,
+    '_shortcutsAction': CLIENT_SHELL,
+    # Plan 44 MF9: the top-level View row that presses the shared Minimise
+    # console action; it changes no case.
+    'consoleMinimiseMirror': CLIENT_SHELL,
     'farfieldEdit': CLIENT_SHELL,
     'farfieldRemove': 'configuration.patch',
 }

@@ -24,12 +24,22 @@ from PySide6.QtWidgets import (
 from foammesh.core.facade import applicability
 from foammesh.core.facade.errors import ValidationFailedError
 from foammesh.core.facade.fields import REGISTRY
+from foammesh.view.engine_context import (
+    WHEN_GMSH, WHEN_SNAPPY, engine_holds)
 from foammesh.view.facade_client import query, query_async, submit
 
-from .conditional_fields import refresh_applicability
-from foammesh.view.theming.metrics import (MARGIN_NONE, align_unit_column,
+from .conditional_fields import follows_master, refresh_applicability
+from foammesh.view.theming.metrics import (GAP_TIGHT, MARGIN_NONE,
+                                           align_unit_column,
                                            apply_form_metrics)
+from foammesh.core.facade.field_tiers import (
+    COMMON, ESSENTIAL, EXPERT, tier_of)
+from foammesh.view.widgets.folder_header import FolderHeader
 from .field_widgets import FieldEditor
+from .page_action import PageAction
+from .page_filter import make_filter_box
+from .tiers import expert_visibility, make_expert_toggle
+from widgets import async_message_box as messages
 
 
 class FieldGroupPage(QWidget):
@@ -49,10 +59,19 @@ class FieldGroupPage(QWidget):
 
     dirtyChanged = Signal(bool)
 
+    #: Plan 40 UXD4. Whether the rows are grouped by tier: Essential first,
+    #: Common behind a fold, Expert behind *Show expert settings*. A page
+    #: whose own logic chooses its rows (execution preferences) says False.
+    tiered: bool = True
+
     def __init__(self, facade_client, parent=None):
         super().__init__(parent)
         self._client = facade_client
         self._editors: dict[str, FieldEditor] = {}
+        self._commonHeader = None
+        self._expertToggle = None
+        self._commonTouched = False
+        self._applyingTiers = False
         self._pending: dict[str, object] = {}
         self.setObjectName(self.token.replace('.', '_') + 'Page')
         self.setAccessibleName(self.heading or self.token)
@@ -82,6 +101,13 @@ class FieldGroupPage(QWidget):
         self._heading = title
         outer.addWidget(title)
 
+        # Plan 40 UXD3 (F7a). A panel inside a task page is filtered by that
+        # page's box; one standing alone has its own, shown from `build`.
+        self._filter = make_filter_box(self)
+        self._filter.setVisible(False)
+        self._filter.textChanged.connect(self._on_filter_text)
+        outer.addWidget(self._filter)
+
         body = QWidget(self)
         self._form = QGroupBox(self.heading or self.token, body)
         apply_form_metrics(QFormLayout(self._form))
@@ -102,16 +128,17 @@ class FieldGroupPage(QWidget):
         self._body = body
         self._scroll = scroll
         self._embedded = False
+        self._filterText = ''
 
-        self._apply = QPushButton(self.tr('Apply'), self)
-        self._revert = QPushButton(self.tr('Revert'), self)
+        # Plan 43 LY13 (D4, D-019). A panel is a section of a task page and
+        # every one is adopted by one (`EngineTaskPage.adoptPanel`,
+        # `setEmbedded`): the page's footer commit applies it and the header's
+        # *Revert and edit* reverts it. It draws no Apply or Revert of its
+        # own; these hold the pending state the page reads.
+        self._apply = PageAction(self.tr('Apply'), self)
+        self._revert = PageAction(self.tr('Revert'), self)
         self._apply.clicked.connect(self.apply)
         self._revert.clicked.connect(self.revert)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        for button in (self._revert, self._apply):
-            buttons.addWidget(button)
-        outer.addLayout(buttons)
 
         self.build()
 
@@ -124,7 +151,24 @@ class FieldGroupPage(QWidget):
             if item.widget() is not None:
                 item.widget().deleteLater()
         self._editors.clear()
-        for field_id in self.field_ids:
+        self._commonHeader = None
+        self._expertToggle = None
+        ordered = self.field_ids
+        if self.tiered:
+            rank = {ESSENTIAL: 0, COMMON: 1, EXPERT: 2}
+            ordered = tuple(sorted(
+                self.field_ids, key=lambda item: rank[tier_of(item)]))
+        folded = (self.tiered
+                  and any(tier_of(item) == ESSENTIAL for item in ordered)
+                  and any(tier_of(item) == COMMON for item in ordered))
+        for field_id in ordered:
+            if (folded and self._commonHeader is None
+                    and tier_of(field_id) != ESSENTIAL):
+                self._commonHeader = FolderHeader(self.tr('Advanced'), self)
+                self._commonHeader.setObjectName('advancedDisclosure')
+                self._commonHeader.toggled.connect(self._onCommonTouched)
+                self._commonHeader.toggled.connect(self._apply_tiers)
+                layout.addRow(self._commonHeader)
             try:
                 descriptor = self._client.descriptor(field_id)
             except (KeyError, ValidationFailedError, AttributeError):
@@ -165,6 +209,15 @@ class FieldGroupPage(QWidget):
             # crossing a plane" and "Add feature edges from file".
             editor.setRow(layout, container)
             self._editors[field_id] = editor
+        if self.tiered and any(
+                editor.tier == EXPERT for editor in self._editors.values()):
+            self._expertToggle = make_expert_toggle(self._form)
+            layout.addRow(self._expertToggle)
+            expert_visibility().changed.connect(self._apply_tiers)
+        for editor in self._editors.values():
+            editor.setFilterText(self._filterText)
+        self._filter.setVisible(
+            bool(self._editors) and not self._embedded)
         # DP-339. A rebuild replaces the editors; it is not a write, so an
         # edit that has not reached the case yet is carried onto the new ones.
         self.reload(discard_pending=False)
@@ -249,6 +302,7 @@ class FieldGroupPage(QWidget):
                 MARGIN_NONE, MARGIN_NONE, MARGIN_NONE, MARGIN_NONE)
         for button in (self._apply, self._revert):
             button.hide()
+        self._filter.setVisible(False)
 
     def isEmbedded(self) -> bool:
         """True when this panel is a section of a task page (DP-155)."""
@@ -307,7 +361,97 @@ class FieldGroupPage(QWidget):
         # panel embedded on a task page has this done again, across both
         # panels, after the page's refresh has reloaded them.
         align_unit_column((self.form_layout(),))
+        self._apply_tiers()
         self._set_dirty(bool(self._pending))
+
+    # -- tiers (Plan 40 UXD4) ---------------------------------------------- #
+
+    def _onCommonTouched(self, *_args) -> None:
+        # Only a change the page did not make itself is the reader's.
+        if not self._applyingTiers:
+            self._commonTouched = True
+
+    def _common_editors(self) -> list:
+        return [editor for editor in self._editors.values()
+                if editor.tier == COMMON]
+
+    # -- page filter (Plan 40 UXD3) ----------------------------------------- #
+
+    def filterText(self) -> str:
+        return self._filterText
+
+    def setFilterText(self, text: str) -> None:
+        """Keep only the rows matching ``text``; '' puts the tiers back.
+
+        Called by the task page that adopted this panel, and by the panel's
+        own box when it stands alone. Hidden rows keep their values.
+        """
+        text = ' '.join(str(text or '').split())
+        if text == self._filterText:
+            return
+        self._filterText = text
+        if self._filter.text() != text and not self._embedded:
+            blocked = self._filter.blockSignals(True)
+            self._filter.setText(text)
+            self._filter.blockSignals(blocked)
+        for editor in self._editors.values():
+            editor.setFilterText(text)
+        self._apply_tiers()
+
+    def _on_filter_text(self, _text: str = '') -> None:
+        self.setFilterText(self._filter.text())
+
+    def visibleFieldIds(self) -> tuple:
+        return tuple(field_id for field_id, editor in self._editors.items()
+                     if editor.isRowShown())
+
+    def _apply_filter_chrome(self) -> None:
+        """Fold, header and switch yield to the filter while it has text."""
+        filtering = bool(self._filterText)
+        if self._commonHeader is not None:
+            self._commonHeader.setVisible(not filtering)
+        if self._expertToggle is not None:
+            self._expertToggle.setVisible(not filtering)
+        if self._embedded and self._editors:
+            # A panel with no match leaves the page, group box and all.
+            self._form.setVisible(
+                not filtering
+                or any(editor.isRowShown()
+                       for editor in self._editors.values()))
+
+    def _apply_tiers(self, *_args) -> None:
+        """Hide Expert rows until asked for; fold Common unless it is live."""
+        self._apply_filter_chrome()
+        if not self.tiered:
+            return
+        shown = expert_visibility().shown()
+        for editor in self._editors.values():
+            if editor.tier == EXPERT:
+                editor.setTierHidden(not shown)
+        header = self._commonHeader
+        if header is not None:
+            changed = sum(1 for editor in self._common_editors()
+                          if editor.applies() and not editor.isAtDefault())
+            if not self._commonTouched:
+                self._applyingTiers = True
+                try:
+                    header.setChecked(changed > 0)
+                finally:
+                    self._applyingTiers = False
+            header.setText(
+                self.tr('Advanced') if not changed
+                else self.tr('Advanced') + f'  ({changed} not at default)')
+            folded = not header.isChecked()
+            for editor in self._common_editors():
+                editor.setTierHidden(folded)
+        toggle = self._expertToggle
+        if toggle is not None:
+            changed = sum(1 for editor in self._editors.values()
+                          if editor.tier == EXPERT and editor.applies()
+                          and not editor.isAtDefault())
+            base = self.tr('Show expert settings')
+            toggle.setText(base if shown or not changed
+                           else f'{base} ({changed} not at default)')
 
     def _conditionOverrides(self) -> dict:
         """Values the applicability clauses judge in place of the stored ones.
@@ -322,11 +466,21 @@ class FieldGroupPage(QWidget):
         return bool(self._pending)
 
     def pending_patch(self) -> dict:
-        return dict(self._pending)
+        # Plan 40 UXB6. A dependant whose master was unticked before Apply
+        # is not read by the run, so the edit is held, not written.
+        return {field_id: value for field_id, value in self._pending.items()
+                if self._editors.get(field_id) is None
+                or self._editors[field_id].applies()}
 
     def _on_changed(self, field_id: str, value) -> None:
         self._pending[field_id] = value
         self._set_dirty(True)
+        # Plan 40 UXB6. The master is judged as ticked, not as stored.
+        if follows_master(self._editors, field_id):
+            self._inactive = refresh_applicability(
+                self._client, self._editors, None,
+                overrides={**self._conditionOverrides(), **self._pending})
+            align_unit_column((self.form_layout(),))
 
     def _set_dirty(self, dirty: bool) -> None:
         self._apply.setEnabled(dirty)
@@ -341,7 +495,7 @@ class FieldGroupPage(QWidget):
             if getattr(result, 'status', 'accepted') == 'accepted':
                 self.reload()
                 return
-            QMessageBox.warning(
+            messages.warning(
                 self, self.tr('Update failed'),
                 str(getattr(result, 'message', '')
                     or self.tr('The facade rejected the edit.')))
@@ -397,6 +551,9 @@ class ExecutionPreferencesPage(FieldGroupPage):
     Plan 31 (parallel.decompose_extras) added the last five: the ``constraints``
     block of ``decomposeParDict`` and its weight field.
     """
+
+    #: Its rows follow the engine, the mode and the method (UXD4 leaves them).
+    tiered = False
 
     #: How long the page is willing to wait for the runtime probe before
     #: rendering. The probe boots a WSL distribution -- about half a minute
@@ -495,10 +652,10 @@ class ExecutionPreferencesPage(FieldGroupPage):
         mode = str(mode or '').rsplit('.', 1)[-1].lower()
         method = str(method or '').rsplit('.', 1)[-1].lower()
         shown = {'mesh.execution.mode'}
-        if engine == 'gmsh':
+        if engine_holds(engine, *WHEN_GMSH):
             # Gmsh meshes in one process; the count is threads, not ranks.
             shown.add('mesh.execution.max_cpu_cores')
-        elif engine == 'snappy':
+        elif engine_holds(engine, *WHEN_SNAPPY):
             if mode == 'parallel':
                 shown.update(self.DECOMPOSITION_FIELDS)
                 shown.update(self.METHOD_FIELDS.get(method, ()))
@@ -566,7 +723,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
         if button is None:
             return
         # Only snappy decomposes; a Gmsh case has no processor cases.
-        button.setVisible(self._engine_id == 'snappy')
+        button.setVisible(engine_holds(self._engine_id, *WHEN_SNAPPY))
 
     def _askTarget(self, current: int) -> int | None:
         from PySide6.QtWidgets import QInputDialog
@@ -599,14 +756,14 @@ class ExecutionPreferencesPage(FieldGroupPage):
         return max(int(current), 2)
 
     def _confirm(self, text: str) -> bool:
-        answer = QMessageBox.question(
+        answer = messages.question(
             self, self.tr('Change core count'), text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
         return answer == QMessageBox.StandardButton.Yes
 
     def _tell(self, text: str, warning: bool = False) -> None:
-        box = QMessageBox.warning if warning else QMessageBox.information
+        box = messages.warning if warning else messages.information
         box(self, self.tr('Change core count'), text)
 
     def redistributeSummary(self, report: dict) -> str:
@@ -734,6 +891,12 @@ class ExecutionPreferencesPage(FieldGroupPage):
         super().build()
         self._mountEffectiveCount()
         self._applyRoute()
+        # Plan 44 F4 (MF14 sheet conventions). The mode combo sized itself to
+        # its longest entry ("Auto (snappy: 15 ranks · Gmsh: 15 threads)",
+        # 285 px) and pushed Mesh setup to 370 px in the 275 px column of a
+        # 1280 px window. It elides, with the whole text in its tooltip.
+        from foammesh.view.theming.sheet_form import elide_combos
+        elide_combos(self._form)
 
     def _cellFor(self, field_id: str):
         editor = self._editors.get(field_id)
@@ -760,6 +923,13 @@ class ExecutionPreferencesPage(FieldGroupPage):
             return
         label = QLabel(cell)
         label.setObjectName('executionEffectiveCores')
+        # Plan 44 F4. "snappy: 15 ranks · Gmsh: 15 threads" on one line is
+        # 213 px beside the spin box, which pushed the sheet 52 px wide. It
+        # is the spin box's caption now (as each engine's runtime line is
+        # under its radio on the same page): under the editor, in the same
+        # cell, so it still hides with the row, and it wraps.
+        label.setWordWrap(True)
+        label.setProperty('foammeshTone', 'muted')
         # DP-186 and the castellation estimate before it: a label whose text
         # is rewritten on every edit must not carry a fixed accessible name,
         # or an assistive reader is handed the heading in place of the
@@ -769,7 +939,18 @@ class ExecutionPreferencesPage(FieldGroupPage):
                     'the machine has.'))
         label.setToolTip(label.accessibleDescription())
         # DP-156: the cell still ends with the unit label.
-        row.insertWidget(max(row.count() - 1, 0), label)
+        first = row.itemAt(0)
+        editor = first.widget() if first is not None else None
+        if editor is not None and row.count() > 1:
+            row.removeWidget(editor)
+            stack = QVBoxLayout()
+            stack.setContentsMargins(0, 0, 0, 0)
+            stack.setSpacing(GAP_TIGHT)
+            stack.addWidget(editor)
+            stack.addWidget(label)
+            row.insertLayout(0, stack, 1)
+        else:
+            row.insertWidget(max(row.count() - 1, 0), label)
         self._effective = label
         self._refreshEffectiveCount()
 
@@ -806,7 +987,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
         unread = self.UNREAD_FIELDS.get(field_id)
         if unread:
             return unread
-        if self._engine_id == 'gmsh':
+        if engine_holds(self._engine_id, *WHEN_GMSH):
             return self.tr('Gmsh meshes in one process and decomposes '
                            'nothing, so a Gmsh run never reads this.')
         mode = str(self._currentValue('mesh.execution.mode') or '')
@@ -852,14 +1033,18 @@ class ExecutionPreferencesPage(FieldGroupPage):
                      else self.tr('{0} ranks').format(ranks))
         thread_text = (self.tr('1 thread') if threads == 1
                        else self.tr('{0} threads').format(threads))
-        if self._engine_id == 'snappy':
+        if engine_holds(self._engine_id, *WHEN_SNAPPY):
             label.setText(rank_text)
-        elif self._engine_id == 'gmsh':
+        elif engine_holds(self._engine_id, *WHEN_GMSH):
             label.setText(thread_text)
         else:
             label.setText(self.tr('snappy: {0} \u00b7 Gmsh: {1}').format(
                 rank_text, thread_text))
-        if self._engine_id == 'gmsh':
+        # Plan 40 UXB2 (#38). Auto is not left bare: it says what it came to.
+        mode = self._editors.get('mesh.execution.mode')
+        if mode is not None:
+            mode.annotate_option('auto', label.text())
+        if engine_holds(self._engine_id, *WHEN_GMSH):
             from foammesh.core.execution.resources import meshing_cpu_count
             cpu = meshing_cpu_count(policy, engine='gmsh', host=host)
             count = threads
@@ -1133,6 +1318,13 @@ class ExecutionPreferencesPage(FieldGroupPage):
 
 
 
+_FARFIELD_FIELDS = tuple(
+    f'gmsh.describe_geometry.{leaf}' for leaf in (
+        'enabled', 'shape', 'centre_mode', 'centre.x', 'centre.y',
+        'centre.z', 'padding', 'radius', 'length', 'axis.x', 'axis.y',
+        'axis.z'))
+
+
 class GmshHealingPanel(FieldGroupPage):
     """The import and healing questions Gmsh asks, hosted on Preparation.
 
@@ -1162,10 +1354,14 @@ class GmshHealingPanel(FieldGroupPage):
         'take effect in the Gmsh run '
         'only; the readiness report on this page is not re-run with them.')
     caveat = ''
+    #: Plan 42 SG5. The 12 far-field fields are edited in one place,
+    #: Geometry > Farfield...; this panel no longer carries a copy.
+    FARFIELD_FIELDS = _FARFIELD_FIELDS
     field_ids: tuple[str, ...] = tuple(
         field_id for field_id in REGISTRY.ids()
         if REGISTRY.get(field_id).ui_location
-        == 'workflow.gmsh.describe_geometry')
+        == 'workflow.gmsh.describe_geometry'
+        and field_id not in _FARFIELD_FIELDS)
 
     #: DP-629 (field audit 0924 D-SH-02). Settings of Gmsh's CAD importer. A
     #: surface (STL/OBJ) is read without it, so on a case whose every source
@@ -1204,40 +1400,6 @@ class GmshHealingPanel(FieldGroupPage):
         return bool(entries) and not any(is_cad_entry(item)
                                          for item in entries)
 
-    #: Plan 37. The farfield these fields describe is one record, edited here
-    #: and from Geometry > Farfield...; the line says where the other is.
-    FARFIELD_POINTER = ('The far field can also be set up from '
-                        'Geometry → Farfield…; both edit the '
-                        'same settings.')
-
-    def build(self) -> None:
-        super().build()
-        layout = self.form_layout()
-        editor = self._editors.get('gmsh.describe_geometry.enabled')
-        if editor is None:
-            return
-        row, _role = layout.getWidgetPosition(editor.label)
-        if row < 0:
-            return
-        pointer = QLabel(self.tr(self.FARFIELD_POINTER), self._form)
-        pointer.setObjectName('gmshFarfieldPointer')
-        pointer.setWordWrap(True)
-        layout.insertRow(row, pointer)
-        # Plan 37 UF13. Said under the shape when a sphere or cylinder was
-        # sized to hold the geometry, as Geometry > Farfield... says it.
-        shape = self._editors.get('gmsh.describe_geometry.shape')
-        fit_row = (layout.getWidgetPosition(shape.label)[0]
-                   if shape is not None else -1)
-        note = QLabel(self._form)
-        note.setObjectName('gmshFarfieldFitNote')
-        note.setWordWrap(True)
-        note.hide()
-        if fit_row >= 0:
-            layout.insertRow(fit_row + 1, note)
-        else:
-            layout.addRow(note)
-        self._fitNote = note
-
     def pinnedReasons(self) -> dict[str, str]:
         """The fields this case cannot use, beyond their own conditions."""
         pinned = {self.IMPORT_SCALING: self.IMPORT_SCALING_REASON}
@@ -1246,11 +1408,17 @@ class GmshHealingPanel(FieldGroupPage):
                           for field_id in self.CAD_IMPORTER_FIELDS)
         return pinned
 
+    def pending_patch(self) -> dict:
+        """The whole edit.
+
+        Plan 42 SG5: the far-field rows that were held back by shape are gone
+        from this panel, so nothing is held here (the base class holds an edit
+        whose row the run does not read).
+        """
+        return dict(self._pending)
+
     def reload(self, *, discard_pending: bool = True) -> None:
         super().reload(discard_pending=discard_pending)
-        note = getattr(self, '_fitNote', None)
-        if note is not None and discard_pending:
-            note.hide()
         if self._applyPinned():
             align_unit_column((self.form_layout(),))
             self._set_dirty(bool(self._pending))
@@ -1270,135 +1438,3 @@ class GmshHealingPanel(FieldGroupPage):
             self._pending.pop(field_id, None)
             changed = True
         return changed
-
-    # -- the farfield rows follow the shape as it is chosen ---------------- #
-
-    #: Plan 37 UF13. The settings the farfield rows' clauses read on this
-    #: page: the radius, length and axis follow the shape, the explicit
-    #: centre follows the centre mode.
-    FARFIELD_SWITCHES = ('gmsh.describe_geometry.shape',
-                         'gmsh.describe_geometry.centre_mode')
-
-    def _conditionOverrides(self) -> dict:
-        """The shape and centre mode as chosen, applied or not.
-
-        Plan 37 UF13. The rows were judged on the stored shape only, so a
-        sphere's radius appeared after Apply. Geometry → Farfield… swaps them
-        as the shape is chosen; this panel edits the same record and now
-        does the same.
-        """
-        return {field_id: self._pending[field_id]
-                for field_id in self.FARFIELD_SWITCHES
-                if field_id in self._pending}
-
-    #: Choosing these sizes a sphere or cylinder that would not hold the
-    #: geometry, as Geometry > Farfield... does (``FarfieldDialog._fit``).
-    FARFIELD_FIT_TRIGGERS = FARFIELD_SWITCHES + (
-        'gmsh.describe_geometry.enabled',)
-    FIT_NOTE = ('Sized to hold the geometry with room around it; change it '
-                'if you need a different size.')
-
-    def _on_changed(self, field_id: str, value) -> None:
-        super()._on_changed(field_id, value)
-        if field_id in self.FARFIELD_FIT_TRIGGERS:
-            self._fitFarfield()
-        if field_id in self.FARFIELD_SWITCHES:
-            self._refreshFarfieldRows()
-
-    def modelBounds(self):
-        """The model's extent in Gmsh order, or ``None`` with no geometry.
-
-        Read as Geometry > Farfield... reads it, from the geometry manager's
-        surface bounds.
-        """
-        try:
-            from foammesh.app import app
-            from foammesh.core.mesh import snappy_farfield
-            manager = getattr(getattr(app, 'window', None),
-                              'geometryManager', None)
-            surfaces = getattr(manager, 'getSurfaceBounds', None)
-            extent = surfaces() if surfaces is not None else None
-            return (None if extent is None
-                    else snappy_farfield.gmsh_bounds(extent.toTuple()))
-        except Exception:                                    # noqa: BLE001
-            return None
-
-    def fitNote(self) -> QLabel | None:
-        return getattr(self, '_fitNote', None)
-
-    def _fitFarfield(self) -> bool:
-        """A sphere or cylinder chosen too small is sized to hold the model.
-
-        Plan 37 UF13. The same rule as ``FarfieldDialog._fit``: only with an
-        automatic centre, and only when the size on screen would be refused
-        for containment. The new radius (and a cylinder's length) is put in
-        the edit, so Apply writes it. True when anything was sized.
-        """
-        from foammesh.core.mesh import farfield_spec
-        from foammesh.view.geometry.farfield_dialog import (FIELDS,
-                                                            spec_from_values)
-
-        note = self.fitNote()
-        if note is not None:
-            note.hide()
-        values = {field_id: (self._pending[field_id]
-                             if field_id in self._pending
-                             else self._editors[field_id].value())
-                  for field_id, _leaf in FIELDS if field_id in self._editors}
-        try:
-            spec = spec_from_values(values)
-        except Exception:                                    # noqa: BLE001
-            return False
-        bounds = self.modelBounds()
-        if (bounds is None or not spec.enabled or spec.shape == 'box'
-                or spec.centre_mode != 'auto' or spec.problems()
-                or not farfield_spec.check(spec, bounds)):
-            return False
-        sized = farfield_spec.fitted(spec, bounds)
-        fits = {'gmsh.describe_geometry.radius': sized.radius}
-        if spec.shape == 'cylinder':
-            fits['gmsh.describe_geometry.length'] = sized.length
-        for field_id, value in fits.items():
-            editor = self._editors.get(field_id)
-            if editor is None:
-                continue
-            editor.set_value(value)
-            self._pending[field_id] = editor.value()
-        self._set_dirty(True)
-        if note is not None:
-            note.setText(self.tr(self.FIT_NOTE))
-            note.show()
-        return True
-
-    def _refreshFarfieldRows(self) -> None:
-        """Offer the rows the chosen shape and centre mode read, now.
-
-        Nothing is dropped from the edit: a radius typed for a sphere is
-        kept if the shape goes back to sphere before Apply, and
-        `pending_patch` leaves out whatever the shape on screen does not read.
-        """
-        self._inactive = refresh_applicability(
-            self._client, self._editors, None,
-            overrides=self._conditionOverrides())
-        self._applyPinned()
-        align_unit_column((self.form_layout(),))
-
-    def pending_patch(self) -> dict:
-        """The edit, less the farfield rows the chosen shape does not read.
-
-        Only the rows whose clauses name the shape or the centre mode are
-        held back here; every other inactive row is dropped by the reload,
-        as on every field page.
-        """
-        inactive = getattr(self, '_inactive', None) or {}
-        held = set()
-        for field_id in self._pending:
-            editor = self._editors.get(field_id)
-            if field_id not in inactive or editor is None:
-                continue
-            clauses = getattr(editor.descriptor, 'applies_when', ()) or ()
-            if set(applicability.referenced_fields(clauses)) & set(
-                    self.FARFIELD_SWITCHES):
-                held.add(field_id)
-        return {field_id: value for field_id, value in self._pending.items()
-                if field_id not in held}

@@ -64,6 +64,20 @@ def refresh_applicability(client, editors, pending=None, *,
     return inactive
 
 
+def follows_master(editors, field_id) -> bool:
+    """Whether some editor on the page is conditioned on ``field_id``.
+
+    Plan 40 UXB6. A dependant follows its master checkbox as the box is
+    ticked, not after Apply, so a page re-judges its rows when an edit
+    lands on a field that another row's clause reads.
+    """
+    for editor in editors.values():
+        clauses = getattr(editor.descriptor, 'applies_when', ()) or ()
+        if field_id in applicability.referenced_fields(clauses):
+            return True
+    return False
+
+
 def condition_context(client, editors) -> tuple[dict, dict]:
     """The values and the display names the clauses on this page refer to.
 

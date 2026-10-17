@@ -20,9 +20,49 @@
    <string>Start FoamMesh</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="spacing">
+    <number>12</number>
+   </property>
+   <property name="leftMargin">
+    <number>16</number>
+   </property>
+   <property name="topMargin">
+    <number>16</number>
+   </property>
+   <property name="rightMargin">
+    <number>16</number>
+   </property>
+   <property name="bottomMargin">
+    <number>16</number>
+   </property>
    <item>
     <widget class="QWidget" name="widget" native="true">
      <layout class="QHBoxLayout" name="horizontalLayout">
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="recentCaps">
+        <property name="foammeshTone" stdset="0">
+         <string>muted</string>
+        </property>
+        <property name="text">
+         <string>Recent cases</string>
+        </property>
+       </widget>
+      </item>
       <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
@@ -37,16 +77,22 @@
        </spacer>
       </item>
       <item>
-       <widget class="QPushButton" name="newCase">
+       <widget class="QPushButton" name="open">
         <property name="text">
-         <string>New case</string>
+         <string>Open…</string>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="open">
+       <widget class="QPushButton" name="newCase">
+        <property name="foammeshRole" stdset="0">
+         <string>primary</string>
+        </property>
         <property name="text">
-         <string>Open</string>
+         <string>New case</string>
+        </property>
+        <property name="default">
+         <bool>true</bool>
         </property>
        </widget>
       </item>
@@ -54,9 +100,28 @@
     </widget>
    </item>
    <item>
+    <widget class="QLabel" name="emptyState">
+     <property name="foammeshTone" stdset="0">
+      <string>secondary</string>
+     </property>
+     <property name="text">
+      <string>No recent cases yet. Choose New case to start one, or Open… to pick a case folder you already have.</string>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignLeft|Qt::AlignVCenter</set>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QListWidget" name="recentCases">
      <property name="frameShape">
       <enum>QFrame::NoFrame</enum>
+     </property>
+     <property name="spacing">
+      <number>4</number>
      </property>
      <property name="itemAlignment">
       <set>Qt::AlignTop</set>

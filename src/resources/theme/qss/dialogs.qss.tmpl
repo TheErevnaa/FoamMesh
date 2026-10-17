@@ -1,0 +1,191 @@
+/* -- checkboxes and radios ---------------------------------------------- */
+/* These were left entirely unstyled, so they rendered in the native Windows
+ * look while every other control was themed -- the single loudest difference
+ * between the two applications on a settings page. */
+
+QCheckBox, QRadioButton, QLabel {
+    color: {{foreground.primary}};
+    background: transparent;
+}
+QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 2px solid {{border.default}};
+    background: {{input.background}};
+}
+QCheckBox::indicator, QGroupBox::indicator { border-radius: 4px; }
+QRadioButton::indicator { border-radius: 9px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover,
+QGroupBox::indicator:hover { border-color: {{accent.hover}}; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked,
+QGroupBox::indicator:checked {
+    background: {{accent.default}};
+    border-color: {{accent.default}};
+}
+QCheckBox::indicator:checked, QGroupBox::indicator:checked {
+    image: url(:/icons/checkmark.svg);
+}
+QRadioButton::indicator:checked { image: url(:/icons/radio-button-on.svg); }
+QCheckBox::indicator:focus, QRadioButton::indicator:focus,
+QGroupBox::indicator:focus { border-color: {{focus.ring}}; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
+QGroupBox::indicator:disabled {
+    border-color: {{disabled.foreground}};
+    background: {{disabled.background}};
+}
+/* R110. Only the indicator ever looked disabled. The `color:` rule above is a
+   stylesheet rule, and a stylesheet colour beats the palette's Disabled group,
+   so `setEnabled(False)` on an engine radio left its text at full contrast:
+   MEASURED on the Meshing Method page, where "Gmsh (SU2 export)" was ruled out
+   for the chosen solver, carried a greyed dot and full-strength text, and read
+   as merely unselected -- clicking it did nothing and said nothing. Buttons
+   already restate this at line 52 for the same reason. */
+/* DP-148. The rule above names three widgets and R110 restated two of them,
+   so every disabled QLabel in the application kept full-strength text.
+   MEASURED on a collapsed Advanced group: the field label held `#e6e6e6` at
+   13.2:1 while the value beside it dropped to `#6f747b` at 3.14:1 -- half a
+   row dimmed and half did not, on the same line. A label carrying its own
+   colour (a status message, a heading) still sets it, by source order and by
+   specificity. */
+QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled {
+    color: {{disabled.foreground}};
+}
+
+/* -- FoamMesh's own controls -------------------------------------------- */
+
+QLabel[foammeshStatus="success"] { color: {{status.success}}; }
+QLabel[foammeshStatus="warning"] { color: {{status.warning}}; }
+QLabel[foammeshStatus="error"] { color: {{status.error}}; }
+QLabel[foammeshStatus="info"] { color: {{status.info}}; }
+/* Plan 40 UXD6: an entry the product will not take sits in a red outline, with its one-line note under it. */
+*[foammeshInvalid="true"] { border: 1px solid {{status.error}}; }
+QLabel#inlineNote, QLabel#inlineBanner { padding: 1px 4px; }
+QLabel#inlineNote { background: {{background.surface}}; border: 1px solid {{border.default}}; }
+QLabel[foammeshTone="muted"] { color: {{foreground.muted}}; }
+QLabel[foammeshTone="secondary"] { color: {{foreground.secondary}}; }
+/* DP-109. The sentence that says what a run produced -- "gmsh-dead217bb1 ·
+   accepted · 91,220 cells · polyMesh" -- is the most important thing the page
+   has to offer once a mesh finishes, and it was drawn in the panel's ordinary
+   body grey under the action button row, reading as a footnote to the
+   buttons. The weight makes it the page's answer. The colour is applied only
+   where the strip has no status role of its own, so a failed run keeps the
+   error shade the rule above gives it. */
+QLabel#runStatusText { font-weight: 600; }
+QLabel#runStatusText[foammeshStatus=""] { color: {{foreground.primary}}; }
+QLabel[foammeshAccentSurface="true"] { background: {{selection.background}}; margin: 2px; }
+ListTable[foammeshSurface="true"] { background: {{background.surface}}; }
+QLabel#regionEmptyMessage, QLabel#regionValidationMessage {
+    padding: 10px;
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+}
+*[foammeshColorSwatch="true"] {
+    background-color: palette(window);
+    border: 1px solid {{border.default}};
+    border-radius: 3px;
+}
+QPlainTextEdit[foammeshConsole="true"] {
+    background-color: {{console.background}};
+    color: {{console.foreground}};
+    selection-background-color: {{selection.background}};
+}
+/* G2. A page whose four stacked buttons all look alike hides which one is
+   the action: `Apply method` read exactly like `Re-probe runtimes`. The one
+   button that advances the workflow is drawn in the accent. */
+QPushButton[foammeshRole="primary"] {
+    background: {{accent.fill}};
+    color: {{accent.text}};
+    border: 1px solid {{accent.default}};
+}
+QPushButton[foammeshRole="primary"]:hover {
+    background: {{accent.fill.hover}};
+    border-color: {{accent.hover}};
+}
+QPushButton[foammeshRole="primary"]:disabled {
+    background: {{background.elevated}};
+    color: {{foreground.muted}};
+    border-color: {{border.default}};
+}
+FlatPushButton[foammeshFlat="true"], IconCheckBox[foammeshFlat="true"] {
+    background: transparent;
+    border: none;
+}
+QPushButton[foammeshFlat="true"], QToolButton[foammeshFlat="true"] {
+    background: transparent;
+    border: none;
+}
+QPushButton[foammeshFlat="true"]:hover, QToolButton[foammeshFlat="true"]:hover {
+    background: {{background.elevated}};
+    border-radius: 6px;
+}
+QToolButton[foammeshFlat="true"]:checked {
+    background: {{selection.background}};
+    border-radius: 6px;
+}
+QToolButton[foammeshFlat="true"]:disabled { background: transparent; }
+
+
+/* -- Plan 44 MF25: the start window ------------------------------------- */
+QDialog#ProjectSelector { background: {{background.surface}}; }
+QDialog#ProjectSelector QListWidget#recentCases {
+    background: transparent;
+    border: none;
+    outline: none;
+}
+QDialog#ProjectSelector QListWidget#recentCases::item,
+QDialog#ProjectSelector QListWidget#recentCases::item:selected,
+QDialog#ProjectSelector QListWidget#recentCases::item:hover {
+    background: transparent;
+    border: none;
+}
+/* A recent case: name, path and date inside a 1 px group outline. */
+ProjectWidget[foammeshStartCard="true"] {
+    background: {{background.surface}};
+    border: 1px solid {{border.group}};
+    border-radius: 4px;
+}
+ProjectWidget[foammeshStartCard="true"]:hover {
+    background: {{background.raised}};
+    border-color: {{border.default}};
+}
+ProjectWidget[foammeshStartCard="true"] QLabel#name,
+ProjectWidget[foammeshStartCard="true"] QLabel#path,
+ProjectWidget[foammeshStartCard="true"] QLabel#status,
+ProjectWidget[foammeshStartCard="true"] QWidget#widget,
+ProjectWidget[foammeshStartCard="true"] QWidget#widget_2,
+ProjectWidget[foammeshStartCard="true"] QWidget#widget_3 {
+    border: none;
+    background: transparent;
+}
+QDialog#ProjectSelector QLabel#emptyState { padding: 24px; }
+
+
+/* -- Plan 44 MF26: the sheet dialog (mockup `.snap`, M:333-345) ---------- */
+/* Every message box (src/widgets/async_message_box.py) and the forms that ask
+ * for it: the raised surface, the group outline, radius 6. The 10 12 12
+ * padding and the 8 px gap are layout margins, set by the helper. */
+QDialog[foammeshRole="sheetDialog"] {
+    background: {{background.raised}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.float}}px;
+}
+/* `.snap .st`: the caps title and the caps section titles. The caps face is
+ * the helper's (`fonts.caps_font`); the mockup's 7d838c is a caption grey
+ * that reads below 4.5:1, so the title takes the secondary ink. */
+QDialog[foammeshRole="sheetDialog"] QLabel#sheetDialogTitle,
+QDialog[foammeshRole="sheetDialog"] QLabel#sheetSectionTitle {
+    color: {{foreground.secondary}};
+}
+/* `.snap .row>span:first-child`: the 78 px label column. */
+QDialog[foammeshRole="sheetDialog"] QLabel[foammeshSheetLabel="true"] {
+    color: {{foreground.secondary}};
+}
+QDialog[foammeshRole="sheetDialog"] QLabel[foammeshSheetLabel="true"]:disabled {
+    color: {{disabled.foreground}};
+}
+/* `.snap .btns`: right-aligned, secondary then primary (GnomeLayout puts the
+ * stretch first and the accept button last). */
+QDialog[foammeshRole="sheetDialog"] QDialogButtonBox {
+    button-layout: 3;
+}

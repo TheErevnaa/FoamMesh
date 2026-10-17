@@ -1,0 +1,290 @@
+/* -- input fields -------------------------------------------------------- */
+/* Plan 44 MF2 (mockup .field): field fill, 1px border, radius 3, 3px 8px.
+ * The height stays 28 (DP-189) until MF19 owns the density switch. */
+
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit,
+QAbstractSpinBox, QDateEdit, QTimeEdit {
+    background: {{background.field}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    padding: 3px 8px;
+    selection-background-color: {{selection.background}};
+    selection-color: {{foreground.strong}};
+}
+/* A 14px drop-down with an 8px chevron. */
+QComboBox::drop-down {
+    border: none;
+    width: 14px;
+}
+/* DP-203. The chevron has to be named. Sizing `::drop-down` above already
+ * moved this box onto the style-sheet paint path, and on that path an arrow
+ * with no `image` is drawn as nothing at all -- so every combo box in the
+ * application was a text field with a dead margin, and the one thing that
+ * says "there are other answers than this one" was missing from all of
+ * them. `icon.ink` picks the set the theme can be read in. */
+QComboBox::down-arrow {
+    image: url(:/{{icon.ink}}/chevron-down.svg);
+    width: 8px;
+    height: 8px;
+}
+/* A closed list has no other answer to offer, so it offers no chevron. */
+QComboBox::down-arrow:disabled { image: none; }
+
+/* Plan 44 MF2. A number box has no step buttons: stepping stays on the wheel
+ * and the arrow keys, and the strip the buttons took goes back to the
+ * number. DP-203 is re-baselined, not deleted: the sub-controls are still
+ * named, because naming them keeps the box on the style-sheet paint path, and
+ * a zero-width control paints nothing instead of two dead cells. */
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 0;
+    border: none;
+    background: transparent;
+}
+QAbstractSpinBox::up-button { subcontrol-position: top right; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; }
+QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow {
+    width: 0;
+    height: 0;
+    image: none;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QPlainTextEdit:disabled, QTextEdit:disabled, QAbstractSpinBox:disabled {
+    background: {{disabled.background}};
+    color: {{disabled.foreground}};
+    border-color: {{border.default}};
+}
+
+/* The focus ring is 2px and the pixel comes out of the padding, so gaining
+ * focus never changes a widget's content box and shifts the layout under the
+ * cursor. Scoped to widgets that already carry a border. Push and tool
+ * buttons have their own ring in core. */
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QAbstractSpinBox:focus, QPlainTextEdit:focus, QTextEdit:focus {
+    border: 2px solid {{accent.default}};
+    padding: 2px 7px;
+}
+QTreeView:focus, QListView:focus, QTableView:focus {
+    border: 1px solid {{accent.default}};
+}
+
+/* -- group boxes (Plan 44 MF2) ------------------------------------------ */
+/* The title sits INSIDE the card (mockup .grp > .t): 1px group border,
+ * radius 4, no margin above the frame, 26px of padding on top that holds the
+ * 14px title, 8px on the other sides. `QGroupBox` is the only group box rule (MF3 deleted the old one in chrome.qss.tmpl).
+ * Plan 40 UXB1: one rule for every section title, bold, one step larger than
+ * the body; no page sets a title font of its own. */
+QGroupBox {
+    border: 1px solid {{border.group}};
+    border-radius: {{radius.group}}px;
+    margin-top: 0;
+    padding: 26px 8px 8px 8px;
+    font-weight: 600;
+    font-size: {{type.h3}}px;
+}
+QGroupBox::title {
+    subcontrol-origin: padding;
+    subcontrol-position: top left;
+    left: 8px;
+    top: 6px;
+    padding: 0;
+    color: {{foreground.primary}};
+}
+
+/* -- sheet form rows and the one disclosure idiom (Plan 44 MF14) --------- */
+/* Mockup `.row .u`: the unit that ends a row is 12px and quiet. */
+QLabel#fieldUnit {
+    color: {{foreground.sub}};
+    font-size: {{type.small}}px;
+}
+/* A card title that folds (`.grp > .t` with a chevron): the same 14px 600
+ * title a group box carries, so a fold and a group read as one idiom. The
+ * chevron is the button's own themed icon (widgets/folder_header.py). */
+FolderHeader {
+    font-weight: 600;
+    font-size: {{type.h3}}px;
+    color: {{foreground.primary}};
+    padding: 2px 0;
+    spacing: 6px;
+}
+FolderHeader:hover { color: {{foreground.strong}}; }
+FolderHeader:focus { color: {{foreground.strong}}; }
+
+/* -- segmented control (mockup `.seg`) ----------------------------------- */
+/* 1px `border.default` frame, radius 4 outside; each option is a flat cell
+ * separated by the next cell's left border; the chosen one is filled with
+ * `selection.background` and white words. The property selectors out-rank
+ * the global `QPushButton` rules of core, so a segment never grows the raised
+ * button look, its hover ring or its 2px focus border. */
+QWidget[foammeshRole="segmentGroup"] {
+    background: {{background.field}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.group}}px;
+}
+QWidget[foammeshRole="segmentGroup"]:focus {
+    border: 1px solid {{accent.default}};
+}
+QPushButton[foammeshRole="segment"] {
+    background: transparent;
+    color: {{foreground.sub}};
+    border: none;
+    border-left: 1px solid {{border.default}};
+    border-radius: 0;
+    padding: 3px 8px;
+    min-height: 20px;
+}
+QPushButton[foammeshRole="segment"][foammeshSegment="first"],
+QPushButton[foammeshRole="segment"][foammeshSegment="only"] {
+    border-left: none;
+    border-top-left-radius: 3px;
+    border-bottom-left-radius: 3px;
+}
+QPushButton[foammeshRole="segment"][foammeshSegment="last"],
+QPushButton[foammeshRole="segment"][foammeshSegment="only"] {
+    border-top-right-radius: 3px;
+    border-bottom-right-radius: 3px;
+}
+QPushButton[foammeshRole="segment"]:hover {
+    background: {{background.raised}};
+    color: {{foreground.strong}};
+    border-color: {{border.default}};
+}
+QPushButton[foammeshRole="segment"][foammeshSegment="first"]:hover,
+QPushButton[foammeshRole="segment"][foammeshSegment="only"]:hover {
+    border-left: none;
+}
+QPushButton[foammeshRole="segment"]:checked,
+QPushButton[foammeshRole="segment"]:checked:hover {
+    background: {{selection.background}};
+    color: {{foreground.strong}};
+    border-color: {{border.default}};
+}
+QPushButton[foammeshRole="segment"][foammeshSegment="first"]:checked,
+QPushButton[foammeshRole="segment"][foammeshSegment="only"]:checked {
+    border-left: none;
+}
+QPushButton[foammeshRole="segment"]:disabled {
+    color: {{disabled.foreground}};
+    background: transparent;
+}
+QPushButton[foammeshRole="segment"]:checked:disabled {
+    background: {{disabled.background}};
+}
+/* An untitled card (the Advanced and Expert bodies) reserves no title row. */
+QWidget QGroupBox[foammeshUntitled="true"] {
+    padding-top: 8px;
+}
+
+/* -- the completion lock and the read-only look (Plan 44 MF18) ----------- */
+/* Mockup `.lockt`: a 24px chip, padding 0 9px, radius 3, 12px words, in the
+ * filter row. Locked is the green `lock.ok.*`, open the grey `lock.open.*`,
+ * and the confirm press the red `lock.warn.*`. 22px of content + a 1px
+ * border above and below = 24. The property selectors out-rank the global
+ * `QPushButton` rules of core, focus ring included. */
+QPushButton[foammeshLock="locked"], QPushButton[foammeshLock="open"],
+QPushButton[foammeshLock="confirm"], QPushButton[foammeshLock="cancel"] {
+    border-radius: {{radius.control}}px;
+    padding: 0 9px;
+    font-size: 12px;
+    min-height: 22px;
+    max-height: 22px;
+}
+QPushButton[foammeshLock="locked"] {
+    border: 1px solid {{lock.ok.border}};
+    background: {{lock.ok.bg}};
+    color: {{lock.ok.fg}};
+}
+QPushButton[foammeshLock="locked"]:hover,
+QPushButton[foammeshLock="locked"]:focus {
+    border: 1px solid {{lock.ok.hover}};
+    background: {{lock.ok.bg}};
+    color: {{foreground.strong}};
+}
+QPushButton[foammeshLock="open"], QPushButton[foammeshLock="cancel"] {
+    border: 1px solid {{lock.open.border}};
+    background: {{lock.open.bg}};
+    color: {{lock.open.fg}};
+}
+QPushButton[foammeshLock="cancel"] { padding: 0 7px; }
+QPushButton[foammeshLock="open"]:hover, QPushButton[foammeshLock="open"]:focus,
+QPushButton[foammeshLock="cancel"]:hover,
+QPushButton[foammeshLock="cancel"]:focus {
+    border: 1px solid {{accent.default}};
+    background: {{lock.open.bg}};
+}
+QPushButton[foammeshLock="confirm"],
+QPushButton[foammeshLock="confirm"]:hover,
+QPushButton[foammeshLock="confirm"]:focus {
+    border: 1px solid {{lock.warn.border}};
+    background: {{lock.warn.bg}};
+    color: {{accent.text}};
+}
+QPushButton[foammeshLock="confirm"]:focus { border-color: {{accent.text}}; }
+/* Mockup `.frow .ask`: what the unlock discards, 12px, one line. */
+QLabel[foammeshLock="ask"] {
+    color: {{ask.fg}};
+    font-size: 12px;
+}
+/* Mockup `.page-body.ro`: a locked step's editors keep their words readable
+ * and show a dashed border; nothing is greyed (B10, the DP-148 dimming is for
+ * a disabled control, and a locked one is not disabled). */
+QLineEdit[foammeshReadOnly="true"], QComboBox[foammeshReadOnly="true"],
+QAbstractSpinBox[foammeshReadOnly="true"], QSpinBox[foammeshReadOnly="true"],
+QDoubleSpinBox[foammeshReadOnly="true"],
+QPlainTextEdit[foammeshReadOnly="true"], QTextEdit[foammeshReadOnly="true"] {
+    border-style: dashed;
+    color: {{foreground.secondary}};
+}
+QCheckBox[foammeshReadOnly="true"]::indicator,
+QRadioButton[foammeshReadOnly="true"]::indicator {
+    border-style: dashed;
+}
+/* Plan 44 CHR1 (K2, DP-2665). The unchecked box kept the quiet border
+ * (1.61:1 on the dark page) and a box that a page had also disabled kept the
+ * disabled ink (3.26:1). A locked page keeps its words readable (4.5:1 at
+ * least), so both restate the secondary ink; a checked box keeps its accent
+ * fill, which carries the contrast. */
+QCheckBox[foammeshReadOnly="true"]::indicator:unchecked,
+QRadioButton[foammeshReadOnly="true"]::indicator:unchecked,
+QCheckBox[foammeshReadOnly="true"]::indicator:unchecked:disabled,
+QRadioButton[foammeshReadOnly="true"]::indicator:unchecked:disabled {
+    border-color: {{foreground.secondary}};
+}
+QCheckBox[foammeshReadOnly="true"]:disabled,
+QRadioButton[foammeshReadOnly="true"]:disabled {
+    color: {{foreground.secondary}};
+}
+QWidget[foammeshRole="segmentGroup"][foammeshReadOnly="true"] {
+    border-style: dashed;
+}
+
+/* -- notices and hints (Plan 44 MF18, mockup `.hint`) --------------------- */
+/* A notice is a quiet card: a 14px glyph in the status colour carries the
+ * kind, the sentence stays the page ink on one line, "More..." opens it. */
+QFrame[foammeshNotice="info"], QFrame[foammeshNotice="warning"],
+QFrame[foammeshNotice="error"] {
+    background: {{background.raised}};
+    border: 1px solid {{border.quiet}};
+    border-radius: {{radius.control}}px;
+}
+QFrame[foammeshNotice="warning"] { border-color: {{status.warning}}; }
+QFrame[foammeshNotice="error"] { border-color: {{status.error}}; }
+QFrame[foammeshNotice] QLabel {
+    color: {{foreground.primary}};
+    font-size: {{type.body}}px;
+}
+QFrame[foammeshNotice] QPushButton#noticeMore {
+    background: transparent;
+    border: none;
+    padding: 0 2px;
+    min-height: 14px;
+    color: {{accent.default}};
+    font-size: 12px;
+}
+QFrame[foammeshNotice] QPushButton#noticeMore:hover { color: {{accent.hover}}; }
+/* Mockup `.hint`: one quiet line under a card, 12.5px, secondary ink. */
+QLabel[foammeshRole="hint"] {
+    color: {{foreground.secondary}};
+    font-size: {{type.body}}px;
+}

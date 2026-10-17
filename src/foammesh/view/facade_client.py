@@ -12,6 +12,7 @@ authority in the supersession order (§4.6). This module imports no Qt.
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from foammesh.core.facade import (
@@ -263,7 +264,12 @@ class DesktopFacadeClient:
         raises ``RuntimeError`` by design.
         """
         result = await self._facade.execute(self._command(operation, parameters or {}))
-        self._resync_external_baseline()
+        # DP-2712. The re-baseline hashes every polyMesh file (and the
+        # triSurface directory). MEASURED on the guided pipe walk: it ran on
+        # the GUI thread right after blockMesh, under the "Running Base grid"
+        # modal, and its length grows with the mesh. It reads files only, so
+        # it goes to a worker and the loop keeps painting while it hashes.
+        await asyncio.to_thread(self._resync_external_baseline)
         return await self._offer_retry(operation, parameters or {}, result)
 
     #: The runs a failure may offer [Retry] for (Plan 35 CR6).

@@ -505,6 +505,69 @@ class SectionGeometry:
         order = np.lexsort((face, cell))
         return cell[order], face[order], flip[order]
 
+    def cell_centres_volumes(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(centres, volumes)`` of every cell, made once (VI10b).
+
+        As OpenFOAM computes them: each face is a fan of triangles about the
+        mean of its vertices, a cell is the pyramids from an estimated
+        centre (the mean of its face centres) to its faces, and the cell
+        centre is the pyramids' volume-weighted centroid.
+        """
+        held = self._derived.get(('centres',))
+        if held is not None:
+            return held
+        offsets = self.face_offsets[:-1]
+        sizes = self.sizes
+        slots = np.arange(len(self.face_vertices), dtype=np.int64)
+        following = slots + 1
+        following[self.face_offsets[1:] - 1] = offsets
+        face_of = np.repeat(np.arange(self.n_faces, dtype=np.int64), sizes)
+        here = self.points[self.face_vertices]
+        there = self.points[self.face_vertices[following]]
+        estimate = np.add.reduceat(here, offsets, axis=0) / sizes[:, None]
+        about = estimate[face_of]
+        area = 0.5 * np.cross(here - about, there - about)
+        weight = np.linalg.norm(area, axis=1)
+        area_vector = np.add.reduceat(area, offsets, axis=0)
+        total = np.add.reduceat(weight, offsets)
+        moment = np.add.reduceat(((about + here + there) / 3.0)
+                                 * weight[:, None], offsets, axis=0)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            centre = np.where(total[:, None] > 0.0,
+                              moment / total[:, None], estimate)
+        n = self.n_cells
+        count = np.bincount(self.owner, minlength=n).astype(float)
+        mean = np.zeros((n, 3))
+        for axis in range(3):
+            mean[:, axis] = np.bincount(self.owner, centre[:, axis],
+                                        minlength=n)
+        if self.n_internal:
+            count += np.bincount(self.neighbour, minlength=n)
+            for axis in range(3):
+                mean[:, axis] += np.bincount(
+                    self.neighbour, centre[:self.n_internal, axis],
+                    minlength=n)
+        mean /= np.maximum(count, 1.0)[:, None]
+        volume = np.zeros(n)
+        moment = np.zeros((n, 3))
+        sides = [(self.owner, centre, area_vector, 1.0)]
+        if self.n_internal:
+            sides.append((self.neighbour, centre[:self.n_internal],
+                          area_vector[:self.n_internal], -1.0))
+        for cells, face_centre, vector, sign in sides:
+            pyramid = sign * np.einsum('ij,ij->i', vector,
+                                       face_centre - mean[cells]) / 3.0
+            volume += np.bincount(cells, pyramid, minlength=n)
+            heart = 0.75 * face_centre + 0.25 * mean[cells]
+            for axis in range(3):
+                moment[:, axis] += np.bincount(
+                    cells, pyramid * heart[:, axis], minlength=n)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            centres = np.where(np.abs(volume)[:, None] > 0.0,
+                               moment / volume[:, None], mean)
+        held = self._derived[('centres',)] = (centres, volume)
+        return held
+
     def face_points(self, face: int, reverse: bool = False) -> np.ndarray:
         verts = self.face_vertices[self.face_offsets[face]:
                                    self.face_offsets[face + 1]]

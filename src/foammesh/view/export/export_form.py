@@ -22,17 +22,21 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout,
-    QWidget)
+    QCheckBox, QComboBox, QFormLayout, QLabel, QLineEdit, QSizePolicy,
+    QVBoxLayout, QWidget)
 
 from widgets.new_project_widget import NewProjectWidget
 from widgets.selector_dialog import SelectorDialog, SelectorItem
 from widgets.typed_edit import FloatEdit
 
+from foammesh.view.combo_items import set_item_enabled
 from foammesh.app import app
 from foammesh.core.case.scratch import is_scratch_case, suggested_name
 from foammesh.core.mesh.extrusion_options import ExtrudeModel, ExtrudeOptions
 from foammesh.db.configurations_schema import CFDType
+from foammesh.view.workflow_controls.length_box import (
+    ModelLengthBox, format_model_units, length_cell,
+)
 from foammesh.view.theming.metrics import (
     FORM_MARGIN, align_form_columns, apply_form_metrics, place_unit)
 
@@ -44,7 +48,18 @@ from .export_2D_region_widgets import (
 #: the operation that writes each one. Both lists used to be attributes of the
 #: legacy page; they are here because the form is what reads them now and the
 #: page imports them back, so there is still exactly one of each.
-MESH_FORMATS = ('openfoam', 'su2', 'gmsh', 'vtk', 'cgns', 'med', 'unv')
+MESH_FORMATS = ('openfoam', 'su2', 'gmsh', 'vtk', 'cgns', 'med', 'unv',
+                'fluent', 'openfoam_format')
+
+#: Plan 43 LY13 (D10). The two entries that rewrite the case where it is and
+#: so ask for no destination: ``fluent`` writes ``fluentInterface/`` inside
+#: the case, ``openfoam_format`` converts the case files between ASCII and
+#: binary in place. They sat on the menu route only; the Export page lists
+#: them with the other formats now.
+IN_CASE = ('fluent', 'openfoam_format')
+
+#: The values ``case.export.format_convert`` accepts for ``write_format``.
+WRITE_FORMATS = (('ascii', 'ASCII'), ('binary', 'Binary'))
 
 #: DP-680. The formats whose export can replace an existing destination.
 OVERWRITABLE = ('openfoam', 'su2')
@@ -57,6 +72,8 @@ EXPORT_OPERATIONS = {
     'cgns': 'case.export.cgns',
     'med': 'case.export.med',
     'unv': 'case.export.unv',
+    'fluent': 'case.export.fluent',
+    'openfoam_format': 'case.export.format_convert',
 }
 
 #: What the form offers when the facade could not be asked. The OpenFOAM case
@@ -75,7 +92,7 @@ PLANE = 'plane'
 WEDGE = 'wedge'
 
 DIMENSIONALITIES = (
-    (THREE_D, 'Three dimensional'),
+    (THREE_D, 'As meshed, no extrusion'),
     (PLANE, 'Two dimensional, extruded from a plane'),
     (WEDGE, 'Two dimensional, a wedge about an axis'),
 )
@@ -219,6 +236,7 @@ class ExportForm(QWidget):
     def __init__(self, parent=None, entries=(), recommended: str = 'openfoam'):
         super().__init__(parent)
         self._entries = tuple(entries) or DEFAULT_ENTRIES
+        self._recommended = recommended
         # DP-536. The destination this form offered, and whether the reader
         # has since typed over it. See `_offerDestination`.
         self._offering = False
@@ -237,6 +255,16 @@ class ExportForm(QWidget):
         self._format.setAccessibleName(self.tr('Format'))
         self._format.setAccessibleDescription(
             self.tr('The file format this mesh is written in.'))
+        # P40GM (DP-2668). The longest format name sized the combo, and the
+        # combo sized the form: 382 px in a 241 px column. It now takes the
+        # column and elides; the full name is in the tooltip and the list.
+        self._format.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._format.setMinimumContentsLength(8)
+        self._format.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Fixed)
+        self._format.currentIndexChanged.connect(
+            lambda _index: self._format.setToolTip(self._format.currentText()))
         formatLabel = QLabel(self)
         formatLabel.setText(self.tr('Format'))
         # W-O1. The label is built by hand rather than by `addRow(text, ...)`,
@@ -279,6 +307,7 @@ class ExportForm(QWidget):
         apply_form_metrics(shape)
         layout.addLayout(shape)
         self._shapeForm = shape
+        self._section = False
         self._dimension = QComboBox(self)
         self._dimension.setObjectName('exportDimensionality')
         # DP-218. The row used to be called Dimensionality, which is what the
@@ -296,6 +325,43 @@ class ExportForm(QWidget):
         # W-O1, as above: a name with no buddy is not a name to Qt.
         self._dimensionLabel.setBuddy(self._dimension)
         shape.addRow(self._dimensionLabel, self._dimension)
+
+        # Plan 43 LY13 (D10). The three inputs of the in-place OpenFOAM
+        # conversion (``case.export.format_convert``); shown for that entry
+        # only, as the extrusion inputs are shown for the extrusion.
+        self._convert = QWidget(self)
+        convertLayout = QVBoxLayout(self._convert)
+        convertLayout.setContentsMargins(0, 0, 0, 0)
+        convertForm = QFormLayout()
+        apply_form_metrics(convertForm)
+        convertLayout.addLayout(convertForm)
+        self._convertForm = convertForm
+        self._writeFormat = QComboBox(self._convert)
+        self._writeFormat.setObjectName('exportWriteFormat')
+        self._writeFormat.setAccessibleName(self.tr('Write as'))
+        self._writeFormat.setAccessibleDescription(
+            self.tr('Whether the case files are rewritten as ASCII or '
+                    'binary.'))
+        for value, text in WRITE_FORMATS:
+            self._writeFormat.addItem(self.tr(text), value)
+        writeLabel = QLabel(self.tr('Write as'), self._convert)
+        writeLabel.setBuddy(self._writeFormat)
+        convertForm.addRow(writeLabel, self._writeFormat)
+        self._compression = QCheckBox(self.tr('Compress'), self._convert)
+        self._compression.setObjectName('exportCompression')
+        self._compression.setToolTip(
+            self.tr('Write the converted files gzip-compressed'))
+        convertForm.addRow(self._compression)
+        self._commitSettings = QCheckBox(
+            self.tr('Keep these settings in controlDict'), self._convert)
+        self._commitSettings.setObjectName('exportCommitSettings')
+        self._commitSettings.setToolTip(
+            self.tr('Leave writeFormat and writeCompression in '
+                    'system/controlDict as set here. Off restores the '
+                    'values the case had.'))
+        convertForm.addRow(self._commitSettings)
+        layout.addWidget(self._convert)
+        self._convert.setVisible(False)
 
         self._twoD = QWidget(self)
         self._buildTwoDimensional(self._twoD)
@@ -318,7 +384,8 @@ class ExportForm(QWidget):
         under forms of its own aligns them all through this tuple.
         """
         return (self._chooserForm, self._pathWidget.formLayout(),
-                self._shapeForm, self._planeForm, self._wedgeForm)
+                self._shapeForm, self._convertForm, self._planeForm,
+                self._wedgeForm)
 
     def setDestinationShown(self, shown: bool) -> None:
         """Draw the derived destination sentence, or leave it off the form.
@@ -365,11 +432,14 @@ class ExportForm(QWidget):
         apply_form_metrics(planeForm)
         planeLayout.addLayout(planeForm)
         self._planeForm = planeForm
-        self._thickness = FloatEdit(self._planeBox)
+        # UXB3c. Lengths: typed in the project display unit, handed to the
+        # extrusion in model units.
+        self._thickness = ModelLengthBox(self._planeBox, minimum=None)
         self._thickness.setObjectName('exportThickness')
-        self._thickness.setText('1')
+        self._thickness.setAccessibleName(self.tr('Thickness'))
+        self._thickness.setModelValue(1.0)
         planeForm.addRow(QLabel(self.tr('Thickness'), self._planeBox),
-                         self._thickness)
+                         length_cell(self._thickness, self._planeBox))
 
         wedgeForm = QFormLayout()
         apply_form_metrics(wedgeForm)
@@ -385,12 +455,13 @@ class ExportForm(QWidget):
         self._origin = []
         self._direction = []
         for axis in ('X', 'Y', 'Z'):
-            edit = FloatEdit(self._wedgeBox)
+            edit = ModelLengthBox(self._wedgeBox, minimum=None)
             edit.setObjectName(f'exportOrigin{axis}')
-            edit.setText('0')
+            edit.setAccessibleName(self.tr('Origin {0}').format(axis))
+            edit.setModelValue(0.0)
             wedgeForm.addRow(
                 QLabel(self.tr('Origin {0}').format(axis), self._wedgeBox),
-                edit)
+                length_cell(edit, self._wedgeBox))
             self._origin.append(edit)
         for index, axis in enumerate(('X', 'Y', 'Z')):
             edit = FloatEdit(self._wedgeBox)
@@ -448,9 +519,8 @@ class ExportForm(QWidget):
             if not entry.get('available'):
                 label = self.tr('{0}  (not available)').format(label)
             self._format.addItem(label, entry['entry_id'])
-            item = self._format.model().item(index)
-            if item is not None and not entry.get('available'):
-                item.setEnabled(False)
+            if not entry.get('available'):
+                set_item_enabled(self._format, index, False)
             self._format.setItemData(
                 index, entry.get('reason') or entry.get('notes') or '',
                 Qt.ItemDataRole.ToolTipRole)
@@ -465,7 +535,14 @@ class ExportForm(QWidget):
     def setEntries(self, entries, recommended: str = '') -> None:
         """Take a fresh answer from the facade's export registry."""
         entries = tuple(entries)
-        if not entries or entries == self._entries:
+        if not entries:
+            return
+        # Plan 40 UXB8 (#6). The format follows the target: when Mesh setup
+        # changes the target the recommended entry changes while the list
+        # does not, and the box has to follow it rather than keep the old one.
+        followed = bool(recommended) and recommended != self._recommended
+        self._recommended = recommended or self._recommended
+        if entries == self._entries and not followed:
             return
         self._entries = entries
         self._fillFormats(recommended or self.selectedFormat())
@@ -480,9 +557,6 @@ class ExportForm(QWidget):
     def formatBox(self):
         return self._format
 
-    def refusalLabel(self):
-        return self._refusal
-
     def selectedEntry(self):
         entry_id = self._format.currentData()
         for entry in self._entries:
@@ -493,6 +567,30 @@ class ExportForm(QWidget):
     def selectedFormat(self) -> str:
         entry = self.selectedEntry()
         return entry['entry_id'] if entry else 'openfoam'
+
+    @staticmethod
+    def _entryInCase(entry) -> bool:
+        return bool(entry) and (entry.get('destination') == 'in_case'
+                                or entry.get('entry_id') in IN_CASE)
+
+    def inCase(self, entry=None) -> bool:
+        """Whether the chosen format rewrites the case rather than a file."""
+        return self._entryInCase(entry or self.selectedEntry())
+
+    def operationParameters(self) -> dict:
+        """What the chosen format's operation takes, besides the extrusion.
+
+        A file or case destination carries ``destination``; an in-place
+        entry carries none, and the ASCII/binary conversion carries its
+        three inputs instead.
+        """
+        if not self.inCase():
+            return {'destination': str(self.projectPath())}
+        if self.selectedFormat() == 'openfoam_format':
+            return {'write_format': str(self._writeFormat.currentData()),
+                    'compression': self._compression.isChecked(),
+                    'commit_settings': self._commitSettings.isChecked()}
+        return {}
 
     def operation(self) -> str:
         """The facade route that writes what this form describes."""
@@ -514,8 +612,14 @@ class ExportForm(QWidget):
         # R125. An OpenFOAM case is a folder that gets created; every other
         # format on this list is one file with an extension. The destination
         # preview said "folder" for both until it was told.
-        self._pathWidget.setDestination(entry.get('destination') or 'directory',
-                                        entry.get('suffix') or '')
+        in_case = self.inCase(entry)
+        # D10. An in-place entry has no destination to ask for.
+        self._pathWidget.setVisible(not in_case)
+        self._convert.setVisible(entry.get('entry_id') == 'openfoam_format')
+        if not in_case:
+            self._pathWidget.setDestination(
+                entry.get('destination') or 'directory',
+                entry.get('suffix') or '')
         self._offerOverwrite(entry)
         self._showDimensionality(entry)
         self._offerDestination()
@@ -531,11 +635,24 @@ class ExportForm(QWidget):
         one file written by a writer that has no extrusion in it, so the
         choice is absent there rather than present and refused.
         """
-        offered = entry.get('entry_id') == EXTRUDABLE
+        # UXA7 (#57). "Three dimensional" told nobody anything on a 3D case;
+        # the row exists for a case that is a 2D or axisymmetric section.
+        offered = (entry.get('entry_id') == EXTRUDABLE
+                   and self._section)
         self._dimension.setVisible(offered)
         self._dimensionLabel.setVisible(offered)
         if not offered and self._dimension.currentIndex() != 0:
             self._dimension.setCurrentIndex(0)
+
+    def setSection(self, section: bool) -> None:
+        """Say whether the case is a 2D or axisymmetric section (UXA7)."""
+        section = bool(section)
+        if section == self._section:
+            return
+        self._section = section
+        entry = self.selectedEntry()
+        if entry is not None:
+            self._showDimensionality(entry)
 
     def _offerOverwrite(self, entry) -> None:
         """Offer overwriting where the export can replace what is there.
@@ -663,12 +780,27 @@ class ExportForm(QWidget):
                     location.setText(str(case))
             name = self._unusedName(
                 Path(location.text()) if location is not None else case,
-                f'{stem}_{self.selectedFormat()}')
+                self._offeredStem(stem))
             field = self._pathWidget.findChild(QLineEdit, 'projectName')
             if field is not None and field.text() != name:
                 field.setText(name)
         finally:
             self._offering = False
+
+    def _offeredStem(self, stem: str) -> str:
+        """The name offered for *stem* in the chosen format (UXA7, #57).
+
+        A folder carries the format in its name (``pipe_openfoam``) unless the
+        case already says it; a file carries it in its extension, so
+        ``pipe.su2`` and not ``pipe_su2.su2``.
+        """
+        entry = self.selectedEntry() or {}
+        if entry.get('destination') == 'file':
+            return stem
+        fmt = self.selectedFormat()
+        if stem.lower().endswith('_' + fmt.lower()):
+            return stem
+        return f'{stem}_{fmt}'
 
     def _unusedName(self, location: Path, name: str) -> str:
         """*name*, or *name* numbered, whichever is not on disk yet (DP-562).
@@ -727,6 +859,8 @@ class ExportForm(QWidget):
             return str(entry.get('reason')
                        or self.tr('This format cannot be written from this '
                                   'case.'))
+        if self.inCase(entry):
+            return ''
         if self._pathWidget.projectPath() is None:
             return (self.validationMessage()
                     or self.tr('Give the export a name and a folder that '
@@ -737,10 +871,6 @@ class ExportForm(QWidget):
                 if not region.boundary():
                     return self.tr('Select boundary — {0}').format(
                         region.rname())
-            try:
-                self._thickness.validate(self.tr('Thickness'))
-            except ValueError as error:
-                return str(error)
         elif mode == WEDGE:
             for region in self._wedgeRegions:
                 if not region.p1():
@@ -750,8 +880,6 @@ class ExportForm(QWidget):
             try:
                 self._angle.validate(self.tr('Angle'), low=0, high=90,
                                      lowInclusive=False, highInclusive=False)
-                for axis, edit in zip('XYZ', self._origin):
-                    edit.validate(self.tr('Origin {0}').format(axis))
                 for axis, edit in zip('XYZ', self._direction):
                     edit.validate(self.tr('Direction {0}').format(axis))
             except ValueError as error:
@@ -768,10 +896,12 @@ class ExportForm(QWidget):
             return ([(region.rname(), region.boundary(), region.boundary())
                      for region in self._planeRegions],
                     ExtrudeOptions(ExtrudeModel.PLANE,
-                                   thickness=self._thickness.text()))
+                                   thickness=format_model_units(
+                                       self._thickness.modelValue())))
         return ([(region.rname(), region.p1(), region.p2())
                  for region in self._wedgeRegions],
                 ExtrudeOptions(ExtrudeModel.WEDGE,
-                               point=[edit.text() for edit in self._origin],
+                               point=[format_model_units(edit.modelValue())
+                                      for edit in self._origin],
                                axis=[edit.text() for edit in self._direction],
                                angle=self._angle.text()))

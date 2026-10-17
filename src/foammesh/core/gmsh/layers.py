@@ -48,6 +48,7 @@ their plain faces.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from .layer_targets import (
     MODE_ALL_WALLS,
@@ -98,9 +99,30 @@ class BoundaryLayers:
     scope: str = SCOPE_SELECTED
     warnings: tuple[str, ...] = ()
     calculation_version: str = CALCULATION_VERSION
+    #: Plan 41 GN10 (M-34). Elements each layer is split into; the heights
+    #: above stay the layer boundaries, the elements divide each of them.
+    elements_per_layer: int = 1
+    #: Plan 41 GN10 (M-34). One stack per named patch, each with its own
+    #: count, first height, ratio, total, elements per layer and quads. A
+    #: patch with no row keeps the stack above.
+    stacks: tuple[dict, ...] = ()
+
+    def stack_for(self, patch: str) -> dict | None:
+        for stack in self.stacks:
+            if stack['patch'] == patch:
+                return stack
+        return None
 
     def to_dict(self) -> dict:
+        # The GN10 keys only when the job uses them: a job with one element
+        # per layer and no per-patch stack is the job it was before GN10, and
+        # keeps the digest that keys its mesh cache (the runner reads both
+        # with these defaults).
+        gn10 = ({'elementsPerLayer': self.elements_per_layer,
+                 'stacks': [dict(stack) for stack in self.stacks]}
+                if self.elements_per_layer != 1 or self.stacks else {})
         return {
+            **gn10,
             'enabled': self.enabled,
             'mode': self.mode,
             'layerCount': self.layer_count,
@@ -162,7 +184,137 @@ def _patch_mode(values, *, enabled, patches) -> str:
     return MODE_SELECTED
 
 
-def derive_boundary_layers(values: dict, *, target_size: float | None = None
+def _elements(value, owner: str) -> int:
+    """Elements each layer is divided into (``extrudeBoundaryLayer``'s
+    ``numElements``): a whole number, 1 or more."""
+    if value in (None, ''):
+        return 1
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise LayerError(
+            f'{owner}: elements per layer needs a whole number, '
+            f'not {value!r}') from None
+    if number != int(number) or number < 1:
+        raise LayerError(
+            f'{owner}: elements per layer is a whole number of 1 or more, '
+            f'not {value!r}')
+    return int(number)
+
+
+def _stack_numbers(mode, count, ratio, first, total, owner):
+    """First height, ratio and the cumulative heights of one stack."""
+    if count < 1:
+        raise LayerError(f'{owner} needs at least one layer')
+    if ratio < 1.0:
+        raise LayerError(
+            f'{owner}: growth ratio {ratio} would shrink each layer; '
+            'it must be >= 1')
+    if mode == 'first_and_ratio':
+        if first <= 0:
+            raise LayerError(f'{owner}: first layer height must be positive')
+    elif mode == 'total_and_count':
+        if total <= 0:
+            raise LayerError(f'{owner}: total thickness must be positive')
+        # Invert the geometric series to recover the first height.
+        if abs(ratio - 1.0) < 1e-12:
+            first = total / count
+        else:
+            first = total * (ratio - 1.0) / (ratio ** count - 1.0)
+    else:
+        raise LayerError(f'{owner}: unknown boundary-layer mode: {mode!r}')
+    heights, running, step = [], 0.0, first
+    for _ in range(count):
+        running += step
+        heights.append(running)
+        step *= ratio
+    return first, ratio, heights
+
+
+def stacks_from_text(text) -> list[dict]:
+    """The per-patch stack rows however the store holds them (JSON text or a
+    list); an empty store has none."""
+    text = getattr(text, 'value', text)
+    if isinstance(text, (list, tuple)):
+        data = list(text)
+    else:
+        text = str(text or '').strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except ValueError as error:
+            raise LayerError(
+                f'the stored layer stacks are not valid JSON: {error}'
+            ) from None
+        if isinstance(data, dict):
+            data = data.get('rows', [])
+    if not isinstance(data, list):
+        raise LayerError('the stored layer stacks are not a list of rows')
+    return [dict(item) for item in data if isinstance(item, dict)]
+
+
+def stacks_to_text(rows) -> str:
+    rows = [dict(item) for item in (rows or ())]
+    return json.dumps(rows, separators=(',', ':'), sort_keys=True) if rows else ''
+
+
+def _derive_stacks(value, inherited: dict, warnings: list,
+                   target_size) -> tuple[dict, ...]:
+    """One stack per named patch; what a row leaves out is the global's."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for index, row in enumerate(stacks_from_text(value), start=1):
+        patch = str(row.get('patch') or '').strip()
+        if not patch:
+            raise LayerError(
+                f'layer stack {index}: name the patch it grows on')
+        owner = f'the layer stack on {patch!r}'
+        if not bool(row.get('enabled', True)):
+            continue
+        key = ''.join(c for c in patch.lower() if c.isalnum())
+        if key in seen:
+            raise LayerError(f'{owner}: two rows name that patch; a patch '
+                             'grows one stack')
+        seen.add(key)
+        mode = _enum_value(row.get('mode'), inherited['mode'])
+
+        def number(name, kind=float):
+            raw = row.get(name)
+            if raw in (None, ''):
+                return inherited[name]
+            try:
+                return kind(raw)
+            except (TypeError, ValueError):
+                raise LayerError(
+                    f'{owner}: {name} needs a number, not {raw!r}') from None
+
+        count = int(number('layerCount', float))
+        ratio = number('ratio')
+        first = number('firstHeight')
+        total = number('totalThickness')
+        elements = _elements(row.get('elementsPerLayer',
+                                     inherited['elementsPerLayer']), owner)
+        first, ratio, heights = _stack_numbers(
+            mode, count, ratio, first, total, owner)
+        if target_size and heights[-1] > target_size * 2.0:
+            warnings.append(
+                f'{owner} is {heights[-1]:.6g} m deep against a target '
+                f'element size of {target_size:.6g} m; the core mesh may be '
+                'crowded out')
+        quads = row.get('quads')
+        out.append({
+            'patch': patch, 'mode': mode, 'layerCount': count,
+            'firstHeight': first, 'ratio': ratio,
+            'totalThickness': heights[-1], 'elementsPerLayer': elements,
+            'quads': inherited['quads'] if quads in (None, '')
+            else bool(quads),
+            'cumulativeHeights': [-value for value in heights]})
+    return tuple(out)
+
+
+def derive_boundary_layers(values: dict, *, target_size: float | None = None,
+                           first_default: float | None = None
                            ) -> BoundaryLayers:
     """Turn persisted layer values into the stack the runner will extrude."""
     values = dict(values or {})
@@ -174,7 +326,13 @@ def derive_boundary_layers(values: dict, *, target_size: float | None = None
     patch_mode = _patch_mode(values, enabled=enabled, patches=patches)
     count = int(values.get('layerCount', 3) or 0)
     ratio = float(values.get('ratio', 1.2) or 1.0)
-    first = float(values.get('firstHeight', 0.0) or 0.0)
+    # Plan 40 UXA1: unset means the Mesh size choice's first layer; 0.0006 is
+    # the figure a case saved before the choice ran on.
+    first = values.get('firstHeight')
+    if first in (None, ''):
+        first = first_default if first_default else 0.0006
+    first = float(first or 0.0)
+    values['firstHeight'] = first
     total = float(values.get('totalThickness', 0.0) or 0.0)
 
     if not enabled:
@@ -183,31 +341,9 @@ def derive_boundary_layers(values: dict, *, target_size: float | None = None
             ratio=1.0, total_thickness=0.0, patch_mode=patch_mode,
             quads=bool(values.get('quads', True)))
 
-    if count < 1:
-        raise LayerError('a boundary layer needs at least one layer')
-    if ratio < 1.0:
-        raise LayerError(
-            f'growth ratio {ratio} would shrink each layer; it must be >= 1')
-
-    if mode == 'first_and_ratio':
-        if first <= 0:
-            raise LayerError('first layer height must be positive')
-    elif mode == 'total_and_count':
-        if total <= 0:
-            raise LayerError('total thickness must be positive')
-        # Invert the geometric series to recover the first height.
-        if abs(ratio - 1.0) < 1e-12:
-            first = total / count
-        else:
-            first = total * (ratio - 1.0) / (ratio ** count - 1.0)
-    else:
-        raise LayerError(f'unknown boundary-layer mode: {mode!r}')
-
-    heights, running, step = [], 0.0, first
-    for _ in range(count):
-        running += step
-        heights.append(running)
-        step *= ratio
+    elements = _elements(values.get('elementsPerLayer'), 'the stack')
+    first, ratio, heights = _stack_numbers(
+        mode, count, ratio, first, total, 'a boundary layer')
     total_actual = heights[-1]
 
     if target_size and total_actual > target_size * 2.0:
@@ -227,7 +363,16 @@ def derive_boundary_layers(values: dict, *, target_size: float | None = None
         patch_mode=patch_mode,
         scope=(SCOPE_WALLS if patch_mode == MODE_ALL_WALLS
                else SCOPE_SELECTED),
-        warnings=tuple(warnings))
+        warnings=tuple(warnings),
+        elements_per_layer=elements,
+        stacks=_derive_stacks(
+            values.get('stacks'),
+            {'mode': mode, 'layerCount': count, 'ratio': ratio,
+             'firstHeight': float(values.get('firstHeight', 0.0) or 0.0),
+             'totalThickness': total,
+             'elementsPerLayer': elements,
+             'quads': bool(values.get('quads', True))},
+            warnings, target_size))
 
 
 def _median(spread) -> float:
@@ -311,11 +456,16 @@ def achieved_coverage(statistics: dict) -> dict:
             faces=columns or total_faces,
             layers=float(min(depths)) if depths else 0.0,
             thickness=thickness,
-            coverage_pct=(100.0 * thickness / requested_thickness
+            coverage_pct=(100.0 * thickness / float(
+                (entry.get('requested') or {}).get('totalThickness')
+                or requested_thickness)
                           if requested_thickness else 0.0),
-            requested_layers=(requested_layers
-                              if entry.get('selected') and requested_layers
-                              else None)))
+            # Plan 41 GN10. A patch with a stack of its own is held against
+            # that stack, not against the list's.
+            requested_layers=(
+                int((entry.get('requested') or {}).get('layers')
+                    or requested_layers)
+                if entry.get('selected') and requested_layers else None)))
         if len(depths) > 1:
             notes.append(
                 f'{name}: the stacks are {min(depths)} to {max(depths)} '

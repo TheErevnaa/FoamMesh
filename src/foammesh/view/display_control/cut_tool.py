@@ -14,6 +14,7 @@ Two faults kept this tool from working on the meshes people most often open:
 
 import asyncio
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -33,14 +34,19 @@ from foammesh.core.quantities import agreeing, count_text
 from foammesh.core.section.cut_cells import (
     projected_ranges, scale_step_from_ranges, tolerance_for)
 from foammesh.core.section.modes import SectionMode
+from foammesh.core.section.section_geometry import HalfSpace
+from foammesh.core.section.pieces import (
+    CellRule, Combine, Prefer, ScalePolicy, choose_sides)
 from foammesh.core.section.notices import (
     EXPLANATIONS, WORKER_CURRENT, WORKER_PREVIOUS, WORKER_REFUSED,
     sectionNotices)
+from foammesh.core.section import cancel_registry
 from foammesh.core.section.section_jobs import (
     SectionJobs, SectionRequest, is_current, manifest_key)
 from foammesh.core.section.plane_state import local_basis
 from foammesh.rendering.actor_info import (
     BoundaryActor, CutMode, GeometryActor, MeshActor)
+from foammesh.rendering import combine_clip
 from foammesh.rendering.cut_cells import cellLayout
 from foammesh.rendering.plane_widget import AXIS_NORMAL, PlaneWidget
 from foammesh.rendering.preview_clip import (
@@ -54,6 +60,8 @@ from foammesh.rendering.worker_section import (
 from foammesh.support.mesh import Bounds
 from foammesh.support import resource_budget
 
+from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
+
 from . import section_case_fields as case_fields
 from .section_panel import (
     MAX_PLANES, CutType, SectionPanel, SectionPlaneState, _modeFor)
@@ -63,6 +71,12 @@ logger = logging.getLogger(__name__)
 #: Above this many displayed cells a live re-cut on every mouse move stops
 #: being live and starts being a stutter, so the cut waits for the drag to end
 #: -- and the panel says so rather than quietly behaving differently.
+#: VI14 (LIVE-V). Above this many cells on screen the cell-scale step is found
+#: on a worker. Not a limit on what can be shown: the answer is the same, only
+#: the thread differs (below it the read costs a few milliseconds).
+STEP_ASYNC_CELLS = 50_000
+#: How many positions' answers are kept (a nudge moves the plane every press).
+STEP_ANSWERS_KEPT = 8
 LIVE_CELL_BUDGET = 400_000
 #: Plan 37 UF8. A frame of the renderer-clipped preview (planes handed to the
 #: mappers and one render) must fit in this; a slower one falls back to the
@@ -216,6 +230,45 @@ class SectionSnapshot:
                 self._dragAxis, self._locked, tuple(self._gizmos))
 
 
+def localSides(grids, planes, combine, prefer, current):
+    """The keep sides of *planes* that keep the larger / smaller volume of
+    the local *grids* (VI10b). *planes*: canonical `PlaneState`s; cells are
+    counted by their centres.
+    """
+    from vtkmodules.vtkFiltersCore import vtkCellCenters
+    from vtkmodules.vtkFiltersVerdict import vtkCellSizeFilter
+
+    centres, volumes = [], []
+    for grid in grids:
+        found = vtkCellCenters()
+        found.SetInputData(grid)
+        found.Update()
+        points = found.GetOutput().GetPoints()
+        if points is None or not points.GetNumberOfPoints():
+            continue
+        sizes = vtkCellSizeFilter()
+        sizes.SetInputData(grid)
+        sizes.ComputeVolumeOn()
+        sizes.ComputeAreaOff()
+        sizes.ComputeLengthOff()
+        sizes.ComputeVertexCountOff()
+        sizes.Update()
+        array = sizes.GetOutput().GetCellData().GetArray('Volume')
+        centres.append(vtk_to_numpy(points.GetData()))
+        volumes.append(np.abs(vtk_to_numpy(array)))
+    if not centres:
+        return None
+    centres = np.concatenate(centres)
+    volumes = np.concatenate(volumes)
+    signed = np.array([HalfSpace(s.normal, 0.0, 1).signed(centres)
+                       - float(np.asarray(s.normal, float)
+                               @ np.asarray(s.reference, float) + s.distance)
+                       for s in planes])
+    keeps, _volume, _table = choose_sides(signed, volumes, combine, prefer,
+                                          current)
+    return list(keeps)
+
+
 class _NotWholeMesh(Exception):
     """No volume on screen is the whole mesh a case field is read for."""
 
@@ -239,6 +292,7 @@ class CutTool(QObject):
     _caps = ()
     _picture = (False, None, ())
     _computing = False
+    _followedManager = None
     _surfaceCache = None
     # Plan 37 UF7 likewise.
     _savedCamera = None
@@ -267,6 +321,8 @@ class CutTool(QObject):
     _colourMapping = {'kind': 'none'}
     _colourReason = ''
     _colourSkipped = 0
+    #: VI10b. A one-shot 'larger' / 'smaller' for the next worker request.
+    _prefer = None
     _caseMesh = None
     _caseFields = {}
     _caseReads = frozenset()
@@ -276,6 +332,10 @@ class CutTool(QObject):
 
         self._widget = ui.cutTool
         self._header = ui.cutHeader
+        self._group = ui.cut
+        #: Plan 43 LY6 (VP-194): the rail's Cut plane popover holds the same
+        #: section; once it is in charge the scene page's copy is not drawn.
+        self._pageCopyHidden = False
         self._view = ui.renderingView
 
         self._panel = SectionPanel(ui.sectionHost)
@@ -300,6 +360,14 @@ class CutTool(QObject):
         self._savedCamera = None
         self._mode = None
         self._stepCache = None
+        #: VI14 (LIVE-V). The step of a large mesh is read off the GUI
+        #: thread: the answers found, the last one per normal, the request
+        #: waiting for the worker and the worker itself.
+        self._stepLock = threading.Lock()
+        self._stepAnswers = {}
+        self._stepByNormal = {}
+        self._stepWanted = None
+        self._stepTask = None
         self._shortcuts = []
         #: Plan 37 UF10. The section worker: its jobs, the plane generation
         #: (bumped on every change of the cut), the case the user asked to
@@ -308,6 +376,8 @@ class CutTool(QObject):
         #: refusal refused. Whether a plane is being dragged, and how many
         #: planes were cutting (fewer is a plane deleted).
         self._jobs = SectionJobs(self._sectionDelivered)
+        # Plan 42 SG12. The footer Cancel stops a running section too.
+        cancel_registry.register(self, self.cancelSection)
         self._generation = 0
         self._cellsCase = None
         self._workerActor = None
@@ -336,10 +406,16 @@ class CutTool(QObject):
         #: levels and zones read from it for the local volume, by
         #: ``(folder, key)``, and the reads under way.
         self._caseMesh = None
+        self._caseProbes = {}
         self._caseFields = {}
         self._caseReads = set()
 
         self._header.setContents(ui.cut)
+        self._cutExpanded = False
+        self._settingHeader = False
+        toggled = getattr(self._header, 'toggled', None)
+        if toggled is not None:
+            toggled.connect(self._cutToggled)
 
         self._connectSignalsSlots()
         self._panel.setStepProvider(self.cellScaleStep)
@@ -356,6 +432,23 @@ class CutTool(QObject):
     def option(self):
         return self._option
 
+    def sectionMode(self) -> SectionMode:
+        """The mode the cut on screen was made in (the panel's before one)."""
+        return self._mode or self._panel.mode()
+
+    def cellRule(self) -> CellRule:
+        return self._panel.cellRule()
+
+    def clipCurves(self) -> bool:
+        """Plan 42 SG12. Whether line and point elements are clipped too."""
+        return self._panel.clipCurves()
+
+    def setCurvesOffered(self, offered: bool) -> None:
+        """Offer *Also clip curves and points* while a mesh with line or
+        point elements is on screen (and nowhere else)."""
+        for panel in [self._panel, *self._mirrors]:
+            panel.setCurvesOffered(offered)
+
     def isVisible(self):
         return self._widget.isVisible()
 
@@ -368,6 +461,7 @@ class CutTool(QObject):
         panel.viewNormalRequested.connect(self._useViewNormal)
         panel.loadVolumeRequested.connect(self._loadVolume)
         panel.loadCellsRequested.connect(self.loadCellsForCut)
+        panel.cancelSectionRequested.connect(self.cancelSection)
         panel.lookAlongRequested.connect(self.lookAlongPlane)
         panel.colourChanged.connect(self.setSectionColour)
         panel.planesChanged.connect(self._mirrorGizmos)
@@ -378,7 +472,11 @@ class CutTool(QObject):
         panel.compareCleared.connect(self.clearStageCompare)
         panel.freezeRequested.connect(self.freezeCells)
         panel.unfreezeRequested.connect(self.unfreezeCells)
+        panel.keepPieceRequested.connect(self.keepPiece)
+        panel.colourScaleChanged.connect(self.setColourScale)
+        panel.rescaleRequested.connect(self.rescaleColour)
         panel.setColourKey(self._colourKey)
+        panel.setScalePolicy(self._colourRange.policy())
         panel.adoptFrom(self._panel)
         panel.setCompareStale(self._compareStale)
         self._publishSaved()
@@ -424,9 +522,32 @@ class CutTool(QObject):
         self._widget.hide()
 
     def show(self):
-        self._header.setChecked(False)
+        # VI10 (F2e). The Cut group stays the way the user left it for the
+        # session; it opens folded only the first time.
+        self._settingHeader = True
+        try:
+            self._header.setChecked(self._cutExpanded)
+        finally:
+            self._settingHeader = False
+        self._applyPageCopy()
         self.updateBounds()
         self._widget.show()
+
+    def hidePageCopy(self) -> None:
+        """The scene page's Cut fold is a copy of the rail's Cut plane panel
+        (the mirror drives this same section). Hide the copy; the section, its
+        signals and the tool's own visibility are untouched."""
+        self._pageCopyHidden = True
+        self._applyPageCopy()
+
+    def pageCopyHidden(self) -> bool:
+        return self._pageCopyHidden
+
+    def _applyPageCopy(self) -> None:
+        if self._pageCopyHidden:
+            self._header.hide()
+            if self._group is not None:
+                self._group.hide()
 
     def updateBounds(self):
         """Re-place the handles against whatever is currently in the scene."""
@@ -580,6 +701,7 @@ class CutTool(QObject):
         self._panel.sectionChanged.connect(self._apply)
         self._panel.loadVolumeRequested.connect(self._loadVolume)
         self._panel.loadCellsRequested.connect(self.loadCellsForCut)
+        self._panel.cancelSectionRequested.connect(self.cancelSection)
         self._panel.gizmosChanged.connect(self._syncGizmos)
         self._panel.viewNormalRequested.connect(self._useViewNormal)
         self._panel.activePlaneChanged.connect(lambda _index: self._syncGizmos())
@@ -593,10 +715,22 @@ class CutTool(QObject):
         self._panel.compareCleared.connect(self.clearStageCompare)
         self._panel.freezeRequested.connect(self.freezeCells)
         self._panel.unfreezeRequested.connect(self.unfreezeCells)
+        self._panel.keepPieceRequested.connect(self.keepPiece)
+        self._panel.colourScaleChanged.connect(self.setColourScale)
+        self._panel.rescaleRequested.connect(self.rescaleColour)
         for index, widget in enumerate(self._planeWidgets):
             widget.planeChanged.connect(
                 lambda origin, normal, i=index: self._handleMoved(i, origin, normal))
             widget.interactionFinished.connect(self._dragFinished)
+
+    def _cutToggled(self, checked):
+        """VI10 (F2e). Remember whether the user left the Cut group open."""
+        if not self._settingHeader:
+            self._cutExpanded = bool(checked)
+        self._applyPageCopy()
+
+    def cutExpanded(self) -> bool:
+        return self._cutExpanded
 
     def _planesChanged(self):
         """UF11. A plane was added, named or deleted: every panel and
@@ -628,6 +762,8 @@ class CutTool(QObject):
         dragAxis = self._panel.dragAxis()
         locked = self._panel.isLocked()
         planes = self._panel.planes()
+        sheets = set(self._panel.sheetIndexes())
+        opacity = self._panel.sheetOpacity()
         for index, widget in enumerate(self._planeWidgets):
             plane = planes[index] if index < len(planes) else None
             if plane is not None and index in wanted and plane.enabled:
@@ -636,11 +772,23 @@ class CutTool(QObject):
                 widget.on(plane.normalised())
                 widget.setOrigin(plane.origin)
                 widget.setDragAxis(dragAxis if index == active else None)
+                # VI10 (F3b). The sheet is its own choice, not the handle's.
+                self._setSheet(widget, index in sheets, opacity)
             else:
                 widget.off()
             widget.setLocked(locked)
         self._syncPanels()
         self._view.refresh()
+
+    @staticmethod
+    def _setSheet(widget, visible, opacity):
+        """Show or hide a handle's sheet and set how solid it is."""
+        setVisible = getattr(widget, 'setSheetVisible', None)
+        if setVisible is not None:
+            setVisible(visible)
+        setOpacity = getattr(widget, 'setSheetOpacity', None)
+        if setOpacity is not None:
+            setOpacity(opacity)
 
     def _handleMoved(self, index, origin, normal):
         seedPlane = (self._seedSection is not None
@@ -685,12 +833,19 @@ class CutTool(QObject):
                 self._publishStatus()
 
     def _dragFinished(self):
+        # VI14 (LIVEV). A press and release on the plane's sheet that never
+        # moved it leaves the cut on screen exactly as it was; re-cutting
+        # every part of a multi-million-cell mesh for it is what hung a
+        # section on the 6.64 M-cell impeller (the harness's scan clicked the
+        # sheet a thousand times). Only a move sets ``_dragging``.
+        moved = self._dragging
         self._dragging = False
         self._previewSlow = False
         self._liveSlow = False
         self._colourRange.thaw()
         if self._panel.isLive():
-            self._apply()
+            if moved or self._option is None:
+                self._apply()
         elif self._computing:
             self._endPreview()
             self._computing = False
@@ -762,7 +917,8 @@ class CutTool(QObject):
     # -- application ------------------------------------------------------- #
 
     def _vtkPlanes(self, mode=None):
-        states = self._panel.enabledPlanes()
+        # VI10b. A plane shown on its own cuts alone; the rest stay on.
+        states = self._panel.effectivePlanes()
         if mode is SectionMode.CUT_CELLS:
             # Cut cells are the active plane's; the others only mask them.
             active = self._panel.planes()[self._panel.activeIndex()]
@@ -790,6 +946,13 @@ class CutTool(QObject):
             sectionMode, planes = restore
         cutType, mode = MODE_CUTS[sectionMode]
         self._mode = sectionMode
+        # VI10b (F2f, F2g). How the planes combine and which whole cells
+        # stay; the actors read it when they clip.
+        combine_clip.set_options(
+            self._panel.combine() if sectionMode.clips else Combine.COMMON,
+            self._panel.cellRule() if sectionMode in (
+                SectionMode.CLIP_WHOLE_CELLS, SectionMode.CUT_CELLS)
+            else CellRule.ANY)
 
         managers = [getattr(app.window, name, None)
                     for name in ('geometryManager', 'meshManager')]
@@ -813,13 +976,87 @@ class CutTool(QObject):
                 if manager is not None:
                     manager.slice(planes)
 
-        self._computing = False
+        # Plan 39 VI2. A volume's cut is worked out off this thread.
+        self._followVolumeCuts()
+        self._computing = self._volumeCutting()
         # UF10. Every applied cut is a new generation of the section.
         self._generation += 1
         self._followWorker()
         self._refreshCaps()
         self._syncGizmos()
         self.sectionApplied.emit()
+
+    # -- Plan 39 VI2: a volume's cut is worked out off the GUI thread ----- #
+
+    def _followVolumeCuts(self):
+        manager = getattr(app.window, 'meshManager', None)
+        signal = getattr(manager, 'volumeCutBusy', None)
+        if signal is None or manager is self._followedManager:
+            return
+        signal.connect(self._volumeCutBusy)
+        self._followedManager = manager
+
+    def _volumeCutting(self) -> bool:
+        asking = getattr(getattr(app.window, 'meshManager', None),
+                         'isVolumeCutting', None)
+        try:
+            return bool(asking()) if callable(asking) else False
+        except Exception:                                   # noqa: BLE001
+            return False
+
+    def cancelVolumeCut(self) -> bool:
+        """Stop the volume's cut being worked out; what is on screen stays."""
+        stop = getattr(getattr(app.window, 'meshManager', None),
+                       'cancelVolumeCut', None)
+        return bool(stop()) if callable(stop) else False
+
+    def cancelSection(self) -> bool:
+        """Plan 39 VI11. *Cancel* on the section panel: stop the worker's
+        cut and the filters over a loaded volume. The section already on
+        screen stays, and is labelled as the previous one."""
+        stopped = self.cancelVolumeCut()
+        case = self._cellsCase
+        if case is not None and self._jobs is not None:
+            if self._jobs.cancel(case, 'cancelled by the user'):
+                stopped = True
+            self._workerMessage = ''
+            actor = self._workerActor
+            if actor is not None and actor.completion() is not None:
+                self._workerState = WORKER_PREVIOUS
+            else:
+                self._workerState = None
+        self._computing = self._volumeCutting()
+        self._publishStatus()
+        return stopped
+
+    def _recutFinished(self, busy):
+        """A cut built again for the arrays a colour needs is done: colour it.
+
+        Only the actor that was asked to cut again is followed, and only
+        until it is done.
+        """
+        if busy:
+            return
+        for info in self._volumeActors():
+            signal = getattr(info, 'cutBusy', None)
+            if signal is not None:
+                try:
+                    signal.disconnect(self._recutFinished)
+                except (RuntimeError, TypeError):
+                    pass
+        if self._colouring is not None:
+            self._recolour()
+            self._view.refresh()
+
+    def _volumeCutBusy(self, busy):
+        """The filters over the volume started or finished: say so, and
+        colour and cap what they left."""
+        self._computing = bool(busy)
+        if busy:
+            self._publishStatus()
+            return
+        self._refreshCaps()
+        self._view.refresh()
 
     # -- Plan 37 UF6: caps and what the section is ------------------------ #
 
@@ -966,7 +1203,10 @@ class CutTool(QObject):
             'surface', 'decimated')
         # UF10. Cells for the cut: on a boundary-only picture, until the
         # worker's section of this cut is on screen or on its way.
-        cellsOffered = (offered and self._workerState != WORKER_CURRENT
+        # Plan 39 VI2 (F1a). A loaded volume is offered the worker's exact
+        # cut as well: it is drawn over the volume, which stays the body.
+        cellsOffered = ((offered or (bool(self._option) and hasVolume))
+                        and self._workerState != WORKER_CURRENT
                         and not running)
         _case, why = self._workerTarget()
         cells = self._totalCells()
@@ -989,6 +1229,10 @@ class CutTool(QObject):
             setLoadCells = getattr(panel, 'setLoadCells', None)
             if setLoadCells is not None:
                 setLoadCells(cellsOffered, why is None, why or '')
+            setBusy = getattr(panel, 'setSectionBusy', None)
+            if setBusy is not None:
+                setBusy(bool(self._option) and (
+                    running or self._volumeCutting()))
 
     def _totalCells(self) -> int:
         manager = getattr(app.window, 'meshManager', None)
@@ -1068,6 +1312,10 @@ class CutTool(QObject):
         mode = self._panel.mode()
         if mode not in PREVIEW_MODES or self._previewSlow:
             return False
+        if self._panel.combine() is not Combine.COMMON \
+                and len(self._panel.effectivePlanes()) > 1:
+            # The renderer's clip planes only intersect.
+            return False
         planes = self._vtkPlanes(mode)
         if not planes:
             return False
@@ -1082,8 +1330,11 @@ class CutTool(QObject):
                 cap.clear()
             self._previewProps = props
             self._moving = 'preview'
-        setPreviewClipping(self._previewProps, planes)
-        self._view.refresh()
+        setPreviewClipping(self._dragTargets(), planes)
+        # Plan 39 VI14d. A handle being dragged draws the frame itself, right
+        # after this slot; asking for another paint drew every move twice.
+        if not getattr(self._view, '_handleDragHeld', False):
+            self._view.refresh()
         elapsed = time.perf_counter() - started
         if first:
             # The first frame also uncuts the surfaces; it is not a frame
@@ -1100,6 +1351,33 @@ class CutTool(QObject):
         self._previewTimes.append(elapsed)
         return True
 
+    def _dragTargets(self):
+        """What the dragged plane clips: the reduced copy drawn in place of
+        a part while the copies stand in, the part itself otherwise.
+
+        Plan 39 VI14c. Clipping a full part's mapper modifies it, and its
+        buffers (6.6 M cells) are rebuilt on the GUI thread the next time it
+        is drawn -- measured 735 ms in the first move of a drag. The part
+        under a copy is not drawn, so it is left alone.
+        """
+        getDetail = getattr(self._view, 'interactionDetail', None)
+        detail = getDetail() if getDetail is not None else None
+        if detail is None or not detail.active():
+            self._previewStandIns = []
+            return self._previewProps
+        targets, standIns = [], []
+        for prop in self._previewProps:
+            copy = detail.standIn(prop)
+            if copy is None:
+                targets.append(prop)
+            else:
+                targets.append(copy)
+                standIns.append(copy)
+        self._previewStandIns = standIns
+        return targets
+
+    _previewStandIns = ()
+
     def _endPreview(self, restore=False):
         """Take the renderer's clip off; with *restore* put the last cut
         back (the filters, the caps) as it was before the drag."""
@@ -1107,6 +1385,8 @@ class CutTool(QObject):
             self._moving = None
             return
         clearPreviewClipping(self._previewProps)
+        clearPreviewClipping(self._previewStandIns)
+        self._previewStandIns = []
         self._previewProps = []
         self._moving = None
         if restore and self._option:
@@ -1169,6 +1449,18 @@ class CutTool(QObject):
             return section_colour.SOURCE_VOLUME
         return section_colour.SOURCE_BOUNDARY
 
+    def _volumeArrays(self) -> frozenset:
+        """Plan 41 GN23. The cell arrays the volume on screen carries."""
+        found = set()
+        for info in self._volumeActors():
+            data = info.dataSet()
+            if data is None:
+                continue
+            cells = data.GetCellData()
+            found.update(cells.GetArrayName(index) or ''
+                         for index in range(cells.GetNumberOfArrays()))
+        return frozenset(found)
+
     def _ensureQuality(self):
         manager = getattr(app.window, 'meshManager', None)
         ensure = getattr(manager, 'ensureQualityFields', None)
@@ -1212,11 +1504,21 @@ class CutTool(QObject):
         targets = []
         for info in self._volumeActors():
             # Every piece keeps its cell's id and type through the cut.
+            before = info.dataSet().GetMTime()
             stampCellIdentity(info.dataSet())
             if field is not None and not case_fields.attach(info.dataSet(),
                                                             field):
                 self._colourSkipped += 1
                 continue
+            if info.dataSet().GetMTime() != before:
+                # The cut was built from a copy taken before these arrays
+                # were on the volume: build it again (VI14 hover). Done on a
+                # thread with a loop; `_volumeCutBusy` colours what it left.
+                busy = getattr(info, 'cutBusy', None)
+                if busy is not None:
+                    busy.connect(self._recutFinished,
+                                 Qt.ConnectionType.UniqueConnection)
+                info.recut()
             prop = info.actor()
             mapper = prop.GetMapper()
             mapper.Update()
@@ -1235,12 +1537,26 @@ class CutTool(QObject):
         source = self._colourSource()
         unavailable = (self._workerUnavailable()
                        if source == section_colour.SOURCE_WORKER else None)
+        manager = getattr(app.window, 'meshManager', None)
+        gmshQuality = bool(getattr(manager, 'hasGmshQuality', None)
+                           and manager.hasGmshQuality())
+        native = self._isNative()
+        for panel in [self._panel, *self._mirrors]:
+            setGmsh = getattr(panel, 'setCompareGmsh', None)
+            if setGmsh is not None:
+                try:
+                    setGmsh(native)
+                except RuntimeError:
+                    pass
+        volumeHas = self._volumeArrays() if native else ()
         states = {item.key: section_colour.availability(
-                      item.key, source, unavailable=unavailable)
+                      item.key, source, unavailable=unavailable,
+                      gmshQuality=gmshQuality, native=native,
+                      volumeHas=volumeHas)
                   for item in section_colour.CHOICES}
         item = section_colour.choice(self._colourKey)
         field = None
-        if source == section_colour.SOURCE_VOLUME:
+        if source == section_colour.SOURCE_VOLUME and not native:
             # Plan 37 UF9: levels and zones of a local volume are read
             # from the case, bound to the mesh the cells came from.
             for key in case_fields.MEMBERS:
@@ -1252,7 +1568,7 @@ class CutTool(QObject):
         self._colouring.restore()
         mapped = {'kind': 'none'}
         caseField = case_fields.is_case_field(item.key) \
-            and source == section_colour.SOURCE_VOLUME
+            and source == section_colour.SOURCE_VOLUME and not native
         if caseField and allowed and field is None:
             # Being read: the choice stays, the cut waits uncoloured.
             reason = self.tr('Reading {0} from the case…').format(
@@ -1276,7 +1592,8 @@ class CutTool(QObject):
                     names = fieldString(targets[0][2], 'cellZoneNames')
                 mapped = section_colour.mapping(
                     item.key, np.concatenate(values) if values else None,
-                    colourRange=self._colourRange, names=names)
+                    colourRange=self._colourRange, names=names,
+                    whole=self._wholeMeshValues(item, source))
                 for prop, mapper, _data in targets:
                     self._colouring.colour(mapper, mapped)
                     prop.Modified()
@@ -1305,8 +1622,21 @@ class CutTool(QObject):
                 'on screen (a cell zone or region shown on its own).').format(
                     item.label, count_text(self._colourSkipped, 'part'))
         for panel in [self._panel, *self._mirrors]:
-            panel.setColourChoices(states)
+            panel.setColourChoices(states, offerGmsh=native or gmshQuality)
             panel.setColourLegend(legend, tooltip)
+
+    def _wholeMeshValues(self, item, source):
+        """VI10b (F2h). The field's values over the whole mesh, where the
+        volume on screen holds them all (the exact cut holds the cut only)."""
+        if source != section_colour.SOURCE_VOLUME or item.categorical:
+            return None
+        found = []
+        for info in self._volumeActors():
+            array = cellArray(info.dataSet(), item.array)
+            if array is None:
+                return None
+            found.append(array)
+        return np.concatenate(found) if found else None
 
     def _caseMeshDir(self):
         """``(constant/polyMesh, None)`` of the open case, or
@@ -1314,6 +1644,10 @@ class CutTool(QObject):
         case, why = self._workerTarget()
         if case is None:
             return None, why
+        if self._isNative():
+            return None, self.tr(
+                'This is a Gmsh mesh; it has no polyMesh to read a case '
+                'field from.')
         cached = self._caseMesh
         if cached is None or cached[0] != case:
             meshDir, why = case_fields.mesh_directory(case)
@@ -1330,12 +1664,16 @@ class CutTool(QObject):
             return (False, self.tr(
                 '{0} is read from the polyMesh of an OpenFOAM case. {1}')
                 .format(label, why or '').strip()), None
-        try:
-            if not case_fields.has_member(meshDir, key):
-                return (False, case_fields.absent_reason(key)), None
-            revision = case_fields.mesh_revision(meshDir)
-        except OSError as error:
-            return (False, str(error)), None
+        probed = self._caseProbe(meshDir, key)
+        if probed is None:
+            # Being looked at off the GUI thread; the cut is recoloured when
+            # the answer lands.
+            return (True, ''), None
+        present, revision, error = probed
+        if error:
+            return (False, error), None
+        if not present:
+            return (False, case_fields.absent_reason(key)), None
         for info in self._volumeActors():
             data = info.dataSet()
             if data is not None and case_fields.bindVolume(
@@ -1354,6 +1692,60 @@ class CutTool(QObject):
                 return (False, field.reason), None
             return (True, ''), field
         return (True, ''), None
+
+    #: Seconds an answer about the case's files is trusted before it is asked
+    #: again (off the GUI thread).
+    CASE_PROBE_SECONDS = 3.0
+
+    def _caseProbe(self, meshDir, key):
+        """``(has the member, the mesh's revision, error text)`` or ``None``
+        while it is being asked.
+
+        Plan 39 VI14c. Both are file system calls (``stat`` of the polyMesh
+        files); on a freshly written multi-million-cell case the virus
+        scanner made one hold the GUI thread for 1.6 s inside every
+        recolour (measured, `VI14_stalls_vi14c1`: raise 685 ms). With an
+        event loop running they are asked on a thread and the answer kept for
+        :data:`CASE_PROBE_SECONDS`; without one (a test, a script) they are
+        asked here.
+        """
+        slot = (str(meshDir), key)
+
+        def ask():
+            try:
+                return (case_fields.has_member(meshDir, key),
+                        case_fields.mesh_revision(meshDir), '')
+            except OSError as error:
+                return False, '', str(error)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return ask()
+        now = time.monotonic()
+        probes = self.__dict__.setdefault('_caseProbes', {})
+        kept = probes.get(slot)
+        if kept is not None and now - kept[0] < self.CASE_PROBE_SECONDS:
+            return kept[1]
+        pending = self.__dict__.setdefault('_caseProbing', set())
+        if slot not in pending:
+            pending.add(slot)
+
+            async def run():
+                try:
+                    answer = await asyncio.to_thread(ask)
+                except Exception as error:                  # noqa: BLE001
+                    answer = (False, '', str(error))
+                finally:
+                    pending.discard(slot)
+                before = probes.get(slot)
+                probes[slot] = (time.monotonic(), answer)
+                if (before is None or before[1] != answer)                         and self._colouring is not None:
+                    self._recolour()
+                    self._view.refresh()
+
+            loop.create_task(run())
+        return kept[1] if kept is not None else None
 
     def _readCaseField(self, meshDir, key):
         """Read *key* from *meshDir*: off the GUI thread when an event
@@ -1406,15 +1798,34 @@ class CutTool(QObject):
         if manager is None:
             return None, self.tr('No mesh is open.')
         native = getattr(manager, 'nativePath', None)
-        if callable(native) and native() is not None:
-            return None, self.tr(
-                'This mesh was opened from a mesh file; the section worker '
-                'cuts the polyMesh of an OpenFOAM case.')
+        found = native() if callable(native) else None
+        if found is not None:
+            # Plan 41 GN23. A Gmsh hand-over or .msh: the worker reads the
+            # file itself, as the polyhedral mesh `native_mesh` makes of it.
+            return str(found), None
         caseRoot = getattr(manager, 'caseRoot', None)
         root = caseRoot() if callable(caseRoot) else None
         if not root:
             return None, self.tr('No case mesh is open.')
         return str(Path(root)), None
+
+    def _isNative(self) -> bool:
+        """Plan 41 GN23. Whether the mesh on screen is a Gmsh file, which
+        has no polyMesh, no case fields and no stage snapshots."""
+        manager = getattr(app.window, 'meshManager', None)
+        native = getattr(manager, 'nativePath', None)
+        return bool(callable(native) and native() is not None)
+
+    def _storeRoot(self):
+        """The directory whose ``foammesh/`` folder keeps what is saved
+        about the mesh on screen: the case, or for a native mesh the case of
+        the session that made it (else the folder of the file)."""
+        case, _why = self._workerTarget()
+        if case is None or not self._isNative():
+            return case
+        getter = getattr(app.window.meshManager, 'nativeStoreRoot', None)
+        root = getter() if getter is not None else None
+        return None if root is None else str(root)
 
     # -- Plan 37 UF11: named sections saved with the case ------------------ #
 
@@ -1438,7 +1849,15 @@ class CutTool(QObject):
             self._savedDocument = None
             self._publishSaved(why or '')
             return None
-        self._savedDocument = named_sections.load_sections(case)
+        root = self._storeRoot()
+        if root is None:
+            # A native mesh nobody made a session for keeps nothing beside it.
+            self._savedDocument = None
+            self._publishSaved(self.tr(
+                'Sections cannot be saved: this Gmsh mesh file has no '
+                'case to keep them in.'))
+            return None
+        self._savedDocument = named_sections.load_sections(root)
         self._publishSaved()
         return self._savedDocument
 
@@ -1468,14 +1887,20 @@ class CutTool(QObject):
         panel = self._panel
         planes = tuple(
             named_sections.NamedPlane(panel.planeName(index), plane.state,
-                                      tuple(plane.origin), plane.enabled)
+                                      tuple(plane.origin), plane.enabled,
+                                      plane.handle_visible,
+                                      plane.surface_visible)
             for index, plane in enumerate(panel.planes()))
         fields = dict(active=panel.activeIndex(),
                       mode=self._mode or panel.mode(),
                       units='model', colour=self._colourKey,
                       mask={'caps': True},
                       target=self._targetPolicy(),
-                      frozen=self._frozenDefinition())
+                      frozen=self._frozenDefinition(),
+                      combine=panel.combine().value,
+                      cell_rule=panel.cellRule().value,
+                      scale=self._colourRange.policy().value,
+                      scale_range=self._colourRange.fixedRange())
         if sectionId is None:
             return named_sections.SectionDefinition.new(name, planes,
                                                         **fields)
@@ -1495,15 +1920,24 @@ class CutTool(QObject):
             plane = SectionPlaneState(name=named.name)
             plane.setState(named.state, named.pivot)
             plane.enabled = named.enabled
+            # VI10 (F3a). A saved section brings back what was hidden.
+            plane.handle_visible = named.handle_visible
+            plane.surface_visible = named.surface_visible
             planes.append(plane)
         gizmos = [index for index, named in enumerate(section.planes)
-                  if named.enabled]
+                  if named.enabled and named.handle_visible]
         wanted = SectionSnapshot(
             planes, section.active, CutType.CLIP, False,
             self._panel.isLive(), self._panel.dragAxis(),
             self._panel.isLocked(), gizmos, section.mode)
         self._panel.adoptFrom(wanted)
+        self._panel.setCombine(section.combine)
+        self._panel.setCellRule(section.cell_rule)
         self.setSectionColour(section.colour)
+        self._colourRange.setPolicy(ScalePolicy(section.scale),
+                                    section.scale_range)
+        for panel in [self._panel, *self._mirrors]:
+            panel.setScalePolicy(self._colourRange.policy())
         self._apply()
         self._syncGizmos()
         # The frozen cells come back bound to the mesh they were frozen on
@@ -1523,17 +1957,24 @@ class CutTool(QObject):
         if case is None:
             self._publishSaved(why)
             return False, why
+        if self._storeRoot() is None:
+            reason = self.tr('Sections cannot be saved: this Gmsh mesh file '
+                             'has no case to keep them in.')
+            self._publishSaved(reason)
+            return False, reason
         name = str(name or '').strip()
         try:
-            document = named_sections.load_sections(case)
+            store = self._storeRoot()
+            document = named_sections.load_sections(store)
             existing = next((s for s in document.sections
                              if s.name == name), None)
             section = self.sectionDefinition(
                 name, existing.id if existing else None)
-            self._savedDocument = named_sections.put_section(case, section)
+            self._savedDocument = named_sections.put_section(store, section)
         except (ValueError, OSError,
                 named_sections.SectionStoreError) as error:
-            self._savedDocument = named_sections.load_sections(case)
+            self._savedDocument = named_sections.load_sections(
+                self._storeRoot())
             reason = str(error)
             self._publishSaved()
             for panel in [self._panel, *self._mirrors]:
@@ -1558,15 +1999,89 @@ class CutTool(QObject):
         case, why = self._workerTarget()
         if case is None:
             return False, why
+        if self._storeRoot() is None:
+            return False, self.tr('This Gmsh mesh file has no case that '
+                                  'keeps sections.')
         try:
             self._savedDocument = named_sections.delete_section(
-                case, sectionId)
+                self._storeRoot(), sectionId)
         except (OSError, named_sections.SectionStoreError) as error:
             return False, str(error)
         if self._savedCurrent == sectionId:
             self._savedCurrent = None
         self._publishSaved()
         return True, ''
+
+    # -- Plan 39 VI10b: larger / smaller, the colour scale ------------------ #
+
+    def keepPiece(self, which) -> bool:
+        """*Keep larger* / *Keep smaller*: set every cutting plane's keep
+        side to the combination that keeps the larger / smaller volume.
+
+        From the volume on screen when there is one (cell centres and
+        volumes of the grid, off the GUI thread); otherwise the section
+        worker is asked, from the mesh on disk, and its answer sets them.
+        Flip still overrides afterwards.
+        """
+        prefer = Prefer(which)
+        states = self._panel.enabledPlanes()
+        if not self._option or not states or not self._panel.mode().clips:
+            return False
+        grids = ([info.dataSet() for info in self._volumeActors()]
+                 if self._picture[0] else [])
+        if grids:
+            combine = self._panel.combine()
+            current = [1 for _state in states]
+            canon = [state.state for state in states]
+            indexes = [index for index, plane in enumerate(self._panel.planes())
+                       if plane.enabled]
+
+            def work():
+                keeps = localSides(grids, canon, combine, prefer, current)
+                return None if keeps is None else dict(zip(indexes, keeps))
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self._takeSides(work())
+                return True
+
+            async def run():
+                self._takeSides(await asyncio.to_thread(work))
+
+            asyncio.ensure_future(run())
+            return True
+        case, _why = self._workerTarget()
+        if case is None or self._jobs is None:
+            return False
+        self._prefer = prefer.value
+        self._cellsCase = case
+        self._submitWorker(self._workerRequest(case))
+        return True
+
+    def _takeSides(self, keeps):
+        """Put the chosen keep sides ``{plane index: +-1}`` on the planes."""
+        if keeps:
+            self._panel.setKeeps(keeps)
+
+    def colourScale(self) -> ScalePolicy:
+        return self._colourRange.policy()
+
+    def setColourScale(self, policy, fixed=None):
+        """How the cut's colour range is fitted (`ScalePolicy`)."""
+        self._colourRange.setPolicy(ScalePolicy(policy), fixed)
+        for panel in [self._panel, *self._mirrors]:
+            panel.setScalePolicy(self._colourRange.policy())
+        self._recolour()
+        self._view.refresh()
+
+    def rescaleColour(self):
+        """*Rescale to cut*: fit the colour range to the cells on screen."""
+        self._colourRange.rescale()
+        for panel in [self._panel, *self._mirrors]:
+            panel.setScalePolicy(self._colourRange.policy())
+        self._recolour()
+        self._view.refresh()
 
     def _workerRunning(self) -> bool:
         case = self._cellsCase
@@ -1580,10 +2095,23 @@ class CutTool(QObject):
             active = next((index for index, plane in enumerate(planes)
                            if plane.enabled), active)
         mode = self._mode or self._panel.mode()
+        asked = [plane.to_dict() for plane in planes]
+        solo = self._panel.soloIndex()
+        if solo is not None and 0 <= solo < len(asked):
+            # VI10b. The others are masked off without being turned off.
+            for index, plane in enumerate(asked):
+                plane['enabled'] = index == solo
+            active = solo
+        prefer, self._prefer = self._prefer, None
         return SectionRequest(
             case_dir=case, case_id=case, generation=self._generation,
-            mode=mode.value, planes=tuple(plane.to_dict() for plane in planes),
-            active=active, arrays=tuple(self._workerArrays()))
+            mode=mode.value, planes=tuple(asked),
+            active=active, arrays=tuple(self._workerArrays()),
+            combine=self._panel.combine().value if mode.clips else None,
+            cell_rule=self._panel.cellRule().value if mode in (
+                SectionMode.CLIP_WHOLE_CELLS, SectionMode.CUT_CELLS)
+            else None,
+            prefer=prefer)
 
     def _workerArrays(self):
         """The source arrays the worker is asked for (UF9 colours)."""
@@ -1659,6 +2187,14 @@ class CutTool(QObject):
             self._workerState = WORKER_REFUSED
             self._workerMessage = completion.message or completion.reason
             self._publishStatus()
+            return
+        chosen = completion.manifest.get('resolved_keeps')
+        if completion.request.prefer and chosen:
+            # VI10b. The sides were asked for, not a cut: take them and cut
+            # again with them (the answer is not drawn).
+            self._jobs.release(completion)
+            self._takeSides({int(index): keep
+                             for index, keep in chosen.items()})
             return
         asyncio.ensure_future(self._drawDelivered(completion))
 
@@ -1823,6 +2359,15 @@ class CutTool(QObject):
         if case is None:
             self._comparePanels([why])
             return None
+        if self._isNative():
+            # Plan 41 GN23. A Gmsh mesh compares the kept passes of its
+            # session, which live under the session's case.
+            case = self._storeRoot()
+            if case is None:
+                self._comparePanels([self.tr(
+                    'This Gmsh mesh has no session; open the mesh the Gmsh '
+                    'session made to compare its passes.')])
+                return None
         planes = self._panel.planes()
         enabled = [index for index, plane in enumerate(planes)
                    if plane.enabled]
@@ -2111,8 +2656,10 @@ class CutTool(QObject):
         """The section mode the cut on screen was made in (None: no cut)."""
         return self._mode if self._option else None
 
-    def _stepSources(self):
-        """``(points, offsets, connectivity)`` of the cells on screen.
+    def _stepData(self):
+        """``[(data set, key)]`` of the cells on screen. Cheap: it only asks
+        the actors for the data they already hold, so it runs on the GUI
+        thread whatever the mesh weighs.
 
         The volume when it is shown, otherwise the boundary faces.
         """
@@ -2122,14 +2669,27 @@ class CutTool(QObject):
         shown = self._shown(mesh)
         chosen = ([info for info in shown if isinstance(info, MeshActor)]
                   or [info for info in shown if isinstance(info, BoundaryActor)])
-        cache = dict(self._stepCache or {})
-        sources, keys = [], set()
+        found = []
         for info in chosen:
             data = info.dataSet()
             if (data is None or not data.GetNumberOfCells()
                     or data.GetPoints() is None):
                 continue
-            key = (id(data), data.GetMTime())
+            found.append((data, (id(data), data.GetMTime())))
+        return found
+
+    def _stepSources(self, found=None):
+        """``(points, offsets, connectivity, tolerance, ranges)`` of the
+        cells on screen.
+
+        Reads every cell the first time a data set is seen, so a mesh of
+        millions calls this from the step worker, never the GUI thread
+        (`cellScaleStep`).
+        """
+        found = self._stepData() if found is None else found
+        cache = dict(self._stepCache or {})
+        sources, keys = [], set()
+        for data, key in found:
             keys.add(key)
             if key not in cache:
                 offsets, connectivity = cellLayout(data)
@@ -2144,14 +2704,41 @@ class CutTool(QObject):
         self._stepCache = {key: cache[key] for key in keys}
         return sources
 
+    def _stepFrom(self, found, normal, normalKey, offset):
+        """The median cell thickness along *normal* at *offset*, from the
+        cells in *found* (None when the plane passes through none). Holds the
+        step lock: the cache it fills is one thread's at a time."""
+        spans = []
+        with self._stepLock:
+            for points, offsets, connectivity, tolerance, ranges \
+                    in self._stepSources(found):
+                if normalKey not in ranges:
+                    if len(ranges) >= 3:
+                        ranges.pop(next(iter(ranges)))
+                    ranges[normalKey] = projected_ranges(
+                        points, offsets, connectivity, normal)
+                low, high = ranges[normalKey]
+                step = scale_step_from_ranges(low, high, offset, tolerance)
+                if step is not None:
+                    spans.append(step)
+        if not spans:
+            return None
+        return float(np.median(spans))
+
     def cellScaleStep(self, plane):
         """The median thickness along n of the cells *plane* passes through.
 
         Metres, or None when it passes through none (the panel then keeps its
-        last step or says it fell back to the model's size). It is read on
-        the GUI thread from the arrays already on screen.
+        last step or says it fell back to the model's size).
+
+        VI14 (LIVE-V). Measured on the 6.64 M-cell impeller, finding this on
+        the GUI thread stalled it 925 ms at the raise and 1.6 s when a drag
+        was let go (every cell is read once per normal, and compared with the
+        plane on every call). Above `STEP_ASYNC_CELLS` the answer is worked
+        out on a worker; until it lands this returns the last answer for the
+        same normal (a step changes slowly along n), or None, and the panel
+        is told when the answer is in (`_stepAnswered`).
         """
-        spans = []
         normal = np.asarray(plane.state.normal, dtype=float)
         length = float(np.linalg.norm(normal))
         if not length or not np.isfinite(length):
@@ -2159,19 +2746,55 @@ class CutTool(QObject):
         normal = normal / length
         offset = float(np.dot(np.asarray(plane.origin, dtype=float), normal))
         normalKey = tuple(round(float(value), 12) for value in normal)
-        for points, offsets, connectivity, tolerance, ranges                 in self._stepSources():
-            if normalKey not in ranges:
-                if len(ranges) >= 3:
-                    ranges.pop(next(iter(ranges)))
-                ranges[normalKey] = projected_ranges(
-                    points, offsets, connectivity, normal)
-            low, high = ranges[normalKey]
-            step = scale_step_from_ranges(low, high, offset, tolerance)
-            if step is not None:
-                spans.append(step)
-        if not spans:
+        found = self._stepData()
+        if not found:
             return None
-        return float(np.median(spans))
+        cells = sum(int(data.GetNumberOfCells()) for data, _key in found)
+        loop = None
+        if cells > STEP_ASYNC_CELLS:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None            # a test, a shutdown: answer here
+        if loop is None:
+            return self._stepFrom(found, normal, normalKey, offset)
+        key = (tuple(key for _data, key in found), normalKey, offset)
+        if key in self._stepAnswers:
+            return self._stepAnswers[key]
+        self._stepWanted = (found, normal, normalKey, offset, key)
+        if self._stepTask is None or self._stepTask.done():
+            self._stepTask = asyncio.ensure_future(self._stepRun())
+        return self._stepByNormal.get((key[0], normalKey))
+
+    async def _stepRun(self):
+        while self._stepWanted is not None:
+            found, normal, normalKey, offset, key = self._stepWanted
+            self._stepWanted = None
+            try:
+                step = await asyncio.to_thread(
+                    self._stepFrom, found, normal, normalKey, offset)
+            except Exception:                                # noqa: BLE001
+                logger.exception('the cell-scale step failed')
+                step = None
+            self._stepAnswers[key] = step
+            if len(self._stepAnswers) > STEP_ANSWERS_KEPT:
+                self._stepAnswers.pop(next(iter(self._stepAnswers)))
+            if step is not None:
+                self._stepByNormal[(key[0], normalKey)] = step
+            if self._stepWanted is None:
+                self._stepAnswered()
+
+    def _stepAnswered(self):
+        """The worker found a step: every panel redraws its note and stops
+        using the step it kept."""
+        for panel in [self._panel, *self._mirrors]:
+            refresh = getattr(panel, 'stepFound', None)
+            if refresh is None:
+                continue
+            try:
+                refresh()
+            except RuntimeError:
+                pass
 
     def _installNudgeKeys(self, widget):
         for key, direction in NUDGE_KEYS.items():
@@ -2181,10 +2804,32 @@ class CutTool(QObject):
                 shortcut = QShortcut(QKeySequence(modifier | key), widget)
                 shortcut.setContext(
                     Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                adoptShortcut('plane.' + ('up' if direction > 0 else 'down')
+                              + ('Fine' if fine else ''), shortcut)
                 shortcut.activated.connect(
                     lambda d=direction, f=fine, w=widget:
                     self._shortcutNudge(d, f, w))
                 self._shortcuts.append(shortcut)
+        # VI10 (F3c). H hides or shows the selected plane's handle, under the
+        # same focus rule; a text box keeps its H (the box takes the key
+        # before a shortcut sees it).
+        shortcut = QShortcut(QKeySequence(Qt.Key.Key_H), widget)
+        shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        adoptShortcut('plane.handle', shortcut)
+        shortcut.activated.connect(
+            lambda w=widget: self.toggleHandleFromKey(
+                QApplication.focusWidget() or w))
+        self._shortcuts.append(shortcut)
+
+    def toggleHandleFromKey(self, focus=None) -> bool:
+        """The H key: hide or show the active plane's handle. True if it did."""
+        if not self.ownsFocus(focus):
+            return False
+        panel = self._panel
+        for mirror in self._mirrors:
+            if mirror is focus or mirror.isAncestorOf(focus):
+                panel = mirror
+        return panel.toggleActiveHandle()
 
     def _shortcutNudge(self, direction, fine, widget):
         key = Qt.Key.Key_PageUp if direction > 0 else Qt.Key.Key_PageDown
@@ -2296,4 +2941,5 @@ class CutTool(QObject):
         self._showLooking(False)
 
     def _viewDestroyed(self, *_args):
+        cancel_registry.unregister(self)
         self._savedCamera = None

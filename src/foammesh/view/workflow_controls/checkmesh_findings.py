@@ -17,6 +17,59 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.view.facade_client import query
+from foammesh.view.theming.metrics import GAP_TIGHT
+from foammesh.view.widgets.folded_note import FoldedNote
+
+
+def fit_table_to_rows(table, *, max_rows: int = 4) -> None:
+    """Draw a findings table as tall as its rows, to *max_rows* of them.
+
+    Plan 44 CHR2 (G-FITS-1 / G-FITG-1). A ``QTableWidget`` asks for the Qt
+    default viewport, about 192 px, whatever it holds. MEASURED live at
+    1280x800: a one-finding table took 192 px of the 300 px sheet, and two of
+    them (checkMesh and the SU2 readiness check) pushed Gmsh Quality 631 px
+    past its scroller. Every row is still there (a longer table scrolls
+    inside its own box); an empty space is not.
+    """
+    rows = table.rowCount()
+    shown = max(1, min(rows, max_rows))
+    height = table.horizontalHeader().height() or table.horizontalHeader().sizeHint().height()
+    for row in range(shown):
+        height += table.rowHeight(row)
+    height += 2 * table.frameWidth() + table.horizontalScrollBar().sizeHint().height()
+    table.setMinimumHeight(0)
+    table.setMaximumHeight(height)
+    policy = table.sizePolicy()
+    policy.setVerticalPolicy(policy.Policy.Maximum)
+    table.setSizePolicy(policy)
+
+def fold_findings_table(inner, table, title: str, name: str):
+    """Put a findings table behind a closed fold header; return the header.
+
+    Plan 44 CHR2 (G-FITS-1 / G-FITG-1). MEASURED live at 1280x800: the
+    findings table is 192 px of a 233 px column whatever it holds (one
+    wrapped finding is 140 px of it), and Gmsh Quality draws two. The verdict
+    headline stays in sight; the rows (every one of them) are one press away,
+    and the header counts them. ``refresh`` calls :func:`count_findings`.
+    """
+    from foammesh.view.widgets.folder_header import FolderHeader
+
+    header = FolderHeader(title)
+    header.setObjectName(name)
+    header.setProperty('foammeshFoldTitle', title)
+    header.setProperty('foammeshSectionFold', True)
+    header.setChecked(False)
+    inner.insertWidget(inner.indexOf(table), header)
+    header.setContents(table)
+    return header
+
+
+def count_findings(header, table, rows: int) -> None:
+    """Say how many rows are behind the fold; draw none when there are none."""
+    title = str(header.property('foammeshFoldTitle') or '')
+    header.setText(f'{title}  ({rows})' if rows else title)
+    header.setVisible(rows > 0)
+    table.setVisible(rows > 0 and header.isChecked())
 
 
 class CheckMeshFindings(QGroupBox):
@@ -29,11 +82,18 @@ class CheckMeshFindings(QGroupBox):
     surface reading the same file cannot disagree about it.
     """
 
-    def __init__(self, facade_client, parent=None):
+    def __init__(self, facade_client, parent=None, *, check: str = ''):
         super().__init__('checkMesh findings', parent)
         self._client = facade_client
+        #: Plan 41 GN16. Which check's report this panel reads. Empty means
+        #: the report the project's own preset asks for (the snappy page);
+        #: the Gmsh Quality page names its check, so a panel shows its own
+        #: check's report whatever the preset is.
+        self._check = str(check or '')
         inner = QVBoxLayout(self)
-        self._headline = QLabel(self)
+        inner.setSpacing(GAP_TIGHT)  # Plan 44 CHR2: the fold and verdict sit close
+        # Plan 44 CHR2: the verdict is one line until opened (FX2 idiom).
+        self._headline = FoldedNote(self)
         self._headline.setObjectName('qaFindingsHeadline')
         self._headline.setWordWrap(True)
         self._headline.setAccessibleName(
@@ -59,11 +119,16 @@ class CheckMeshFindings(QGroupBox):
                 column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         inner.addWidget(self._table)
+        self._fold = fold_findings_table(
+            inner, self._table, self.tr('Findings and metrics'), 'qaFindingsFold')
         self.refresh()
 
     def report(self) -> dict:
         try:
-            payload = query(self._client, 'quality.report').payload or {}
+            payload = query(
+                self._client, 'quality.report',
+                {'check': self._check} if self._check else {}
+            ).payload or {}
         except Exception:                                    # noqa: BLE001
             return {}
         return dict(payload.get('report') or {})
@@ -90,7 +155,11 @@ class CheckMeshFindings(QGroupBox):
                 self._table.setItem(index, column,
                                     QTableWidgetItem(str(value)))
         self._table.resizeRowsToContents()
-        self._table.setVisible(bool(readout.rows))
+        fit_table_to_rows(self._table)
+        count_findings(self._fold, self._table, len(readout.rows))
+        # Plan 40 UXA4 (#53). A box with nothing in it is not drawn.
+        self.setVisible(bool(report) or bool(readout.rows))
 
 
-__all__ = ['CheckMeshFindings']
+__all__ = ['CheckMeshFindings', 'count_findings', 'fit_table_to_rows',
+           'fold_findings_table']

@@ -209,6 +209,20 @@ def _settle_removed_geometry(session) -> None:
                     len(result['restored']))
 
 
+#: Plan 40 UXD9 (#54), found by the round-2 guided walk. The Gmsh quality
+#: gate's limits are edited on Quality, which is after the mesh exists, so
+#: the page that shows them cannot also be a page whose lock refuses them:
+#: the walk's press on Quality was refused with "Generate is locked" and the
+#: reader was left on a row that said their edits were not saved. On Gmsh
+#: these limits stale the quality report only (``invalidates_for('gmsh')``),
+#: they are not inputs the mesh on disk was made from, so they hold no lock.
+_UNLOCKED_FIELDS = {
+    'gmsh': frozenset((
+        'gmsh.compute.quality_type', 'gmsh.compute.min_quality',
+        'gmsh.compute.allowed_fraction', 'gmsh.compute.allowed_count',
+        'gmsh.compute.hard_floor', 'gmsh.compute.extra_limits')),
+}
+
 _LOCK_PATHS: dict = {}
 
 
@@ -220,8 +234,11 @@ def _lock_paths(descriptor) -> tuple:
         return cached
     collections = FIELD_REGISTRY.collections
     pairs = []
+    unlocked = _UNLOCKED_FIELDS.get(descriptor.engine_id, frozenset())
     for task in descriptor.ordered_tasks():
         for binding in task.fields:
+            if binding.field_id in unlocked:
+                continue
             if binding.field_id in FIELD_STORAGE:
                 pairs.append((FIELD_STORAGE[binding.field_id], task.task_id))
             elif binding.field_id in collections:
@@ -325,7 +342,8 @@ def _locked_tasks_of(session):
     AF1 owner-loop budget measured a 65-98 ms first edit when it was not).
     """
     workflow = Path(session.case_path) / 'foammesh' / 'workflow'
-    if not any(workflow.glob('*-publications.json')):
+    if not (any(workflow.glob('*-publications.json'))
+            or (workflow / 'completion-locks.json').is_file()):
         return None
     from foammesh.core.engine.registry import ENGINE_REGISTRY, configured_engine_id
     from foammesh.core.workflow.task_state_store import EngineTaskStateStore
@@ -335,7 +353,8 @@ def _locked_tasks_of(session):
     except Exception:
         return None
     store = EngineTaskStateStore(session.case_path, descriptor)
-    if not store.publications_path.is_file():
+    if not (store.publications_path.is_file()
+            or store.completion_path.is_file()):
         return None
     locked = set(store.locked_tasks())
     if not locked:
@@ -1141,6 +1160,7 @@ class FoamMeshFacade:
             session.require_writable()
             adapter = self.entities[collection_id]
             fields = command.parameters.get('fields') or {}
+            self._precheck_band_fields(collection_id, fields)
             normalized = adapter.normalize_patch(fields) if fields else {}
             self._validate_collection_scope(
                 session, collection_id, normalized)
@@ -1175,6 +1195,8 @@ class FoamMeshFacade:
             if not data.hasElement(adapter.storage_path, key):
                 raise ValidationFailedError('entity does not exist', details={
                     'collection': collection_id, 'entity_id': key})
+            self._precheck_band_fields(
+                collection_id, command.parameters.get('fields') or {})
             normalized = adapter.normalize_patch(command.parameters.get('fields') or {})
             self._validate_collection_scope(
                 session, collection_id, normalized)
@@ -1286,8 +1308,16 @@ class FoamMeshFacade:
             if 'castellationGroup' in (normalized or {}):
                 FoamMeshFacade._validate_surface_group_binding(data, row_path)
             return
+        # LY13-D1 (DP-2370..): what the legacy dialogs refused at entry.
+        FoamMeshFacade._validate_group_name(collection_id, data, row_path,
+                                            normalized)
+        if collection_id == 'meshing.castellation.volume_bands':
+            FoamMeshFacade._validate_volume_band(data, row_path, normalized)
+            return
         if collection_id != 'meshing.castellation.surface_refinements':
             return
+        FoamMeshFacade._validate_surface_group_entry(data, row_path,
+                                                     normalized)
         try:
             minimum = data.getValue(f'{row_path}/surfaceRefinement/minimumLevel')
             maximum = data.getValue(f'{row_path}/surfaceRefinement/maximumLevel')
@@ -1305,6 +1335,177 @@ class FoamMeshFacade:
                          'error': 'minimum_above_maximum',
                          'minimum_level': int(minimum),
                          'maximum_level': int(maximum)})
+
+    #: Collections whose rows are looked up by ``groupName``: the feature and
+    #: volume bands attach to a group by that name, so two rows sharing one
+    #: make the attachment ambiguous.
+    _GROUP_NAMED = ('meshing.castellation.surface_refinements',
+                    'meshing.castellation.volume_refinements',
+                    'meshing.layers.groups')
+
+    @staticmethod
+    def _validate_group_name(collection_id: str, data, row_path: str,
+                             normalized) -> None:
+        """Refuse a group name another group already holds.
+
+        LY13-D1 (DP-2370). The legacy surface, volume and layer dialogs said
+        ``Group name "x" already exists.`` before they saved; the guided
+        editor created the duplicate, and ``feature_bands`` / ``volume_bands``
+        (which attach by group name) then read both groups' rows for each.
+        Checked on create and rename only, so a row already saved under a
+        duplicate name can still be edited in its other fields.
+        """
+        if collection_id == 'regions.items':
+            # Legacy region page: 'Region "x" already exists.'
+            storage_path, _, key = row_path.rpartition('/')
+            if 'name' not in (normalized or {}):
+                return
+            name = str(data.getValue(row_path + '/name') or '').strip()
+            for other in data.getKeys(storage_path) if name else ():
+                if str(other) != key and str(data.getValue(
+                        f'{storage_path}/{other}/name') or '').strip() == name:
+                    raise ValidationFailedError(
+                        f'Region "{name}" already exists. Choose another '
+                        'name.',
+                        details={'collection': collection_id,
+                                 'field': 'name',
+                                 'error': 'duplicate_region_name',
+                                 'value': name})
+            return
+        if collection_id not in FoamMeshFacade._GROUP_NAMED:
+            return
+        if 'groupName' not in (normalized or {}):
+            return
+        storage_path, _, key = row_path.rpartition('/')
+        name = str(data.getValue(row_path + '/groupName') or '').strip()
+        if not name:
+            return
+        for other in data.getKeys(storage_path):
+            if str(other) == key:
+                continue
+            if str(data.getValue(f'{storage_path}/{other}/groupName')
+                   or '').strip() == name:
+                raise ValidationFailedError(
+                    f'Group name "{name}" already exists. Two groups with '
+                    'one name cannot be told apart by the distance bands '
+                    'that attach to a group by its name; choose another '
+                    'name.',
+                    details={'collection': collection_id,
+                             'field': 'group_name',
+                             'error': 'duplicate_group_name',
+                             'value': name})
+
+    @staticmethod
+    def _validate_surface_group_entry(data, row_path: str,
+                                      normalized) -> None:
+        """A patch group is a word; a point zone needs its point.
+
+        LY13-D1 (DP-2371, DP-2372). Both used to be refused only by the
+        legacy dialog. The point is the worse case: ``insidePoint`` with no
+        point used to be written as ``(0 0 0)``, a seed nobody placed, and
+        the zone came out wrong without a word.
+        """
+        normalized = normalized or {}
+        if 'patchGroups' in normalized:
+            raw = data.getValue(f'{row_path}/patchGroups')
+            for name in str(raw or '').replace(',', ' ').split():
+                if not name.replace('_', '').replace('.', '').isalnum():
+                    raise ValidationFailedError(
+                        f'"{name}" is not a patch group name. A group name '
+                        'is an OpenFOAM word: letters, digits, _ and . only.',
+                        details={'field': 'patch_groups',
+                                 'error': 'invalid_patch_group',
+                                 'value': name})
+        point_keys = [key for key in normalized
+                      if key.startswith('zoneInsidePoint')]
+        if point_keys:
+            # The flag tells a seed typed at the origin from the (0 0 0) every
+            # row starts with; the case builder reads it too.
+            data.setValue(f'{row_path}/zoneInsidePointSet', True)
+        if not point_keys and 'zoneMode' not in normalized:
+            return
+        mode = data.getValue(f'{row_path}/zoneMode')
+        if str(getattr(mode, 'value', mode)) != 'insidePoint':
+            return
+        if bool(data.getValue(f'{row_path}/zoneInsidePointSet')):
+            return
+        if any(float(data.getValue(f'{row_path}/zoneInsidePoint/{axis}') or 0)
+               for axis in ('x', 'y', 'z')):
+            return
+        raise ValidationFailedError(
+            'A cell zone selected by a point needs the point. Give a '
+            'coordinate inside the region you want.',
+            details={'field': 'zone_inside_point',
+                     'error': 'zone_point_missing'})
+
+    @staticmethod
+    def _precheck_band_fields(collection_id: str, fields) -> None:
+        """Say a band's range in words before the schema says it in code.
+
+        LY13-D1 (DP-2373). The schema refuses a zero distance or a negative
+        level with "entity value failed validation"; the legacy dialog said
+        which band and what to do.
+        """
+        if collection_id != 'meshing.castellation.volume_bands':
+            return
+        try:
+            if 'distance' in fields and float(fields['distance']) <= 0:
+                raise ValidationFailedError(
+                    f'This band has a distance of {float(fields["distance"]):g}. '
+                    'Every band has to reach a positive distance.',
+                    details={'field': 'volume_band.distance',
+                             'error': 'band_distance'})
+            if 'level' in fields and int(fields['level']) < 0:
+                raise ValidationFailedError(
+                    'This band has a negative level.',
+                    details={'field': 'volume_band.level',
+                             'error': 'band_level'})
+        except (TypeError, ValueError):
+            return  # not a number: the schema names that
+
+    @staticmethod
+    def _validate_volume_band(data, row_path: str, normalized) -> None:
+        """The ramp rules OpenFOAM stops the mesher on, judged as they are set.
+
+        LY13-D1 (DP-2373). Legacy ``volume_refinement_dialog._bandError``: a
+        band reaches a positive distance at a non-negative level, and the
+        group's bands, nearest first, never refine more as they go further.
+        The case builder judges the same rules at run time.
+        """
+        if not ({'groupName', 'distance', 'level'} & set(normalized or {})):
+            return
+        storage_path, _, key = row_path.rpartition('/')
+        group = str(data.getValue(f'{row_path}/groupName') or '')
+        rows = []
+        for other in data.getKeys(storage_path):
+            base = f'{storage_path}/{other}'
+            if str(data.getValue(f'{base}/groupName') or '') != group:
+                continue
+            rows.append((float(data.getValue(f'{base}/distance')),
+                         int(data.getValue(f'{base}/level'))))
+        rows.sort()
+        for index, (distance, level) in enumerate(rows):
+            if distance <= 0:
+                raise ValidationFailedError(
+                    f'Band {index + 1} has a distance of {distance:g}. Every '
+                    'band has to reach a positive distance.',
+                    details={'field': 'volume_band.distance',
+                             'error': 'band_distance'})
+            if level < 0:
+                raise ValidationFailedError(
+                    f'Band {index + 1} has a negative level.',
+                    details={'field': 'volume_band.level',
+                             'error': 'band_level'})
+            if index:
+                before = rows[index - 1]
+                if distance <= before[0] or level > before[1]:
+                    raise ValidationFailedError(
+                        f'Band {index + 1} reaches {distance:g} at level '
+                        f'{level}, which does not follow band {index} at '
+                        f'{before[0]:g}/level {before[1]}. OpenFOAM requires '
+                        'increasing distance and non-increasing level.',
+                        details={'field': 'volume_band.level',
+                                 'error': 'band_order'})
 
     #: DP-578. The surface shapes the snappy writer can refine as a surface:
     #: a tessellated import and, since DP-668, the closed surface of a box,
@@ -1502,27 +1703,34 @@ class FoamMeshFacade:
                                payload={'presentation': changed,
                                         'state': session.presentation.to_dict()})
 
-    def _undo(self, session: CaseSession, command: Command) -> OperationResult:
-        if command.actor.kind is not ActorKind.HUMAN or command.source is not CommandSource.GUI:
-            raise UndoNotAllowedError('only the local human GUI owner may use generic undo')
-        session.require_writable()
-        before = _referenced_geometry_ids(session)
-        transaction = session.state.undo()
-        _sync_geometry_store(session, before)
-        return OperationResult('accepted', command.operation, session.revisions,
-                               payload={'undone': transaction is not None,
-                                        'transaction_id': transaction.tx_id if transaction else None})
+    async def _undo(self, session: CaseSession, command: Command) -> OperationResult:
+        return await self._step_history(session, command, 'undo')
 
-    def _redo(self, session: CaseSession, command: Command) -> OperationResult:
+    async def _redo(self, session: CaseSession, command: Command) -> OperationResult:
+        return await self._step_history(session, command, 'redo')
+
+    async def _step_history(self, session: CaseSession, command: Command,
+                            direction: str) -> OperationResult:
+        """Undo or redo ``steps`` entries (default one): the History panel
+        jumps to an entry by asking for as many steps as lie between."""
         if command.actor.kind is not ActorKind.HUMAN or command.source is not CommandSource.GUI:
-            raise UndoNotAllowedError('only the local human GUI owner may use generic redo')
+            raise UndoNotAllowedError(
+                f'only the local human GUI owner may use generic {direction}')
         session.require_writable()
+        try:
+            steps = max(1, int(command.parameters.get('steps') or 1))
+        except (TypeError, ValueError):
+            raise ValidationFailedError('steps must be a whole number') from None
+        from . import stage_history
         before = _referenced_geometry_ids(session)
-        transaction = session.state.redo()
+        taken = await stage_history.step(session, direction, steps)
         _sync_geometry_store(session, before)
+        key, tx_key = (('undone', 'transaction_id') if direction == 'undo'
+                       else ('redone', 'transaction_id'))
+        last = session.state.log.to_list()[-1] if taken else None
         return OperationResult('accepted', command.operation, session.revisions,
-                               payload={'redone': transaction is not None,
-                                        'transaction_id': transaction.tx_id if transaction else None})
+                               payload={key: taken > 0, 'steps': taken,
+                                        tx_key: last.get('tx_id') if last else None})
 
     def _revert_latest(self, session: CaseSession, command: Command,
                        change_set_id: str | None) -> list:

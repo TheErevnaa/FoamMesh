@@ -1,0 +1,1 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><g transform="rotate(38 12 12) translate(1 -1)"><line x1="12" y1="15" x2="12" y2="22.5" stroke="@needle@" stroke-width="1.4" stroke-linecap="round"/><path d="M7.2 3.2h9.6l-1.6 2.2v4.4l3 3.1v1.6H5.8v-1.6l3-3.1V5.4Z" fill="none" stroke="@head@" stroke-width="1.6"/></g></svg>

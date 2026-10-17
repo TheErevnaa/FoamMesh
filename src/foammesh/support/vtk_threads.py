@@ -4,6 +4,8 @@
 import asyncio
 import functools
 import contextvars
+import logging
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,8 +37,45 @@ _holdRendering = False
 _holdGeneration = 0
 
 
-def holdRendering():
+#: DP-2711. Who holds rendering and since when, so a hold that never ends can
+#: be named instead of silently blacking the viewport.
+_holdOwner = None
+_holdSince = None
+_holdWarned = False
+HOLD_WARN_SECONDS = 10.0
+
+
+def holdOwner():
+    """Name of the job that holds rendering, or None."""
+    return _holdOwner if _holdRendering else None
+
+
+def holdSince():
+    """``time.monotonic()`` when the current VTK hold began, or None."""
+    return _holdSince if _holdRendering else None
+
+
+def holdAge():
+    """Seconds the current VTK hold has lasted, or 0.0 when none is held."""
+    since = holdSince()
+    return 0.0 if since is None else time.monotonic() - since
+
+
+def _warnLongHold():
+    """Log once per hold when it outlasts ``HOLD_WARN_SECONDS`` (no thread)."""
+    global _holdWarned
+    if _holdRendering and not _holdWarned and holdAge() > HOLD_WARN_SECONDS:
+        _holdWarned = True
+        logging.getLogger(__name__).warning(
+            'rendering has been held for %.1f s by %s',
+            holdAge(), _holdOwner)
+
+
+def holdRendering(owner=None):
     """Holds VTK rendering while VTK is working in background
+
+    Args:
+        owner: name of the job taking the hold (for diagnostics)
 
     Returns:
         int: the generation of this hold, for the caller to release
@@ -46,12 +85,18 @@ def holdRendering():
     """
     global _holdRendering
     global _holdGeneration
+    global _holdOwner
+    global _holdSince
+    global _holdWarned
 
     if _holdRendering:
         raise AssertionError
 
     _holdRendering = True
     _holdGeneration += 1
+    _holdOwner = owner
+    _holdSince = time.monotonic()
+    _holdWarned = False
 
     return _holdGeneration
 
@@ -68,10 +113,36 @@ def resumeRendering():
         raise AssertionError
 
     _holdRendering = False
+    _clearHoldRecord()
+
+
+def _clearHoldRecord():
+    global _holdOwner
+    global _holdSince
+    _holdOwner = None
+    _holdSince = None
+
+
+#: Plan 39 VI14b. How many scene swaps are in progress on the GUI thread. A
+#: swap hands the event loop back between its slices, and a paint in between
+#: would draw half an old scene and half a new one. Counted apart from
+#: ``_holdRendering`` so it can never collide with a VTK job taking that hold.
+_sceneHolds = 0
+
+
+def holdScene():
+    global _sceneHolds
+    _sceneHolds += 1
+
+
+def resumeScene():
+    global _sceneHolds
+    _sceneHolds = max(0, _sceneHolds - 1)
 
 
 def isRenderingHold():
-    return _holdRendering
+    _warnLongHold()
+    return _holdRendering or _sceneHolds > 0
 
 
 def _forgetClosedLoops():
@@ -106,6 +177,19 @@ def _dropStrandedHold(mine):
         return
 
     _holdRendering = False
+    _clearHoldRecord()
+
+
+async def vtk_run_in_background(func, /, *args, **kwargs):
+    """Run ``func`` on the VTK thread WITHOUT holding rendering.
+
+    DP-2711.  For jobs whose input is a private copy no render pipeline
+    references and whose result the caller attaches on the GUI thread, so a
+    paint cannot meet half-mutated data.  It still uses the one VTK thread
+    (jobs run serially) but neither takes the hold nor waits on the lock of
+    held jobs, so it never stops the viewport from drawing.
+    """
+    return await _to_vtk_thread(func, *args, **kwargs)
 
 
 async def vtk_run_in_thread(func, /, *args, **kwargs):
@@ -116,7 +200,8 @@ async def vtk_run_in_thread(func, /, *args, **kwargs):
     lock = _vtk_locks.setdefault(loop, asyncio.Lock())
     async with lock:
         _dropStrandedHold(lock)
-        generation = holdRendering()
+        generation = holdRendering(
+            getattr(func, '__qualname__', None) or repr(func))
         try:
             return await _to_vtk_thread(func, *args, **kwargs)
         finally:

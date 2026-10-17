@@ -103,6 +103,16 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/healing/booleanTolerance',
                 'gmsh/healing/importScaling', 'gmsh/healing/importLabels',
                 'gmsh/healing/occParallel')),
+        # Plan 41 GN18 (section 4.1). The Geometry row: pick, build and open
+        # on the resident session. Optional, so a case that never touches the
+        # model by hand is not asked to.
+        WorkflowTask(
+            'gmsh.geometry', 'Edit geometry', 12,
+            cardinality=TaskCardinality.OPTIONAL,
+            depends_on=('gmsh.describe_geometry',),
+            description=(
+                'Pick entities and physical groups, build or change geometry, '
+                'and open or merge a file on the Gmsh model.')),
         # GF0. Evidence readiness rather than an engineering decision, so it
         # does not accept an override (§8.6).
         WorkflowTask(
@@ -111,7 +121,7 @@ GMSH_WORKFLOW = WorkflowDescriptor(
             description='Confirm a validation reference and feature manifest '
                         'exist for the prepared geometry.'),
         WorkflowTask(
-            'gmsh.global_sizing', 'Global sizing', 20,
+            'gmsh.global_sizing', 'Sizing', 20,
             depends_on=('gmsh.describe_geometry',),
             description=(
                 'Target and minimum element size, curvature adaptation, and '
@@ -154,21 +164,27 @@ GMSH_WORKFLOW = WorkflowDescriptor(
             depends_on=('gmsh.global_sizing',),
             description=(
                 'Spatial refinement: distance-to-surface thresholds and '
-                'analytic box, ball, cylinder and frustum regions.')),
+                'analytic box, ball, cylinder and frustum regions.'),
+            # Plan 41 GN6: every Gmsh field type, edited as a graph on the
+            # page (the "All Gmsh size fields" tier).
+            fields=_fields('gmsh/nativeFields/rows',
+                           'gmsh/pointSizes/rows')),
         WorkflowTask(
             'gmsh.curve_controls', 'Curve controls', 40,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.size_fields',),
             description='Structured (transfinite) or locally sized curves.'),
         WorkflowTask(
-            'gmsh.volume_controls', 'Volume controls', 50,
+            'gmsh.volume_controls', 'Structure', 50,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.curve_controls',),
             description='Per-volume sizing, inclusion, and region typing.',
             fields=_fields('gmsh/structuring/automatic',
-                           'gmsh/structuring/transfiniteTri')),
+                           'gmsh/structuring/transfiniteTri',
+                           'gmsh/entityControls/rows',
+                           'gmsh/structure/rows')),
         WorkflowTask(
-            'gmsh.boundary_layers', 'Boundary layers', 60,
+            'gmsh.boundary_layers', 'Layers', 60,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.volume_controls',),
             # R118. The description used to say the stack could only apply
@@ -190,9 +206,11 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/boundaryLayers/firstHeight', 'gmsh/boundaryLayers/ratio',
                 'gmsh/boundaryLayers/layerCount',
                 'gmsh/boundaryLayers/totalThickness',
-                'gmsh/boundaryLayers/quads')),
+                'gmsh/boundaryLayers/quads',
+                'gmsh/boundaryLayers/elementsPerLayer',
+                'gmsh/boundaryLayers/stacks')),
         WorkflowTask(
-            'gmsh.periodic', 'Periodic pairs', 70,
+            'gmsh.periodic', 'Periodic', 70,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('gmsh.boundary_layers',),
             description=(
@@ -208,7 +226,7 @@ GMSH_WORKFLOW = WorkflowDescriptor(
             # saved task state, named by `depends_on` and `invalidates` across
             # both engines, and the key of the `compute` stage -- and renaming
             # it would strand every case saved before this release.
-            'gmsh.compute', 'Generate mesh', 80,
+            'gmsh.compute', 'Generate', 80,
             depends_on=('gmsh.periodic',), engine_stage='compute',
             capabilities=(CapabilityRequirement('gmsh'),),
             artifacts=(_GMSH_MESH,), run_gated=True,
@@ -235,12 +253,15 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/optimization/allowedFraction',
                 'gmsh/optimization/allowedCount',
                 'gmsh/optimization/hardFloor',
+                # Plan 41 GN14: further measures, each on its own limit.
+                'gmsh/optimization/extraLimits',
                 # Plan 31 FC-D. The repair pass belongs beside the limits it
                 # is triggered by: it runs only when the mesh has failed one.
                 'gmsh/optimization/repairPoorElements',
                 # Plan 29 WP8. Element order sits with the run rather than on a
-                # sizing page because it is a solver contract: only the SU2
-                # route can read a second-order mesh.
+                # sizing page because it is a property of the mesh being made.
+                # Plan 41 GN2: no target solver gates it; the export that
+                # cannot take the order declines it, with the reason.
                 'gmsh/output/elementOrder',
                 'gmsh/output/secondOrderIncomplete',
                 # Plan 31 FC-D. The high-order knobs, on the page that owns
@@ -249,6 +270,7 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/output/secondOrderLinear',
                 'gmsh/optimization/highOrderOptimize',
                 'gmsh/output/renumber',
+                'gmsh/output/renumberMethod',
                 # DP-672 (field audit 0924 gmsh-generate-export D2). The
                 # runner reads the mode when it picks `generate(2)` or
                 # `generate(3)` and the publisher builds the one-cell
@@ -262,7 +284,10 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/dimensionality/frontPatch',
                 'gmsh/dimensionality/backPatch',
                 # DP-675 (D11): names for the section's boundary curves.
-                'gmsh/dimensionality/edgeNames')),
+                'gmsh/dimensionality/edgeNames',
+                # Plan 41 GN2: every option of the installed Gmsh, from the
+                # option catalogue (the Options panel on this page).
+                'gmsh/options/overrides')),
         # GF1 on Gmsh is OPTIONAL and diagnostic -- it measures the native
         # .msh before publication. It does not gate: Gmsh meshes the CAD volume
         # directly, so a boundary face cannot be lost the way snappy can lose
@@ -376,11 +401,16 @@ class GmshMeshingEngine:
     #: DP-638. The job imports solid models or surfaces, never both
     #: (runner_v1.py refuses the mix), so the case is refused it up front.
     mixes_cad_and_surfaces = False
-    #: DP-641. Gmsh has no non-conformal coupling to build an NCC pair with.
-    builds_non_conformal_interfaces = False
+    #: Plan 42 SG22 Q2. A non-conformal pair is honoured by meshing its two
+    #: bodies apart (no fragment on that pair); OpenFOAM
+    #: createNonConformalCouples couples them after the conversion, for an
+    #: OpenFOAM target only (:mod:`foammesh.core.engine.interface_intent`).
+    builds_non_conformal_interfaces = True
+    non_conformal_route = 'separate_volumes'
     #: Plan 36 RP11. Each solid is meshed as its own volume, so a region is a
     #: solid: detection answers from the solids and accepting types them.
     regions_are_solids = True
+    publishes_native_mesh_file = True
 
     def __init__(self, *, profile=None, runtime_probe=None):
         self._profile = profile
@@ -401,6 +431,53 @@ class GmshMeshingEngine:
         return GMSH_WORKFLOW
 
     def derivation_warnings(self, db, *, bbox=None) -> dict:
+        warnings = self._derivation_warnings(db, bbox=bbox)
+        # Plan 42 SG22 Q2. A pair authored before the engine was chosen that
+        # this engine cannot honour is said on the page that runs the mesh,
+        # which is also where the run refuses it.
+        from foammesh.core.engine.interface_intent import intent_refusal
+        from foammesh.core.engine.registry import configured_target_solver
+        from foammesh.core.gmsh.execution import interface_pair_rows
+
+        refusal = intent_refusal('gmsh', configured_target_solver(db),
+                                 interface_pair_rows(db))
+        notes = [text for text in (refusal, self._added_shape_note(db)) if text]
+        if notes:
+            warnings = {key: list(value) for key, value in warnings.items()}
+            warnings.setdefault('gmsh.compute', []).extend(notes)
+        return warnings
+
+    @staticmethod
+    def _added_shape_note(db) -> str:
+        """SG22. Geometry > Add shape is engine-blind; say here what Gmsh does with it.
+
+        A box, cylinder, sphere or plane added on Geometry is a snappyHexMesh
+        search shape. The Gmsh job meshes imported or constructed solids and
+        surfaces only, so such a shape is not meshed; the page that runs the
+        mesh says so instead of the Geometry page hiding the button."""
+        try:
+            rows = dict(db.getElements('geometry') or {})
+        except Exception:                                    # noqa: BLE001
+            return ''
+        names = []
+        for row in rows.values():
+            try:
+                get = row.value if hasattr(row, 'value') else row.get
+                gtype = str(get('gType') or '')
+                shape = str(get('shape') or '')
+                name = str(get('name') or '')
+            except Exception:                                # noqa: BLE001
+                continue
+            if gtype == 'volume' and shape and shape != 'triSurfaceMesh':
+                names.append(name or shape)
+        if not names:
+            return ''
+        return ('Shapes added with Add shape ({}) are snappyHexMesh search '
+                'shapes and are not meshed by Gmsh. Use Construct on the '
+                'Geometry step to make a solid Gmsh meshes.').format(
+                    ', '.join(sorted(names)))
+
+    def _derivation_warnings(self, db, *, bbox=None) -> dict:
         """Per-task derivation warnings for the current configuration.
 
         Plan 26 WP2.1. Derived on every read rather than persisted: a warning
@@ -413,7 +490,9 @@ class GmshMeshingEngine:
         show on a page; the page that owns the offending control raises it in
         its own validation. Returning nothing here is therefore correct.
         """
-        from foammesh.core.gmsh.execution import _native_section
+        from foammesh.core.gmsh.execution import (
+            _native_section, _size_preset,
+        )
         from foammesh.core.gmsh.plan_derivation import (
             PlanDerivationError, derive_from_native,
         )
@@ -425,7 +504,8 @@ class GmshMeshingEngine:
         try:
             intent = derive_from_native(
                 _native_section(db), bbox=bbox,
-                target_solver=configured_target_solver(db))
+                target_solver=configured_target_solver(db),
+                size_preset=_size_preset(db))
         except SizingError as error:
             # DP-614: an "Auto" size with no geometry to derive it from, or a
             # size the domain cannot hold. Said on the page that owns it
@@ -711,7 +791,15 @@ class GmshMeshingEngine:
                   for key in ('targetSize', 'minimumSize', 'sizeFactor',
                               'fromCurvature')}
         try:
-            sizing = derive_global_sizing(values, bbox)
+            from foammesh.core.sizing import curvature_points, diagonal_divisor
+
+            sizing = derive_global_sizing(
+                values, bbox, diagonal_divisor(value('mesh/sizePreset')),
+                curvature_points(value('mesh/sizePreset')),
+                # SG44. What was asked is a fact about the settings; the RAM
+                # free at the moment of reading is not (a busy machine had the
+                # resolution report call a configured 0.02 m "unavailable").
+                check_memory=False)
         except SizingError as error:
             return None, 'unavailable', str(error)
         size = float(sizing.target_size) * float(sizing.size_factor or 1.0)

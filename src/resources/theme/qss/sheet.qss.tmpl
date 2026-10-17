@@ -1,0 +1,83 @@
+/*
+ * Plan 44 MF5. The settings sheet: the floating frame and the one header
+ * (final-layout.html .sheet, .page-h, .ib, .chip). The frame is a native
+ * window with a masked radius, so the border radius here only shapes the line.
+ */
+
+QFrame#settingsSheet {
+    background: {{background.surface}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.sheet}}px;
+}
+
+QWidget#settingsSheetHolder {
+    background: transparent;
+}
+
+QWidget#settingsSheetHeader {
+    background: transparent;
+}
+
+QFrame#sheetChip {
+    background: {{accent.default}};
+    border: none;
+    border-radius: 2px;
+}
+
+QLabel#sheetTitle {
+    color: {{foreground.strong}};
+    font-size: {{type.h2}}px;
+    font-weight: 600;
+}
+
+QLabel#sheetSubtitle {
+    color: {{foreground.sub}};
+    font-size: 12px;
+    font-weight: 400;
+}
+
+QToolButton[sheetButton="true"] {
+    background: {{background.control}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    color: {{foreground.secondary}};
+    font-size: 12px;
+    padding: 1px 4px;
+    min-height: 0px;
+}
+
+QToolButton[sheetButton="true"]::menu-indicator {
+    image: none;
+    width: 0px;
+}
+
+/* Plan 44 FX2 (S3). final-layout.html draws the pin as a bare 16 px glyph
+   (.pinb{width:16px;height:16px}), not a bordered button: the 31 px button
+   was part of what left the title line no room for "Mesh setup · k of 5".
+   Hover and focus still draw the border (the rules below). */
+QToolButton#sheetPinButton {
+    background: transparent;
+    border-color: transparent;
+    padding: 1px 1px;
+}
+
+/* SG44: the hover and checked labels are foreground.strong, not accent.text.
+   accent.text is the white label of a filled accent button; on the light
+   theme's background.control and accent.soft it measured 1.24:1 and 1.18:1
+   (DP-193 contract). foreground.strong reads 8.4:1 or better in both themes. */
+QToolButton[sheetButton="true"]:hover {
+    background: {{background.control}};
+    border-color: {{accent.default}};
+    color: {{foreground.strong}};
+}
+
+QToolButton[sheetButton="true"]:checked,
+QToolButton[sheetButton="true"]:pressed {
+    background: {{accent.soft}};
+    border-color: {{accent.default}};
+    color: {{foreground.strong}};
+}
+
+QToolButton[sheetButton="true"]:focus {
+    border-color: {{focus.ring}};
+}

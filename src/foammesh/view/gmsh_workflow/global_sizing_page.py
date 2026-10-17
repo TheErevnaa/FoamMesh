@@ -1,7 +1,7 @@
 """Gmsh workflow page: gmsh.global_sizing."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QLabel
+from foammesh.view.widgets.folded_note import FoldedNote
 
 from .base import GmshTaskPage
 
@@ -28,7 +28,9 @@ class GmshGlobalSizingPage(GmshTaskPage):
     task_id_default = 'gmsh.global_sizing'
 
     def build_sections(self, layout) -> None:
-        self._threadNote = QLabel(self)
+        # Plan 44 FX2. One line until opened: three wrapped lines took Gmsh
+        # Sizing past the 300 px sheet on a meshed case (G-FITG-1).
+        self._threadNote = FoldedNote(self)
         self._threadNote.setObjectName('gmshThreadEffectNote')
         self._threadNote.setWordWrap(True)
         self._threadNote.setProperty('foammeshStatus', 'warning')
@@ -38,51 +40,123 @@ class GmshGlobalSizingPage(GmshTaskPage):
         # that reaches nothing, and both were measured rather than reasoned
         # about: a quad surface algorithm on a target that reads tetrahedra,
         # and a per-turn element floor with size-from-curvature switched off.
-        self._surfaceNote = QLabel(self)
+        self._surfaceNote = FoldedNote(self)
         self._surfaceNote.setObjectName('gmshQuadSurfaceNote')
         self._surfaceNote.setWordWrap(True)
         self._surfaceNote.setProperty('foammeshStatus', 'warning')
         self._surfaceNote.setVisible(False)
         layout.addWidget(self._surfaceNote)
+        # Plan 41 GN25c. The Automatic tier of the Sizing row: the shared
+        # card, first on the page.
+        from foammesh.view.sizing.automatic_sizing_card import (
+            AutomaticSizingCard)
+        self.sizing_card = AutomaticSizingCard(self._client, 'gmsh', self)
+        self.sizing_card.applied.connect(self.refresh_keeping_edits)
+        self.sizing_card.rowOpenRequested.connect(self.showAutomaticRow)
+        layout.insertWidget(0, self.sizing_card)
+
+    def showAutomaticRow(self, name: str) -> None:
+        """M-20. Open the Gmsh size fields fold on the row the card made."""
+        panel = getattr(self, 'native_panel', None)
+        fold = getattr(self, '_foldNativeFields', None)
+        if fold is not None:
+            fold.setChecked(True)
+        if panel is not None:
+            panel.reload()
+            panel.select_row(name)
 
     def refresh(self) -> None:
         super().refresh()
+        card = getattr(self, 'sizing_card', None)
+        if card is not None:
+            card.refresh()
+        self._showMeshSetupThreads()
         if hasattr(self, '_threadNote'):
             self._updateThreadNote()
         if hasattr(self, '_surfaceNote'):
             self._updateSurfaceNote()
 
-    def _updateSurfaceNote(self) -> None:
-        """Say when the chosen surface algorithm will not be the one used.
+    def meshSetupThreads(self) -> int:
+        """The thread count Mesh setup gives a Gmsh run (Plan 40 UXB8, #29).
 
-        Plan 31 FC-B. ``frontal_delaunay_quads`` and ``quasi_structured_quad``
-        mesh in quadrilaterals, and the derivation clears them for any target
-        but SU2 -- the same gate recombination goes through, for the same
-        measured reason. Said here so the user reads it while they can act on
-        it, rather than in a warning attached to the finished run.
+        Asked of ``resolve_parallel_threads`` with the execution policy the
+        Mesh setup page stores, which is what the job asks too.
         """
-        from foammesh.core.gmsh.plan_derivation import (
-            QUAD_SURFACE_ALGORITHMS,
-            RECOMBINING_SOLVERS,
-        )
+        from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
+
+        values = self._client.field_values((
+            'mesh.execution.mode', 'mesh.execution.max_cpu_cores',
+            'mesh.execution.max_memory_bytes'))
+
+        def plain(name):
+            value = values.get(name)
+            return getattr(value, 'value', value)
+
+        def number(name):
+            try:
+                return max(int(plain(name) or 0), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        policy = {
+            'mode': str(plain('mesh.execution.mode') or 'auto'
+                        ).rsplit('.', 1)[-1].lower(),
+            'max_cpu_cores': number('mesh.execution.max_cpu_cores') or None,
+            'max_memory_bytes':
+                number('mesh.execution.max_memory_bytes') or None}
+        return resolve_parallel_threads(policy)
+
+    def _showMeshSetupThreads(self) -> None:
+        """Threads reads the Mesh setup value until someone overrides it.
+
+        Plan 40 UXB8 (#29). The stored count is 1 until it is overridden, and
+        the job reads 1 as "nobody asked" and takes Mesh setup's count, so the
+        box used to say 1 against a Mesh setup that said 2. At the floor it
+        now says where the number comes from; a count above it is the
+        override, and the tooltip says so. (The Expert tier that will hide the
+        override waits for UXD4.)
+        """
+        editor = self._editors.get('gmsh.global_sizing.threads')
+        if editor is None:
+            return
+        try:
+            count = self.meshSetupThreads()
+        except Exception:                                    # noqa: BLE001
+            return
+        words = (self.tr('{0} thread').format(count) if count == 1
+                 else self.tr('{0} threads').format(count))
+        widget = editor.editor
+        special = getattr(widget, 'setSpecialValueText', None)
+        if special is not None:
+            special(self.tr('Mesh setup ({0})').format(words))
+        tip = self.tr(
+            'Taken from Mesh setup ({0}). A count typed above the minimum '
+            'overrides it for Gmsh only.').format(words)
+        widget.setToolTip(tip)
+        editor.label.setToolTip(tip)
+
+    def _updateSurfaceNote(self) -> None:
+        """Say what a quadrilateral surface algorithm costs at export.
+
+        Plan 41 GN2 (G2). The algorithm is no longer swapped for another one
+        when the target cannot read quadrilaterals: the mesh is made as asked
+        and the polyMesh export is the thing that says it cannot write it.
+        """
+        from foammesh.core.gmsh.plan_derivation import QUAD_SURFACE_ALGORITHMS
 
         values = self._client.field_values(('gmsh.global_sizing.surface',))
         algorithm = str(
             getattr(values.get('gmsh.global_sizing.surface'), 'value',
                     values.get('gmsh.global_sizing.surface') or '')
         ).split('.')[-1].lower()
-        target = self.target_solver()
         if algorithm not in QUAD_SURFACE_ALGORITHMS:
             self._surfaceNote.setVisible(False)
             return
-        if target in RECOMBINING_SOLVERS:
-            self._surfaceNote.setVisible(False)
-            return
         self._surfaceNote.setText(self.tr(
-            'The %s algorithm meshes the surfaces in quadrilaterals, which '
-            'the %s route cannot read, so the mesh will be made with '
-            'frontal_delaunay instead. Choose the su2 target to mesh in '
-            'quads.') % (algorithm, target))
+            'The %s algorithm meshes the surfaces in quadrilaterals. The '
+            'mesh is made as chosen; a quadrilateral surface mesh can be '
+            'written in the Gmsh formats but not as an OpenFOAM polyMesh.')
+            % algorithm)
         self._surfaceNote.setVisible(True)
 
     def default_threads(self) -> int:

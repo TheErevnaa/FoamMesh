@@ -42,6 +42,13 @@ def tree(source, prefix):
     return collected
 
 
+# Plan 41 GN25e: the size-field tool ships inside the program (the app copies it
+# into the user's WSL distribution on request). tree() below collects it; the
+# build stops here if it is missing, as it would otherwise ship without it.
+SIZEFIELD_TOOL = ROOT / 'src' / 'resources' / 'sizefield' / 'linux-x86_64' / 'foammesh-sizefield'
+if not SIZEFIELD_TOOL.is_file():
+    raise SystemExit(f'{SIZEFIELD_TOOL} is missing: the packaged app could not set up automatic sizing')
+
 datas = [
     *tree(ROOT / 'src' / 'resources', 'resources'),
     *tree(ROOT / 'docs', 'docs'),
@@ -152,8 +159,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleDisplayName': 'FoamMesh',
             'CFBundleName': 'FoamMesh',
-            'CFBundleShortVersionString': '1.1.0',
-            'CFBundleVersion': '1.1.0',
+            'CFBundleShortVersionString': '1.1.1',
+            'CFBundleVersion': '1.1.1',
             'NSHighResolutionCapable': True,
         },
     )

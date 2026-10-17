@@ -27,21 +27,43 @@ holds them), so the worker can share it.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
-__all__ = ['cell_ranges', 'contact_mask', 'cut_cells_mask', 'cell_scale_step',
+__all__ = ['cell_ranges', 'cell_means', 'contact_mask', 'cut_cells_mask', 'cell_scale_step',
            'tolerance_for', 'signed_distances', 'projected_ranges',
            'scale_step_from_ranges']
+
+#: Plan 39 VI14d. numpy holds the GIL through a fancy index or a ``reduceat``
+#: for tens of milliseconds on a multi-million-cell mesh, and a worker doing
+#: that starves the GUI thread of every Python callback meanwhile (measured
+#: 31 ms for one ``cell_ranges`` of 6.6 M cells). The work is done in slices
+#: and the GIL is handed over between them.
+SLICE_CELLS = 200_000
+SLICE_POINTS = 1_000_000
+
+
+def _yield_gil() -> None:
+    time.sleep(0)
+
 
 #: A contact within this fraction of the model's diagonal is a contact.
 RELATIVE_TOLERANCE = 1e-9
 
 
 def tolerance_for(points) -> float:
-    points = np.asarray(points, dtype=float)
+    points = np.asarray(points)
     if not len(points):
         return 0.0
-    diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    low = high = None
+    for start in range(0, len(points), SLICE_POINTS):
+        part = points[start:start + SLICE_POINTS].astype(float, copy=False)
+        part_low, part_high = part.min(axis=0), part.max(axis=0)
+        low = part_low if low is None else np.minimum(low, part_low)
+        high = part_high if high is None else np.maximum(high, part_high)
+        _yield_gil()
+    diagonal = float(np.linalg.norm(high - low))
     return RELATIVE_TOLERANCE * (diagonal or 1.0)
 
 
@@ -49,8 +71,16 @@ def signed_distances(points, origin, normal):
     """``normal . (x - origin)`` for every point; *normal* need not be unit."""
     normal = np.asarray(normal, dtype=float)
     normal = normal / np.linalg.norm(normal)
-    return (np.asarray(points, dtype=float)
-            - np.asarray(origin, dtype=float)) @ normal
+    points = np.asarray(points)
+    origin = np.asarray(origin, dtype=float)
+    if len(points) <= SLICE_POINTS:
+        return (points.astype(float, copy=False) - origin) @ normal
+    out = np.empty(len(points))
+    for start in range(0, len(points), SLICE_POINTS):
+        part = points[start:start + SLICE_POINTS].astype(float, copy=False)
+        out[start:start + SLICE_POINTS] = (part - origin) @ normal
+        _yield_gil()
+    return out
 
 
 def cell_ranges(values, offsets, connectivity):
@@ -66,12 +96,18 @@ def cell_ranges(values, offsets, connectivity):
     high = np.full(count, -np.inf)
     if count <= 0 or not len(connectivity):
         return low, high
-    sizes = np.diff(offsets)
-    filled = sizes > 0
-    starts = offsets[:-1][filled]
-    per = values[connectivity[:offsets[-1]]]
-    low[filled] = np.minimum.reduceat(per, starts)
-    high[filled] = np.maximum.reduceat(per, starts)
+    for first in range(0, count, SLICE_CELLS):
+        last = min(count, first + SLICE_CELLS)
+        base = offsets[first]
+        local = offsets[first:last + 1] - base
+        filled = np.diff(local) > 0
+        if not filled.any():
+            continue
+        per = values[connectivity[base:offsets[last]]]
+        starts = local[:-1][filled]
+        low[first:last][filled] = np.minimum.reduceat(per, starts)
+        high[first:last][filled] = np.maximum.reduceat(per, starts)
+        _yield_gil()
     return low, high
 
 
@@ -81,11 +117,15 @@ def contact_mask(distances, offsets, connectivity, tolerance):
     return (low <= tolerance) & (high >= -tolerance)
 
 
-def cut_cells_mask(points, offsets, connectivity, planes, tolerance=None):
+def cut_cells_mask(points, offsets, connectivity, planes, tolerance=None,
+                   rule='any'):
     """Cut cells of the first of *planes*, masked by the rest.
 
     *planes* are ``(origin, normal)`` with the normal pointing into the kept
-    half, as every clip in the viewport keeps.
+    half, as every clip in the viewport keeps. *rule* (Plan 39 VI10b, F2g) is
+    how a mask keeps a cell: ``'any'`` part of it on the kept side,
+    ``'centroid'`` (the mean of its points) on it, or ``'entire'`` cell on
+    it.
     """
     if not planes:
         return np.zeros(len(offsets) - 1, dtype=bool)
@@ -95,10 +135,32 @@ def cut_cells_mask(points, offsets, connectivity, planes, tolerance=None):
     mask = contact_mask(signed_distances(points, origin, normal),
                         offsets, connectivity, tolerance)
     for origin, normal in planes[1:]:
-        _low, high = cell_ranges(signed_distances(points, origin, normal),
-                                 offsets, connectivity)
-        mask &= high >= -tolerance
+        distances = signed_distances(points, origin, normal)
+        low, high = cell_ranges(distances, offsets, connectivity)
+        if rule == 'entire':
+            mask &= low >= -tolerance
+        elif rule == 'centroid':
+            mask &= cell_means(distances, offsets, connectivity) > tolerance
+        else:
+            mask &= high >= -tolerance
     return mask
+
+
+def cell_means(values, offsets, connectivity):
+    """The mean of *values* over each cell's points (``-inf`` for a cell with
+    none, which is never inside)."""
+    values = np.asarray(values, dtype=float)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    count = len(offsets) - 1
+    mean = np.full(max(count, 0), -np.inf)
+    sizes = np.diff(offsets)
+    filled = sizes > 0
+    if count > 0 and filled.any():
+        sums = np.add.reduceat(
+            values[np.asarray(connectivity, dtype=np.int64)[:offsets[-1]]],
+            offsets[:-1][filled])
+        mean[filled] = sums / sizes[filled]
+    return mean
 
 
 def projected_ranges(points, offsets, connectivity, normal):
@@ -115,9 +177,16 @@ def projected_ranges(points, offsets, connectivity, normal):
 def scale_step_from_ranges(low, high, offset, tolerance):
     """`cell_scale_step` from `projected_ranges` and the plane's offset
     ``n . origin`` along the same unit normal."""
-    met = (low <= offset + tolerance) & (high >= offset - tolerance)
-    spans = (high - low)[met]
-    spans = spans[spans > tolerance]
+    found = []
+    for first in range(0, len(low), SLICE_CELLS):
+        part_low = low[first:first + SLICE_CELLS]
+        part_high = high[first:first + SLICE_CELLS]
+        met = ((part_low <= offset + tolerance)
+               & (part_high >= offset - tolerance))
+        spans = (part_high - part_low)[met]
+        found.append(spans[spans > tolerance])
+        _yield_gil()
+    spans = np.concatenate(found) if found else np.empty(0)
     if not len(spans):
         return None
     return float(np.median(spans))

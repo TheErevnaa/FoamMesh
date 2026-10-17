@@ -15,13 +15,20 @@ sole carrier of that meaning.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 
 class QualityHistogram(QWidget):
-    """One metric's distribution, with the limit marked."""
+    """One metric's distribution, with the limit marked.
+
+    Plan 39 VI9. The limit line can be dragged: pressing or dragging inside
+    the plot moves it, and ``limitDragged`` carries the value it now marks.
+    """
+
+    #: The user moved the limit line; the value is in the metric's own unit.
+    limitDragged = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,6 +41,7 @@ class QualityHistogram(QWidget):
         self._counts: list[int] = []
         self._limit: float | None = None
         self._beyond_is_above = True
+        self.setMouseTracking(False)
         self.clear()
 
     # -- data -------------------------------------------------------------- #
@@ -60,6 +68,54 @@ class QualityHistogram(QWidget):
         self._beyond_is_above = bool(beyond_is_above)
         self._describe()
         self.update()
+
+    def limit(self) -> float | None:
+        return self._limit
+
+    def set_limit(self, limit) -> None:
+        """Move the limit line without touching the bars."""
+        self._limit = None if limit is None else float(limit)
+        self._describe()
+        self.update()
+
+    def edges(self) -> list[float]:
+        return list(self._edges)
+
+    def counts(self) -> list[int]:
+        return list(self._counts)
+
+    def _plot_area(self) -> QRectF:
+        margin, label_height = 6.0, 18.0
+        return QRectF(margin, margin, self.width() - 2 * margin,
+                      self.height() - 2 * margin - label_height)
+
+    def value_at(self, x: float) -> float | None:
+        """The metric value under a horizontal pixel position, clamped to the
+        plotted range; None where there is no plot."""
+        if len(self._edges) < 2 or self._edges[-1] <= self._edges[0]:
+            return None
+        area = self._plot_area()
+        if area.width() <= 0:
+            return None
+        fraction = min(max((x - area.left()) / area.width(), 0.0), 1.0)
+        return self._edges[0] + fraction * (self._edges[-1] - self._edges[0])
+
+    def _drag_to(self, event) -> None:
+        value = self.value_at(event.position().x())
+        if value is None:
+            return
+        self._limit = value
+        self._describe()
+        self.update()
+        self.limitDragged.emit(value)
+
+    def mousePressEvent(self, event) -> None:      # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton and self._counts:
+            self._drag_to(event)
+
+    def mouseMoveEvent(self, event) -> None:       # noqa: N802 - Qt naming
+        if event.buttons() & Qt.MouseButton.LeftButton and self._counts:
+            self._drag_to(event)
 
     @property
     def total(self) -> int:
@@ -114,9 +170,8 @@ class QualityHistogram(QWidget):
                              self.tr('No mesh has been measured yet.'))
             return
 
-        margin, label_height = 6.0, 18.0
-        area = QRectF(margin, margin, self.width() - 2 * margin,
-                      self.height() - 2 * margin - label_height)
+        label_height = 18.0
+        area = self._plot_area()
         tallest = max(self._counts) or 1
         span = len(self._counts)
         width = area.width() / span

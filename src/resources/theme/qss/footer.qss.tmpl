@@ -1,0 +1,47 @@
+/*
+ * Plan 44 MF17. The settings-page footer (final-layout.html .page-f, M:199,
+ * M:467): padding 8px 10px (written by the shell's apply_footer_metrics),
+ * a 1 px rule on top, then "> Help", a spacer, Back, Proceed (accent fill,
+ * dialogs.qss.tmpl) and the more-ways arrow. The help text never sits in
+ * this row: it opens in the pane above it.
+ *
+ * Every colour is a token.
+ */
+
+QWidget#wizardActionBar {
+    background: transparent;
+    border: none;
+    border-top: 1px solid {{border.rule}};
+}
+
+/* The Help chip is the mockup's `.btn`: the footer's buttons' own skin, and
+   it reads as pressed while the pane is open. */
+QToolButton#helpPaneToggle {
+    background: {{background.control}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    color: {{foreground.primary}};
+}
+QToolButton#helpPaneToggle:hover {
+    border-color: {{accent.default}};
+}
+QToolButton#helpPaneToggle:checked {
+    background: {{background.raised}};
+    border-color: {{accent.default}};
+}
+
+/* The opened help, floating just above the footer rule. */
+QFrame#helpPaneBody {
+    background: {{background.raised}};
+    border: none;
+    border-top: 1px solid {{border.rule}};
+}
+QLabel#helpPaneName {
+    color: {{foreground.strong}};
+}
+QLabel#helpPaneExplanation {
+    color: {{foreground.secondary}};
+}
+QLabel#helpPaneKeyword {
+    color: {{foreground.sub}};
+}

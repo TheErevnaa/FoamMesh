@@ -319,6 +319,10 @@ class OperationExecutor:
                 job = replace(job, run_state=record.get('state'))
 
         self.jobs.record_result(job)
+        # Plan 42 SG16 (D9). A snappy stage ends in the shared run listing,
+        # cancelled or not, as a Gmsh run already does.
+        from . import run_listing
+        run_listing.record_stage_job(session.case_path, spec, job)
 
         after = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
         changed_before, changed_after = before, after

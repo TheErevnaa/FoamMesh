@@ -141,11 +141,18 @@ class CreateZonesDict(DictionaryFile):
                 'box': (pointToEntry(point1), pointToEntry(point2)),
             })
         if shape == Shape.CYLINDER.value:
-            return self._cellGenerator('cylinder', {
+            entries = {
                 'point1': pointToEntry(point1),
                 'point2': pointToEntry(point2),
                 'radius': geometry.value('radius'),
-            })
+            }
+            try:    # LY13-D3 (A-088a): the bore of a hollow cylinder
+                inner = float(geometry.value('innerRadius') or 0)
+            except (LookupError, TypeError, ValueError):
+                inner = 0.0
+            if inner > 0:
+                entries['innerRadius'] = inner
+            return self._cellGenerator('cylinder', entries)
         if shape == Shape.SPHERE.value:
             return self._cellGenerator('sphere', {
                 'centre': pointToEntry(point1),

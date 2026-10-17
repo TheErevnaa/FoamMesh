@@ -14,8 +14,12 @@ import re
 
 from foammesh.core.quantities import count_text
 
+from .entity_controls import EntityControls
+from .structure import Structure
+from .field_catalogue import NativeFields
 from .layers import BoundaryLayers, derive_boundary_layers
 from .periodic import PeriodicPlan, derive_periodic_pairs
+from .point_sizes import PointSizes
 from .quality import QualityThresholds, derive_thresholds
 from .size_fields import (SizeFieldPlan, derive_size_fields,
                           derive_surface_sizes, validate_field_graph)
@@ -29,15 +33,20 @@ JOB_SCHEMA_VERSION = 1
 SURFACE_ALGORITHM = {
     'meshadapt': 1,
     'automatic': 2,
+    # Plan 41 GN2 (DP-1388). All nine of Gmsh 4.15.2's 2D algorithms.
+    'initial_mesh_only': 3,
     'delaunay': 5,
     'frontal_delaunay': 6,
+    'bamg': 7,
     'frontal_delaunay_quads': 8,
     'packing_parallelograms': 9,
     'quasi_structured_quad': 11,
 }
-#: Plan 31 FC-B. Surface algorithms that write a quadrilateral surface, and so
-#: belong to the same target gate recombination does: the polyMesh route reads
-#: the tetrahedral family, and a quad surface is what it refuses.
+#: Plan 31 FC-B. Surface algorithms that write a quadrilateral surface.
+#: Plan 41 GN2: this is no longer a gate on the algorithm. The Gmsh route
+#: meshes with the algorithm the user chose; the set only tells the export
+#: that the polyMesh publisher, which reads the tetrahedral family, declines
+#: the result (``ExportSettings.poly_mesh_refusals``).
 #:
 #: The membership is MEASURED, not read off the option's name, and the
 #: measurement removed one of the two the package expected to find here.
@@ -56,7 +65,10 @@ SURFACE_ALGORITHM = {
 QUAD_SURFACE_ALGORITHMS = frozenset({'quasi_structured_quad'})
 VOLUME_ALGORITHM = {
     'delaunay': 1,
+    # Plan 41 GN2 (DP-1388). All six of Gmsh 4.15.2's 3D algorithms.
+    'initial_mesh_only': 3,
     'frontal': 4,
+    'rtree': 9,
     'hxt': 10,
     # Plan 31 FC-B. Shipped on the measurement, not on the name: at matched
     # cell count it beat both incumbents on non-orthogonality and skewness on
@@ -165,22 +177,24 @@ EXPORTER_ELEMENT_ORDERS: dict[str, tuple[int, ...]] = {
     'openfoam': (1,),
     'su2': (1,),
 }
-#: Per export adapter, why an order it refuses is refused. Written to be shown
-#: to a user unchanged.
+#: Per export adapter, why an order it declines is declined. Written to be
+#: shown to a user unchanged.
+#:
+#: Plan 41 GN2 (DP-1396). These are reasons an EXPORT gives. They used to be
+#: the reason the mesher was held to order 1; the mesh is now made at the
+#: order the user chose and only the export that cannot take it declines.
 ELEMENT_ORDER_REFUSALS: dict[tuple[str, int], str] = {
     ('openfoam', 2): (
         'OpenFOAM 13 reads first-order MSH 2.2 and nothing else — gmshToFoam '
-        'and the direct polyMesh publisher both do — so a quadratic mesh '
-        'cannot be exported to it. Clear the target solver to mesh at order 2: '
-        'the native MSH is kept and counted, and no polyMesh is published.'),
+        'and the direct polyMesh publisher both do — so no polyMesh was '
+        'published from this quadratic mesh. The mesh was made at order 2 as '
+        'asked and the native MSH is kept and counted.'),
     ('su2', 2): (
         "FoamMesh's own SU2 reader and census hold the linear VTK type codes "
         'only — 10, 12, 13 and 14 — so a quadratic SU2 file, whose cells '
         'carry code 24, is one this application would write and then be unable '
-        'either to open or to count. So no quadratic SU2 file is written: the '
-        'mesh is made and exported at first order instead. Clear the target '
-        'solver to mesh at order 2 natively; qualifying the SU2 exporter for '
-        'second order is separate work.'),
+        'either to open or to count. So no SU2 file was written: the mesh was '
+        'made at order 2 as asked and the native MSH is kept and counted.'),
 }
 #: The order every route accepts, and therefore what an unknown target clamps
 #: to.
@@ -318,38 +332,64 @@ def solver_token(target_solver) -> str:
                or 'unselected').split('.')[-1].lower()
 
 
-def supported_element_orders(target_solver) -> tuple[int, ...]:
-    """The element orders this route may write.
+def supported_element_orders(target_solver=None) -> tuple[int, ...]:
+    """The element orders the MESHER may be asked for.
 
-    Plan 31 CP-01. Two capabilities, read in order: what Gmsh can mesh, then
-    what the selected export adapter can represent. A target that names no
-    exporter -- ``unselected`` -- constrains nothing, because there is no
-    export to be incompatible with.
+    Plan 41 GN2 (G2). This used to be the intersection of what Gmsh can mesh
+    and what the selected export adapter can represent, so choosing OpenFOAM
+    took order 2 away from the mesher. The target no longer enters: the answer
+    is Gmsh's, and an export that cannot take the result declines it at the
+    export (:func:`export_refusals`). The argument is kept so a caller that
+    still passes one does not break; it is ignored.
+    """
+    return MESHER_ELEMENT_ORDERS
+
+
+def exporter_element_orders(target_solver) -> tuple[int, ...]:
+    """The orders the export adapter of *target_solver* can represent."""
+    token = solver_token(target_solver)
+    return EXPORTER_ELEMENT_ORDERS.get(
+        'openfoam' if token in POLY_MESH_TARGETS else token,
+        MESHER_ELEMENT_ORDERS)
+
+
+def element_order_options(target_solver=None
+                          ) -> tuple[tuple[int, bool, str], ...]:
+    """``(order, supported, note)`` for every order Gmsh can mesh.
+
+    Every order is supported -- the target does not grey a mesher control. The
+    note is what the export of the selected target will say about that order,
+    so a page can show it beside the control instead of removing the control.
     """
     token = solver_token(target_solver)
-    exporter = EXPORTER_ELEMENT_ORDERS.get(token)
-    if exporter is None:
-        return MESHER_ELEMENT_ORDERS
-    return tuple(order for order in MESHER_ELEMENT_ORDERS
-                 if order in exporter) or (DEFAULT_ELEMENT_ORDER,)
-
-
-def element_order_options(target_solver) -> tuple[tuple[int, bool, str], ...]:
-    """``(order, supported, reason)`` for every order Gmsh can write.
-
-    What a page needs to grey an option and say why, taken from the same table
-    the derivation clamps with, so the control cannot offer an order the job
-    would silently drop.
-    """
-    token = solver_token(target_solver)
-    allowed = supported_element_orders(token)
     return tuple(
-        (order, order in allowed,
-         '' if order in allowed else ELEMENT_ORDER_REFUSALS.get(
-             (token, order),
-             f'the {token} route accepts element order '
-             + ' or '.join(str(item) for item in allowed) + ' only'))
-        for order in (1, 2))
+        (order, True,
+         export_refusals(token, order)[0] if export_refusals(token, order)
+         else '')
+        for order in MESHER_ELEMENT_ORDERS)
+
+
+def export_refusals(target_solver, order: int,
+                    blockers: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Why the export of *target_solver* declines a mesh, in plain words.
+
+    Plan 41 G2: a refusal belongs to the export that cannot take the mesh,
+    never to the mesher upstream of it. Empty when the export takes it.
+    """
+    token = solver_token(target_solver)
+    reasons: list[str] = []
+    if token in POLY_MESH_TARGETS:
+        # A run with no target chosen names no OpenFOAM export, so it is not
+        # told about OpenFOAM's reader; it publishes no polyMesh from a
+        # quadratic mesh, as it never did.
+        if token == 'openfoam' and order not in EXPORTER_ELEMENT_ORDERS[
+                'openfoam']:
+            reasons.append(ELEMENT_ORDER_REFUSALS[('openfoam', order)])
+        reasons.extend(blockers)
+    elif token == 'su2':
+        if order not in EXPORTER_ELEMENT_ORDERS['su2']:
+            reasons.append(ELEMENT_ORDER_REFUSALS[('su2', order)])
+    return tuple(reasons)
 
 
 @dataclass(frozen=True)
@@ -730,7 +770,15 @@ class ExportSettings:
     #: written. Independent of the order: it is about the numbering, not the
     #: shapes, so every route may ask for it.
     renumber: bool = False
+    #: DP-1471. The Gmsh name of the renumbering method (RCMK, Hilbert or
+    #: Metis); read only when `renumber` is on.
+    renumber_method: str = 'RCMK'
     warnings: tuple[str, ...] = ()
+    #: Plan 41 GN2 (G2). Why the polyMesh publisher declines THIS mesh --
+    #: a recombined or quad-surface mesh, which it reads as negative cell
+    #: volumes -- as opposed to why it declines the order. The mesh was made as
+    #: the user asked; the export says no, here, with the reason.
+    poly_mesh_refusals: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse a combination whose file and reader disagree.
@@ -794,7 +842,8 @@ class ExportSettings:
         describes a failed import and not a quadratic mesh.
         """
         return (self.target_solver in POLY_MESH_TARGETS
-                and self.element_order == 1)
+                and self.element_order == 1
+                and not self.poly_mesh_refusals)
 
     def to_dict(self) -> dict:
         return {
@@ -810,6 +859,15 @@ class ExportSettings:
             'publishesPolyMesh': self.publishes_poly_mesh,
             'warnings': list(self.warnings),
             'calculation_version': EXPORT_VERSION,
+            # Only when there is one, so a job that never met the refusal
+            # keeps the digest it had.
+            # DP-2240. Only a method other than Gmsh's own default, and only
+            # when a renumbering is asked for, so a job that never chose one
+            # keeps the digest it had (the runner reads a missing key as RCMK).
+            **({'renumberMethod': self.renumber_method}
+               if self.renumber and self.renumber_method != 'RCMK' else {}),
+            **({'polyMeshRefusals': list(self.poly_mesh_refusals)}
+               if self.poly_mesh_refusals else {}),
         }
 
 
@@ -879,6 +937,23 @@ class VolumeControl:
 
 
 @dataclass(frozen=True)
+class OptionOverrides:
+    """The Gmsh options the user set from the option catalogue.
+
+    Plan 41 GN2 (T-01, G3). Each row is ``(name, storage, value)``; the runner
+    applies them after every page control, so what the user set is what Gmsh
+    holds, and the ledger shows requested against effective.
+    """
+
+    rows: tuple = ()
+    warnings: tuple[str, ...] = ()
+
+    def to_list(self) -> list:
+        return [{'name': name, 'storage': storage, 'value': value}
+                for name, storage, value in self.rows]
+
+
+@dataclass(frozen=True)
 class JobIntent:
     """Everything the runner needs, and nothing it has to look up."""
 
@@ -902,8 +977,43 @@ class JobIntent:
         second_order_incomplete=False, mesh_format='msh2.2'))
     warnings: tuple[str, ...] = ()
     metadata: dict = field(default_factory=dict)
+    #: Plan 41 GN2. Only written to the job when there is one, so a project
+    #: that sets none derives the byte-identical job it always did.
+    options: OptionOverrides = field(default_factory=OptionOverrides)
+    #: Plan 41 GN6. The size fields built from any of Gmsh's field types,
+    #: written to the job only when there are some.
+    native_fields: NativeFields = field(default_factory=NativeFields)
+    #: Plan 41 GN7. Size at picked points, written to the job only when there
+    #: are some.
+    point_sizes: PointSizes = field(default_factory=PointSizes)
+    #: Plan 41 GN9. Embedded entities and per-entity meshing constraints,
+    #: written to the job only when there are some.
+    entity_controls: EntityControls = field(default_factory=EntityControls)
+    #: Plan 41 GN8. Transfinite surfaces and volumes and automatic transfinite
+    #: as stored rows, written to the job only when there are some.
+    structure: Structure = field(default_factory=Structure)
+    #: Plan 41 GN25f. The saved automatic size field as the background field
+    #: (`sizeField/useAsBackground`): {directory, octree, key, ...}. Empty
+    #: unless the project switched it on, and then not written to the job.
+    automatic_field: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
+        document = self._base_dict()
+        if self.options.rows:
+            document['options'] = self.options.to_list()
+        if self.native_fields.nodes:
+            document['nativeFields'] = self.native_fields.to_list()
+        if self.point_sizes.rows:
+            document['pointSizes'] = self.point_sizes.to_list()
+        if self.entity_controls.ops:
+            document['entityControls'] = self.entity_controls.to_list()
+        if self.structure.ops:
+            document['structure'] = self.structure.to_list()
+        if self.automatic_field:
+            document['automaticField'] = dict(self.automatic_field)
+        return document
+
+    def _base_dict(self) -> dict:
         return {
             'schemaVersion': self.schema_version,
             'sizing': self.sizing.to_dict(),
@@ -945,12 +1055,16 @@ class JobIntent:
                 'algorithms': self.algorithms.to_dict(),
                 'parallel': self.parallel.to_dict(),
             },
-            'gmsh.size_fields': {'sizeFields': self.size_fields.to_dict()},
+            'gmsh.size_fields': {'sizeFields': self.size_fields.to_dict(),
+                                 'nativeFields': self.native_fields.to_list(),
+                                 'pointSizes': self.point_sizes.to_list()},
             'gmsh.curve_controls': {
                 'curveControls': [item.to_dict() for item in self.curve_controls]},
             'gmsh.volume_controls': {
                 'volumeControls': [item.to_dict() for item in self.volume_controls],
-                'structuring': self.structuring.to_dict()},
+                'structuring': self.structuring.to_dict(),
+                'entityControls': self.entity_controls.to_list(),
+                'structure': self.structure.to_list()},
             'gmsh.boundary_layers': {'layers': self.layers.to_dict()},
             'gmsh.periodic': {'periodic': self.periodic.to_dict()},
             'gmsh.compute': {
@@ -979,10 +1093,12 @@ class JobIntent:
             'gmsh.describe_geometry': list(self.healing.warnings)
             + list(self.dimensionality.warnings),
             'gmsh.global_sizing': list(self.sizing.warnings),
-            'gmsh.size_fields': list(self.size_fields.warnings),
+            'gmsh.size_fields': list(self.size_fields.warnings)
+            + list(self.native_fields.warnings),
             'gmsh.boundary_layers': list(self.layers.warnings),
             'gmsh.periodic': list(self.periodic.warnings),
-            'gmsh.compute': list(self.export.warnings),
+            'gmsh.compute': list(self.export.warnings)
+            + list(self.options.warnings),
         }
         # DP-612 (field audit 0924 gmsh-sizing D4): a local-size curve row
         # that "From points" switches off belongs to both pages involved.
@@ -1030,16 +1146,25 @@ def configured_tasks(intent) -> frozenset:
         return value if isinstance(value, dict) else {}
 
     asked = {
-        'gmsh.size_fields': bool(block('sizeFields').get('fields')),
+        'gmsh.size_fields': bool(block('sizeFields').get('fields')
+                                 or intent.get('nativeFields')
+                                 or intent.get('pointSizes')),
         'gmsh.curve_controls': bool(intent.get('curveControls')),
         'gmsh.volume_controls': bool(
             intent.get('volumeControls')
             or block('structuring').get('automatic')
-            or block('structuring').get('transfiniteTri')),
+            or block('structuring').get('transfiniteTri')
+            or intent.get('entityControls')
+            or intent.get('structure')),
         'gmsh.boundary_layers': bool(block('layers').get('enabled')),
         'gmsh.periodic': bool(block('periodic').get('pairs')),
     }
     return frozenset(task_id for task_id, used in asked.items() if used)
+
+
+#: DP-1471. The three methods Gmsh 4.15.2's computeRenumbering documents,
+#: keyed by the stored (lower-case) value, valued by the name Gmsh takes.
+RENUMBER_METHOD = {'rcmk': 'RCMK', 'hilbert': 'Hilbert', 'metis': 'Metis'}
 
 
 def _enum(value, default=''):
@@ -1059,12 +1184,6 @@ def _rows(value):
     return ()
 
 
-#: Plan 30 WP12. Targets whose reader accepts the quad/hex family Gmsh's
-#: recombination produces. Everything else -- the polyMesh publisher above
-#: all -- gets tetrahedra, because a recombined mesh fails checkMesh on every
-#: geometry measured (see ``GmshCellShape`` in the schema).
-RECOMBINING_SOLVERS = frozenset({'su2'})
-
 #: DP-628. Said whenever hexahedra are asked for. It is a caution, not a
 #: refusal: the same geometry passed at a finer size.
 HEXAHEDRAL_ON_CURVES = (
@@ -1080,30 +1199,21 @@ def derive_structuring(values: dict,
                        target_solver: str = 'unselected') -> Structuring:
     """Whether the run asks Gmsh to structure what it can by itself.
 
-    The SU2-only guard is the same one recombination carries and for the same
-    measured reason: ``setTransfiniteAutomatic`` recombines as part of its
-    work. On a unit box it produced 125 hexahedra behind 150 quadrilateral
-    boundary faces, which is the mesh family the polyMesh route rejects.
+    Plan 41 GN2 (DP-1395, G2). ``setTransfiniteAutomatic`` recombines as part
+    of its work -- on a unit box it produced 125 hexahedra behind 150
+    quadrilateral boundary faces -- and that mesh is one the OpenFOAM polyMesh
+    publisher declines. It used to be switched off here for every target but
+    SU2. The Gmsh route is a mesher in its own right: the request reaches
+    Gmsh as made, and the export that cannot take the result says so
+    (:func:`derive_export`, ``poly_mesh_refusals``). ``target_solver`` is
+    accepted and ignored.
     """
     values = dict(values or {})
-    automatic = bool(values.get('automatic', False))
-    solver = solver_token(target_solver)
-    warnings: tuple = ()
-    if automatic and solver not in RECOMBINING_SOLVERS:
-        automatic = False
-        warnings = (
-            f'automatic structuring was requested but the {solver} route '
-            'reads tetrahedra; it recombines as it structures, and the mesh '
-            'it produced on a unit box was 125 hexahedra behind 150 '
-            'quadrilateral boundary faces, which is the mesh that fails '
-            'checkMesh with negative cell volumes. It was not applied. '
-            'Choose the su2 target to mesh in hexahedra.',)
     # No guard on the triangular setting: it changes how a three-sided face
     # is filled, not what family it is filled with. MEASURED: 120 triangles
     # became 64, and both counts are triangles.
-    return Structuring(automatic=automatic,
-                       transfinite_tri=bool(values.get('transfiniteTri', False)),
-                       warnings=warnings)
+    return Structuring(automatic=bool(values.get('automatic', False)),
+                       transfinite_tri=bool(values.get('transfiniteTri', False)))
 
 
 def derive_algorithms(values: dict,
@@ -1125,7 +1235,6 @@ def derive_algorithms(values: dict,
         raise PlanDerivationError(
             f'unknown cell shape {cell_shape!r}; expected one of '
             f'{", ".join(sorted(CELL_SHAPE))}')
-    solver = solver_token(target_solver)
     recombine = bool(values.get('recombine', False))
     recombiner = _enum(values.get('recombinationAlgorithm'), 'blossom')
     if recombiner not in RECOMBINATION_ALGORITHM:
@@ -1146,38 +1255,11 @@ def derive_algorithms(values: dict,
             'splitting quadrangles back into triangles was requested but '
             'nothing recombines them in the first place; the surfaces are '
             'meshed as triangles already, so the setting was not applied.',)
-    elif recombine and solver not in RECOMBINING_SOLVERS and not split:
-        # Refused here rather than in the runner so the reason reaches the
-        # page while the user can still act on it -- and the reason now names
-        # the remedy, because there is one.
-        recombine = False
-        warnings += (
-            f'recombination was requested but the {solver} route reads '
-            'tetrahedra; the recombined mesh fails checkMesh with negative '
-            'cell volumes, so it was not applied. Choose the su2 target to '
-            'mesh in quads and hexahedra, or split the quadrangles back into '
-            'triangles to keep the recombination on this route.',)
-    elif recombine and split and solver not in RECOMBINING_SOLVERS:
-        # Kept, not cleared: the quadrangles never survive to the volume
-        # pass, so the mesh this route publishes is the tetrahedral one it
-        # reads.
-        warnings += (
-            f'the surfaces are recombined and then split back into triangles, '
-            f'because the {solver} route reads tetrahedra; the mesh is '
-            'tetrahedral, and it is the recombiner rather than the surface '
-            'mesher that decided where its triangles are.',)
-    # Plan 31 FC-B. The quad surfacers go through the same gate, and for the
-    # same measured reason: a quadrilateral surface is not a mesh the polyMesh
-    # route can read. Cleared here, not in the runner, so the user is told
-    # while they can still act on it. `splitQuadrangles` does not rescue one:
-    # the runner splits only what recombination made, and whether the split
-    # also reaches a quad surfacer's own quadrangles is unmeasured.
-    if surface in QUAD_SURFACE_ALGORITHMS and solver not in RECOMBINING_SOLVERS:
-        warnings += (
-            f'the {surface} surface algorithm meshes in quadrilaterals, which '
-            f'the {solver} route cannot read; frontal_delaunay was used '
-            'instead. Choose the su2 target to mesh the surfaces in quads.',)
-        surface = 'frontal_delaunay'
+    # Plan 41 GN2 (DP-1395, G2). Recombination, the quad surface algorithms and
+    # automatic structuring used to be cleared here for every target but SU2,
+    # swapping the user's choice for another with a warning. They reach Gmsh as
+    # chosen; the export that cannot read the family declines it
+    # (derive_export). ``target_solver`` is accepted and ignored.
     return Algorithms(surface=surface, volume=volume, cell_shape=cell_shape,
                       recombine=recombine, recombination_algorithm=recombiner,
                       fallback=bool(values.get('algorithmFallback', True)),
@@ -1329,76 +1411,79 @@ def derive_parallel(values: dict, algorithms: Algorithms | None = None,
     return Parallel(threads=threads, volume_threaded=volume_threaded)
 
 
-def derive_export(values: dict, target_solver: str = 'unselected'
+def derive_export(values: dict, target_solver: str = 'unselected',
+                  *, mesh_family_blockers: tuple[str, ...] = ()
                   ) -> ExportSettings:
     """Element order and output format for the case's target solver.
 
-    Plan 29 WP8, corrected by Plan 30 WP-07 and Plan 31 CP-01. The order comes
-    from :func:`supported_element_orders` rather than from an ``if`` written
-    here, so the page that greys an option and the job that would have dropped
-    it read one pair of tables.
+    Plan 29 WP8, corrected by Plan 30 WP-07, Plan 31 CP-01 and Plan 41 GN2.
+    The mesh is made at the order the user chose. What the target decides is
+    which files are written beside the native MSH, and a file the target's
+    reader cannot take is not written and the reason is said
+    (:func:`export_refusals`): the refusal is at the export, never upstream
+    (G2).
 
     The format follows from the target, not from the order: an SU2 case is
     given Gmsh's own ``.su2`` writer, because that file is what the solver
-    consumes and the run has no other way to be told to write it
-    (``write_job`` adds ``su2`` to the requested formats when it sees this
-    value). The native ``.msh`` is written beside it either way, at the one
-    version this application reads.
+    consumes (``write_job`` adds ``su2`` to the requested formats when it sees
+    this value). The native ``.msh`` is written beside it either way, at the
+    one version this application reads.
+
+    ``mesh_family_blockers`` are the reasons the mesh the user asked for is not
+    one the polyMesh publisher reads (recombination, a quad surface algorithm,
+    automatic structuring). They only matter to a polyMesh target.
     """
     values = dict(values or {})
     solver = solver_token(target_solver)
     try:
-        requested = int(values.get('elementOrder', 1) or 1)
+        order = int(values.get('elementOrder', 1) or 1)
     except (TypeError, ValueError):
         raise PlanDerivationError(
             f'element order {values.get("elementOrder")!r} is not a number')
-    if requested not in (1, 2):
+    if order not in MESHER_ELEMENT_ORDERS:
         raise PlanDerivationError(
-            f'element order {requested} is outside 1-2; Gmsh writes linear or '
+            f'element order {order} is outside 1-2; Gmsh writes linear or '
             'quadratic elements only')
     incomplete = bool(values.get('secondOrderIncomplete', False))
     straight_midsides = bool(values.get('secondOrderLinear', False))
     renumber = bool(values.get('renumber', False))
+    method_key = _enum(values.get('renumberMethod'), 'rcmk')
+    if method_key not in RENUMBER_METHOD:
+        raise PlanDerivationError(
+            f'unknown renumbering method {method_key!r}; Gmsh 4.15.2 has '
+            f'{", ".join(RENUMBER_METHOD.values())}')
 
     warnings: list[str] = []
-    allowed = supported_element_orders(solver)
-    if requested in allowed:
-        order = requested
-    else:
-        order = max(item for item in allowed if item <= requested) \
-            if any(item <= requested for item in allowed) else min(allowed)
-        refusal = ELEMENT_ORDER_REFUSALS.get((solver, requested), '')
-        warnings.append(
-            f'element order {requested} was requested but the mesh was '
-            f'written at order {order}: '
-            + (refusal or f'the {solver} route accepts order '
-                          + ' or '.join(str(item) for item in allowed)
-                          + ' only.'))
-    mesh_format = 'su2' if solver == 'su2' else 'msh2.2'
+    refusals = export_refusals(solver, order, tuple(mesh_family_blockers))
+    declined_order = order not in exporter_element_orders(solver)
+    poly_refusals = (tuple(mesh_family_blockers)
+                     if solver in POLY_MESH_TARGETS else ())
+    if refusals:
+        warnings.extend(refusals)
+    # The SU2 file is written only where the target's reader can take it.
+    mesh_format = ('su2' if solver == 'su2' and not declined_order
+                   else 'msh2.2')
     if order != 2:
         incomplete = False
         straight_midsides = False
-    # Plan 31 FC-D. Renumbering is an SU2-route option because MSH 2.2 is the
-    # only other file this product writes and that writer does not carry it.
-    # MEASURED on a 406-node sphere, one mesh renumbered and written three
-    # ways: the widest node-number spread over a cell was 458 before, and
-    # after RCMK it was 129 in the .su2 and in MSH 4.1 -- and 458 again in
-    # MSH 2.2, whose writer indexes nodes in storage order and throws the new
-    # numbering away. Offering the control on a route whose file cannot carry
-    # it is the shape of defect C31-02, so it is cleared here with a reason
-    # rather than set, recorded, and silently lost at the write.
+    # Plan 31 FC-D. MSH 2.2's writer discards a renumbering (measured: widest
+    # node-number spread 458 before, 129 after in the SU2 file and in MSH 4.1,
+    # 458 again in MSH 2.2). Plan 41 GN2: the request is NOT cleared here for
+    # the route it is on -- it reaches the runner as set, and the runner says,
+    # in the ledger, that the file it wrote cannot carry the numbering.
     if renumber and mesh_format != 'su2':
-        renumber = False
         warnings.append(
-            'node renumbering was requested but not applied: this route '
-            'writes MSH 2.2, and that writer numbers nodes in storage order, '
-            'so a renumbering cannot reach the file. It applies on the SU2 '
-            'route, whose writer carries it.')
+            'node renumbering was requested; this run writes MSH 2.2, whose '
+            'writer numbers nodes in storage order, so the renumbering is '
+            'not in that file (the SU2 file and MSH 4.1 carry it). The run '
+            'records what it could carry.')
     return ExportSettings(target_solver=solver, element_order=order,
                           second_order_incomplete=incomplete,
                           second_order_linear=straight_midsides,
                           renumber=renumber,
-                          mesh_format=mesh_format, warnings=tuple(warnings))
+                          renumber_method=RENUMBER_METHOD[method_key],
+                          mesh_format=mesh_format, warnings=tuple(warnings),
+                          poly_mesh_refusals=poly_refusals)
 
 
 def derive_corner_points(raw, name: str) -> tuple:
@@ -1536,6 +1621,140 @@ def derive_volume_controls(rows) -> tuple[VolumeControl, ...]:
     return tuple(sorted(derived, key=lambda item: (-item.order, item.name)))
 
 
+def derive_option_overrides(values) -> OptionOverrides:
+    """The catalogue options the user set, validated before any run.
+
+    Plan 41 GN2. A name the build does not have, a read-only option and an
+    enum value Gmsh would silently rewrite are refused here with the reason
+    (``option_catalogue.OptionRefusal``), so the page tells the user while they
+    can still fix it and not after the mesher has run.
+    """
+    from .option_catalogue import (
+        OptionRefusal, overrides_from_text, resolve_overrides)
+
+    values = dict(values or {})
+    try:
+        mapping = overrides_from_text(values.get('overrides'))
+        rows, warnings = resolve_overrides(mapping)
+    except OptionRefusal as error:
+        raise PlanDerivationError(f'Gmsh options: {error}') from None
+    return OptionOverrides(rows=rows, warnings=warnings)
+
+
+def derive_point_sizes(values) -> PointSizes:
+    """The sizes at picked points, checked before a run (Plan 41 GN7)."""
+    from .point_sizes import PointSizeRefusal, rows_from_text, validate
+
+    values = dict(values or {})
+    try:
+        return validate(rows_from_text(values.get('rows')))
+    except PointSizeRefusal as error:
+        raise PlanDerivationError(f'Gmsh point sizes: {error}') from None
+
+
+def derive_entity_controls(values) -> EntityControls:
+    """The embedded entities and per-entity constraints, checked before a
+    run (Plan 41 GN9)."""
+    from .entity_controls import EntityRefusal, rows_from_text, validate
+
+    values = dict(values or {})
+    try:
+        return validate(rows_from_text(values.get('rows')))
+    except EntityRefusal as error:
+        raise PlanDerivationError(f'Gmsh entity controls: {error}') from None
+
+
+def derive_structure(values) -> Structure:
+    """The transfinite surfaces, volumes and automatic structuring, checked
+    before a run (Plan 41 GN8)."""
+    from .structure import StructureRefusal, rows_from_text, validate
+
+    values = dict(values or {})
+    try:
+        return validate(rows_from_text(values.get('rows')))
+    except StructureRefusal as error:
+        raise PlanDerivationError(f'Gmsh structure: {error}') from None
+
+
+def derive_native_fields(values, algorithms, size_fields=None) -> NativeFields:
+    """The size fields made from any Gmsh field type, checked before a run.
+
+    Plan 41 GN6. The rows are validated against the field catalogue; an
+    anisotropic type is refused while neither BAMG nor MMG3D is selected, and
+    a metric cannot be combined with the sizes of the other size fields.
+    """
+    from .field_catalogue import (
+        FieldRefusal, TYPES, rows_from_text, validate)
+
+    values = dict(values or {})
+    try:
+        rows = rows_from_text(values.get('rows'))
+        plan = validate(
+            rows, surface_algorithm=getattr(algorithms, 'surface', ''),
+            volume_algorithm=getattr(algorithms, 'volume', ''))
+    except FieldRefusal as error:
+        raise PlanDerivationError(f'Gmsh size fields: {error}') from None
+    metric = [n.name for n in plan.nodes
+              if n.enabled and n.background and TYPES[n.gmsh].anisotropic]
+    if metric and size_fields is not None and size_fields.fields:
+        raise PlanDerivationError(
+            'Gmsh size fields: '
+            + ', '.join(repr(n) for n in metric)
+            + ' give a metric, which cannot share the background with the '
+              'sizes of the other size fields and surface sizes; turn those '
+              'off, or put everything in one anisotropic field')
+    return plan
+
+
+#: Writer options the polyMesh route pins (ASCII MSH 2.2). A catalogue
+#: override of one of them wins -- a user-typed value is never overwritten --
+#: and the publisher then says it cannot read the file.
+WRITER_OPTIONS = frozenset({'Mesh.Binary', 'Mesh.MshFileVersion',
+                            'Mesh.Format'})
+
+
+def poly_mesh_blockers(algorithms: Algorithms,
+                       structuring: Structuring,
+                       options: 'OptionOverrides | None' = None
+                       ) -> tuple[str, ...]:
+    """Why the mesh these settings make is not one the polyMesh publisher reads.
+
+    Plan 41 GN2 (G2). MEASURED (Plan 30 WP12, Plan 31 FC-B/FC-C): a recombined
+    mesh, a quad-surface mesh and an automatically structured one fail
+    checkMesh with negative cell volumes once published, so the OpenFOAM
+    publisher declines them. They are still made; they are written natively,
+    and every other export takes them.
+    """
+    reasons = []
+    if algorithms.recombine and not algorithms.split_quadrangles:
+        reasons.append(
+            'no polyMesh was published: the surfaces were recombined into '
+            'quadrilaterals, and a recombined mesh fails checkMesh with '
+            'negative cell volumes on every geometry measured. The mesh was '
+            'made as asked and the native MSH is kept; split the quadrangles '
+            'back into triangles to publish a polyMesh from it.')
+    if algorithms.surface in QUAD_SURFACE_ALGORITHMS:
+        reasons.append(
+            f'no polyMesh was published: the {algorithms.surface} surface '
+            'algorithm meshes in quadrilaterals, which the polyMesh publisher '
+            'cannot read. The mesh was made as asked and the native MSH is '
+            'kept.')
+    if structuring.automatic:
+        reasons.append(
+            'no polyMesh was published: automatic structuring recombines as '
+            'it structures (125 hexahedra behind 150 quadrilateral faces on a '
+            'unit box), a mesh that fails checkMesh with negative cell '
+            'volumes. The mesh was made as asked and the native MSH is kept.')
+    for name, _storage, value in (options.rows if options else ()):
+        if name in WRITER_OPTIONS:
+            reasons.append(
+                f'no polyMesh was published: the option {name} was set to '
+                f'{value!r} from the option catalogue, and the polyMesh '
+                'publisher reads only ASCII MSH 2.2. The mesh was written '
+                'as the option says and kept.')
+    return tuple(reasons)
+
+
 def derive_job_intent(request) -> JobIntent:
     """Derive the immutable job from an :class:`EnginePlanRequest`."""
     carrier = dict(request.intent.native or {})
@@ -1546,6 +1765,7 @@ def derive_job_intent(request) -> JobIntent:
         # read from a database here: the plan request is the only thing this
         # function is given, and element order depends on the target solver.
         target_solver=carrier.get('targetSolver') or 'unselected',
+        size_preset=carrier.get('sizePreset'),
         metadata={
             'engine_id': 'gmsh',
             'configuration_revision': getattr(
@@ -1561,7 +1781,8 @@ def derive_job_intent(request) -> JobIntent:
 def derive_from_native(native: dict, *, bbox=None, metadata=None,
                        target_solver='unselected',
                        prepared_geometry=None,
-                       resource_policy=None) -> JobIntent:
+                       resource_policy=None,
+                       size_preset=None) -> JobIntent:
     """Derive from the raw ``gmsh`` configuration section.
 
     Split out from :func:`derive_job_intent` so the derivation can be unit
@@ -1578,7 +1799,11 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     """
     native = dict(native or {})
     dimensionality = derive_dimensionality(native.get('dimensionality'))
-    sizing = derive_global_sizing(native.get('globalSizing'), bbox)
+    from foammesh.core.sizing import curvature_points, diagonal_divisor
+
+    sizing = derive_global_sizing(
+        native.get('globalSizing'), bbox, diagonal_divisor(size_preset),
+        curvature_points(size_preset))
     structuring = derive_structuring(native.get('structuring'), target_solver)
     algorithms = derive_algorithms(
         native.get('algorithms'), target_solver,
@@ -1587,8 +1812,19 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
                                resource_policy=resource_policy)
     healing = derive_healing(native.get('healing'))
     quality = derive_thresholds(native.get('optimization'))
+    from foammesh.core.sizing import derive_sizes
+
+    gmsh_bounds = _bounds_of(bbox)
+    proposal = derive_sizes(
+        size_preset,
+        None if gmsh_bounds is None else (
+            gmsh_bounds[0], gmsh_bounds[3], gmsh_bounds[1], gmsh_bounds[4],
+            gmsh_bounds[2], gmsh_bounds[5]),
+        diagonal=sizing.target_size * diagonal_divisor(size_preset))
     layers = derive_boundary_layers(
-        native.get('boundaryLayers'), target_size=sizing.target_size)
+        native.get('boundaryLayers'), target_size=sizing.target_size,
+        first_default=(proposal.first_layer_height.value
+                       if proposal is not None else None))
     size_fields = derive_size_fields(_rows(native.get('sizeFields')), bbox)
     # Per-surface sizes are ordinary size fields once compiled, and they have
     # to join this plan rather than travel beside it: Gmsh keeps one background
@@ -1602,7 +1838,16 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
     # not carry, or two fields reading each other, is a refusal now rather
     # than a mesh nobody asked for.
     validate_field_graph(size_fields.fields)
-    export = derive_export(native.get('output'), target_solver)
+    options = derive_option_overrides(native.get('options'))
+    native_fields = derive_native_fields(
+        native.get('nativeFields'), algorithms, size_fields)
+    point_sizes = derive_point_sizes(native.get('pointSizes'))
+    entity_controls = derive_entity_controls(native.get('entityControls'))
+    structure = derive_structure(native.get('structure'))
+    export = derive_export(
+        native.get('output'), target_solver,
+        mesh_family_blockers=poly_mesh_blockers(
+            algorithms, structuring, options))
     curves = derive_curve_controls(_rows(native.get('curveControls')))
     volumes = derive_volume_controls(_rows(native.get('volumeControls')))
     periodic = derive_periodic_pairs(_rows(native.get('periodicPairs')))
@@ -1646,7 +1891,9 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
         *sizing.warnings, *healing.warnings, *layers.warnings,
         *size_fields.warnings, *periodic.warnings, *export.warnings,
         *algorithms.warnings, *dimensionality.warnings,
-        *structuring.warnings, *curve_size_warnings(curves, sizing),
+        *curve_size_warnings(curves, sizing), *options.warnings,
+        *native_fields.warnings, *point_sizes.warnings,
+        *entity_controls.warnings, *structure.warnings,
     )
     if parallel.threads > 1 and not parallel.volume_threaded:
         # Silence here reads as "sixteen threads were used". They were not.
@@ -1660,5 +1907,7 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
         size_fields=size_fields, curve_controls=curves, volume_controls=volumes,
         periodic=periodic, dimensionality=dimensionality,
         farfield=farfield, structuring=structuring,
-        export=export, warnings=warnings,
+        export=export, warnings=warnings, options=options,
+        native_fields=native_fields, point_sizes=point_sizes,
+        entity_controls=entity_controls, structure=structure,
         metadata=dict(metadata or {}))

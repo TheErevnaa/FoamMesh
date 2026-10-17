@@ -63,6 +63,8 @@ import math
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from foammesh.rendering.pick_alone import drawing_only
+
 #: How long the arrows are on screen, at any zoom.
 ARROW_PIXELS = 90.0
 
@@ -1027,7 +1029,10 @@ class SeedGizmo(QObject):
             return None
         self._syncCamera()
         self._place()
-        if not self._picker.Pick(float(x), float(y), 0.0, self._renderer):
+        # DP-2713. Only the handles' renderer is drawn in the selection pass.
+        with drawing_only(self._renderer):
+            hit = self._picker.Pick(float(x), float(y), 0.0, self._renderer)
+        if not hit:
             return None
         prop = self._picker.GetViewProp()
         for key, actor in self._handles.items():

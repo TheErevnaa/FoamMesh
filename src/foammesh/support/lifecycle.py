@@ -73,6 +73,8 @@ import threading
 import time
 from pathlib import Path
 
+from foammesh.support.deferred_log import DeferredHandler
+
 LOG_DIRECTORY_NAME = 'logs'
 FAULT_LOG = 'faulthandler.log'
 LIFECYCLE_LOG = 'lifecycle.log'
@@ -382,6 +384,14 @@ def attach_root_log(directory=None, level: int = logging.INFO):
     root = logging.getLogger()
     for existing in root.handlers:
         if existing.get_name() == ROOT_LOG_HANDLER:
+            if isinstance(existing, logging.handlers.RotatingFileHandler):
+                # The packaged build's runtime hook writes on the logging
+                # thread; hand the file to a thread of its own.
+                deferred = DeferredHandler(existing)
+                root.removeHandler(existing)
+                root.addHandler(deferred)
+                _state['root_handler'] = deferred
+                return deferred
             return existing
     directory = Path(directory) if directory else _state['directory']
     if directory is None:
@@ -398,6 +408,7 @@ def attach_root_log(directory=None, level: int = logging.INFO):
         return None
     handler.set_name(ROOT_LOG_HANDLER)
     handler.setFormatter(logging.Formatter(ROOT_LOG_FORMAT))
+    handler = DeferredHandler(handler)
     root.addHandler(handler)
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)

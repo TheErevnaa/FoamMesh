@@ -3,11 +3,41 @@
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRegularExpression, Qt, Signal
-from PySide6.QtGui import QFontMetrics, QRegularExpressionValidator
+import weakref
+
+from PySide6.QtCore import QEvent, QObject, QRegularExpression, Qt, Signal
+from PySide6.QtGui import QFontMetrics, QGuiApplication, QRegularExpressionValidator
 from PySide6.QtWidgets import QFileDialog, QSizePolicy, QWidget
 
 from .new_project_widget_ui import Ui_NewProjectWidget
+
+
+class _ActivationWatch(QObject):
+    """Asks a NewProjectWidget to look at the disk again (R42) when its
+    window comes to the front.
+
+    DP-1447. Told by the application's `focusWindowChanged` signal, not by
+    an event filter on the window: a Python filter on a window was called
+    while the window was being torn down, with an event Qt had already freed
+    (rc 139 at the end of the Gmsh walks, the DP-1430/DP-1438 family).
+    """
+
+    def __init__(self, window, widget):
+        super().__init__(window)
+        self._widget = weakref.ref(widget)
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.focusWindowChanged.connect(self._focusWindowChanged)
+
+    def _focusWindowChanged(self, focused):
+        widget = self._widget()
+        if widget is None or focused is None:
+            return
+        try:
+            if focused is widget.window().windowHandle():
+                widget.revalidate()
+        except RuntimeError:
+            pass
 
 
 class NewProjectWidget(QWidget):
@@ -114,7 +144,14 @@ class NewProjectWidget(QWidget):
         # front.
         window = self.window()
         if window is not None:
-            window.installEventFilter(self)
+            # DP-1447. Not `self`: the window outlives this widget, and an
+            # event it received while this widget was being destroyed was
+            # handed to a Python override whose C++ object was half gone
+            # (rc 139 at the end of a Gmsh walk).  A helper that belongs to
+            # the window, and looks this widget up when the event comes,
+            # cannot be called into a dead one.
+            watch = _ActivationWatch(window, self)
+            self.destroyed.connect(watch.deleteLater)
 
         if suffix is None:
             self._ui.formLayout.removeRow(self._ui.suffixField)
@@ -195,13 +232,6 @@ class NewProjectWidget(QWidget):
         it again was the only way to make the next identical click export.
         """
         self._updateProjectPath()
-
-    def eventFilter(self, watched, event):
-        # R42. See revalidate(): coming back from the file manager is the
-        # event that says "look at the disk again".
-        if event.type() == QEvent.Type.WindowActivate:
-            self.revalidate()
-        return super().eventFilter(watched, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

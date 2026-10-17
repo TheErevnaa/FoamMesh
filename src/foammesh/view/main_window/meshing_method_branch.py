@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QMenu
 
 from foammesh.core.engine.contracts import TaskState
 from foammesh.db.configurations_schema import Step
-from .naviagtion_view import BASE_LABEL_ROLE, TOKEN_ROLE, WorkflowRowState
+from .navigation_view import BASE_LABEL_ROLE, TOKEN_ROLE, WorkflowRowState
 
 
 #: Token for the Mesh setup node itself. The string is unchanged from when the
@@ -37,17 +37,24 @@ TASK_TOKEN_PREFIX = 'engine_task:'
 LEGACY_TOKEN_ALIASES = {
     'workflow.mesh.intent': METHOD_TOKEN,        # was `1. Mesh intent`
     'preferences.execution': METHOD_TOKEN,       # was `2. Execution`
-    # Hosted on `3. Preparation` (Plan 32 section 4.4).
-    TASK_TOKEN_PREFIX + 'gmsh.describe_geometry': None,
     # Plan 33 CURVE-06. Hosted on `Size fields` as the edge control section:
     # one question -- where is the mesh finer than the global size -- asked
     # on one step. A case saved while the curve row was open reopens on the
     # step that now holds the table.
     TASK_TOKEN_PREFIX + 'gmsh.curve_controls':
-        TASK_TOKEN_PREFIX + 'gmsh.size_fields',
+        TASK_TOKEN_PREFIX + 'gmsh.global_sizing',
+    # Plan 42 SG11 (D4). The import and healing values are asked on the Gmsh
+    # `Edit geometry` row, after the engine is chosen, not on Preparation.
+    TASK_TOKEN_PREFIX + 'gmsh.describe_geometry':
+        TASK_TOKEN_PREFIX + 'gmsh.geometry',
+    # Plan 41 GN18 (section 4.1, row 2). Global sizing, the size fields and
+    # the curve controls are one row, `Sizing`; a case saved while the size
+    # fields row was open reopens on the row that now holds them.
+    TASK_TOKEN_PREFIX + 'gmsh.size_fields':
+        TASK_TOKEN_PREFIX + 'gmsh.global_sizing',
 }
 
-#: Tasks whose settings are hosted on a shared page, so they get no outline
+#: Tasks whose settings are hosted on another row's page, so they get no outline
 #: row of their own. The task still exists, still has prerequisites and still
 #: has to be settled -- it is settled from the page that hosts it.
 HOSTED_TASKS = frozenset({'gmsh.describe_geometry'})
@@ -80,10 +87,15 @@ ROW_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
                       'common.resolution', 'common.summary'),
         'common.export': ('common.export',),
     },
+    # Plan 41 GN18 (section 4.1). The eight rows of the Gmsh route, in the
+    # order they are walked: Geometry, Sizing, Structure, Layers, Periodic,
+    # Generate, Quality, Export. Sizing is one row for the three tasks that
+    # answer how fine the mesh is and where.
     'gmsh': {
+        'gmsh.geometry': ('gmsh.geometry',),
         'gmsh.global_sizing': ('gmsh.global_sizing',
-                               'common.reference_readiness'),
-        'gmsh.size_fields': ('gmsh.size_fields', 'gmsh.curve_controls'),
+                               'common.reference_readiness',
+                               'gmsh.size_fields', 'gmsh.curve_controls'),
         'gmsh.volume_controls': ('gmsh.volume_controls',),
         'gmsh.boundary_layers': ('gmsh.boundary_layers',),
         'gmsh.periodic': ('gmsh.periodic',),
@@ -143,13 +155,14 @@ PROCEED_LABELS: dict[str, dict[str, tuple[str, str]]] = {
             'Writes the mesh to the destination this step names'),
     },
     'gmsh': {
+        'gmsh.geometry': (
+            'Proceed',
+            'Keeps the geometry you built here, or records a skip when you '
+            'built nothing, then opens the next step'),
         'gmsh.global_sizing': (
             'Proceed',
-            'Saves the global sizing, then opens the next step'),
-        'gmsh.size_fields': (
-            'Proceed',
-            'Saves the sizing on this step, or records a skip where there '
-            'is none'),
+            'Saves the global sizing, the size fields and the edge controls, '
+            'then opens the next step'),
         'gmsh.volume_controls': (
             'Proceed',
             'Saves these volume controls, or records a skip when there are '
@@ -182,6 +195,19 @@ PROCEED_LABELS: dict[str, dict[str, tuple[str, str]]] = {
 DEFAULT_PROCEED: tuple[str, str] = (
     'Proceed', 'Save this step and open the next one')
 
+#: Plan 40 UXA4 (#24). What the footer says on a page with nothing to set.
+CONTINUE: tuple[str, str] = (
+    'Continue', 'Nothing is set on this step; open the next one')
+
+#: Plan 44 MF18 K4. What the footer says on a row whose result is locked: the
+#: step is finished and read-only, so the press runs and saves nothing and
+#: only opens the next row. The act-naming labels above stay for every row
+#: that is not locked (DP-238, Plan 40 UXA4). Export is never answered with
+#: it, because its press writes the files again.
+LOCKED_NEXT: tuple[str, str] = (
+    'Next', 'This step is finished and locked; open the next one. Unlock it '
+    'to change its settings')
+
 
 def row_tasks(engine_id: str, task_id: str) -> tuple[str, ...]:
     """Every task one press on ``task_id``'s row settles, in order.
@@ -202,12 +228,62 @@ def row_tasks(engine_id: str, task_id: str) -> tuple[str, ...]:
     return (task_id,)
 
 
+def row_locked(branch, engine_id: str, row: str) -> bool:
+    """True when ``row``'s page is result-locked (finished, its settings
+    read-only) and the press would settle nothing on it: every other task the
+    row's press settles is locked or already accepted, so the press only opens
+    the next row (Plan 44 MF18 K4). A branch that cannot say is taken to be
+    unlocked, so the act-naming label stays."""
+    locked = getattr(branch, 'resultLocked', None)
+    accepted = getattr(branch, 'is_accepted', None)
+    if not callable(locked):
+        return False
+    try:
+        if not locked(row):
+            return False
+        return all(bool(locked(task)) or (
+            callable(accepted) and bool(accepted(task)))
+            for task in row_tasks(engine_id, row))
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def owning_row(engine_id: str, task_id: str) -> str | None:
     """The row whose press settles ``task_id``, or ``None`` if no row does."""
     for row, entry in (ROW_TASKS.get(engine_id) or {}).items():
         if task_id in entry:
             return row
     return None
+
+
+#: Plan 40 UXB4 (#12, #13). What a sentence calls a task that is hosted on
+#: another row and has none of its own: the row that hosts it. Plan 42 SG11:
+#: the Gmsh import and healing values live on `Edit geometry`.
+HOSTED_ROW_TITLE = 'Edit geometry'
+
+
+def visible_title(engine_id: str, task_id: str, titles: dict) -> str:
+    """The name of the outline row a sentence may use for ``task_id``.
+
+    A task folded into another row's press, or hosted on Preparation, has no
+    row, and a status line that names it names a step the outline does not
+    show. Such a task is called by the row that settles it; every other task
+    keeps its own title.
+    """
+    if task_id in HOSTED_TASKS:
+        return HOSTED_ROW_TITLE
+    owner = owning_row(engine_id, task_id) or task_id
+    return str(titles.get(owner) or titles.get(task_id) or owner)
+
+
+def visible_titles(engine_id: str, task_ids, titles: dict) -> list[str]:
+    """`visible_title` of each id, in order, each row named once."""
+    names: list[str] = []
+    for task_id in task_ids:
+        name = visible_title(engine_id, task_id, titles)
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def substep_tasks(engine_id: str) -> frozenset[str]:
@@ -324,14 +400,14 @@ class MeshingMethodBranch(QObject):
         # field; the second held thirteen settings that all have working
         # defaults. Both are bands of this node's page now (see
         # LEGACY_TOKEN_ALIASES), and neither is a step.
+        # Plan 42 SG8 (D1). The engine is chosen after Preparation, so the
+        # node is anchored on Preparation and the outline reads `1. Geometry`,
+        # `2. Preparation`, `3. Mesh setup`, then the engine rows from 4.
+        # Import, surface names and Preparation are the same for both
+        # engines because nothing has been chosen when they are walked. The
+        # token is unchanged, so a saved `routeMemo` still finds the node.
         self._node = navigation.installBranchNode(
-            self.tr('2. Mesh setup'), METHOD_TOKEN, Step.GEOMETRY)
-        # DP-271. `3. Preparation` is walked between this row and the engine
-        # rows, and the engine rows are children of this node -- so while it
-        # stayed at the root the outline painted it *below* all of them and
-        # read 1, 2, 4..11 or 4..12, 3. It leads this band instead, so the
-        # band reads 3, 4, 5 downwards and the paint is the walk.
-        navigation.nestStepInBranch(Step.GEOMETRY_REPAIR, METHOD_TOKEN)
+            self.tr('3. Mesh setup'), METHOD_TOKEN, Step.GEOMETRY_REPAIR)
         navigation.branchRequested.connect(self._onBranchRequested)
         # Plan 37 UF5 DP-1043. A locked step is unlocked from its own row:
         # right-click, "Unlock and discard later results...". The outline is
@@ -341,6 +417,10 @@ class MeshingMethodBranch(QObject):
         if tree is not None and hasattr(tree, 'customContextMenuRequested'):
             tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             tree.customContextMenuRequested.connect(self._onOutlineMenu)
+        # Plan 43 LY2. The step ribbon's right-click opens the same menu.
+        ribbon_menu = getattr(navigation, 'rowMenuRequested', None)
+        if ribbon_menu is not None:
+            ribbon_menu.connect(self._onRibbonMenu)
 
     # -- lazy construction ------------------------------------------------- #
 
@@ -381,8 +461,28 @@ class MeshingMethodBranch(QObject):
         if not rows:
             return DEFAULT_PROCEED
         task_id = token[len(TASK_TOKEN_PREFIX):]
-        return rows.get(owning_row(engine_id, task_id) or task_id,
-                        DEFAULT_PROCEED)
+        row = owning_row(engine_id, task_id) or task_id
+        label = rows.get(row, DEFAULT_PROCEED)
+        # Plan 44 MF18 K4. A locked row's press only opens the next row.
+        if row in rows and row != 'common.export' and row_locked(
+                self._branch, engine_id, row):
+            return LOCKED_NEXT
+        # Plan 40 UXA4 (#24). A page with nothing to set says *Continue*: the
+        # press saves nothing and opens the next row.
+        if label[0] == DEFAULT_PROCEED[0] and self._nothingToSet(task_id):
+            return CONTINUE
+        return label
+
+    def _nothingToSet(self, task_id: str) -> bool:
+        """True when the task's page is a task page with no field and no
+        panel on it. A page that cannot say is taken to have something."""
+        page = getattr(self._branch, 'page', None)
+        page = page(task_id) if callable(page) else None
+        has = getattr(page, 'hasEditsToCommit', None)
+        try:
+            return bool(callable(has) and not has())
+        except Exception:                                    # noqa: BLE001
+            return False
 
     def load(self) -> bool:
         """Build or refresh the pages once a case is open."""
@@ -424,9 +524,40 @@ class MeshingMethodBranch(QObject):
         self._syncChildren()
         return True
 
+    @property
+    def _layerPanels(self) -> list:
+        """Plan 42 SG6. The Gmsh per-patch layer panels that may hold ghosts."""
+        if self._branch is None:
+            return []
+        from foammesh.view.gmsh_workflow.layer_stacks_panel import (
+            LayerStacksPanel)
+        return list(self._branch.findChildren(LayerStacksPanel))
+
+    def _clearEngineOverlays(self) -> None:
+        """Plan 42 SG6 (defect 8). The layer ghosts and the check highlights
+        belong to the engine that drew them: an engine switch clears both."""
+        for panel in self._layerPanels:
+            try:
+                panel.clearPreview()
+            except RuntimeError:
+                pass
+        from foammesh.app import app
+        window = getattr(app, 'window', None)
+        control = getattr(window, 'displayControl', None)
+        info_of = getattr(control, 'meshQualityInfo', None)
+        if info_of is None:
+            return
+        try:
+            info = info_of()
+            if info.isHighlighting():
+                info.clearHighlight()
+        except Exception:                                    # noqa: BLE001
+            pass
+
     def _onEngineChanged(self, _engine_id: str) -> None:
         # Switching engines replaces the visible branch; the previous engine's
         # state is retained by the facade, not by these widgets.
+        MeshingMethodBranch._clearEngineOverlays(self)
         self._branch.refresh()
         self._syncChildren()
 
@@ -514,9 +645,15 @@ class MeshingMethodBranch(QObject):
                         row_state = folded
                         rank = ROW_STATE_FOLD_RANK[folded]
             enabled = state is not TaskState.LOCKED
+            # Plan 40 UXA5 (F8e). The row repeats the cell count of the step
+            # it stands for and carries the strip in its tooltip.
+            strip = self._branch.resultStrip(task_id)
+            if strip is not None:
+                from foammesh.core.mesh.stage_strip import short_cells
+                strip = dict(strip, short_cells=short_cells(strip['cells']))
             entries.append((
                 label, TASK_TOKEN_PREFIX + task_id, enabled,
-                row_state.value))
+                row_state.value, strip))
         self._navigation.setBranchChildren(METHOD_TOKEN, entries)
         self._restoreBranchHighlight()
 
@@ -588,16 +725,27 @@ class MeshingMethodBranch(QObject):
             self._branch.requestUndoUnlock if undo else None))
         return actions
 
-    def _onOutlineMenu(self, position) -> None:
+    def _onOutlineMenu(self, position, token=None, global_position=None):
+        """The row menu of the outline tree, or of the step ribbon.
+
+        The ribbon names the step by its token and the screen position it was
+        right-clicked at; the tree names a position in its own viewport.
+        """
         tree = getattr(self._navigation, '_tree', None)
-        if tree is None:
-            return
-        index = tree.indexAt(position)
-        token = str(index.data(TOKEN_ROLE) or '') if index.isValid() else ''
+        parent = tree
+        if token is None:
+            if tree is None:
+                return None
+            index = tree.indexAt(position)
+            token = (str(index.data(TOKEN_ROLE) or '')
+                     if index.isValid() else '')
+            global_position = tree.viewport().mapToGlobal(position)
+        else:
+            parent = getattr(self._ui, 'centralwidget', None) or tree
         actions = self.rowActions(token) if token else []
         if not actions:
-            return
-        menu = QMenu(tree)
+            return None
+        menu = QMenu(parent)
         menu.setObjectName('outlineRowMenu')
         for name, label, enabled, tooltip, callback in actions:
             action = menu.addAction(label)
@@ -607,7 +755,11 @@ class MeshingMethodBranch(QObject):
             if callback is not None:
                 action.triggered.connect(lambda _checked=False, cb=callback: cb())
         menu.setToolTipsVisible(True)
-        menu.exec(tree.viewport().mapToGlobal(position))
+        menu.exec(global_position)
+        return menu
+
+    def _onRibbonMenu(self, token, global_position) -> None:
+        self._onOutlineMenu(None, str(token or ''), global_position)
 
     # -- routing ----------------------------------------------------------- #
 

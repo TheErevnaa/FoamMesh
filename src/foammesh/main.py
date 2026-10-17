@@ -70,13 +70,9 @@ if __name__ == '__main__':
         # then.
         from foammesh.support import native_capture
         native_capture.install()
-    # 2026-10-01. Ask for the high-performance GPU before Qt or VTK loads
-    # OpenGL; the driver falls back to the integrated GPU by itself.
-    try:
-        from foammesh.rendering import gpu_profile as _gpu_profile
-        _gpu_profile.prefer_discrete_gpu()
-    except Exception:                                       # noqa: BLE001
-        pass
+    # GPUPREF: the dedicated-GPU request is applied in main(), once the
+    # settings are readable (it honours the Settings toggle), still before Qt
+    # or VTK loads OpenGL.
 
 import qasync
 from PySide6.QtWidgets import QApplication
@@ -228,12 +224,23 @@ def main():
     if graphics.active:
         logger.warning('Graphics safe mode: %s', graphics.reason)
         lifecycle.record(f'graphics safe mode: {graphics.reason}')
+    # GPUPREF: Settings > Use the dedicated GPU when available. Before Qt
+    # reads OpenGL; a failed or software start falls back by itself.
+    try:
+        from foammesh.rendering import gpu_preference
+        gpu_preference.startup(app.settings, lifecycle.log_directory())
+    except Exception:                                       # noqa: BLE001
+        logger.warning('GPU preference could not be applied', exc_info=True)
     if crash_helper.start(lifecycle.log_directory()) is None:
         logger.info('No crash helper this session; a native crash leaves '
                     'faulthandler.log only.')
     qt_messages.install()
     os.environ['LC_NUMERIC'] = 'C'
     _claim_windows_taskbar_identity()
+    # Plan 40 UXE3: UI scale and the HiDPI rounding policy can only be set
+    # before the QApplication exists.
+    from foammesh.view.theming import appearance
+    appearance.prepare_application(appearance.Appearance.from_settings(app.settings))
     application = QApplication(sys.argv)
     application.setWindowIcon(meshAppProperties.icon())
     application.lastWindowClosed.connect(

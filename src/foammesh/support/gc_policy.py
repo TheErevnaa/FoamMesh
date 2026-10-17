@@ -13,8 +13,15 @@ garbage grow without bound):
 * the gen-0 threshold is raised once, so an automatic collection is rare;
 * a GUI-thread timer runs a young collection once the event loop has been
   idle for two seconds, so garbage is reaped where the render objects live;
-* a full collection runs on the GUI thread after every scene swap and every
-  project close, the two moments large cyclic structures become garbage.
+* a full collection runs on the GUI thread after every project close, the
+  moment large cyclic structures become garbage; after a scene swap it runs
+  once the window has been quiet for a moment (`collect_full_when_quiet`),
+  because a full pass over a big session costs 100 ms or more and a load is
+  the one moment the user is watching the window answer (Plan 39 VI14b);
+* a full collection runs on the GUI thread before a theme is applied,
+  because applying one re-polishes every live widget in one Qt loop
+  that calls back into Python, and a collection tripped inside that
+  loop destroys widgets Qt is still walking.
 
 This is the one module in ``src`` allowed to call ``gc.freeze``,
 ``gc.disable``, ``gc.enable``, ``gc.set_threshold`` or ``gc.collect``; a
@@ -125,6 +132,61 @@ def collect_full(reason=''):
         logger.debug('gc_policy: full collect for %r skipped off the GUI thread', reason)
         return 0
     return gc.collect()
+
+
+#: Milliseconds the window stays quiet before the deferred full pass runs.
+QUIET_COLLECT_MS = 1500
+
+
+def collect_full_when_quiet(reason=''):
+    """Reap what a scene swap left, but not inside the swap.
+
+    A young pass runs now (cheap, and it takes the swap's own temporaries);
+    the full pass waits ``QUIET_COLLECT_MS`` and then runs on the GUI thread,
+    put off while a mouse button is down. Called again before the first one
+    has run, it restarts the wait rather than stacking another.
+    """
+    if not _on_main_thread():
+        return 0
+    freed = gc.collect(1)
+    try:
+        from PySide6.QtCore import QCoreApplication, QTimer
+    except Exception:                                       # noqa: BLE001
+        return freed
+    application = QCoreApplication.instance()
+    if application is None:
+        gc.collect()
+        return freed
+    timer = _state.get('quiet_timer')
+    if timer is None:
+        timer = QTimer(application)
+        timer.setObjectName('gc_policy.quiet_collector')
+        timer.setSingleShot(True)
+        timer.timeout.connect(_quiet_collect)
+        _state['quiet_timer'] = timer
+    _state['quiet_reason'] = reason
+    timer.start(QUIET_COLLECT_MS)
+    return freed
+
+
+def _quiet_collect():
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
+        if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            _state['quiet_timer'].start(500)
+            return
+    except Exception:                                       # noqa: BLE001
+        pass
+    gc.collect()
+
+
+def full_collect_pending() -> bool:
+    timer = _state.get('quiet_timer')
+    try:
+        return bool(timer is not None and timer.isActive())
+    except RuntimeError:
+        return False
 
 
 def frozen_count():

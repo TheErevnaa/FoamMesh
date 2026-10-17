@@ -1,0 +1,183 @@
+/*
+ * Plan 44 MF6. The console card and its one 28 px header row.
+ *
+ * Card: a floating panel over the viewport's bottom edge -- field background,
+ * 1 px border with no bottom edge, radius 6 6 0 0. Header: 28 px, surface
+ * background, 1 px rule underneath. Tabs are pills; the filter chips, the
+ * verdict, the size read-out and the minimise chip sit on the same row.
+ *
+ * Every colour is a token. The shadow ring is painted by the shell's
+ * `_CardRing` overlay with `elevation.paint_ring` (Plan 44 MF1).
+ */
+
+QFrame#consoleCard {
+    background: {{background.field}};
+    border: 1px solid {{border.default}};
+    border-bottom: none;
+    border-top-left-radius: {{radius.float}}px;
+    border-top-right-radius: {{radius.float}}px;
+}
+/* The sheet is pinned at the left: the card's top-left corner is flush. */
+QFrame#consoleCard[foammeshFlushLeft="true"] {
+    border-top-left-radius: 0;
+}
+
+/* -- the header row ------------------------------------------------------- */
+
+QFrame#consoleHeader {
+    background: {{background.surface}};
+    border: none;
+    border-bottom: 1px solid {{border.rule}};
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+}
+QTabWidget#regionCTabHost::pane {
+    border: none;
+    border-top: none;
+    top: 0;
+    background: {{background.field}};
+}
+QTabWidget#regionCTabHost QTabBar#consoleHeaderTabs {
+    background: transparent;
+    border: none;
+}
+QTabWidget#regionCTabHost QTabBar::tab {
+    background: transparent;
+    color: {{foreground.muted}};
+    border: 1px solid transparent;
+    border-radius: {{radius.control}}px;
+    padding: 2px 10px;
+    margin: 2px 2px 3px 0;
+    height: 16px;
+    min-height: 16px;
+    font-size: {{type.body}}px;
+}
+QTabWidget#regionCTabHost QTabBar::tab:hover {
+    background: {{background.elevated}};
+    color: {{foreground.primary}};
+}
+QTabWidget#regionCTabHost QTabBar::tab:selected {
+    background: {{background.field}};
+    border: 1px solid {{border.default}};
+    color: {{foreground.strong}};
+}
+QTabWidget#regionCTabHost QToolButton#outputTabClose {
+    background: transparent;
+    border: none;
+    padding: 0;
+    min-height: 14px;
+    min-width: 14px;
+    margin: 0 0 0 2px;
+}
+QTabWidget#regionCTabHost QToolButton#outputTabClose:hover {
+    background: {{background.elevated}};
+}
+
+QWidget#consoleHeaderTools, QWidget#consoleHeaderFilters,
+QFrame#consoleHeaderChip {
+    background: transparent;
+    border: none;
+}
+QFrame#consoleHeaderChip {
+    background: {{background.surface}};
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+}
+QFrame#consoleHeaderRule { background: {{border.default}}; border: none; }
+
+/* Filter chips: 20 px line, 1 px border, radius 3, 12 px. */
+QWidget#consoleFilterChips QToolButton,
+QWidget#consoleFilterChips QComboBox {
+    background: transparent;
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    padding: 0 8px;
+    min-height: 18px;
+    max-height: 20px;
+    font-size: 12px;
+}
+QWidget#consoleFilterChips QToolButton:hover,
+QWidget#consoleFilterChips QComboBox:hover {
+    background: {{background.elevated}};
+    border-color: {{accent.default}};
+}
+QWidget#consoleFilterChips QToolButton:checked {
+    background: {{selection.background}};
+    border-color: {{accent.default}};
+}
+QWidget#consoleFilterChips QComboBox::drop-down { width: 14px; border: none; }
+
+/* The verdict: a dot and one 12 px line, no frame. */
+QFrame#meshVerdictStrip { background: transparent; border: none; }
+QFrame#meshVerdictStrip QLabel { font-size: 12px; }
+QFrame#meshVerdictStrip QPushButton {
+    background: transparent;
+    border: 1px solid {{border.default}};
+    border-radius: {{radius.control}}px;
+    padding: 0 8px;
+    min-height: 18px;
+    max-height: 20px;
+    font-size: 12px;
+}
+QFrame#meshVerdictStrip QPushButton:hover {
+    background: {{background.elevated}};
+    border-color: {{accent.default}};
+}
+QFrame#meshVerdictStrip QPushButton:disabled {
+    color: {{disabled.foreground}};
+    border-color: {{border.default}};
+    background: transparent;
+}
+
+/* The size read-out, and the minimise and restore chips. */
+QLabel#consoleSizeReadout {
+    color: {{foreground.muted}};
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+}
+QToolButton#consoleMinimiseButton, QToolButton#consoleRestoreButton {
+    background: transparent;
+    color: {{foreground.primary}};
+    border: 1px solid transparent;
+    border-radius: {{radius.control}}px;
+    padding: 0 8px;
+    min-height: 18px;
+    max-height: 20px;
+    font-size: 12px;
+}
+QToolButton#consoleMinimiseButton:hover, QToolButton#consoleRestoreButton:hover {
+    background: {{background.elevated}};
+    border-color: {{border.default}};
+}
+
+/* The log: field background, the console colours, the text face is set in
+   code (Cascadia Mono, Consolas, monospace). */
+QFrame#consoleCard QPlainTextEdit[foammeshConsole="true"] {
+    background-color: {{background.field}};
+    color: {{console.foreground}};
+    border: none;
+    padding: 0 8px;
+    selection-background-color: {{selection.background}};
+}
+
+/* -- the grips ------------------------------------------------------------- */
+/* No painted splitter colour at rest; hover paints a 2 px accent line. */
+
+QSplitter#regionCSplitter { background: transparent; }
+QSplitter#regionCSplitter::handle:vertical {
+    /* DP-2707: over the native GL view "transparent" is black, so the grip
+       wears the card's own field colour and reads as its top edge. */
+    background: {{background.field}};
+    border: none;
+    margin: 0;
+}
+QSplitter#regionCSplitter::handle:vertical:hover,
+QSplitter#regionCSplitter::handle:vertical:pressed {
+    background: {{accent.default}};
+    border-top: 3px solid {{background.field}};
+    border-bottom: 3px solid {{background.field}};
+    background-clip: padding;
+}
+QWidget#consoleSideGrip { background: transparent; }
+QWidget#consoleSideGrip:hover { background: {{accent.default}}; }

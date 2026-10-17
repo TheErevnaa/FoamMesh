@@ -8,12 +8,13 @@ from pathlib import Path
 
 import numpy as np
 import qasync
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QCoreApplication, Qt, Signal
 
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.app import app
 from foammesh.core.mesh.msh_scene import MshSceneError, read_msh_scene
+from foammesh.core.mesh import handover_scene
 from foammesh.core.mesh.presentation import (
     ENCLOSURE_OPACITY, VOLUME_DEPTH_BIAS, artifact_kind, display_mode_name,
     enclosing_part_ids, hides_geometry, summary_text)
@@ -22,12 +23,13 @@ from foammesh.core.mesh.poly_mesh_reader import MeshPreviewLoader
 from foammesh.core.run_result import GMSH_MSH, GMSH_SURFACE_MSH, POLY_MESH
 from foammesh.rendering.actor_info import ActorInfo, BoundaryActor, DisplayMode, MeshActor, MeshQualityIndex
 from foammesh.rendering.actor_info import ActorType
+from foammesh.rendering import layers_grown
+from foammesh.rendering.patch_skin import PatchSkin
 from foammesh.view.main_window.actor_manager import ActorManager
 from foammesh.core.quality import extract_selected_cells
 from PySide6.QtGui import QColor
 from foammesh.view.facade_client import query_async
 from foammesh.core.quality.geometry_fidelity import live_distance
-from foammesh.support.colormap import deviationLut
 from foammesh.support import gc_policy
 
 
@@ -49,6 +51,45 @@ def _closeProgress(dialog):
     deleteLater = getattr(dialog, 'deleteLater', None)
     if callable(deleteLater):
         deleteLater()
+
+
+def _connectCancel(dialog, slot):
+    """Wire a dialog's Cancel to ``slot``; a stand-in without one is left alone."""
+    signal = getattr(dialog, 'cancelClicked', None)
+    if signal is not None:
+        signal.connect(slot)
+
+
+class _Cancellation:
+    """Whether the user pressed Cancel on a load, and the task it should stop."""
+
+    def __init__(self, dialog):
+        self.requested = False
+        self.task = None
+        self._dialog = dialog
+        _connectCancel(dialog, self.request)
+
+    def request(self):
+        self.requested = True
+        label = getattr(self._dialog, 'setLabelText', None)
+        if callable(label):
+            label(QCoreApplication.translate('MeshManager', 'Cancelling…'))
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+
+
+_SOURCE_FIELDS = ('_time', '_root', '_nativePath', '_surfaceOnly',
+                  '_artifactId', '_stage')
+
+
+def _sourceState(manager) -> dict:
+    """Where the picture on screen came from, to put back on a Cancel."""
+    return {name: getattr(manager, name, None) for name in _SOURCE_FIELDS}
+
+
+def _restoreSource(manager, state: dict):
+    for name, value in state.items():
+        setattr(manager, name, value)
 
 
 def _disposeLoader(loader):
@@ -73,7 +114,199 @@ def _previewOf(loader) -> dict:
 
 def _swapScene():
     """The old scene has been disposed; reap what it left, on this thread."""
-    gc_policy.collect_full('scene swap')
+    # Plan 39 VI14b. The full pass is put off until the window is quiet: it
+    # cost 124 ms of the load's GUI-thread hold on the 6.6 M-cell volume.
+    gc_policy.collect_full_when_quiet('scene swap')
+
+
+#: Plan 39 VI14b. The longest the GUI thread is kept by one slice of a scene
+#: swap before the event loop gets it back.
+SCENE_SLICE_SECONDS = 0.02
+
+#: Plan 39 VI14d. How long the loop is left between two slices of a swap.
+SLICE_REST_SECONDS = 0.006
+
+
+async def _swapInScene(manager, generation, prepare, build, *args, **kwargs):
+    """Take the old scene down and put the new one up, in slices.
+
+    The 6.6 M-cell load held the GUI thread for the old scene's actors coming
+    down (58 ms), the full collection (124 ms) and the new scene's build
+    (161 ms), in one piece. Here each actor is one step; whenever a slice has
+    run ``SCENE_SLICE_SECONDS`` the loop is handed back, and rendering is held
+    meanwhile so no frame shows half of each scene.
+
+    ``prepare`` runs once the old scene is down; ``build`` is the manager's
+    ``_buildSceneSteps`` generator function, called with ``*args, **kwargs``.
+    Returns False when this load was superseded or the manager disposed
+    during a pause: a superseded build is finished in one go first, so the
+    scene is never left half built for the load that overtook it. A manager
+    without step support (a stand-in) draws in one piece, as it always did.
+    """
+    from time import perf_counter
+
+    from foammesh.support import vtk_threads
+    if not hasattr(manager, 'remove') or not hasattr(manager, '_actorInfos'):
+        manager.clear()
+        _swapScene()
+        manager._visibility = True
+        prepare()
+        manager._buildScene(*args, **kwargs)
+        return True
+    budget = SCENE_SLICE_SECONDS
+    # The progress dialog has just closed (8 to 19 ms of its own): let the
+    # timers and paints behind it run before the old scene comes down. Before
+    # the hold, not inside it: the old scene is still whole here, so there is
+    # nothing to hide, and whatever the loop runs in this turn (the strip, the
+    # task list, the window repainting where the dialog was) is not charged
+    # to the "Updating the view" cover.
+    await asyncio.sleep(SLICE_REST_SECONDS)
+    if (getattr(manager, '_disposed', False)
+            or generation != getattr(manager, '_load_generation', generation)):
+        return False
+    parts = _QuietParts(getattr(manager, '_displayControl', None))
+    vtk_threads.holdScene()
+    try:
+        slice_began = perf_counter()
+
+        async def _pause():
+            nonlocal slice_began
+            if perf_counter() - slice_began < budget:
+                return
+            # Plan 39 VI14d. Not sleep(0): a zero-delay hand-back is run
+            # again before Windows delivers the WM_TIMER messages behind
+            # Qt's timers, so the slices ran back to back and the 5 ms
+            # heartbeat saw one gap as long as all of them (MEASURED 66 to
+            # 119 ms over five runs). A real wait lets the timers and paint
+            # events through between slices.
+            parts.release()
+            await asyncio.sleep(SLICE_REST_SECONDS)
+            parts.quiet()
+            slice_began = perf_counter()
+
+        parts.quiet()
+        slice_began = perf_counter()
+        for key in tuple(manager._actorInfos):
+            manager.remove(key)
+            await _pause()
+            if manager._disposed:
+                return False
+            if generation != manager._load_generation:
+                return False       # what is left is the next load's to clear
+        manager.applyToDisplay()
+        manager._visibility = False
+        manager._framed = False
+        _swapScene()
+        manager._visibility = True
+        prepare()
+        steps = build(*args, **kwargs)
+        for _ in steps:
+            await _pause()
+            if manager._disposed:
+                return False
+            if generation != manager._load_generation:
+                for _ in steps:        # finish it: never leave it half built
+                    pass
+                return False
+        # The announcement rebuilds the overlay's parts once; it gets a
+        # slice of its own when the build's last step used this one up.
+        await _pause()
+        parts.release()
+        parts.announce()
+        return True
+    finally:
+        parts.release()
+        vtk_threads.resumeScene()
+        parts.announce()
+        try:
+            manager._displayControl.refreshView()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+#: The display controls a sliced swap is holding quiet right now.
+_quietControls: list = []
+
+
+def _partsQuiet(control) -> bool:
+    """Whether a sliced swap is holding ``control``'s signals right now."""
+    return any(control is quiet for quiet in _quietControls)
+
+
+class _QuietParts:
+    """The display control's signals held for the length of each slice.
+
+    MEASURED (real ``MainWindow``, offscreen, a 4,096-cell box with seven
+    actors): every actor added or removed made the display control emit
+    ``partsChanged``, and each one rebuilt the viewport overlay's parts list,
+    chip and region picker -- 106 of the swap's 165 ms of GUI-thread work,
+    10 to 18 ms a step, so nearly every step crossed the slice budget and
+    paused, and each pause then ran the layout and paint the rebuilt overlay
+    left behind (13 to 22 ms against 6.6 ms for an idle wait). The swap held
+    the view 280 to 315 ms for seven actors, and grows with the parts squared.
+
+    Blocked only while a slice runs, never across a pause: anything the
+    user does to the tree in between still announces itself. When the swap
+    ends, the parts, the selection and the visible count are announced once,
+    for the scene as it now stands.
+    """
+
+    def __init__(self, control):
+        from PySide6.QtCore import QObject
+        self._control = control if isinstance(control, QObject) else None
+        self._was = None
+        self._announced = False
+
+    def quiet(self):
+        if self._control is None or self._was is not None:
+            return
+        try:
+            self._was = bool(self._control.blockSignals(True))
+        except RuntimeError:                       # its C++ object is gone
+            self._control = None
+            return
+        _quietControls.append(self._control)
+
+    def release(self):
+        if self._control is None or self._was is None:
+            return
+        try:
+            _quietControls.remove(self._control)
+        except ValueError:
+            pass
+        try:
+            self._control.blockSignals(self._was)
+        except RuntimeError:
+            self._control = None
+        self._was = None
+
+    def announce(self):
+        """Say once what the swap changed: parts, selection, visible count."""
+        control = self._control
+        if self._announced or control is None:
+            return
+        self._announced = True
+        try:
+            if control.signalsBlocked():
+                return
+        except RuntimeError:
+            return
+        for say in (lambda: control.partsChanged.emit(),
+                    lambda: control.selectedItemsChanged(),
+                    lambda: control.visibilityChanged.emit(
+                        *control.visibilitySummary())):
+            try:
+                say()
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            except Exception:                                # noqa: BLE001
+                logger.debug('announcing the swapped scene', exc_info=True)
+
+
+#: Plan 42 SG2. The boundary type a native group's role stands for.
+_NATIVE_TYPE_OF_CATEGORY = {
+    'wall': 'wall', 'far_field': 'patch', 'inlet': 'patch',
+    'outlet': 'patch', 'symmetry': 'symmetry'}
 
 
 class MeshManager(ActorManager):
@@ -89,6 +322,18 @@ class MeshManager(ActorManager):
     #: preview, or the outline drawn in place of one that was not built.
     #: ``dict`` (see ``MeshPreviewLoader.notice``) or None to clear it.
     previewNoticeChanged = Signal(object)
+    #: Plan 39 VI1 (F6b). The user pressed Cancel on a load: the picture on
+    #: screen is the one that stood before it, unchanged.
+    loadCancelled = Signal()
+    #: Plan 41 GN13. "Load full volume" on a native mesh that holds no volume.
+    nativeVolumeRefused = Signal(str)
+    #: Plan 39 VI2 (F1a). A cut or quality filter over the loaded volume is
+    #: being worked out on the VTK thread (True), or has come to its end,
+    #: swapped in or cancelled (False). The picture on screen is the one
+    #: before it until then.
+    volumeCutBusy = Signal(bool)
+    #: Plan 39 VI16. The volume's exterior colour was taken off (a cut began).
+    volumeColourDropped = Signal()
 
     def __init__(self):
         super().__init__()
@@ -106,6 +351,12 @@ class MeshManager(ActorManager):
         # since CP-01 is every Gmsh case with no solver target -- has no root
         # to go back to.
         self._nativePath = None
+        # Plan 41 GN23. The patches of the native scene on screen ({name:
+        # cells}, in draw order) and the directory whose ``foammesh/`` store
+        # holds what is kept about it (a session's case, else the file's).
+        self._nativePatches = {}
+        self._nativeStoreRoot = None
+        self._nativeCurves = {}
         # Which artifact the picture, the counters and any overlay belong to.
         # ``RunResultHandle.artifact_id``: run, format and content. Overlays
         # are refused when they name a different one, because a quality
@@ -128,6 +379,10 @@ class MeshManager(ActorManager):
         self._patchIds: list[str] = []
         self._zoneIds: list[str] = []
         self._regionPartIds: list[str] = []
+        # Plan 39 VI4 (F1e). One per region whose exterior says which patch
+        # each face is: the exterior wears the patches' colours and the
+        # patches draw their edges only.
+        self._skins: list[PatchSkin] = []
 
         # DP-96. What the user pressed to make this mesh, when a stage
         # page made it. A result loaded from a run has no stage and
@@ -163,6 +418,72 @@ class MeshManager(ActorManager):
     def nativePath(self):
         """The .msh currently drawn, or None when the scene came from a case."""
         return self._nativePath
+
+    def nativeStoreRoot(self):
+        """Plan 41 GN23. The directory whose ``foammesh/`` folder keeps the
+        saved sections, stored deviations and pass snapshots of the native
+        mesh on screen (``None``: no native mesh)."""
+        if self._nativePath is None:
+            return None
+        return Path(self._nativeStoreRoot) if self._nativeStoreRoot             else Path(self._nativePath).parent
+
+    def nativeCurves(self) -> dict:
+        """Plan 41 GN23. ``{curve name: [polyline points]}`` of the native
+        mesh on screen: the model's curve entities as the mesh lines them."""
+        return dict(self._nativeCurves) if self._nativePath is not None else {}
+
+    def nativeDigest(self) -> str:
+        """Plan 41 GN23. The sha256 of the native file on screen (cached by
+        size and time), which names the mesh a stored result belongs to."""
+        if self._nativePath is None:
+            return ''
+        from foammesh.core.mesh import native_mesh
+        try:
+            stat = Path(self._nativePath).stat()
+        except OSError:
+            return ''
+        key = (str(self._nativePath), stat.st_size, stat.st_mtime_ns)
+        cached = getattr(self, '_nativeDigestCache', None)
+        if cached is None or cached[0] != key:
+            try:
+                cached = (key, native_mesh.digest(self._nativePath))
+            except OSError:
+                return ''
+            self._nativeDigestCache = cached
+        return cached[1]
+
+    def meshIdentity(self) -> dict:
+        """Plan 42 SG14 (D8). Which kind of mesh is on screen and which one:
+        a saved element selection records it and is marked when opened on
+        another."""
+        if self._nativePath is not None:
+            return {'source': 'gmsh', 'digest': self.nativeDigest()}
+        return {'source': 'openfoam', 'digest': self._artifactId}
+
+    def cellsForElements(self, elements) -> list:
+        """Plan 42 SG14. The positions in the drawn volume of saved element
+        numbers: Gmsh element tags on a native mesh, cell positions on an
+        OpenFOAM mesh (numbers beyond the mesh are dropped)."""
+        if self._nativePath is not None:
+            return self.nativeCellsForTags(elements)
+        internal = self._actorInfos.get('internalMesh')
+        data = internal.dataSet() if internal is not None else None
+        count = data.GetNumberOfCells() if data is not None else 0
+        return sorted({int(e) for e in elements if 0 <= int(e) < count})
+
+    def nativeCellsForTags(self, tags) -> list:
+        """Plan 41 GN23. The positions in the drawn volume of the cells
+        whose Gmsh element tags are *tags* (the offending rows of a gate)."""
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        internal = self._actorInfos.get('internalMesh')
+        data = internal.dataSet() if internal is not None else None
+        array = data.GetCellData().GetArray('gmshElementTag') \
+            if data is not None else None
+        if array is None:
+            return []
+        present = vtk_to_numpy(array)
+        return np.nonzero(np.isin(present, np.asarray(
+            list(tags), dtype=present.dtype)))[0].astype(int).tolist()
 
     def caseRoot(self):
         """The case directory the drawn mesh was read from, or None (Plan 37
@@ -211,7 +532,30 @@ class MeshManager(ActorManager):
                    if isinstance(actorInfo, MeshActor))
 
     def hasAllQualityFields(self) -> bool:
-        return all(self.hasScalar(index) for index in MeshQualityIndex)
+        if self.hasGmshQuality():
+            # Plan 41 GN13. A session mesh arrives with Gmsh's measures in
+            # its cells; there is nothing to compute from a polyMesh.
+            return True
+        return all(self.hasScalar(index)
+                   for index in MeshQualityIndex.openfoam())
+
+    def dataSets(self) -> list:
+        """The datasets drawn, the volume first (cells to be inspected)."""
+        infos = sorted(self._actorInfos.items(),
+                       key=lambda item: item[0] != 'internalMesh')
+        return [info.dataSet() for _key, info in infos
+                if hasattr(info, 'dataSet') and info.dataSet() is not None]
+
+    def hasGmshQuality(self) -> bool:
+        """Whether the volume on screen carries Gmsh's quality arrays."""
+        return self.hasScalar(MeshQualityIndex.GMSH_SICN)
+
+    def qualityMetrics(self) -> list:
+        """The metrics the mesh on screen can be coloured by, in order."""
+        if self.hasGmshQuality():
+            return [index for index in MeshQualityIndex.gmsh()
+                    if self.hasScalar(index)]
+        return MeshQualityIndex.openfoam()
 
     async def ensureQualityFields(self) -> str:
         """Compute the per-cell quality arrays and attach them to the mesh.
@@ -350,6 +694,52 @@ class MeshManager(ActorManager):
             return 'this run left no artifact to read'
         return f'no reader for {fmt}'
 
+    async def loadSessionMesh(self, controller) -> str:
+        """Draw the mesh the resident Gmsh session holds, with its quality.
+
+        Plan 41 GN13. The hand-over is written by the session (a file, as
+        Plan 39 Q1 decided), read off the GUI thread, and drawn like any
+        native mesh -- no ``.msh`` written, no polyMesh made. Returns ''
+        on success or the reason nothing was drawn.
+        """
+        directory = Path(controller.case_path) / 'foammesh' / 'gmsh'             / 'handover'
+        loop = asyncio.get_running_loop()
+        try:
+            written = await loop.run_in_executor(
+                None, controller.handover, directory)
+        except Exception as error:                                 # noqa: BLE001
+            return str(error)
+        mesh = (written or {}).get('mesh') or {}
+        if not mesh.get('host_path'):
+            return 'the session holds no mesh to draw'
+        use = mesh.get('dims') or []
+        self._keepPassSnapshot(controller, mesh)
+        problem = await self.loadNative(
+            mesh['host_path'], artifact_id='gmsh-session',
+            stage=self.tr('Gmsh session'), surface_only=3 not in use)
+        if not problem:
+            self._nativeStoreRoot = Path(controller.case_path)
+        return problem
+
+    def _keepPassSnapshot(self, controller, mesh) -> None:
+        """Plan 41 GN23 (FM-08). The hand-over of a stage that ends a pass
+        (1D, 2D, 3D, Optimize, Set order) is kept for stage compare, keyed
+        to that pass. A failed keep is logged, never a failure to draw."""
+        from foammesh.core.gmsh import pass_snapshots
+        stages = list(getattr(getattr(controller, 'timeline', None),
+                              'stages', ()) or ())
+        last = stages[-1] if stages else None
+        key = pass_snapshots.pass_key(getattr(last, 'action', ''))
+        if key is None or not getattr(last, 'ok', False):
+            return
+        source = Path(mesh['host_path'])
+        try:
+            pass_snapshots.capture_file(
+                controller.case_path, key, source, action=last.action,
+                after=dict(getattr(last, 'after', {}) or {}))
+        except Exception:                                      # noqa: BLE001
+            logger.warning('could not keep the %s pass', key, exc_info=True)
+
     async def loadNative(self, path, artifact_id: str = '', stage: str = '',
                          *, surface_only: bool = False) -> str:
         """Draw a native Gmsh ``.msh`` directly, publishing nothing.
@@ -376,6 +766,7 @@ class MeshManager(ActorManager):
         # every one of them -- a reload blanked the mesh a user was looking
         # at and brought it back unchanged. The old scene stands in until the
         # new one is in hand, and the two swap in `_buildScene` below.
+        previous = _sourceState(self)
         self._time = None
         self._root = None
         self._loader = None
@@ -388,17 +779,36 @@ class MeshManager(ActorManager):
         self._surfaceOnly = bool(surface_only)
         self._setPreview({})
 
-        progressDialog = ProgressDialog(app.window, self.tr('Loading mesh'))
+        progressDialog = ProgressDialog(
+            app.window, self.tr('Loading mesh'), cancelable=True,
+            autoCloseOnCancel=False, onViewport=True)
         progressDialog.setLabelText(self.tr('Loading mesh…'))
         progressDialog.open()
+        cancellation = _Cancellation(progressDialog)
         try:
             # Off the event loop: the parse plus the VTK conversion is
             # seconds of pure Python on the meshes this product produces
             # (measured 0.98 s for the 141,486-cell finned_tube candidate),
             # and freezing the window for it is the R95 complaint again.
-            scene = await asyncio.get_running_loop().run_in_executor(
-                None, functools.partial(read_msh_scene, self._nativePath,
+            # Plan 39 VI1. Cancel stops waiting for the read and leaves the
+            # picture alone; the read thread is not a process and finishes
+            # on its own, its result dropped.
+            # Plan 41 GN13. The session's hand-over (``mesh.vtu``) is read
+            # by its own reader; a ``.msh`` by the MSH parser.
+            reader = (handover_scene.read_handover_scene
+                      if handover_scene.is_handover(self._nativePath)
+                      else read_msh_scene)
+            reading = asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(reader, self._nativePath,
                                         surface_only=self._surfaceOnly))
+            cancellation.task = reading
+            scene = await reading
+        except asyncio.CancelledError:
+            if not cancellation.requested:
+                raise
+            _restoreSource(self, previous)
+            self.loadCancelled.emit()
+            return ''
         except MshSceneError as error:
             # DP-128. The old scene stood in while the read ran; it cannot
             # stand in for a read that failed, so it comes down here instead.
@@ -422,10 +832,15 @@ class MeshManager(ActorManager):
         # Plan 35 CR3 step 5. `clear` disposes every actor of the old scene
         # here, on the GUI thread, and the collection that follows reaps
         # what it leaves before the new scene is built.
-        self.clear()
-        _swapScene()
-        self._visibility = True
-        self._buildScene(scene.vtk_mesh, hidden)
+        def _prepare():
+            self._nativePatches = dict(scene.patches)
+            self._nativeCurves = dict(getattr(scene, 'curves', None) or {})
+            self._nativeStoreRoot = None
+        if not await _swapInScene(
+                self, generation, _prepare,
+                getattr(self, '_buildSceneSteps', None), scene.vtk_mesh, hidden):
+            return ''
+
         return ''
 
     async def load(self, time: int, root=None, artifact_id: str = '',
@@ -476,6 +891,7 @@ class MeshManager(ActorManager):
         # DP-128. Not cleared here -- see `loadNative`. Reading a polyMesh is
         # seconds of work, and this method is what a stage reload calls, so
         # clearing first emptied the viewport for the whole of every reload.
+        previous = _sourceState(self)
         self._time = time
         self._root = Path(root) if root else Path(app.facadeClient.case_root)
         self._nativePath = None
@@ -483,9 +899,20 @@ class MeshManager(ActorManager):
         self._artifactId = str(artifact_id or '')
         self._stage = str(stage or '')
 
-        progressDialog = ProgressDialog(app.window, self.tr('Loading mesh'))
+        # Plan 39 VI14d. Opening the strip is 25 to 32 ms of its own (the
+        # strip, the status bar and the task list all answer it); the call
+        # that started the load, and the work after, each get a turn of the
+        # event loop around it so the three do not make one 60 ms hold.
+        await asyncio.sleep(SLICE_REST_SECONDS)
+        if generation != self._load_generation:
+            return
+        progressDialog = ProgressDialog(
+            app.window, self.tr('Loading mesh'), cancelable=True,
+            autoCloseOnCancel=False, onViewport=True)
         progressDialog.setLabelText(self.tr('Loading mesh…'))
         progressDialog.open()
+        await asyncio.sleep(SLICE_REST_SECONDS)
+        cancellation = _Cancellation(progressDialog)
 
         # DP-711. Region points reach the loader only when there are any.
         # Asked of the class: it needs no state of this manager.
@@ -501,10 +928,20 @@ class MeshManager(ActorManager):
 
         self._readStarted()
         finished = False
+        cancelled = False
         try:
-            vtkMesh = await loader.loadMesh(self._time)
+            # Plan 39 VI1. A task of its own, so Cancel can stop the read:
+            # cancelling it kills the preview worker's whole process tree
+            # (`local_worker.run_worker`), and the scene on screen stays.
+            reading = asyncio.ensure_future(loader.loadMesh(self._time))
+            cancellation.task = reading
+            vtkMesh = await reading
             preview = _previewOf(loader)
             finished = True
+        except asyncio.CancelledError:
+            if not cancellation.requested:
+                raise
+            cancelled = True
         except Exception:
             finished = True
             # DP-128. A read that failed leaves nothing to swap in, so the
@@ -521,6 +958,14 @@ class MeshManager(ActorManager):
                 _disposeLoader(loader)
                 if self._loader is loader:
                     self._loader = None
+            elif cancelled and self._loader is loader:
+                self._loader = None
+        if cancelled:
+            # The old scene was never cleared, so it is still the picture.
+            if generation == self._load_generation:
+                _restoreSource(self, previous)
+                self.loadCancelled.emit()
+            return
         if generation != self._load_generation:
             # Superseded mid-read. Leave the scene alone: the load that
             # overtook this one owns what is on screen now.
@@ -535,13 +980,72 @@ class MeshManager(ActorManager):
             self.previewNoticeChanged.emit(notice)
             return
         # Plan 35 CR3 step 5 -- see `loadNative`.
-        self.clear()
-        _swapScene()
-        self._visibility = True
-        self._setPreview(preview)
-        self._buildScene(vtkMesh, hidden, precomputed=preview['precomputed'],
-                         outline=preview['outline'])
+        # Plan 39 VI14b: swapped in slices, so the window keeps answering.
+        if not await _swapInScene(
+                self, generation, lambda: self._setPreview(preview),
+                getattr(self, '_buildSceneSteps', None), vtkMesh, hidden, precomputed=preview['precomputed'],
+                outline=preview['outline']):
+            return
         self.previewNoticeChanged.emit(self._previewNotice)
+        self._startCaseFields(generation)
+
+    # -- Plan 39 VI14 (check 8b): the hover names the cell's level and zone -- #
+
+    _caseFieldsTask = None
+
+    def _startCaseFields(self, generation: int) -> None:
+        """Read the case's cellLevel and cellZones for the volume on screen."""
+        if not self._volumeActors() or self.caseRoot() is None:
+            return
+        try:
+            self._caseFieldsTask = asyncio.get_running_loop().create_task(
+                self._attachCaseFields(generation))
+        except RuntimeError:
+            self._caseFieldsTask = None
+
+    async def _attachCaseFields(self, generation: int) -> None:
+        """Put the refinement level and the cell zones of the case's polyMesh
+        on the loaded volume, so the cell under the cursor says them.
+
+        Read off the GUI thread, by the reader Colour mesh by uses, and put
+        on only a volume of the whole mesh's cell count. A case without the
+        files, or whose files are of another mesh, leaves the volume as it
+        was: the readout then simply has no such row.
+        """
+        from vtkmodules.vtkCommonCore import vtkStringArray
+
+        from foammesh.core.section import section_colour
+        from foammesh.view.display_control import section_case_fields as fields
+
+        try:
+            meshDir, _why = fields.mesh_directory(str(self.caseRoot()))
+            if meshDir is None:
+                return
+            for key in (section_colour.CELL_LEVEL, section_colour.CELL_ZONE):
+                if not fields.has_member(meshDir, key):
+                    continue
+                field = await asyncio.to_thread(
+                    fields.read_case_field, meshDir, key)
+                if (generation != self._load_generation
+                        or field.status != fields.READ):
+                    continue
+                for actor in self._volumeActors():
+                    data = actor.dataSet()
+                    if not fields.attach(data, field):
+                        continue
+                    if key == section_colour.CELL_ZONE and field.names:
+                        names = vtkStringArray()
+                        names.SetName('cellZoneNames')
+                        for name in field.names:
+                            names.InsertNextValue(str(name))
+                        info = data.GetFieldData()
+                        if info.GetAbstractArray('cellZoneNames') is not None:
+                            info.RemoveArray('cellZoneNames')
+                        info.AddArray(names)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            logger.exception('Reading the case fields for the hover')
 
     def _setPreview(self, preview: dict):
         self._previewCounts = preview.get('counts')
@@ -577,8 +1081,28 @@ class MeshManager(ActorManager):
                         buildAnyway=True)
 
     async def loadFullVolume(self):
-        """Read the volume too (up to 5 M cells / 1 GB), in the worker."""
-        if self._time is None or self._nativePath is not None:
+        """Read the volume too, in the worker.
+
+        There is no cell cap (user rule 2026-10-01): the only refusal is the
+        free RAM the volume's files need (Plan 39 F1d).
+
+        Plan 41 GN13. A native mesh (a ``.msh`` or the session's hand-over)
+        drawn as its surface is read again as the volume; a file that holds
+        no volume says so and leaves the surface on screen.
+        """
+        if self._nativePath is not None:
+            if not self._surfaceOnly:
+                return
+            path, artifact, stage = (self._nativePath, self._artifactId,
+                                     self._stage)
+            problem = await self.loadNative(path, artifact, stage,
+                                            surface_only=False)
+            if problem:
+                self.nativeVolumeRefused.emit(problem)
+                await self.loadNative(path, artifact, stage,
+                                      surface_only=True)
+            return
+        if self._time is None:
             return
         await self.load(self._time, root=self._root,
                         artifact_id=self._artifactId, stage=self._stage,
@@ -638,7 +1162,18 @@ class MeshManager(ActorManager):
 
     def _buildScene(self, vtkMesh, hidden=frozenset(), precomputed=None,
                     outline=None):
+        """Build the whole scene in one go (see :meth:`_buildSceneSteps`)."""
+        for _ in self._buildSceneSteps(vtkMesh, hidden, precomputed, outline):
+            pass
+
+    def _buildSceneSteps(self, vtkMesh, hidden=frozenset(), precomputed=None,
+                         outline=None):
         """Turn one loaded mesh into actors, whichever reader produced it.
+
+        A generator: it yields between its steps (after each actor, and
+        between the closing passes) so a caller on the GUI thread can hand the
+        event loop back when a slice has used its budget -- Plan 39 VI14b,
+        the 6.6 M-cell load held the thread for 161 ms in this one call.
 
         The polyMesh reader and the native ``.msh`` reader hand over the same
         shape -- region -> boundary/internalMesh/zones -- so both meshes reach
@@ -665,6 +1200,9 @@ class MeshManager(ActorManager):
         # DP-713. A new scene carries no deviation colouring, so neither
         # does what describes it.
         self._deviation = None
+        self._deviationState = None
+        # Plan 39 VI16. Nor the Layers grown colouring.
+        self._layersGrown = None
         # DP-714. Nor any surface faded for a colouring it no longer has.
         self._qualityFaded = {}
         patch_ids: list[str] = []
@@ -673,6 +1211,7 @@ class MeshManager(ActorManager):
         region_ids: dict[str, list[str]] = {}
         patch_bounds: dict[str, tuple] = {}
         volume_of: dict[str, str] = {}
+        skin_regions: dict[str, list[str]] = {}
         if vtkMesh:
             multi_region = len(vtkMesh) > 1
             for rname, region in vtkMesh.items():
@@ -683,6 +1222,7 @@ class MeshManager(ActorManager):
                     display = f'{rname}/{bname}' if rname else bname
                     self.add(_adopt(BoundaryActor(polyData, actor_id, display),
                                     (rname, 'boundary', bname)))
+                    yield
                     patch_ids.append(actor_id)
                     # Not every reader hands over a vtkPolyData; one
                     # that cannot say where it is simply does not
@@ -717,12 +1257,17 @@ class MeshManager(ActorManager):
                     # meaning, so the volume is the one that steps back.
                     internal_actor.setDepthBias(VOLUME_DEPTH_BIAS)
                     self.add(internal_actor)
+                    yield
                     # The volume's own exterior surface is the same box its
                     # boundary patches describe, so a patch that fades without
                     # it fades behind an opaque copy of itself.
                     for member in region_ids[rname]:
                         volume_of[member] = internal_id
                     region_ids[rname].append(internal_id)
+                    # The region's patches in boundary order: the order the
+                    # worker numbered them in the exterior's `patchId`.
+                    skin_regions[internal_id] = [
+                        f'{prefix}{bname}' for bname in region['boundary']]
                 zones = region.get('zones', region)
                 # DP-711. `regions` is the reader naming the pieces of a mesh
                 # that holds several regions without cell zones (S5's fluid
@@ -743,6 +1288,7 @@ class MeshManager(ActorManager):
                         self.add(_adopt(
                             actor_type(data_set, actor_id, display),
                             (rname, category, zone_name)))
+                        yield
                         (region_part_ids if category == 'regions'
                          else zone_ids).append(actor_id)
                         region_ids[rname].append(actor_id)
@@ -754,16 +1300,82 @@ class MeshManager(ActorManager):
             self.add(BoundaryActor(outline, 'meshOutline',
                                    self.tr('Mesh outline')))
         self._assignPalettes()
+        yield
         self._fadeEnclosures(patch_bounds, volume_of)
+        yield
         for key in set(hidden) & set(self._actorInfos):
             self._actorInfos[key].setVisible(False)
-        self._presentArtifact()
+        self._buildSkins(skin_regions)
+        yield
+        yield from self._presentArtifactSteps()
+        yield
         self.applyToDisplay()
+        yield
         self.fitDisplay()
         self._notifyCellCountChange()
         rebuild = getattr(app.window, 'rebuildOverlayParts', None)
-        if rebuild is not None:
+        if rebuild is not None and not _partsQuiet(self._displayControl):
+            # Inside a sliced swap the overlay is rebuilt once, when the
+            # swap announces the parts (`_QuietParts.announce`).
             rebuild()
+
+    # -- Plan 39 VI4 (F1e): patches as edges over the volume's exterior ----- #
+
+    def _buildSkins(self, regions: dict):
+        """Let each volume's exterior carry its patches' faces.
+
+        ``regions`` maps a volume's actor id to its patches' ids in the order
+        the exterior's ``patchId`` numbers them. A volume whose exterior does
+        not say (a filter's, a native mesh's) is left as it was.
+        """
+        for volume_id, patch_ids in regions.items():
+            volume = self._actorInfos.get(volume_id)
+            patches = [self._actorInfos.get(i) for i in patch_ids]
+            if (not isinstance(volume, MeshActor) or not patches
+                    or not callable(getattr(volume, 'carriesPatchIds', None))
+                    or not volume.carriesPatchIds()
+                    or not all(isinstance(p, BoundaryActor) for p in patches)):
+                continue
+            self._skins.append(PatchSkin(volume, patches))
+        view = getattr(self._displayControl, 'view', None)
+        view = view() if callable(view) else None
+        if view is not None and hasattr(view, 'setPickResolver'):
+            view.setPickResolver(
+                self._resolveSkinPick if self._skins else None)
+
+    def skins(self) -> list:
+        return list(self._skins)
+
+    def remove(self, key):
+        # A skin lets go of its actors before any of them goes.
+        for skin in tuple(self._skins):
+            if key == skin.volume().id() or any(
+                    key == patch.id() for patch in skin.patches()):
+                skin.dispose()
+                self._skins.remove(skin)
+        super().remove(key)
+
+    def _resolveSkinPick(self, actor, x, y, renderer):
+        """A pick on a volume's exterior is the patch whose face it is."""
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+
+        for skin in self._skins:
+            if actor is not skin.volume().actor():
+                continue
+            picker = vtkCellPicker()
+            picker.SetTolerance(0.0005)
+            picker.PickFromListOn()
+            picker.AddPickList(actor)
+            if not picker.Pick(float(x), float(y), 0.0, renderer):
+                return actor
+            data = picker.GetDataSet()
+            ids = data.GetCellData().GetArray('patchId') if data else None
+            cell = int(picker.GetCellId())
+            if ids is None or not 0 <= cell < ids.GetNumberOfTuples():
+                return actor
+            patch = skin.patchAt(int(ids.GetValue(cell)))
+            return patch.actor() if patch is not None else actor
+        return actor
 
     def _fadeEnclosures(self, patch_bounds: dict, volume_of: dict):
         """Draw an outer boundary that holds a body so the body reads through it.
@@ -845,6 +1457,11 @@ class MeshManager(ActorManager):
         return 0
 
     def _presentArtifact(self):
+        """The whole of :meth:`_presentArtifactSteps`, in one go."""
+        for _ in self._presentArtifactSteps():
+            pass
+
+    def _presentArtifactSteps(self):
         """Put the mesh a load just built in front of the user (DP-95/DP-96).
 
         Three things, none of which the user should have to ask for: the
@@ -867,6 +1484,12 @@ class MeshManager(ActorManager):
                 setMode = getattr(actorInfo, 'setDisplayMode', None)
                 if setMode is not None:
                     setMode(member)
+        # Plan 39 VI14d. Each of the three costs 18 to 24 ms on the 6.6 M-cell
+        # volume (the bounds of 6 M points, the readouts that follow the
+        # summary, the geometry stepping aside); one slice of the swap
+        # holding all of them held the GUI thread 42 ms on top of its
+        # neighbours.
+        yield
         # An actor that cannot say where it is is not a reason to refuse to
         # draw the mesh. The size sentence loses its extent and keeps its
         # counts, which is the part that cannot be got anywhere else.
@@ -878,7 +1501,9 @@ class MeshManager(ActorManager):
             size = None
         self._summary = summary_text(
             self._stage, kind, cells, faces, self.pointCount(), size)
+        yield
         self.meshSummaryChanged.emit(self._summary)
+        yield
         if hides_geometry(kind):
             geometry = getattr(app.window, 'geometryManager', None)
             hide = getattr(geometry, 'hide', None)
@@ -1129,7 +1754,9 @@ class MeshManager(ActorManager):
         self.applyToDisplay()
         return coloured
 
-    def showFidelityHotspots(self, fields, artifact_id: str = '') -> int:
+    def showFidelityHotspots(self, fields, artifact_id: str = '',
+                             unit=live_distance.DEFAULT_UNIT,
+                             tolerance=None) -> int:
         """WP3.3 tier two: colour each patch by *where* it left the reference.
 
         ``fields`` is ``solver_name -> (face_ids, deviations)``. A section-level
@@ -1146,6 +1773,11 @@ class MeshManager(ActorManager):
             return 0
         # DP-713. Model units in the file, millimetres on screen, and the
         # faces put where their labels say rather than where they fell.
+        # Plan 39 VI5: ``unit`` is the case's length unit, not always metres.
+        # Plan 39 VI6 (F4e): a stored run holds closest distances, never
+        # negative, so it is painted on a 0 -> scale ramp and with the run's
+        # own tolerance (``tolerance``, in mm) rather than a signed scale.
+        factor = live_distance.unit_to_mm(unit)
         measured = {}
         for name, field in (fields or {}).items():
             if self._actorInfos.get(name) is None:
@@ -1156,17 +1788,36 @@ class MeshManager(ActorManager):
                 continue
             measured[name] = (
                 np.asarray(face_ids, dtype=np.int64).ravel(),
-                np.asarray(deviations, dtype=np.float64).ravel()
-                * live_distance.MODEL_TO_MM)
-        return self._paintDeviation(measured, self.patchStartFaces(), 'run')
+                np.abs(np.asarray(deviations, dtype=np.float64).ravel())
+                * factor)
+        universe = [(name, name in measured,
+                     '' if name in measured else 'not in the run')
+                    for name in self._patchIds]
+        return self._paintDeviation(
+            measured, self.patchStartFaces(), 'run', signed=False,
+            tolerance=tolerance, universe=universe)
 
-    def showLiveDeviation(self, reference) -> int:
-        """DP-713. Colour each patch by its signed distance to ``reference``.
+    def showLiveDeviation(self, reference,
+                          unit=live_distance.DEFAULT_UNIT,
+                          tolerance=None, identity=None) -> int:
+        """DP-713. Colour each patch by its distance to ``reference``.
 
         Viewport audit 0925 F8. With no stored fidelity run the colouring had
         nothing to show, on a case whose reference geometry was loaded in
-        the same window. This measures every patch face centre against that
-        geometry now -- blue short of it, red past it -- on one shared range.
+        the same window. This measures the patches that have a reference
+        against that geometry now.
+
+        Plan 39 VI5. ``reference`` is in the mesh's frame and ``unit`` is the
+        case's length unit (a name or metres per model unit); the figures are
+        millimetres whatever the mesh is modelled in.
+
+        Plan 39 VI6. Only the patches that stand for a surface of the geometry
+        are ticked and measured (F4b): a wall, or a patch ``identity`` (the
+        patch-identity map) traces to prepared geometry -- not the far field,
+        inlet, outlet, symmetry, empty, cyclic or wedge. The others stay
+        listed, unticked, and a tick measures them anyway
+        (`setDeviationSurface`). ``tolerance`` (mm) is the neutral band. The
+        sign is kept only against a closed reference (F4f).
         """
         if reference is None:
             return 0
@@ -1176,54 +1827,206 @@ class MeshManager(ActorManager):
             if (isinstance(actorInfo, BoundaryActor)
                     and actorInfo.dataSet() is not None):
                 surfaces[actor_id] = actorInfo.dataSet()
-        distances = live_distance.face_distances_mm(reference, surfaces)
-        fields = {name: (np.arange(values.size, dtype=np.int64), values)
-                  for name, values in distances.items()}
+        types = getattr(self, 'patchTypes', None)
+        types = types() if callable(types) else {}
+        universe = []
+        for name in surfaces:
+            solver = name.split(':', 1)[-1]
+            known = identity.get(solver) if identity is not None else None
+            has, why = live_distance.patch_reference(
+                solver, types.get(name), known)
+            universe.append((name, has, why))
+        ticked = {name for name, has, _why in universe if has}
+        notice = ''
+        if not ticked:
+            # No patch traces to the geometry (a mesh imported without its
+            # sidecar): measure what could be a surface rather than nothing.
+            ticked = {name for name, _has, why in universe
+                      if why not in live_distance._NO_REFERENCE_TYPES}
+            if ticked:
+                notice = ('No patch is traced to the geometry; every patch '
+                          'that can be a surface is measured.')
+        prepared = live_distance.prepare_reference(reference)
+        fields = {}
+        measure = {name: surfaces[name] for name in ticked}
+        distances, _prepared = live_distance.measure_surfaces_mm(
+            prepared, measure, unit)
+        for name, values in distances.items():
+            fields[name] = (np.arange(values.size, dtype=np.int64), values)
+        state = {'prepared': prepared, 'unit': unit, 'live': True}
         return self._paintDeviation(
-            fields, {name: 0 for name in fields}, 'live')
+            fields, {name: 0 for name in surfaces}, 'live',
+            signed=prepared.closed, tolerance=tolerance, universe=universe,
+            ticked=ticked,
+            notice=' '.join(part for part in (prepared.notice, notice)
+                            if part),
+            state=state)
 
-    def _paintDeviation(self, fields, starts, source) -> int:
-        """Paint ``name -> (face labels, mm)`` on one symmetric range."""
-        valueRange = live_distance.symmetric_range(
-            values for _ids, values in fields.values())
+    def _paintDeviation(self, fields, starts, source, *, signed=None,
+                        tolerance=None, scale=None, universe=None,
+                        ticked=None, notice='', state=None,
+                        keep_empty=False) -> int:
+        """Paint ``name -> (face labels, mm)`` by |d| on one magnitude scale.
+
+        Plan 43 LY11. The faces carry ``|d|`` (a face at -d and one at +d are
+        one colour); the signed values stay in the readout for the numbers.
+
+        ``universe`` is ``[(name, has_reference, why_not)]`` for every patch
+        of the Surfaces list and ``ticked`` the names to paint (default: every
+        name in ``fields``); the others keep their plain colour. ``scale``
+        overrides the default, the 98th percentile of |d| over what is shown.
+        """
+        if signed is None:
+            signed = source != 'run'
+        universe = list(universe) if universe is not None else [
+            (name, True, '') for name in fields]
+        ticked = set(fields) if ticked is None else set(ticked)
+        shown = {name: field for name, field in fields.items()
+                 if name in ticked}
         self._deviation = None
-        if valueRange is None:
+        self._deviationState = dict(
+            fields=dict(fields), starts=dict(starts),
+            source=source, signed=bool(signed), universe=universe,
+            ticked=set(ticked), notice=notice,
+            tolerance=0.0 if tolerance is None else abs(float(tolerance)),
+            scale_user=scale, **(state or {}))
+        # Whatever is not shown goes back to its plain colour.
+        for name, _has, _why in universe:
+            if name in shown:
+                continue
+            info = self._actorInfos.get(name)
+            if info is not None and info.faceScalarName() is not None:
+                info.clearFaceScalars()
+                info.resetColor()
+        values = [field[1] for field in shown.values()]
+        autoScale = live_distance.absolute_scale(values)
+        scale = float(scale) if scale else autoScale
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = autoScale
+        if not shown or live_distance._joined(values).size == 0:
+            if keep_empty and universe:
+                self._deviation = live_distance.DeviationReadout(
+                    fields={}, value_range=live_distance.scale_range(
+                        scale, signed),
+                    lookup_table=live_distance.deviation_lut(
+                        scale, self._deviationState['tolerance'], signed),
+                    source=source, signed=bool(signed), scale=scale,
+                    tolerance=self._deviationState['tolerance'],
+                    notice=notice, surfaces=MeshManager._deviationSurfaceRows(self))
             self.applyToDisplay()
             return 0
-        lut = deviationLut(valueRange)
+        tolerance = self._deviationState['tolerance']
+        valueRange = live_distance.scale_range(scale, signed)
+        lut = live_distance.deviation_lut(scale, tolerance, signed)
         painted = {}
-        for name, (face_ids, values) in fields.items():
+        for name, (face_ids, field) in shown.items():
             actorInfo = self._actorInfos[name]
             if actorInfo.setFaceScalars(
-                    'deviation', face_ids, values,
+                    'deviation', face_ids, np.abs(np.asarray(
+                        field, dtype=np.float64)),
                     start_face=starts.get(name), value_range=valueRange,
-                    lookup_table=lut):
+                    lookup_table=lut, magnitude=True):
                 painted[name] = actorInfo.faceScalars('deviation')
-        if painted:
+        if painted or keep_empty:
             self._deviation = live_distance.DeviationReadout(
                 fields=painted, value_range=valueRange, lookup_table=lut,
-                source=source)
+                source=source, signed=bool(signed), scale=scale,
+                tolerance=tolerance, notice=notice,
+                surfaces=MeshManager._deviationSurfaceRows(self),
+                signed_fields={name: np.asarray(shown[name][1],
+                                                dtype=np.float64)
+                               for name in painted})
         self.applyToDisplay()
         return len(painted)
+
+    def _deviationSurfaceRows(self) -> tuple:
+        """``[(name, ticked, has_reference, why_not)]`` for the Surfaces list."""
+        state = getattr(self, '_deviationState', None) or {}
+        ticked = state.get('ticked', set())
+        return tuple((name, name in ticked, bool(has), why)
+                     for name, has, why in state.get('universe', ()))
 
     def deviationReadout(self):
         """DP-713. What the deviation colouring on screen shows, or None."""
         return getattr(self, '_deviation', None)
 
-    def patchStartFaces(self) -> dict[str, int]:
-        """DP-713. ``actor id -> startFace`` of every patch on screen.
+    def setDeviationTolerance(self, tolerance) -> bool:
+        """Plan 39 VI6 (F4a). Move the neutral band; nothing is measured again.
 
-        A face label is only a cell of its patch's actor once the patch's
-        first label is known. Read from the boundary file of the mesh the
-        viewport drew -- the time's own polyMesh when it has one -- and empty
-        for a native mesh or one that cannot be read, which leaves only a
-        field with one value per face to paint.
+        The scale's table is refilled in place, so the faces on screen and
+        the legend that share it repaint together.
+        """
+        readout = getattr(self, '_deviation', None)
+        state = getattr(self, '_deviationState', None)
+        if readout is None or state is None:
+            return False
+        tolerance = abs(float(tolerance))
+        state['tolerance'] = tolerance
+        readout.tolerance = tolerance
+        live_distance.fill_deviation_lut(
+            readout.lookup_table, readout.scale, tolerance, readout.signed)
+        self.applyToDisplay()
+        return True
+
+    def setDeviationScale(self, scale=None) -> bool:
+        """Plan 39 VI6. Set the distance the ramp reaches; ``None`` = automatic."""
+        state = getattr(self, '_deviationState', None)
+        if state is None or getattr(self, '_deviation', None) is None:
+            return False
+        self._paintDeviation(
+            state['fields'], state['starts'], state['source'],
+            signed=state['signed'], tolerance=state['tolerance'],
+            scale=scale or None, universe=state['universe'],
+            ticked=state['ticked'], notice=state['notice'],
+            state={key: state[key] for key in ('prepared', 'unit', 'live')
+                   if key in state}, keep_empty=True)
+        return True
+
+    def setDeviationSurface(self, name, ticked: bool) -> bool:
+        """Plan 39 VI6 (Q2). Tick or untick one patch of the Surfaces list.
+
+        Ticking measures only that patch (when it has not been) and repaints;
+        the rest of the picture is not measured again.
+        """
+        state = getattr(self, '_deviationState', None)
+        if state is None or name not in [row[0] for row in state['universe']]:
+            return False
+        shown = set(state['ticked'])
+        if ticked:
+            shown.add(name)
+            if name not in state['fields']:
+                prepared = state.get('prepared')
+                info = self._actorInfos.get(name)
+                if prepared is None or info is None or info.dataSet() is None:
+                    return False
+                distances, _p = live_distance.measure_surfaces_mm(
+                    prepared, {name: info.dataSet()}, state.get('unit'))
+                values = distances[name]
+                state['fields'][name] = (
+                    np.arange(values.size, dtype=np.int64), values)
+        else:
+            shown.discard(name)
+        self._paintDeviation(
+            state['fields'], state['starts'], state['source'],
+            signed=state['signed'], tolerance=state['tolerance'],
+            scale=state.get('scale_user'), universe=state['universe'],
+            ticked=shown, notice=state['notice'],
+            state={key: state[key] for key in ('prepared', 'unit', 'live')
+                   if key in state}, keep_empty=True)
+        return True
+
+    def _boundaryPatches(self) -> dict:
+        """``actor id -> BoundaryPatch`` of every patch on screen.
+
+        Read from the boundary file of the mesh the viewport drew -- the
+        time's own polyMesh when it has one -- and empty for a native mesh or
+        one that cannot be read.
         """
         from foammesh.core.mesh.poly_mesh_boundary import _read_boundary
 
         if self._root is None:
             return {}
-        starts: dict[str, int] = {}
+        found: dict = {}
         bases = [self._root / str(self._time)] if self._time else []
         bases.append(self._root / 'constant')
         for rname in (self._regionIds or {'': []}):
@@ -1240,9 +2043,63 @@ class MeshManager(ActorManager):
                                  exc_info=True)
                     continue
                 for patch in patches:
-                    starts[f'{prefix}{patch.name}'] = int(patch.start_face)
+                    found[f'{prefix}{patch.name}'] = patch
                 break
-        return starts
+        return found
+
+    def patchStartFaces(self) -> dict[str, int]:
+        """DP-713. ``actor id -> startFace`` of every patch on screen.
+
+        A face label is only a cell of its patch's actor once the patch's
+        first label is known. Empty for a native mesh or one that cannot be
+        read, which leaves only a field with one value per face to paint.
+        """
+        if self._nativePath is not None:
+            # Plan 41 GN23. A native mesh has no boundary file: a patch's
+            # first label is the count of the faces drawn before it.
+            starts, running = {}, 0
+            for name, count in self._nativePatches.items():
+                starts[name] = running
+                running += int(count)
+            return starts
+        return {name: int(patch.start_face)
+                for name, patch in self._boundaryPatches().items()}
+
+    def patchTypes(self) -> dict[str, str]:
+        """Plan 39 VI6. ``actor id -> boundary type`` of every patch on screen.
+
+        Plan 42 SG2. A native mesh has no boundary file; its patches take the
+        type their group's role says (the role the Gmsh route publishes them
+        with): a far field, inlet or outlet is a plain ``patch``, a symmetry
+        plane ``symmetry``, a wall ``wall``, and a group that announces
+        nothing has no type, so the measuring code still asks its name.
+        """
+        if self.nativePath() is not None:
+            from foammesh.core.gmsh.layer_targets import boundary_category
+
+            types = {}
+            for name in self._patchIds:
+                category = boundary_category(name.split(':', 1)[-1])
+                types[name] = _NATIVE_TYPE_OF_CATEGORY.get(category, '')
+            return types
+        return {name: str(patch.patch_type)
+                for name, patch in self._boundaryPatches().items()}
+
+    def nativeScaleToMetres(self) -> float:
+        """Plan 42 SG2. Metres in one coordinate unit of the native mesh on
+        screen: what the session recorded beside it at hand-over
+        (``mesh.names.json``), else 1.0 -- the mesh the product's own Gmsh
+        run writes is in metres. 1.0 for a mesh read from a case."""
+        if self._nativePath is None:
+            return 1.0
+        import json
+        try:
+            text = (Path(self._nativePath).parent
+                    / 'mesh.names.json').read_text(encoding='utf-8')
+            value = float(json.loads(text).get('metres_per_unit'))
+        except (OSError, ValueError, TypeError):
+            return 1.0
+        return value if value > 0.0 else 1.0
 
     def clearFidelityColouring(self):
         """Put every patch back on its palette colour and drop the field."""
@@ -1250,7 +2107,144 @@ class MeshManager(ActorManager):
             actorInfo.clearFaceScalars()
             actorInfo.resetColor()
         self._deviation = None
+        self._deviationState = None
+        self._layersGrown = None
         self.applyToDisplay()
+
+    # -- Plan 39 VI16 (I6): Colour mesh by > Layers grown ------------------- #
+
+    def showLayersGrown(self, rows) -> int:
+        """Paint each patch with the layers the run achieved on it.
+
+        *rows* are the stored layer report's rows. A patch that asked for
+        layers takes the count it got on one table (0 to the largest request);
+        a patch that asked for none, or that the report does not name, is
+        grey. Returns how many patches were painted by count.
+        """
+        if (getattr(self, '_layersGrown', None) is not None
+                or getattr(self, '_deviation', None) is not None):
+            self.clearFidelityColouring()
+        painted = layers_grown.plan(rows, self._patchIds)
+        high = layers_grown.top(painted)
+        table = layers_grown.lookup_table(high)
+        grey = QColor.fromRgbF(*layers_grown.GREY)
+        counted = 0
+        for actorId, paint in painted.items():
+            actor = self._actorInfos.get(actorId)
+            if actor is None:
+                continue
+            actor.clearFaceScalars()
+            data = actor.dataSet()
+            cells = data.GetNumberOfCells() if data is not None else 0
+            if paint.achieved is None or cells <= 0:
+                actor.setColor(grey)
+                continue
+            if actor.setFaceScalars(
+                    layers_grown.LEGEND_KEY, None,
+                    np.full(cells, paint.achieved, dtype=np.float64),
+                    value_range=(0.0, high), lookup_table=table):
+                counted += 1
+        self._layersGrown = {
+            'table': table, 'range': (0.0, high),
+            'patches': {a: p.achieved for a, p in painted.items()}}
+        self.applyToDisplay()
+        return counted
+
+    def layersGrownReadout(self):
+        """``{'table', 'range', 'patches'}`` of the colouring on screen, or None."""
+        return getattr(self, '_layersGrown', None)
+
+    def clearLayersGrown(self):
+        if getattr(self, '_layersGrown', None) is not None:
+            self.clearFidelityColouring()
+
+    # -- Plan 39 VI16 (I6): Colour mesh by, on the volume's exterior -------- #
+
+    def _volumeActors(self) -> list:
+        return [info for info in self._actorInfos.values()
+                if isinstance(info, MeshActor)]
+
+    async def colourVolumeBy(self, key: str):
+        """Paint the loaded volume's exterior by a *Colour cut by* choice.
+
+        Cell type, refinement level, region / zone and the four quality
+        metrics, on the same mapping, table and quality band the section
+        uses. Returns ``(mapped, reason)``: *mapped* is the legend's mapping
+        (``{'kind': 'none'}`` when nothing was painted) and *reason* says why
+        not.
+        """
+        from foammesh.core.section import section_colour
+        from foammesh.rendering.section_colour_map import (
+            MapperColouring, cellArray, stampCellIdentity)
+        from foammesh.view.display_control import section_case_fields as fields
+
+        none = {'kind': 'none'}
+        actors = self._volumeActors()
+        if not actors:
+            return none, 'No volume mesh is loaded.'
+        item = section_colour.choice(key)
+        names = None
+        if item.key == section_colour.CELL_TYPE:
+            for actor in actors:
+                stampCellIdentity(actor.dataSet())
+        elif fields.is_case_field(item.key):
+            root = self.caseRoot()
+            if not root:
+                return none, ('{0} is read from the polyMesh of an OpenFOAM '
+                              'case; this mesh has none.').format(item.label)
+            meshDir, why = fields.mesh_directory(str(root))
+            if meshDir is None or not fields.has_member(meshDir, item.key):
+                return none, (why or fields.absent_reason(item.key))
+            revision = fields.mesh_revision(meshDir)
+            field = await asyncio.to_thread(
+                fields.read_case_field, meshDir, item.key)
+            if field.status != fields.READ:
+                return none, field.reason
+            if not any(fields.attach(actor.dataSet(), field)
+                       for actor in actors):
+                return none, ('{0} is read for the whole mesh, and none of '
+                              'the cells on screen are the whole mesh.'
+                              ).format(item.label)
+            if item.key == section_colour.CELL_ZONE:
+                names = field.names
+        elif item.key.startswith(section_colour.QUALITY_PREFIX):
+            state = await self.ensureQualityFields()
+            if state != 'ready':
+                return none, ('The quality fields could not be computed '
+                              '({0}).').format(state)
+        else:
+            return none, 'There is no such colouring.'
+        values = [v for v in (cellArray(actor.dataSet(), item.array)
+                              for actor in actors) if v is not None]
+        if not values:
+            return none, 'The mesh has no {0} values.'.format(item.label)
+        mapped = section_colour.mapping(
+            item.key, np.concatenate(values), names=names)
+        colouring = getattr(self, '_exteriorColouring', None)
+        if colouring is None:
+            colouring = self._exteriorColouring = MapperColouring()
+        painted = sum(1 for actor in actors
+                      if actor.paintExterior(mapped, colouring))
+        if not painted:
+            return none, ('A cut or filter is on the volume; colour it with '
+                          'Colour cut by in the section.')
+        self.applyToDisplay()
+        return mapped, ''
+
+    def clearVolumeColour(self) -> bool:
+        """Put the volume's exterior back on its plain colour."""
+        cleared = False
+        for actor in self._volumeActors():
+            clear = getattr(actor, 'clearExteriorPaint', None)
+            cleared = (clear is not None and clear()) or cleared
+        if cleared:
+            self.applyToDisplay()
+            self.volumeColourDropped.emit()
+        return cleared
+
+    def volumeColoured(self) -> bool:
+        return any(getattr(actor, 'exteriorPainted', lambda: False)()
+                   for actor in self._volumeActors())
 
     def clearFailedCells(self):
         self.remove('failedCells')
@@ -1273,11 +2267,40 @@ class MeshManager(ActorManager):
 
         self._notifyCellCountChange()
 
+    def add(self, actorInfo):
+        super().add(actorInfo)
+        shown = self._actorInfos.get(actorInfo.id())
+        busy = getattr(shown, 'cutBusy', None)
+        if isinstance(shown, MeshActor) and busy is not None:
+            busy.connect(self._volumeCutBusy,
+                         Qt.ConnectionType.UniqueConnection)
+
+    def _volumeCutBusy(self, busy):
+        if not busy:
+            # The count comes from the output the filters finished.
+            self._notifyCellCountChange()
+        self.volumeCutBusy.emit(bool(busy))
+
+    def isVolumeCutting(self) -> bool:
+        """Whether a cut or band over the volume is still being worked out."""
+        return any(isinstance(info, MeshActor) and info.isCutting()
+                   for info in self._actorInfos.values())
+
+    def cancelVolumeCut(self) -> bool:
+        """Stop the cut being worked out; the picture on screen stays."""
+        stopped = False
+        for info in list(self._actorInfos.values()):
+            if isinstance(info, MeshActor):
+                stopped = info.cancelCut() or stopped
+        return stopped
+
     def clip(self, planes):
+        self.clearVolumeColour()
         super().clip(planes)
         self._notifyCellCountChange()
 
     def slice(self, plane):
+        self.clearVolumeColour()
         super().slice(plane)
         self._notifyCellCountChange()
 

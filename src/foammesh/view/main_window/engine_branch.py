@@ -20,13 +20,15 @@ import json
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QStackedWidget, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.core.engine.contracts import TaskState
 from foammesh.core.quantities import count_text
+from foammesh.view.widgets.folded_note import FoldedNote
 from foammesh.core.workflow.dynamic import EngineWorkflowGraph
 from foammesh.view.gmsh_workflow import GMSH_TASK_PAGES
 from foammesh.view.snappy_workflow import SNAPPY_TASK_PAGES
@@ -34,6 +36,7 @@ from foammesh.view.facade_client import query, submit
 from foammesh.view.outside_task import modal
 
 from .run_narration import describe_result, newest_log
+from widgets import async_message_box as messages
 
 
 def stage_timeout_parameters() -> dict:
@@ -222,6 +225,8 @@ class EngineBranchView(QWidget):
     #: Plan 37 UF5 DP-1043. Tasks whose published result is the mesh on
     #: disk, read with the task states. Their pages are read-only.
     _resultLocked: frozenset = frozenset()
+    #: Plan 43 LY9. Every locked step, the setup steps included.
+    _lockedSteps: frozenset = frozenset()
     #: Plan 37 F5. The publication record of each task, as last read: its
     #: ``revision`` is the identity a run's result is named by.
     _publications: dict = {}
@@ -251,8 +256,13 @@ class EngineBranchView(QWidget):
         self.setAccessibleName(self.tr('Selected meshing engine tasks'))
 
         layout = QVBoxLayout(self)
+        # Plan 44 MF5. The task name is the sheet header's title now; this
+        # label stays built and filled (it is where the words are authored and
+        # what `_updateHeading` writes) and stays out of the layout, like
+        # `engineTaskTitle` on the task page.
         self._heading = QLabel(self)
         self._heading.setObjectName('engineBranchHeading')
+        self._heading.setVisible(False)
         self._runAll = QPushButton(self.tr('Run to end'), self)
         self._runAll.setObjectName('branchRunCompleteMesh')
         self._runAll.setAccessibleDescription(self.tr(
@@ -263,10 +273,51 @@ class EngineBranchView(QWidget):
         # A whole-pipeline run belongs to the engine, not to whichever task
         # happens to be open. On the task page it sat a button's width from
         # "Run this step", and the two read as variants of one action.
-        heading_row = QHBoxLayout()
-        heading_row.addWidget(self._heading, 1)
-        heading_row.addWidget(self._runAll, 0)
-        layout.addLayout(heading_row)
+        #
+        # Plan 40 UXA4 (#23, #24). It is not drawn in the heading any more:
+        # the footer's drop-down offers it (`StepManager.footerMenuActions`)
+        # on the pages that have a stage after them, and presses this
+        # button, so the in-flight guard and the refusal text still live in
+        # one place. The heading carries the ... menu in its place.
+        #
+        # Plan 44 MF5. The heading is gone; the ... menu is carried by the
+        # settings sheet's one header (`releaseMoreMenuButton`). Until a sheet
+        # takes it, it stays here in a row of its own, so a branch that has no
+        # sheet around it loses no tool.
+        self._moreRow = QWidget(self)
+        self._moreRow.setObjectName('engineBranchMoreRow')
+        heading_row = QHBoxLayout(self._moreRow)
+        heading_row.setContentsMargins(0, 0, 0, 0)
+        heading_row.addStretch(1)
+        self._more = QToolButton(self)
+        self._more.setObjectName('taskMoreMenu')
+        self._more.setText('⋯')
+        self._more.setAccessibleName(self.tr('More actions for this step'))
+        self._more.setToolTip(self.tr('More actions for this step'))
+        self._more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._moreMenu = QMenu(self._more)
+        self._moreMenu.setObjectName('taskMoreMenuList')
+        self._moreMenu.setToolTipsVisible(True)
+        self._moreMenu.aboutToShow.connect(self._fillMoreMenu)
+        self._more.setMenu(self._moreMenu)
+        heading_row.addWidget(self._more, 0)
+        layout.addWidget(self._moreRow)
+        # Plan 40 UXA5 (F8e). What the step left: the cell count large, then
+        # faces, points, boundary faces, time and the change since the stage
+        # before. Drawn once the step has run; hidden before.
+        self._strips: dict = {}
+        # Plan 44 FX2. One line until it is opened: three wrapped lines of
+        # counts pushed Castellation and Boundary layers past the 300 px
+        # sheet at 1280x800 (MF27 live pass, G-FITS-1).
+        self._strip = FoldedNote(self)
+        self._strip.setObjectName('engineBranchResultStrip')
+        self._strip.setTextFormat(Qt.TextFormat.RichText)
+        self._strip.setWordWrap(True)
+        self._strip.setAccessibleName(self.tr('Result of this step'))
+        self._strip.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._strip.setVisible(False)
+        layout.addWidget(self._strip)
 
         # R159. Saved task progress can be discarded behind the user's back --
         # a workflow digest bump, an unreadable file, states inconsistent with
@@ -427,7 +478,10 @@ class EngineBranchView(QWidget):
                     lambda tid: self._on_task_transition(tid, 'revert'))
             unlock_signal = getattr(page, 'unlockRequested', None)
             if unlock_signal is not None:
-                unlock_signal.connect(lambda tid: self.requestUnlock(tid))
+                # Plan 44 MF18 K2: the page's lock chip asked inline (first
+                # press) and was confirmed (second press), so no modal follows.
+                unlock_signal.connect(
+                    lambda tid: self.requestUnlock(tid, confirmed=True))
             run_signal = getattr(page, 'runRequested', None)
             if run_signal is not None:
                 run_signal.connect(self._on_run_requested)
@@ -476,9 +530,104 @@ class EngineBranchView(QWidget):
         down whenever a mounted page carried its own copy; that copy has since
         moved off the task page, so this is now the only one.
         """
-        self._runAll.setVisible(
-            bool(engine_id) and engine_id in self.RUN_OPERATIONS)
+        # Plan 40 UXA4: never drawn in the heading; the footer offers it.
+        self._runAll.setVisible(False)
+        self._runAllEngine = bool(engine_id) and engine_id in self.RUN_OPERATIONS
         self._gradeRunAll()
+
+    #: Rows nothing follows. Running "to the end" from one of them would
+    #: re-run what the user has just judged (Plan 40 UXA4, #24).
+    NO_RUN_TO_END_TASKS = frozenset({
+        'snappy.qa', 'gmsh.qa', 'common.export'})
+
+    def runToEndOffered(self, task_id: str) -> bool:
+        """Whether the footer's drop-down may offer *Run to end* here."""
+        from .meshing_method_branch import owning_row
+
+        if not getattr(self, '_runAllEngine', False):
+            return False
+        row = owning_row(self.engine_id, task_id) or task_id
+        return task_id not in self.NO_RUN_TO_END_TASKS             and row not in self.NO_RUN_TO_END_TASKS
+
+    def rowFooterActions(self, task_id: str) -> list:
+        """The footer drop-down's page acts for the row *task_id* belongs to.
+
+        Plan 43 LY13 (D4). A row is the set of tasks one press settles, so the
+        acts of every member page are offered on the row: *Publish again* is
+        the act of ``gmsh.publish``, a substep of *Generate mesh*, and no
+        other press performs it. The row's own page comes first.
+        """
+        from .meshing_method_branch import row_tasks
+
+        order = [task_id] + [name for name in (
+            row_tasks(self._engine_id, task_id) or ()) if name != task_id]
+        actions: list = []
+        seen: set = set()
+        for name in order:
+            ask = getattr(self._pages.get(name), 'footerActions', None)
+            if ask is None:
+                continue
+            for row in ask():
+                if row[0] not in seen:
+                    seen.add(row[0])
+                    actions.append(row)
+        return actions
+
+    def runToEndEnabled(self) -> bool:
+        return self._runAll.isEnabled()
+
+    def runToEndTooltip(self) -> str:
+        return self._runAll.toolTip() or self.tr(self.RUN_ALL_DESCRIPTION)
+
+    def pressRunToEnd(self) -> None:
+        self._runAll.click()
+
+    def moreActions(self, task_id: str = '') -> list:
+        """The ... menu: ``(object name, label, enabled, tooltip, callback)``.
+
+        Always the same four rows in the same order (Plan 40 UXA4, #25):
+        Revert and edit, Details, Restore previous mesh, Reset page to
+        defaults. A row that does not apply is shown disabled with its
+        reason rather than left out, so the menu never moves.
+        """
+        task_id = task_id or self.currentTask()
+        page = self._pages.get(task_id)
+        asked = {}
+        if page is not None and hasattr(page, 'headerActions'):
+            try:
+                asked = {row[0]: row for row in page.headerActions()}
+            except Exception:                                # noqa: BLE001
+                asked = {}
+        none = self.tr('This page has no settings of its own.')
+
+        def row(name, label):
+            return asked.get(name) or (name, label, False, none, None)
+
+        undo = {}
+        try:
+            undo = self.undoAvailable()
+        except Exception:                                    # noqa: BLE001
+            undo = {}
+        restore = (
+            'taskRestorePreviousMesh', self.tr('Restore previous mesh'),
+            bool(undo),
+            '' if undo else self.tr('There is no unlock to undo.'),
+            self.requestUndoUnlock if undo else None)
+        return [row('taskRevertAndEdit', self.tr('Revert and edit')),
+                row('taskDetails', self.tr('Details…')),
+                restore,
+                row('taskResetDefaults', self.tr('Reset page to defaults'))]
+
+    def _fillMoreMenu(self) -> None:
+        self._moreMenu.clear()
+        for name, label, enabled, tooltip, callback in self.moreActions():
+            action = self._moreMenu.addAction(label)
+            action.setObjectName(name)
+            action.setEnabled(bool(enabled) and callback is not None)
+            action.setToolTip(str(tooltip or ''))
+            if callback is not None:
+                action.triggered.connect(
+                    lambda _checked=False, cb=callback: cb())
 
     #: What "Run to end" says about itself when nothing refuses it.
     RUN_ALL_DESCRIPTION = 'Run every stage of the selected engine in one go.'
@@ -533,7 +682,9 @@ class EngineBranchView(QWidget):
         self._setStateNotice('')
         self._subscribeToChecks()
         self._resultLocked = frozenset()
+        self._lockedSteps = frozenset()
         self._publications = {}
+        self._strips = {}
         try:
             state_payload = query(
                 self._client, 'mesh.workflow.task_state',
@@ -542,6 +693,10 @@ class EngineBranchView(QWidget):
             self._checking = dict(state_payload.get('checking') or {})
             self._checkFailures = dict(
                 state_payload.get('check_failures') or {})
+            self._strips = {
+                str(task): dict(record) for task, record in
+                (state_payload.get('strips') or {}).items()
+                if isinstance(record, dict)}
         except Exception:                                    # noqa: BLE001
             self._setStateNotice(self.tr(
                 'Saved task progress for this engine could not be read, so '
@@ -549,6 +704,7 @@ class EngineBranchView(QWidget):
                 'been changed.'))
             return graph
         self._resultLocked = frozenset(snapshot.get('locked') or ())
+        self._lockedSteps = frozenset(snapshot.get('locked_steps') or ())
         self._publications = {
             str(task): dict(record) for task, record in
             (snapshot.get('publications') or {}).items()
@@ -590,6 +746,19 @@ class EngineBranchView(QWidget):
                 titles[task_id] = task.get('title') or task_id
         return titles
 
+    def visibleTitles(self, task_ids) -> list[str]:
+        """Names for ``task_ids`` that the outline shows, each once.
+
+        Plan 40 UXB4. A sentence on the status line or a page may only name
+        a step that has a row; a task folded into another row is called by
+        that row.
+        """
+        from .meshing_method_branch import visible_titles
+        return visible_titles(self.engine_id, task_ids, self.taskTitles())
+
+    def visibleTitle(self, task_id: str) -> str:
+        return self.visibleTitles([task_id])[0]
+
     def _label(self, task: dict, task_id: str) -> str:
         title = task.get('title') or task_id
         if task.get('optional'):
@@ -626,6 +795,77 @@ class EngineBranchView(QWidget):
 
         self._showCheckNotice()
         self._settleHistoricalLabel()
+        self._paintStrip()
+
+    def resultStrip(self, task_id: str) -> dict | None:
+        """What the step on ``task_id``'s row left, or ``None`` before it ran.
+
+        Plan 40 UXA5. ``{headline, detail, change, tooltip, cells}`` from the
+        counts recorded when the step wrote its mesh. A row several tasks
+        settle answers with the last of them that left counts, and only while
+        that task still holds its result: a step that went stale has no
+        numbers to show. The change is against the nearest earlier step that
+        left counts.
+        """
+        from foammesh.core.mesh import stage_strip
+        from .meshing_method_branch import row_tasks
+
+        if not task_id or not self._strips:
+            return None
+        members = row_tasks(self._engine_id, task_id) or (task_id,)
+        held = [name for name in members
+                if name in self._strips and self.is_accepted(name)]
+        if not held:
+            return None
+        task = held[-1]
+        entry = self._strips[task]
+        order = [str(item.get('task_id') or '')
+                 for item in self.workflow_tasks]
+        previous, before = None, ''
+        if task in order:
+            for name in reversed(order[:order.index(task)]):
+                if (name in self._strips and name not in members
+                        and self.is_accepted(name)):
+                    previous, before = self._strips[name], name
+                    break
+        titles = self.taskTitles()
+        before_title = str(titles.get(before, before)) if before else ''
+        return {
+            'task_id': task,
+            'cells': int(entry.get('cells') or 0),
+            'headline': stage_strip.headline(entry),
+            'detail': stage_strip.detail(entry),
+            'change': stage_strip.change(entry, previous, before_title),
+            'tooltip': stage_strip.tooltip(entry, previous, before_title),
+        }
+
+    def _paintStrip(self) -> None:
+        """Draw the strip of the task on screen, or hide the line."""
+        import html
+
+        row = self.tasks.currentRow()
+        task_id = self._order[row] if 0 <= row < len(self._order) else ''
+        strip = self.resultStrip(task_id)
+        if strip is None:
+            self._strip.clear()
+            self._strip.setVisible(False)
+            return
+        parts = [f'<span style="font-size:15pt;font-weight:700">'
+                 f'{html.escape(strip["headline"])}</span>',
+                 html.escape(strip['detail'])]
+        if strip['change']:
+            parts.append(html.escape(strip['change']))
+        self._strip.setText('&nbsp;&nbsp;'.join(parts))
+        summary = getattr(self._strip, 'setSummary', None)
+        if callable(summary):
+            # Plan 44 FX2. Folded, the line is the count and the change; the
+            # faces, points, boundary faces and time are one click away.
+            summary('&nbsp;&nbsp;'.join(
+                [parts[0]] + [html.escape(strip['change'])]
+                if strip['change'] else parts))
+        self._strip.setToolTip(strip['tooltip'])
+        self._strip.setAccessibleDescription(strip['tooltip'])
+        self._strip.setVisible(True)
 
     def _writesMesh(self, task_id: str) -> bool:
         """Whether running ``task_id`` changes the mesh on disk (I2).
@@ -682,10 +922,8 @@ class EngineBranchView(QWidget):
 
     def _showCheckNotice(self) -> None:
         """Say which checks are running, or why one could not (Plan 35 CR2)."""
-        titles = self.taskTitles()
         if self._checking:
-            names = ', '.join(titles.get(task, task)
-                              for task in sorted(self._checking))
+            names = ', '.join(self.visibleTitles(sorted(self._checking)))
             text = self.tr('Checking the mesh in the background: {0}. The '
                            'mesh is published and usable meanwhile.').format(
                                names)
@@ -693,7 +931,7 @@ class EngineBranchView(QWidget):
             text = ' '.join(
                 self.tr('{0} could not run ({1}): {2} Run it again when '
                         'ready.').format(
-                    titles.get(task, task),
+                    self.visibleTitle(task),
                     failure.get('reason') or failure.get('code') or 'error',
                     failure.get('message') or '')
                 for task, failure in sorted(self._checkFailures.items()))
@@ -903,7 +1141,7 @@ class EngineBranchView(QWidget):
         only thing that knows which of them are still unaccepted; the names
         come from the workflow document, which is what the outline shows.
         """
-        title = str(self.task_info(task_id).get('title') or task_id)
+        title = self.visibleTitle(task_id)
         blocking = ()
         graph = self._graph
         if graph is not None:
@@ -911,8 +1149,7 @@ class EngineBranchView(QWidget):
                 blocking = graph.blocking_prerequisites(task_id)
             except Exception:                                # noqa: BLE001
                 blocking = ()
-        names = ', '.join(str(self.task_info(item).get('title') or item)
-                          for item in blocking)
+        names = ', '.join(self.visibleTitles(blocking))
         if not names:
             return self.tr(
                 '{0} is not marked done yet: an earlier step is still '
@@ -1033,7 +1270,7 @@ class EngineBranchView(QWidget):
             # when it had not, named the task they were already looking
             # at rather than the one holding it, and offered no way on.
             if after_save and 'locked by prerequisites' in message:
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Settings saved'),
                     self.tr('Your settings were saved. ')
                     + self._locked_sentence(task_id))
@@ -1041,10 +1278,10 @@ class EngineBranchView(QWidget):
                 # Plan 37 UF4 DP-1025. A check that stopped Check & Proceed
                 # is titled as that, not as an internal "Task state"; the
                 # facade's sentence already says what failed and what to do.
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Quality check did not finish'), message)
             else:
-                QMessageBox.warning(self, self.tr('Task state'), message)
+                messages.warning(self, self.tr('Task state'), message)
         self._graph = self._build_graph(self._engine_id)
         self._apply_states()
         self.taskChanged.emit(task_id)
@@ -1306,7 +1543,7 @@ class EngineBranchView(QWidget):
             elif self._was_cancelled(payload):
                 self._report_cancelled_stage(stage)
             elif is_check and isinstance(payload.get('parsed'), dict):
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Mesh check'),
                     self.tr('checkMesh reported problems with this mesh; '
                             'see the Quality tab.'))
@@ -1327,7 +1564,17 @@ class EngineBranchView(QWidget):
         baseline = self._skipBaseline()
 
         def start() -> None:
-            task = _submit(self._client, operation, parameters, on_result)
+            # Plan 42 SG18. checkMesh goes through the one check action the
+            # Quality page and the Mesh menu use; a stage is a stage run.
+            if is_check:
+                from foammesh.view.mesh_check_action import run_mesh_check
+
+                task = run_mesh_check(self._client, on_result,
+                                      operation=operation,
+                                      parameters=parameters)
+            else:
+                task = _submit(self._client, operation, parameters,
+                               on_result)
             if task is None:
                 # R101. `_submit` returns None only when it already ran the
                 # operation synchronously, so the run is over by the time we
@@ -1373,7 +1620,7 @@ class EngineBranchView(QWidget):
                 if not started:
                     released()
             if failure:
-                await modal(lambda: QMessageBox.warning(
+                await modal(lambda: messages.warning(
                     self, self.tr('Stage run'), failure))
 
         self._stage_task = asyncio.ensure_future(generate_then_run())
@@ -1474,7 +1721,7 @@ class EngineBranchView(QWidget):
         """
         title = str(self.task_info(task_id).get('title') or stage)
         progress = ProgressDialog(self, self.tr('Running %s') % title,
-                                  cancelable=True, autoCloseOnCancel=False)
+                                  cancelable=True, autoCloseOnCancel=False, modal=True)
         progress.setLabelText(
             self.tr('%s is running. This can take a few minutes.') % stage)
         progress.cancelClicked.connect(
@@ -1588,19 +1835,20 @@ class EngineBranchView(QWidget):
             if log:
                 write(self.tr('Log: %s') % log)
         if not details and not log:
-            QMessageBox.warning(self, title, text)
+            messages.warning(self, title, text)
             return
         where = []
         if job_id:
             where.append(self.tr('Job %s') % job_id)
         if log:
             where.append(self.tr('Log: %s') % log)
-        box = QMessageBox(QMessageBox.Icon.Warning, title, text,
-                          QMessageBox.StandardButton.Ok, self)
-        box.setInformativeText('\n'.join(where))
-        if details:
-            box.setDetailedText(details)
-        box.exec()
+        # Plan 44 MF26c. An OK-only box is a notice (Plan 40 UXC7): it was
+        # built here and ``exec()``-ed, so it took the window and ran a nested
+        # loop. The one helper shows it without either, with the same title,
+        # sentence, log line and Details.
+        messages.showNotice(QMessageBox.Icon.Warning, self, title, text,
+                            informativeText='\n'.join(where),
+                            detailedText=details)
 
     def _report_cancelled_stage(self, what: str) -> None:
         """Say the run was stopped, in the words of the thing that happened.
@@ -1664,7 +1912,7 @@ class EngineBranchView(QWidget):
         # with no task current (`outside_task`), so its nested loop does not
         # refuse -- and drop -- the tasks it steps.
         if failure:
-            await modal(lambda: QMessageBox.warning(
+            await modal(lambda: messages.warning(
                 self, self.tr('Stage run'), failure))
         payload = getattr(result, 'payload', {}) or {}
         accepted = getattr(result, 'status', '') == 'accepted'
@@ -1708,7 +1956,8 @@ class EngineBranchView(QWidget):
                     self.tr('{0} ran, but its result was not published: '
                             '{1}').format(stage, unpublished), payload),
                     failed=True)
-            elif revision or payload.get('region_warnings'):
+            elif (revision or payload.get('region_warnings')
+                  or payload.get('layer_warnings')):
                 message = self.tr('%s completed.') % stage
                 if revision:
                     message += ' ' + self.revisionText(revision)
@@ -1749,8 +1998,7 @@ class EngineBranchView(QWidget):
             return ''
         if self.is_accepted(task_id):
             return ''
-        waiting = [str(self.task_info(item).get('title') or item)
-                   for item in self.blocking_prerequisites(task_id)]
+        waiting = self.visibleTitles(self.blocking_prerequisites(task_id))
         if waiting:
             return self.tr('{0} must be finished again first, then run '
                            'this step again.').format(', '.join(waiting))
@@ -1771,15 +2019,9 @@ class EngineBranchView(QWidget):
         OpenFOAM and for anything unreadable or unset, because it is what this
         row has always run.
         """
-        from foammesh.core.engine.base import qa_operation
+        from foammesh.view.mesh_check_action import check_operation
 
-        try:
-            result = query(self._client, 'mesh.engine.list')
-            payload = getattr(result, 'payload', None) or {}
-        except Exception:
-            return qa_operation(None)
-        return str(payload.get('qa_operation')
-                   or qa_operation(payload.get('target_solver')))
+        return check_operation(self._client)
 
     @staticmethod
     def _facadeFailureLead(error) -> str:
@@ -1829,7 +2071,7 @@ class EngineBranchView(QWidget):
                 'The mesh check could not run, so Quality was not marked '
                 'done. Nothing about the mesh changed. Fix the cause '
                 'above, then press Check & Proceed again.')
-            await modal(lambda: QMessageBox.warning(
+            await modal(lambda: messages.warning(
                 self, self.tr('Mesh check'), text))
         payload = getattr(result, 'payload', {}) or {}
         self._publish_verdict(payload)
@@ -1846,7 +2088,7 @@ class EngineBranchView(QWidget):
             blocked = (payload.get('task_state') or {}).get('blocked') or {}
             reason = str(blocked.get('reason') or payload.get('message') or '')
             if reason:
-                await modal(lambda: QMessageBox.warning(
+                await modal(lambda: messages.warning(
                     self, self.tr('Quality check did not finish'), reason))
         return accepted
 
@@ -1915,13 +2157,19 @@ class EngineBranchView(QWidget):
         """
         warnings = [str(item) for item in (payload or {}).get(
             'region_warnings') or () if str(item).strip()]
-        if not warnings:
+        # DP-2403. snappyHexMesh exits successfully even when it rejected
+        # layers; the legacy completion box said what the mesh received.
+        layers = [str(item) for item in (payload or {}).get(
+            'layer_warnings') or () if str(item).strip()]
+        if not warnings and not layers:
             return message
         console = self._console()
         if console is not None:
             for warning in warnings:
                 console.append(self.tr('Regions: %s') % warning)
-        return ' '.join([message] + warnings)
+            for warning in layers:
+                console.append(self.tr('Layers: %s') % warning)
+        return ' '.join([message] + warnings + layers)
 
     def _report_run(self, message: str, *, failed: bool = False,
                     log: str = '') -> None:
@@ -1986,8 +2234,9 @@ class EngineBranchView(QWidget):
     _appliedResultLocks: frozenset = frozenset()
 
     def _apply_result_locks(self) -> None:
-        if self._resultLocked != self._appliedResultLocks:
-            self._appliedResultLocks = self._resultLocked
+        held = self._resultLocked | self._lockedSteps
+        if held != self._appliedResultLocks:
+            self._appliedResultLocks = held
             self.resultLocksChanged.emit()
         for task_id, page in self._pages.items():
             setter = getattr(page, 'setResultLocked', None)
@@ -2000,7 +2249,7 @@ class EngineBranchView(QWidget):
 
     def _confirm(self, title: str, text: str) -> bool:
         """Ask before discarding work. Tests replace this."""
-        answer = QMessageBox.question(
+        answer = messages.question(
             self, title, text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -2008,7 +2257,7 @@ class EngineBranchView(QWidget):
 
     def _warn(self, title: str, text: str) -> None:
         """Say why nothing happened. Tests replace this."""
-        QMessageBox.warning(self, title, text)
+        messages.warning(self, title, text)
 
     @staticmethod
     def _bytes(count) -> str:
@@ -2023,21 +2272,27 @@ class EngineBranchView(QWidget):
     def unlockConfirmation(self, preview: dict) -> str:
         """What the unlock confirmation says: tasks, artifacts, disk cost."""
         titles = list(preview.get('titles') or preview.get('scope') or ())
-        lines = [self.tr('Unlocking "{0}" reopens it and every step after it '
-                         'that depends on it. Their results are discarded and '
-                         'they have to be run again:').format(
-                             titles[0] if titles else preview.get('task_id'))]
+        name = titles[0] if titles else preview.get('task_id')
+        # Plan 43 LY9, section 2: the words of the decision.
+        if preview.get('resets_values'):
+            lines = [self.tr('Unlocking "{0}" deletes the mesh and the quality '
+                             'results, and every later step starts over, as '
+                             'for new geometry:').format(name)]
+        else:
+            lines = [self.tr('Unlocking "{0}" deletes the mesh and the quality '
+                             'results. Later steps keep their values but go '
+                             'back to not done:').format(name)]
         lines += [f'  • {title}' for title in titles]
         artifacts = list(preview.get('artifacts') or ())
         if artifacts:
             lines.append('')
-            lines.append(self.tr('Kept on disk as the previous result until '
-                                 'the next run replaces it:'))
+            lines.append(self.tr('Deleted from the case, and gone from the '
+                                 'viewport:'))
             for artifact in artifacts:
                 lines.append(f'  • {artifact.get("path")} '
                              f'({self._bytes(artifact.get("bytes"))})')
-            lines.append(self.tr('The mesh on screen stays as it is: nothing '
-                                 'is re-meshed until you run a step again.'))
+            lines.append(self.tr('Nothing is re-meshed until you run a step '
+                                 'again.'))
         lines.append('')
         lines.append(self.tr('A copy is kept so that "Restore previous mesh '
                              'and settings" can put everything back: {0} of '
@@ -2261,8 +2516,16 @@ class EngineBranchView(QWidget):
             write(text)
         return text
 
-    def requestUnlock(self, task_id: str) -> bool:
-        """Unlock ``task_id`` after the user has seen what it discards."""
+    def requestUnlock(self, task_id: str, *, confirmed: bool = False) -> bool:
+        """Unlock ``task_id`` after the user has seen what it discards.
+
+        ``confirmed`` is True when the caller already asked: the task page's
+        lock chip confirms inline with two presses (Plan 44 MF18 K2), so the
+        modal is not shown a second time. The outline row's menu and the
+        legacy banner link do not ask, so they get the modal. A step that is
+        not locked, or an unlock that does not fit on the disk, is still
+        refused with its reason either way.
+        """
         title = self.tr('Unlock and discard later results')
         try:
             preview = query(self._client, 'mesh.workflow.unlock_preview',
@@ -2285,7 +2548,8 @@ class EngineBranchView(QWidget):
                 'reserve_bytes': reserve}, self.tr('Unlocking'),
                 copy=self.tr('the copy of the current mesh kept for undo')))
             return False
-        if not self._confirm(title, self.unlockConfirmation(preview)):
+        if not confirmed and not self._confirm(
+                title, self.unlockConfirmation(preview)):
             return False
         baseline = self._skipBaseline()
         # Plan 37 I2. Read before the unlock lands: the label names the
@@ -2320,8 +2584,8 @@ class EngineBranchView(QWidget):
             self.refresh_states()
             count = len(payload.get('deactivated') or preview.get('scope') or ())
             self._setStateNotice(self.tr(
-                '"{0}" is unlocked and {1} reopened. The mesh on disk '
-                'is the previous result until you run again; "Restore previous '
+                '"{0}" is unlocked and {1} reopened. The mesh and the quality '
+                'results were deleted; "Restore previous '
                 'mesh and settings" (right-click a step) puts it all '
                 'back.').format(
                     (preview.get('titles') or [task_id])[0],
@@ -2329,9 +2593,10 @@ class EngineBranchView(QWidget):
             self._noticeSkippedSnapshots(baseline, payload, append=True)
             self._historicalScope = tuple(
                 payload.get('scope') or preview.get('scope') or (task_id,))
-            self._labelViewport('showHistoricalResult',
-                                (preview.get('titles') or [task_id])[0],
-                                retained_revision)
+            # Plan 43 LY9. The mesh is deleted, so the viewport and the
+            # quality views are emptied with it: nothing on screen is a mesh
+            # the settings no longer describe.
+            self._labelViewport('discardResultsOnScreen')
             self.taskChanged.emit(task_id)
 
         submit(self._client, 'mesh.workflow.unlock', {
@@ -2423,6 +2688,7 @@ class EngineBranchView(QWidget):
                     baseline, getattr(result, 'payload', None), append=True)
                 self._historicalScope = ()
                 self._labelViewport('clearHistoricalResult', True)
+                self._labelViewport('restoreResultsOnScreen')
                 self.taskChanged.emit(str(preview.get('task_id') or ''))
 
         submit(self._client, 'mesh.workflow.undo_unlock',
@@ -2460,14 +2726,12 @@ class EngineBranchView(QWidget):
         """
         if not self.taskIsLocked(task_id):
             return ''
-        titles = {task.get('task_id'): (task.get('title') or task.get('task_id'))
-                  for task in self.workflow_tasks}
-        mine = titles.get(task_id, task_id)
+        mine = self.visibleTitle(task_id)
         blocking = self.blocking_prerequisites(task_id)
         if not blocking:
             return self.tr('{0} is not available yet.').format(mine)
         return self.tr('{0} opens once {1} is finished.').format(
-            mine, titles.get(blocking[0], blocking[0]))
+            mine, self.visibleTitle(blocking[0]))
 
     def selectRefusal(self, task_id: str) -> str:
         """Why standing on ``task_id`` is refused, or ``''`` to allow it.
@@ -2503,6 +2767,16 @@ class EngineBranchView(QWidget):
         self._gradeRunAll()
         self.taskSelected.emit(self._order[row])
 
+    @property
+    def moreMenuButton(self) -> QToolButton:
+        """The ... menu button of the step on screen."""
+        return self._more
+
+    def releaseMoreMenuButton(self) -> QToolButton:
+        """Hand the ... button to the sheet header; the row that held it goes."""
+        self._moreRow.setVisible(False)
+        return self._more
+
     def _updateHeading(self) -> None:
         """Title the panel with the task on screen, not with the engine."""
         row = self.tasks.currentRow()
@@ -2513,3 +2787,4 @@ class EngineBranchView(QWidget):
             self.tr('{0} task of the {1} workflow').format(
                 title, self._engineName)
             if title else self._engineName)
+        self._paintStrip()

@@ -50,11 +50,13 @@ GMSH_QUERY_NAME = {
     'sicn': 'minSICN',
     'sige': 'minSIGE',
     'gamma': 'gamma',
+    'disto': 'disto',
 }
-#: ``disto`` is a valid ``Mesh.QualityType`` for the *optimiser* (0..3 all set
-#: cleanly) but ``getElementQualities`` has no name for it, so the gate cannot
-#: measure what it asked the optimiser to improve. Rather than crash or judge
-#: silently against something else, the run substitutes this and says so.
+#: Plan 41 GN14 (F5a). ``disto`` has no ``getElementQualities`` name, but it is
+#: Gmsh's ratio of an element's smallest to its largest Jacobian determinant and
+#: both are named (``minDetJac``, ``maxDetJac``), so it is measured and nothing
+#: stands in for it. Only a measure that is in none of the tables is judged
+#: against this, and the run says so.
 UNQUERYABLE_SUBSTITUTE = 'sicn'
 
 #: Verdicts. Ordered worst to best so ``max`` over a set of metric verdicts
@@ -353,6 +355,26 @@ def derive_limit(values: dict, *, context: str = 'optimization') -> QualityLimit
         allowed_count=allowed_count, hard_floor=hard_floor)
 
 
+def extra_limit_rows(value) -> list:
+    """The further-limits rows from a list or from the stored JSON text."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        import json
+
+        try:
+            value = json.loads(text)
+        except ValueError as error:
+            raise QualityError(
+                f'the further quality limits are not valid JSON: {error}')
+    if not isinstance(value, (list, tuple)):
+        if value in (None, ''):
+            return []
+        raise QualityError('the further quality limits are not a list')
+    return [dict(row) for row in value if isinstance(row, dict)]
+
+
 def derive_thresholds(values: dict) -> QualityThresholds:
     values = dict(values or {})
     primary = derive_limit(values)
@@ -361,7 +383,7 @@ def derive_thresholds(values: dict) -> QualityThresholds:
         raise QualityError(f'netgenPasses {passes} is outside 0-10')
     extra = []
     seen = {primary.measure}
-    for index, row in enumerate(values.get('extraLimits') or ()):
+    for index, row in enumerate(extra_limit_rows(values.get('extraLimits'))):
         limit = derive_limit(row, context=f'extraLimits[{index}]')
         if limit.measure in seen:
             raise QualityError(
@@ -720,3 +742,120 @@ def _fingerprint(document) -> str:
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(',', ':'),
         default=str).encode('utf-8')).hexdigest()
+
+
+# -- the gate reading the hand-over's arrays (Plan 41 GN14, section 4.3) ------ #
+
+#: The cell array each measure is read from. ``disto`` is the ratio of the two
+#: Jacobian arrays rather than an array of its own.
+ARRAY_FOR_MEASURE = {'sicn': 'gmshSICN', 'sige': 'gmshSIGE',
+                     'gamma': 'gmshGamma'}
+
+
+def disto_from_jacobians(smallest, largest):
+    """Gmsh's distortion: smallest over largest Jacobian determinant, per cell.
+
+    At most 1. A cell whose largest determinant is zero reads 0 and one whose
+    largest is negative (inverted throughout) reads -1, so ``value <= 0`` still
+    counts as inverted exactly as it does for the other measures.
+    """
+    import numpy as np
+
+    smallest = np.asarray(smallest, dtype=np.float64)
+    largest = np.asarray(largest, dtype=np.float64)
+    out = np.where(largest < 0, -1.0, 0.0)
+    positive = largest > 0
+    out[positive] = np.minimum(1.0, smallest[positive] / largest[positive])
+    return out
+
+
+def measure_values(arrays: dict, measure: str):
+    """The per-cell values of *measure* from hand-over *arrays*, or ``None``."""
+    if measure == 'disto':
+        low, high = arrays.get('gmshMinDetJac'), arrays.get('gmshMaxDetJac')
+        if low is None or high is None:
+            return None
+        return disto_from_jacobians(low, high)
+    name = ARRAY_FOR_MEASURE.get(measure)
+    return arrays.get(name) if name else None
+
+
+def block_from_arrays(measure: str, values, tags, threshold: float, *,
+                      centroids=None) -> dict:
+    """One metric's achieved block from its full per-cell array.
+
+    The runner's block carries at most :data:`OFFENDER_CAP` offenders because
+    it travels in ``result.json``. This reads the array itself, so every
+    element below *threshold* is named, worst first.
+    """
+    import numpy as np
+
+    values = np.asarray(values, dtype=np.float64)
+    tags = np.asarray(tags)
+    finite = np.isfinite(values)
+    judged = values[finite]
+    if not len(judged):
+        return {'measure': measure, 'minimum': 0.0, 'mean': 0.0,
+                'below_threshold': 0, 'total': 0, 'inverted': 0,
+                'offending': []}
+    below = np.nonzero(finite & (values < float(threshold)))[0]
+    below = below[np.argsort(values[below], kind='stable')]
+    offending = []
+    for index in below:
+        centroid = (list(map(float, centroids[index]))
+                    if centroids is not None else [0.0, 0.0, 0.0])
+        offending.append({'tag': int(tags[index]),
+                          'value': float(values[index]),
+                          'measure': measure, 'centroid': centroid})
+    return {'measure': measure, 'minimum': float(judged.min()),
+            'mean': float(judged.mean()), 'below_threshold': int(len(below)),
+            'total': int(len(judged)),
+            'inverted': int(np.count_nonzero(judged <= 0)),
+            'offending': offending, 'offendingTruncated': False}
+
+
+def achieved_from_arrays(thresholds: QualityThresholds, arrays: dict, *,
+                         centroids=None) -> dict:
+    """The ``achieved`` mapping :func:`assess` reads, built from the arrays.
+
+    The highest-dimension elements are judged (the volume of a 3D mesh, the
+    surface of a 2D one), as the runner judges the volume.
+    """
+    import numpy as np
+
+    dims = np.asarray(arrays.get('gmshEntityDim', ()))
+    judged_dim = int(dims.max()) if len(dims) else 0
+    mask = dims == judged_dim
+    tags = np.asarray(arrays['gmshElementTag'])[mask]
+    local = None if centroids is None else np.asarray(centroids)[mask]
+    metrics = {}
+    for limit in thresholds.limits:
+        values = measure_values(arrays, limit.measure)
+        if values is None:
+            continue
+        metrics[limit.measure] = block_from_arrays(
+            limit.measure, np.asarray(values)[mask], tags, limit.minimum,
+            centroids=local)
+    return {'metrics': metrics}
+
+
+def assess_arrays(thresholds: QualityThresholds, arrays: dict, *,
+                  centroids=None) -> QualityVerdict:
+    """Judge the hand-over's own per-element arrays against the limits."""
+    return assess(thresholds, achieved_from_arrays(
+        thresholds, arrays, centroids=centroids))
+
+
+def gate_verdict_dict(report: dict | None) -> dict:
+    """The strip's verdict shape from a stored gate report.
+
+    ``mesh-quality.json`` spells the verdict the way waivers do (``fail``,
+    ``warning``); the real four-state word is ``gate_verdict``.
+    """
+    document = dict(report or {})
+    if not document:
+        return {}
+    word = str(document.get('gate_verdict') or document.get('verdict') or '')
+    document['verdict'] = {'warning': BLEMISH}.get(word, word)
+    document.setdefault('offending', [])
+    return document

@@ -1,19 +1,28 @@
 """Shared meshing-method chooser backed exclusively by facade operations."""
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup, QDialog, QDialogButtonBox, QGroupBox, QLabel, QMessageBox,
+    QButtonGroup, QDialog, QDialogButtonBox, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel,
+    QMessageBox,
     QPlainTextEdit, QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from foammesh.core.naming import humanise_option
+from foammesh.core.naming import humanise_option, runtime_name
+from foammesh.view.engine_context import (
+    WHEN_NOT_GMSH, WHEN_NOT_SNAPPY, engine_from_listing, engine_holds)
+from foammesh.view.meshing_method.size_page import MeshSizePage
+from foammesh.view.theming.metrics import GAP_TIGHT
+from foammesh.view.theming.sheet_form import LabelWidthWatcher
 from foammesh.view.widgets.folder_header import FolderHeader
+from foammesh.view.widgets.link_button import link_row
 from foammesh.view.workflow_controls.field_group_page import (
     ExecutionPreferencesPage,
 )
 from foammesh.view.workflow_controls.warning_text import format_warnings
 from foammesh.view.facade_client import FailedResult, query, submit
+from widgets import async_message_box as messages
 
 
 #: Kept as the name this module has always exported; the definition moved to
@@ -88,6 +97,17 @@ class MeshingMethodPage(QWidget):
         title = QLabel(self.tr('Mesh setup'))
         title.setObjectName('meshingMethodTitle')
         layout.addWidget(title)
+        # Plan 44 F1 (MF5 "one header", mockup `.page-h`). The settings sheet
+        # heads every step with "N. Title" itself, so this second heading
+        # said "Mesh setup" twice and cost the page a row of the 700 px
+        # column (test_only_one_scroller_shows_a_bar_in_a_700_pixel_window).
+        # The label stays, hidden, for the names that address it.
+        title.setVisible(False)
+        self._title = title
+        # Mockup `.page-body{padding:0 10px}`: the sheet header above and the
+        # footer below already space the page; only the sides are inset.
+        margins = layout.contentsMargins()
+        layout.setContentsMargins(margins.left(), 0, margins.right(), 0)
 
         # Plan 28. The solver comes first because it decides what follows: SU2
         # reads four cell families and snappyHexMesh produces a fifth, so the
@@ -97,10 +117,24 @@ class MeshingMethodPage(QWidget):
         # and the first engine radio, where it read as a caption for the
         # engine below it, and the engine radios had no group label at all.
         # Each explanation now lives inside the group it explains.
-        solverBox = QGroupBox(self.tr('Mesh for'), self)
+        solverBox = QGroupBox(self.tr('Preset: mesh for'), self)
         solverBox.setObjectName('targetSolverBox')
         solverLayout = QVBoxLayout(solverBox)
+        # Plan 44 F1 (MF14 card): the card's own padding is the QSS one
+        # (`QGroupBox { padding: 26px 8px 8px 8px }`); a layout margin on top
+        # of it padded every card twice, 16 px a card.
+        solverLayout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(solverBox)
+        # Plan 33 section 4 (a 700 px window). The alternatives of one choice
+        # stand side by side, so the page asks for a row of height, not a row
+        # per radio: this page did not fit the 508 px column of a 700 px
+        # window by 52 px after the engine choice moved behind Preparation.
+        solverRow = QHBoxLayout()
+        solverLayout.addLayout(solverRow)
+        # Plan 44 F1. The sentence under the radios is their caption, the
+        # tight step below them, as each engine's runtime line is under its
+        # radio (DP-194: a gap is a step of the scale).
+        solverLayout.setSpacing(GAP_TIGHT)
         self._targetSolver = 'unselected'
         self._solverGroup = QButtonGroup(self)
         self._solverButtons = {}
@@ -113,33 +147,46 @@ class MeshingMethodPage(QWidget):
                 self.chooseTargetSolver(chosen))
             self._solverGroup.addButton(button)
             self._solverButtons[solver_id] = button
-            solverLayout.addWidget(button)
+            solverRow.addWidget(button)
+        solverRow.addStretch(1)
         self._solverReason = QLabel(self)
         self._solverReason.setWordWrap(True)
         self._solverReason.setObjectName('targetSolverReason')
         self._solverReason.setProperty('foammeshTone', 'muted')
         # F5. Choosing a solver clears this sentence, and the whole button
-        # column jumped up under the cursor. Two lines of height are kept
-        # whether or not there is anything to say.
+        # column jumped up under the cursor. A fixed height is kept
+        # whether or not there is anything to say. Plan 44 F1: every
+        # sentence it shows is now one line (the long explanation is the
+        # tooltip), so one line is kept, and the 700 px column fits.
         self._solverReason.setMinimumHeight(
-            2 * self._solverReason.fontMetrics().lineSpacing())
+            self._solverReason.fontMetrics().lineSpacing())
         solverLayout.addWidget(self._solverReason)
 
         engineBox = QGroupBox(self.tr('Meshing engine'), self)
         engineBox.setObjectName('meshingEngineBox')
         engineLayout = QVBoxLayout(engineBox)
+        engineLayout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(engineBox)
+        # Plan 44 F1. Each engine's runtime line sits under its own radio, in
+        # that engine's column, rather than on a row of its own under both:
+        # the box is one radio row and one line of reasons tall, which is
+        # what lets Mesh setup fit the 700 px column.
+        engineGrid = QGridLayout()
+        engineGrid.setContentsMargins(0, 0, 0, 0)
+        engineGrid.setHorizontalSpacing(12)
+        engineGrid.setVerticalSpacing(2)
+        engineLayout.addLayout(engineGrid)
         self._group = QButtonGroup(self)
         self._buttons = {}
         self._reasons = {}
         self._incompatible = {}
-        for engine_id in self._engine_ids():
+        for column, engine_id in enumerate(self._engine_ids()):
             label = humanise_option(engine_id)
             button = QRadioButton(label, self)
             button.setProperty('engineId', engine_id)
             self._group.addButton(button)
             self._buttons[engine_id] = button
-            engineLayout.addWidget(button)
+            engineGrid.addWidget(button, 0, column)
             reason = QLabel(self)
             reason.setWordWrap(True)
             reason.setObjectName(engine_id + 'AvailabilityReason')
@@ -147,7 +194,9 @@ class MeshingMethodPage(QWidget):
             # drawn at the same weight as the choice they annotate.
             reason.setProperty('foammeshTone', 'muted')
             self._reasons[engine_id] = reason
-            engineLayout.addWidget(reason)
+            engineGrid.addWidget(reason, 1, column,
+                                 Qt.AlignmentFlag.AlignTop)
+            engineGrid.setColumnStretch(column, 1)
         # Plan 33 SETUP-05. `Apply method` stood here, the one control on a
         # four-button page that moved the work forward, beside a footer whose
         # Proceed is what every other step is committed with. MEASURED: the
@@ -168,11 +217,27 @@ class MeshingMethodPage(QWidget):
         # presses from sight. The settings are the page now, under the name of
         # what they are; the reports keep the fold, because a report is not a
         # setting and nothing on this page has to be read before meshing.
+        # Plan 40 UXA1. One size choice for either mesher, above the settings
+        # that govern the run.
+        self._size = MeshSizePage(facade_client, self)
+        self._size.setEmbedded(True)
+        layout.addWidget(self._size)
+
         self._execution = ExecutionPreferencesPage(facade_client, self)
         # DP-155/157. A section of a page does not scroll itself and does not
         # carry a commit pair of its own.
         self._execution.setEmbedded(True)
         layout.addWidget(self._execution)
+        # Plan 44 F1 (MF14 card). The two embedded panels' forms sit in their
+        # cards with no inset of their own, as the grid cards do.
+        for panel in (self._size, self._execution):
+            panel.form_layout().setContentsMargins(0, 0, 0, 0)
+        # Plan 44 F4 (MF14). One label column for both forms, capped at 44 %
+        # of the column (`share_label_width`), re-shared on every resize and
+        # refresh, so a long label wraps inside its column rather than
+        # widening the sheet.
+        self._labelWidths = LabelWidthWatcher(self, lambda: [
+            self._size.form_layout(), self._execution.form_layout()])
 
         self._diagnosticsBody = QWidget(self)
         self._diagnosticsBody.setObjectName('meshingDiagnosticsBody')
@@ -182,16 +247,20 @@ class MeshingMethodPage(QWidget):
             self.tr('OpenFOAM runtime diagnostics…'),
             self._diagnosticsBody)
         self._runtimeDiagnostics.clicked.connect(self._show_runtime_diagnostics)
-        diagnosticsLayout.addWidget(self._runtimeDiagnostics)
         self._effectiveDictionaries = QPushButton(
             self.tr('Effective meshing setup…'), self._diagnosticsBody)
         self._effectiveDictionaries.clicked.connect(
             self._show_effective_dictionaries)
-        diagnosticsLayout.addWidget(self._effectiveDictionaries)
         self._reprobe = QPushButton(self.tr('Re-probe runtimes'),
                                     self._diagnosticsBody)
         self._reprobe.clicked.connect(lambda: self.refresh(force=True))
-        diagnosticsLayout.addWidget(self._reprobe)
+        # Plan 44 MF20. Three reports and a re-probe are secondary actions:
+        # two 20 px rows of text links, not three buttons the width of the sheet.
+        diagnosticsLayout.addWidget(link_row(
+            self._diagnosticsBody, 'meshingDiagnosticsLinks',
+            self._runtimeDiagnostics, self._effectiveDictionaries))
+        diagnosticsLayout.addWidget(link_row(
+            self._diagnosticsBody, 'meshingReprobeLinks', self._reprobe))
 
         self._diagnostics = FolderHeader(self.tr('Diagnostics'), self)
         self._diagnostics.setObjectName('meshingMethodDiagnosticsHeader')
@@ -210,6 +279,10 @@ class MeshingMethodPage(QWidget):
         self.refresh()
 
     # -- the Advanced disclosure ------------------------------------------- #
+
+    def sizePanel(self):
+        """The Mesh size control (Plan 40 UXA1)."""
+        return self._size
 
     def executionPanel(self):
         """The embedded execution settings, reachable without a private name.
@@ -253,7 +326,8 @@ class MeshingMethodPage(QWidget):
         """
         engine_id = self._checkedEngineId()
         self._execution.setEngine(engine_id)
-        self._runtimeDiagnostics.setVisible(engine_id != 'gmsh')
+        self._runtimeDiagnostics.setVisible(
+            engine_holds(engine_id, *WHEN_NOT_GMSH))
 
     def hasPendingExecutionEdits(self) -> bool:
         """True when the Advanced band holds an edit nobody has committed.
@@ -296,8 +370,9 @@ class MeshingMethodPage(QWidget):
         # DP-339. A revisit of this page is not a write, so the band
         # keeps an edit that has not reached the case yet.
         self._execution.reload(discard_pending=False)
+        self._size.reload(discard_pending=False)
         result = query(self._client, 'mesh.engine.list').payload
-        current = result['current_engine']
+        current = engine_from_listing(result)
         # Absent on an older payload or a test double, and permissive when
         # absent: that is exactly the pre-Plan-28 behaviour.
         self._targetSolver = str(result.get('target_solver') or 'unselected')
@@ -348,6 +423,10 @@ class MeshingMethodPage(QWidget):
             self._reasons[engine_id].setText(self.tr('Probing the runtime…'))
             self._submit_probe(engine_id, current, generation, force)
         self._syncExecutionRoute()
+        # A reload may rebuild a panel's rows; the new labels join the column.
+        watcher = getattr(self, '_labelWidths', None)
+        if watcher is not None:
+            watcher.run()
 
     def _checkedEngineId(self) -> str:
         """Which engine radio is checked right now, if any (R130/R131)."""
@@ -370,10 +449,17 @@ class MeshingMethodPage(QWidget):
         blocked = [humanise_option(engine_id)
                    for engine_id, reason in sorted(self._incompatible.items())
                    if reason]
+        # Plan 44 F1 (mockup `.hint`: one short line). The caption says what
+        # the choice is; the whole explanation is its tooltip.
+        self._solverReason.setToolTip('')
         if self._targetSolver == 'unselected':
             self._solverReason.setText(self.tr(
-                'Choose the solver this mesh is for. Every meshing method is '
-                'offered until you do.'))
+                'Optional. Every meshing method stays offered.'))
+            self._solverReason.setToolTip(self.tr(
+                'Optional preset. It picks defaults (what is written beside '
+                'the mesh, which check Check & Proceed runs); the Gmsh '
+                'controls do not depend on it. Every meshing method is '
+                'offered until you choose one.'))
         elif blocked:
             self._solverReason.setText(self.tr(
                 '{0} cannot be used for this solver.').format(
@@ -411,7 +497,7 @@ class MeshingMethodPage(QWidget):
             if stranded:
                 # Not repaired here: which engine to move to is the user's
                 # call, and silently switching would discard their settings.
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Meshing method'),
                     self.tr('The selected meshing method cannot serve '
                             'this solver.'
@@ -433,7 +519,7 @@ class MeshingMethodPage(QWidget):
             # Say so and ask again shortly, rather than reporting a cold
             # WSL boot as a missing runtime.
             self._reasons[engine_id].setText(
-                self.tr('Still probing the runtime…'))
+                self.tr('Looking for {0}…').format(self._toolName(engine_id)))
             QTimer.singleShot(
                 self.PROBE_RETRY_MS, self,
                 lambda: self._retry_probe(engine_id, current, generation))
@@ -445,6 +531,10 @@ class MeshingMethodPage(QWidget):
         if generation != self._probeGeneration:
             return
         self._submit_probe(engine_id, current, generation, False)
+
+    def _toolName(self, engine_id) -> str:
+        # What a user calls the runtime behind each engine (core.naming).
+        return runtime_name(engine_id) or self.tr('the runtime')
 
     def _apply_probe(self, probe, current, engine_id):
         if self._incompatible.get(engine_id):
@@ -468,7 +558,12 @@ class MeshingMethodPage(QWidget):
             # E6. The fingerprint identifies a build for a bug report; it is
             # not something to weigh when choosing an engine. It moves to
             # where someone looking for it will still find it.
-            label = self.tr('Runtime {0}').format(version) if version else text
+            # Plan 40 UXB1 (#28). Say what was found, in the product's own
+            # name, rather than "Runtime 13".
+            where = (self.tr(' (WSL)') if 'wsl' in profile.lower() else '')
+            label = (self.tr('{0} {1} found{2}').format(
+                self._toolName(engine_id), version, where)
+                if version else text)
             # DP-50. An engine can be available and still have something worth
             # saying: Gmsh runs without OpenFOAM's checkMesh, and the mesh it
             # publishes then goes unvalidated. This line was overwritten with
@@ -505,13 +600,14 @@ class MeshingMethodPage(QWidget):
     def _show_effective_dictionaries(self):
         checked = self._group.checkedButton()
         if (checked is not None
-                and checked.property('engineId') != 'snappy'):
+                and engine_holds(checked.property('engineId'),
+                                 *WHEN_NOT_SNAPPY)):
             self._show_effective_plan()
             return
 
         def show(result):
             if getattr(result, 'status', '') != 'accepted':
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Effective meshing setup'),
                     str(getattr(result, 'message', '')
                         or self.tr('Generate dictionaries first.')))
@@ -578,7 +674,7 @@ class MeshingMethodPage(QWidget):
     def _show_effective_plan(self):
         def show(result):
             if getattr(result, 'status', '') != 'accepted':
-                QMessageBox.warning(
+                messages.warning(
                     self, self.tr('Effective engine plan unavailable'),
                     str(getattr(result, 'message', '')
                         or self.tr('The engine plan is not available.')))
@@ -589,7 +685,7 @@ class MeshingMethodPage(QWidget):
                     window, 'showEffectiveEnginePlan'):
                 window.showEffectiveEnginePlan(result.payload or {})
                 return
-            QMessageBox.information(
+            messages.information(
                 self, self.tr('Effective engine plan'),
                 str((result.payload or {}).get('plan_digest') or
                     self.tr('Engine plan derived.')))
@@ -679,7 +775,7 @@ class MeshingMethodPage(QWidget):
             'engine settings but mark its generated artifacts stale.')
         if detail:
             prompt += self.tr('\n\nAffected retained artifacts:\n') + detail
-        choice = QMessageBox.question(
+        choice = messages.question(
             self, self.tr('Change meshing method'), prompt,
             QMessageBox.StandardButton.Yes |
             QMessageBox.StandardButton.Cancel,

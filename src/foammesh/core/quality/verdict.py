@@ -78,17 +78,51 @@ def verdict_source(verdict) -> str:
     return str((verdict or {}).get('source') or GMSH_GATE_SOURCE)
 
 
+def verdict_tier(verdict) -> str:
+    """Which max-non-orthogonality tier judged *verdict*, '' if none did.
+
+    Plan 40 UXD9 (N7). checkMesh and the SU2 readiness check judge at the
+    ``report`` tier (70). The Gmsh element gate has no non-orthogonality
+    limit at all. Reading this changes no verdict.
+    """
+    from .policy import TIER_REPORT
+
+    if verdict_source(verdict) in (CHECKMESH_SOURCE, SU2_READINESS_SOURCE):
+        return TIER_REPORT
+    return ''
+
+
+def verdict_tier_line(verdict) -> str:
+    """The sentence that says which tier a verdict used, '' when none did."""
+    from .policy import (
+        TIER_NAMES, TIER_RELAXED, TIER_REPORT, TIER_STRICT, tier_default_value)
+
+    tier = verdict_tier(verdict)
+    if not tier or str((verdict or {}).get('verdict') or '') in ('', 'unrated'):
+        return ''
+    limit = tier_default_value(TIER_REPORT)
+    return (
+        f'Judged at the {TIER_NAMES[TIER_REPORT]} tier (non-orthogonality '
+        f'above {limit:g} deg). The {TIER_NAMES[TIER_STRICT].lower()} and the '
+        f'{TIER_NAMES[TIER_RELAXED].lower()} are the limits of the mesher, set on '
+        'Snap and Layers; they decide nothing here.')
+
+
 def _report_source(report: Any) -> str:
     command = tuple(getattr(report, 'command', ()) or ())
     return SU2_READINESS_SOURCE if command[:1] == ('su2-readiness',)         else CHECKMESH_SOURCE
 
 
-def verdict_from_report(report: Any) -> dict:
+def verdict_from_report(report: Any, *, offending=()) -> dict:
     """Map a :class:`~core.quality.checkmesh_service.QualityReport` to a verdict.
 
     ``report`` may be ``None`` -- an unchecked mesh -- in which case the
     verdict is ``unrated`` and says which command would produce one, rather
     than leaving the surface blank for the user to interpret.
+
+    Plan 41 GN14 (F5d). ``offending`` is the Gmsh gate's own element rows for
+    the same mesh. checkMesh names cell sets, not elements, so a refresh used
+    to replace the gate's rows with ``[]``; passing them keeps them.
     """
     if report is None:
         return {
@@ -146,7 +180,7 @@ def verdict_from_report(report: Any) -> dict:
         # `constant/polyMesh/sets/…` for the cells that failed. The tab's
         # element table is for the Gmsh gate; the sets are carried separately
         # so the viewport can still be pointed at them.
-        'offending': [],
+        'offending': [dict(item) for item in offending or ()],
         'sets': [dict(item) for item in report.sets],
         'overridable': False,
         'source': _report_source(report),
@@ -167,7 +201,49 @@ def verdict_from_report(report: Any) -> dict:
     retained = getattr(result, 'retained', None)
     if isinstance(retained, dict) and retained.get('split'):
         out['retainedRegions'] = dict(retained)
+    # DP-2635. A region meshed too thin fails, and is the one blocking
+    # finding a user may knowingly accept: the mesh runs, it only does not
+    # resolve that region. So a failure whose every blocking finding is a
+    # thin region offers Accept anyway; any other blocking finding does not.
+    thin = getattr(result, 'thin_regions', None)
+    if isinstance(thin, dict) and thin.get('thin'):
+        from .thin_regions import is_finding, line as thin_line
+
+        out['thinRegions'] = dict(thin)
+        out['thinLine'] = thin_line(thin)
+        blocking = list(result.blocking_findings)
+        out['overridable'] = bool(
+            verdict == 'fail' and blocking
+            and all(is_finding(item) for item in blocking))
     return out
+
+
+def merge_offending(verdict: dict, gate: dict | None) -> dict:
+    """*verdict* with the Gmsh gate's offending elements carried through.
+
+    Plan 41 GN14 (F5d). A verdict that already names elements is left alone.
+    """
+    gate_rows = [dict(item) for item in (gate or {}).get('offending') or ()]
+    if not gate_rows or (verdict or {}).get('offending'):
+        return verdict
+    return dict(verdict, offending=gate_rows)
+
+
+def verdict_with_gate(report: Any, gate: dict | None) -> dict:
+    """What a refresh publishes, given the target check and the Gmsh gate.
+
+    Plan 41 GN14 (F5d). ``report`` is the target check's stored report
+    (checkMesh or SU2 readiness), ``gate`` the Gmsh element gate's stored
+    report (``foammesh/quality/mesh-quality.json``). With only a gate, the gate
+    is the verdict; with both, the target check's verdict stands and carries
+    the gate's offending elements, so a refresh no longer drops them.
+    """
+    from foammesh.core.gmsh.quality import gate_verdict_dict
+
+    gate_rows = (gate or {}).get('offending') or ()
+    if report is None and gate:
+        return gate_verdict_dict(gate)
+    return verdict_from_report(report, offending=gate_rows)
 
 
 def layer_shortfall_line(coverage) -> str:
@@ -357,6 +433,9 @@ def _metric(indicator: dict) -> dict:
         'total': None,
         'allowance': None,
         'verdict': GRADE_VERDICT.get(str(indicator.get('grade')), 'unrated'),
+        # Plan 40 UXD9 (N7). Which non-orthogonality tier this row's limit is.
+        'tier': ('report' if str(indicator.get('name') or '')
+                 == 'non-orthogonality' else ''),
         'grade': str(indicator.get('grade') or ''),
         'reason': str(indicator.get('note') or ''),
     }

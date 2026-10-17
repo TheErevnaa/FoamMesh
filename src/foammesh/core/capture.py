@@ -56,6 +56,16 @@ class CaptureRecord:
     #: not have to be reconstructed from a run that may since have been
     #: discarded.
     result: str = ''
+    #: Plan 43 LY15. How the picture was made: the file format, the size
+    #: multiple and pixel size (raster), the labels font and size, and which of
+    #: the legend, worst values, caption, axes triad and transparent
+    #: background it carries.  Empty on a record from before the snapshot.
+    format: str = ''
+    scale: int = 0
+    size_px: list = field(default_factory=list)
+    font: str = ''
+    text_size: str = ''
+    includes: dict = field(default_factory=dict)
     version: int = RECORD_VERSION
 
     def is_stale(self, fingerprint: str | None) -> bool:
@@ -104,6 +114,23 @@ def capture_paths(case_root: Path | str, stamp: str) -> tuple[Path, Path]:
     return directory / f'{stamp}.png', directory / f'{stamp}{SIDECAR_SUFFIX}'
 
 
+#: The six picture formats a snapshot writes (Plan 43 LY15).
+IMAGE_SUFFIXES = ('.png', '.jpg', '.jpeg', '.svg', '.pdf', '.eps', '.ps')
+
+
+def sidecar_for(image: Path | str) -> Path:
+    """The record beside *image*.
+
+    A PNG keeps the name it always had (``name.json``).  Any other format
+    keeps its suffix (``name.svg.json``), so ``name.png`` and ``name.svg``
+    taken from one view do not share a record.
+    """
+    image = Path(image)
+    if image.suffix.lower() == '.png':
+        return image.with_suffix(SIDECAR_SUFFIX)
+    return image.with_name(image.name + SIDECAR_SUFFIX)
+
+
 def new_stamp(moment: datetime | None = None) -> str:
     moment = moment or datetime.now(timezone.utc)
     return moment.strftime('%Y%m%d-%H%M%S-%f')[:-3]
@@ -143,8 +170,9 @@ def list_captures(case_root: Path | str) -> list[CaptureRecord]:
         return []
 
     records = []
-    for image in sorted(directory.glob('*.png')):
-        sidecar = image.with_suffix(SIDECAR_SUFFIX)
+    for image in sorted(path for path in directory.iterdir()
+                        if path.suffix.lower() in IMAGE_SUFFIXES):
+        sidecar = sidecar_for(image)
         record = read_record(sidecar) if sidecar.is_file() else None
         if record is None:
             record = CaptureRecord(
@@ -164,7 +192,7 @@ def delete_capture(case_root: Path | str, image_name: str) -> bool:
     image = directory / Path(image_name).name
     if not image.is_file():
         return False
-    sidecar = image.with_suffix(SIDECAR_SUFFIX)
+    sidecar = sidecar_for(image)
     image.unlink()
     if sidecar.is_file():
         sidecar.unlink()

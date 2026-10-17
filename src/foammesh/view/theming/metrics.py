@@ -6,8 +6,44 @@ from PySide6.QtWidgets import (
     QStyle, QTableView, QWidget,
 )
 
+from . import appearance
+
 FOCUS_WIDTH = 2
-CONTROL_RADIUS = 4
+#: The 1 px painted frame a floating control (the segmented control, the
+#: legend chip) keeps its children inside. A border width, not a distance on
+#: the DP-195 margin scale.
+FRAME_WIDTH = 1
+
+# --------------------------------------------------------------------------- #
+# Plan 44 MF0. The scale the mockup is built from, as data. The style sheet
+# reads these through {{radius.*}}, {{type.*}} and {{space.*}}; nothing below is
+# applied by MF0 itself, later packages adopt the numbers rule by rule.
+# --------------------------------------------------------------------------- #
+RADIUS_CONTROL = 3
+RADIUS_GROUP = 4
+RADIUS_MENU = 5
+RADIUS_FLOAT = 6
+RADIUS_SHEET = 7
+
+#: One source for the control radius. It used to be 4 here while the style sheet
+#: said 6; every reader now takes ``RADIUS_CONTROL``.
+CONTROL_RADIUS = RADIUS_CONTROL
+
+TYPE_BODY = 12.5
+TYPE_SMALL = 11.5
+TYPE_CAPTION = 11
+TYPE_CAPS = 10.5
+TYPE_H3 = 14
+TYPE_H2 = 16
+
+SPACE_XS = 4
+SPACE_SM = 8
+SPACE_MD = 12
+SPACE_LG = 16
+SPACE_XL = 24
+
+MOTION_FAST = 150
+MOTION = 200
 CONTROL_PADDING = 4
 SELECTION_BORDER_WIDTH = 2
 ICON_SIZE = 20
@@ -35,49 +71,132 @@ ICON_SIZE = 20
 # construction sites, which is what let the tables drift in the first place.
 # --------------------------------------------------------------------------- #
 
-#: The height every control in the app is laid out to.
-CONTROL_HEIGHT = 28
+#: Plan 44 MF19 (decision Q1). DP-189 restated: ONE control height PER DENSITY.
+#: Compact (the default) is the mockup's 24 px, Comfortable keeps 28 px. The
+#: style sheet's arithmetic reaches each (``qss_renderer.apply_density``);
+#: ``control_height()`` is the number it adds up to. ``CONTROL_HEIGHT`` (read by
+#: ``from ... import CONTROL_HEIGHT``) is the live value at the moment of the
+#: import; code that must follow a live density change calls ``control_height()``.
+CONTROL_HEIGHT_COMFORTABLE = appearance.CONTROL_HEIGHT_COMFORTABLE
+CONTROL_HEIGHT_COMPACT = appearance.CONTROL_HEIGHT_COMPACT
+
+
+def control_height() -> int:
+    """The height every control is laid out to, in the live density."""
+    return appearance.control_height()
+
+
+def __getattr__(name):
+    if name == 'CONTROL_HEIGHT':
+        return control_height()
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
 
 #: Marks the application the polish filter below is already installed on, so
 #: re-applying the theme does not stack a second one.
 _CONTROL_METRICS_INSTALLED = '_foammesh_control_metrics_installed'
 
+#: Marks the application `HouseStyle` is installed on, so the control metrics
+#: know the style that carries their rule is really the application's.
+_HOUSE_STYLE_INSTALLED = '_foammesh_house_style_installed'
+
 
 def apply_table_metrics(table) -> None:
-    """Give one table's rows the shared control height.
+    """Give one table's rows and header the shared control height.
 
-    Rows that are sized to their contents still grow past it; this sets the
-    floor the table starts from, which is the number the eye compares against
-    the button and the tab beside it.
+    Plan 44 MF19: header 24 and rows 24 in compact (28 in comfortable). Rows
+    that are sized to their contents still grow past it; this sets the floor
+    the table starts from, which is the number the eye compares against the
+    button and the tab beside it. A table that asks to be fitted (the
+    ``foammeshFitRows`` property, an int cap on the visible rows) also has its
+    height sized to its rows.
     """
     header = table.verticalHeader()
     if header is not None:
-        header.setDefaultSectionSize(CONTROL_HEIGHT)
+        header.setDefaultSectionSize(control_height())
+    cap = table.property(FIT_ROWS_PROPERTY)
+    if isinstance(cap, int) and cap > 0:
+        autofit_table(table, cap)
 
 
-class _ControlMetrics(QObject):
-    """Applies the shared row height to every table as it is polished."""
+#: A table with this property (an int: the most rows it shows before it scrolls)
+#: is kept exactly as tall as its rows.
+FIT_ROWS_PROPERTY = 'foammeshFitRows'
+_FIT_CONNECTED = '_foammesh_fit_connected'
 
-    def eventFilter(self, watched, event):
-        if event.type() == QEvent.Type.Polish and isinstance(watched, QTableView):
-            apply_table_metrics(watched)
-        return False
+
+def table_fit_height(table, cap_rows: int) -> int:
+    """The height that holds the header and at most ``cap_rows`` rows.
+
+    An empty table is the header plus the frame; it never reserves a blank
+    body (header 24 plus the frame, inside the plan's 48 px empty-state rule).
+    """
+    header = table.horizontalHeader()
+    head = header.height() if header is not None and not header.isHidden() else 0
+    rows = table.model().rowCount() if table.model() is not None else 0
+    shown = min(max(rows, 0), max(1, int(cap_rows)))
+    body = sum(table.rowHeight(row) for row in range(shown))
+    return head + body + 2 * table.frameWidth()
+
+
+def autofit_table(table, cap_rows: int) -> None:
+    """Keep ``table`` as tall as its rows (up to ``cap_rows``) as they change."""
+    table.setProperty(FIT_ROWS_PROPERTY, int(cap_rows))
+
+    def refit(*_args, _table=table):
+        # SG44. The model can outlive its table (a page torn down while its
+        # model is still being reset), and the signal then reaches a deleted
+        # widget: nothing is left to fit.
+        try:
+            cap = _table.property(FIT_ROWS_PROPERTY)
+            if isinstance(cap, int) and cap > 0:
+                _table.setFixedHeight(table_fit_height(_table, cap))
+        except RuntimeError:
+            pass
+
+    refit()
+    if table.property(_FIT_CONNECTED):
+        return
+    table.setProperty(_FIT_CONNECTED, True)
+    model = table.model()
+    if model is not None:
+        for signal in (model.rowsInserted, model.rowsRemoved, model.modelReset,
+                       model.layoutChanged):
+            signal.connect(refit)
 
 
 def install_control_metrics(application) -> bool:
     """Put every table in the application on the shared control height.
 
-    An application-wide filter rather than a call at each table: there are a
-    dozen places that build one, and a thirteenth added later would silently
-    be 30px tall again. Tables that exist already are done directly, because
-    a widget is polished once and will not be polished again when the theme
-    is re-applied.
+    Not an application-wide event filter: there are a dozen places that build
+    a table, and a thirteenth added later would silently be 30px tall again,
+    so the rule lives in `HouseStyle.polish`, which Qt calls for every widget
+    it polishes.  Tables that exist already are done directly, because a
+    widget is polished once and will not be polished again when the theme is
+    re-applied.
 
-    Returns whether this call installed the filter.
+    DP-1438. This used to be an `eventFilter` on the application, and a
+    Python filter on the application is called for *every* event of *every*
+    object -- including objects Qt is destroying.  Handing such an object to
+    Python is itself the access violation (rc 139, the frame faulthandler
+    shows is the `def eventFilter` line, before any Python in it runs), so no
+    guard inside the filter could help; two other Python filters went for the
+    same reason (FIX-J, WALK-1).  A style's `polish` is called
+    on a widget that is being polished, which is a live one.
+
+    Returns whether this call installed the rule.
     """
     if application.property(_CONTROL_METRICS_INSTALLED):
+        # MF19. The theme is applied again when the density changes; the
+        # tables that exist already take the new row height now.
+        for widget in application.allWidgets():
+            if isinstance(widget, QTableView):
+                apply_table_metrics(widget)
         return False
-    application.installEventFilter(_ControlMetrics(application))
+    if not application.property(_HOUSE_STYLE_INSTALLED):
+        # The rule is carried by HouseStyle; put it in if the platform style
+        # happened to answer the layout metrics already.
+        _set_house_style(application)
     application.setProperty(_CONTROL_METRICS_INSTALLED, True)
     for widget in application.allWidgets():
         if isinstance(widget, QTableView):
@@ -860,6 +979,18 @@ class HouseStyle(QProxyStyle):
             return value
         return super().pixelMetric(metric, option, widget)
 
+    def polish(self, subject):
+        """Give a table its shared row height as it is polished (DP-1438).
+
+        `polish` is overloaded in Qt (a widget, the application, a palette);
+        the palette one returns the palette it was given, so the result of
+        the base call is always handed back.
+        """
+        result = super().polish(subject)
+        if isinstance(subject, QTableView):
+            apply_table_metrics(subject)
+        return result
+
 
 def house_style_in_effect(application) -> bool:
     """Whether the layout metrics a widget will be built against are ours.
@@ -884,14 +1015,22 @@ def install_house_style(application) -> bool:
     does not wrap a second proxy around the first. Returns whether this call
     installed it.
     """
-    current = application.style()
     if house_style_in_effect(application):
         return False
+    _set_house_style(application)
+    return True
+
+
+def _set_house_style(application) -> None:
+    current = application.style()
+    if isinstance(current, HouseStyle):
+        application.setProperty(_HOUSE_STYLE_INSTALLED, True)
+        return
     name = current.objectName()
     proxy = HouseStyle(name) if name else HouseStyle()
     proxy.setObjectName(name)
     application.setStyle(proxy)
-    return True
+    application.setProperty(_HOUSE_STYLE_INSTALLED, True)
 
 
 # --------------------------------------------------------------------------- #

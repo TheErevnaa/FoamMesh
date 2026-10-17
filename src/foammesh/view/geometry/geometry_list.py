@@ -20,7 +20,9 @@ SURFACE_ICON_FILE = ':/graphicsIcons/face.svg'
 
 def cfdTypeToText(cfdType):
     return {
-        CFDType.NONE.value: QCoreApplication.translate('GeometryPage', 'None'),
+        # Plan 40 UXB1 (#30). A row with no CFD role has no type to show;
+        # the word "None" read as a setting that had been turned off.
+        CFDType.NONE.value: '',
         CFDType.CELL_ZONE.value: QCoreApplication.translate('GeometryPage', 'CellZone'),
         CFDType.BOUNDARY.value: QCoreApplication.translate('GeometryPage', 'Boundary'),
         CFDType.INTERFACE.value: QCoreApplication.translate('GeometryPage', 'Interface'),

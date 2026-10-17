@@ -199,7 +199,11 @@ class MeshPreviewLoader(QObject):
         payload = outcome.payload or {}
         if payload.get('empty'):
             return None
-        refused = self._refuseFiles(payload, max_bytes)
+        # The checks open every file the worker wrote (stat, resolve) and ask
+        # the system for free memory; on Windows a handle closed on a file
+        # just written waits for the virus scanner, 1 to 1.8 s measured on
+        # the GUI thread with the 6.6 M-cell impeller (VI14), so not there.
+        refused = await asyncio.to_thread(self._refuseFiles, payload, max_bytes)
         if refused:
             mesh_preview.remove_files(payload)
             return await self._outline('preview_too_large', refused)

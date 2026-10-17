@@ -8,6 +8,7 @@ from vtkmodules.vtkFiltersSources import vtkSphereSource, vtkLineSource
 from vtkmodules.vtkRenderingCore import vtkPropPicker, vtkActor, vtkDataSetMapper, vtkPolyDataMapper
 
 from widgets.rendering.rendering_widget import MouseHandler, RenderingWidget
+from foammesh.rendering.pick_alone import pick_prop
 from foammesh.view.theming.vtk_theme import rgb
 
 
@@ -26,9 +27,13 @@ class RotationMouseHandler(MouseHandler):
     def center(self):
         return self._center
 
+    def setCenter(self, center):
+        """Rotate about a point that was typed rather than picked."""
+        self._center = tuple(float(value) for value in center)
+
     def _leftButtonClicked(self, x, y):
         picker = vtkPropPicker()
-        picker.PickProp(x, y, self._renderer, self._renderer.GetActors())
+        pick_prop(picker, x, y, self._renderer, self._renderer.GetActors())
 
         self._center = picker.GetPickPosition()
         self.centerChanged.emit(self._center)
@@ -145,6 +150,19 @@ class RotationCenterWidget:
         self._actors = RotationCenterActors()
 
         self._mouseHandler.centerChanged.connect(self._setCenter)
+
+    @property
+    def centerChanged(self):
+        """Emitted with the new centre when a click in the view picks one."""
+        return self._mouseHandler.centerChanged
+
+    def center(self):
+        return tuple(self._mouseHandler.center())
+
+    def setCenter(self, center):
+        """Plan 42 SG23. Move the centre to a typed point."""
+        self._mouseHandler.setCenter(center)
+        self._setCenter(self._mouseHandler.center())
 
     def on(self):
         self._view.setMouseHandler(self._mouseHandler)

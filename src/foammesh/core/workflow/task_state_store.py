@@ -55,6 +55,17 @@ _SETTLED = frozenset({
 #: verdict judges a mesh; it does not make one, so it locks nothing.
 PUBLISHING_EVIDENCE = frozenset({'stage', 'atomic_run'})
 PUBLICATION_SCHEMA_VERSION = 1
+
+#: Plan 43 LY9 (the completion lock, plan section 2). The three steps before
+#: the engine's own tasks. They are not engine tasks, but Proceed locks them
+#: like any other and unlocking Geometry resets everything after it, so they
+#: are steps of the lock's order.
+SETUP_STEPS = ('setup.geometry', 'setup.preparation', 'setup.mesh_setup')
+SETUP_TITLES = {'setup.geometry': 'Geometry',
+                'setup.preparation': 'Preparation',
+                'setup.mesh_setup': 'Mesh setup'}
+GEOMETRY_STEP = SETUP_STEPS[0]
+COMPLETION_SCHEMA_VERSION = 1
 #: A task holds its published result while it is in one of these. SKIPPED
 #: is the record that nothing ran, so there is nothing of it to lock.
 _PUBLISHED_STATES = _SETTLED - {TaskState.SKIPPED}
@@ -372,6 +383,46 @@ class EngineTaskStateStore:
             self.save(graph)
         return changed
 
+    def restore_step(self, tasks_text, completion_text, *,
+                     reopened: str | None = None) -> list[str]:
+        """Put the task states and the finish locks back (undo and redo of a step).
+
+        UXD7 (DP-1381). The publication records are not touched: a step's
+        acceptance does not write them, and they describe meshes on disk.
+
+        ``reopened`` names a step whose acceptance is being undone. Every
+        later result that held a state when this is called is not wiped with
+        the older document: it is marked stale, so the outline says it was
+        made before the step was reopened and needs re-running, and its mesh
+        and reports stay where they are. Returns the tasks marked.
+        """
+        held: list[str] = []
+        if reopened:
+            try:
+                current = self.load()
+                held = [task_id for task_id in self.descriptor.descendants(reopened)
+                        if current.state(task_id) in _SETTLED]
+            except (KeyError, LookupError, ValueError):
+                held = []                   # a setup step is not a task
+        if tasks_text is None:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            _write_text_durably(self.path, tasks_text)
+        self.restore_completion(completion_text)
+        marked: list[str] = []
+        if held:
+            graph = self.load_result().graph
+            for task_id in held:
+                if graph.state(task_id) not in _SETTLED | {TaskState.STALE}:
+                    graph._state[task_id] = TaskState.STALE
+                    marked.append(task_id)
+            if marked:
+                self.save(graph)
+        return marked
+
     def record_stage_chain_success(self, task_id: str, *,
                                    warning: bool = False,
                                    reasons=()) -> dict:
@@ -400,7 +451,8 @@ class EngineTaskStateStore:
     def record_atomic_run_success(self, task_ids, *,
                                   warning: bool = False,
                                   waived=(), configured=(),
-                                  warning_for=None, reasons=()) -> dict:
+                                  warning_for=None, reasons=(),
+                                  evidenced=()) -> dict:
         """Advance the tasks one atomic engine run actually performed.
 
         Some engines do several tasks in one invocation -- ``mesh.gmsh.run``
@@ -457,7 +509,8 @@ class EngineTaskStateStore:
                          else set(warning_for) & performed),
             performed=performed, evidence={'kind': 'atomic_run'},
             reasons=reasons,
-            configured=configured, waived=frozenset(waived))
+            configured=configured, waived=frozenset(waived),
+            evidenced=frozenset(evidenced) & performed)
 
     def record_check_result(self, task_id: str, *, evidence: dict,
                             warning: bool = False) -> dict:
@@ -482,7 +535,7 @@ class EngineTaskStateStore:
     def _record(self, task_ids, *, warning: bool, evidence: dict,
                 complete: bool = False, warning_for=None, performed=None,
                 configured=frozenset(), waived=frozenset(),
-                reasons=()) -> dict:
+                reasons=(), evidenced=frozenset()) -> dict:
         """Advance the named tasks, stopping cleanly and keeping what advanced.
 
         The previous recorder raised into a caller that swallowed the exception
@@ -591,7 +644,7 @@ class EngineTaskStateStore:
                     graph.start(task_id)
                     graph.fail(task_id)
                     graph.waive(task_id)
-                elif complete:
+                elif complete or task_id in evidenced:
                     # R180. `complete` refuses to run from EDITING, and a
                     # check task reaches EDITING the moment anyone presses
                     # Revert and edit on it. From there it is a dead end: a
@@ -650,6 +703,8 @@ class EngineTaskStateStore:
                     next_runnable=graph.next_runnable(),
                     evidence=self.evidence(),
                     locked=self.locked_tasks(graph),
+                    completion_locked=self.completion_locked_steps(graph),
+                    locked_steps=self.locked_steps(graph),
                     publications=self.lock_state(graph),
                     workflow_reset_notice=loaded.notice())
 
@@ -718,16 +773,150 @@ class EngineTaskStateStore:
         the task -- a configure, a reset, an unlock of a predecessor walked
         along the dependency edges -- has already moved it out of the
         published states, so its lock went with it.
+
+        Plan 43 LY9. A task the user finished with Proceed is locked too (the
+        completion lock): it is in this list for as long as the state it was
+        finished in holds, whether or not a run published it.
         """
-        if not self.publications_path.is_file():
+        have_completion = self.completion_path.is_file()
+        if not have_completion and not self.publications_path.is_file():
             return []
         graph = graph or self.load()
-        active = {task_id for task_id, record in
-                  self.publications()['publications'].items()
-                  if isinstance(record, dict) and record.get('active')}
+        active = set(self.completion_locked_tasks(graph))
+        if self.publications_path.is_file():
+            active |= {task_id for task_id, record in
+                       self.publications()['publications'].items()
+                       if isinstance(record, dict) and record.get('active')
+                       and task_id in graph._state
+                       and graph.state(task_id) in _PUBLISHED_STATES}
         return [task.task_id for task in self.descriptor.ordered_tasks()
-                if task.task_id in active
-                and graph.state(task.task_id) in _PUBLISHED_STATES]
+                if task.task_id in active]
+
+    # -- Plan 43 LY9: the completion lock --------------------------------- #
+
+    @property
+    def completion_path(self) -> Path:
+        """One file for the case: the setup steps belong to no engine."""
+        return self.path.with_name('completion-locks.json')
+
+    def completion_document(self) -> dict:
+        empty = {'schema_version': COMPLETION_SCHEMA_VERSION, 'revision': 0,
+                 'locked': {}}
+        try:
+            document = json.loads(self.completion_path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return empty
+        except (OSError, ValueError):
+            return dict(empty, unreadable=True)
+        if not isinstance(document, dict) or not isinstance(
+                document.get('locked'), dict):
+            return dict(empty, unreadable=True)
+        return document
+
+    def step_order(self) -> list[str]:
+        """Every step the lock orders: the setup steps, then the tasks."""
+        return [*SETUP_STEPS,
+                *(task.task_id for task in self.descriptor.ordered_tasks())]
+
+    def step_title(self, step_id: str) -> str:
+        if step_id in SETUP_TITLES:
+            return SETUP_TITLES[step_id]
+        return self.descriptor.task(step_id).title
+
+    def _require_step(self, step_id: str) -> None:
+        if step_id in SETUP_TITLES:
+            return
+        self.descriptor.task(step_id)       # raises for an unknown id
+
+    def completion_locked_steps(self, graph: EngineWorkflowGraph | None = None
+                                ) -> list[str]:
+        """The steps Proceed has locked and whose finished state still holds.
+
+        A setup step has no state of its own to check; it stays locked until
+        it is unlocked. A task also drops out of the list the moment the
+        graph moves it out of a settled state (a reset, an edit that was
+        allowed through before the lock existed), so the list never claims a
+        lock over a step that is not done.
+        """
+        recorded = self.completion_document()['locked']
+        if not recorded:
+            return []
+        graph = graph or self.load()
+        found = []
+        for step_id in self.step_order():
+            if step_id not in recorded:
+                continue
+            if step_id in SETUP_TITLES or (
+                    step_id in graph._state
+                    and graph.state(step_id) in _SETTLED):
+                found.append(step_id)
+        return found
+
+    def completion_locked_tasks(self, graph: EngineWorkflowGraph | None = None
+                                ) -> list[str]:
+        return [step for step in self.completion_locked_steps(graph)
+                if step not in SETUP_TITLES]
+
+    def locked_steps(self, graph: EngineWorkflowGraph | None = None) -> list[str]:
+        """Every locked step in the lock's order, setup steps included."""
+        graph = graph or self.load()
+        tasks = set(self.locked_tasks(graph))
+        setup = set(self.completion_locked_steps(graph)) & set(SETUP_STEPS)
+        return [step for step in self.step_order()
+                if step in tasks or step in setup]
+
+    def is_step_locked(self, step_id: str) -> bool:
+        return step_id in self.locked_steps()
+
+    def lock_completed(self, step_id: str) -> dict:
+        """Proceed locks the step: it is finished and protected (section 2).
+
+        A task has to be in a settled state (accepted, passed, skipped,
+        completed or waived): there is nothing to protect on a step that is
+        not done, and a lock over one would make it impossible to finish.
+        """
+        self._require_step(step_id)
+        loaded = self.load_result()
+        graph = loaded.graph
+        if step_id not in SETUP_TITLES and graph.state(step_id) not in _SETTLED:
+            raise TaskStateError(
+                f'{self.step_title(step_id)} is not done, so it cannot be '
+                'locked')
+        document = self.completion_document()
+        document.pop('unreadable', None)
+        # The steps before it are what it was finished on, so they are
+        # protected with it: the locked steps are always a run from the
+        # start, never a locked step with an open one behind it.
+        order = self.step_order()
+        wanted = [step for step in order[:order.index(step_id) + 1]
+                  if step in SETUP_TITLES or graph.state(step) in _SETTLED]
+        added = [step for step in wanted if step not in document['locked']]
+        if added:
+            revision = int(document.get('revision') or 0) + 1
+            for step in added:
+                document['locked'][step] = {'locked_at': _now(),
+                                            'revision': revision}
+            document['revision'] = revision
+            document['schema_version'] = COMPLETION_SCHEMA_VERSION
+            _write_json_durably(self.completion_path, document)
+        return {'step_id': step_id, 'locked': self.locked_steps(graph),
+                'revision': document['revision']}
+
+    def completion_text(self):
+        try:
+            return self.completion_path.read_text(encoding='utf-8')
+        except FileNotFoundError:
+            return None
+
+    def restore_completion(self, text) -> None:
+        """Put the completion document back byte for byte (undo, rollback)."""
+        if text is None:
+            try:
+                self.completion_path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        _write_text_durably(self.completion_path, text)
 
     def lock_state(self, graph: EngineWorkflowGraph | None = None) -> dict:
         if not self.publications_path.is_file():
@@ -743,25 +932,55 @@ class EngineTaskStateStore:
     def is_locked(self, task_id: str) -> bool:
         return task_id in self.locked_tasks()
 
-    def unlock_scope(self, task_id: str) -> list[str]:
-        """The task and every task that depends on it, by dependency edges."""
-        self.descriptor.task(task_id)
-        return [task_id, *self.descriptor.descendants(task_id)]
+    def unlock_scope(self, step_id: str) -> list[str]:
+        """The step and every step that has to be done again after it.
+
+        Plan 43 LY9. A step finished with Proceed carries every step after
+        it in the lock's order, whether or not the dependency edges reach
+        them: the mesh that exists must match the settings of every locked
+        step, so reopening one reopens the rest. A step that is locked only
+        because a run published it keeps the earlier scope, the dependency
+        edges (Plan 37 UF5).
+        """
+        self._require_step(step_id)
+        recorded = self.completion_document()['locked']
+        if step_id not in recorded and step_id not in SETUP_TITLES:
+            return [step_id, *self.descriptor.descendants(step_id)]
+        order = self.step_order()
+        later = order[order.index(step_id) + 1:]
+        if step_id in SETUP_TITLES:
+            return [step_id, *later]
+        return [step_id, *later]
 
     def unlock(self, task_id: str, *, operation_id: str) -> dict:
-        """Reopen a locked task and discard the results that depend on it.
+        """Reopen a locked step and discard the results that depend on it.
 
-        The task and its dependants go STALE; their publications are
-        deactivated -- kept rather than deleted, so the historical record
-        stays addressable.
+        The step and everything after it go back to not done: a task goes
+        STALE (its values are kept; the ribbon reads that as not done), its
+        publication is deactivated -- kept rather than deleted, so the
+        historical record stays addressable -- and its completion lock is
+        removed. Unlocking Geometry starts every later step over, as for new
+        geometry: the task states are reset, not marked out of date.
         """
         loaded = self.load_result()
         graph = loaded.graph
-        if task_id not in self.locked_tasks(graph):
+        if task_id not in self.locked_steps(graph):
             raise TaskStateError(f'{task_id} is not locked')
         scope = self.unlock_scope(task_id)
-        invalidated = graph.invalidate(task_id, include_self=True)
+        resets = task_id == GEOMETRY_STEP
+        if resets:
+            invalidated = [step for step in scope if step in graph._state
+                           and graph.state(step) is not TaskState.LOCKED]
+            graph = EngineWorkflowGraph(self.descriptor)
+        else:
+            invalidated = []
+            for step in scope:
+                if step in graph._state:
+                    invalidated.extend(
+                        item for item in graph.invalidate(step, include_self=True)
+                        if item not in invalidated)
         document = self.save(graph)
+        cleared = self._clear_completion(scope)
         publications = self.publications()
         revision = int(publications.get('revision') or 0) + 1
         deactivated = []
@@ -773,11 +992,26 @@ class EngineTaskStateStore:
                 record['deactivated_revision'] = revision
                 deactivated.append(scoped)
         publications['revision'] = revision
+        publications.pop('unreadable', None)
         self._write_publications(publications)
         return {'task_id': task_id, 'scope': scope,
                 'invalidated': list(invalidated), 'deactivated': deactivated,
+                'completion_cleared': cleared, 'resets_values': resets,
                 'tasks': document['tasks'],
                 'publication_revision': revision}
+
+    def _clear_completion(self, scope) -> list[str]:
+        document = self.completion_document()
+        recorded = document['locked']
+        cleared = [step for step in scope if step in recorded]
+        if not cleared:
+            return []
+        for step in cleared:
+            del recorded[step]
+        document.pop('unreadable', None)
+        document['revision'] = int(document.get('revision') or 0) + 1
+        _write_json_durably(self.completion_path, document)
+        return cleared
 
     def document_texts(self) -> tuple:
         """The task-state and publication files as they are on disk."""

@@ -17,6 +17,7 @@ from foammesh.core.mesh import MeshInfo, MeshInfoService, MeshTransformRequest, 
 from foammesh.core.mesh.transform import parse_scale
 from foammesh.core.quality import QualityReport
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
+from widgets import async_message_box as messages
 
 
 def _readonly_text(text: str) -> QPlainTextEdit:
@@ -112,7 +113,10 @@ class MeshInfoDialog(QDialog):
         try:
             MeshInfoService.save_report(self._info, path)
         except (OSError, ValueError) as error:
-            QMessageBox.warning(self, self.tr('Save mesh report'), str(error))
+            messages.error(self, self.tr('The mesh report could not be saved.'),
+                           why=self.tr('The file could not be written.'),
+                           todo=self.tr('Check the folder and try again.'),
+                           exception=error, title=self.tr('Save mesh report'))
 
 
 class QualityDashboardDialog(QDialog):
@@ -284,9 +288,12 @@ class TransformDialog(QDialog):
         try:
             self.request().argv()
         except ValueError as error:
-            QMessageBox.warning(self, self.windowTitle(), str(error))
+            messages.error(self, self.tr('The request could not be read.'),
+                           why=self.tr('One of the values is not valid.'),
+                           todo=self.tr('Correct it and try again.'),
+                           exception=error, title=self.windowTitle())
             return
-        if self.request().has_negative_scale and QMessageBox.warning(
+        if self.request().has_negative_scale and messages.warning(
                 self, self.windowTitle(),
                 self.tr('Negative scale mirrors the mesh. Continue?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

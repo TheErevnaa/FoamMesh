@@ -118,13 +118,32 @@ class PublishReport:
 # --------------------------------------------------------------------------- #
 
 def read_msh(path: str | Path) -> MshDocument:
-    """Read an ASCII MSH 2.2 file.
+    """Read an MSH file: ASCII 2.2, or 4.x in ASCII or binary (GN15).
 
     Version 2.2 is what the runner writes: OpenFOAM 13's ``gmshToFoam`` cannot
     read 4.1 at all, and one format serving both the direct route and the
-    diagnostic fallback is one format to get right.
+    diagnostic fallback is one format to get right.  The Export page can
+    write any version, so the 4.x reader is :mod:`foammesh.core.gmsh.msh4`.
     """
     path = Path(path)
+    # Plan 41 GN15: the Export page writes any MSH version, so a 4.x file
+    # (ASCII or binary) is read here too, by :mod:`msh4`.
+    try:
+        with open(path, 'rb') as handle:
+            head = handle.read(64)
+    except OSError as error:
+        raise PublishError(f'mesh file could not be read: {error}') from error
+    from foammesh.core.gmsh import msh4
+    if msh4.is_msh4(head):
+        try:
+            points, node_ids, rows, names = msh4.read_msh4(path)
+        except msh4.Msh4Error as error:
+            raise PublishError(str(error)) from error
+        return MshDocument(
+            points=np.asarray(points, dtype=np.float64),
+            node_index={int(node): position
+                        for position, node in enumerate(node_ids.tolist())},
+            elements=rows, physical_names=names)
     try:
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
     except OSError as error:
@@ -872,7 +891,7 @@ def _region_metadata(cell_blocks, physical_names, supplied):
 # --------------------------------------------------------------------------- #
 
 def patch_metadata_from(categories=None, periodic_pairs=(),
-                        identities=None) -> dict:
+                        identities=None, non_conformal_pairs=()) -> dict:
     """Build the per-patch metadata the writer needs.
 
     ``categories`` maps a solver patch name to a prepared boundary category,
@@ -888,6 +907,12 @@ def patch_metadata_from(categories=None, periodic_pairs=(),
 
     Periodic pairs become matched ``cyclic`` patches carrying the transform,
     which is what lets OpenFOAM couple them.
+
+    Plan 42 SG22 Q2. ``non_conformal_pairs`` names (``masterSolverName``,
+    ``slaveSolverName``) the two patches the Gmsh run kept apart: they stay
+    ordinary patches here, declared ``non_conformal`` so the validator lets
+    the coincident points of the two copies stand, and OpenFOAM
+    ``createNonConformalCouples`` couples them afterwards.
     """
     identities = dict(identities or {})
     metadata: dict[str, dict] = {}
@@ -903,6 +928,13 @@ def patch_metadata_from(categories=None, periodic_pairs=(),
         master = str(pair.get('masterSolverName') or pair.get('masterScope') or '')
         slave = str(pair.get('slaveSolverName') or pair.get('slaveScope') or '')
         if not master or not slave:
+            continue
+        if str(pair.get('transform')) == 'affine':
+            # Plan 41 GN11. OpenFOAM's cyclic patch carries a translation or
+            # a rotation; a general matrix has no cyclic form, so the pair
+            # is a Gmsh-side periodicity (the $Periodic section of a native
+            # .msh) and its surfaces publish as the plain patches they are,
+            # rather than as a translational pair with the wrong vector.
             continue
         shared = {
             'coupling': 'cyclic',
@@ -930,6 +962,21 @@ def patch_metadata_from(categories=None, periodic_pairs=(),
             item['interface'] = dict(
                 shared, role=role, neighbour_stable_id=neighbour,
                 neighbour_solver_name=neighbour)
+    for pair in non_conformal_pairs or ():
+        master = str(pair.get('masterSolverName') or '')
+        slave = str(pair.get('slaveSolverName') or '')
+        if not master or not slave:
+            continue
+        for name, role, neighbour in ((master, 'master', slave),
+                                      (slave, 'slave', master)):
+            item = metadata.setdefault(name, {
+                'name': name, 'solver_name': name, 'stable_id': name,
+                'category': 'wall'})
+            item['interface'] = {
+                'coupling': 'non_conformal',
+                'pair_id': str(pair.get('name') or ''),
+                'role': role, 'neighbour_stable_id': neighbour,
+                'neighbour_solver_name': neighbour}
     return metadata
 
 
@@ -973,6 +1020,7 @@ def substitute_mesh_constrained(categories) -> tuple[dict, list]:
 def publish(msh_path: str | Path, destination: str | Path, *,
             categories=None, periodic_pairs=(), region_metadata=None,
             identities=None, source_fingerprint: str = '',
+            non_conformal_pairs=(),
             extrusion: 'SectionExtrusion | None' = None) -> PublishReport:
     """Read a Gmsh mesh and write ``constant/polyMesh`` at ``destination``."""
     document = read_msh(msh_path)
@@ -993,7 +1041,7 @@ def publish(msh_path: str | Path, destination: str | Path, *,
     mesh, report = build_canonical(
         document,
         patch_metadata=patch_metadata_from(
-            categories, periodic_pairs, identities),
+            categories, periodic_pairs, identities, non_conformal_pairs),
         region_metadata=region_metadata,
         source_fingerprint=source_fingerprint or Path(msh_path).name,
         extrusion=extrusion)

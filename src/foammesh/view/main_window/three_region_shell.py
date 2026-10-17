@@ -9,15 +9,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, Signal
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
-    QBoxLayout, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter, QTabWidget, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from foammesh.view.theming.metrics import GAP, apply_bar_metrics
 
+from foammesh.view.theming.elevation import level_margins, paint_ring
+
+from .output_tabs import CONSOLE_HEADER_HEIGHT, ConsoleHeader
 from .verdict_strip import VerdictStrip
+
+
+class ElidingPushButton(QPushButton):
+    """MF27. The footer's primary button. At 1280x800 the 300 px sheet left
+    "Apply layers & Proceed" (and every "<verb> & Proceed") about 30 px less
+    than its label, and Qt clipped the centred text at both ends ("ly layers
+    & Proc"). The label is now elided at its end when the row is short; the
+    full words stay in ``text()``, the accessible name and the tooltip."""
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(hint.width(), self.fontMetrics().horizontalAdvance(
+            'Proceed') + 24))
+        return hint
+
+    def displayedText(self) -> str:
+        """The words as painted: elided to the contents rect when short."""
+        from PySide6.QtWidgets import QStyle, QStyleOptionButton
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        room = self.style().subElementRect(
+            QStyle.SubElement.SE_PushButtonContents, option, self).width()
+        # '&&' is a literal ampersand, a lone '&' marks a mnemonic
+        plain = '&'.join(part.replace('&', '')
+                         for part in self.text().split('&&'))
+        metrics = self.fontMetrics()
+        if metrics.horizontalAdvance(plain) <= room:
+            return plain
+        return metrics.elidedText(plain, Qt.TextElideMode.ElideRight,
+                                  max(room, 0))
+
+    def paintEvent(self, event):
+        from PySide6.QtWidgets import QStyle, QStyleOptionButton, QStylePainter
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.text = self.displayedText().replace('&', '&&')
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.ControlElement.CE_PushButton, option)
 
 
 REGION_A_MINIMUM = 190
@@ -36,6 +79,13 @@ REGION_C_BAND_MINIMUM = 90
 #: offending elements are all readable without touching the handle.
 REGION_C_BAND_PREFERRED = 260
 REGION_A_PREFERRED = 220
+#: Plan 40 UXC1 (section 4.4 item 1). Collapsed, the outline is a rail of step
+#: numbers and glyphs this wide; the freed room goes to the viewport.
+REGION_A_RAIL = 48
+#: Plan 40 UXC1 (section 4.4 item 5). From this window width a wide table page
+#: may take the room it needs, up to this share of the window.
+REGION_B_WIDE_FROM = 1920
+REGION_B_WIDE_SHARE = 0.40
 REGION_B_PREFERRED = 420
 REGION_B_COMPACT_PREFERRED = 360
 #: DP-569. A window narrower than this gets the compact settings column. It
@@ -101,8 +151,221 @@ def reveal_output_band(splitter, *, minimum: int | None = None) -> bool:
     return True
 
 
+class OutputBandController:
+    """The output band on demand, and focus mode (Plan 40 UXC2).
+
+    F2b/F8d/N11. The band under the viewport took about 260 px for a console
+    that said nothing and a quality tab that said the same thing three times,
+    and reading the quality tables meant shrinking the view of the mesh they
+    describe. Closed, the band is the verdict strip alone -- the one-line chip
+    -- and the viewport keeps the rest. It opens on a run, on a failure, on
+    ``Details`` and on a click on the chip; ``Ctrl+J`` toggles it.
+
+    Focus mode (``F11``) hides the outline, the page column and the band, so
+    the model owns the window; ``Esc`` puts back exactly what was there.
+    """
+
+    def __init__(self, region_splitter, output_band, tab_host, verdict_strip,
+                 region_splitter_h=None, header=None) -> None:
+        #: Plan 44 MF6. The console's one header row (it moves the verdict
+        #: between the row and the folded chip); ``None`` for a bare band.
+        self._header = header
+        self._splitter = region_splitter
+        self._band = output_band
+        self._tabs = tab_host
+        self._strip = verdict_strip
+        self._outer = region_splitter_h
+        self._open = False
+        self._focus = False
+        self._band_open_before_focus = False
+        self._hidden_before_focus: list = []
+        self._listeners: list = []
+        self._docks = None
+        # UXR: a band a run opened folds again when the runs end well; a band
+        # the reader opened or took over (a click, Ctrl+J, a tab asked for)
+        # stays.
+        self._automatic = False
+        self._running = 0
+        self._failed = False
+
+    def use_docks(self, docks) -> None:
+        """Plan 40 UXC3. Focus mode closes the side docks instead of hiding
+        splitter children, and the sizes it left come back with them."""
+        self._docks = docks
+        self._sizes_before_focus = None
+
+    # -- band -------------------------------------------------------------- #
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    @property
+    def in_focus_mode(self) -> bool:
+        return self._focus
+
+    def subscribe(self, callback) -> None:
+        """``callback(is_open, in_focus_mode)`` after either state changes."""
+        self._listeners.append(callback)
+
+    def _changed(self) -> None:
+        for callback in tuple(self._listeners):
+            callback(self._open, self._focus)
+
+    def _viewport_total(self) -> int:
+        sizes = self._splitter.sizes()
+        total = sum(sizes[:2])
+        return total if total > 0 else 800
+
+    def open(self, *, automatic: bool = False) -> bool:
+        """Show the tab band at a readable height. True when it changed.
+
+        ``automatic`` marks a run opening it: that band folds when the runs
+        end well. Any other open is the reader's and keeps it."""
+        if self._focus:
+            # Focus mode owns the screen; the band opens when it ends.
+            self._band_open_before_focus = True
+            return False
+        if self._open:
+            if not automatic:
+                self._automatic = False
+            return False
+        self._automatic = automatic
+        self._open = True
+        self._show_band_widgets(True)
+        total = self._viewport_total()
+        self._splitter.setSizes(list(preferred_band_sizes(total)))
+        self._changed()
+        return True
+
+    def close(self) -> bool:
+        """Fold the band to the verdict chip. True when it changed."""
+        if self._focus:
+            self._band_open_before_focus = False
+            return False
+        self._automatic = False
+        if not self._open and self._folded():
+            return False
+        self._open = False
+        self._show_band_widgets(False)
+        total = self._viewport_total()
+        chip = self._chip_height()
+        self._splitter.setSizes([max(total - chip, 0), chip])
+        self._changed()
+        return True
+
+    def toggle(self) -> bool:
+        """Ctrl+J. Returns whether the band is open afterwards."""
+        if self._focus:
+            self.leave_focus()
+        if self._open:
+            self.close()
+        else:
+            self.open()
+        return self._open
+
+    def run_started(self) -> bool:
+        """A job started: bring the band up as the run's, not the reader's."""
+        self._running += 1
+        self._failed = False
+        return self.open(automatic=True)
+
+    def run_failed(self) -> bool:
+        """A job failed: the band stays, whoever opened it."""
+        self._running = max(self._running - 1, 0)
+        self._failed = True
+        self._automatic = False
+        return self.open()
+
+    def run_ended(self) -> None:
+        self._running = max(self._running - 1, 0)
+
+    def settle_after_runs(self) -> bool:
+        """Fold the band a run opened once no run is left and none failed."""
+        if (self._automatic and self._open and self._running == 0
+                and not self._failed and not self._focus):
+            return self.close()
+        return False
+
+    def _folded(self) -> bool:
+        return self._tabs.isHidden()
+
+    def _chip_height(self) -> int:
+        # Plan 44 MF6. Folded, the console is its 28 px header row and nothing
+        # else; the verdict strip no longer decides the height.
+        return CONSOLE_HEADER_HEIGHT
+
+    def _show_band_widgets(self, opened: bool) -> None:
+        self._tabs.setVisible(opened)
+        if self._header is not None:
+            self._header.set_folded(not opened)
+        if opened:
+            self._band.setMinimumHeight(
+                CONSOLE_HEADER_HEIGHT + REGION_C_BAND_MINIMUM)
+            self._band.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+            self._band.setMaximumHeight(16777215)
+        else:
+            # One line, and no handle to drag it taller than its content.
+            chip = self._chip_height()
+            self._band.setMinimumHeight(chip)
+            self._band.setMaximumHeight(chip)
+
+    # -- focus mode -------------------------------------------------------- #
+
+    def enter_focus(self) -> bool:
+        if self._focus:
+            return False
+        self._band_open_before_focus = self._open
+        self._hidden_before_focus = []
+        if self._docks is not None:
+            self._sizes_before_focus = self._docks.regions.sizes()
+            self._docks.hide_side_docks()
+        elif self._outer is not None:
+            for index in (0, 1):
+                widget = self._outer.widget(index)
+                if widget is not None and not widget.isHidden():
+                    widget.hide()
+                    self._hidden_before_focus.append(widget)
+        self._band.hide()
+        self._focus = True
+        self._changed()
+        return True
+
+    def leave_focus(self) -> bool:
+        if not self._focus:
+            return False
+        self._focus = False
+        if self._docks is not None:
+            self._docks.show_side_docks()
+            if self._sizes_before_focus and all(self._sizes_before_focus):
+                self._docks.regions.setSizes(self._sizes_before_focus)
+        for widget in self._hidden_before_focus:
+            widget.show()
+        self._hidden_before_focus = []
+        self._band.show()
+        wanted = self._band_open_before_focus
+        if wanted:
+            self._open = False
+            self.open()
+        else:
+            self._open = True
+            self.close()
+        self._changed()
+        return True
+
+    def toggle_focus(self) -> bool:
+        """F11. Returns whether focus mode is on afterwards."""
+        if self._focus:
+            self.leave_focus()
+        else:
+            self.enter_focus()
+        return self._focus
+
+
 def preferred_region_sizes(
-        total_width: int, a_preferred: int | None = None
+        total_width: int, a_preferred: int | None = None,
+        b_wanted: int | None = None, rail: bool = False
 ) -> tuple[int, int, int]:
     """Return the FOAMFlow-aligned A/B/C allocation for ``total_width``.
 
@@ -110,23 +373,33 @@ def preferred_region_sizes(
     without eliding them; ``REGION_A_PREFERRED`` is the floor, and B and C keep
     their own minimums ahead of it, so a long task name can widen the pane but
     never starve the page or the viewport.
+
+    Plan 40 UXC1. ``rail`` collapses A to ``REGION_A_RAIL`` and gives what it
+    frees to C. ``b_wanted`` is the width the page on screen asks for; in a
+    window of ``REGION_B_WIDE_FROM`` or more a wide table page gets it, up to
+    ``REGION_B_WIDE_SHARE`` of the window, and a narrower window is unchanged.
     """
     total_width = max(
         int(total_width),
         REGION_A_MINIMUM + REGION_B_MINIMUM + REGION_C_MINIMUM,
     )
-    a_width = max(REGION_A_PREFERRED, int(a_preferred or 0))
+    a_width = (REGION_A_RAIL if rail
+               else max(REGION_A_PREFERRED, int(a_preferred or 0)))
     b_width = (
         REGION_B_COMPACT_PREFERRED
         if total_width < REGION_B_COMPACT_BELOW else REGION_B_PREFERRED
     )
+    if b_wanted and total_width >= REGION_B_WIDE_FROM:
+        b_width = max(b_width, min(
+            int(b_wanted), int(total_width * REGION_B_WIDE_SHARE)))
     c_width = total_width - a_width - b_width
     if c_width < REGION_C_MINIMUM:
         deficit = REGION_C_MINIMUM - c_width
         shrink_b = min(deficit, b_width - REGION_B_MINIMUM)
         b_width -= shrink_b
         deficit -= shrink_b
-        a_width -= min(deficit, a_width - REGION_A_MINIMUM)
+        if not rail:
+            a_width -= min(deficit, a_width - REGION_A_MINIMUM)
         c_width = total_width - a_width - b_width
     return a_width, b_width, c_width
 
@@ -146,25 +419,27 @@ def layout_worth_recording(user_moved: bool, restored_sizes) -> bool:
 
 
 def clamp_region_sizes(
-        total_width: int, sizes, a_preferred: int | None = None
+        total_width: int, sizes, a_preferred: int | None = None,
+        b_wanted: int | None = None, rail: bool = False
 ) -> tuple[int, int, int]:
     """Validate a saved allocation and return a safe current-schema layout."""
     try:
         values = tuple(int(value) for value in sizes)
     except (TypeError, ValueError):
-        return preferred_region_sizes(total_width, a_preferred)
+        return preferred_region_sizes(total_width, a_preferred, b_wanted, rail)
     if len(values) != 3 or any(value < 0 for value in values):
-        return preferred_region_sizes(total_width, a_preferred)
+        return preferred_region_sizes(total_width, a_preferred, b_wanted, rail)
 
     total_width = max(
         int(total_width),
         REGION_A_MINIMUM + REGION_B_MINIMUM + REGION_C_MINIMUM,
     )
-    a_width = max(REGION_A_MINIMUM, values[0])
+    a_width = (REGION_A_RAIL if rail
+               else max(REGION_A_MINIMUM, values[0]))
     b_width = max(REGION_B_MINIMUM, values[1])
     # A and B own their requested widths; every remaining pixel belongs to C.
     if a_width + b_width + REGION_C_MINIMUM > total_width:
-        return preferred_region_sizes(total_width, a_preferred)
+        return preferred_region_sizes(total_width, a_preferred, b_wanted, rail)
     return a_width, b_width, total_width - a_width - b_width
 
 
@@ -176,7 +451,8 @@ class PageColumn(QScrollArea):
     every page it holds, shown or not -- was a term in the window's own
     minimum height. MEASURED on the real window built offscreen at
     `4ed5fcb8`: 892 px of minimum height, of which Region B asked for 823 and
-    the page stack for 736, and the 736 belonged to `baseGridPage`, a page
+    the page stack for 736, and the 736 belonged to `baseGridPage` (Plan 43 D1 has since emptied it: the
+    five snappy stack pages are bare shells that keep the stack indices), a page
     the user may never open. The elbow campaign of 16 September measured the
     same thing on a real display: 1,428 px of minimum height against 1,032 px
     of screen, with the one forward button 359 px below the bottom of the
@@ -214,9 +490,14 @@ class PageColumn(QScrollArea):
     that scrolls itself is given exactly the room it is shown in.
     """
 
+    #: Plan 40 UXC1. The width the page on screen asks for, in the window's
+    #: own pixels (page floor plus the column's chrome), when it changes.
+    wantedWidthChanged = Signal(int)
+
     def __init__(self, stack, parent=None) -> None:
         super().__init__(parent)
         self._stack = stack
+        self._wantedWidth = 0
         self.setObjectName('regionBPageColumn')
         self.setAccessibleName('Settings for the current step')
         self.setWidgetResizable(True)
@@ -256,6 +537,10 @@ class PageColumn(QScrollArea):
     def stack(self):
         return self._stack
 
+    def wantedWidth(self) -> int:
+        """Width the shown page needs, with the column's own chrome."""
+        return self._wantedWidth
+
     def eventFilter(self, watched, event):
         if watched is self._stack and event.type() in (
                 QEvent.Type.LayoutRequest, QEvent.Type.ChildAdded,
@@ -283,6 +568,12 @@ class PageColumn(QScrollArea):
             self._stack.setMaximumHeight(capped)
         if self._stack.minimumWidth() != width:
             self._stack.setMinimumWidth(width)
+        # What the page asks for, plus the bar the column may draw beside it.
+        chrome = self.verticalScrollBar().sizeHint().width() + 2 * GAP
+        wanted_width = width + chrome if width else 0
+        if wanted_width != self._wantedWidth:
+            self._wantedWidth = wanted_width
+            self.wantedWidthChanged.emit(wanted_width)
 
     def _keepLeftEdge(self, value: int) -> None:
         if value:
@@ -309,6 +600,8 @@ class ThreeRegionShell:
     page_column: QWidget = None                              # type: ignore[assignment]
     #: DP-A1. The footer, outside that scroller and never inside it.
     action_bar: QWidget = None                               # type: ignore[assignment]
+    #: Plan 40 UXC2. Opens and folds the output band; owns focus mode.
+    band: object = None
 
     @property
     def minimum_window_width(self) -> int:
@@ -317,12 +610,34 @@ class ThreeRegionShell:
             + 2 * self.splitter.handleWidth()
         )
 
+    @property
+    def rail(self) -> bool:
+        """Plan 40 UXC1. True while the outline is the narrow rail."""
+        return bool(self.region_a.property('railMode'))
+
+    def set_rail(self, collapsed: bool) -> bool:
+        """Collapse the outline to the rail, or open it. True when changed."""
+        collapsed = bool(collapsed)
+        if collapsed == self.rail:
+            return False
+        self.region_a.setProperty('railMode', collapsed)
+        if collapsed:
+            self.region_a.setMinimumWidth(REGION_A_RAIL)
+            self.region_a.setMaximumWidth(REGION_A_RAIL)
+        else:
+            self.region_a.setMaximumWidth(16777215)
+            self.region_a.setMinimumWidth(REGION_A_MINIMUM)
+        return True
+
     def apply_sizes(self, total_width: int, saved=None,
-                    a_preferred: int | None = None) -> tuple[int, int, int]:
+                    a_preferred: int | None = None,
+                    b_wanted: int | None = None) -> tuple[int, int, int]:
+        rail = self.rail
         sizes = (
-            preferred_region_sizes(total_width, a_preferred)
+            preferred_region_sizes(total_width, a_preferred, b_wanted, rail)
             if saved is None
-            else clamp_region_sizes(total_width, saved, a_preferred)
+            else clamp_region_sizes(
+                total_width, saved, a_preferred, b_wanted, rail)
         )
         self.splitter.setSizes(list(sizes))
         return sizes
@@ -334,7 +649,8 @@ class ThreeRegionShell:
         assert tuple(
             self.splitter.widget(index).objectName() for index in range(3)
         ) == ('regionAHost', 'regionBHost', 'regionCHost')
-        assert self.region_a.minimumWidth() == REGION_A_MINIMUM
+        assert self.region_a.minimumWidth() == (
+            REGION_A_RAIL if self.rail else REGION_A_MINIMUM)
         assert self.region_b.minimumWidth() == REGION_B_MINIMUM
         assert self.region_c_host.minimumWidth() == REGION_C_MINIMUM
         # WP3's whole point: the model never leaves the screen. The viewport is
@@ -348,6 +664,192 @@ class ThreeRegionShell:
         # page would carry the one forward action off the bottom of the view.
         assert self.page_column is not None and self.action_bar is not None
         assert not self.page_column.isAncestorOf(self.action_bar)
+
+
+#: Plan 44 MF17 (M:199, `.page-f{padding:8px 10px;border-top:1px solid}`). The
+#: footer row's own padding and the one-pixel rule above it. With a 24 px
+#: control the row is 1 + 8 + 24 + 8 = 41 px, the mockup's 40 +- 2.
+FOOTER_PAD_H = 10
+FOOTER_PAD_V = 8
+FOOTER_RULE = 1
+
+
+def apply_footer_metrics(bar: QWidget, layout) -> None:
+    """Widen the footer from the house bar inset to the mockup's padding.
+
+    The rule is drawn by the style sheet (``footer.qss.tmpl``) as the bar's
+    top border, inside the bar, so the top padding counts it.
+    """
+    bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    layout.setContentsMargins(FOOTER_PAD_H, FOOTER_PAD_V + FOOTER_RULE,
+                              FOOTER_PAD_H, FOOTER_PAD_V)
+
+
+class _HideWhenDisabled(QObject):
+    """Plan 44 MF17. Back is hidden where it cannot act, i.e. on step 1.
+
+    The step manager disables Back exactly when there is no previous page
+    (no case open, or the route history is one page long). A disabled Back
+    on the first page was a dead button in the mockup's place for nothing,
+    so the button follows its own enabled state: hidden while disabled,
+    shown again when enabled. Proceed does not move, because the row is
+    right-aligned behind its spacer.
+    """
+
+    def __init__(self, button: QWidget) -> None:
+        super().__init__(button)
+        self._button = button
+        button.installEventFilter(self)
+        self.sync()
+
+    def sync(self) -> None:
+        self._button.setVisible(self._button.isEnabled())
+
+    def eventFilter(self, watched, event):
+        if watched is self._button and event.type() == QEvent.Type.EnabledChange:
+            self.sync()
+        return False
+
+
+class _CollapseWhenEmpty(QObject):
+    """Plan 44 MF17. No dead band between the page column and the footer.
+
+    The Designer row that holds the legacy Unlock and Cancel buttons kept
+    its height (MEASURED 32 px at 1920x1080) with both buttons hidden, an
+    empty stripe between the page and the footer. The row now shows only
+    while one of its buttons does.
+    """
+
+    def __init__(self, row: QWidget) -> None:
+        super().__init__(row)
+        self._row = row
+        self._buttons = [child for child in row.findChildren(QPushButton)
+                         if child.parentWidget() is row]
+        for button in self._buttons:
+            button.installEventFilter(self)
+        self.sync()
+
+    def sync(self) -> None:
+        if not self._buttons:
+            return
+        wanted = any(not button.isHidden() for button in self._buttons)
+        if self._row.isHidden() == wanted:
+            self._row.setVisible(wanted)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.ShowToParent,
+                            QEvent.Type.HideToParent):
+            self.sync()
+        return False
+
+
+class _ClearOverView(QObject):
+    """DP-2707. Cut the console splitter's window down to what it draws.
+
+    MF6 lays the splitter over the whole viewport and calls it transparent,
+    but the 3D view is a native GL window and the card's ring is native too,
+    which makes the splitter a native window stacked above the view. Windows
+    does not see through a sibling window: the view drew its frame into a
+    window nobody could see, so the viewport stayed black, and the chips and
+    the rail drawn over it left trails. A mask on the splitter removes the
+    clear part from its window region, so only the handle and the card band
+    stay over the view.
+    """
+
+    def __init__(self, splitter: QWidget, spacer: QWidget,
+                 card: QWidget | None = None) -> None:
+        super().__init__(splitter)
+        self._splitter, self._spacer, self._card = splitter, spacer, card
+        for watched in (splitter, spacer) + ((card,) if card else ()):
+            watched.installEventFilter(self)
+        splitter.splitterMoved.connect(lambda *_: self.sync())
+        self.sync()
+
+    def sync(self) -> None:
+        from PySide6.QtGui import QRegion
+        splitter, spacer = self._splitter, self._spacer
+        region = QRegion(splitter.rect())
+        if spacer.isVisibleTo(splitter):
+            region = region.subtracted(QRegion(spacer.geometry()))
+        card = self._card
+        if card is not None and card.isVisibleTo(splitter):
+            # The band and the handle are transparent outside the card, and
+            # transparent over a GL window is black: keep the card's columns.
+            left = card.mapTo(splitter, QPoint(0, 0)).x()
+            region = region.intersected(QRegion(QRect(
+                left, 0, card.width(), splitter.height())))
+        if region.isEmpty():
+            # An empty mask means "no mask" to Qt; keep one pixel instead.
+            region = QRegion(QRect(0, 0, 1, 1))
+        if splitter.mask() != region:
+            splitter.setMask(region)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Move, QEvent.Type.Resize,
+                            QEvent.Type.Show, QEvent.Type.Hide,
+                            QEvent.Type.ShowToParent,
+                            QEvent.Type.HideToParent,
+                            QEvent.Type.LayoutRequest):
+            self.sync()
+        return False
+
+
+class _CardRing(QWidget):
+    """The console card's shadow ring (``elevation.paint_ring``, level 'card').
+
+    ``elevation.elevate`` puts its ring in the card's parent, and the card's
+    parent is the output band, which is exactly the card's size, so that ring
+    would be clipped to nothing. This overlay is a child of the host instead,
+    stacked between the viewport and the splitter that carries the card, and
+    follows the card as the splitter moves it.
+    """
+
+    def __init__(self, host: QWidget, card: QWidget, band: QWidget,
+                 splitter: QWidget) -> None:
+        super().__init__(host)
+        self._host, self._card, self._band = host, card, band
+        self._splitter = splitter
+        self.setObjectName('consoleCardRing')
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self._margins = level_margins('card')
+        for watched in (host, card, band):
+            watched.installEventFilter(self)
+        self.sync()
+
+    def sync(self) -> None:
+        card = self._card
+        left, top, right, bottom = self._margins
+        origin = card.mapTo(self._host, QPoint(0, 0))
+        self.setGeometry(QRect(origin, card.size()).adjusted(
+            -left, -top, right, bottom))
+        self.stackUnder(self._splitter)
+        self.setVisible(card.isVisible())
+        # DP-2707. The ring is a native window over the GL view, where its
+        # translucent shadow paints black; only the card's own rect is kept.
+        from PySide6.QtGui import QRegion
+        self.setMask(QRegion(QRect(left, top, card.width(), card.height())))
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Move, QEvent.Type.Resize,
+                            QEvent.Type.Show, QEvent.Type.Hide,
+                            QEvent.Type.LayoutRequest):
+            self.sync()
+        return False
+
+    def paintEvent(self, _event) -> None:
+        left, top, right, bottom = self._margins
+        panel = QRectF(self.rect()).adjusted(left, top, -right, -bottom)
+        painter = QPainter(self)
+        paint_ring(painter, 'card', panel, self.devicePixelRatioF())
+        painter.end()
+
+
+def _elevate_card(card: QWidget, band: QWidget, splitter: QWidget) -> _CardRing:
+    """Raise the console card off the viewport (Plan 44 section 3)."""
+    ring = _CardRing(splitter.parentWidget(), card, band, splitter)
+    card.setProperty('foammeshElevation', 'card')
+    return ring
 
 
 def install_three_region_shell(ui) -> ThreeRegionShell:
@@ -393,6 +895,9 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
         QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
     b_layout = QVBoxLayout(region_b)
     b_layout.setContentsMargins(0, 0, 0, 0)
+    # Plan 44 MF17. The workflow box's own bottom margin is the one gap
+    # between the page and the footer rule (8 px); the column adds none.
+    b_layout.setSpacing(0)
     workflow.setParent(region_b)
     workflow.setTitle('')
     workflow.setMinimumWidth(0)
@@ -406,6 +911,13 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     page_slot = max(workflow_layout.indexOf(ui.content), 0)
     page_column = PageColumn(ui.content, workflow)
     workflow_layout.insertWidget(page_slot, page_column, 1)
+    # Plan 44 MF17. MEASURED at 9d64d61c: the box's frame below the layout
+    # (8 px) and the layout's own bottom margin (8 px) stood 16 px between
+    # the last row of the page and the footer rule. The frame's 8 px is the
+    # one gap the mockup draws (`.page-body` gap above `.page-f`).
+    footer_gap = workflow_layout.contentsMargins()
+    footer_gap.setBottom(0)
+    workflow_layout.setContentsMargins(footer_gap)
     b_layout.addWidget(workflow, 1)
 
     # Scene / Display is a Region B page.  Moving the existing widget leaves
@@ -431,6 +943,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # DP-191. The row used to sit its buttons two pixels above its own
     # centre, and its inset now matches the shell's other bars.
     apply_bar_metrics(action_bar, action_layout)
+    # Plan 44 MF17. The footer then takes the mockup's own padding and rule.
+    apply_footer_metrics(action_bar, action_layout)
     action_layout.setSpacing(GAP)
     action_layout.addStretch(1)
     back = QPushButton('Back', action_bar)
@@ -440,7 +954,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # The explanation belongs in the description slot.
     back.setAccessibleDescription(
         'Go to the previous available meshing page.')
-    proceed = QPushButton('Proceed', action_bar)
+    back._foammeshHideWhenDisabled = _HideWhenDisabled(back)
+    proceed = ElidingPushButton('Proceed', action_bar)
     proceed.setObjectName('wizardProceedButton')
     proceed.setAccessibleDescription(
         'Validate and apply the current page, then move on.')
@@ -449,8 +964,41 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # buttons of the same weight. Drawing this one as the primary says which
     # idiom is the forward one.
     proceed.setProperty('foammeshRole', 'primary')
+    # F6 (DP-2659). The legacy Unlock / Cancel buttons stand in the footer
+    # row, left of Back, so a locked page has no 46 px band of its own
+    # between the page column and the footer. They are the same buttons:
+    # every connection and ButtonID mapping still reaches them.
+    for legacy_name in ('unlock', 'finishCancel'):
+        legacy_button = getattr(ui, legacy_name, None)
+        if isinstance(legacy_button, QPushButton):
+            legacy_button.setParent(action_bar)
+            action_layout.addWidget(legacy_button)
+            # Each shows only when the step manager asks (showButton); they
+            # used to ride in a row that was hidden until one of them was.
+            legacy_button.hide()
     action_layout.addWidget(back)
-    action_layout.addWidget(proceed)
+    # Plan 40 UXA4. The primary is a split button: the label presses, the
+    # arrow beside it opens what else this page offers (Run to end, Preview
+    # only, Update preview), and only the ones that apply. Drawn with no gap
+    # so the two read as one control; hidden when the menu would be empty.
+    split = QWidget(action_bar)
+    split.setObjectName('wizardProceedSplit')
+    split_layout = QHBoxLayout(split)
+    split_layout.setContentsMargins(0, 0, 0, 0)
+    split_layout.setSpacing(0)
+    split_layout.addWidget(proceed)
+    more = QToolButton(split)
+    more.setObjectName('wizardProceedMore')
+    more.setText('▾')
+    more.setAccessibleName('More ways forward')
+    more.setAccessibleDescription(
+        'Other things this page can do: run to the end, preview, update.')
+    more.setToolTip('More ways forward')
+    more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+    more.setProperty('foammeshRole', 'primary')
+    more.setVisible(False)
+    split_layout.addWidget(more)
+    action_layout.addWidget(split)
     # DP-A2. The footer keeps its own height whatever else region B is
     # asked to fit. MEASURED at 4ed5fcb8: a run completion posted a
     # status strip into this column and the window minimum rose from
@@ -461,6 +1009,15 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     action_bar.setSizePolicy(
         QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     b_layout.addWidget(action_bar, 0)
+    # Plan 44 MF17. The legacy Unlock / Cancel row collapses while empty.
+    legacy_row = getattr(ui, 'widget_4', None)
+    if isinstance(legacy_row, QWidget):
+        legacy_row._foammeshCollapse = _CollapseWhenEmpty(legacy_row)
+        legacy_row.hide()                 # F6: it holds nothing now
+    # Plan 40 UXD5. The help pane follows focus: a strip in the footer row's
+    # empty left side, its body floating over the bottom of region B.
+    from .help_pane import install_help_pane
+    install_help_pane(ui, action_bar, region_b)
 
     # Region C is split vertically rather than tabbed. Before Plan 26 WP3 the
     # viewport and the console were peer tabs in one QTabWidget, so only one
@@ -474,44 +1031,78 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     region_c_host.setMinimumWidth(REGION_C_MINIMUM)
     region_c_host.setSizePolicy(
         QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-    c_layout = QVBoxLayout(region_c_host)
+    c_layout = QGridLayout(region_c_host)
     c_layout.setContentsMargins(0, 0, 0, 0)
     c_layout.setSpacing(0)
 
+    # Plan 44 MF6. The console is a card that floats over the bottom of the
+    # viewport, not a band the viewport gives way to: the viewport fills region
+    # C, and the splitter that sizes the card is laid over it. The splitter is
+    # transparent and lets the mouse through; only its handle (an invisible grip
+    # until hovered) and the card itself take it. Its first child is a spacer
+    # standing for the part of the viewport the card does not cover, so
+    # ``sizes()`` is still ``[clear viewport, console]`` for everything that
+    # read it before.
     region_c_splitter = QSplitter(Qt.Orientation.Vertical, region_c_host)
     region_c_splitter.setObjectName('regionCSplitter')
     region_c_splitter.setChildrenCollapsible(False)
-    viewport.setParent(region_c_splitter)
+    region_c_splitter.setAttribute(
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    viewport.setParent(region_c_host)
     if hasattr(viewport, 'setTitle'):
         viewport.setTitle('')
     viewport.setMinimumHeight(REGION_C_VIEWPORT_MINIMUM)
     viewport.setToolTip('Persistent mesh viewport')
+    c_layout.addWidget(viewport, 0, 0)
+    c_layout.addWidget(region_c_splitter, 0, 0)
+    viewport.lower()
+    region_c_splitter.raise_()
 
-    # The strip and the tab band travel together: collapsing the band leaves
-    # the strip, which is what "always visible" means here.
+    clear_spacer = QWidget(region_c_splitter)
+    clear_spacer.setObjectName('regionCClearSpacer')
+    clear_spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    # The card and the band that places it travel together. The band is
+    # transparent (the console's width is set by margins on it) and the card is
+    # the visible panel: one 28 px header row over the pages.
     output_band = QWidget(region_c_splitter)
     output_band.setObjectName('regionCOutputBand')
     output_band.setAccessibleName('Mesh verdict and output tabs')
+    output_band.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     band_layout = QVBoxLayout(output_band)
     band_layout.setContentsMargins(0, 0, 0, 0)
     band_layout.setSpacing(0)
 
-    verdict_strip = VerdictStrip(output_band)
-    band_layout.addWidget(verdict_strip)
+    console_card = QFrame(output_band)
+    console_card.setObjectName('consoleCard')
+    console_card.setAccessibleName('Console')
+    card_layout = QVBoxLayout(console_card)
+    card_layout.setContentsMargins(0, 0, 0, 0)
+    card_layout.setSpacing(0)
 
-    region_c = QTabWidget(output_band)
+    verdict_strip = VerdictStrip(console_card)
+
+    region_c = QTabWidget(console_card)
     region_c.setObjectName('regionCTabHost')
     region_c.setAccessibleName('Mesh outputs')
     region_c.setTabsClosable(False)
     region_c.setMovable(False)
     region_c.setSizePolicy(
         QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-    band_layout.addWidget(region_c, 1)
+    # The header row: tabs, filter chips, verdict, size read-out, minimise.
+    console_header = ConsoleHeader(console_card, region_c, verdict_strip)
+    card_layout.addWidget(region_c, 1)
+    card_layout.addWidget(console_header.chip)
+    band_layout.addWidget(console_card)
     output_band.setMinimumHeight(
-        verdict_strip.sizeHint().height() + REGION_C_BAND_MINIMUM)
+        CONSOLE_HEADER_HEIGHT + REGION_C_BAND_MINIMUM)
 
-    region_c_splitter.addWidget(viewport)
+    region_c_splitter.addWidget(clear_spacer)
     region_c_splitter.addWidget(output_band)
+    region_c_splitter._foammeshClearMask = _ClearOverView(
+        region_c_splitter, clear_spacer, console_card)
+    ui.consoleCardRing = _elevate_card(
+        console_card, output_band, region_c_splitter)
     # The 3D view takes roughly three quarters of the height; the band is a
     # reading surface, not the subject.
     region_c_splitter.setStretchFactor(0, 3)
@@ -523,7 +1114,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     # R157. The handle that resizes it was a few pixels tall and unnamed:
     # drags at y=657 and y=654 -- both over what reads as the same divider --
     # did nothing, and only y=683 worked. A wider grab target with a name and
-    # a tooltip is one a user and a screen reader can both find.
+    # a tooltip is one a user and a screen reader can both find. Plan 44 MF6:
+    # it stays 8 px and named, but is painted only on hover.
     region_c_splitter.setHandleWidth(8)
     c_handle = region_c_splitter.handle(1)
     if c_handle is not None:
@@ -531,7 +1123,6 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
         c_handle.setToolTip('Drag to resize the mesh viewport and the '
                             'output band below it')
         c_handle.setCursor(Qt.CursorShape.SplitVCursor)
-    c_layout.addWidget(region_c_splitter, 1)
 
     splitter.insertWidget(0, region_a)
     splitter.insertWidget(1, region_b)
@@ -559,6 +1150,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     ui.regionCHost = region_c_host
     ui.regionCSplitter = region_c_splitter
     ui.regionCOutputBand = output_band
+    ui.regionCConsoleCard = console_card
+    ui.consoleHeader = console_header
     ui.regionCTabHost = region_c
     ui.meshVerdictStrip = verdict_strip
     ui.meshRegionPage = viewport
@@ -571,12 +1164,23 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     ui.wizardActionBar = action_bar
     ui.wizardBackButton = back
     ui.wizardProceedButton = proceed
+    ui.wizardProceedMore = more
 
+    # Plan 43 LY4: the console controller itself, not the base class swapped
+    # afterwards (DP-1660). Imported here because console_band imports this
+    # module.
+    from foammesh.view.main_window.console_band import ConsoleBandController
+    band = ConsoleBandController(
+        region_c_splitter, output_band, region_c, verdict_strip,
+        region_splitter_h=splitter, header=console_header)
+    ui.regionCBandController = band
     shell = ThreeRegionShell(
         splitter, region_a, region_b, region_c, viewport,
         region_c_host=region_c_host, region_c_splitter=region_c_splitter,
         verdict_strip=verdict_strip, output_band=output_band,
-        page_column=page_column, action_bar=action_bar)
+        page_column=page_column, action_bar=action_bar, band=band)
+    # UXC2: nothing to show means a one-line chip, not a 260 px empty band.
+    band.close()
     shell.apply_sizes(1280)
     shell.assert_invariants()
     return shell

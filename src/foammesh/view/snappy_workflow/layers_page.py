@@ -22,10 +22,14 @@ from PySide6.QtWidgets import QLabel
 from foammesh.core.geometry.boundary_roles import (
     boundaries_from_manifest, default_layer_pattern, default_layer_targets,
     defaulted_targets_sentence, flat_boundaries)
+from foammesh.core import display_unit
 from foammesh.view.facade_client import query, submit
+from foammesh.view.widgets.folded_note import FoldedNote, FoldedNotes
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
+from foammesh.view.workflow_controls.y_plus_helper import YPlusButton, fill_editor
 
 from .base import SnappyTaskPage
+from .mesher_limits import MesherLimitsGroup, fold_limits
 from .layer_membership import (
     BY_PATTERN, LayerMembership, begin_group_write, bound_layer_groups,
     end_group_write, hold_binding, release_binding, unbind_layer_group,
@@ -33,6 +37,73 @@ from .layer_membership import (
 from .layer_pattern_preview import (
     LayerPatternPreview, candidate_patch_names,
 )
+
+
+#: DP-2402. Legacy `STAGED_MESH_ADVISORY`, said on the guided route: layers run
+#: on their own restart from the mesh on disk and cannot apply the quality
+#: control one combined run does (measured on the reference curved pipe: the
+#: staged result reported concave cells where the batch pipeline reported
+#: "Mesh OK").
+STAGED_MESH_ADVISORY = (
+    'This mesh was built stage by stage, which is intended for tuning '
+    'settings. For the mesh you hand to a solver, finish with Run to end so '
+    'every phase runs in one qualified snappyHexMesh pass.')
+
+#: DP-2403. Legacy completion wording, kept: snappyHexMesh exits successfully
+#: even when it rejected every layer, so the page says what the mesh got.
+PARTIAL_LAYERS_HEADING = (
+    'Boundary layers were applied, but not every requested layer could be '
+    'added:')
+
+#: Task states in which the layers stage has produced the mesh on screen.
+_RAN_STATES = ('passed', 'warning', 'completed')
+
+
+def result_notes(coverage, state: str, locked: bool = False) -> tuple[str, str]:
+    """``(partial, staged)`` sentences for the layers just grown, or blanks.
+
+    *coverage* is the ``mesh.layer_coverage`` payload. Nothing is said before
+    the stage has run (an unmeasured or reopened step has no result to
+    qualify) and a complete, combined-pass result says nothing.
+    """
+    if not isinstance(coverage, dict) or not coverage.get('measured', True)             or not coverage.get('patches'):
+        return '', ''
+    if state not in _RAN_STATES and not locked:
+        return '', ''
+    from foammesh.core.quality import layer_shortfall_line
+    from foammesh.core.quality.layer_report import NOT_GROWN_REMEDY
+
+    partial = ''
+    warnings = [str(item) for item in coverage.get('warnings') or ()
+                if str(item).strip()]
+    line = layer_shortfall_line(coverage)
+    if warnings or line:
+        body = warnings or [line[0].upper() + line[1:] + '.']
+        partial = PARTIAL_LAYERS_HEADING + '\n- ' + '\n- '.join(body)
+        if 'not grown' in line:
+            partial += '\n' + NOT_GROWN_REMEDY
+    staged = STAGED_MESH_ADVISORY if coverage.get('staged') else ''
+    return partial, staged
+
+
+#: Plan 44 FX2. The folded line of the staged-mesh advisory.
+STAGED_MESH_SUMMARY = ('Built stage by stage: finish with Run to end for the '
+                       'mesh you hand to a solver.')
+
+
+def result_summaries(partial: str, staged: str) -> tuple[str, str]:
+    """``(partial, staged)`` one-line summaries of :func:`result_notes`.
+
+    Plan 44 FX2. Folded, the shortfall leads with what fell short (the
+    patches and their counts) rather than with the heading, and the
+    advisory with what to do; the line opens to both notes in full.
+    """
+    partial_line = ''
+    if partial:
+        bodies = [line[2:].strip() for line in partial.splitlines()
+                  if line.startswith('- ')]
+        partial_line = '; '.join(bodies)
+    return partial_line, (STAGED_MESH_SUMMARY if staged else '')
 
 
 #: Plan 37 UF2 (DP-1028). Whether this case has had its default group.
@@ -79,11 +150,40 @@ class LayerGroupPanel(ChildControlPanel):
             facade_client, selector=self._selectorValue)
         annotations = dict(kwargs.pop('annotations', None) or {})
         annotations['patch_selector'] = self.membership
+        # Plan 43 LY13 D1 (C-134). The y+ helper stands under the first-layer
+        # box, which is shown only on the thickness models that read it.
+        self.yplus_button = YPlusButton(self._fillFirstLayer)
+        annotations['first_layer_thickness'] = self.yplus_button
         super().__init__(facade_client, collection_id, title,
                          annotations=annotations, **kwargs)
         editor = self.editor('patch_selector')
         if editor is not None:
             editor.valueChanged.connect(self.membership.syncSelector)
+
+    def _fillFirstLayer(self, metres: float) -> bool:
+        """Write the estimated height into the group editor's own box.
+
+        ``relativeSizes`` makes the box a fraction of the local cell size
+        rather than a length, and an absolute height in it would be read as a
+        multiple of the cell, so a relative group is told so instead.
+        """
+        editor = self.editor('first_layer_thickness')
+        relative = self.editor('relative_sizes')
+        if editor is None:
+            return False
+        if relative is not None and relative.value():
+            from widgets import async_message_box as messages
+            messages.information(
+                self, self.tr('Estimated first-layer height'),
+                self.tr('First-layer height: {0}\n'
+                        'The layer sizes are '
+                        'relative to the local cell size, so this length '
+                        'was not entered. Turn off the relative sizes '
+                        'setting to enter lengths.').format(
+                    display_unit.format_length(metres)))
+            return False
+        fill_editor(editor, metres)
+        return True
 
     def _selectorValue(self):
         editor = self.editor('patch_selector')
@@ -253,6 +353,16 @@ class SnappyLayersPage(SnappyTaskPage):
         # is about, and the eighteen shrinking and smoothing controls the task
         # declares are the settings behind them.
         layout.insertWidget(0, self.panel)
+        # Plan 40 UXD9 (#4, #5). The relaxed limits are read only while
+        # layers are added, so they are edited here; the strict ones are on
+        # Snap.
+        self._limits = self.adoptPanel(
+            MesherLimitsGroup(self._client, self, engine_id=self.engine_id,
+                              relaxed=True))
+        layout.insertWidget(1, self._limits)
+        # Plan 44 MF27. Behind one closed header, as on Snap: the relaxed
+        # limits took Layers 101 px past the 300 px sheet.
+        self._limitsFold = fold_limits(self, layout, self._limits)
 
         # Plan 32 W4. The mark on a defaulted target is a sentence naming it,
         # not a colour: a colour cannot be read aloud, cannot be searched for
@@ -272,6 +382,30 @@ class SnappyLayersPage(SnappyTaskPage):
         self.unbound_label.setWordWrap(True)
         self.unbound_label.setVisible(False)
         layout.insertWidget(2, self.unbound_label)
+
+        # DP-2402/2403. What the layers stage just did, said where it is read:
+        # layers that did not all grow, and a mesh built stage by stage.
+        # Hidden until a finished stage has something to say.
+        # Plan 44 FX2. The two notes share one folded line until it is
+        # opened: they took nine wrapped lines and Boundary layers past the
+        # 300 px sheet on a meshed case (MF27 live pass, G-FITS-1).
+        self._resultNotes = FoldedNotes(self, 'snappyLayerResultNotes')
+        self._partialNote = self._resultNotes.add(FoldedNote())
+        self._partialNote.setObjectName('snappyLayerPartialNote')
+        self._partialNote.setWordWrap(True)
+        self._partialNote.setProperty('foammeshStatus', 'warning')
+        self._partialNote.setVisible(False)
+        self._stagedNote = self._resultNotes.add(FoldedNote())
+        self._stagedNote.setObjectName('snappyLayerStagedNote')
+        self._stagedNote.setWordWrap(True)
+        self._stagedNote.setVisible(False)
+        layout.insertWidget(2, self._resultNotes)
+
+        # Plan 41 GN25c. Layers thicker than the gap they grow into, said
+        # before addLayers runs.
+        from foammesh.view.sizing.automatic_sizing_card import ThinRegionsNote
+        self.thin_note = ThinRegionsNote(self._client, self)
+        layout.insertWidget(1, self.thin_note)
 
         editor = self.panel.editor('patch_pattern')
         if editor is not None:
@@ -451,10 +585,55 @@ class SnappyLayersPage(SnappyTaskPage):
             targets, flat_boundaries(boundaries)))
         self._defaultNote.setVisible(True)
 
+    def setResultLocked(self, locked: bool) -> None:
+        super().setResultLocked(locked)
+        # The lock is what marks the stage finished; the notes follow it.
+        self.sync_result_notes()
+
+    def sync_result_notes(self) -> None:
+        """DP-2402/2403. Say what the finished layers stage left behind."""
+        if not hasattr(self, '_partialNote'):
+            return
+        try:
+            coverage = query(self._client, 'mesh.layer_coverage').payload
+        except Exception:                        # noqa: BLE001 - advisory only
+            coverage = None
+        partial, staged = result_notes(
+            coverage, self.task_state()[0], self.isResultLocked())
+        for label, text in ((self._partialNote, partial),
+                            (self._stagedNote, staged)):
+            label.setText(text)
+            label.setVisible(bool(text))
+        # Plan 44 FX2. What each folded note says on its one line.
+        partial_summary, staged_summary = result_summaries(partial, staged)
+        for label, summary in ((self._partialNote, partial_summary),
+                               (self._stagedNote, staged_summary)):
+            label.setSummary(summary)
+        self._resultNotes.sync()
+
+    def aligned_forms(self):
+        """The limits panel reads as part of this page's one column (DP-154)."""
+        limits = getattr(self, '_limits', None)
+        return (limits.form_layout(),) if limits is not None else ()
+
+    def sizingBadgePanels(self) -> list:
+        return [self.panel] if hasattr(self, 'panel') else []
+
     def refresh(self) -> None:
         super().refresh()
+        note = getattr(self, 'thin_note', None)
+        if note is not None:
+            note.refresh()
+        limits = getattr(self, '_limits', None)
+        if limits is not None:
+            # DP-339. A refresh keeps an uncommitted edit.
+            limits.reload(discard_pending=False)
+            # DP-156. The panel's reload aligns its own unit column alone;
+            # the page puts it back in the page's one column after it.
+            self._align_field_columns()
         if hasattr(self, 'panel'):
             self.defaultTargetGroup()
         self.updateDefaultNote()
         self.sync_preview()
         self.sync_unbound_groups()
+        self.sync_result_notes()

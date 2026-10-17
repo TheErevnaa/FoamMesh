@@ -151,6 +151,30 @@ def discover_cell_set_files(case_path) -> dict[str, list[int]]:
     return discovered
 
 
+def sets_of_this_mesh(case_path) -> dict[str, list[int]]:
+    """DP-2722. The sets already on disk, when they were written of the mesh
+    that is there now: every set file no older than ``polyMesh/owner``.
+
+    What a check run in this session wrote is recorded as it finishes; a case
+    opened later, its sets on disk and its stored check on screen, had the
+    failed-cells button disabled with "no mesh check has written a
+    failed-cell set yet". A mesh written after the check (a re-mesh leaves
+    the old ``sets`` directory in place) makes the sets name other cells, so
+    any set file older than the mesh refuses the lot.
+    """
+    polymesh = Path(case_path) / 'constant' / 'polyMesh'
+    owner = next((polymesh / name for name in ('owner', 'owner.gz')
+                  if (polymesh / name).is_file()), None)
+    directory = polymesh / 'sets'
+    if owner is None or not directory.is_dir():
+        return {}
+    meshed = owner.stat().st_mtime
+    files = [path for path in directory.iterdir() if path.is_file()]
+    if not files or any(path.stat().st_mtime < meshed for path in files):
+        return {}
+    return discover_cell_set_files(case_path)
+
+
 def discover_check_surfaces(case_path) -> list[dict]:
     """The surfaces ``checkMesh -writeSurfaces`` wrote, newest instance first.
 

@@ -5,8 +5,11 @@ import json
 from typing import NamedTuple
 
 import qasync
+import shiboken6
 
 from PySide6.QtCore import QCoreApplication, QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QButtonGroup
 
 from foammesh.core.geometry.diagnostics.repair import (
     REPAIR_BANDS, TESSELLATED_ACTIONS,
@@ -16,8 +19,8 @@ from foammesh.core.naming import humanise_option
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSizePolicy, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+    QPushButton, QRadioButton, QSizePolicy, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from widgets.fit_to_text import FlowLayout, fit_to_text
 
@@ -25,13 +28,20 @@ from foammesh.app import app
 from foammesh.view.outside_task import modal
 from foammesh.core.facade.errors import FacadeError
 from foammesh.view.facade_client import FailedResult, query, submit
+from foammesh.view.geometry.boundary_panel import BoundaryPanel
+from foammesh.view.geometry.feature_angle_panel import FeatureAnglePanel
 from foammesh.view.step_page import StepPage
 from foammesh.view.theming.metrics import (
     FORM_MARGIN, MARGIN_NONE, CompactDoubleSpinBox, CompactSpinBox,
-    align_unit_column, unit_cell)
+    align_unit_column, autofit_table, unit_cell)
+from foammesh.view.theming.sheet_form import (LabelWidthWatcher, SheetForm,
+                                               elide_combos,
+                                               share_label_width)
 from foammesh.view.widgets.folder_header import FolderHeader
+from foammesh.view.widgets.segmented_control import SegmentedControl
+from foammesh.view.workflow_controls.field_widgets import LengthDoubleSpinBox
 from foammesh.view.widgets.justification_dialog import JustificationDialog
-from foammesh.view.workflow_controls.field_group_page import GmshHealingPanel
+from widgets import async_message_box as messages
 
 #: Findings columns holding a number rather than a name (Count, Size).
 _NUMERIC_FINDING_COLUMNS = (2, 3)
@@ -126,6 +136,131 @@ def _errorDetail(error) -> str:
     return str(details.get('error') or error)
 
 
+
+def _sizeText(size, unit) -> str:
+    """A finding's characteristic size; a length in the project display unit.
+
+    Plan 40 UXB3 (#36): metres are shown in the display unit with four
+    significant figures, other units (cells, ...) keep their own word.
+    """
+    from foammesh.core import display_unit
+    if (unit or '') == 'm':
+        return display_unit.format_length(size)
+    return ' '.join(part for part in (f'{size:.6g}', unit or '') if part)
+
+
+class _ElidedLabel(QLabel):
+    """A one-line label that elides in the middle and keeps the whole text in
+    its tool tip (UXB9, #36): a long revision name is cut where it is
+    clearly cut, not where the column happens to end."""
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        painter.drawText(
+            self.rect(), int(Qt.AlignmentFlag.AlignVCenter
+                             | Qt.AlignmentFlag.AlignLeft),
+            self.fontMetrics().elidedText(
+                self.text(), Qt.TextElideMode.ElideMiddle, self.width()))
+
+    def minimumSizeHint(self):
+        size = super().minimumSizeHint()
+        size.setWidth(self.fontMetrics().horizontalAdvance('Current: …'))
+        return size
+
+
+class _CurrentPageStack(QStackedWidget):
+    """A stack that asks for the room of the page it shows.
+
+    ``QStackedWidget`` asks for the tallest page it holds, shown or not, so
+    the Wrap options (a taller page) raised the minimum of the whole
+    Preparation step while Repair was on screen: the step overflowed the
+    508 px column of a 700 px window by 24 px with nothing to scroll to
+    reach. The page that is showing sets the floor; the others set it when
+    they are chosen, and the column scrolls that once.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def _current(self):
+        return self.currentWidget()
+
+    def minimumSizeHint(self):
+        page = self._current()
+        if page is None:
+            return super().minimumSizeHint()
+        return page.minimumSizeHint()
+
+    def sizeHint(self):
+        page = self._current()
+        if page is None:
+            return super().sizeHint()
+        return page.sizeHint()
+
+
+class PreparationChoices(QWidget):
+    """Repair, Wrap and Use as-is as one radio group over a stack (UXB9, #35).
+
+    They are three alternatives for one step, not three documents, so they
+    are a group of radio buttons rather than tabs. The stack keeps the
+    ``widget(i)`` / ``currentIndex()`` / ``setCurrentIndex()`` / ``count()``
+    reading the page and its tests already use.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('geometryPreparationActions')
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        # Plan 44 MF14. Three alternatives for one step are one segmented
+        # row, not three radio buttons with indicator circles. The radios
+        # stay as hidden aliases (Q8): same objects, same object names, same
+        # `toggled` signal, so nothing that addressed them notices.
+        self._segments = SegmentedControl(self)
+        self._segments.setObjectName('geometryPreparationSegments')
+        self._segments.setAccessibleName('Preparation method')
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._buttons = []
+        self._stack = _CurrentPageStack(self)
+        column.addWidget(self._segments)
+        column.addWidget(self._stack, 1)
+
+    def addChoice(self, page, text):
+        index = self._stack.addWidget(page)
+        button = QRadioButton(text, self)
+        button.setObjectName('preparationChoice{0}'.format(index))
+        self._group.addButton(button, index)
+        button.toggled.connect(
+            lambda checked, i=index: checked and self._stack.setCurrentIndex(i))
+        self._buttons.append(button)
+        self._segments.addOption(text, key=index, alias=button)
+        if index == 0:
+            button.setChecked(True)
+        return index
+
+    def widget(self, index):
+        return self._stack.widget(index)
+
+    def count(self):
+        return self._stack.count()
+
+    def currentIndex(self):
+        return self._stack.currentIndex()
+
+    def setCurrentIndex(self, index):
+        if 0 <= index < len(self._buttons):
+            self._buttons[index].setChecked(True)
+
+    def choiceText(self, index):
+        return self._buttons[index].text()
+
+    def choiceButtons(self):
+        return list(self._buttons)
+
+
 class PreparationVerdict(NamedTuple):
     """What Proceed on Preparation may do, and what to say about it.
 
@@ -165,6 +300,7 @@ class GeometryRepairPage(StepPage):
         ui.geometryRepairPage = widget
         super().__init__(ui, widget)
         self._report = None
+        self._lastSync = (False, False)
         self._repairPlan = None
         #: DP-300. What the page used to print into the column as indented
         #: JSON -- the readiness report, the plan the mesher receives, the
@@ -183,7 +319,44 @@ class GeometryRepairPage(StepPage):
         font = title.font()
         font.setBold(True)
         title.setFont(font)
-        layout.addWidget(title)
+        # Plan 44 MF5. The settings sheet's one header says `3. Preparation`
+        # above this page; the label stays built (the accessible name of the
+        # page, and what the words are authored in) and out of the layout.
+        title.setVisible(False)
+        # Plan 42 SG5. The one Feature-angle control, before the fork: every
+        # place that holds an angle reads or derives it from this.
+        self._featureAnglePanel = FeatureAnglePanel(parent=widget)
+        layout.addWidget(self._featureAnglePanel)
+
+        # Plan 43 LY13 (D2, DP-1473). The boundary tools: patch table, inline
+        # rename, viewport highlight, Merge, Split merged, Feature angle and
+        # Split by angle (B-062..068). `geometry.patches.*` needs no repair,
+        # so they are offered before the fork and serve both engines. Folded
+        # by default so the three choices below keep their height.
+        # Plan 44 MF14. One disclosure idiom: a card title with a chevron
+        # (`FolderHeader`). `surfaceNamesToggle` stays as the hidden,
+        # checkable alias that carries the state, so the id the tests and the
+        # tool register know is unchanged.
+        self._surfaceNamesHeader = FolderHeader(self.tr('Surface names'), widget)
+        self._surfaceNamesHeader.setObjectName('surfaceNamesHeader')
+        self._surfaceNamesHeader.setChecked(False)
+        self._surfaceNamesHeader.setAccessibleDescription(self.tr(
+            'Name, merge and split the boundaries the solver will see.'))
+        layout.addWidget(self._surfaceNamesHeader)
+        self._surfaceNamesToggle = QToolButton(widget)
+        self._surfaceNamesToggle.setObjectName('surfaceNamesToggle')
+        self._surfaceNamesToggle.setText(self.tr('Surface names'))
+        self._surfaceNamesToggle.setCheckable(True)
+        self._surfaceNamesToggle.setAccessibleDescription(self.tr(
+            'Name, merge and split the boundaries the solver will see.'))
+        self._surfaceNamesToggle.setVisible(False)
+        self._surfaceNamesHeader.toggled.connect(
+            self._surfaceNamesToggle.setChecked)
+        self._boundaryPanel = BoundaryPanel(widget)
+        self._boundaryPanel.setVisible(False)
+        self._boundaryPanel.geometryChanged.connect(self.refresh)
+        self._surfaceNamesToggle.toggled.connect(self._toggleSurfaceNames)
+        layout.addWidget(self._boundaryPanel)
 
         # DP-78. Every button on this page used to act on `geometries[0]`,
         # while the banner above aggregated the readiness of all of them. On
@@ -213,6 +386,10 @@ class GeometryRepairPage(StepPage):
         self._geometrySelect.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._geometrySelect.setMinimumContentsLength(12)
+        # Plan 44 F4. Twelve characters and the label asked 265 px of the
+        # 259 px a 1280 px window's sheet gives the page; the combo elides
+        # (MF14), its whole name in its tooltip.
+        elide_combos(self._geometrySelect)
         self._geometrySelect.currentIndexChanged.connect(self._geometryChosen)
         chooser.addWidget(self._geometryLabel)
         chooser.addWidget(self._geometrySelect, 1)
@@ -226,19 +403,25 @@ class GeometryRepairPage(StepPage):
         # the shell had already had to make scroll. The verdict and the
         # findings are what the Repair choice is decided from, so they are
         # inside it.
-        tabs = QTabWidget(widget)
-        tabs.setObjectName('geometryPreparationActions')
+        tabs = PreparationChoices(widget)
         self._choices = tabs
-        tabs.addTab(self._buildRepairTab(tabs), self.tr('Repair'))
-        tabs.addTab(self._buildWrapTab(tabs), self.tr('Wrap'))
+        tabs.addChoice(self._buildRepairTab(tabs), self.tr('Repair'))
+        tabs.addChoice(self._buildWrapTab(tabs), self.tr('Wrap'))
         # R178. The Boundaries tab that used to sit here is on 1. Geometry
         # now. Naming a boundary is not a repair: `geometry.patches.*` reads
         # the artifact store directly and needs no repair, no wrap and no
         # prepared revision, and the boundaries are already rows in the
         # geometry tree (R169). A user whose geometry was clean never opened
         # this page and so never found the controls that name the inlet.
-        tabs.addTab(self._buildUseTab(tabs), self.tr('Use as-is'))
+        tabs.addChoice(self._buildUseTab(tabs), self.tr('Use as-is'))
         layout.addWidget(tabs, 1)
+        # Plan 44 MF14. Every form on the page (the wrap options, the repair
+        # plan's parameters) shares one label column, 44 % of the page at
+        # most; it is measured again whenever the plan is rebuilt or the
+        # page is resized.
+        self._labelWatcher = LabelWidthWatcher(
+            widget, lambda: widget.findChildren(SheetForm))
+        self._labelWatcher.run()
         # DP-514. `Cancel running preparation` stood in the Repair tab's
         # button row at all times, beside the three presses that start
         # something, and did nothing unless one of them was still running
@@ -256,34 +439,9 @@ class GeometryRepairPage(StepPage):
         self._cancelButton.setVisible(False)
         layout.addWidget(self._cancelButton, 0, Qt.AlignmentFlag.AlignLeft)
 
-        # Plan 32 section 4.4 / DP-149. `Describe geometry` was the first
-        # task row of the Gmsh branch, so its nineteen registry fields -- the
-        # import tolerances, the sewing, the small-edge and small-face fixes,
-        # the solid making and the far-field box -- were asked after the file
-        # had been imported, after it had been repaired, and only once a
-        # method had been chosen and applied. They are statements about how
-        # the file is read, so they are asked where the user is already
-        # looking at what the geometry is wrong with. snappy has no import
-        # stage, so the section only exists for the engine that asks.
-        #
-        # The panel is built on the first showing rather than here: it is
-        # nineteen editors, and a case meshed with snappy never needs them.
-        self._engineId = ''
-        self._healingPanel = None
-        self._healingBody = QWidget(widget)
-        self._healingBody.setObjectName('gmshHealingBody')
-        self._healingLayout = QVBoxLayout(self._healingBody)
-        self._healingLayout.setContentsMargins(0, 0, 0, 0)
-        self._healingHeader = FolderHeader(self.tr('Advanced'), widget)
-        self._healingHeader.setObjectName('gmshHealingHeader')
-        # DP-186/187. Read aloud, `Advanced` on its own says nothing about
-        # which advanced this is.
-        self._healingHeader.setAccessibleName(
-            self.tr('Advanced import and healing settings for Gmsh'))
-        layout.addWidget(self._healingHeader)
-        layout.addWidget(self._healingBody)
-        self._healingHeader.setContents(self._healingBody)
-        self._healingHeader.setVisible(False)
+        # Plan 42 SG11 (D4). The Gmsh import and healing values are not asked
+        # here: Preparation is the same page for both engines, and the values
+        # belong to the Gmsh page that follows the engine choice.
 
         # DP-534 (audit 0924, S5/S6). The strip, the combo and the button
         # share one row, and each used to be at least as wide as its own
@@ -298,18 +456,30 @@ class GeometryRepairPage(StepPage):
         # no spaces could not wrap anyway) and keeps the whole text in its
         # tool tip, and the combo elides past ten characters.
         revisions = QHBoxLayout()
-        self._revisionStrip = QLabel(widget)
+        self._revisionStrip = _ElidedLabel(widget)
         self._revisionStrip.setObjectName('geometryRevisionStrip')
         strip_policy = self._revisionStrip.sizePolicy()
         strip_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         self._revisionStrip.setSizePolicy(strip_policy)
         self._revisionSelect = QComboBox(widget)
         self._revisionSelect.currentIndexChanged.connect(self._inspectRevision)
-        self._revisionRestore = QPushButton(self.tr('Restore selected revision'), widget)
+        self._revisionSelect.currentTextChanged.connect(
+            self._revisionSelect.setToolTip)
+        # Plan 44 F4. The combo (ten characters) and "Restore selected
+        # revision" asked 327 px in the 259 px of a 1280 px window's sheet,
+        # and the button was cut. The button says "Restore revision" and
+        # keeps the whole sentence as its description and tooltip; the combo
+        # elides (MF14), its whole text in its tooltip.
+        self._revisionRestore = QPushButton(self.tr('Restore revision'), widget)
+        self._revisionRestore.setAccessibleDescription(self.tr(
+            'Restore the revision selected beside this button.'))
+        self._revisionRestore.setToolTip(
+            self._revisionRestore.accessibleDescription())
         self._revisionRestore.clicked.connect(self._restoreRevision)
         self._revisionSelect.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._revisionSelect.setMinimumContentsLength(10)
+        elide_combos(self._revisionSelect)
         revisions.addWidget(self._revisionStrip, 1)
         revisions.addWidget(self._revisionSelect, 1)
         revisions.addWidget(self._revisionRestore)
@@ -334,6 +504,13 @@ class GeometryRepairPage(StepPage):
     #: plan below names the same actions in words, with a checkbox each; the
     #: ids stay on the row and in `Details…`.
     _FINDINGS_ACTION_COLUMN = 5
+
+    def _releaseFindingsFloor(self, *_args):
+        # Model signals can outlive the table during teardown.
+        findings = getattr(self, '_findings', None)
+        if findings is None or not shiboken6.isValid(findings):
+            return
+        findings.setMinimumHeight(0)
 
     def _fitFindingColumns(self):
         """Give the finding name the width its own text needs (R6/R77).
@@ -461,7 +638,17 @@ class GeometryRepairPage(StepPage):
         self._findings.itemSelectionChanged.connect(self._highlightFinding)
         self._findings.verticalHeader().setVisible(False)
         self._fitFindingColumns()
-        layout.addWidget(self._findings, 1)
+        self._findings.setMinimumHeight(0)
+        # MF20: as tall as its rows (8 at most), but it reserves no floor: the
+        # fit is a ceiling, so an empty table is a header and the empty-state
+        # label below says why.
+        autofit_table(self._findings, 8)
+        self._findings.setMinimumHeight(0)
+        _model = self._findings.model()
+        for _signal in (_model.rowsInserted, _model.rowsRemoved,
+                        _model.modelReset, _model.layoutChanged):
+            _signal.connect(lambda *_a: self._releaseFindingsFloor())
+        layout.addWidget(self._findings)
         # C4. An empty table is a header over a blank rectangle: it says
         # neither "nothing is wrong" nor "nothing has been checked yet".
         self._findingsEmpty = QLabel(self.tr(
@@ -603,10 +790,15 @@ class GeometryRepairPage(StepPage):
             'Uniform-grid wrap changes geometry. Memory grows cubically and sharp edges may round.'), tab)
         limitation.setWordWrap(True)
         layout.addWidget(limitation)
-        controls = QFormLayout()
+        controls = SheetForm()
+        controls.setContentsMargins(0, 0, 0, 0)
         self._wrapResolution = CompactSpinBox(tab)
         self._wrapResolution.setRange(16, 256)
         self._wrapResolution.setValue(64)
+        from foammesh.core import display_unit
+        self._lengthBoxes = []
+        self._lengthLabels = []
+        display_unit.subscribe(self._displayUnitChanged)
         self._wrapGap = self._optionalDistance(tab)
         self._wrapDeviation = self._optionalDistance(tab)
         self._wrapSmoothing = CompactDoubleSpinBox(tab)
@@ -633,15 +825,16 @@ class GeometryRepairPage(StepPage):
         for label, control, unit in (
                 (self.tr('Flow mode'), self._wrapMode, ''),
                 (self.tr('Base resolution'), self._wrapResolution, 'cells'),
-                (self.tr('Maximum gap'), self._wrapGap, 'm'),
-                (self.tr('Maximum deviation'), self._wrapDeviation, 'm'),
+                (self.tr('Maximum gap'), self._wrapGap, 'length'),
+                (self.tr('Maximum deviation'), self._wrapDeviation, 'length'),
                 (self.tr('Fluid seeds'), self._wrapSeeds, '')):
-            controls.addRow(label, unit_cell(control, unit))
+            controls.addRow(label, self._lengthCell(control) if unit == 'length'
+                            else unit_cell(control, unit))
         layout.addLayout(controls)
 
         self._wrapAdvanced = QWidget(tab)
         self._wrapAdvanced.setObjectName('wrapAdvancedOptions')
-        advanced = QFormLayout(self._wrapAdvanced)
+        advanced = SheetForm(self._wrapAdvanced)
         advanced.setContentsMargins(0, 0, 0, 0)
         self._wrapSmallestFeature = self._optionalDistance(self._wrapAdvanced)
         self._wrapSmallestFeature.setObjectName('wrapSmallestFeature')
@@ -652,7 +845,7 @@ class GeometryRepairPage(StepPage):
         advanced.addRow(self.tr('Minimum component cells'),
                         unit_cell(self._wrapMinComponent, 'cells'))
         advanced.addRow(self.tr('Smallest feature to preserve'),
-                        unit_cell(self._wrapSmallestFeature, 'm'))
+                        self._lengthCell(self._wrapSmallestFeature))
         precedence = QLabel(self.tr(
             'Automatic keeps Base resolution active. A positive value derives '
             'the grid from the smallest feature and takes precedence.'),
@@ -699,7 +892,7 @@ class GeometryRepairPage(StepPage):
     def _wrapSizingParameters(self):
         parameters = {'resolution': self._wrapResolution.value()}
         if self._wrapSmallestFeature.value() > 0:
-            parameters['smallest_feature'] = self._wrapSmallestFeature.value()
+            parameters['smallest_feature'] = self._metres(self._wrapSmallestFeature)
         return parameters
 
     def _buildUseTab(self, parent):
@@ -848,86 +1041,41 @@ class GeometryRepairPage(StepPage):
                     decision.replace('_', ' ')))
 
     def _optionalDistance(self, parent):
-        control = CompactDoubleSpinBox(parent)
+        # UXB9 (#36). A distance is typed in the project display unit; the
+        # request still carries metres (`_metres`).
+        control = LengthDoubleSpinBox(parent)
         control.setDecimals(8)
-        control.setRange(0, 1e12)
-        control.setSpecialValueText(self.tr('Automatic'))
+        control.setRange(0, 1e12 / control.per)
+        control.setSpecialValueText(self.tr('Automatic (from base resolution)'))
+        self._lengthBoxes.append(control)
         return control
 
-    # -- the Gmsh import and healing section ------------------------------- #
+    @staticmethod
+    def _metres(control) -> float:
+        return control.value() * control.per
 
-    def setEngine(self, engine_id) -> None:
-        """Show the import and healing section for the engine that asks.
+    def _lengthCell(self, control):
+        """The box and a unit label that follows the display unit."""
+        from foammesh.core import display_unit
+        from foammesh.view.theming.metrics import UnitLabel
+        cell = unit_cell(control, display_unit.current())
+        self._lengthLabels.append(cell.findChild(UnitLabel))
+        return cell
 
-        Plan 32 section 4.4. Only Gmsh has an import stage; snappy is handed
-        a surface and starts from it. The page asks the facade which engine
-        is selected on every refresh, so `StepManager` gains nothing to
-        remember.
-        """
-        engine_id = str(engine_id or '')
-        if engine_id == self._engineId:
-            return
-        self._engineId = engine_id
-        wanted = engine_id == 'gmsh'
-        if wanted and self._healingPanel is None:
-            panel = GmshHealingPanel(app.facadeClient, self._healingBody)
-            # DP-155/157. A section of a page does not scroll itself and
-            # carries no commit pair of its own.
-            panel.setEmbedded(True)
-            self._healingLayout.addWidget(panel)
-            self._healingPanel = panel
-        elif wanted:
-            # DP-339. A refresh keeps an uncommitted edit.
-            self._healingPanel.reload(discard_pending=False)
-        self._healingHeader.setVisible(wanted)
-        self._healingBody.setVisible(wanted and self._healingHeader.isChecked())
-
-    def healingPanel(self):
-        """The import and healing editors, or None while none are needed."""
-        return self._healingPanel
-
-    def healingHeader(self):
-        """The disclosure that opens the import and healing section."""
-        return self._healingHeader
-
-    def hasPendingHealingEdits(self) -> bool:
-        """True when the section holds an edit nobody has committed."""
-        return self._healingPanel is not None and self._healingPanel.is_dirty
-
-    def applyPendingHealing(self):
-        """Commit whatever the import and healing section is holding."""
-        if self._healingPanel is None:
-            return None
-        return self._healingPanel.apply()
-
-    async def savePendingHealing(self) -> bool:
-        """Commit that section and say whether the case took it.
-
-        DP-251, the same rule as the Advanced band on `2. Mesh setup`: a
-        section with no Apply of its own (DP-157) is committed by the press
-        that leaves the page, and the press has to know the answer before it
-        moves. These settings describe how the CAD is read, so a press that
-        walked past them unsaved would prepare the geometry with the
-        tolerances the reader had just replaced. True when there is nothing
-        to write -- no Gmsh, no section, no pending edit.
-        """
-        if self._healingPanel is None:
-            return True
-        return await self._healingPanel.save()
-
-    def _syncEngine(self) -> None:
-        """Ask the facade which engine is selected and follow it.
-
-        A page that has no session, or a client that does not answer, leaves
-        the section as it is rather than guessing.
-        """
+    def _displayUnitChanged(self):
+        from foammesh.core import display_unit
         try:
-            payload = query(app.facadeClient, 'mesh.engine.list').payload
-        except Exception:  # noqa: BLE001 - the page must still draw
-            return
-        engine_id = (payload or {}).get('current_engine')
-        if engine_id:
-            self.setEngine(str(engine_id))
+            for control in self._lengthBoxes:
+                metres = control.value() * control.per
+                blocked = control.blockSignals(True)
+                control.per = display_unit.metres_per_unit()
+                control.setRange(0, 1e12 / control.per)
+                control.setValue(metres / control.per)
+                control.blockSignals(blocked)
+            for label in self._lengthLabels:
+                label.setText(display_unit.current())
+        except RuntimeError:
+            pass  # the widgets went with their page
 
     def load(self):
         self._loaded = True
@@ -998,20 +1146,17 @@ class GeometryRepairPage(StepPage):
         of those would contradict the findings table standing above it, so
         the sentence says which of the two it was.
         """
+        # Plan 40 UXB1 (#14). This lands in the status bar, which a 1280 px
+        # window cuts at about 90 characters; the revision is on the page.
         if stale:
             return self.tr(
-                'The geometry has changed since the last decision, so it '
-                'was accepted as it is again and a prepared revision was '
-                'recorded.')
+                'Geometry changed since the last decision: accepted as it '
+                'is again.')
         if state == 'repairable':
             return self.tr(
-                'The geometry was accepted as it is: the checks found '
-                'nothing that must be fixed before meshing, so a prepared '
-                'revision was recorded. The repairs offered above are still '
-                'available if you want them.')
-        return self.tr(
-            'The geometry was accepted as it is: the checks found nothing '
-            'that needs repairing, so a prepared revision was recorded.')
+                'Geometry accepted as it is: nothing that must be fixed '
+                'before meshing.')
+        return self.tr('Geometry accepted as it is: nothing needs repairing.')
 
     def preparationVerdict(self):
         """What Proceed may do about preparation, or None if this cannot say.
@@ -1147,6 +1292,37 @@ class GeometryRepairPage(StepPage):
         replace it went on meshing the geometry they had just replaced, with
         a task tree that agreed nothing had changed.
         """
+        self._dropShownResult()
+
+        def discarded(_result):
+            self._updateAsIsState()
+            self._updateNextStepAvailable()
+
+        submit(app.facadeClient, 'geometry.prepared.discard', {},
+               then=discarded)
+        self.stepReset.emit()
+
+    def resetForRefresh(self):
+        """Redraw this page empty after a reload, keeping what was recorded.
+
+        LIVE-V. `StepManager.load()` resets every page above the saved step
+        on each reload, and `clearResult()` here throws the published
+        revision and the recorded decision away. A reload follows every
+        applied transaction, so a decision recorded while the saved step was
+        still `1. Geometry` -- `geometry.preparation.decide` and
+        `geometry.prepared.create` sent to a case that had not walked on yet
+        -- was discarded again by the reload their own transactions caused,
+        and `workflow.status` read `undecided` straight after both applied.
+        Throwing the record away is the answer to an unlock (`clearResult`);
+        a refresh only repaints, and a revision whose geometry changed stops
+        being current by its fingerprint (`PreparedGeometryStore.current`).
+        """
+        self._dropShownResult()
+        self._updateAsIsState()
+        self._updateNextStepAvailable()
+        self.stepReset.emit()
+
+    def _dropShownResult(self):
         self._repairPlan = None
         self._details = {}
         self._clearPlanCards()
@@ -1158,14 +1334,6 @@ class GeometryRepairPage(StepPage):
         self.clearRefusal()
         self._findings.setRowCount(0)
         self._report = None
-
-        def discarded(_result):
-            self._updateAsIsState()
-            self._updateNextStepAvailable()
-
-        submit(app.facadeClient, 'geometry.prepared.discard', {},
-               then=discarded)
-        self.stepReset.emit()
 
     def forgetRemovedGeometry(self):
         """Drop what this page drew from a geometry set that has changed.
@@ -1191,6 +1359,21 @@ class GeometryRepairPage(StepPage):
         self._report = None
         self._offerGeometries([])
 
+    def _toggleSurfaceNames(self, shown):
+        if self._surfaceNamesHeader.isChecked() != bool(shown):
+            self._surfaceNamesHeader.setChecked(bool(shown))
+        self._boundaryPanel.setVisible(shown)
+        if shown:
+            self._boundaryPanel.refresh()
+
+    def boundaryPanel(self):
+        """The boundary tools (Plan 43 LY13, D2)."""
+        return self._boundaryPanel
+
+    def featureAnglePanel(self):
+        """The project Feature-angle control (Plan 42 SG5)."""
+        return self._featureAnglePanel
+
     def refresh(self):
         # C31-12. `geometry.readiness` is a READ that declares an artifact
         # (`readiness_report`), so the registry classes it as a mutation and
@@ -1199,7 +1382,9 @@ class GeometryRepairPage(StepPage):
         # report is computed and written, which is the slowest thing this
         # page asks for. The report is fetched, and the redraw below happens
         # when it arrives, in the same order as before.
-        self._syncEngine()
+        self._featureAnglePanel.reload()
+        if self._boundaryPanel.isVisibleTo(self._widget):
+            self._boundaryPanel.refresh()
 
         def rendered(result):
             if isinstance(result, FailedResult):
@@ -1210,7 +1395,28 @@ class GeometryRepairPage(StepPage):
                 return
             self._renderReadiness(result.payload)
 
-        submit(app.facadeClient, 'geometry.readiness', {}, then=rendered)
+        self._readinessTask = submit(
+            app.facadeClient, 'geometry.readiness', {}, then=rendered)
+
+    async def readinessSettled(self):
+        """Wait until the report the last `refresh()` asked for is drawn.
+
+        UXA8 with Plan 42 SG8. An example is imported and walked to Mesh
+        setup in one go, so its Proceed on this page comes straight after the
+        page opened -- before the report of the geometry just imported had
+        arrived, and the verdict was read off the report of the empty case.
+        """
+        import asyncio
+
+        task = getattr(self, '_readinessTask', None)
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        # `submit` hands the result to `rendered` through `call_soon`.
+        await asyncio.sleep(0)
 
     def _renderReadiness(self, report):
         """Draw the readiness report `refresh()` asked for (C31-12)."""
@@ -1284,10 +1490,7 @@ class GeometryRepairPage(StepPage):
                       # DP-223. The unit travels with the number: this
                       # column holds a length in one row and a count of
                       # cells in the next, so no heading speaks for both.
-                      ' '.join(part for part in (
-                          f'{size:.6g}',
-                          finding.get('characteristic_unit') or '')
-                          if part)
+                      _sizeText(size, finding.get('characteristic_unit'))
                       if evaluated and size is not None
                       else '—',
                       humanise_option(finding['severity'])
@@ -1328,11 +1531,25 @@ class GeometryRepairPage(StepPage):
         # row by stretch, so neither is pinned to its text's width.
         self._revisionStrip.setText(self.tr('Current: {0}').format(' — '.join(labels) or 'none'))
         self._revisionStrip.setToolTip(self._revisionStrip.text())
+        # UXB9 (#36). The combo elides past ten characters; every entry, and
+        # the one showing, carries its whole name, and the list opens as wide
+        # as its longest name.
+        widest = 0
+        for position in range(self._revisionSelect.count()):
+            name = self._revisionSelect.itemText(position)
+            self._revisionSelect.setItemData(
+                position, name, Qt.ItemDataRole.ToolTipRole)
+            widest = max(widest,
+                         self._revisionSelect.fontMetrics().horizontalAdvance(name))
+        self._revisionSelect.view().setMinimumWidth(widest + 40)
+        self._revisionSelect.setToolTip(self._revisionSelect.currentText())
         self._updateAsIsState()
         # DP-300. The wrap estimate is a coarse voxelisation of the whole
         # surface; running it on every redraw of a page the reader may not
         # even open the Wrap choice on spent that time for nothing. It runs
         # when the reader asks for it.
+        self._syncPlanButtons(searched=self._lastSync[0],
+                              actions=self._lastSync[1])
         self._updateNextStepAvailable()
 
     def _identifiedItem(self, parent, name: str, identity: str):
@@ -1472,6 +1689,15 @@ class GeometryRepairPage(StepPage):
         self._planArea.setVisible(False)
         self._syncPlanButtons(searched=False, actions=False)
 
+    def _activeState(self) -> str:
+        """The readiness state of the geometry the buttons act on."""
+        geometry_id = self._activeGeometryId()
+        for item in (self._report or {}).get('geometries', ()):
+            if item.get('geometry_id') == geometry_id:
+                return ((item.get('diagnostics', {}).get('readiness') or {})
+                        .get('state', 'ready'))
+        return ''
+
     def _syncPlanButtons(self, *, searched: bool, actions: bool):
         """Show the presses that act in the plan's state, and no others.
 
@@ -1481,7 +1707,11 @@ class GeometryRepairPage(StepPage):
         After a search that found nothing, none of the three has work, and
         the one-line note says where the way on is.
         """
-        self._findButton.setVisible(not searched)
+        # UXB9 (#36). A Ready geometry has nothing to find; the button that
+        # searches for repairs is not offered on it.
+        self._lastSync = (searched, actions)
+        self._findButton.setVisible(
+            not searched and self._activeState() != 'ready')
         self._previewButton.setVisible(actions)
         self._applyButton.setVisible(actions)
         self._planEmpty.setVisible(
@@ -1575,7 +1805,7 @@ class GeometryRepairPage(StepPage):
                 label.setToolTip(_riskDetail(actions[0]['action']))
             box.addWidget(label)
         if shared:
-            form = QFormLayout()
+            form = SheetForm()
             form.setContentsMargins(0, 0, 0, 0)
             for name in sorted(shared):
                 value, users = shared[name]
@@ -1593,7 +1823,7 @@ class GeometryRepairPage(StepPage):
         header.setObjectName('geometryRepairPlanAdvanced')
         header.setAccessibleName(self.tr('Advanced repair settings'))
         body = QWidget(self._planArea)
-        form = QFormLayout(body)
+        form = SheetForm(body)
         form.setContentsMargins(0, 0, 0, 0)
         readers = {}
         for action, name, value in specialist:
@@ -1644,7 +1874,7 @@ class GeometryRepairPage(StepPage):
             else:
                 own.append(name)
         if own:
-            form = QFormLayout()
+            form = SheetForm()
             form.setContentsMargins(0, 0, 0, 0)
             for name in own:
                 control, read = self._parameterEditor(card, parameters[name])
@@ -1697,6 +1927,7 @@ class GeometryRepairPage(StepPage):
             self.tr('{0} found.').format(
                 count_text(len(actions), 'repair action'))
             if actions else '')
+        self._labelWatcher.run()
 
     def _editedPlan(self):
         if not self._repairPlan:
@@ -1722,7 +1953,7 @@ class GeometryRepairPage(StepPage):
             preview = (await self._runPreparation(
                 'geometry.repair.preview', {'plan': plan})).payload
         except (TypeError, ValueError) as error:
-            await modal(QMessageBox.warning,
+            await modal(messages.warning,
                         self._widget, self.tr('Repair plan'), str(error))
             return None
         self._repairPlan = plan
@@ -1768,7 +1999,7 @@ class GeometryRepairPage(StepPage):
             self.showProceedRefusal(effect)
             return
         answer = await modal(
-            QMessageBox.question,
+            messages.question,
             self._widget, self.tr('Apply repair preview'),
             ' '.join(filter(None, (
                 self.tr('{0} previewed.').format(
@@ -1797,9 +2028,9 @@ class GeometryRepairPage(StepPage):
                       'minimum_component_size': self._wrapMinComponent.value(),
                       'mode': self._wrapMode.currentData()}
         if self._wrapGap.value() > 0:
-            parameters['max_gap'] = self._wrapGap.value()
+            parameters['max_gap'] = self._metres(self._wrapGap)
         if self._wrapDeviation.value() > 0:
-            parameters['max_deviation'] = self._wrapDeviation.value()
+            parameters['max_deviation'] = self._metres(self._wrapDeviation)
         seeds = []
         for value in self._wrapSeeds.text().split(';'):
             if not value.strip():
@@ -1823,7 +2054,7 @@ class GeometryRepairPage(StepPage):
         try:
             parameters = self._wrapParameters()
         except ValueError as error:
-            await modal(QMessageBox.warning,
+            await modal(messages.warning,
                         self._widget, self.tr('Wrap controls'), str(error))
             return None
         preview = (await self._runPreparation(
@@ -1855,7 +2086,7 @@ class GeometryRepairPage(StepPage):
         if not geometry_id or preview is None:
             return
         answer = await modal(
-            QMessageBox.warning,
+            messages.warning,
             self._widget, self.tr('Apply wrap'),
             self._wrapAcceptanceSummary(preview),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -1896,15 +2127,15 @@ class GeometryRepairPage(StepPage):
             '{7}'
             '  Watertight: {0}\n'
             '  Triangles: {1:,}\n'
-            '  Maximum deviation: {2:.6g} (budget {3:.6g})\n'
+            '  Maximum deviation: {2} (budget {3})\n'
             '  Unassigned patch area: {4:.1%}\n'
             '  New-skin fraction: {5:.1%}\n'
             'Patch transfer:\n{6}\n\n'
             'The imported revision remains immutable. Continue?').format(
                 coarse['watertight'],
                 coarse.get('triangle_count', coarse.get('cells', 0)),
-                coarse['deviation']['max'],
-                coarse.get('deviation_budget', 0.0),
+                _sizeText(coarse['deviation']['max'], 'm'),
+                _sizeText(coarse.get('deviation_budget', 0.0), 'm'),
                 transfer.get('unassigned_area_fraction',
                              transfer.get('unassigned_fraction', 1.0)),
                 coarse['new_skin_fraction'],
@@ -1915,7 +2146,7 @@ class GeometryRepairPage(StepPage):
         if not selection:
             return
         geometry_id, revision = selection
-        answer = QMessageBox.question(
+        answer = messages.question(
             self._widget, self.tr('Restore geometry revision'),
             self.tr('Make revision {0} current? Existing revisions are retained.').format(revision),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -1934,7 +2165,7 @@ class GeometryRepairPage(StepPage):
         # will throw away is worse than saying so here.
         fatal, engine = self._engineFatal()
         if fatal:
-            QMessageBox.warning(
+            messages.warning(
                 self._widget, self.tr('Geometry preparation'),
                 self.tr('This geometry cannot be meshed by {0} as it is: '
                         '{1}. Repair or wrap it, or choose the other '
@@ -2031,7 +2262,7 @@ class GeometryRepairPage(StepPage):
                 error = result.error
                 detail = (getattr(error, 'details', None) or {}).get(
                     'error', str(error))
-                QMessageBox.warning(
+                messages.warning(
                     self._widget, self.tr('Geometry preparation'),
                     self.tr('The decision was recorded, but the prepared geometry '
                             'could not be frozen: {0}').format(detail))

@@ -44,10 +44,14 @@ def label_text(shape: str, engine: str = 'snappy') -> str:
     The patch names are the engine's: snappy publishes one ``far_field``
     patch on every shape, Gmsh names the primitive's faces (the Geometry
     page draws the farfield for whichever engine the case has chosen).
+    With ``engine=''`` (the Geometry page, before the fork) it names the
+    shape only: patch names belong to an engine.
     """
     from foammesh.core.mesh.farfield_spec import GMSH, ROLE_TITLE, primitives
     from foammesh.core.mesh.snappy_farfield import PATCH
 
+    if not str(engine or '').strip():
+        return f'{ROLE_TITLE} · {shape}'
     if str(engine or '').strip().lower() == GMSH:
         names = tuple(primitives().patch_names(shape))
         if len(names) == 1:

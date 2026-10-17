@@ -11,6 +11,7 @@ from foammesh.app import app
 from foammesh.core.geometry.measure import format_size, union_bounds
 from foammesh.core.geometry.units import UNIT_TO_M, suggest_unit
 from .geometry_import_dialog_ui import Ui_ImportDialog
+from widgets import async_message_box as messages
 
 
 #: Offered in the order an engineer thinks of them, not alphabetically.
@@ -58,31 +59,6 @@ def parseFeatureAngle(text) -> int:
     return value
 
 
-def _caseSources():
-    """``(engine id, store entries)`` of the open case, empty when unknown."""
-    engine, entries = '', []
-    try:
-        from foammesh.core.engine.registry import configured_engine_id
-        engine = configured_engine_id(app.db)
-    except Exception:                                      # noqa: BLE001
-        pass
-    project = getattr(app, 'project', None)
-    if project is not None and getattr(project, 'path', None) is not None:
-        try:
-            from foammesh.core.geometry import GeometryArtifactStore
-            entries = GeometryArtifactStore(project.path).entries()
-        except (OSError, ValueError):
-            entries = []
-    return engine, entries
-
-
-def _mixesCadAndSurfaces(engine) -> bool:
-    from foammesh.core.engine.registry import ENGINE_REGISTRY
-    if engine not in ENGINE_REGISTRY.ids():
-        return True
-    return getattr(ENGINE_REGISTRY.get(engine), 'mixes_cad_and_surfaces', True)
-
-
 class ImportDialog(QDialog):
     """Choose files, say what unit they are in, and optionally split them.
 
@@ -121,6 +97,14 @@ class ImportDialog(QDialog):
         # leaves is refused at OK, before anything is imported.
         self._ui.featureAngle.setValidator(
             QIntValidator(*FEATURE_ANGLE_RANGE, self))
+        # Plan 40 UXA2 (#31). The split angle starts from the project's
+        # feature angle rather than from a number of its own.
+        try:
+            from foammesh.core.facade.feature_angle import import_split_angle
+            self._ui.featureAngle.setText(str(import_split_angle(
+                app.db.getValue('mesh/featureAngle'))))
+        except Exception:                                    # noqa: BLE001
+            pass
 
         self._connectSignalsSlots()
 
@@ -210,18 +194,16 @@ class ImportDialog(QDialog):
                 parseFeatureAngle(self._ui.featureAngle.text())
             except ValueError as error:
                 return str(error)
-        # DP-638. Refused here, before the first file goes in: the page
-        # imports the CAD half of a selection before the surfaces.
-        engine, entries = _caseSources()
-        if not _mixesCadAndSurfaces(engine):
-            from foammesh.core.geometry.store import gmsh_mixed_sources_refusal
-            return gmsh_mixed_sources_refusal(entries, self.files())
+        # SG22 (Q1 C): the mix of CAD and surfaces is not judged here. The
+        # import is the same for both engines; a mesher that cannot take the
+        # mix refuses it on its own first page (choosing the engine), and the
+        # Convert CAD to surface button on Geometry is the way through.
         return None
 
     def accept(self):
         refusal = self.refusal()
         if refusal:
-            QMessageBox.warning(self, self.tr('Import geometry'), refusal)
+            messages.warning(self, self.tr('Import geometry'), refusal)
             return
         # Remembered so the next import opens on what this one used; the
         # measured suggestion still overrides it once files are chosen.

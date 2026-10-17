@@ -3,6 +3,7 @@
 
 from typing import Optional
 
+from foammesh.view import inline_error
 import asyncio
 
 import qasync
@@ -51,8 +52,7 @@ class SimpleSheetDialog(QDialog):
     async def _okClicked(self):
         if not self._future.done():
             if not self._ui.sheet.isDataComplete():
-                await AsyncMessageBox().warning(self, self.tr('Input error'),
-                                                    self.tr('Empty cells are not allowed within the data range.'))
+                inline_error.show(self, self.tr('Empty cells are not allowed within the data range.'))
                 return
 
             data = self._ui.sheet.getData()

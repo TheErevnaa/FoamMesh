@@ -21,12 +21,15 @@ clicking it raises the Mesh quality tab where the rest lives.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy)
 
+from foammesh.core.quality.attribution import attribute
 from foammesh.core.quality.phrasing import NO_MESH_YET
 from foammesh.core.quality.verdict import verdict_source
-from foammesh.view.theming.metrics import GAP, apply_bar_metrics
+from foammesh.view.theming.metrics import GAP
 
 #: Verdict -> (glyph, word, ``foammeshStatus`` role). The glyph and the word
 #: carry the meaning; the role only picks a themed colour to reinforce it.
@@ -63,29 +66,74 @@ _WAIVED = ('※', 'waived', 'warning')
 _STALE_ROLE = ''
 
 
+class _ElidedLabel(QLabel):
+    """A label that gives up width before it gives up the row.
+
+    Plan 44 MF6. The verdict now shares the console's one 28 px header row with
+    the tabs and the filters, so a long line (``Quality limits: pass · quality:
+    good · 0 / 120 000``) must be able to shrink. ``text()`` is always the full
+    line (the accessible description and the tooltip repeat it); only the
+    painting is cut, with an ellipsis, and only when it does not fit.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Preferred)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.fontMetrics().horizontalAdvance(self.text()) + 2,
+                     super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(24, super().minimumSizeHint().height())
+
+    def paintEvent(self, event) -> None:
+        text = self.text()
+        room = self.contentsRect().width()
+        if self.fontMetrics().horizontalAdvance(text) <= room:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        painter.setFont(self.font())
+        painter.drawText(
+            self.contentsRect(),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            self.fontMetrics().elidedText(
+                text, Qt.TextElideMode.ElideRight, room))
+
+
 class VerdictStrip(QFrame):
     """One line: verdict, governing metric, count. Always visible."""
 
     #: Emitted when the user clicks the strip. The window raises Mesh quality.
     activated = Signal()
+    #: Plan 43 LY9. A failed check named the step to look at; carries its task
+    #: id (``setup.preparation`` for the Preparation step).
+    stepRequested = Signal(str)
+
+    #: Tells the strip which engine the mesh belongs to. Set by the window.
+    engineProvider = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('meshVerdictStrip')
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        # Plan 44 MF6. A dot and one line, no frame: it sits in the console's
+        # header row (and in the folded chip), not on a row of its own.
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAccessibleName('Mesh quality verdict')
+        self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Preferred)
         self._state = 'dormant'
         self._verdict: dict = {}
 
         layout = QHBoxLayout(self)
-        # DP-191. This strip draws a frame, so the frame is part of the
-        # inset rather than added to it -- otherwise its glyph starts a
-        # pixel right of the run status line directly above it.
-        apply_bar_metrics(self, layout)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(GAP)
         self._glyph = QLabel(self)
         self._glyph.setObjectName('meshVerdictGlyph')
-        self._text = QLabel(self)
+        self._text = _ElidedLabel(self)
         self._text.setObjectName('meshVerdictText')
         self._text.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -97,8 +145,15 @@ class VerdictStrip(QFrame):
         self._details.setAccessibleDescription(
             self.tr('Open the Mesh quality tab.'))
         self._details.clicked.connect(self.activated.emit)
+        self._openStep = QPushButton(self)
+        self._openStep.setObjectName('meshVerdictOpenStep')
+        self._openStep.setFlat(True)
+        self._openStep.setVisible(False)
+        self._openStep.clicked.connect(self._requestStep)
+        self._hint: dict | None = None
         layout.addWidget(self._glyph)
         layout.addWidget(self._text, 1)
+        layout.addWidget(self._openStep)
         layout.addWidget(self._details)
         self.clear()
 
@@ -116,6 +171,7 @@ class VerdictStrip(QFrame):
         """No mesh has been produced in this session."""
         self._state = 'dormant'
         self._verdict = {}
+        self._setHint(None)
         glyph, word, role = _DORMANT
         # DP-107. The same sentence the Mesh quality tab a centimetre
         # below uses, because it is the same fact.
@@ -135,6 +191,35 @@ class VerdictStrip(QFrame):
         # warning. This line is the whole verdict, and it names its scope.
         glyph, _word, role = self._appearance()
         self._render(glyph, self.scopedSummary(), role, self.scopedSummary())
+        engine = ''
+        provider = self.engineProvider
+        if callable(provider):
+            try:
+                engine = str(provider() or '')
+            except Exception:                                # noqa: BLE001
+                engine = ''
+        self._setHint(attribute(self._verdict, engine))
+
+    @property
+    def hint(self) -> dict | None:
+        """The step a failed verdict points at, or ``None`` (Plan 43 LY9)."""
+        return dict(self._hint) if self._hint else None
+
+    def _setHint(self, hint) -> None:
+        self._hint = hint
+        if not hint:
+            self._openStep.setVisible(False)
+            return
+        first = hint['steps'][0]
+        self._openStep.setText(str(self.tr('Open {0}')).format(first['label']))
+        self._openStep.setToolTip(hint['sentence'])
+        self._openStep.setAccessibleDescription(hint['sentence'])
+        self._openStep.setVisible(True)
+        self._text.setToolTip(hint['sentence'])
+
+    def _requestStep(self) -> None:
+        if self._hint and self._hint.get('steps'):
+            self.stepRequested.emit(self._hint['steps'][0]['task_id'])
 
     def scopedSummary(self) -> str:
         """The verdict line, prefixed with who produced it.
@@ -160,6 +245,7 @@ class VerdictStrip(QFrame):
         if self._state == 'dormant':
             return
         self._state = 'stale'
+        self._setHint(None)
         glyph, _word, _role = self._appearance()
         text = (reason or self.tr('Superseded — settings changed since this '
                                   'mesh')) + ': ' + self.summary()
@@ -189,6 +275,10 @@ class VerdictStrip(QFrame):
         # S6 both ended `Failed 1 mesh checks` and this line read `blemish ·
         # mesh grades marginal`, which is how a formally failed check reached
         # Export looking like a pass.
+        # DP-2635. A region meshed too thin is the failure itself; it goes
+        # first, ahead of checkMesh's tally, which may all be advisory.
+        if self._verdict.get('thinLine'):
+            parts.append(str(self._verdict['thinLine']))
         if self._verdict.get('failedCheckLine'):
             parts.append(str(self._verdict['failedCheckLine']))
         # DP-664. Requested layers that were not grown, which checkMesh

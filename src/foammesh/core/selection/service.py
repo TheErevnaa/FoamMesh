@@ -148,6 +148,12 @@ class SelectionService:
         self.visibility_changed = SelectionSignal()
         self.orphan_changed = SelectionSignal()
         self.state_changed = SelectionSignal()
+        #: Emitted with the live :class:`PickRequest`, or None when it ends.
+        self.pick_changed = SelectionSignal()
+        self._pick = None
+        self._pick_driver: Callable | None = None
+        self._pick_source = None
+        self._pick_reason = ''
         self._entities: dict[str, SelectionEntity] = {}
         self._snapshot = SelectionSnapshot()
         self._renderer: Callable | None = None
@@ -258,6 +264,89 @@ class SelectionService:
         self._snapshot = replace(self._snapshot, hidden_ids=values)
         self.visibility_changed.emit(values)
         self._apply()
+
+    # -- the one Pick tool (Plan 42 SG13) ------------------------------------ #
+
+    @property
+    def pick_source(self):
+        """The object behind the driver (the picker's panel), or None."""
+        return self._pick_source
+
+    def set_pick_driver(self, driver: Callable | None, source=None) -> None:
+        """Register the picker that serves requests; ``driver(request)``
+        returns True when it started, False (after ``refuse``) when not."""
+        self._pick_driver = driver
+        self._pick_source = source if driver is not None else None
+
+    def has_pick_driver(self) -> bool:
+        return self._pick_driver is not None
+
+    @property
+    def active_pick(self):
+        return self._pick
+
+    @property
+    def pick_reason(self) -> str:
+        """Why the last request was refused, or ''."""
+        return self._pick_reason
+
+    def refuse(self, reason: str) -> None:
+        self._pick_reason = str(reason)
+
+    def begin_pick(self, request, *, engine: str = 'gmsh',
+                   mesh_on_screen: bool = False) -> bool:
+        """Ask the Pick tool to serve *request*; False says why in
+        :attr:`pick_reason`."""
+        from .pick import pick_filters
+
+        self._pick_reason = ''
+        offered = pick_filters(engine, mesh_on_screen=mesh_on_screen)
+        missing = [name for name in request.filters if name not in offered]
+        if missing:
+            self._pick_reason = (
+                '%s cannot be picked with the %s engine here.'
+                % (', '.join(missing), engine))
+            return False
+        if self._pick_driver is None:
+            self._pick_reason = (
+                'There is no viewport to pick in; open the Geometry step '
+                'first.')
+            return False
+        if self._pick is not None:
+            self.cancel_pick()
+        self._pick = request
+        started = False
+        try:
+            started = bool(self._pick_driver(request))
+        finally:
+            if not started:
+                self._pick = None
+        if started:
+            self.pick_changed.emit(request)
+        return started
+
+    def accept_pick(self, chosen: Iterable) -> bool:
+        """Finish the live request with *chosen*; False when none is live."""
+        request, self._pick = self._pick, None
+        if request is None:
+            return False
+        chosen = tuple(tuple(c) if isinstance(c, (list, tuple)) else c
+                       for c in chosen)
+        if request.multiplicity == 'one':
+            chosen = chosen[:1]
+        if request.on_accept is not None:
+            request.on_accept(chosen)
+        self.pick_changed.emit(None)
+        return True
+
+    def cancel_pick(self) -> bool:
+        request, self._pick = self._pick, None
+        if request is None:
+            return False
+        if request.on_cancel is not None:
+            request.on_cancel()
+        self.pick_changed.emit(None)
+        return True
 
     def attach_editor(
             self, callback: Callable[[tuple[str, ...]], None],

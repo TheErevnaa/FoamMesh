@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
 
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
 from foammesh.view.workflow_controls.task_page import EngineTaskPage
+from foammesh.core.facade.feature_angle import included_angle, project_angle
 from foammesh.view.facade_client import query, submit
+from .walls_default import apply_project_angle, ensure_walls_group
 from foammesh.view.theming.metrics import (
     CompactDoubleSpinBox, apply_form_metrics, unit_cell,
 )
@@ -73,6 +75,16 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         self._filters = self.adoptPanel(
             _FeatureFilterGroup(self._client, self))
         layout.addWidget(self._filters)
+        # Plan 44 FIT (DP-2667). The filters keep what survives the angle and
+        # default to OpenFOAM's own, so they sit behind one closed header; the
+        # included angle and the extracted edges stay on the page.
+        from .sheet_folds import fold_behind, open_on_filter
+        self._filtersFold = fold_behind(
+            layout, self._filters, self.tr(self._filters.heading),
+            'surfaceFeatureFiltersFold',
+            tooltip=self.tr(self._filters.purpose))
+        self._filters._form.setTitle('')
+        open_on_filter(self, self._filtersFold)
         self._diagnostics = self.adoptPanel(
             _FeatureDiagnosticsGroup(self._client, self))
         layout.addWidget(self._diagnostics)
@@ -150,7 +162,9 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self._angle = CompactDoubleSpinBox(box)
         self._angle.setObjectName('includedAngle')
-        self._angle.setRange(0.001, 179.999)
+        # Plan 40 UXA2. The project angle is 1..179 degrees of turn, which is
+        # an included angle of 1..179.
+        self._angle.setRange(1.0, 179.0)
         self._angle.setDecimals(3)
         self._angle.setAccessibleName(self.tr('Feature included angle'))
         described = self.tr(INCLUDED_ANGLE_HELP)
@@ -196,6 +210,9 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         super().refresh()
         if hasattr(self, '_angle'):
             self._populate_angle()
+            # Plan 40 UXA2. A new case gets its walls group before the first
+            # extraction, so the stage reads a group at the derived levels.
+            ensure_walls_group(self._client, then=self._populate_angle)
         for name in ('_filters', '_diagnostics'):
             group = getattr(self, name, None)
             if group is not None:
@@ -229,85 +246,59 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
     def _populate_angle(self) -> None:
         groups = self.refinement_groups()
         angles = sorted({self._group_angle(group) for group in groups.values()})
+        # Plan 40 UXA2 (F1c). With no group the control shows the project
+        # angle's included angle, and writing it works all the same: the
+        # angle is the project's, not a group's.
+        project = included_angle(project_angle(self._configuration()))
         # The widest configured angle keeps the most edges, so showing it is
         # the reading that cannot understate what extraction will produce.
         self._angle.blockSignals(True)
-        self._angle.setValue(angles[-1] if angles else DEFAULT_INCLUDED_ANGLE)
+        self._angle.setValue(angles[-1] if angles else project)
         self._angle.blockSignals(False)
-        self._angle.setEnabled(bool(groups))
-        # Plan 33 OF-04. One sentence per branch, and each of them says what
-        # is true of this case right now. The standing explanation that used
-        # to be the third branch is `INCLUDED_ANGLE_HELP`, carried by the spin
-        # box itself, so it is there for all three.
-        if not groups:
-            # Disabled and *explained*: this page already claimed a control it
-            # did not have, and an unlabelled dead spin box says the same
-            # thing over again.
-            self._angleNote.setText(self.tr(
-                'Stored per surface refinement group, and no group exists '
-                'yet, so add one on Castellation to change it.'))
-            # W-O1. Why this spin box is shut is the spin box's own
-            # description, beside what the angle does, so the reader who
-            # clicks the dead control is answered by it.
-            described = ' '.join(
-                (self.tr(INCLUDED_ANGLE_HELP), self._angleNote.text()))
-            self._angle.setToolTip(described)
-            self._angle.setAccessibleDescription(described)
-        elif len(angles) > 1:
+        self._angle.setEnabled(True)
+        described = self.tr(INCLUDED_ANGLE_HELP)
+        self._angle.setToolTip(described)
+        self._angle.setAccessibleDescription(described)
+        if len(angles) > 1:
             self._angleNote.setText(self.tr(
                 'The refinement groups do not agree (%s), and changing this '
                 'writes one angle to every one of them.')
                 % ', '.join(format(a, 'g') for a in angles))
         else:
             self._angleNote.setText('')
-        if groups:
-            described = self.tr(INCLUDED_ANGLE_HELP)
-            self._angle.setToolTip(described)
-            self._angle.setAccessibleDescription(described)
-        # W-O1. Only the disagreement branch stands: the other two are the
-        # state of the case, said on the control above.
-        self._angleNote.setVisible(bool(groups) and len(angles) > 1)
+        # W-O1. Only the disagreement stands on the form.
+        self._angleNote.setVisible(len(angles) > 1)
+
+    def _configuration(self) -> dict:
+        try:
+            return self._client.configuration() or {}
+        except Exception:                                    # noqa: BLE001
+            return {}
 
     def apply_included_angle(self) -> None:
-        """Write the angle to every refinement group, then re-read it."""
+        """Write the project feature angle, and with it every place it feeds.
+
+        Plan 40 UXA2 (#31). The angle is the project's: one write sets it and
+        the places derived from it (resolve angle, layer angles, every
+        refinement group's included angle); see ``walls_default``.
+        """
         value = float(self._angle.value())
-        pending = [entity_id
-                   for entity_id, group in self.refinement_groups().items()
-                   if abs(self._group_angle(group) - value) >= 1e-9]
 
-        # C31-12. Still one write per group, still strictly in order, and
-        # still stopping at the first refusal -- but each write is scheduled
-        # rather than run on the GUI thread, which for a case with a dozen
-        # refinement groups was a dozen consecutive freezes. `write_next` is
-        # the loop body and re-enters itself from the continuation of the
-        # write it just made, so group N+1 is not sent before group N has
-        # been answered.
-        def write_next(index: int, changed: bool) -> None:
-            if index >= len(pending):
-                if changed:
-                    self._populate_angle()
+        def written(outcome) -> None:
+            if outcome is True:
+                self._populate_angle()
                 return
+            # Refusing in silence is the shape of defect this page exists to
+            # end, so the refusal is written where the control is.
+            self._angleNote.setText(
+                self.tr('The included angle was not saved: %s')
+                % (getattr(outcome, 'message', '')
+                   or self.tr('the facade refused the change')))
+            # W-O1. A refusal is a validation error beside the input it
+            # concerns, which Plan 33 section 1 keeps on the form.
+            self._angleNote.setVisible(True)
 
-            def written(result) -> None:
-                if getattr(result, 'status', 'accepted') != 'accepted':
-                    # Refusing in silence is the shape of defect this page
-                    # exists to end, so the refusal is written where the
-                    # control is.
-                    self._angleNote.setText(
-                        self.tr('The included angle was not saved: %s')
-                        % (getattr(result, 'message', '')
-                           or self.tr('the facade refused the change')))
-                    # W-O1. A refusal is a validation error beside the input
-                    # it concerns, which Plan 33 section 1 keeps on the form.
-                    self._angleNote.setVisible(True)
-                    return
-                write_next(index + 1, True)
-
-            submit(self._client, REFINEMENT_COLLECTION + '.patch',
-                   {'entity_id': pending[index],
-                    'fields': {'included_angle': value}}, then=written)
-
-        write_next(0, False)
+        apply_project_angle(self._client, value, then=written)
 
     # -- the result -------------------------------------------------------- #
 
@@ -356,6 +347,8 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         self._populate_subset_note(rows)
         box = getattr(self, '_featureBox', None)
         if box is not None:
+            # Plan 40 UXA4 (#53). Nothing extracted: nothing to draw.
+            box.setVisible(bool(rows))
             box.setToolTip(said)
             box.setAccessibleDescription(said)
 

@@ -26,6 +26,14 @@ controls. A Ctrl+drag on a handle now moves a locked plane for that one drag:
 a press observer that runs before the widget's own lets the widget take the
 press, and the lock closes again when the drag (or a press on no handle) ends.
 A plain Ctrl+click still selects; only a press on a handle is taken.
+
+Plan 39 VI10 (F2b, F3b). The drawn sheet is grabbable again: a press on it
+slides the plane along its normal (the arrow still turns it, the outline
+still moves it freely), because a plane that only a user who knows where the
+arrow is can move reads as a plane that will not move. The sheet can be hidden
+on its own (:meth:`setSheetVisible`, which also stops it taking a press, so a
+hidden sheet leaves every drag to the camera) and its opacity is a setting
+(:meth:`setSheetOpacity`) rather than a constant. Lock still stops every drag.
 """
 from __future__ import annotations
 
@@ -47,6 +55,8 @@ AXIS_X, AXIS_Y, AXIS_Z, AXIS_NORMAL = 0, 1, 2, 3
 #: The plane is drawn faintly: solid enough to read as a surface at a glance,
 #: transparent enough that the mesh behind it is still the subject.
 PLANE_OPACITY = 0.16
+#: VI10 F3b. The sheet's opacity is the user's, between none and half.
+MAX_SHEET_OPACITY = 0.5
 OUTLINE_WIDTH = 1.4
 NORMAL_WIDTH = 2.0
 
@@ -86,6 +96,8 @@ class PlaneWidget(QObject):
         self._ctrlDrag = False
         self._interacting = False
         self._gateTags = []
+        self._sheetVisible = True
+        self._sheetOpacity = PLANE_OPACITY
 
         rep = vtkImplicitPlaneRepresentation()
         rep.SetPlaceFactor(1.25)  # This must be set prior to placing the widget
@@ -110,7 +122,8 @@ class PlaneWidget(QObject):
 
         self._widget.SetInteractor(view.interactor())
         self._widget.SetRepresentation(rep)
-        _stopPlaneSurfaceGrabbing(rep)
+        self._sheetActors = _sheetActors(rep)
+        self._syncSheetPick()
 
         self._widget.AddObserver(
             vtkCommand.StartInteractionEvent, self._interactionStarted)
@@ -210,6 +223,45 @@ class PlaneWidget(QObject):
     def isLocked(self) -> bool:
         return self._locked
 
+    # -- the sheet (VI10) -------------------------------------------------- #
+
+    def setSheetVisible(self, visible: bool):
+        """Show or hide only the translucent sheet; arrow and outline stay.
+
+        A hidden sheet is not pickable either: a press where it was belongs
+        to the camera.
+        """
+        self._sheetVisible = bool(visible)
+        rep = self._representation()
+        if self._sheetVisible:
+            rep.DrawPlaneOn()
+        else:
+            rep.DrawPlaneOff()
+        self._syncSheetPick()
+        self._view.refresh()
+
+    def isSheetVisible(self) -> bool:
+        return self._sheetVisible
+
+    def setSheetOpacity(self, opacity: float):
+        """The sheet's opacity, 0 to :data:`MAX_SHEET_OPACITY`."""
+        self._sheetOpacity = min(max(float(opacity), 0.0), MAX_SHEET_OPACITY)
+        rep = self._representation()
+        rep.GetPlaneProperty().SetOpacity(self._sheetOpacity)
+        rep.GetSelectedPlaneProperty().SetOpacity(
+            min(self._sheetOpacity * 1.6, 1.0))
+        self._view.refresh()
+
+    def sheetOpacity(self) -> float:
+        return self._sheetOpacity
+
+    def _syncSheetPick(self):
+        for actor in self._sheetActors:
+            if self._sheetVisible:
+                actor.PickableOn()
+            else:
+                actor.PickableOff()
+
     # -- lifecycle --------------------------------------------------------- #
 
     def on(self, normal=None):
@@ -266,6 +318,14 @@ class PlaneWidget(QObject):
 
     def _interactionStarted(self, obj, event):
         self._interacting = True
+        # Closing round 2026-10-12 (VI14): a drag of the sheet draws the
+        # reduced copies, as a drag of the camera does.
+        begin = getattr(self._view, 'beginHandleDrag', None)
+        if begin is not None:
+            try:
+                begin()
+            except Exception:                               # noqa: BLE001
+                pass
         self._dragOrigin = tuple(self.origin())
         direction = self._dragDirection()
         self._dragStartTravel = (None if direction is None
@@ -273,6 +333,12 @@ class PlaneWidget(QObject):
 
     def _interactionEnded(self, obj, event):
         self._interacting = False
+        end = getattr(self._view, 'endHandleDrag', None)
+        if end is not None:
+            try:
+                end()
+            except Exception:                               # noqa: BLE001
+                pass
         self._dragOrigin = None
         self._dragStartTravel = None
         if self._ctrlDrag:
@@ -378,23 +444,25 @@ class PlaneWidget(QObject):
         return (cosine * along_ray - along_line) / denominator
 
 
-def _stopPlaneSurfaceGrabbing(rep):
-    """Make the drawn plane surface unpickable, leaving the handles live.
+def _sheetActors(rep):
+    """The actors that draw the plane sheet.
 
     ``vtkImplicitPlaneRepresentation`` picks from a list that includes the cut
-    surface; a press on it starts a push along the normal. The surface actor
-    is the one wearing the plane property (or its selected twin).
+    surface; a press on it starts a push along the normal. The sheet actor is
+    the one wearing the plane property (or its selected twin).
     """
     getActors = getattr(rep, 'GetActors', None)
     if getActors is None:
-        return
+        return []
     props = vtkPropCollection()
     getActors(props)
     wanted = (rep.GetPlaneProperty(), rep.GetSelectedPlaneProperty())
+    found = []
     for index in range(props.GetNumberOfItems()):
         actor = props.GetItemAsObject(index)
         getProperty = getattr(actor, 'GetProperty', None)
         if getProperty is None:
             continue
         if any(getProperty() is prop for prop in wanted):
-            actor.PickableOff()
+            found.append(actor)
+    return found

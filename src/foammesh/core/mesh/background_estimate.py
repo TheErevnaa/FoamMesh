@@ -38,6 +38,12 @@ class BackgroundEstimate:
     ram_bytes: int
     #: Physical RAM free when the estimate was made (0: unknown).
     available_bytes: int
+    #: Longest background cell edge over the shortest (0: not known, as for
+    #: hand-written blocks).
+    aspect_ratio: float = 0.0
+    #: DP-2400. Whether the background cells are strongly anisotropic
+    #: (`core.mesh.sizing.background_estimate`'s own test, ratio above 3).
+    anisotropic: bool = False
 
     @property
     def over_ram(self) -> bool:
@@ -62,6 +68,7 @@ def estimate(db, geometry_bounds, *, available_bytes: int | None = None
     except Exception:                                       # noqa: BLE001
         return None
     cells = int(plan.get('estimate') or 0)
+    ratio, anisotropic = _anisotropy(plan)
     level = int(plan.get('level') or 0)
     cell = plan.get('cell')
     if available_bytes is None:
@@ -74,7 +81,25 @@ def estimate(db, geometry_bounds, *, available_bytes: int | None = None
         near_cell=float(cell) / 2 ** level if cell and level else None,
         level=level,
         ram_bytes=resource_budget.mesher_memory_needed('snappy', cells),
-        available_bytes=int(available_bytes or 0))
+        available_bytes=int(available_bytes or 0),
+        aspect_ratio=ratio, anisotropic=anisotropic)
+
+
+def _anisotropy(plan) -> tuple[float, bool]:
+    """DP-2400. The legacy base-grid page judged the block against its
+    counts with `sizing.background_estimate`; the plan holds both."""
+    from foammesh.core.mesh import sizing
+
+    block, counts = plan.get('block'), plan.get('counts')
+    if not block or not counts:
+        return 0.0, False
+    try:
+        found = sizing.background_estimate(
+            tuple(float(value) for value in block),
+            tuple(int(value) for value in counts))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0, False
+    return float(found['aspect_ratio']), bool(found['anisotropic'])
 
 
 def _length(value: float) -> str:
@@ -83,8 +108,20 @@ def _length(value: float) -> str:
     return f'{value * 1000:.3g} mm'
 
 
-def describe(found: BackgroundEstimate | None) -> str:
-    """The sentences every page shows; a warning, never a refusal."""
+#: DP-2401. Share of maxGlobalCells the starting cells may take before the
+#: castellation page says so (legacy `_updateCellRisk`).
+BUDGET_SHARE = 0.5
+
+
+def describe(found: BackgroundEstimate | None, *,
+             max_global_cells: int | None = None) -> str:
+    """The sentences every page shows; a warning, never a refusal.
+
+    *max_global_cells* is the user's own ``maxGlobalCells``, given by the
+    castellation page only. At half of it the page says how little budget
+    refinement has left. It is an advisory: nothing is capped or refused
+    (user rule 2026-10-01).
+    """
     from foammesh.support.resource_budget import format_bytes
 
     if found is None:
@@ -104,6 +141,19 @@ def describe(found: BackgroundEstimate | None) -> str:
     if found.level and found.uniform_cells > found.cells:
         lines.append('Filled at the target size the far field would have '
                      'held {0:,} cells.'.format(found.uniform_cells))
+    if found.anisotropic:
+        lines.append(
+            'Warning: background cells are strongly anisotropic (the longest '
+            'cell edge is {0:.3g} times the shortest). Change the cell counts '
+            'or the target size to make them closer to cubes.'.format(
+                found.aspect_ratio))
+    if (max_global_cells and max_global_cells > 0
+            and found.cells / max_global_cells >= BUDGET_SHARE):
+        lines.append(
+            'maxGlobalCells is {0:,} and the background alone is about '
+            '{1:,} cells. Warning: refinement has little remaining '
+            'global-cell budget. Raise maxGlobalCells if the mesh is meant '
+            'to be that large.'.format(max_global_cells, found.cells))
     if found.over_ram:
         lines.append(
             'Warning: that is more than the {0} of RAM free now; castellation '

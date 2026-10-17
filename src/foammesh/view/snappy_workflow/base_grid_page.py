@@ -30,15 +30,19 @@ old "toward start" switch's cells at the wrong end (DP-1033).
 """
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-    QRadioButton, QVBoxLayout,
+    QRadioButton, QVBoxLayout, QWidget,
 )
 
 from foammesh.core.facade import applicability
 from foammesh.core.mesh import grading as background_mesh
 from foammesh.view.theming.metrics import ReflowGrid, apply_form_metrics
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
+from foammesh.view.theming.sheet_form import SheetForm
+from foammesh.view.widgets.folder_header import FolderHeader
+from foammesh.view.widgets.segmented_control import SegmentedControl
 from foammesh.view.workflow_controls.conditional_fields import (
     condition_context,
 )
@@ -157,15 +161,47 @@ class SnappyBaseGridPage(SnappyTaskPage):
         # now, where it is read by someone who wants it and skipped by
         # someone who does not.
         layout.insertWidget(0, self._build_mode_choice())
+        # Plan 41 GN25c. Sizing starts here: the Automatic Sizing card needs
+        # only the geometry, so it is reachable before any stage has run and
+        # Apply here stales nothing (the same card sits on Castellation).
+        from foammesh.view.sizing.automatic_sizing_card import (
+            AutomaticSizingCard)
+        self.sizing_card = AutomaticSizingCard(self._client, 'snappy', self)
+        self.sizing_card.applied.connect(self.refresh_keeping_edits)
+        layout.insertWidget(0, self.sizing_card)
         # Plan 37 #7. What the sizing above costs, under the choice it
         # follows from: the far-field and near-body cells, the cells
         # castellation starts from, and the RAM that takes.
         self._estimate_label = QLabel(self)
         background_estimate_label.prepare(self._estimate_label, 'baseGridBackgroundEstimate')
         layout.insertWidget(1, self._estimate_label)
+        # Plan 43 D1. Said when the stored Hex6 no longer names a Hex6.
+        self._hex6_note = QLabel(self)
+        self._hex6_note.setObjectName('baseGridHex6Note')
+        self._hex6_note.setWordWrap(True)
+        self._hex6_note.setProperty('foammeshStatus', 'warning')
+        self._hex6_note.setVisible(False)
+        layout.insertWidget(2, self._hex6_note)
+        # Plan 44 MF27 (after the two inserts above, which count from the
+        # card). The card is a tool a reader opens on purpose; open,
+        # its 309 px took this step past the 300 px sheet. One press away.
+        from .sheet_folds import fold_sizing_card
+        self._sizingFold = fold_sizing_card(self, layout, self.sizing_card)
         self._grading_box = self._build_grading()
         layout.addWidget(self._grading_box)
         self._faces_box = self._build_faces()
+        # Plan 40 UXD9 (#41). Eighteen fields for six faces nobody has named
+        # are folded away; the fold's title says how many faces are set and
+        # how many still need a name (Plan 44 MF27), and the reader's own
+        # press is kept.
+        self._faces_touched = False
+        self._applying_fold = False
+        self._faces_fold = FolderHeader(self.tr('Background faces'), self)
+        self._faces_fold.setObjectName('baseGridFacesFold')
+        self._faces_fold.setChecked(False)
+        self._faces_fold.setContents(self._faces_box)
+        self._faces_fold.toggled.connect(self._on_faces_fold_touched)
+        layout.addWidget(self._faces_fold)
         layout.addWidget(self._faces_box)
         self._build_authoring(layout)
         self.sync_authoring()
@@ -189,6 +225,13 @@ class SnappyBaseGridPage(SnappyTaskPage):
             'coarsest cell in the result, and every refinement level halves '
             'it.'))
         inner = QVBoxLayout(box)
+        # Plan 44 MF14. Two exclusive answers are one segmented row. The two
+        # radios below stay as hidden aliases (Q8): same objects, names and
+        # `toggled` signal.
+        self._modeSegments = SegmentedControl(box)
+        self._modeSegments.setObjectName('baseGridModeSegments')
+        self._modeSegments.setAccessibleName(self.tr('Background mesh'))
+        inner.addWidget(self._modeSegments)
 
         self._automatic = QRadioButton(
             self.tr('One block around the geometry'), box)
@@ -196,7 +239,6 @@ class SnappyBaseGridPage(SnappyTaskPage):
         self._automatic.setAccessibleDescription(self.tr(
             'A single box derived from the bounding box of the geometry, '
             'with the standoff and the faces below.'))
-        inner.addWidget(self._automatic)
 
         self._custom = QRadioButton(
             self.tr('Blocks I write myself'), box)
@@ -205,8 +247,11 @@ class SnappyBaseGridPage(SnappyTaskPage):
             'The block topology written out by hand: vertices first, then '
             'the blocks that use them, then a patch for every external '
             'face.'))
-        inner.addWidget(self._custom)
 
+        self._modeSegments.addOption(
+            self._automatic.text(), key='automatic', alias=self._automatic)
+        self._modeSegments.addOption(
+            self._custom.text(), key='custom', alias=self._custom)
         self._automatic.setChecked(True)
         self._automatic.toggled.connect(self._apply_mode)
         return box
@@ -228,17 +273,18 @@ class SnappyBaseGridPage(SnappyTaskPage):
         hand, and its label says what it does to them in that mode.
         """
         custom = self.authoring_is_chosen()
-        for name in ('_faces_box', '_grading_box'):
-            box = getattr(self, name, None)
-            if box is not None:
-                box.setVisible(not custom)
+        self.sync_grading_box()
+        fold = getattr(self, '_faces_fold', None)
+        if fold is not None:
+            fold.setVisible(not custom)
+            self._faces_box.setVisible(not custom and fold.isChecked())
         for panel in self.authoring_panels():
             panel.setVisible(custom)
         self._refresh_sizing_rows()
 
     # -- the six derived faces --------------------------------------------- #
 
-    def _build_faces(self) -> QGroupBox:
+    def _build_faces(self) -> QWidget:
         """One small form per face, holding that face's three coupled fields.
 
         Left to the default routing the category landed in Guided (it is a
@@ -246,7 +292,13 @@ class SnappyBaseGridPage(SnappyTaskPage):
         (they are writer keys), which is the one arrangement in which the
         refusal that couples them cannot be read.
         """
-        box = QGroupBox(self.tr('Background faces'), self)
+        # The fold above it carries the heading (Plan 40 UXD9). SG2: a plain
+        # container, not an untitled group box. Under the theme a QGroupBox
+        # is a card (Plan 44 MF2: a border and 8 px of padding), which no
+        # contents margin set here can take off, so the six face cards sat
+        # one card deeper than every other card: MEASURED, face labels at
+        # x=34 against the page's 26 at the 635 px column.
+        box = QWidget(self)
         box.setObjectName('baseGridFacesBox')
         box.setToolTip(self.tr(
             'Each face carries a patch type, the name it is delivered under, '
@@ -275,18 +327,18 @@ class SnappyBaseGridPage(SnappyTaskPage):
         # was clipped away entirely. `ReflowGrid` counts the columns that fit.
         self._face_grid = ReflowGrid(box)
         outer.addWidget(self._face_grid)
-        self._face_forms: dict[str, QFormLayout] = {}
+        self._face_forms: dict[str, SheetForm] = {}
         for key, label, side in FACES:
             group = QGroupBox('%s (%s)' % (self.tr(side), label),
                               self._face_grid)
             group.setObjectName('baseGridFace_' + key)
-            form = QFormLayout(group)
+            form = SheetForm(group)
+            form.setContentsMargins(0, 0, 0, 0)
             # The same setters every other registry-backed form on the page
             # gets. Left to the `QFormLayout` default these six carried a
             # 9 px margin where the page carries 4, which was the other half
             # of the jog. `wrap=False` because a grid cell is already at its
             # narrowest and the width watcher would wrap every row of it.
-            apply_form_metrics(form, wrap=False)
             self._face_forms[key] = form
             self._face_grid.addCell(group)
         return box
@@ -332,8 +384,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
         self._grading_notice.setVisible(False)
         outer.addWidget(self._grading_notice)
         container = QFrame(box)
-        self._grading_form = QFormLayout(container)
-        apply_form_metrics(self._grading_form)
+        self._grading_form = SheetForm(container)
+        self._grading_form.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(container)
         self._grading_report = QLabel(box)
         self._grading_report.setObjectName('baseGridGradingReport')
@@ -404,6 +456,7 @@ class SnappyBaseGridPage(SnappyTaskPage):
         label.setText(text)
         label.setVisible(bool(text))
         self._refresh_grading_notice()
+        self.sync_grading_box()
 
     #: Where dismissals are kept; a test swaps in a plain set.
     dismissed_notes = DismissedNotes()
@@ -431,6 +484,37 @@ class SnappyBaseGridPage(SnappyTaskPage):
         text = self.grading_notice()
         self._grading_notice_text.setText(text)
         frame.setVisible(bool(text))
+
+    def grading_box_has_content(self) -> bool:
+        """Whether the Grading card holds anything the reader can see.
+
+        Plan 44 MF14 (audit B12). The card is shown only while it has a row
+        that applies, a note, or a report; a frame around nothing is not
+        drawn.
+        """
+        form = getattr(self, '_grading_form', None)
+        live = form is not None and any(
+            form.isRowVisible(row) for row in range(form.rowCount()))
+        notice = getattr(self, '_grading_notice', None)
+        report = getattr(self, '_grading_report', None)
+        return bool(live
+                    or (notice is not None and not notice.isHidden())
+                    or (report is not None and not report.isHidden()
+                        and bool(report.text())))
+
+    def _apply_tiers(self) -> None:
+        """The grading rows are Expert rows, so showing or hiding Expert
+        settings changes whether the Grading card has anything in it."""
+        super()._apply_tiers()
+        self.sync_grading_box()
+
+    def sync_grading_box(self) -> None:
+        box = getattr(self, '_grading_box', None)
+        if box is None:
+            return
+        wanted = self.grading_box_has_content() and not self.authoring_is_chosen()
+        if box.isVisibleTo(self) != wanted:
+            box.setVisible(wanted)
 
     def dismiss_grading_notice(self) -> None:
         """Put the note away: it is said once, and this is the once."""
@@ -504,8 +588,209 @@ class SnappyBaseGridPage(SnappyTaskPage):
             reason += ' ' + self.tr(self.SCALE_IGNORED).format(value=stored)
         return reason
 
+    # -- the six faces' fold (Plan 40 UXD9, #41) ----------------------------- #
+
+    #: What an unset face purpose is called. The stored word stays
+    #: ``unclassified``; the reader sees what it means.
+    NOT_SET = 'Not set'
+
+    def _on_faces_fold_touched(self, _checked=False) -> None:
+        if not self._applying_fold:
+            self._faces_touched = True
+
+    def faces_set(self) -> list:
+        """The faces that carry a name or a purpose, by their schema key."""
+        found = []
+        for key, _label, _side in FACES:
+            name = self._editors.get('meshing.base_grid.boundary_names.' + key)
+            purpose = self._editors.get(
+                'meshing.base_grid.boundary_categories.' + key)
+            named = name is not None and str(name.value() or '').strip()
+            chosen = (purpose is not None
+                      and str(purpose.value() or '') not in ('', 'unclassified'))
+            if named or chosen:
+                found.append(key)
+        return found
+
+    def faces_unnamed(self) -> list:
+        """The faces given a purpose but no name, which cannot be written."""
+        found = []
+        for key, _label, _side in FACES:
+            name = self._editors.get('meshing.base_grid.boundary_names.' + key)
+            purpose = self._editors.get(
+                'meshing.base_grid.boundary_categories.' + key)
+            named = name is not None and str(name.value() or '').strip()
+            chosen = (purpose is not None
+                      and str(purpose.value() or '') not in ('', 'unclassified'))
+            if chosen and not named:
+                found.append(key)
+        return found
+
+    def sync_faces_fold(self, *, reposition: bool = True) -> None:
+        """Relabel the unset purposes and say on the fold how many faces
+        are set and how many cannot be written yet."""
+        for key, _label, _side in FACES:
+            editor = self._editors.get(
+                'meshing.base_grid.boundary_categories.' + key)
+            combo = getattr(editor, 'editor', None)
+            if combo is None or not hasattr(combo, 'findData'):
+                continue
+            index = combo.findData('unclassified')
+            if index >= 0:
+                combo.setItemText(index, self.tr(self.NOT_SET))
+        fold = getattr(self, '_faces_fold', None)
+        if fold is None:
+            return
+        count = len(self.faces_set())
+        unnamed = len(self.faces_unnamed())
+        if unnamed:
+            # Plan 44 MF27. The fold stays closed, so a face that cannot be
+            # written is said on its title.
+            text = (self.tr('Background faces (%d of %d set, %d need a name)')
+                    % (count, len(FACES), unnamed))
+        elif count:
+            text = (self.tr('Background faces (%d of %d set)')
+                    % (count, len(FACES)))
+        else:
+            text = self.tr('Background faces (not set)')
+        fold.setText(text)
+        if reposition and not self._faces_touched:
+            # Plan 44 MF27. The six faces are 616 px, more than the whole
+            # 491 px a 300 px sheet scrolls, so the fold no longer opens by
+            # itself: its title says how many faces are set and how many
+            # still need a name. The reader's own press is kept.
+            self._applying_fold = True
+            try:
+                fold.setChecked(False)
+            finally:
+                self._applying_fold = False
+        self._faces_box.setVisible(
+            not self.authoring_is_chosen() and fold.isChecked())
+
+    # -- the box around the geometry, chosen by name (Plan 43 D1) ---------- #
+
+    HEX6 = 'meshing.base_grid.bounding_hex6'
+
+    def _geometry_rows(self) -> dict:
+        try:
+            geometry = (self._client.configuration() or {}).get('geometry')
+        except Exception:                                    # noqa: BLE001
+            geometry = None
+        return {str(key): dict(row) for key, row in (geometry or {}).items()
+                if isinstance(row, dict)}
+
+    @staticmethod
+    def _id_value(key):
+        text = str(key)
+        return int(text) if text.isdigit() else text
+
+    def _stored_hex6(self):
+        """The id the case holds, or None; ids are compared as strings."""
+        pending = getattr(self, '_pending', None) or {}
+        if self.HEX6 in pending:
+            value = pending[self.HEX6]
+        else:
+            try:
+                value = self._client.field_values((self.HEX6,)).get(self.HEX6)
+            except Exception:                                # noqa: BLE001
+                value = None
+        text = '' if value is None else str(value).strip()
+        return None if text in ('', 'None') else text
+
+    def hex6_choices(self, selected=None) -> list:
+        """Every Hex6 volume by name, the derived box, and a stale id kept."""
+        rows = self._geometry_rows()
+
+        def shape(row):
+            value = row.get('shape')
+            return str(getattr(value, 'value', value))
+
+        options = [(self.tr('None — use the geometry bounds'), None,
+                    self.tr('The block is derived from the geometry and the '
+                            'standoff'), True)]
+        hex6 = sorted(((key, row) for key, row in rows.items()
+                       if shape(row) == 'hex6'),
+                      key=lambda item: (not item[0].isdigit(),
+                                        int(item[0]) if item[0].isdigit() else 0,
+                                        item[0]))
+        for key, row in hex6:
+            name = str(row.get('name') or '').strip() or self.tr(
+                'Hex6 {0}').format(key)
+            options.append((name, self._id_value(key),
+                            self.tr('Hex6 volume'), True))
+        chosen = self._stored_hex6() if selected is None else selected
+        if chosen not in (None, '') and str(chosen) not in {k for k, _ in hex6}:
+            row = rows.get(str(chosen))
+            what = (self.tr('names no geometry row') if row is None
+                    else self.tr('is not a Hex6 volume'))
+            options.append((self.tr('Geometry {0} ({1})').format(chosen, what),
+                            self._id_value(chosen), what, True))
+        return options
+
+    def field_choices(self, field_id: str):
+        if field_id == self.HEX6:
+            return self.hex6_choices()
+        return None
+
+    def hex6_note(self) -> str:
+        """The legacy "Hex6 not found" sentence, for a stored id that fails."""
+        stored = self._stored_hex6()
+        if stored is None:
+            return ''
+        rows = self._geometry_rows()
+        row = rows.get(stored)
+        value = None if row is None else row.get('shape')
+        if row is not None and str(getattr(value, 'value', value)) == 'hex6':
+            return ''
+        if row is None:
+            return self.tr(
+                'There is no Hex6 with id {0}. Choose a Hex6 volume by name, '
+                'or None to use the geometry bounds.').format(stored)
+        return self.tr(
+            'Geometry {0} ({1}) is not a Hex6 volume. Choose a Hex6 volume '
+            'by name, or None to use the geometry bounds.').format(
+                stored, row.get('name') or stored)
+
+    def sync_hex6_choices(self) -> None:
+        """Re-offer the Hex6 volumes after the geometry rows change."""
+        editor = getattr(self, '_editors', {}).get(self.HEX6)
+        combo = getattr(editor, 'editor', None)
+        if combo is not None and hasattr(combo, 'itemData'):
+            current = editor.value()
+            options = self.hex6_choices('' if current is None else current)
+            blocked = combo.blockSignals(True)
+            try:
+                combo.clear()
+                for label, value, status, enabled in options:
+                    combo.addItem(label, value)
+                    combo.setItemData(combo.count() - 1,
+                                      f'{status}; stable ID: {value}',
+                                      Qt.ItemDataRole.ToolTipRole)
+                self._select_hex6(combo, current)
+            finally:
+                combo.blockSignals(blocked)
+        note = getattr(self, '_hex6_note', None)
+        if note is not None:
+            text = self.hex6_note()
+            note.setText(text)
+            note.setVisible(bool(text))
+
+    def _select_hex6(self, combo, value) -> None:
+        index = 0
+        if value is not None:
+            for position in range(combo.count()):
+                if str(combo.itemData(position)) == str(value):
+                    index = position
+                    break
+        combo.setCurrentIndex(index)
+
     def reload_values(self) -> None:
         super().reload_values()
+        editor = getattr(self, '_editors', {}).get(self.HEX6)
+        if editor is not None:
+            self._select_stored_hex6(editor)
+        self.sync_hex6_choices()
+        self.sync_faces_fold()
         # DP-580. The shared rule judged the clauses from the saved values
         # only; the hand-written-blocks choice is this page's, so it is
         # applied again over it.
@@ -514,6 +799,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
 
     def _on_field_changed(self, field_id: str, value) -> None:
         super()._on_field_changed(field_id, value)
+        if field_id.startswith(_FACE_PREFIXES):
+            self.sync_faces_fold(reposition=False)
         if field_id == self.SIZING_MODE:
             self._refresh_sizing_rows()
         if field_id in GRADING_FIELDS or field_id == self.SIZING_MODE \
@@ -521,6 +808,16 @@ class SnappyBaseGridPage(SnappyTaskPage):
             self._refresh_grading_report()
         if field_id in self.DERIVED_BOX_FIELDS:
             self.refresh_estimate()
+
+    def _select_stored_hex6(self, editor) -> None:
+        """Show the stored id by its name (the editor matched ints only)."""
+        stored = self._stored_hex6()
+        combo = editor.editor
+        blocked = combo.blockSignals(True)
+        try:
+            self._select_hex6(combo, stored)
+        finally:
+            combo.blockSignals(blocked)
 
     def refresh_derived(self) -> None:
         """Re-judge the sizing rows and the estimate against the edits.
@@ -535,6 +832,8 @@ class SnappyBaseGridPage(SnappyTaskPage):
             self._refresh_sizing_rows()
             self._refresh_grading_report()
         super().refresh_derived()
+        self.sync_hex6_choices()
+        self.sync_faces_fold()
 
     def refresh_estimate(self):
         """Plan 37 #7: say what the background will hold, edits included."""
@@ -584,6 +883,10 @@ class SnappyBaseGridPage(SnappyTaskPage):
                 inactive[field_id] = reason
                 self._pending.pop(field_id, None)
         self._inactive_fields = inactive
+        # The rows just judged decide whether the Grading card has anything
+        # to show (MF14 B12), so the card is judged after them, not before:
+        # back on the one block its rows apply again and the card returns.
+        self.sync_grading_box()
 
     def _stored_scale(self, editor):
         """The Scale this case saved, or ``None`` when it cannot be read."""
@@ -694,6 +997,9 @@ class SnappyBaseGridPage(SnappyTaskPage):
         super().refresh()
         self.sync_authoring()
         self.refresh_estimate()
+        card = getattr(self, 'sizing_card', None)
+        if card is not None:
+            card.refresh()
 
 
 class BlockPanel(ChildControlPanel):

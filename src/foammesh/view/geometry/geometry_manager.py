@@ -25,6 +25,14 @@ from foammesh.view.main_window.actor_manager import ActorManager, _union
 OPEN_SURFACE_SHAPE_VALUES = (Shape.PLANE.value, Shape.DISK.value, Shape.PLATE.value)
 
 
+def _innerRadius(volume):
+    """A cylinder's bore (LY13-D3); 0 for a solid or a row from before."""
+    try:
+        return float(volume.float('innerRadius') or 0)
+    except Exception:  # noqa: BLE001 - the key is optional
+        return 0.0
+
+
 def openSurfacePolyData(shape, volume):
     """What the viewport draws for a plane, a disk or a plate.
 
@@ -185,7 +193,7 @@ class GeometryManager(ActorManager):
             self._displayControl.removeOverlay(self._findingHighlight)
             self._findingHighlight = None
 
-    def clear(self):
+    def _clearGeometry(self):
         self.clearFindingHighlight()
         self._clearSeedPreview()
         self._clearExcludePreview()
@@ -229,7 +237,7 @@ class GeometryManager(ActorManager):
     def polyData(self, gId):
         return self._actorInfos[gId].dataSet()
 
-    def referenceSurface(self):
+    def referenceSurface(self, transform=None):
         """DP-713. The loaded geometry as one surface to measure a mesh by.
 
         Viewport audit 0925 F8: deviation could only be coloured from a
@@ -237,6 +245,11 @@ class GeometryManager(ActorManager):
         loaded right here. A surface marked as refinement only (CFD type
         ``none``) shapes the cells, not the boundary, so it is left out --
         unless it is all there is. ``None`` when there is no geometry.
+
+        Plan 39 VI5 (F4d). The surface comes back in the mesh's frame: moved
+        by ``transform`` (a 4x4 matrix) or, when none is given, by the case's
+        recorded Mesh > Scale / Translate / Rotate. The geometry used is the
+        prepared one -- a revision scaled at import already carries its scale.
         """
         from vtkmodules.vtkFiltersCore import vtkAppendPolyData
 
@@ -266,10 +279,110 @@ class GeometryManager(ActorManager):
         for data in kept:
             append.AddInputData(data)
         append.Update()
-        return append.GetOutput()
+        return self._inMeshFrame(append.GetOutput(), transform)
+
+    @staticmethod
+    def _inMeshFrame(surface, transform=None):
+        """``surface`` moved by the case's mesh transform (or ``transform``)."""
+        import numpy as np
+        from foammesh.core.mesh import transform_record
+
+        if transform is None:
+            try:
+                path = getattr(app.project, 'path', None)
+            except Exception:                                 # noqa: BLE001
+                path = None
+            transform = (transform_record.load(path) if path is not None
+                         else transform_record.identity())
+        matrix = np.asarray(transform, dtype=np.float64)
+        if transform_record.is_identity(matrix):
+            return surface
+
+        from vtkmodules.vtkCommonMath import vtkMatrix4x4
+        from vtkmodules.vtkCommonTransforms import vtkTransform
+        from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
+
+        vtkMatrix = vtkMatrix4x4()
+        for row in range(4):
+            for column in range(4):
+                vtkMatrix.SetElement(row, column, float(matrix[row, column]))
+        vtkTrans = vtkTransform()
+        vtkTrans.SetMatrix(vtkMatrix)
+        mover = vtkTransformPolyDataFilter()
+        mover.SetInputData(surface)
+        mover.SetTransform(vtkTrans)
+        mover.Update()
+        moved = mover.GetOutput()
+        if np.linalg.det(matrix[:3, :3]) < 0.0:
+            # A mirror turns the triangles inside out, and the sign of a
+            # distance follows their winding.
+            from vtkmodules.vtkFiltersCore import vtkReverseSense
+            reverse = vtkReverseSense()
+            reverse.SetInputData(moved)
+            reverse.ReverseCellsOn()
+            reverse.Update()
+            moved = reverse.GetOutput()
+        return moved
+
+    #: DP-2710. What the scene on screen was last built from; see
+    #: :meth:`_databaseKey`.
+    _loadedKey = None
+
+    @staticmethod
+    def _databaseKey():
+        """Which state of the case's database a load would read, or None.
+
+        The database bumps its revision on every commit and replaces its
+        content on every restore (undo, redo, a restored artifact), so the
+        pair says whether anything this scene is built from has moved. The
+        content is held, not its id: an id can be handed to the next copy.
+        None when the case cannot say (no session), and then every load runs.
+        """
+        try:
+            db = app.facadeClient.session().state.db
+            return (db, int(db._revision), db._content)
+        except Exception:                                     # noqa: BLE001
+            return None
+
+    def clear(self):
+        self._loadedKey = None
+        self._clearGeometry()
 
     def load(self):
-        self.clear()
+        """Rebuild the scene from the case, once.
+
+        DP-2710. Every actor added announced a parts change, and each
+        announcement rebuilt the viewport overlay's parts list -- O(parts)
+        each, O(parts squared) for the load. The display control is held
+        quiet for the length of the build and the parts, the selection and
+        the visible count are announced once at the end (the same hold the
+        mesh scene swap takes). An import also asked for the load twice, once
+        for the project refresh its commit scheduled and once itself; the
+        second finds the scene already built from this very state of the
+        database and has nothing to do.
+
+        The build itself is :meth:`_load`: it clears, adds an actor per
+        row, gives each surface its slot (`_assignPalettes`) and seeds the
+        regions.
+        """
+        key = self._databaseKey()
+        if key is not None and self._loadedKey is not None:
+            held = self._loadedKey
+            if held[0] is key[0] and held[1] == key[1] and held[2] is key[2]:
+                return
+        from foammesh.view.main_window.mesh_manager import _QuietParts
+        parts = _QuietParts(self._displayControl)
+        parts.quiet()
+        self._loadedKey = None
+        try:
+            self._load()
+        finally:
+            parts.release()
+            parts.announce()
+        self._loadedKey = key
+
+    def _load(self):
+        self._clearGeometry()
         self._visibility = True
 
         geometries = app.facadeClient.checkout().getElements('geometry')
@@ -1070,7 +1183,8 @@ class GeometryManager(ActorManager):
             if shape == Shape.HEX.value:
                 polyData = hexPolyData(volume.vector('point1'), volume.vector('point2'))
             elif shape == Shape.CYLINDER.value:
-                polyData = cylinderPolyData(volume.vector('point1'), volume.vector('point2'), volume.float('radius'))
+                polyData = cylinderPolyData(volume.vector('point1'), volume.vector('point2'), volume.float('radius'),
+                                           _innerRadius(volume))
             elif shape == Shape.SPHERE.value:
                 polyData = spherePolyData(volume.vector('point1'), volume.float('radius'))
             elif shape in OPEN_SURFACE_SHAPE_VALUES:

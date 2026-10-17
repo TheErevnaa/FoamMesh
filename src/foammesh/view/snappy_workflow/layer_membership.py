@@ -5,7 +5,7 @@ geometry``, the schema default) is written into ``addLayersControls/layers``
 only for the geometry rows that name it in ``geometry/*/layerGroup`` -- or, for
 the far side of an interface, ``slaveLayerGroup``: that binding is all
 ``CaseBuilder._layer_surfaces`` reads. The legacy Boundary Layers page set it
-through the "Select boundaries" list of ``BoundarySettingDialog``. The routed
+through the "Select boundaries" list of its (since removed) group dialog. The routed
 Layers page edits groups in the shared child editor, which had no such list,
 so a group added there on the default selector grew layers on nothing -- the
 same gap DP-490 closed for the castellation refinement groups.
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from foammesh.db.configurations_schema import CFDType
 from foammesh.view.geometry.display_name import readable_geometry_name
 from foammesh.view.geometry.merged_boundaries import MergedBoundaries
+from foammesh.view.snappy_workflow.membership_pick import ViewportPick
 
 from .refinement_membership import (
     _PLATES, _GeometryView, _key, _order, _patch_bindings, geometry_rows,
@@ -125,7 +126,7 @@ class LayerMembership(QWidget):
     row's ``patch_selector`` as the editor holds it.
     """
 
-    def __init__(self, client, selector=None, parent=None):
+    def __init__(self, client, selector=None, parent=None, service=None):
         super().__init__(parent)
         self._client = client
         self._selector = selector
@@ -152,6 +153,14 @@ class LayerMembership(QWidget):
             'The boundaries this group grows layers on. A group that covers '
             'no boundary is not written to the mesher.'))
         body.addWidget(self.list)
+        # Plan 43 LY13 D1 (C-154). The legacy dialog ticked boundaries by
+        # clicking them in the viewport; so does this list. A pick ticks the
+        # boundary's own side, never its `_slave` side.
+        self.pick = ViewportPick(
+            self.list, self._rowsPicked, self._pickable, service=service,
+            parent=self, name=self.tr('Pick in view'))
+        self.pick.toggle.setObjectName('layerGroupPickInView')
+        body.addWidget(self.pick.toggle)
         self._empty = QLabel(self.tr(
             'There is no boundary to grow layers on yet.'))
         self._empty.setWordWrap(True)
@@ -242,9 +251,37 @@ class LayerMembership(QWidget):
                 self._initial.add(entry)
         self._empty.setVisible(self.list.count() == 0)
         self.list.setVisible(self.list.count() > 0)
+        self.pick.setVisible(self.list.count() > 0)
+        self.pick.refresh()
         self._loadedFor = group
         self._loaded = True
         self.syncSelector()
+
+    def _listed(self) -> list:
+        return [str(self.list.item(index).data(Qt.ItemDataRole.UserRole))
+                for index in range(self.list.count())]
+
+    def _pickable(self) -> set:
+        out = set()
+        for entry in self._listed():
+            gId, slave = _split(entry)
+            if not slave:
+                out.update(self._merged.cover(gId))
+        return out
+
+    def _rowsPicked(self, stable_id) -> list:
+        stable_id = str(stable_id)
+        rows = []
+        for entry in self._listed():
+            gId, slave = _split(entry)
+            if not slave and stable_id in self._merged.cover(gId):
+                rows.append(entry)
+        return rows
+
+    def hideEvent(self, event):
+        self.pick.detach()
+        self.pick.toggle.setChecked(False)
+        super().hideEvent(event)
 
     def checked(self) -> set:
         return {str(self.list.item(index).data(Qt.ItemDataRole.UserRole))

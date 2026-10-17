@@ -386,8 +386,10 @@ class SnappyMeshingEngine:
     mixes_cad_and_surfaces = True
     #: DP-641. An NCC pair is written for OpenFOAM's non-conformal coupling.
     builds_non_conformal_interfaces = True
+    non_conformal_route = 'staged_ncc'
     #: Plan 36 RP11. A snappy region is the space a seed point picks out.
     regions_are_solids = False
+    publishes_native_mesh_file = False
 
     @property
     def descriptor(self) -> EngineDescriptor:
@@ -766,7 +768,10 @@ class SnappyMeshingEngine:
                 from foammesh.core.mesh.sizing import auto_target_cell_size
 
                 extent = hex_bounds or bounds
-                base = (auto_target_cell_size(extent)
+                from foammesh.core.sizing import diagonal_divisor
+
+                base = (auto_target_cell_size(
+                            extent, diagonal_divisor(value('mesh/sizePreset')))
                         if extent is not None else None)
                 if base is None:
                     return (None, 'unavailable',

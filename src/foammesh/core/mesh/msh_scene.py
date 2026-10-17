@@ -84,6 +84,8 @@ class MshScene:
     patches: dict = field(default_factory=dict)
     #: Volume group name -> cell count.
     volumes: dict = field(default_factory=dict)
+    #: Plan 41 GN23. The model's curves: ``{name: [polyline points (k, 3)]}``.
+    curves: dict = field(default_factory=dict)
 
     @property
     def patch_names(self) -> tuple:
@@ -223,6 +225,26 @@ def _poly_data(points, rows_by_type):
     return surface
 
 
+def _curves(document) -> dict:
+    """Plan 41 GN23. The line elements of a ``.msh`` as polylines, one per
+    physical group (an unnamed one is ``curve<tag>``)."""
+    from foammesh.core.mesh.native_mesh import chain_polylines
+
+    index = document.node_index
+    rows, tags = [], []
+    for element_type, physical, nodes in document.elements:
+        if element_type == 1:
+            rows.append([index[nodes[0]], index[nodes[1]]])
+            tags.append(int(physical))
+    if not rows:
+        return {}
+    points = np.asarray(document.points, dtype=np.float64)
+    found = chain_polylines(points, rows, tags)
+    names = document.physical_names
+    return {str(names.get((1, tag)) or f'curve{tag}'): chains
+            for tag, chains in found.items()}
+
+
 def read_msh_scene(path, *, surface_only: bool = False) -> MshScene:
     """Read a native Gmsh ``.msh`` into datasets the viewport can draw.
 
@@ -296,6 +318,7 @@ def read_msh_scene(path, *, surface_only: bool = False) -> MshScene:
     return MshScene(
         vtk_mesh={'': {'boundary': boundary, 'internalMesh': internal,
                        'zones': zones}},
+        curves=_curves(document),
         points=int(len(document.points)),
         cells=int(len(volume_tags)),
         patches=patches, volumes=volumes)
@@ -327,6 +350,7 @@ def _surface_scene(path, document, surfaces) -> MshScene:
     return MshScene(
         vtk_mesh={'': {'boundary': boundary, 'internalMesh': None,
                        'zones': {'cellZones': {}, 'faceZones': {}}}},
+        curves=_curves(document),
         points=int(len(document.points)),
         cells=sum(patches.values()),
         patches=patches, volumes={})

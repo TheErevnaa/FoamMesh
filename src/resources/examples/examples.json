@@ -1,0 +1,15 @@
+{
+  "provenance": "Every file here was authored by this project (catalogue source authored_cad in test_cases/_geometry); no third-party CAD.",
+  "examples": [
+    {"name": "pipe", "title": "Straight pipe", "file": "pipe.step",
+     "summary": "Internal flow through a round pipe, one solid, one fluid region inside the bore."},
+    {"name": "elbow", "title": "Pipe elbow", "file": "elbow.step",
+     "summary": "Internal flow through a bent pipe; curved walls to refine."},
+    {"name": "finned_heat_sink", "title": "Finned heat sink", "file": "finned_heat_sink.step",
+     "summary": "External flow around a finned block; many thin fins close together."},
+    {"name": "duct", "title": "Rectangular duct", "file": "duct.step",
+     "summary": "Internal flow through a straight rectangular duct."},
+    {"name": "expansion", "title": "Sudden expansion", "file": "expansion.step",
+     "summary": "Internal flow through a duct that widens in one step."}
+  ]
+}

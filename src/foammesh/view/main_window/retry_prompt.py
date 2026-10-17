@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from foammesh.core.jobs.retry import RETRY, RETRY_FEWER_CORES
 from foammesh.core.quantities import count_text
+from widgets import async_message_box as messages
 
 
 def retry_text(result, offer: dict) -> tuple[str, str]:
@@ -43,7 +44,7 @@ class RetryPrompt:
 
     async def __call__(self, operation, result, offer) -> str | None:
         reason, detail = retry_text(result, offer)
-        box = self.box = QMessageBox(QMessageBox.Icon.Warning,
+        box = self.box = messages.box(QMessageBox.Icon.Warning,
                                      'Run failed', reason, parent=self._parent)
         box.setObjectName('retryPrompt')
         box.setInformativeText(detail)

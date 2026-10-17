@@ -17,24 +17,17 @@ from foammesh.core.geometry.interface_contact import (
     contacting_face_pairs, face_contact, group_manifest_of)
 from foammesh.view.facade_client import query
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
+from widgets import async_message_box as messages
 
 _MASTER, _SLAVE = 'master_scope_token', 'slave_scope_token'
 
 
-def _engineBuildsNcc() -> bool:
-    """Whether the case's meshing engine builds a non-conformal pair (DP-641)."""
-    try:
-        from foammesh.app import app
-        from foammesh.core.engine.registry import (
-            ENGINE_REGISTRY, configured_engine_id)
-        engine = ENGINE_REGISTRY.get(configured_engine_id(app.db))
-    except Exception:                          # noqa: BLE001 - unknown case
-        return True
-    return bool(getattr(engine, 'builds_non_conformal_interfaces', True))
-
-
 class InterfacePairPanel(ChildControlPanel):
     """``geometry.interface_pairs``, proposing and checking the two faces."""
+
+    #: Plan 44 FIT (DP-2667/2668). Most cases have no pair; one empty row is
+    #: the empty state, and the second took Geometry past the 1280x800 sheet.
+    MIN_VISIBLE_ROWS = 1
 
     def __init__(self, facade_client, collection_id: str, title: str,
                  *args, **kwargs):
@@ -88,7 +81,6 @@ class InterfacePairPanel(ChildControlPanel):
         # asks for the dialog; the proposal goes in between, so it is what
         # the form opens on and it is not written over.
         dialog = super().editor_dialog()
-        self._offerCouplings()
         if self._proposing:
             self._proposing = False
             pair = self.proposedPair()
@@ -96,22 +88,6 @@ class InterfacePairPanel(ChildControlPanel):
                 self._editors[_MASTER].set_value(pair[0])
                 self._editors[_SLAVE].set_value(pair[1])
         return dialog
-
-    def _offerCouplings(self) -> None:
-        """DP-641. Gmsh builds no NCC coupling, so it is not offered there."""
-        editor = self._editors.get('coupling')
-        combo = getattr(editor, 'editor', None)
-        if combo is None or not hasattr(combo, 'findData'):
-            return
-        index = combo.findData('non_conformal')
-        item = combo.model().item(index) if index >= 0 else None
-        if item is None:
-            return
-        builds = _engineBuildsNcc()
-        item.setEnabled(builds)
-        item.setToolTip('' if builds else self.tr(
-            'Gmsh builds no non-conformal (NCC) coupling; choose conformal '
-            'or cyclic, or mesh this case with snappyHexMesh.'))
 
     # -- OK checks that a coincident pair's faces touch -------------------- #
 
@@ -142,7 +118,7 @@ class InterfacePairPanel(ChildControlPanel):
         if not problem:
             return values
         text = self.tr(
-            'The master and slave faces of this coincident pair do not touch: '
+            'The two faces of this coincident pair do not touch: '
             '%s. The pair cannot apply, and the mesher will report it as not '
             'applied. Save it anyway?') % problem
         proposal = self.proposedPair()
@@ -152,7 +128,7 @@ class InterfacePairPanel(ChildControlPanel):
                 'The prepared geometry has touching faces %s and %s.') % (
                     names.get(proposal[0], proposal[0]),
                     names.get(proposal[1], proposal[1]))
-        answer = QMessageBox.question(
+        answer = messages.question(
             self, self.tr('Faces do not touch'), text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)

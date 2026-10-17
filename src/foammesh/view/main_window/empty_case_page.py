@@ -1,19 +1,31 @@
 """Designed main-window state shown before a case is opened.
 
-The page is guidance only. Case lifecycle lives in the File menu, which already
-offers New case, Open Project and Open recent with their shortcuts; duplicating
-two of those three as buttons here gave a second, narrower entry point to the
-same actions, so the page points at the menu instead of restating it.
+The welcome panel (Plan 40 UXA8, #27). It says where the File menu keeps case
+lifecycle and also offers the four ways in as buttons -- New case, Open case,
+Open recent and Open example -- because a first-time user looks at the window,
+not at a menu. The buttons are the same actions the menu runs: this page only
+raises a signal and the window does the work, so there is still one backend
+for each.
 """
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QLabel, QMenu, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
 from foammesh.view.theming.metrics import apply_prose_measure
 
 
 class EmptyCasePage(QWidget):
+    newRequested = Signal()
+    openRequested = Signal()
+    recentSelected = Signal(str)
+    exampleSelected = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._recentsProvider = lambda: []
+        self._examplesProvider = None
         # DP-216. The actions are held so the sentence can be written
         # again whenever one of them changes. The window wires this page
         # fifty lines before it installs its shortcuts, so a key read at
@@ -55,7 +67,89 @@ class EmptyCasePage(QWidget):
 
         layout.addWidget(title)
         layout.addWidget(self._message)
+        layout.addSpacing(12)
+        self._buildButtons(layout)
         layout.addStretch(1)
+
+    def _buildButtons(self, layout):
+        left = Qt.AlignmentFlag.AlignLeft
+
+        def push(name, text, tip, signal):
+            button = QPushButton(text, self)
+            button.setObjectName(name)
+            button.setToolTip(tip)
+            button.clicked.connect(lambda _checked=False: signal.emit())
+            layout.addWidget(button, 0, left)
+            return button
+
+        def menu(name, text, tip, fill):
+            button = QToolButton(self)
+            button.setObjectName(name)
+            button.setText(text)
+            button.setToolTip(tip)
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            popup = QMenu(button)
+            popup.setToolTipsVisible(True)
+            popup.aboutToShow.connect(lambda: fill(popup))
+            button.setMenu(popup)
+            layout.addWidget(button, 0, left)
+            return button
+
+        self._newButton = push(
+            'welcomeNewButton', self.tr('New case…'),
+            self.tr('Make a FoamMesh case in a folder you choose'),
+            self.newRequested)
+        self._newButton.setProperty('foammeshRole', 'primary')
+        self._openButton = push(
+            'welcomeOpenButton', self.tr('Open case…'),
+            self.tr('Open an existing FoamMesh or OpenFOAM case'),
+            self.openRequested)
+        self._recentButton = menu(
+            'welcomeRecentButton', self.tr('Open recent'),
+            self.tr('Reopen a case you worked on lately'),
+            self._fillRecents)
+        self._exampleButton = menu(
+            'welcomeExampleButton', self.tr('Open example'),
+            self.tr('Start from a model that ships with FoamMesh'),
+            self._fillExamples)
+
+    def setRecentsProvider(self, provider):
+        """`provider()` answers the recent cases, newest first, as records
+        with a `path` (and optionally a `display_name`) or as bare paths."""
+        self._recentsProvider = provider
+
+    def setExamplesProvider(self, provider):
+        """`provider()` answers objects with `name`, `title` and `summary`."""
+        self._examplesProvider = provider
+
+    def _fillRecents(self, popup):
+        popup.clear()
+        records = [r if isinstance(r, dict) else {'path': str(r)}
+                   for r in (self._recentsProvider() or [])]
+        if not records:
+            popup.addAction(self.tr('No recent cases')).setEnabled(False)
+            return
+        for record in records:
+            path = str(record['path'])
+            action = popup.addAction(
+                str(record.get('display_name') or Path(path).name or path))
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda _checked=False, p=path: self.recentSelected.emit(p))
+
+    def _fillExamples(self, popup):
+        popup.clear()
+        provider = self._examplesProvider
+        if provider is None:
+            from foammesh.core.examples import list_examples as provider
+        for example in provider():
+            action = popup.addAction(example.title)
+            action.setToolTip(example.summary)
+            action.triggered.connect(
+                lambda _checked=False, n=example.name:
+                self.exampleSelected.emit(n))
 
     def setGuidance(self, newAction=None, openAction=None,
                     importAction=None):

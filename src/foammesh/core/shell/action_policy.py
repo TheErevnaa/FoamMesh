@@ -53,6 +53,8 @@ class ActionId(str, Enum):
     VIEW_ROLL = 'view_roll'
     VIEW_ROTATION_CENTER = 'view_rotation_center'
     PREFERENCES = 'preferences'
+    SETTINGS_MESH_QUALITY = 'settings_mesh_quality'
+    START_WINDOW = 'start_window'
     TERMINAL_HERE = 'terminal_here'
     TUTORIALS = 'tutorials'
     LICENSE = 'license'
@@ -94,6 +96,8 @@ ACTION_OBJECT_NAMES: Mapping[ActionId, str] = {
     ActionId.VIEW_ROLL: 'actionViewRoll',
     ActionId.VIEW_ROTATION_CENTER: 'actionViewRotationCenter',
     ActionId.PREFERENCES: 'actionPreferences',
+    ActionId.SETTINGS_MESH_QUALITY: 'actionSettingsMeshQuality',
+    ActionId.START_WINDOW: 'actionStartWindow',
     ActionId.TERMINAL_HERE: 'actionTerminalHere',
     ActionId.TUTORIALS: 'actionTutorials',
     ActionId.LICENSE: 'actionLicense',
@@ -157,7 +161,8 @@ class ActionPolicy:
         # Close/Exit stay reachable so their lifecycle handler can offer
         # Cancel operation / Keep running / Return instead of trapping users.
         result[ActionId.EXIT] = ActionPresentation(True)
-        for action in (ActionId.PREFERENCES, ActionId.TUTORIALS,
+        for action in (ActionId.PREFERENCES, ActionId.START_WINDOW,
+                       ActionId.TUTORIALS,
                        ActionId.LICENSE, ActionId.ABOUT,
                        ActionId.RUN_DETAILS):
             result[action] = ActionPresentation(True)
@@ -170,7 +175,7 @@ class ActionPolicy:
         for action in (
                 ActionId.SAVE_AS, ActionId.SAVE_PROJECT_AS, ActionId.LOAD_GEOMETRY,
                 ActionId.LOAD_MESH, ActionId.CLOSE_PROJECT,
-                ActionId.MESH_QUALITY):
+                ActionId.MESH_QUALITY, ActionId.SETTINGS_MESH_QUALITY):
             result[action] = self._capability_action(snapshot, action, project_idle, project_reason)
         result[ActionId.CLOSE_PROJECT] = self._capability_action(
             snapshot, ActionId.CLOSE_PROJECT, True)

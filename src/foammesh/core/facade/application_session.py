@@ -9,6 +9,18 @@ from pathlib import Path
 from .errors import RevisionConflictError
 
 
+def _reach_app_settings(changed: dict) -> None:
+    """SG17 (defect 9): a patched setting the app knows is stored in the
+    app's own settings file, so the GUI, the CLI and a restart all read it.
+    Keys the app has no setting for stay in the session only."""
+    from foammesh.settings.app_settings import SettingKey, appSettings
+    known = {key.value: key for key in SettingKey}
+    for name, value in changed.items():
+        key = known.get(name)
+        if key is not None:
+            appSettings._set(key, value)
+
+
 @dataclass
 class ApplicationSession:
     values: dict = field(default_factory=dict)
@@ -32,6 +44,7 @@ class ApplicationSession:
         changed = {key: value for key, value in values.items() if self.values.get(key) != value}
         if changed:
             self.values.update(changed)
+            _reach_app_settings(changed)
             self.settings_revision += 1
             self._save()
         return {'changed_settings': sorted(changed), **self.snapshot()}

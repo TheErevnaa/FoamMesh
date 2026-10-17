@@ -7,8 +7,9 @@ page here reads its current value from ``AppSettings`` and writes it back
 through the same setter the rest of the application reads from, so nothing
 new is stored and nothing is read from a second place.
 
-Scale is not offered: ``AppSettings.getScale`` has no reader, so a control
-for it would change nothing.
+Appearance (Plan 40 UXE3): UI scale and the HiDPI rounding policy are read
+before the application is built, so they apply at the next start; density and
+font apply at once.
 """
 from __future__ import annotations
 
@@ -16,14 +17,18 @@ import threading
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QLabel,
     QLineEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from foammesh.view.widget_factory import make
+from widgets import async_message_box as messages
 from foammesh.core.geometry.diagnostics.budget import BudgetPolicy
 from foammesh.core.jobs import stage_snapshots
 from foammesh.core.naming import humanise_option
 from foammesh.core.quality.qualification import QualificationMode
+from foammesh.view.theming import appearance
 from foammesh.view.theming.metrics import (
     CompactDoubleSpinBox, CompactSpinBox, unit_cell,
 )
@@ -38,6 +43,13 @@ _BUDGET_NOTES = {
     BudgetPolicy.ABORT: 'A surface check that runs past the limit stops and is reported as not evaluated.',
     BudgetPolicy.WARN_ONLY: 'A surface check that runs past the limit is reported, then allowed to finish.',
     BudgetPolicy.NEVER_LIMIT: 'Surface checks run for as long as they take.',
+}
+_HIDPI_LABELS = {
+    'pass_through': 'Exact (default)',
+    'round': 'Round to the nearest whole number',
+    'round_prefer_floor': 'Round, halves down',
+    'ceil': 'Always round up',
+    'floor': 'Always round down',
 }
 _MODE_NOTES = {
     QualificationMode.REPORT_ONLY: 'Geometry checks are run and reported, and block nothing.',
@@ -58,6 +70,34 @@ def _note(text: str = '') -> QLabel:
     return label
 
 
+class _PreferenceButtons(QWidget):
+    """The dialog's button row: Cancel, Apply, OK, flush to the right."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('preferencesButtons')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.cancel = QPushButton(self.tr('Cancel'), self)
+        self.apply = QPushButton(self.tr('Apply'), self)
+        self.ok = QPushButton(self.tr('OK'), self)
+        self.ok.setDefault(True)
+        self.ok.setProperty('foammeshRole', 'primary')
+        for button in (self.cancel, self.apply, self.ok):
+            row.addWidget(button)
+
+    def buttons(self):
+        return [self.cancel, self.apply, self.ok]
+
+    def button(self, which):
+        """The button a ``QDialogButtonBox.StandardButton`` names."""
+        names = {QDialogButtonBox.StandardButton.Ok: self.ok,
+                 QDialogButtonBox.StandardButton.Cancel: self.cancel,
+                 QDialogButtonBox.StandardButton.Apply: self.apply}
+        return names.get(which)
+
+
 class PreferencesDialog(QDialog):
     """One page per preference; OK and Apply write, Cancel leaves them."""
 
@@ -75,6 +115,8 @@ class PreferencesDialog(QDialog):
         self._findRuntime = findRuntime
         self.runtimeFound.connect(self._showFoundRuntime)
         self._runtime = settings.getOpenFoamRuntime()
+        #: Plan 44 MF26. The page forms, laid on the 78 px label column.
+        self._forms: list[QFormLayout] = []
 
         self.pages = QTabWidget(self)
         self.pages.setObjectName('preferencesPages')
@@ -91,12 +133,13 @@ class PreferencesDialog(QDialog):
         self.problem.setProperty('foammeshStatus', 'error')
         self.problem.hide()
 
-        self.buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-            | QDialogButtonBox.StandardButton.Apply, self)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        self.buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply)
+        # D1 (DP-2662). Secondary then primary, on the right: Cancel, Apply,
+        # OK. A button box lays Apply out ahead of Cancel in the sheet's order,
+        # so the row is built here, in the order it is read.
+        self.buttons = _PreferenceButtons(self)
+        self.buttons.cancel.clicked.connect(self.reject)
+        self.buttons.apply.clicked.connect(self.apply)
+        self.buttons.ok.clicked.connect(self.accept)
 
         # Every page's tab stays in sight; none hides behind scroll arrows.
         self.setMinimumWidth(self.pages.tabBar().sizeHint().width() + 48)
@@ -104,11 +147,21 @@ class PreferencesDialog(QDialog):
         layout.addWidget(self.pages)
         layout.addWidget(self.problem)
         layout.addWidget(self.buttons)
+        # Plan 44 MF26. The sheet look: a caps title, the 78 px label column
+        # on every page and the buttons on the right, secondary then OK.
+        self.sheetTitle = messages.makeSheet(self, self.windowTitle())
+        for form in self._forms:
+            messages.labelGrid(form)
+
+    def _form(self, page) -> QFormLayout:
+        form = QFormLayout(page)
+        self._forms.append(form)
+        return form
 
     # Pages ----------------------------------------------------------------
     def _appearancePage(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        form = self._form(page)
         self.themeCombo = QComboBox(page)
         self.themeCombo.setObjectName('preferencesTheme')
         for mode in (ThemeMode.SYSTEM, ThemeMode.LIGHT, ThemeMode.DARK):
@@ -117,11 +170,112 @@ class PreferencesDialog(QDialog):
             self.themeCombo.findData(ThemeMode(self._themes.mode).value))
         form.addRow(self.tr('Theme'), self.themeCombo)
         form.addRow(_note(self.tr('System follows the light or dark setting of the desktop.')))
+
+        stored = appearance.Appearance.from_settings(self._settings)
+        self.scaleCombo = QComboBox(page)
+        self.scaleCombo.setObjectName('preferencesScale')
+        steps = list(appearance.SCALE_STEPS)
+        if stored.scale not in steps:
+            steps = sorted(steps + [stored.scale])
+        for step in steps:
+            self.scaleCombo.addItem(f'{appearance.scale_percent(step)} %', step)
+        self.scaleCombo.setCurrentIndex(self.scaleCombo.findData(stored.scale))
+        form.addRow(self.tr('Interface scale'), self.scaleCombo)
+
+        self.hidpiCombo = QComboBox(page)
+        self.hidpiCombo.setObjectName('preferencesHiDpiPolicy')
+        for policy in appearance.HIDPI_POLICIES:
+            self.hidpiCombo.addItem(self.tr(_HIDPI_LABELS[policy]), policy)
+        self.hidpiCombo.setCurrentIndex(self.hidpiCombo.findData(stored.hidpi))
+        self.hidpiCombo.setToolTip(self.tr(
+            'How a display scale such as 125 % or 150 % is turned into whole '
+            'pixels. Leave it unless text looks blurred or uneven.'))
+        form.addRow(self.tr('Display scaling'), self.hidpiCombo)
+        self._restartNote = _note(self.tr(
+            'The scale and display scaling apply the next time FoamMesh starts.'))
+        form.addRow(self._restartNote)
+
+        self.densityCombo = QComboBox(page)
+        self.densityCombo.setObjectName('preferencesDensity')
+        self.densityCombo.addItem(self.tr('Comfortable'), appearance.DENSITY_COMFORTABLE)
+        self.densityCombo.addItem(self.tr('Compact'), appearance.DENSITY_COMPACT)
+        self.densityCombo.setCurrentIndex(self.densityCombo.findData(stored.density))
+        form.addRow(self.tr('Density'), self.densityCombo)
+
+        self.fontCombo = QComboBox(page)
+        self.fontCombo.setObjectName('preferencesFont')
+        self.fontCombo.addItem(self.tr('Pretendard'), appearance.FONT_PRETENDARD)
+        self.fontCombo.addItem(self.tr('System font'), appearance.FONT_SYSTEM)
+        self.fontCombo.setCurrentIndex(self.fontCombo.findData(stored.font))
+        form.addRow(self.tr('Font'), self.fontCombo)
+
+        # Plan 43 LY15. The font and size of the labels on the model (legend,
+        # worst values, cell tag, caption); part of the colour standard and
+        # separate from the UI font above.
+        from foammesh.rendering import label_style
+        labels = label_style.load()
+        self.labelFontCombo = make(QComboBox, page)
+        self.labelFontCombo.setObjectName('preferencesLabelFont')
+        for key, text in label_style.FONTS.items():
+            self.labelFontCombo.addItem(text, key)
+        self.labelFontCombo.setCurrentIndex(self.labelFontCombo.findData(labels.font))
+        self.labelFontCombo.setToolTip(self.tr(
+            'The font of the legend, the numbers on the model, the cell tag '
+            'and the caption, and of the pictures saved from them'))
+        form.addRow(self.tr('Labels font'), self.labelFontCombo)
+        self.labelSizeCombo = make(QComboBox, page)
+        self.labelSizeCombo.setObjectName('preferencesLabelSize')
+        for key, (text, _factor) in label_style.SIZES.items():
+            self.labelSizeCombo.addItem(self.tr(text), key)
+        self.labelSizeCombo.setCurrentIndex(self.labelSizeCombo.findData(labels.size))
+        form.addRow(self.tr('Labels size'), self.labelSizeCombo)
+
+        # GPUPREF. The viewport's graphics card; applied at the next start.
+        from foammesh.rendering import gpu_preference
+        self.useDedicatedGpu = QCheckBox(
+            self.tr('Use the dedicated (high-performance) GPU when available'),
+            page)
+        self.useDedicatedGpu.setObjectName('preferencesUseDedicatedGpu')
+        self.useDedicatedGpu.setChecked(bool(self._settings.getUseDedicatedGpu()))
+        self.useDedicatedGpu.setToolTip(self.tr(
+            'On a PC with a dedicated graphics card (NVIDIA, AMD, Intel Arc) '
+            'and integrated graphics, the viewport is drawn by the dedicated '
+            'card. If that does not work FoamMesh uses the integrated '
+            'graphics. A per-app choice you made in Windows is never '
+            'overwritten.'))
+        form.addRow(self.useDedicatedGpu)
+        self.gpuNote = _note()
+        self.gpuNote.setObjectName('preferencesGpuNote')
+        try:
+            self.gpuNote.setText(' '.join(gpu_preference.diagnostic_lines(
+                self._settings)))
+        except Exception:                               # noqa: BLE001
+            pass
+        form.addRow(self.gpuNote)
+        self.useDedicatedGpu.toggled.connect(self._gpuChanged)
+
+        # Plan 43 LY12. The colour standard every continuous field is painted
+        # with. A draft here; saved with OK/Apply.
+        self.colourScale = None
+        if hasattr(self._settings, 'getColourStandard'):
+            from foammesh.view.display_control.colour_scale_panel import (
+                ColourScalePanel)
+            # Plan 44 MF26: a caps section title, not a grey note.
+            self.colourScaleTitle = messages.sectionTitle(self.tr('Colour scale'), page)
+            form.addRow(self.colourScaleTitle)
+            self.colourScale = ColourScalePanel(
+                page, settings=self._settings, live=False)
+            form.addRow(self.colourScale)
         return page
+
+    def _gpuChanged(self, checked) -> None:
+        if bool(checked) != bool(self._settings.getUseDedicatedGpu()):
+            self.gpuNote.setText(self.tr(
+                'The graphics choice takes effect after restart.'))
 
     def _runtimePage(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        form = self._form(page)
         runtime = self._runtime
         self.distroEdit = QLineEdit(str(runtime['wsl_distro']), page)
         self.distroEdit.setObjectName('preferencesWslDistro')
@@ -236,7 +390,7 @@ class PreferencesDialog(QDialog):
 
     def _diagnosticsPage(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        form = self._form(page)
         policy, seconds = self._settings.getDiagnosticBudget()
         self.budgetPolicy = QComboBox(page)
         self.budgetPolicy.setObjectName('preferencesBudgetPolicy')
@@ -258,7 +412,7 @@ class PreferencesDialog(QDialog):
 
     def _qualificationPage(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        form = self._form(page)
         self.qualificationMode = QComboBox(page)
         self.qualificationMode.setObjectName('preferencesQualificationMode')
         for mode in QualificationMode:
@@ -351,6 +505,7 @@ class PreferencesDialog(QDialog):
             self.pages.setCurrentIndex(1)
             return False
 
+        self._applyAppearance()
         theme = self.themeCombo.currentData()
         if theme != ThemeMode(self._themes.mode).value:
             self._themes.set_mode(theme)
@@ -370,6 +525,63 @@ class PreferencesDialog(QDialog):
         self._settings.setQualificationMode(
             QualificationMode(self.qualificationMode.currentData()))
         return True
+
+    def _applyAppearance(self) -> None:
+        """Store the four choices; density and font take effect at once."""
+        stored = appearance.Appearance.from_settings(self._settings)
+        chosen = appearance.Appearance(
+            float(self.scaleCombo.currentData()), self.densityCombo.currentData(),
+            self.fontCombo.currentData(), self.hidpiCombo.currentData())
+        # Only a changed choice is written, so a plain OK rewrites nothing.
+        if chosen.scale != stored.scale:
+            self._settings.setScale(chosen.scale)
+        if chosen.hidpi != stored.hidpi:
+            self._settings.setHiDpiPolicy(chosen.hidpi)
+        if chosen.density != stored.density:
+            self._settings.setDensity(chosen.density)
+        if chosen.font != stored.font:
+            self._settings.setUiFont(chosen.font)
+        self._applyLabelStyle()
+        wanted = self.useDedicatedGpu.isChecked()
+        if wanted != bool(self._settings.getUseDedicatedGpu()):
+            from foammesh.rendering import gpu_preference
+            gpu_preference.set_enabled(self._settings, wanted)
+        self._applyColourScale()
+        before = appearance.current()
+        after = appearance.set_live(self.densityCombo.currentData(),
+                                    self.fontCombo.currentData())
+        if after != before and hasattr(self._themes, 'apply'):
+            self._themes.apply()
+
+    def _applyLabelStyle(self) -> None:
+        """Store the labels font and size, and put them on the open viewport."""
+        from foammesh.rendering import label_style
+        chosen = label_style.normalise(self.labelFontCombo.currentData(),
+                                       self.labelSizeCombo.currentData())
+        if chosen == label_style.load():
+            return
+        label_style.save(chosen)
+        try:
+            from foammesh.app import app
+            view = app.window._ui.renderingView
+            view.setLabelStyle(chosen)
+        except Exception:                                     # noqa: BLE001
+            pass                                  # no window: stored for the next start
+
+    def _applyColourScale(self) -> None:
+        """Save the colour standard if the draft differs from the stored one."""
+        if self.colourScale is None:
+            return
+        from foammesh.support import colour_standard
+        draft = self.colourScale.value()
+        if draft == colour_standard.saved(self._settings):
+            return
+        if draft == colour_standard.APP_STANDARD:
+            self._settings.clearColourStandard()
+        else:
+            self._settings.updateColourStandard(draft.to_record())
+        # Every view opens with the standard that is now stored.
+        colour_standard.go_back_to_standard(self._settings)
 
     def accept(self):
         if self.apply():

@@ -23,7 +23,12 @@ from foammesh.support.simple_db.simple_schema import (
 from foammesh.db.configurations_schema import schema as CONFIGURATIONS_SCHEMA
 from foammesh.core.naming import humanise_option
 
-from .field_metadata import DEFAULT_INVALIDATION, FIELD_OVERRIDES, GROUP_METADATA
+from .field_help import (
+    FIELD_HELP, diagram_for, keyword_for, manual_url, two_lines,
+)
+from .field_metadata import (
+    DEFAULT_INVALIDATION, FIELD_OVERRIDES, GROUP_METADATA, MASTER_CLAUSES,
+)
 
 
 class FieldType(str, Enum):
@@ -37,6 +42,8 @@ class FieldType(str, Enum):
 # Storage-path prefixes (longest match wins) -> semantic area namespace.
 AREA_BY_PREFIX = {
     'mesh': 'mesh',
+    # Plan 41 GN25b. The automatic size field's inputs.
+    'sizeField': 'sizing.field',
     'gmsh/healing': 'gmsh.describe_geometry',
     'gmsh/globalSizing': 'gmsh.global_sizing',
     'gmsh/algorithms': 'gmsh.global_sizing',
@@ -164,6 +171,30 @@ class FieldDescriptor:
     #: engine not named here gets ``invalidates``.
     invalidates_by_engine: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
+    @property
+    def explanation(self) -> str:
+        """The two-line explanation the help pane shows (Plan 40 UXD5)."""
+        return two_lines(self.documentation)
+
+    @property
+    def keyword(self) -> str:
+        """The OpenFOAM or Gmsh keyword the field is written as."""
+        return keyword_for(self.id, self.storage_path)
+
+    @property
+    def manual_url(self) -> str:
+        return manual_url(self.id, self.storage_path)
+
+    @property
+    def diagram(self) -> str:
+        return diagram_for(self.id)
+
+    @property
+    def tier(self) -> str:
+        """Essential, Common or Expert (Plan 40 UXD4)."""
+        from .field_tiers import tier_of
+        return tier_of(self.id)
+
     def invalidates_for(self, engine_id=None) -> tuple[str, ...]:
         """What an edit stales on ``engine_id``'s route (Plan 37 UF15)."""
         engine = str(engine_id or '').strip().lower()
@@ -261,10 +292,14 @@ def _build_descriptor(path: str, primitive: PrimitiveType) -> FieldDescriptor:
         (str(engine), tuple(fingerprints))
         for engine, fingerprints in sorted(dict(by_engine or {}).items()))
     ui_location = override.get('ui_location', group_meta.get('ui_location', ''))
-    documentation = override.get('documentation', '')
+    documentation = override.get('documentation') or FIELD_HELP.get(
+        field_id, '')
     unit = override.get('unit', group_meta.get('units', {}).get(field_id.rsplit('.', 1)[-1]))
     applies_when = tuple(override.get(
         'applies_when', group_meta.get('applies_when', _applicability(path))))
+    # Plan 40 UXB6. A dependant also waits on its master checkbox.
+    applies_when += tuple(clause for clause in MASTER_CLAUSES.get(field_id, ())
+                          if clause not in applies_when)
     read_only = override.get('read_only', path in STANDALONE_SEMANTIC)
 
     return FieldDescriptor(

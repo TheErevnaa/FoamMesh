@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -398,6 +399,38 @@ class JobManager:
         if result.cwd:
             self._persist_result(Path(result.cwd), result, revision=True)
 
+    def session_event(self, event: str, **payload) -> None:
+        """Publish a resident-session event (Plan 41 GN1) on the event bus."""
+        self._publish(event, **payload)
+
+    def record_session_operation(self, *, name: str, state: str,
+                                 seconds: float = 0.0, error: str | None = None,
+                                 cwd=None, generation: int = 0) -> JobResult:
+        """Record one resident-session operation as a finished job (GN1).
+
+        The session is one long process, so the operations in it are the
+        jobs: each one gets a result, a retained entry and the durable
+        ``jobs.jsonl`` line a batch run gets, and an event on the bus.
+        """
+        status = {'finished': JobStatus.DONE,
+                  'crashed': JobStatus.FAILED}.get(state, JobStatus.FAILED)
+        now = _now()
+        result = JobResult(
+            job_id=f"session-{generation}-{uuid4().hex[:10]}", name=name,
+            status=status, returncode=0 if status is JobStatus.DONE else 1,
+            output='', log_path=None, error=error,
+            error_category=(None if status is JobStatus.DONE
+                            else JobErrorCategory.PROCESS),
+            started_at=now, finished_at=now,
+            cwd=str(cwd) if cwd else None, mutation=False,
+            transport='session')
+        self._retain(result)
+        if result.cwd:
+            self._persist_result(Path(result.cwd), result)
+        self._publish('gmsh.session.operation', job_id=result.job_id,
+                      name=name, status=status.value, seconds=seconds)
+        return result
+
     def _retain(self, result: JobResult) -> None:
         """Keep a finished result with a bounded tail of its output (CR4).
 
@@ -459,6 +492,24 @@ class JobManager:
         def remove():
             self._read_barriers.discard(barrier)
         return remove
+
+    @contextlib.asynccontextmanager
+    async def quiesce_readers(self):
+        """No viewport read in flight, and none starts, while the body runs.
+
+        Plan 39 VI14b (DP-1441). The pipeline moves ``constant/polyMesh``
+        aside before a gather, outside any job, so the barrier a job waits on
+        at its start came too late: the viewer's reload of the stage before
+        was still inside the mesh files, and Windows refused the rename
+        ([WinError 5]). The body here is short and synchronous; the reads
+        already running are awaited first.
+        """
+        self._starting_mutations += 1
+        try:
+            await self._wait_for_readers()
+            yield
+        finally:
+            self._starting_mutations -= 1
 
     async def _wait_for_readers(self):
         for barrier in tuple(self._read_barriers):

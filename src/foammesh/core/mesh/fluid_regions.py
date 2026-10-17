@@ -705,6 +705,31 @@ def same_space_conflicts(field, seeds) -> list[dict]:
     return conflicts
 
 
+def seed_clashes(field, seeds) -> list[dict]:
+    """The one verdict on a Fluid and a Solid seed sharing a space (DP-2638).
+
+    The `same_space_conflicts` groups of *field* that mix types. The Domain
+    & regions page warns with these and every snappy launch refuses them --
+    "Run to end" (``workflow.run_pipeline``) included -- so what the page
+    says and what the launch does cannot disagree. *seeds* is
+    ``[(label, type, point), ...]``.
+    """
+    return [group for group in same_space_conflicts(field, seeds)
+            if group['clash']]
+
+
+def clash_message(group) -> str:
+    """The one sentence a `seed_clashes` group is said and refused in."""
+    named = ' and '.join(
+        f'{label} ({kind})'
+        for label, kind in zip(group['regions'], group['types']))
+    where = ('the space around the geometry' if group.get('outside')
+             else 'one enclosed space')
+    return (f'{named} are seeded in {where}; snappy keeps a space as one '
+            'region, so a fluid and a solid cannot share it. Move one seed '
+            'into its own space.')
+
+
 def recheck_h(field, *, max_voxels=None) -> float | None:
     """The voxel size *field* is checked again at: h/2 within the voxel cap.
 

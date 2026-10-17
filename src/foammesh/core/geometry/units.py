@@ -83,27 +83,42 @@ class UnitSuggestion:
     message: str
 
 
+def _length_text(metres: float) -> str:
+    """A length with its unit, to four significant figures (Plan 40 UXB1, #33)."""
+    from foammesh.core.quantities import unit_for
+    scale, suffix = unit_for(metres)
+    return f'{metres * scale:.4g} {suffix}'
+
+
 def suggest_unit(raw_diagonal: float) -> UnitSuggestion:
     """Guess the likely import unit from the raw bounding-box diagonal.
 
     Heuristic for typical engineering parts (their real size is ~0.01-10 m):
     interpret the raw number so the part lands in that band. e.g. a diagonal of
     500 is most likely millimetres (0.5 m); 0.5 is likely metres.
+
+    The message names the diagonal the way it would read once imported with
+    the suggested unit, with its unit and four significant figures, so the
+    number is never a bare ``0.435697``.
     """
     d = abs(raw_diagonal)
     if d == 0:
         return UnitSuggestion('m', False, 'Degenerate geometry (zero size).')
     if 0.01 <= d <= 100:
         return UnitSuggestion('m', True,
-                              f'Diagonal {d:g} looks like metres (SI).')
+                              f'Diagonal {_length_text(d)} read as metres: '
+                              f'a plausible size.')
     if 10 <= d <= 100_000:
         return UnitSuggestion('mm', d > 100,
-                              f'Diagonal {d:g} looks like millimetres (~{d/1000:g} m).')
+                              f'Diagonal {_length_text(d / 1000)} read as '
+                              f'millimetres: a plausible size.')
     if d < 0.01:
         return UnitSuggestion('mm', False,
-                              f'Diagonal {d:g} is very small for metres — check units.')
+                              f'Diagonal {_length_text(d)} read as metres is '
+                              f'very small: check the unit.')
     return UnitSuggestion('mm', False,
-                          f'Diagonal {d:g} is very large — assuming mm; verify units.')
+                          f'Diagonal {_length_text(d / 1000)} read as '
+                          f'millimetres is very large: check the unit.')
 
 
 def scale_warning(diagonal_m: float) -> str | None:

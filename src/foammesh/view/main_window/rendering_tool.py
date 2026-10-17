@@ -2,11 +2,17 @@
 # -*- coding: utf-8 -*-
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, Signal
+from foammesh.view.theming.metrics import UnitLabel
+from foammesh.view.workflow_controls.length_box import ModelLengthBox
+from foammesh.core import display_unit
+from foammesh.rendering import layers_grown
 from PySide6.QtGui import (
     QAction, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap)
+from PySide6.QtGui import QActionGroup, QFont
 from PySide6.QtWidgets import (
-    QColorDialog, QComboBox, QFileDialog, QFrame, QLabel, QMenu, QSizePolicy,
-    QToolButton)
+    QColorDialog, QComboBox, QFileDialog, QFrame, QGridLayout, QLabel,
+    QMenu, QPushButton, QSizePolicy, QToolButton, QWidget, QWidgetAction,
+)
 
 from widgets.rendering.rendering_widget import RenderingWidget
 from widgets.rendering.rotation_center_widget import RotationCenterWidget
@@ -14,9 +20,10 @@ from widgets.rendering.ruler_widget import RulerWidget
 
 from foammesh.app import app
 from foammesh.view.main_window.main_window_ui import Ui_MainWindow
+from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
 from foammesh.view.theming.icons import load_themed_icon
 from foammesh.view.theming.status_colors import (
-    apply_color_swatch, hide_menu_indicator)
+    apply_color_swatch, hide_menu_indicator, style_tool_tile)
 from foammesh.view.display_control import view_modes
 from foammesh.view.main_window.mesh_lines_control import MeshLinesButton
 from foammesh.view.length_readout import format_extent
@@ -33,6 +40,32 @@ BUTTON_SIZE = QSize(28, 28)
 #: DP-106. Kept as a module name because the tests and the callers below
 #: already say it; the ladder itself is shared with the base-grid readout.
 _formatExtent = format_extent
+
+
+class _RowCaption(QLabel):
+    """DP-2720. A Display row's words: pressing them presses the row's
+    control, so the row is the target, not only its 28 px glyph."""
+
+    def __init__(self, text: str, buddy):
+        super().__init__(text)
+        self.setBuddy(buddy)
+        self._buddy = buddy
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        buddy = self._buddy
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())
+                and buddy.isEnabled() and buddy.isVisible()):
+            if isinstance(buddy, QFrame):
+                buddy = next((child for child in buddy.findChildren(QToolButton)
+                              if child.isVisible()), None)
+            if buddy is not None:
+                if isinstance(buddy, QToolButton) and buddy.menu() is not None:
+                    buddy.showMenu()
+                else:
+                    buddy.click()
 
 
 class ElidingLabel(QLabel):
@@ -186,6 +219,12 @@ class RenderingTool(QObject):
     deleteViewRequested = Signal(str)
     viewModeRequested = Signal(str)
     layerCoverageRequested = Signal()
+    #: Plan 39 VI16 (I6). *Colour mesh by* changed; the key is one of
+    #: `rendering.layers_grown.CHOICES`.
+    colourMeshRequested = Signal(str)
+    #: Plan 40 UXE2. What the row could not fit changed; with the rail in
+    #: charge of overflow the rail refolds itself on this.
+    overflowChanged = Signal()
 
     def __init__(self, ui: Ui_MainWindow):
         super().__init__()
@@ -196,6 +235,15 @@ class RenderingTool(QObject):
         self._rotationCenter = None
         self._cheatSheet = None
         self._iconButtons = {}
+        #: UXB5. True while the viewport holds nothing to act on. What each
+        #: gated control was last asked for, so it comes back as asked.
+        self._sceneEmpty = False
+        self._requested = {}
+        self._modelTools = []
+        #: UXE2. The display switches the rail's Display popover took off the
+        #: row, and who shows the row's overflow when the rail does.
+        self._railOwned = []
+        self._overflowToRail = False
 
         self._restoreBackgrounds()
         self._updateBGButtonStyle(self._ui.bg1, QColor.fromRgbF(*self._view.background1()))
@@ -215,10 +263,8 @@ class RenderingTool(QObject):
         self._ui.axis.toggled.connect(self._view.setAxisVisible)
         self._ui.cubeAxis.toggled.connect(self._view.setCubeAxisVisible)
         self._ui.ruler.toggled.connect(self._setRulerVisible)
-        self._ui.fit.clicked.connect(self._fitCamera)
         self._ui.perspective.toggled.connect(self._view.setParallelProjection)
         self._ui.rotate.clicked.connect(self._view.rollCamera)
-        self._ui.rotationCenter.clicked.connect(self._toggleRotationCenter)
         self._ui.bg1.clicked.connect(self._pickBackground1)
         self._ui.bg2.clicked.connect(self._pickBackground2)
         self._backgroundResetButton = self._newBackgroundReset()
@@ -252,6 +298,10 @@ class RenderingTool(QObject):
     #: DP-697. The key every CAD viewer uses to frame what you are looking
     #: at. Scoped to the viewport, so it never eats an F typed in a field.
     FIT_SHORTCUT = 'F'
+    #: One sentence, named once: the menu entry's tip is set on build and set
+    #: again when the run grew layers (DP-185: one control, one description).
+    LAYERS_GROWN_TIP = ('Paint each patch with the layers the run grew on it; '
+                        'patches that asked for none are grey')
     #: Wide enough for "Boundary mesh" at the toolbar font, so the mode the
     #: viewport is in is readable at the narrow window size item 7 asks about
     #: rather than elided to "Bound...".
@@ -274,6 +324,7 @@ class RenderingTool(QObject):
             action.triggered.connect(
                 lambda _checked=False, value=preset:
                 self._view.setViewPreset(value))
+            adoptShortcut('viewport.view.' + preset, action)
             self._view.addAction(action)
             self._viewActions.append(action)
 
@@ -289,6 +340,7 @@ class RenderingTool(QObject):
         index = layout.indexOf(self._ui.rotationCenter) + 1
 
         self._viewMenuButton = QToolButton()
+        self._viewMenuButton.setObjectName('viewportViewMenu')
         self._viewMenuButton.setIcon(
             load_themed_icon(':/graphicsIcons/viewPresets.svg'))
         self._viewMenuButton.setIconSize(ICON_SIZE)
@@ -338,6 +390,7 @@ class RenderingTool(QObject):
             self.tr('Show the boundary mesh with the patches whose prism '
                     'layers fell short of the request highlighted'))
         self._layerCoverageAction.setEnabled(False)
+        self._buildColourMeshMenu(menu)
         self._viewMenuButton.setMenu(menu)
 
         # CP-09 item 5. Five modes people ask for constantly -- what I gave
@@ -353,6 +406,7 @@ class RenderingTool(QObject):
         # that decides whether the grid is drawn at all.
         self._meshLinesButton = MeshLinesButton(
             size=BUTTON_SIZE, iconSize=ICON_SIZE)
+        self._meshLinesButton.setObjectName('viewportMeshLines')
         self._meshLinesButton.styleChanged.connect(
             lambda: self._view.refresh())
 
@@ -373,11 +427,12 @@ class RenderingTool(QObject):
         self._isolateButton = self._toolButton(
             'isolate.svg', self.tr('Show only the selected parts'),
             self.isolateRequested.emit, objectName='viewportIsolate')
-        self._zoomSelectionButton = self._toolButton(
-            'zoomSelection.svg',
-            self.tr('Fit the view to the selected parts  ({0})').format(
-                self.ZOOM_SELECTION_SHORTCUT),
-            self.zoomSelectionRequested.emit)
+        # UXB5. Fit and Fit selection are one split button: the press fits
+        # everything, the arrow offers the selection. Plan 43 LY6 (VP-004):
+        # the separate "Zoom selection" stand-in the overflow menu used to
+        # hold is gone; the overflow lists the Fit menu's own entries.
+        self._adoptFitButton()
+        self._adoptRotationCentreButton()
         self._showAllButton = self._toolButton(
             'showAll.svg', self.tr('Make every part visible again'),
             self.showAllRequested.emit, objectName='viewportShowAll')
@@ -390,6 +445,17 @@ class RenderingTool(QObject):
             self.tr('Colour the cells in the worst tenth of the metric range'),
             self._poorCellsPressed, objectName='viewportWorstCells',
             checkable=True)
+        # Plan 39 VI8 (F5d). The button has a metric of its own. Pressing the
+        # body repeats the last choice; the arrow lists every metric and how
+        # many cells to show. The icon wears the metric it will use.
+        self._poorCellsButton.setMinimumWidth(BUTTON_SIZE.width() + 14)
+        self._poorCellsButton.setMaximumWidth(BUTTON_SIZE.width() + 14)
+        self._poorCellsMenu = QMenu(self._poorCellsButton)
+        self._poorCellsMenu.aboutToShow.connect(self._rebuildWorstCellsMenu)
+        self._poorCellsButton.setMenu(self._poorCellsMenu)
+        self._poorCellsButton.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self._refreshWorstCellsLabel()
         self._fidelityButton = self._toolButton(
             'fidelity.svg',
             self.tr('Colour the surface by how far it left the reference '
@@ -428,12 +494,14 @@ class RenderingTool(QObject):
 
         self._captureButton = self._toolButton(
             'capture.svg',
-            self.tr('Save a picture of the viewport into the case  ({0})').format(
+            self.tr('Snapshot: save or copy a picture of the viewport  ({0})').format(
                 self.CAPTURE_SHORTCUT),
             self.captureRequested.emit)
+        self._captureButton.setObjectName('viewportCapture')
         self._galleryButton = self._toolButton(
             'gallery.svg', self.tr('Open the capture gallery'),
             self.galleryRequested.emit)
+        self._galleryButton.setObjectName('viewportGallery')
 
         self._adoptCellCount()
 
@@ -453,7 +521,7 @@ class RenderingTool(QObject):
         for widget in (self._modeCombo, self._meshLinesButton,
                        self._viewMenuButton, self._backButton,
                        self._forwardButton, self._sectionButton,
-                       self._isolateButton, self._zoomSelectionButton,
+                       self._isolateButton,
                        self._showAllButton,
                        self._poorCellsButton, self._failedCellsButton,
                        self._fidelityButton, self._featuresButton,
@@ -467,13 +535,15 @@ class RenderingTool(QObject):
         for readout in (self._ui.cellCount, self._scaleLabel):
             readout.demandChanged.connect(self.reflowToolbar)
 
-        capture = QAction(self.tr('Capture viewport'), self._view)
+        capture = QAction(self.tr('Snapshot…'), self._view)
         capture.setShortcut(QKeySequence(self.CAPTURE_SHORTCUT))
+        adoptShortcut('viewport.capture', capture)
         capture.triggered.connect(self.captureRequested)
         self._view.addAction(capture)
 
         zoomSelection = QAction(self.tr('Zoom to selection'), self._view)
         zoomSelection.setShortcut(QKeySequence(self.ZOOM_SELECTION_SHORTCUT))
+        adoptShortcut('viewport.zoomSelection', zoomSelection)
         zoomSelection.triggered.connect(self.zoomSelectionRequested)
         self._view.addAction(zoomSelection)
 
@@ -482,11 +552,13 @@ class RenderingTool(QObject):
         fitSelectionOrAll.setShortcut(QKeySequence(self.FIT_SHORTCUT))
         fitSelectionOrAll.setShortcutContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        adoptShortcut('viewport.fit', fitSelectionOrAll)
         fitSelectionOrAll.triggered.connect(self.fitSelectionOrAllRequested)
         self._view.addAction(fitSelectionOrAll)
 
-        cheatSheet = QAction(self.tr('Viewport shortcuts'), self._view)
+        cheatSheet = QAction(self.tr('Keyboard shortcuts'), self._view)
         cheatSheet.setShortcut(QKeySequence(self.CHEAT_SHEET_SHORTCUT))
+        adoptShortcut('help.shortcuts', cheatSheet)
         cheatSheet.triggered.connect(self.showCheatSheet)
         self._view.addAction(cheatSheet)
         self._extraActions = [capture, zoomSelection, fitSelectionOrAll,
@@ -494,6 +566,161 @@ class RenderingTool(QObject):
 
         self.updateHistoryButtons()
         self.updateScaleReadout()
+        self._collectModelTools()
+
+    def _adoptFitButton(self):
+        """Swap the Fit button for a split button: Fit, with the selection
+        behind its arrow (UXB5, #19).
+
+        The window keeps talking to `self._ui.fit`; only the class changes.
+        """
+        old = self._ui.fit
+        button = self._toolButton(
+            'fit.svg',
+            self.tr('Fit the view to everything. The arrow offers the '
+                    'selection.'),
+            self._fitCamera, objectName='fit')
+        button.setMinimumWidth(BUTTON_SIZE.width() + 14)
+        button.setMaximumWidth(BUTTON_SIZE.width() + 14)
+        menu = QMenu(button)
+        menu.addAction(self.tr('Fit everything'), self._fitCamera)
+        menu.addAction(
+            self.tr('Fit the selection  ({0})').format(
+                self.ZOOM_SELECTION_SHORTCUT),
+            self.zoomSelectionRequested.emit)
+        button.setMenu(menu)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        host = old.parentWidget()
+        layout = host.layout() if host is not None else None
+        if layout is not None:
+            layout.replaceWidget(old, button)
+            old.setParent(None)
+            old.deleteLater()
+        self._ui.fit = button
+        self._fitMenu = menu
+
+    #: Plan 42 SG23. How the typed rotation centre is shown.
+    CENTRE_DECIMALS = 4
+
+    def _adoptRotationCentreButton(self):
+        """Swap the Rotation centre button for a split button whose arrow
+        opens the typed X/Y/Z centre (Plan 42 SG23, D-A, DP-1426).
+
+        The press toggles the pick mode as before. The arrow offers the three
+        fields and a "centre of the model" reset; the Gmsh display panel no
+        longer has a second set of them. The window keeps talking to
+        `self._ui.rotationCenter`; only the class changes.
+        """
+        old = self._ui.rotationCenter
+        button = self._toolButton(
+            'rotationCenter.svg',
+            self.tr('Set rotation centre. The arrow takes a typed centre.'),
+            self._toggleRotationCenter, objectName='rotationCenter',
+            checkable=True)
+        button.setMinimumWidth(BUTTON_SIZE.width() + 14)
+        button.setMaximumWidth(BUTTON_SIZE.width() + 14)
+        menu = QMenu(button)
+        panel = QWidget(menu)
+        panel.setObjectName('viewportRotationCentrePanel')
+        grid = QGridLayout(panel)
+        title = QLabel(self.tr('Rotation centre'), panel)
+        grid.addWidget(title, 0, 0, 1, 3)
+        self._centreSpins = []
+        for row, axis in enumerate('XYZ', start=1):
+            # UXB3c: typed in the project display unit; the centre handed
+            # to the viewport and to the camera stays in model units.
+            spin = ModelLengthBox(panel, minimum=-1e12, maximum=1e12,
+                                  step=0.1)
+            spin.setObjectName('viewportRotationCentre' + axis)
+            spin.setAccessibleName(self.tr('Rotation centre {0}').format(axis))
+            # The centre moves when Enter is pressed or the field is left,
+            # not on every digit of a number being typed.
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(self._centreTyped)
+            self._centreSpins.append(spin)
+            grid.addWidget(QLabel(axis, panel), row, 0)
+            grid.addWidget(spin, row, 1)
+            spin.unit_label = UnitLabel(display_unit.current())
+            grid.addWidget(spin.unit_label, row, 2)
+        model = QPushButton(self.tr('Centre of the model'), panel)
+        model.setObjectName('viewportRotationCentreModel')
+        model.setToolTip(self.tr(
+            'Rotate about the middle of everything in the viewport'))
+        model.clicked.connect(self.setRotationCentreToModel)
+        grid.addWidget(model, 4, 0, 1, 3)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(panel)
+        menu.addAction(action)
+        menu.aboutToShow.connect(self._showCentreFields)
+        button.setMenu(menu)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        host = old.parentWidget()
+        layout = host.layout() if host is not None else None
+        if layout is not None:
+            layout.replaceWidget(old, button)
+            old.setParent(None)
+            old.deleteLater()
+        self._ui.rotationCenter = button
+        self._rotationMenu = menu
+        self._typedCentre = None
+
+    def rotationCentre(self):
+        """The point the viewport turns about, or ``None`` for the middle of
+        the model (the mode is off).  Picked and typed centres are one value."""
+        if not self._ui.rotationCenter.isChecked():
+            return None
+        return getattr(self, '_typedCentre', None)
+
+    def setRotationCentre(self, x, y, z):
+        """Turn about a typed point on whichever engine's mesh is on screen.
+
+        Plan 42 SG23 (DP-1426). Switches the rotation-centre mode on, moves
+        the cross to the point and keeps the three fields in step.
+        """
+        centre = (float(x), float(y), float(z))
+        self._typedCentre = centre
+        self._fillCentreFields(centre)
+        button = self._ui.rotationCenter
+        if not button.isChecked():
+            was = button.blockSignals(True)
+            button.setChecked(True)
+            button.blockSignals(was)
+            self._toggleRotationCenter(True)
+        mover = getattr(self._rotationCenter, 'setCenter', None)
+        if callable(mover):
+            mover(centre)
+        return centre
+
+    def setRotationCentreToModel(self, *_args):
+        """The middle of the bounds of what is in the viewport."""
+        bounds = self._view.getBounds()
+        if not bounds or bounds[0] > bounds[1]:
+            return None
+        return self.setRotationCentre(
+            (bounds[0] + bounds[1]) / 2.0, (bounds[2] + bounds[3]) / 2.0,
+            (bounds[4] + bounds[5]) / 2.0)
+
+    def _centreTyped(self, *_args):
+        spins = getattr(self, '_centreSpins', None)
+        if spins:
+            self.setRotationCentre(*(spin.modelValue() for spin in spins))
+
+    def _fillCentreFields(self, centre):
+        for spin, value in zip(getattr(self, '_centreSpins', ()), centre):
+            was = spin.blockSignals(True)
+            spin.setModelValue(float(value))
+            spin.blockSignals(was)
+
+    def _showCentreFields(self):
+        centre = getattr(self, '_typedCentre', None)
+        if centre is None:
+            bounds = self._view.getBounds()
+            if bounds and bounds[0] <= bounds[1]:
+                centre = ((bounds[0] + bounds[1]) / 2.0,
+                          (bounds[2] + bounds[3]) / 2.0,
+                          (bounds[4] + bounds[5]) / 2.0)
+        if centre is not None:
+            self._fillCentreFields(centre)
 
     def _buildModeCombo(self) -> QComboBox:
         """The five modes, behind a placeholder that claims nothing.
@@ -598,6 +825,10 @@ class RenderingTool(QObject):
 
     def _normaliseOriginalButtons(self):
         for name in self.ORIGINAL_BUTTONS:
+            if name in ('fit', 'rotationCenter'):
+                # UXB5 and Plan 42 SG23: replaced by split buttons, which
+                # are wider.
+                continue
             button = getattr(self._ui, name)
             button.setMinimumSize(BUTTON_SIZE)
             button.setMaximumSize(BUTTON_SIZE)
@@ -652,6 +883,7 @@ class RenderingTool(QObject):
         self._overflowButton.setVisible(False)
         self._hiddenTools = []
         self._reflowing = False
+        self._reflowSignature = None
         self._ui.toolbar.installEventFilter(self)
 
     def _toolbarGroups(self):
@@ -671,8 +903,8 @@ class RenderingTool(QObject):
         def part(name):
             return getattr(ui, name, None)
 
-        return (
-            (part('fit'), self._zoomSelectionButton, self._viewMenuButton,
+        groups = (
+            (part('fit'), self._viewMenuButton,
              self._backButton, self._forwardButton, part('alignAxis'),
              part('rotate'), part('perspective'), part('rotationCenter')),
             (self._isolateButton, self._showAllButton),
@@ -683,6 +915,9 @@ class RenderingTool(QObject):
              self._featuresButton, self._resetButton),
             (self._captureButton, self._galleryButton),
         )
+        owned = {id(w) for w in self._railOwned}
+        return tuple(tuple(w for w in group if id(w) not in owned)
+                     for group in groups)
 
     def _arrangeToolbar(self):
         """Lay the row out as `_toolbarGroups`, readouts and overflow last.
@@ -721,7 +956,7 @@ class RenderingTool(QObject):
                 separator.setFrameShape(QFrame.Shape.VLine)
                 separator.setFrameShadow(QFrame.Shadow.Plain)
                 separator.setFixedWidth(1)
-                separator.setMaximumHeight(BUTTON_SIZE.height() - 8)
+                separator.setFixedHeight(18)
                 layout.addWidget(separator)
                 self._groupSeparators.append(separator)
             for widget in group:
@@ -770,7 +1005,7 @@ class RenderingTool(QObject):
         mesh lines menu and the view presets never go.
         """
         ui = self._ui
-        return (
+        order = (
             (ui.rotationCenter, (ui.rotationCenter,)),
             (ui.rotate, (ui.rotate,)),
             (ui.ruler, (ui.ruler,)),
@@ -791,9 +1026,10 @@ class RenderingTool(QObject):
             (self._showAllButton, (self._showAllButton,)),
             (self._isolateButton, (self._isolateButton,)),
             (self._sectionButton, (self._sectionButton,)),
-            (self._zoomSelectionButton, (self._zoomSelectionButton,)),
             (ui.fit, (ui.fit,)),
         )
+        owned = {id(w) for w in self._railOwned}
+        return tuple(pair for pair in order if id(pair[0]) not in owned)
 
     #: A resize changes how much room there is; a layout request means one of
     #: the occupants changed how much it needs -- which is what a cell count
@@ -803,6 +1039,16 @@ class RenderingTool(QObject):
 
     def eventFilter(self, watched, event):
         if watched is self._ui.toolbar and event.type() in self.REFLOW_EVENTS:
+            # Plan 44 HANG. The reflow invalidates the row, and an
+            # invalidation posts a LayoutRequest to the toolbar: without this
+            # check every pass posted the next and a settled window never
+            # went idle (a modal prompt then spun the main thread at 100 %).
+            # A request that finds the room, the row's width and the hidden
+            # set as the last pass left them has nothing to change.
+            if (event.type() == QEvent.Type.LayoutRequest
+                    and self._reflowSignature is not None
+                    and self._reflowSignature == self._currentSignature()):
+                return super().eventFilter(watched, event)
             self.reflowToolbar()
         return super().eventFilter(watched, event)
 
@@ -864,9 +1110,19 @@ class RenderingTool(QObject):
                 given -= 1
             self._updateSeparators()
             self._hiddenTools = [pair for pair in order if pair[0].isHidden()]
-            self._overflowButton.setVisible(bool(self._hiddenTools))
+            self._overflowButton.setVisible(
+                bool(self._hiddenTools) and not self._overflowToRail)
+            self._reflowSignature = self._currentSignature()
         finally:
             self._reflowing = False
+        self.overflowChanged.emit()
+
+    def _currentSignature(self):
+        """What a reflow depends on: the room, what the row wants, and which
+        tools are given up."""
+        row = self._ui.horizontalLayout
+        return (self._ui.toolbar.width(), row.sizeHint().width(),
+                tuple(pair[0].isHidden() for pair in self._overflowOrder()))
 
     @staticmethod
     def _demandOf(widget) -> int:
@@ -878,9 +1134,14 @@ class RenderingTool(QObject):
 
     def overflowedControls(self) -> list:
         """The accessible names of everything currently in the menu."""
-        return [proxy.accessibleName() or proxy.toolTip()
-                for _widget, proxies in self._hiddenTools
-                for proxy in proxies]
+        names = []
+        for _widget, proxies in self._hiddenTools:
+            for proxy in proxies:
+                if proxy is self._ui.fit:
+                    names.extend(a.text() for a in self._fitMenu.actions())
+                else:
+                    names.append(proxy.accessibleName() or proxy.toolTip())
+        return names
 
     def _fillOverflowMenu(self):
         """Mirror the hidden buttons, state, reason and all.
@@ -892,8 +1153,26 @@ class RenderingTool(QObject):
         """
         menu = self._overflowButton.menu()
         menu.clear()
+        self.fillOverflowMenu(menu)
+
+    def hiddenToolCount(self) -> int:
+        return len(self.overflowedControls())
+
+    def fillOverflowMenu(self, menu):
+        """Mirror the hidden buttons into *menu* (the row's own, or the
+        rail's, which shows them first when it is in charge)."""
         for _widget, proxies in self._hiddenTools:
             for proxy in proxies:
+                if proxy is self._ui.fit:
+                    # Fit is a split button: the menu lists what its press
+                    # and its arrow offer (Fit everything, Fit the selection).
+                    for entry in self._fitMenu.actions():
+                        item = menu.addAction(entry.text())
+                        item.setToolTip(proxy.toolTip())
+                        item.setEnabled(proxy.isEnabled())
+                        item.triggered.connect(
+                            lambda _checked=False, e=entry: e.trigger())
+                    continue
                 action = menu.addAction(
                     proxy.accessibleName() or proxy.toolTip())
                 action.setToolTip(proxy.toolTip())
@@ -907,9 +1186,138 @@ class RenderingTool(QObject):
             action = menu.addAction(self.tr('Everything fits at this width'))
             action.setEnabled(False)
 
+    # -- Plan 40 UXE2: the rail takes the display switches ------------------- #
+
+    def displayPanel(self):
+        """The Display popover's body, built from the row's own controls.
+
+        The buttons are the ones the row had -- same objects, same wiring --
+        moved into labelled rows, so there is still one copy of each switch.
+        """
+        from PySide6.QtWidgets import QGridLayout, QVBoxLayout, QWidget
+        ui = self._ui
+        panel = QWidget()
+        panel.setObjectName('displayPopoverBody')
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        rows = (
+            (self.tr('Mesh lines'), self._meshLinesButton),
+            (self.tr('Origin axes'), ui.axis),
+            (self.tr('Cube axes'), ui.cubeAxis),
+            (self.tr('Ruler'), ui.ruler),
+            (self.tr('Feature edges'), self._featuresButton),
+            (self.tr('Background'), ui.frame_2),
+        )
+        owned = []
+        for row, (label, widget) in enumerate(rows):
+            widget.setParent(panel)
+            grid.addWidget(widget, row, 0)
+            caption = _RowCaption(label, widget)
+            grid.addWidget(caption, row, 1)
+            owned.append(widget)
+            # DP-2720: a switch that is on looks on, as every other viewport
+            # tool does (the accent ring); the row showed nothing.
+            if (getattr(widget, 'isCheckable', bool)() and widget.objectName()):
+                widget.setProperty('foammeshTile', True)
+                style_tool_tile(widget)
+        grid.setColumnStretch(1, 1)
+        # Plan 42 SG9. The Elements group, one for both engines: the display
+        # control made it, and an engine item inside it shows only while the
+        # mesh on screen has it.
+        elements = getattr(ui, 'elementDisplayPanel', None)
+        if elements is not None:
+            elements.setParent(panel)
+            grid.addWidget(elements, len(rows), 0, 1, 2)
+            grid.setRowStretch(len(rows) + 1, 1)
+        else:
+            grid.setRowStretch(len(rows), 1)
+        # Plan 43 LY13 D11. Gmsh's visibility and display options hang in
+        # this popover too, in a section the Gmsh pages fill and empty: it is
+        # hidden whenever no Gmsh page has mounted a panel into it.
+        host = QWidget(panel)
+        host.setObjectName('gmshDisplayHost')
+        QVBoxLayout(host).setContentsMargins(0, 0, 0, 0)
+        host.setVisible(False)
+        grid.addWidget(host, len(rows) + 1, 0, 1, 2)
+        self._gmshDisplayHost = host
+        self._gmshDisplayPanel = None
+        self._railOwned = owned
+        self._displayPanel = panel
+        self._regroupAfterRail()
+        return panel
+
+    def mountGmshDisplay(self, widget) -> bool:
+        """Plan 43 LY13 D11. Put Gmsh's display panel in the Display popover.
+
+        The panel is the Gmsh page's own object, every control in it kept; a
+        panel mounted earlier (a page rebuilt by an engine switch) is
+        released first. False when the popover has not been built.
+        """
+        host = getattr(self, '_gmshDisplayHost', None)
+        if host is None:
+            return False
+        self.unmountGmshDisplay(self._gmshDisplayPanel)
+        widget.setParent(host)
+        host.layout().addWidget(widget)
+        widget.setVisible(True)
+        host.setVisible(True)
+        self._gmshDisplayPanel = widget
+        return True
+
+    def unmountGmshDisplay(self, widget) -> None:
+        """Release *widget* (if it is the mounted panel) and hide the section."""
+        if widget is None:
+            return
+        try:
+            if widget is getattr(self, '_gmshDisplayPanel', None):
+                self._gmshDisplayPanel = None
+                self._gmshDisplayHost.setVisible(False)
+            widget.setParent(None)
+            widget.deleteLater()
+        except RuntimeError:
+            pass                                   # already gone
+
+    def gmshDisplayPanel(self):
+        return getattr(self, '_gmshDisplayPanel', None)
+
+    def railOwnedControls(self) -> list:
+        return list(self._railOwned)
+
+    def _regroupAfterRail(self):
+        owned = {id(w) for w in self._railOwned}
+        layout = self._ui.horizontalLayout
+        for widget in self._railOwned:
+            layout.removeWidget(widget)
+        groups = [[w for w in group if id(w) not in owned]
+                  for group in getattr(self, '_toolGroups', ())]
+        groups = [g for g in groups if g]
+        # The rules between groups follow the groups that are left.
+        for rule in getattr(self, '_groupSeparators', ()):
+            layout.removeWidget(rule)
+            rule.deleteLater()
+        self._groupSeparators = []
+        self._toolGroups = groups
+        self._arrangeAfterRail()
+
+    def _arrangeAfterRail(self):
+        self._arrangeToolbar()
+        self.reflowToolbar()
+
+    def sendOverflowToRail(self, rail):
+        """The row's hidden tools are listed in the rail's menu, before its
+        own ``...``; the row's own overflow button stays out of sight."""
+        self._overflowToRail = True
+        self._overflowButton.setVisible(False)
+        rail.setExtraOverflow(self.fillOverflowMenu, self.hiddenToolCount)
+        self.overflowChanged.connect(rail.reflow)
+        self.reflowToolbar()
+
     def _rethemeToolbarIcons(self):
         for button, iconName in self._iconButtons.items():
             button.setIcon(load_themed_icon(f':/graphicsIcons/{iconName}'))
+        self._refreshWorstCellsLabel()
         self._viewMenuButton.setIcon(
             load_themed_icon(':/graphicsIcons/viewPresets.svg'))
 
@@ -920,27 +1328,26 @@ class RenderingTool(QObject):
         seven view presets and the capture existed for months as unlabelled key
         bindings, and from the user's chair they did not exist.
         """
-        rows = [(title, shortcut) for title, _preset, shortcut
-                in self.VIEW_PRESETS]
-        rows.append((self.tr('Capture viewport'), self.CAPTURE_SHORTCUT))
-        rows.append((self.tr('Zoom to selection'), self.ZOOM_SELECTION_SHORTCUT))
-        rows.append((self.tr('Fit the selection, or everything'),
-                     self.FIT_SHORTCUT))
-        rows.append((self.tr('This list'), self.CHEAT_SHEET_SHORTCUT))
+        from foammesh.view.main_window.shortcut_registry import REGISTRY
+
+        rows = [(self.tr(title), REGISTRY.display('viewport.view.' + preset))
+                for title, preset, _shortcut in self.VIEW_PRESETS]
+        for title, command_id in (
+                ('Capture viewport', 'viewport.capture'),
+                ('Zoom to selection', 'viewport.zoomSelection'),
+                ('Fit the selection, or everything', 'viewport.fit'),
+                ('This list', 'help.shortcuts')):
+            rows.append((self.tr(title), REGISTRY.display(command_id)))
         return rows
 
     def showCheatSheet(self):
-        from PySide6.QtWidgets import QMessageBox
+        """F1. The Keyboard shortcuts dialog: every key, rebindable."""
+        from foammesh.view.main_window import shortcuts_dialog
 
-        lines = '\n'.join(
-            f'{shortcut:<12}{title}' for title, shortcut in self.shortcutTable())
-        box = QMessageBox(app.window)
-        box.setWindowTitle(self.tr('Viewport shortcuts'))
-        box.setTextFormat(Qt.TextFormat.PlainText)
-        box.setText(lines)
-        self._cheatSheet = box
-        box.open()
-        return box
+        window = app.window
+        dialog = shortcuts_dialog.show(window)
+        self._cheatSheet = dialog
+        return dialog
 
     def setNamedViews(self, names):
         """Rebuild the saved-view menu. Empty stays disabled, not absent."""
@@ -1047,6 +1454,41 @@ class RenderingTool(QObject):
         self._gate(self._fidelityButton, fidelity, fidelityReason)
         self._gate(self._featuresButton, features, featuresReason)
 
+    def _buildColourMeshMenu(self, menu):
+        """Plan 39 VI16 (I6). *Colour mesh by*: Solid, or the layers grown.
+
+        An exclusive pair: the patches are in one colouring at a time, and the
+        entry that is ticked says which. *Layers grown* is gated with the
+        layer-coverage entry, by the same stored report.
+        """
+        self._colourMeshMenu = menu.addMenu(self.tr('Colour mesh by'))
+        self._colourMeshMenu.setToolTipsVisible(True)
+        self._colourMeshGroup = QActionGroup(self._colourMeshMenu)
+        self._colourMeshGroup.setExclusive(True)
+        self._colourMeshActions = {}
+        for key, label in layers_grown.CHOICES:
+            action = self._colourMeshMenu.addAction(self.tr(label))
+            action.setCheckable(True)
+            action.setData(key)
+            self._colourMeshGroup.addAction(action)
+            self._colourMeshActions[key] = action
+        self._colourMeshActions[layers_grown.SOLID].setChecked(True)
+        self._colourMeshActions[layers_grown.LAYERS_GROWN].setToolTip(
+            self.tr(self.LAYERS_GROWN_TIP))
+        self._colourMeshActions[layers_grown.LAYERS_GROWN].setEnabled(False)
+        self._colourMeshGroup.triggered.connect(
+            lambda action: self.colourMeshRequested.emit(str(action.data())))
+
+    def setColourMeshChoice(self, key: str):
+        """Tick *key* without announcing it (the window put the colour on)."""
+        action = self._colourMeshActions.get(key)
+        if action is not None:
+            action.setChecked(True)
+
+    def colourMeshChoice(self) -> str:
+        checked = self._colourMeshGroup.checkedAction()
+        return str(checked.data()) if checked is not None else layers_grown.SOLID
+
     def setLayerCoverageEnabled(self, enabled: bool, reason: str):
         """The layer-coverage entry, and why it is shut when it is.
 
@@ -1061,16 +1503,80 @@ class RenderingTool(QObject):
         action.setEnabled(bool(enabled))
         action.setToolTip(default if enabled else str(reason or ''))
         action.setStatusTip('' if enabled else str(reason or ''))
+        # Plan 39 VI16. Layers grown reads the same stored report. A ticked
+        # entry stays usable: the way off is Solid, never a dead entry.
+        grown = getattr(self, '_colourMeshActions', {}).get(
+            layers_grown.LAYERS_GROWN)
+        if grown is not None:
+            grown.setEnabled(bool(enabled) or grown.isChecked())
+            if not enabled and not grown.isChecked():
+                grown.setToolTip(str(reason or ''))
+            elif enabled:
+                grown.setToolTip(self.tr(self.LAYERS_GROWN_TIP))
+
+    #: Defaults for a tool built without `__init__` (the gating tests do).
+    _sceneEmpty = False
+    _modelTools = ()
+
+    #: What a model tool says while the viewport is empty.
+    EMPTY_REASON = 'Load a geometry or a mesh first'
+
+    def _collectModelTools(self):
+        """Every control that acts on what is in the viewport (UXB5, #18).
+
+        The history buttons are left out: they are gated by the camera
+        history, which is empty when the viewport is. The background swatches
+        and the capture gallery act on no model and stay available.
+        """
+        ui = self._ui
+        self._modelTools = [
+            ui.fit, self._viewMenuButton,
+            ui.alignAxis, ui.rotate, ui.perspective, ui.rotationCenter,
+            ui.axis, ui.cubeAxis, ui.ruler,
+            self._isolateButton, self._showAllButton, self._sectionButton,
+            self._poorCellsButton, self._failedCellsButton,
+            self._fidelityButton, self._featuresButton, self._resetButton,
+            self._captureButton, self._modeCombo, self._meshLinesButton]
+
+    def modelTools(self) -> list:
+        """The controls the empty viewport turns off."""
+        return list(self._modelTools)
+
+    def isSceneEmpty(self) -> bool:
+        return self._sceneEmpty
+
+    def setSceneEmpty(self, empty: bool):
+        """Turn the model tools off while nothing is loaded, and back on.
+
+        UXB5. Isolate, Show all, Section and Fit were live over an empty
+        picture. Each control returns to what the page last asked of it, so a
+        mesh check's own gating survives a reload.
+        """
+        empty = bool(empty)
+        if empty == self._sceneEmpty:
+            return
+        self._sceneEmpty = empty
+        for button in self._modelTools:
+            self._applyGate(button)
 
     def _gate(self, button, enabled: bool, reason: str):
         """Enable or disable one button, and keep its tooltip truthful."""
+        self.__dict__.setdefault('_requested', {})[button] = (
+            bool(enabled), str(reason or ''))
+        self._applyGate(button)
+
+    def _applyGate(self, button):
         default = button.property('foammeshDefaultTip')
         if default is None:
             default = button.toolTip()
             button.setProperty('foammeshDefaultTip', default)
+        enabled, reason = self.__dict__.get('_requested', {}).get(
+            button, (True, ''))
+        if self._sceneEmpty and button in self._modelTools:
+            enabled, reason = False, self.tr(self.EMPTY_REASON)
         button.setEnabled(bool(enabled))
-        button.setToolTip(default if enabled else str(reason or ''))
-        button.setAccessibleDescription('' if enabled else str(reason or ''))
+        button.setToolTip(default if enabled else reason)
+        button.setAccessibleDescription('' if enabled else reason)
 
     def setInspectionActive(self, name: str, active: bool):
         """Make the icon say what the viewport is actually showing.
@@ -1123,8 +1629,20 @@ class RenderingTool(QObject):
                 self._chooseFailedCellSet(value))
         if names:
             menu.addSeparator()
+        # Plan 39 VI8 (F5b). Taking the camera to the set on screen.
+        fly = menu.addAction(self.tr('Fly to the set on screen'),
+                             self._flyToFailedCells)
+        fly.setEnabled(self._failedCellsButton.isChecked())
         menu.addAction(self.tr('Off'),
                        lambda checked=False: self._chooseFailedCellSet(''))
+
+    def _flyToFailedCells(self):
+        info = self._qualityInfo()
+        if info is not None and not info.flyToFailedCells():
+            window = getattr(app, '_window', None)
+            if window is not None:
+                window.statusBar().showMessage(self.tr(
+                    'No failed-cell set is on screen to fly to.'), 6000)
 
     def _chooseFailedCellSet(self, name: str):
         self._requestedFailedCellSet = str(name)
@@ -1145,7 +1663,148 @@ class RenderingTool(QObject):
         return requested
 
     def _poorCellsPressed(self):
+        self._refreshWorstCellsLabel()
         self.poorCellsRequested.emit()
+
+    # -- Worst cells: a metric of its own (Plan 39 VI8, F5d) ---------------- #
+
+    def _qualityInfo(self):
+        """The quality colouring's panel, or None where there is no window."""
+        window = getattr(app, '_window', None)
+        control = getattr(window, 'displayControl', None) if window else None
+        reader = getattr(control, 'meshQualityInfo', None)
+        return reader() if reader is not None else None
+
+    def worstCellsLabel(self) -> str:
+        """What the button will do, in words (also its tooltip)."""
+        info = self._qualityInfo()
+        if info is None:
+            return self.tr(
+                'Colour the cells in the worst tenth of the metric range')
+        choice = info.worstChoice()
+        metric = info.METRIC_LABELS.get(choice['metric'], '')
+        mode = choice['mode']
+        if mode == 'count':
+            return self.tr('Colour the {0:,} worst cells by {1}').format(
+                choice['count'], metric)
+        if mode == 'limit':
+            return self.tr('Colour the cells beyond the {0} check limit '
+                           '({1:g})').format(
+                               metric, info.limitFor(choice['metric']) or 0)
+        return self.tr('Colour the cells in the worst tenth of the metric '
+                       'range ({0})').format(metric)
+
+    def _refreshWorstCellsLabel(self):
+        """Put the chosen metric on the icon and in the tooltip."""
+        button = getattr(self, '_poorCellsButton', None)
+        if button is None:
+            return
+        label = self.worstCellsLabel()
+        button.setProperty('foammeshDefaultTip', label)
+        if button.isEnabled():
+            button.setToolTip(label)
+        button.setAccessibleName(label)
+        info = self._qualityInfo()
+        icon = load_themed_icon(':/graphicsIcons/poorCells.svg')
+        badge = ''
+        if info is not None:
+            badge = info.METRIC_BADGES.get(info.activeIndex(), '')
+            if badge:
+                icon = self._badged(icon, badge, button)
+        # Named on the button as well as drawn on it: the letters are pixels,
+        # and a test (or a screen reader's description) needs the words.
+        button.setProperty('foammeshMetricBadge', badge)
+        button.setIcon(icon)
+
+    @staticmethod
+    def _badged(icon, text, button):
+        """The icon with a two-letter metric code in its lower right."""
+        pixmap = icon.pixmap(ICON_SIZE)
+        if pixmap.isNull():
+            return icon
+        painter = QPainter(pixmap)
+        font = QFont(button.font())
+        font.setPixelSize(max(8, pixmap.height() // 2 - 2))
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(text) + 2
+        height = metrics.height() - 2
+        x = pixmap.width() / pixmap.devicePixelRatio() - width
+        y = pixmap.height() / pixmap.devicePixelRatio() - height
+        background = QColor(button.palette().window().color())
+        # Text that contrasts with its own backing, whatever the theme: the
+        # palette's text role is not guaranteed to differ from its window.
+        colour = QColor(Qt.GlobalColor.black if background.lightness() > 127
+                        else Qt.GlobalColor.white)
+        background.setAlpha(225)
+        painter.fillRect(int(x), int(y), width, height, background)
+        painter.setPen(colour)
+        painter.drawText(int(x) + 1, int(y) + metrics.ascent() - 1, text)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _rebuildWorstCellsMenu(self):
+        """Every metric, then how many cells; the current choice ticked."""
+        menu = self._poorCellsMenu
+        menu.clear()
+        info = self._qualityInfo()
+        if info is None:
+            return
+        self._refreshWorstCellsLabel()
+        choice = info.worstChoice()
+        metrics = QActionGroup(menu)
+        metrics.setExclusive(True)
+        for index in info.metricOrder():
+            action = menu.addAction(
+                self.tr(info.METRIC_LABELS[index]),
+                lambda checked=False, value=index:
+                self._chooseWorst(metric=value))
+            action.setCheckable(True)
+            action.setChecked(index is choice['metric'])
+            metrics.addAction(action)
+        menu.addSeparator()
+        modes = QActionGroup(menu)
+        modes.setExclusive(True)
+        entries = [(self.tr('Worst tenth of the range'), 'range', None)]
+        entries += [(self.tr('Worst {0:,} cells').format(count), 'count',
+                     count) for count in info.WORST_COUNTS]
+        limit = info.limitFor(choice['metric'])
+        entries.append((
+            self.tr('Beyond the check limit ({0:g})').format(limit)
+            if limit is not None else
+            self.tr('Beyond the check limit (this metric has none)'),
+            'limit', None))
+        for text, mode, count in entries:
+            action = menu.addAction(
+                text,
+                lambda checked=False, m=mode, c=count:
+                self._chooseWorst(mode=m, count=c))
+            action.setCheckable(True)
+            action.setChecked(mode == choice['mode']
+                              and (mode != 'count' or count == choice['count']))
+            action.setEnabled(mode != 'limit' or limit is not None)
+            modes.addAction(action)
+        menu.addSeparator()
+        off = menu.addAction(self.tr('Off'), self._clearWorstCells)
+        off.setEnabled(info.isHighlighting())
+
+    def _chooseWorst(self, metric=None, mode=None, count=None):
+        """Remember a choice, then paint it (or repaint, if already on)."""
+        info = self._qualityInfo()
+        if info is None:
+            return
+        info.setWorstChoice(metric, mode, count)
+        self._refreshWorstCellsLabel()
+        if info.isHighlighting():
+            info.highlightWorst()
+        else:
+            self.poorCellsRequested.emit()
+
+    def _clearWorstCells(self):
+        info = self._qualityInfo()
+        if info is not None:
+            info.clearHighlight()
 
     def _resetInspection(self):
         """Ask the window to put the plain model back.
@@ -1175,17 +1834,50 @@ class RenderingTool(QObject):
             return ''
         return button.toolTip()
 
+    #: The six image formats of "Save image as..." (Plan 42 SG10, D10).
+    IMAGE_FILTERS = (('PNG', 'PNG image (*.png)'), ('JPEG', 'JPEG image (*.jpg *.jpeg)'),
+                     ('SVG', 'SVG drawing (*.svg)'), ('PDF', 'PDF document (*.pdf)'),
+                     ('EPS', 'Encapsulated PostScript (*.eps)'),
+                     ('PS', 'PostScript (*.ps)'))
+
+    def saveImageTo(self, path, fmt=None):
+        """Write the viewport to *path*; the format follows the suffix when
+        *fmt* is not given.  Returns the file written, or None."""
+        from pathlib import Path
+        suffix = Path(path).suffix.lower().lstrip('.')
+        fmt = (fmt or {'jpg': 'JPEG', 'jpeg': 'JPEG'}.get(suffix, suffix.upper()
+                                                         or 'PNG'))
+        try:
+            written = self._view.saveImage(path, fmt, scale=2)
+        except (ValueError, OSError) as error:
+            app.window.statusBar().showMessage(str(error), 8000)
+            return None
+        if written is None:
+            app.window.statusBar().showMessage(self.tr(
+                'The viewport is not drawing, so there is nothing to '
+                'save.'), 8000)
+        return written
+
     def _saveScreenshotAs(self):
-        path, _selected = QFileDialog.getSaveFileName(
-            app.window, self.tr('Save viewport screenshot'), '',
-            self.tr('PNG image (*.png)'))
-        if path:
-            if not path.lower().endswith('.png'):
-                path += '.png'
-            if self._view.saveScreenshot(path, scale=2) is False:
-                app.window.statusBar().showMessage(self.tr(
-                    'The viewport is not drawing, so there is nothing to '
-                    'save.'), 8000)
+        """Plan 43 LY15. *Save image as...* is the Snapshot popover now: the same
+        six formats, with the size, the labels and where it goes."""
+        self.captureRequested.emit()
+
+    def _saveScreenshotDialog(self):
+        """The plain file dialog for the six formats (kept for scripts)."""
+        filters = ';;'.join(self.tr(text) for _fmt, text in self.IMAGE_FILTERS)
+        path, selected = QFileDialog.getSaveFileName(
+            app.window, self.tr('Save image as'), '', filters)
+        if not path:
+            return
+        fmt = None
+        for name, text in self.IMAGE_FILTERS:
+            if self.tr(text) == selected:
+                fmt = name
+        from pathlib import Path
+        if not Path(path).suffix:
+            path += '.' + (fmt or 'PNG').lower().replace('jpeg', 'jpg')
+        self.saveImageTo(path)
 
     def enable(self):
         self._ui.toolbar.setEnabled(True)
@@ -1215,6 +1907,8 @@ class RenderingTool(QObject):
         if self._rotationCenter is not None:
             self._rotationCenter.off()
             self._rotationCenter = None
+        # Plan 42 SG23. The typed centre belonged to the case that closed.
+        self._typedCentre = None
         self.updateHistoryButtons()
 
     def applyTheme(self, tokens):
@@ -1238,12 +1932,25 @@ class RenderingTool(QObject):
 
     def _toggleRotationCenter(self, checked):
         if checked:
-            self._rotationCenter = self._rotationCenter or RotationCenterWidget(self._view)
+            if self._rotationCenter is None:
+                self._rotationCenter = RotationCenterWidget(self._view)
+                picked = getattr(self._rotationCenter, 'centerChanged', None)
+                if hasattr(picked, 'connect'):
+                    picked.connect(self._centrePicked)
             if app.themeManager is not None and app.themeManager.tokens is not None:
                 self._rotationCenter.applyTheme(app.themeManager.tokens)
             self._rotationCenter.on()
-        else:
+            typed = getattr(self, '_typedCentre', None)
+            mover = getattr(self._rotationCenter, 'setCenter', None)
+            if typed is not None and callable(mover):
+                mover(typed)
+        elif self._rotationCenter is not None:
             self._rotationCenter.off()
+
+    def _centrePicked(self, centre):
+        """A click in the view chose the centre: the fields show it."""
+        self._typedCentre = tuple(float(value) for value in centre)
+        self._fillCentreFields(self._typedCentre)
 
     def _pickBackground1(self):
         self._dialog = self._newBGColorDialog()

@@ -49,7 +49,8 @@ from typing import NamedTuple
 import numpy as np
 
 #: Bumped whenever a stored field would be read differently.
-CACHE_VERSION = 3
+#: 4 (CHT1): spaces may carry the closed shell that bounds them exactly.
+CACHE_VERSION = 4
 #: The voxel cap (Plan 36 §7: ~128^3).
 MAX_VOXELS = 2_000_000
 #: h is never finer than the domain diagonal over this.
@@ -181,6 +182,13 @@ class FluidSpaces:
     #: background cells (inside the hull, off every block); ``None`` when
     #: the domain is its box.
     excluded: object = None
+    #: CHT1. Label -> the closed shell (``vtkPolyData``) that bounds that
+    #: space exactly: a space recovered from its shell (RP13 #4) or one cell
+    #: of a conformal multi-body assembly (regions sharing faces). Points
+    #: next to a recovered space are judged against these shells, not the
+    #: voxel centre, so a seed in a wall thinner than a voxel reads its own
+    #: space; the viewport draws these spaces as their shells.
+    shells: dict = field(default_factory=dict, repr=False)
     _surfaces: dict = field(default_factory=dict, repr=False)
     #: RP13 #7. Label -> the cap its surface was boxed under.
     _boxed: dict = field(default_factory=dict, repr=False)
@@ -206,6 +214,20 @@ class FluidSpaces:
                 self.excluded = None
         self._excluded = (None if self.excluded is None
                           else self.excluded.ravel())
+        self.shells = {int(label): shell
+                       for label, shell in dict(self.shells or {}).items()
+                       if int(label) in self._byId and shell is not None
+                       and shell.GetNumberOfCells()}
+        self._testers = {}
+        # Every space with an exact shell, thin or not: MEASURED at 0.98 mm
+        # voxels the pipe wall is two voxels across and an ordinary space,
+        # and a seed 0.6 mm from its outer face read the cold fluid's wall
+        # band -- a Fluid and a Solid in one space at h/2.
+        self._near = _near_mask(self.labels, list(self.shells))
+        # Smallest first: a point in a thin space nested in a larger one is
+        # the thin space's.
+        self._shellOrder = sorted(self.shells, key=lambda label: (
+            self._byId[label].volume, label))
 
     # -- reading ----------------------------------------------------------
 
@@ -276,7 +298,65 @@ class FluidSpaces:
             return None
         if self._excluded is not None and self._excluded[index]:
             return OUTSIDE_DOMAIN
-        return self._lookup[int(self._flat[index])]
+        label = int(self._flat[index])
+        if self._near is not None and self._near[index]:
+            label = self._exact_label(point, index, label)
+        return self._lookup[label]
+
+    def _inside_shell(self, label, point) -> bool:
+        """Whether *point* is inside the stored shell of space *label*."""
+        from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
+
+        with self._lock:
+            tester = self._testers.get(label)
+            if tester is None:
+                shell = self.shells[label]
+                tester = vtkSelectEnclosedPoints()
+                bounds = shell.GetBounds()
+                diagonal = math.sqrt(sum(
+                    (bounds[2 * axis + 1] - bounds[2 * axis]) ** 2
+                    for axis in range(3)))
+                tester.SetTolerance(max(1e-12, 1e-8 * diagonal))
+                tester.Initialize(shell)
+                self._testers[label] = tester
+            return bool(tester.IsInsideSurface(*(float(value)
+                                                  for value in point)))
+
+    def _exact_label(self, point, index, label) -> int:
+        """CHT1: the space of *point* beside a space with an exact shell.
+
+        A voxel is labelled by its centre and its wall band goes to one
+        side, so at 2.9 mm voxels a seed in a 2 mm pipe wall read the fluid
+        beside it, and at 0.98 mm a seed in the wall still read the cold
+        fluid's band. Near such a space the stored shells decide; a point in
+        none of them whose voxel is a shell's space takes the nearest
+        neighbouring voxel that is not.
+        """
+        for shell in self._shellOrder:
+            if self._inside_shell(shell, point):
+                return shell
+        if label not in self.shells:
+            return label
+        nx, ny, nz = self.dimensions
+        i, j, k = index % nx, (index // nx) % ny, index // (nx * ny)
+        best, nearest = label, math.inf
+        for dk in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for di in (-1, 0, 1):
+                    a, b, c = i + di, j + dj, k + dk
+                    if not (0 <= a < nx and 0 <= b < ny and 0 <= c < nz):
+                        continue
+                    other = int(self._flat[a + nx * (b + ny * c)])
+                    if other == 0 or other in self.shells:
+                        continue
+                    centre = (self._origin[0] + (a + 0.5) * self.spacing[0],
+                              self._origin[1] + (b + 0.5) * self.spacing[1],
+                              self._origin[2] + (c + 0.5) * self.spacing[2])
+                    distance = sum((float(point[axis]) - centre[axis]) ** 2
+                                   for axis in range(3))
+                    if distance < nearest:
+                        best, nearest = other, distance
+        return best
 
     def to_dict(self) -> dict:
         return {'key': self.key, 'box': list(self.box), 'h': self.h,
@@ -306,6 +386,11 @@ class FluidSpaces:
         """
         label = int(label)
         cap = max(BOX_TRIANGLES, int(cap))
+        shell = self.shells.get(label)
+        if shell is not None and shell.GetNumberOfCells() <= cap:
+            # CHT1: the space's own closed shell is its exact boundary; the
+            # voxels of a 2 mm wall at 2.9 mm voxels draw a broken ring.
+            return shell
         with self._lock:
             cached = self._surfaces.get(label)
             boxed_under = self._boxed.get(label)
@@ -373,6 +458,11 @@ class FluidSpaces:
                 self.excluded.ravel().astype(np.uint8))
             arrays = {'excluded_values': outValues,
                       'excluded_lengths': outLengths}
+        for label, shell in sorted(self.shells.items()):
+            points, triangles = _shell_arrays(shell)
+            arrays[f'shell_{label}_points'] = points
+            arrays[f'shell_{label}_triangles'] = triangles
+        meta['shells'] = sorted(self.shells)
         temporary = path.with_name(path.name + '.part')
         with open(temporary, 'wb') as stream:
             np.savez_compressed(stream, values=values, lengths=lengths,
@@ -403,6 +493,10 @@ class FluidSpaces:
                     excluded = _run_length_decode(
                         data['excluded_values'], data['excluded_lengths']
                     ).reshape(nz, ny, nx).astype(bool)
+                shells = {int(label): _shell_from_arrays(
+                    data[f'shell_{int(label)}_points'],
+                    data[f'shell_{int(label)}_triangles'])
+                    for label in meta.get('shells') or ()}
         except (OSError, ValueError, KeyError, TypeError):
             return None
         spaces = tuple(Space(
@@ -420,7 +514,7 @@ class FluidSpaces:
                    unassigned=int(meta['unassigned']),
                    timings=dict(meta.get('timings') or {}),
                    elapsed=float(meta.get('elapsed') or 0.0),
-                   from_cache=True, excluded=excluded)
+                   from_cache=True, excluded=excluded, shells=shells)
 
 
 # -- resolution and keys -------------------------------------------------- #
@@ -806,9 +900,14 @@ def _label(surface, box, h, key, *, cancelled=None, progress=None,
                      spacing, first, box, implicit, cancelled=cancelled)
     timings['depth'] = time.perf_counter() - began
     began = time.perf_counter()
-    assigned, spaces = _lost_shells(surface, labels, assigned, spaces,
-                                    spacing, first, implicit,
-                                    cancelled=cancelled, excluded=excluded)
+    shells, cells = _shells(surface, with_cells=True)
+    assigned, spaces, exact = _lost_shells(
+        surface, labels, assigned, spaces, spacing, first, implicit,
+        cancelled=cancelled, excluded=excluded, shells=shells)
+    # CHT1: one space per cell of a conformal multi-body assembly.
+    assigned, spaces, joined = _join_cells(
+        cells, shells, assigned, spaces, box, cancelled=cancelled)
+    exact.update(joined)
     timings['shells'] = time.perf_counter() - began
     _stage(progress, 'depth', 1.0)
 
@@ -816,7 +915,8 @@ def _label(surface, box, h, key, *, cancelled=None, progress=None,
         key=key, box=box, h=float(h), spacing=spacing, dimensions=dims,
         labels=assigned, spaces=spaces,
         open_edges=_open_edge_count(surface), evaluated=evaluated,
-        unassigned=unassigned, timings=timings, excluded=excluded)
+        unassigned=unassigned, timings=timings, excluded=excluded,
+        shells=exact)
 
 
 def _face_labels(labels, rim=None):
@@ -1072,13 +1172,35 @@ def _spaces(labels, assigned, depth2, count, outside, sides, spacing, first,
     return tuple(spaces)
 
 
-def _shells(surface):
-    """The closed connected pieces of *surface*, at most `MAX_SHELLS`."""
+def _compact(polydata):
+    """*polydata* with its unused points dropped (a shell keeps all of them)."""
+    from vtkmodules.vtkFiltersCore import vtkCleanPolyData
+
+    clean = vtkCleanPolyData()
+    clean.SetInputData(polydata)
+    clean.PointMergingOff()
+    clean.Update()
+    return clean.GetOutput()
+
+
+def _shells(surface, with_cells=False):
+    """The closed connected pieces of *surface*, at most `MAX_SHELLS`.
+
+    CHT1. A conformal multi-body assembly -- the hot fluid, the pipe wall and
+    the cold fluid of a conjugate case, one closed STL each, sharing the
+    walls at r = 10 and 12 mm -- assembles into ONE connected piece whose
+    shared edges are used by four triangles, so it is not closed and this
+    returned nothing: the 2 mm wall, all wall voxels at 2.9 mm, was then
+    neither seen nor recovered. Such a piece is split into the regions it
+    bounds (`seed_classifier._shared_face_shells`, DP-924's reading), each
+    closed on its own. With *with_cells* the indices of those shells -- the
+    cells of an assembly -- come back too.
+    """
     from vtkmodules.vtkFiltersCore import (
         vtkCleanPolyData, vtkPolyDataConnectivityFilter,
     )
 
-    from .seed_classifier import _open_edge_count
+    from .seed_classifier import _open_edge_count, _shared_face_shells
 
     connectivity = vtkPolyDataConnectivityFilter()
     connectivity.SetInputData(surface)
@@ -1086,8 +1208,8 @@ def _shells(surface):
     connectivity.Update()
     count = connectivity.GetNumberOfExtractedRegions()
     if count > MAX_SHELLS:
-        return []
-    shells = []
+        return ([], set()) if with_cells else []
+    shells, cells = [], set()
     for region in range(count):
         one = vtkPolyDataConnectivityFilter()
         one.SetInputData(surface)
@@ -1097,9 +1219,18 @@ def _shells(surface):
         clean.SetInputConnection(one.GetOutputPort())
         clean.Update()
         piece = clean.GetOutput()
-        if piece.GetNumberOfCells() >= 4 and not _open_edge_count(piece):
+        if piece.GetNumberOfCells() < 4:
+            continue
+        if not _open_edge_count(piece):
             shells.append(piece)
-    return shells
+            continue
+        for shell in _shared_face_shells(piece):
+            if len(shells) >= MAX_SHELLS:
+                break
+            cells.add(len(shells))
+            shells.append(_compact(shell))
+    shells = shells[:MAX_SHELLS]
+    return (shells, cells) if with_cells else shells
 
 
 def _enclosed(shell, points) -> list:
@@ -1200,8 +1331,17 @@ def _enclosed_voxels(shell, spacing, first, dims) -> list:
             if enclosed]
 
 
+def _shell_volume(shell) -> float:
+    from vtkmodules.vtkFiltersCore import vtkMassProperties
+
+    mass = vtkMassProperties()
+    mass.SetInputData(shell)
+    mass.Update()
+    return abs(float(mass.GetVolume()))
+
+
 def _lost_shells(surface, labels, assigned, spaces, spacing, first,
-                 implicit, cancelled=None, excluded=None):
+                 implicit, cancelled=None, excluded=None, shells=None):
     """Spaces the voxels lost, recovered from the closed shells (RP13 #4).
 
     A closed shell thinner than the wall band -- DP-863's 4 mm slot under
@@ -1212,12 +1352,19 @@ def _lost_shells(surface, labels, assigned, spaces, spacing, first,
     ``resolution_warning``, the shell's own volume and the voxels whose
     centres it encloses plus the one holding its inside point, and the
     space around it gives that volume back.
-    """
-    from vtkmodules.vtkFiltersCore import vtkMassProperties
 
-    shells = _shells(surface)
+    CHT1: *shells* (default `_shells(surface)`) includes the cells of a
+    conformal assembly, so the 2 mm pipe wall between two fluids is such a
+    space. The volume is given back by the spaces whose voxels it takes, in
+    proportion -- the wall band of a shared wall went to both sides, not to
+    one. Returns ``(assigned, spaces, shells)``, the last mapping each
+    recovered space to its shell.
+    """
+    if shells is None:
+        shells = _shells(surface)
     if not shells:
-        return assigned, spaces
+        return assigned, spaces, {}
+    recovered = {}
     nz, ny, nx = labels.shape
     origin = [first[axis] - spacing[axis] / 2 for axis in range(3)]
     byId = {space.id: space for space in spaces}
@@ -1249,15 +1396,15 @@ def _lost_shells(surface, labels, assigned, spaces, spacing, first,
         owners = [int(assigned[cell]) for cell in cells]
         for cell in cells:
             assigned[cell] = nextId
-        mass = vtkMassProperties()
-        mass.SetInputData(shell)
-        mass.Update()
-        volume = abs(float(mass.GetVolume()))
-        container = max(set(owners), key=owners.count)
-        if container in byId:
+        volume = _shell_volume(shell)
+        for container in set(owners):
+            if container not in byId:
+                continue
             around = byId[container]
+            share = volume * owners.count(container) / len(owners)
             byId[container] = replace(
-                around, volume=max(0.0, around.volume - volume))
+                around, volume=max(0.0, around.volume - share))
+        recovered[nextId] = shell
         byId[nextId] = Space(
             id=nextId, volume=volume,
             depth=abs(float(implicit.EvaluateFunction(point))),
@@ -1267,8 +1414,160 @@ def _lost_shells(surface, labels, assigned, spaces, spacing, first,
         nextId += 1
         added = True
     if not added:
-        return assigned, spaces
-    return assigned, tuple(byId[key] for key in sorted(byId))
+        return assigned, spaces, {}
+    return assigned, tuple(byId[key] for key in sorted(byId)), recovered
+
+
+def _join_cells(cells, shells, assigned, spaces, box, cancelled=None):
+    """CHT1: each cell of a conformal assembly is one space, exactly.
+
+    The cells come from a surface whose closed bodies share faces -- one
+    STL per region of a conjugate case. Each cell is a body the user
+    modelled as one region, and its inside is connected; the voxels are not
+    told that. MEASURED on the issue's three-region pipe at the default
+    2.9 mm voxels: the 8 mm cold annulus, 3.7 mm of free voxels across
+    once the wall band is off both walls, broke into four quarter rings,
+    and asked for three regions the detection proposed the hot core and two
+    quarters of the cold fluid. Here every enclosed space whose seed lies
+    in a cell (the innermost shell around it) is joined into that cell's
+    one space, and a cell holding no other shell takes the cell's own
+    volume. A single closed shell is left to the voxels: its narrow
+    passages are graded at h/2 the way RP13 #1 decided (DP-861).
+
+    Returns ``(assigned, spaces, shells)``; the last maps each cell's space
+    to the cell.
+    """
+    if not cells:
+        return assigned, spaces, {}
+
+    slack = 1e-9 * max(box[2 * axis + 1] - box[2 * axis] for axis in range(3))
+    usable = [index for index in sorted(cells)
+              if all(shells[index].GetBounds()[2 * axis] >= box[2 * axis]
+                     - slack and shells[index].GetBounds()[2 * axis + 1]
+                     <= box[2 * axis + 1] + slack for axis in range(3))]
+    if not usable:
+        return assigned, spaces, {}
+    volumes = {index: _shell_volume(shells[index])
+               for index in range(len(shells))}
+    enclosed = [space for space in spaces if not space.outside]
+    seeds = [space.seed for space in enclosed]
+    innermost = [None] * len(enclosed)
+    for index in range(len(shells)):
+        _check(cancelled, 'depth')
+        for position, inside in enumerate(_enclosed(shells[index], seeds)):
+            if inside and (innermost[position] is None
+                           or volumes[index] < volumes[innermost[position]]):
+                innermost[position] = index
+    # A cell that holds another shell's inside point is not one region's
+    # volume on its own; it keeps the voxels' volume.
+    holds_other = set()
+    points = {}
+    for index in range(len(shells)):
+        found = _inside_point(shells[index])
+        if found is not None:
+            points[index] = found[0]
+    for index in usable:
+        others = [point for other, point in points.items() if other != index
+                  and volumes[other] < volumes[index]]
+        if others and any(_enclosed(shells[index], others)):
+            holds_other.add(index)
+
+    groups: dict = {}
+    for space, index in zip(enclosed, innermost):
+        if index in usable:
+            groups.setdefault(index, []).append(space)
+    if not groups:
+        return assigned, spaces, {}
+    byId = {space.id: space for space in spaces}
+    joined = {}
+    copied = False
+    for index, members in sorted(groups.items()):
+        members.sort(key=lambda space: (-space.voxels, space.id))
+        keep = members[0]
+        if len(members) > 1:
+            if not copied:
+                assigned = np.array(assigned, copy=True)
+                copied = True
+            others = [space.id for space in members[1:]]
+            assigned[np.isin(assigned, others)] = keep.id
+            deepest = max(members, key=lambda space: (space.depth, -space.id))
+            bounds = []
+            for axis in range(3):
+                bounds.extend((
+                    min(space.bounds[2 * axis] for space in members),
+                    max(space.bounds[2 * axis + 1] for space in members)))
+            keep = replace(
+                keep, volume=sum(space.volume for space in members),
+                voxels=sum(space.voxels for space in members),
+                depth=deepest.depth, seed=deepest.seed,
+                bounds=tuple(bounds),
+                leaked=any(space.leaked for space in members),
+                resolution_warning=any(space.resolution_warning
+                                       for space in members))
+            for other in others:
+                byId.pop(other, None)
+        if index not in holds_other:
+            keep = replace(keep, volume=volumes[index])
+        byId[keep.id] = keep
+        joined[keep.id] = shells[index]
+    return assigned, tuple(byId[key] for key in sorted(byId)), joined
+
+
+def _near_mask(labels, thin):
+    """Flat booleans: voxels within one voxel (26-) of a label in *thin*.
+
+    ``None`` when there is no thin space: every lookup is then the voxel's.
+    """
+    if not thin:
+        return None
+    mask = np.isin(labels, list(thin))
+    if not mask.any():
+        return None
+    grown = mask.copy()
+    for axis in range(3):
+        step = grown.copy()
+        moved = np.zeros_like(grown)
+        index = [slice(None)] * 3
+        other = [slice(None)] * 3
+        index[axis], other[axis] = slice(1, None), slice(None, -1)
+        moved[tuple(index)] |= step[tuple(other)]
+        moved[tuple(other)] |= step[tuple(index)]
+        grown |= moved
+    return grown.ravel()
+
+
+def _shell_arrays(shell):
+    """``(points, triangles)`` of a closed shell, for the ``.npz`` cache."""
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    points = np.ascontiguousarray(
+        vtk_to_numpy(shell.GetPoints().GetData()), dtype=np.float64)
+    polys = shell.GetPolys()
+    triangles = np.ascontiguousarray(
+        vtk_to_numpy(polys.GetConnectivityArray()), dtype=np.int64
+    ).reshape(-1, 3)
+    return points, triangles
+
+
+def _shell_from_arrays(points, triangles):
+    """The shell `_shell_arrays` stored."""
+    from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+
+    points = np.ascontiguousarray(points, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
+    vtkpoints = vtkPoints()
+    vtkpoints.SetData(numpy_to_vtk(points, deep=1))
+    offsets = np.arange(0, 3 * len(triangles) + 1, 3, dtype=np.int64)
+    cells = vtkCellArray()
+    cells.SetData(numpy_to_vtkIdTypeArray(offsets, deep=1),
+                  numpy_to_vtkIdTypeArray(
+                      np.ascontiguousarray(triangles.ravel()), deep=1))
+    shell = vtkPolyData()
+    shell.SetPoints(vtkpoints)
+    shell.SetPolys(cells)
+    return shell
 
 
 def _bounds_box(bounds):

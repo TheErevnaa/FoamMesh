@@ -133,13 +133,26 @@ class VerticalSliceOperations:
 
         cancelled_checks = await asyncio.to_thread(
             local_worker.cancel_all, str(session.case_path))
-        cancelled = len(cancelled_budgets) + cancelled_jobs + cancelled_checks
+        # Plan 42 SG16 (D9). A Gmsh session action runs in this process, with
+        # no job manager entry; it registers a cancel callback instead.
+        from foammesh.core.jobs import session_actions
+
+        cancelled_sessions = session_actions.cancel_all(session.case_path)
+        # Plan 42 SG12. A running section is a job too: the footer Cancel
+        # stops it, the Section panel's Cancel stops only it.
+        from foammesh.core.section import cancel_registry
+
+        cancelled_sections = cancel_registry.cancel_all()
+        cancelled = (len(cancelled_budgets) + cancelled_jobs + cancelled_checks
+                     + cancelled_sessions + cancelled_sections)
         return OperationResult(
             'accepted', command.operation, session.revisions,
             payload={'cancelled': cancelled,
                      'job_ids': list(job_ids),
                      'diagnostic_ids': cancelled_budgets,
                      'checks_cancelled': cancelled_checks,
+                     'session_actions_cancelled': cancelled_sessions,
+                     'sections_cancelled': cancelled_sections,
                      'recovery': ('managed_by_operation' if cancelled_jobs
                                   else 'not_required')})
 

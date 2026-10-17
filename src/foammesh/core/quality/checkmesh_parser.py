@@ -119,6 +119,9 @@ class CheckMeshResult:
     #: The retained-region judgement a snappy run attaches
     #: (``core/quality/retained_regions.assess``), or ``None``.
     retained: dict | None = None
+    #: DP-2635. The thin-region judgement a snappy run attaches
+    #: (``core/quality/thin_regions.assess``), or ``None``.
+    thin_regions: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -157,6 +160,8 @@ class CheckMeshResult:
             'region_cells': list(self.region_cells),
             'total_volume': self.total_volume,
             'retained': dict(self.retained) if self.retained else None,
+            'thin_regions': (dict(self.thin_regions) if self.thin_regions
+                             else None),
             'quality_grade': self.quality_grade,
             'quality_indicators': self.quality_indicators(),
         }
@@ -552,7 +557,7 @@ def _recommendations(result: CheckMeshResult) -> list[str]:
     recommendations = []
     joined = ' '.join(result.failed_check_details + result.warnings).lower()
     if result.incomplete:
-        recommendations.append('Run Mesh check again; the log ended before a final verdict.')
+        recommendations.append('Run mesh check again; the log ended before a final verdict.')
     if result.max_non_ortho is not None and result.max_non_ortho > 70:
         recommendations.append('Review highly non-orthogonal cells and local refinement or geometry quality.')
     if result.max_skewness is not None and result.max_skewness > 4:

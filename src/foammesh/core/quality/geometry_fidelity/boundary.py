@@ -317,6 +317,25 @@ def load_native(msh_path: str | Path, identity: IdentityMap, *,
                            expected_uuids=expected_uuids)
 
 
+def load_native_mesh(path: str | Path, identity: IdentityMap, *,
+                     checkpoint: str = 'native',
+                     expected_uuids=None) -> BoundaryModel:
+    """Plan 41 GN23. The boundary of a Gmsh hand-over / ``.msh``, reconciled
+    like a published polyMesh's, with no polyMesh to read.
+
+    The sections carry face ids that are positions in the patch-by-patch list
+    of the surface elements -- the labels the viewport paints a stored
+    deviation field by -- so a stored hotspot lands on the faces it measured.
+    """
+    from foammesh.core.mesh import native_mesh
+
+    mesh = native_mesh.boundary_poly_mesh(native_mesh.read_native_mesh(path))
+    return BoundaryModel(
+        mesh=mesh,
+        sections=sections_from(mesh, identity, expected_uuids=expected_uuids),
+        checkpoint=checkpoint, engine_id=identity.engine_id)
+
+
 # --------------------------------------------------------------------------- #
 # Extraction integrity (the WP3 gate)
 # --------------------------------------------------------------------------- #

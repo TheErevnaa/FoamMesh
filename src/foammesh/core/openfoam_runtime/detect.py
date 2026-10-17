@@ -33,12 +33,28 @@ BASHRC_CANDIDATES = (
 #: Distributions that are WSL plumbing, not places a user installs OpenFOAM.
 _IGNORED_PREFIXES = ('docker-desktop', 'rancher-desktop', 'podman-machine')
 
+#: Where the size-field tool is looked for, in order: the copy FoamMesh puts in
+#: the distribution user's home (``core/sizing/tool_setup.py``), then a
+#: developer's own build.
+SIZEFIELD_USER_BINARY = '$HOME/.local/share/foammesh/sizefield/foammesh-sizefield'
+SIZEFIELD_BINARY = '/opt/foammesh/bin/foammesh-sizefield'
+SIZEFIELD_CANDIDATES = (SIZEFIELD_USER_BINARY, SIZEFIELD_BINARY)
+
 _PROBE_SCRIPT = (
     'echo "user=$(id -un)"; echo "home=$HOME"; '
     'for f in ' + ' '.join(f'"{path}"' for path in BASHRC_CANDIDATES) + '; do '
     '[ -f "$f" ] && { echo "bashrc=$f"; break; }; done; '
     'python3 -c "import gmsh; print(\'gmsh=\' + str(getattr(gmsh, \'__version__\', '
-    'None) or gmsh.GMSH_API_VERSION))" 2>/dev/null; true'
+    'None) or gmsh.GMSH_API_VERSION))" 2>/dev/null; '
+    # Plan 41 GN25e: the automatic size-field tool, first copy that starts.
+    # DP-1442: an isolated MPI singleton (no orted) under a watchdog.
+    'export OMPI_MCA_ess_singleton_isolated=1 OMPI_MCA_btl=self '
+    'OMPI_MCA_plm=isolated; '
+    'for p in ' + ' '.join(f'"{path}"' for path in SIZEFIELD_CANDIDATES)
+    + '; do [ -x "$p" ] || continue; '
+    'v=$(timeout -k 5 30 "$p" --version 2>/dev/null | head -n 1); '
+    '[ -n "$v" ] && { echo "sizefield=$v"; echo "sizefield_path=$p"; break; }; '
+    'done; true'
 )
 
 Runner = Callable[[Sequence[str], float], 'tuple[int, bytes]']
@@ -50,6 +66,11 @@ class DetectedRuntime:
     user: str
     bashrc: str = ''
     gmsh_version: str = ''
+    #: First line of ``foammesh-sizefield --version``; empty when it is missing
+    #: or does not start (for example libp4est/libsc absent).
+    sizefield_version: str = ''
+    #: Where that copy is (``sizefield_version`` came from running it).
+    sizefield_path: str = ''
 
     @property
     def has_openfoam(self) -> bool:
@@ -59,9 +80,15 @@ class DetectedRuntime:
     def has_gmsh(self) -> bool:
         return bool(self.gmsh_version)
 
+    @property
+    def has_sizefield(self) -> bool:
+        return bool(self.sizefield_version)
+
     def describe(self) -> str:
         parts = ['OpenFOAM 13' if self.has_openfoam else 'no OpenFOAM 13',
-                 f'Gmsh {self.gmsh_version}' if self.has_gmsh else 'no Gmsh']
+                 f'Gmsh {self.gmsh_version}' if self.has_gmsh else 'no Gmsh',
+                 self.sizefield_version if self.has_sizefield
+                 else 'no size-field tool']
         return f'{self.distribution} as {self.user}: ' + ', '.join(parts)
 
 
@@ -122,7 +149,25 @@ def probe(distribution: str, user: str | None, *, wsl: str = 'wsl.exe',
     if bashrc.startswith('$HOME') and home:
         bashrc = home + bashrc[len('$HOME'):]
     return DetectedRuntime(distribution, values['user'], bashrc,
-                           values.get('gmsh', ''))
+                           values.get('gmsh', ''), values.get('sizefield', ''),
+                           values.get('sizefield_path', ''))
+
+
+def sizefield_refusal(runtime: DetectedRuntime | None) -> str:
+    """Why the automatic size field cannot run on *runtime*, or '' if it can.
+
+    The text says what was measured (the probe of ``--version``), not a guess.
+    """
+    if runtime is None:
+        return ('The automatic size field needs the WSL runtime, and none was '
+                'found on this host.')
+    if runtime.has_sizefield:
+        return ''
+    return (f'The automatic size field is unavailable: running '
+            f'{SIZEFIELD_USER_BINARY} --version (and {SIZEFIELD_BINARY}) in '
+            f'{runtime.distribution} as {runtime.user} printed nothing, so '
+            f'the tool is not there or does not start. Use "Set up automatic '
+            f'sizing" on the Automatic sizing card to copy it from FoamMesh.')
 
 
 def candidates(configured_distribution: str, configured_user: str,

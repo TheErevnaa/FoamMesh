@@ -15,7 +15,8 @@ import vtkmodules.vtkInteractionStyle
 # noinspection PyUnresolvedReferences
 import vtkmodules.vtkRenderingOpenGL2
 from PySide6.QtCore import QTimer, Qt, Signal, QObject
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import (
+    QColor, QLinearGradient, QMouseEvent, QPainter)
 from PySide6.QtWidgets import (
     QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QStackedLayout,
     QVBoxLayout, QWidget)
@@ -27,25 +28,43 @@ from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkInteractionWidgets import vtkLogoRepresentation, vtkLogoWidget, vtkOrientationMarkerWidget
 from vtkmodules.vtkIOImage import vtkPNGReader, vtkPNGWriter
 from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
-from vtkmodules.vtkRenderingAnnotation import vtkAxesActor, vtkCubeAxesActor
-from vtkmodules.vtkRenderingCore import vtkActor, vtkRenderer, vtkPropPicker, vtkLightKit, vtkProp
+from vtkmodules.vtkRenderingAnnotation import vtkAnnotatedCubeActor, vtkAxesActor, vtkCubeAxesActor
+from vtkmodules.vtkRenderingCore import (
+    vtkActor, vtkCellPicker, vtkLightKit, vtkProp, vtkPropAssembly, vtkPropPicker,
+    vtkRenderer)
 
 from foammesh.support import disposal, heartbeat, lifecycle, safe_mode
 from foammesh.support.vtk_threads import isRenderingHold
+from foammesh.rendering.pick_alone import pick_prop
 
+from foammesh.rendering import hover_readout, label_pass, label_style, measure
 from foammesh.rendering import (
     gl_health, gpu_profile, interaction_lod, render_style)
 from foammesh.view.theming.metrics import apply_prose_measure
-from foammesh.view.theming.vtk_theme import apply_vtk_theme
+from foammesh.view.theming.vtk_theme import (
+    WATERMARK_OPACITY_DARK, apply_triad_theme, apply_vtk_theme,
+    watermark_opacity)
 from foammesh.core.quantities import format_group
 from app_properties import meshAppProperties
 from foammesh.core.branding import watermark_geometry
+from foammesh.view.display_control.overlay_layout import OverlayLayout, Slot, apply_to_scalar_bar
 
 
 logger = logging.getLogger(__name__)
 
 RENDER_DELAY_TIME = 200
 REPAINT_SUPPRESS_TIME = 100
+#: UXB5 (N4). A paint that arrives while a hold is on is dropped, and the
+#: native surface behind it is then whatever the window system left: black.
+#: If the hold is still on this long after such a paint, the view is covered
+#: with its own background and a line saying so, until the first real frame.
+HOLD_COVER_DELAY = 120
+#: DP-2705. How often a raised cover asks whether the hold is over (ms).
+HOLD_COVER_WATCH = 50
+#: DP-2705. A second real frame this long after the cover comes down (ms),
+#: in case the window system's own repaint of the uncovered area lands after
+#: the first one.
+HOLD_COVER_SETTLE = 150
 
 #: Multisampling for the opaque scene at start-up -- the Balanced preset's.
 #: Depth peeling cannot coexist with it on the OpenGL2 backend; how the view
@@ -72,6 +91,56 @@ def _presetDirections(preset: str):
         return _VIEW_PRESETS[preset.lower()]
     except KeyError as error:
         raise ValueError(f'unknown view preset: {preset}') from error
+
+
+#: Plan 44 MF15 (F25, VV13). The orientation triad is a fixed 52 logical px
+#: square, 20 px right of the clear area's left edge and 22 px above its
+#: bottom (the console's top): the mockup's size, not a share of the window.
+#: It was a 0.2 share between 96 and 160 px in Plan 39 VI15.
+CORNER_SIZE = 52
+CORNER_LEFT = 20
+CORNER_BOTTOM = 22
+#: DP-2651. 2.4 drew 54 saturated pixels in the live render window (60 wanted;
+#: the offscreen test read 71); 3.4 draws about 76 live.
+TRIAD_AXIS_WIDTH = 3.4
+#: MF27. The corner axes run from the cube's centre to its faces.
+CORNER_AXES_LENGTH = (0.5, 0.5, 0.5)
+#: DP-2651. The axes run inside the cube, so an opaque face hid all but a
+#: stub of them (36 saturated pixels in the live read, the mockup draws three
+#: 16 px arms on top of its hexagon). The faces are translucent so the axes
+#: show through, as the mockup's lines do.
+TRIAD_FACE_OPACITY = 0.3
+#: The world-origin triad's arms are this share of the visible bounds' span.
+ORIGIN_ARM_SHARE = 0.25
+#: DP-2721. The origin triad's X, Y, Z: a fixed 14 px in the axis colours.
+#: VTK's default caption is white and scales with the window (60 px letters
+#: at 1920 x 960, unreadable on the light ground).
+ORIGIN_LABEL_PX = 14
+
+
+def facePresetAt(position) -> str | None:
+    """The view preset for a point on the orientation cube's surface.
+
+    The cube is centred on the corner's origin, so the face a point is on is
+    the axis it is furthest along, and clicking a face looks at that face.
+    """
+    values = [float(value) for value in position]
+    if len(values) != 3 or max(abs(value) for value in values) == 0.0:
+        return None
+    axis = max(range(3), key=lambda index: abs(values[index]))
+    return ('+' if values[axis] > 0 else '-') + 'xyz'[axis]
+
+
+def cornerSize(width: int, height: int, device_pixel_ratio: float = 1.0) -> int:
+    """Device pixels on a side of the orientation triad for a view this size.
+
+    ``width`` and ``height`` are the view's own (logical) size; the result is
+    52 logical pixels times the device-pixel ratio, never more than the view.
+    """
+    if width <= 0 or height <= 0:
+        return 0
+    dpr = max(float(device_pixel_ratio), 1.0)
+    return int(min(round(CORNER_SIZE * dpr), width * dpr, height * dpr))
 
 
 def _sameModel(old, new) -> bool:
@@ -188,6 +257,28 @@ def cubeAxisTicks(lo: float, hi: float) -> list[float]:
         ticks.append(0.0 if abs(value) < step * 1e-9 else value)
         value += step
     return ticks or [float(lo)]
+
+
+def styleOriginLabels(actor, tokens) -> None:
+    """DP-2721. The origin triad's captions at ``ORIGIN_LABEL_PX``, unscaled,
+    plain, each in its axis's colour once a theme is known."""
+    captions = (actor.GetXAxisCaptionActor2D(), actor.GetYAxisCaptionActor2D(),
+                actor.GetZAxisCaptionActor2D())
+    colours = None
+    if tokens is not None:
+        from foammesh.view.theming.vtk_theme import rgb
+        colours = [rgb(tokens.value(name)) for name in
+                   ('status.error', 'status.success', 'status.info')]
+    for index, caption in enumerate(captions):
+        caption.GetTextActor().SetTextScaleModeToNone()
+        caption.BorderOff()
+        text = caption.GetCaptionTextProperty()
+        text.SetFontSize(ORIGIN_LABEL_PX)
+        text.BoldOn()
+        text.ItalicOff()
+        text.ShadowOff()
+        if colours is not None:
+            text.SetColor(*colours[index])
 
 
 def cubeAxisLabels(lo: float, hi: float) -> list[str]:
@@ -372,6 +463,22 @@ def _quietly(call, *args):
         return None
 
 
+def blockVtkCharacterKeys(style):
+    """DP-1469 (VP-181). Stop the trackball style answering w, s, e, q, f, r
+    and 3 itself; the app's own keys are Qt shortcuts and stay."""
+    def _swallow(caller, event):
+        # MF27: nothing to do. A vtkInteractorStyle with a CharEvent observer
+        # (and HandleObservers on) calls the observers *instead of* OnChar,
+        # so the observer's presence is the block. The old body called
+        # caller.SetAbortFlag(1), which the style does not have: every
+        # blocked key raised into the app's excepthook.
+        return None
+    # An observer on the style: vtkInteractorStyle::ProcessEvents runs it in
+    # place of the style's own OnChar.
+    style.AddObserver(vtkCommand.CharEvent, _swallow, 10.0)
+    return style
+
+
 class RenderWindowInteractor(QVTKRenderWindowInteractor):
     def __init__(self, parent=None, **kw):
         self._delayTimer = QTimer()
@@ -386,6 +493,10 @@ class RenderWindowInteractor(QVTKRenderWindowInteractor):
         #: Plan 35 CR8. The owner's guarded render: ``guard(draw, what)``
         #: runs ``draw`` and turns a failure into the viewport placeholder.
         self.renderGuard = None
+        #: UXB5. The owner's hooks: a paint was dropped because a hold is on,
+        #: and a real frame was drawn.
+        self.onHeldPaint = None
+        self.onDrawn = None
 
         super().__init__(parent=parent, **kw)
 
@@ -397,6 +508,9 @@ class RenderWindowInteractor(QVTKRenderWindowInteractor):
     def paintEvent(self, ev):
         if isRenderingHold():
             self._delayTimer.start()
+            held = self.onHeldPaint
+            if held is not None:
+                held()
             return
 
         # Plan 35 CR8. A paint is where QVTK really draws (its Render() only
@@ -404,8 +518,11 @@ class RenderWindowInteractor(QVTKRenderWindowInteractor):
         guard = self.renderGuard
         if guard is not None:
             guard(lambda: self._paint(ev), 'paint')
-            return
-        self._paint(ev)
+        else:
+            self._paint(ev)
+        drawn = self.onDrawn
+        if drawn is not None:
+            drawn()
 
     def _paint(self, ev):
         if platform.system() == 'Darwin':
@@ -495,6 +612,88 @@ class MouseHandler(QObject):
 
     def _mouseMoved(self, x, y, px, py):
         return False
+
+
+class HoldCover(QWidget):
+    """UXB5 (N4). What the viewport shows while a hold dropped its paints.
+
+    The view's own background, top to bottom, and one line of text. It is
+    there so that a reload reads as "updating" and not as a fault.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName('viewportHoldCover')
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self._top = QColor(56, 61, 84)
+        self._bottom = QColor(209, 209, 209)
+        self._radial = None
+        self._text = ''
+        self.hide()
+
+    def setColors(self, top, bottom):
+        self._top, self._bottom = QColor(top), QColor(bottom)
+        self._radial = None
+        self.update()
+
+    def setRadial(self, centre, mid, edge):
+        """MF15. Paint the same off-centre radial the VTK background shows."""
+        self._radial = (QColor(centre), QColor(mid), QColor(edge))
+        self._top, self._bottom = QColor(edge), QColor(mid)
+        self.update()
+
+    def radial(self):
+        return self._radial
+
+    def _radialImage(self):
+        import numpy as np
+        from PySide6.QtGui import QImage
+        from foammesh.view.theming.vtk_theme import radial_background_array
+        key = tuple(color.name() for color in self._radial)
+        if getattr(self, '_radialKey', None) != key:
+            pixels = np.ascontiguousarray(radial_background_array(*key)[::-1])
+            size = pixels.shape[0]
+            self._radialPixels = QImage(
+                pixels.data, size, size, size * 3,
+                QImage.Format.Format_RGB888).copy()
+            self._radialKey = key
+        return self._radialPixels
+
+    def setText(self, text):
+        self._text = str(text or '')
+        self.update()
+
+    def text(self) -> str:
+        return self._text
+
+    def colors(self):
+        return self._top, self._bottom
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if self._radial is not None:
+            # The very pixels the VTK background shows: the same texture.
+            painter.drawImage(self.rect(), self._radialImage())
+        else:
+            gradient = QLinearGradient(0, 0, 0, self.height())
+            gradient.setColorAt(0.0, self._top)
+            gradient.setColorAt(1.0, self._bottom)
+            painter.fillRect(self.rect(), gradient)
+        if self._text:
+            middle = QColor(self._top)
+            middle = QColor(
+                (middle.red() + self._bottom.red()) // 2,
+                (middle.green() + self._bottom.green()) // 2,
+                (middle.blue() + self._bottom.blue()) // 2)
+            # Whichever of black and white reads against the middle of the
+            # gradient, so the line is legible in both themes.
+            luminance = (0.299 * middle.red() + 0.587 * middle.green()
+                         + 0.114 * middle.blue())
+            painter.setPen(QColor(0, 0, 0, 170) if luminance > 140
+                           else QColor(255, 255, 255, 200))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             self._text)
+        painter.end()
 
 
 class ViewportPlaceholder(QFrame):
@@ -591,10 +790,21 @@ def _applyQuality(view, name: str) -> bool:
 
 class RenderingWidget(QWidget):
     actorPicked = Signal(vtkActor, bool, bool)
+    #: Plan 43 LY8. The labels font/size or the legends switch changed, from
+    #: whichever control (Snapshot popover, Preferences, View menu).  The View
+    #: menu state follows these.
+    labelStyleChanged = Signal(object)
+    legendsShownChanged = Signal(bool)
+    #: Plan 44 F1 (MF15, Q9). The watermark was shown (True) or hidden
+    #: (False), by View > Overlays and rendering > Watermark or by code.
+    watermarkShownChanged = Signal(bool)
     viewClosed = Signal()
     #: The name of the part under the cursor, or '' when the cursor is over
     #: nothing. The picture is expected to answer "what is this" on its own.
     actorHovered = Signal(str)
+    #: Plan 39 VI15 (I2). What is under the cursor, as text, and where (view
+    #: pixels, origin top-left); '' takes the readout down.
+    hoverReadout = Signal(str, int, int)
     #: True while the viewport is showing less than the full mesh to stay
     #: responsive. Nothing may drop detail without saying so.
     detailReduced = Signal(bool)
@@ -638,8 +848,37 @@ class RenderingWidget(QWidget):
 
         self._dialog: Optional[QFileDialog] = None
 
+        #: Plan 39 VI15 (I10). The viewport triad in the corner: always on,
+        #: an axes triad inside an annotated cube whose faces are the view
+        #: presets. (Named `_originAxes` before; the world-origin triad is
+        #: `_originTriad` now.)
         self._originAxes: Optional[vtkOrientationMarkerWidget] = None
         self._originAxesActor: Optional[vtkAxesActor] = None
+        self._cornerCube = None
+        self._cornerPixels = 0
+        self._cornerObserver = None
+        #: The world-origin triad (the toolbar's Origin axes): an axes actor at
+        #: (0, 0, 0) on a layer of its own, drawn over the model.
+        self._originTriad = None
+        self._originRenderer = None
+        self._originTriadOn = False
+        #: One layout for everything drawn over the picture (I4).
+        self._overlayLayout = OverlayLayout()
+        self._measureState = measure.MeasureState()
+        self._measureActors = []
+        self._legends = {}
+        #: Plan 44 FX3 (L2). Legends drawn only into a saved picture: the
+        #: screen has the one themed Qt legend (Plan 43 LY11), so a scalar
+        #: bar kept for the VTK-only snapshot must never show on screen.
+        self._pictureOnlyLegends = set()
+        # Plan 43 LY15. One font and size for every label; the groups
+        # ('worst', 'caption') the Include boxes switch; the sizes the labels
+        # were built with, so that Large is a multiple of them and Normal
+        # puts them back.
+        self._labelStyle = label_style.load()
+        self._labelGroups = {}
+        self._labelGroupShown = {'worst': True, 'caption': True}
+        self._labelBase = {}
         self._cubeAxesActor: Optional[vtkCubeAxesActor] = None
         self._themeTokens = None
         # DP-701. The gradient ends the user picked, which a theme pass must
@@ -648,7 +887,7 @@ class RenderingWidget(QWidget):
 
         self._actorPicker = vtkPropPicker()
 
-        self._style = vtkInteractorStyleTrackballCamera()
+        self._style = blockVtkCharacterKeys(vtkInteractorStyleTrackballCamera())
         self._widget = RenderWindowInteractor(self)
         self._widget.GetRenderWindow().SetMultiSamples(
             0 if self._safeMode else MULTI_SAMPLES)
@@ -656,6 +895,31 @@ class RenderingWidget(QWidget):
         self._widget.renderGuard = self._guardedRender
         self._watchRenderWindow(self._widget.GetRenderWindow())
         _holdRenderRate(self._widget)
+        self._holdCover = None
+        self._holdCoverTimer = QTimer(self)
+        self._holdCoverTimer.setSingleShot(True)
+        self._holdCoverTimer.setInterval(HOLD_COVER_DELAY)
+        self._holdCoverTimer.timeout.connect(self._showHoldCover)
+        # DP-2705. The cover is a native window over the native view, so
+        # once it is up Windows sends the view no paint and the "first real
+        # frame" that was to take it down never comes. This watch takes it
+        # down when the hold ends.
+        self._holdCoverWatch = QTimer(self)
+        self._holdCoverWatch.setInterval(HOLD_COVER_WATCH)
+        self._holdCoverWatch.timeout.connect(self._watchHoldCover)
+        #: DP-2705. A paint was dropped under a hold (or a frame was drawn
+        #: while the cover was up, clipped by it): a real frame is owed.
+        self._frameOwed = False
+        self._presentNowTimer = QTimer(self)
+        self._presentNowTimer.setSingleShot(True)
+        self._presentNowTimer.setInterval(0)
+        self._presentNowTimer.timeout.connect(self._presentFrame)
+        self._presentSettleTimer = QTimer(self)
+        self._presentSettleTimer.setSingleShot(True)
+        self._presentSettleTimer.setInterval(HOLD_COVER_SETTLE)
+        self._presentSettleTimer.timeout.connect(self._presentFrame)
+        self._widget.onHeldPaint = self._heldPaint
+        self._widget.onDrawn = self._frameDrawn
 
         self._depthPeeling = False
         #: Plan 35 CR8 step 2. Translucency wanted, peeling dropped (budget).
@@ -665,6 +929,7 @@ class RenderingWidget(QWidget):
         #: DP-736. The visible bounds the camera history was recorded on.
         self._historyBounds = None
         self._cameraMovedByUser = False
+        self._modelFitted = False
         self._refitOnResize = False
 
         self._ambientOcclusion = False
@@ -677,6 +942,11 @@ class RenderingWidget(QWidget):
 
         self._hoverEnabled = True
         self._hoveredName = ''
+        #: I2. On by default; View > Hover readout turns it off.
+        self._readoutEnabled = True
+        self._hoverInfo = None
+        self._hoverVolume = None
+        self._readoutText = ''
         self._hoverTimer = QTimer(self)
         self._hoverTimer.setInterval(HOVER_DWELL_TIME)
         self._hoverTimer.setSingleShot(True)
@@ -691,6 +961,21 @@ class RenderingWidget(QWidget):
             self._renderer)
         self._interactionDetailBuilding = False
         self._interactionDetailTried = False
+        #: Plan 39 VI3. A camera drag is between its start and end events.
+        self._interactionInFlight = False
+        #: perf_counter at the start of the frame being drawn.
+        self._frameStart = None
+        #: Closing round 2026-10-12 (VI14). GPU timer queries of frames not
+        #: yet read, and the finished timings not yet handed to the detail.
+        self._gpuTimers = []
+        self._gpuSeconds = []
+        self._gpuTimerSupported = None
+        self._gpuTimerPoll = QTimer(self)
+        self._gpuTimerPoll.setSingleShot(True)
+        self._gpuTimerPoll.setInterval(20)
+        self._gpuTimerPoll.timeout.connect(self._pollGpuTimers)
+        #: Hover picks not made because a frame was in flight.
+        self.hoverPicksSkipped = 0
         self._interactionDetailTimer = QTimer(self)
         self._interactionDetailTimer.setSingleShot(True)
         self._interactionDetailTimer.setInterval(INTERACTION_DETAIL_DELAY)
@@ -724,6 +1009,10 @@ class RenderingWidget(QWidget):
         self._placeholder = ViewportPlaceholder(self)
         self._placeholder.actionRequested.connect(self.recreateViewport)
         self._stack.addWidget(self._placeholder)
+        self._holdCover = HoldCover(self)
+        # Plan 39 VI14d. Its window handle is made now, hidden; made at the
+        # first show it held the GUI thread for about 30 ms in a section raise.
+        self._holdCover.winId()
 
         self._originalMouseObserver = MouseHandler(self._style)
         self._mouseObserver = self._originalMouseObserver
@@ -750,6 +1039,7 @@ class RenderingWidget(QWidget):
                 self.applyTheme(app.themeManager.tokens)
             app.themeManager.themeChanged.connect(self._themeChanged)
 
+        self._installViewportOverlays()
         disposal.track(self, 'RenderingWidget')
 
         # Plan 35 CR8. Initialising the interactor makes the GL context and
@@ -786,6 +1076,133 @@ class RenderingWidget(QWidget):
     def refresh(self):
         self._widget.Render()
 
+    def setClearInsets(self, left=0, top=0, right=0, bottom=0):
+        """Plan 43 LY5. Centre the model in the clear area.
+
+        The sheet and the console take ``left``/``top``/``right``/``bottom``
+        pixels of the viewport; the camera's window centre moves the
+        projection so the model sits in what is left. Nothing in the scene,
+        the camera position or the picker changes.
+        """
+        self._clearInsets = (int(left), int(top), int(right), int(bottom))
+        self._applyClearInsets()
+        self._layoutCorner()
+        self.arrangeOverlays()
+        if self._modelFitted and not self._cameraMovedByUser:
+            # Plan 44 MF7. Still the framing this view chose: it follows the
+            # clear area, so the model keeps 80 % of what is left.
+            self.fitCamera()
+            return
+        self._renderUnlessHeld()
+
+    def _centredForCapture(self):
+        """A saved picture is of the whole window, so its window centre goes
+        back to the middle for the length of the capture and the on-screen
+        centring (in the clear area) is restored after it. Without this the
+        model sits off-centre in every PNG, SVG and clipboard image."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def centred():
+            camera = self._renderer.GetActiveCamera()
+            if camera is None:
+                yield
+                return
+            was = tuple(camera.GetWindowCenter())
+            camera.SetWindowCenter(0.0, 0.0)
+            # The triad sits in the clear area's corner on screen; a saved
+            # picture is of the whole window, so it goes to the window's own
+            # corner for the length of the capture, as the window centre does.
+            marker = self._originAxes
+            viewport = None
+            if marker is not None and self._cornerPixels > 0:
+                viewport = _quietly(marker.GetViewport)
+                viewport = None if viewport is None else tuple(viewport)
+                if viewport is not None:
+                    _quietly(marker.SetViewport, 0.0, 0.0,
+                             self._cornerPixels / max(self.width(), 1),
+                             self._cornerPixels / max(self.height(), 1))
+            try:
+                yield
+            finally:
+                camera.SetWindowCenter(*was)
+                if viewport is not None:
+                    _quietly(marker.SetViewport, *viewport)
+        return centred()
+
+    def clearRect(self):
+        """Plan 44 MF7. The clear area in the view's pixels (a ``QRect``, y
+        down): the one rectangle the model fit, the triad, the legends and
+        every overlay slot are laid out against."""
+        from foammesh.view.main_window.clear_area import Insets, clear_rect_int
+        return clear_rect_int(self.width(), self.height(),
+                              Insets(*self.clearInsets()))
+
+    def _renderUnlessHeld(self):
+        """Render, except while a hold is on (DP-347) or the view is gone."""
+        if (self._disposed or self._suspended is not None
+                or isRenderingHold()):
+            return
+        self._widget.Render()
+
+    def _projectedExtent(self, bounds):
+        """``(x0, y0, x1, y1)`` in view pixels (y down) of the projected
+        corners of *bounds*, or None while the renderer has no size."""
+        renderer = self._renderer
+        size = renderer.GetSize()
+        if not size or self.width() <= 0 or self.height() <= 0:
+            return None
+        rw, rh = size
+        if rw <= 0 or rh <= 0:
+            return None
+        xs, ys = [], []
+        for x in bounds[0:2]:
+            for y in bounds[2:4]:
+                for z in bounds[4:6]:
+                    renderer.SetWorldPoint(x, y, z, 1.0)
+                    renderer.WorldToDisplay()
+                    dx, dy, _ = renderer.GetDisplayPoint()
+                    xs.append(dx * self.width() / rw)
+                    ys.append((rh - dy) * self.height() / rh)
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _fitToClearArea(self):
+        """Plan 44 MF7. Size the model to 80 % of the clear area's height
+        (and width, whichever binds), centred on it. The window centre is
+        already on the clear centre, so only the scale is left to set."""
+        from foammesh.view.main_window.clear_area import fit_factor
+        bounds = self._visibleBounds()
+        camera = self._renderer.GetActiveCamera()
+        if bounds is None or camera is None:
+            return
+        clear = self.clearRect()
+        self._applyClearInsets()
+        for _ in range(8):
+            box = self._projectedExtent(bounds)
+            if box is None:
+                return
+            factor = fit_factor(box[2] - box[0], box[3] - box[1],
+                                clear.width(), clear.height())
+            if abs(factor - 1.0) < 0.001 or factor <= 0:
+                return
+            if camera.GetParallelProjection():
+                camera.SetParallelScale(camera.GetParallelScale() / factor)
+            else:
+                camera.Dolly(factor)
+            self._renderer.ResetCameraClippingRange()
+
+    def clearInsets(self):
+        return getattr(self, '_clearInsets', (0, 0, 0, 0))
+
+    def _applyClearInsets(self):
+        from foammesh.view.main_window.clear_area import Insets, window_center
+        camera = self._renderer.GetActiveCamera()
+        if camera is None:
+            return
+        width, height = self._widget.width(), self._widget.height()
+        camera.SetWindowCenter(
+            *window_center(width, height, Insets(*self.clearInsets())))
+
     def fitCamera(self):
         cubeAxesOn = False
         if self._cubeAxesActor is not None:
@@ -807,8 +1224,13 @@ class RenderingWidget(QWidget):
         else:
             self._renderer.ResetCameraScreenSpace()
 
+        # Plan 44 MF7: the model is sized to the clear area, not the view.
+        self._fitToClearArea()
+
         if cubeAxesOn:
             self._showCubeAxes()
+
+        self._resizeOriginTriad()
 
         if self._ambientOcclusion:
             # The cavity-shading radius is a fraction of the model, and the
@@ -823,7 +1245,8 @@ class RenderingWidget(QWidget):
         # theirs and re-fitting would undo their work.
         self._cameraMovedByUser = False
         self._refitOnResize = True
-        self._widget.Render()
+        self._modelFitted = True
+        self._renderUnlessHeld()
 
     def renderWindow(self):
         """The VTK render window this view draws into; None once finalised."""
@@ -861,6 +1284,7 @@ class RenderingWidget(QWidget):
         """
         try:
             window.AddObserver(vtkCommand.ErrorEvent, self._renderWindowError)
+            window.AddObserver(vtkCommand.StartEvent, self._renderWindowStarted)
             window.AddObserver(vtkCommand.EndEvent, self._renderWindowEnded)
         except Exception:                                   # noqa: BLE001
             pass
@@ -879,15 +1303,222 @@ class RenderingWidget(QWidget):
         if self._renderError and self._suspended is None and not self._disposed:
             self._contextLost(self._renderError)
 
+    def _renderWindowStarted(self, _caller=None, _event=None):
+        self._frameStart = time.perf_counter()
+        self._startGpuTimer()
+
+    # -- closing round 2026-10-12 (VI14): a frame is timed, not waited for --- #
+
+    def _gpuTimingWanted(self) -> bool:
+        """Whether this frame is one the interaction detail will read."""
+        detail = self.__dict__.get('_interactionDetail')
+        try:
+            return (detail is not None and not detail.active()
+                    and detail.worthTiming())
+        except Exception:                                   # noqa: BLE001
+            return False
+
+    def _startGpuTimer(self) -> None:
+        """Put a GPU timer query round the frame about to be drawn.
+
+        The query is read later, from the event loop, when the GPU has
+        finished the frame: the GUI thread never waits for it. (Waiting for
+        the frame, ``glFinish``, held the thread for the whole GPU time of
+        every frame of a large scene: 150 to 330 ms each on the integrated
+        GPU of the reference host.)
+        """
+        if self._gpuTimerSupported is False or not self._gpuTimingWanted():
+            return
+        try:
+            from vtkmodules.vtkRenderingOpenGL2 import vtkOpenGLRenderTimer
+            if self._gpuTimerSupported is None:
+                self._gpuTimerSupported = bool(
+                    vtkOpenGLRenderTimer.IsSupported())
+                if not self._gpuTimerSupported:
+                    return
+            if len(self._gpuTimers) > 8:
+                return            # the GPU is far behind; do not queue more
+            timer = vtkOpenGLRenderTimer()
+            timer.Start()
+            self._gpuTimers.append(timer)
+        except Exception:                                   # noqa: BLE001
+            self._gpuTimerSupported = False
+            logger.debug('GPU frame timer unavailable', exc_info=True)
+
+    def _stopGpuTimer(self) -> None:
+        timers = self.__dict__.get('_gpuTimers')
+        if not timers:
+            return
+        timer = timers[-1]
+        try:
+            if timer.Started() and not timer.Stopped():
+                timer.Stop()
+        except Exception:                                   # noqa: BLE001
+            timers.remove(timer)
+            return
+        poll = self.__dict__.get('_gpuTimerPoll')
+        if poll is not None and not poll.isActive():
+            poll.start()
+
+    def _dropGpuTimers(self) -> None:
+        """Release the queries against the window's own context, then forget
+        them (a query object is a GL object: it is freed with its context
+        current, or not at all)."""
+        timers, self._gpuTimers = self._gpuTimers, []
+        self._gpuSeconds = []
+        if not timers:
+            return
+        if disposal.make_current(self.renderWindow()):
+            for timer in timers:
+                try:
+                    timer.ReleaseGraphicsResources()
+                except Exception:                           # noqa: BLE001
+                    pass
+
+    def _pollGpuTimers(self) -> None:
+        """Collect the timers the GPU has finished; ask again for the rest."""
+        if not self._gpuTimers:
+            return
+        if self._disposed:
+            self._gpuTimers = []
+            return
+        if self._inRender or self._suspended is not None \
+                or isRenderingHold():
+            self._gpuTimerPoll.start()
+            return
+        if not disposal.make_current(self.renderWindow()):
+            self._gpuTimers = []
+            return
+        pending = []
+        for timer in self._gpuTimers:
+            try:
+                if not timer.Stopped():
+                    pending.append(timer)
+                    continue
+                if timer.Ready():
+                    seconds = float(timer.GetElapsedSeconds())
+                    timer.ReleaseGraphicsResources()
+                    if seconds > 0.0 and math.isfinite(seconds):
+                        self._gpuSeconds.append(seconds)
+                else:
+                    pending.append(timer)
+            except Exception:                               # noqa: BLE001
+                continue
+        self._gpuTimers = pending
+        detail = self.__dict__.get('_interactionDetail')
+        while self._gpuSeconds and detail is not None:
+            detail.noteFrame(self._gpuSeconds.pop(0))
+        if detail is not None:
+            try:
+                if detail.slow() and not detail.active():
+                    timer = self.__dict__.get('_interactionDetailTimer')
+                    if timer is not None and not timer.isActive():
+                        timer.start()
+            except Exception:                               # noqa: BLE001
+                logger.debug('Noting a GPU frame time failed', exc_info=True)
+        if self._gpuTimers and not self._disposed:
+            self._gpuTimerPoll.start()
+
+    def _lastFrameSeconds(self) -> float:
+        """The oldest finished GPU frame time not yet used; 0.0 if none.
+
+        MEASURED 2026-10-09 on the AMD Radeon iGPU: for a 5 M-quad surface
+        ``vtkRenderer.GetLastRenderTimeInSeconds`` and the window's
+        start-to-end time both read about 1 ms, because ``Render`` returns
+        once the commands are queued; the frame took 32 ms to finish. The
+        first version waited for the GPU here (``glFinish``) and so held
+        the GUI thread for each frame's whole GPU time (VI14 closing round:
+        150 to 330 ms per frame of the 6.6 M-cell impeller). The frame is
+        now timed by a GPU timer query (``_startGpuTimer``), read when the
+        GPU has finished it, and this returns the oldest such reading. Where
+        the query is not supported the first frames of a scene are timed by
+        waiting, as before, and no more than the detail needs to decide.
+        """
+        if self._gpuSeconds:
+            return self._gpuSeconds.pop(0)
+        if self._gpuTimerSupported is not False:
+            return 0.0
+        start = self._frameStart
+        detail = self.__dict__.get('_interactionDetail')
+        if (start is None or detail is None
+                or detail.frameSeconds() is not None):
+            return 0.0
+        wait = getattr(self.renderWindow(), 'WaitForCompletion', None)
+        if wait is not None:
+            wait()
+        return time.perf_counter() - start
+
+    def _noteFrame(self) -> None:
+        """Plan 39 VI3. Tell the interaction detail how long this frame took.
+
+        Three full-detail frames averaging over 33 ms make the scene want its
+        reduced copies whatever its face count; they are then made once, in
+        the background, and used from the next drag on.
+        """
+        detail = self.__dict__.get('_interactionDetail')
+        if detail is None or self._disposed or detail.active():
+            return
+        try:
+            if not detail.worthTiming():
+                return
+            seconds = self._lastFrameSeconds()
+            if seconds > 0.0:
+                detail.noteFrame(seconds)
+            if detail.slow() and not detail.active():
+                timer = self.__dict__.get('_interactionDetailTimer')
+                if timer is not None and not timer.isActive():
+                    timer.start()
+        except Exception:                                   # noqa: BLE001
+            logger.debug('Noting a frame time failed', exc_info=True)
+
     def _renderWindowEnded(self, _caller=None, _event=None):
+        self._stopGpuTimer()
+        self._noteFrame()
         if self._inRender or self._suspended is not None or self._disposed:
             return
         window = self.renderWindow()
         reason = self._renderError or (
-            gl_health.lost_context(window, self._interactorStarted)
+            gl_health.lost_context(window, self._interactorStarted,
+                                   check_error=False)
             if window is not None else None)
         if reason:
             QTimer.singleShot(0, lambda: self._contextLost(reason))
+        else:
+            self._scheduleGlErrorCheck()
+
+    #: Quiet time before the GL error flag is read (see `_checkGlErrorFlag`).
+    GL_ERROR_CHECK_DELAY = 250
+
+    def _scheduleGlErrorCheck(self) -> None:
+        """Read the GL error flag once the viewport has been quiet.
+
+        Plan 39 VI14c. ``glGetError`` finishes the frame in flight, so asking
+        after every frame put the GPU's whole frame time (1.5 s at worst on
+        the 6.6 M-cell impeller) inside the GUI thread's hold. Each frame
+        restarts the wait, so the flag is read when the GPU has nothing left
+        to finish. A lost or out-of-memory context is still found, a quarter
+        of a second late.
+        """
+        if self.__dict__.get('_disposed'):
+            return
+        timer = self.__dict__.get('_glErrorTimer')
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self.GL_ERROR_CHECK_DELAY)
+            timer.timeout.connect(self._checkGlErrorFlag)
+            self._glErrorTimer = timer
+        timer.start()
+
+    def _checkGlErrorFlag(self) -> None:
+        if (self._disposed or self._inRender or self._suspended is not None):
+            return
+        window = self.renderWindow()
+        if window is None:
+            return
+        reason = gl_health.lost_context(window, self._interactorStarted)
+        if reason:
+            self._contextLost(reason)
 
     def _guardedRender(self, draw, what: str = 'render') -> bool:
         """Run ``draw`` (anything that renders this view); False if it failed.
@@ -929,8 +1560,11 @@ class RenderingWidget(QWidget):
         finally:
             self._inRender = False
         if reason is None:
+            # Plan 39 VI14c. The first draw of a new scene is checked
+            # at once (a scene too big for the card is found here); any other
+            # draw is checked when the viewport is quiet.
             reason = self._renderError or gl_health.lost_context(
-                window, wasInitialized)
+                window, wasInitialized, check_error=bool(operation))
         if operation:
             heartbeat.set_last_op(previous or '')
         if reason:
@@ -938,6 +1572,8 @@ class RenderingWidget(QWidget):
             return False
         if not self._glChecked:
             self._checkGl(window)
+        if not operation:
+            self._scheduleGlErrorCheck()
         self._scheduleInteractionDetail()
         return True
 
@@ -986,6 +1622,7 @@ class RenderingWidget(QWidget):
             widget.Start()
 
         self._guardedRender(start, 'initialize')
+        self._showCornerTriad()
 
     def _suspend(self, kind: str, title: str, detail: str, action: str) -> None:
         self._suspended = kind
@@ -1034,6 +1671,9 @@ class RenderingWidget(QWidget):
         logoOn = self._logoRepresentation is not None
         _quietly(self._logoWidget.Off)
         if oldWindow is not None:
+            if self._originRenderer is not None:
+                _quietly(getattr(oldWindow, 'RemoveRenderer', None),
+                         self._originRenderer)
             _quietly(getattr(oldWindow, 'RemoveRenderer', None), self._renderer)
             _quietly(getattr(oldWindow, 'RemoveAllObservers', None))
 
@@ -1042,6 +1682,8 @@ class RenderingWidget(QWidget):
         window.SetMultiSamples(0 if self._safeMode else MULTI_SAMPLES)
         widget.SetInteractorStyle(self._style)
         widget.renderGuard = self._guardedRender
+        widget.onHeldPaint = self._heldPaint
+        widget.onDrawn = self._frameDrawn
         _holdRenderRate(widget)
         window.AddRenderer(self._renderer)
         self._watchRenderWindow(window)
@@ -1062,6 +1704,10 @@ class RenderingWidget(QWidget):
             self._originAxes.SetInteractor(widget)
             if originAxesOn:
                 self._originAxes.EnabledOn()
+        self._cornerObserver = None
+        if self._originAxes is not None:
+            self._installCornerClick()
+        self._attachOriginRenderer(window)
 
         if self._stack is not None:
             self._stack.insertWidget(0, widget)
@@ -1145,6 +1791,18 @@ class RenderingWidget(QWidget):
             info['gpu_memory_bytes'] = profile.gpu_memory_bytes
         self._glInfo = info
         gl_health.record(info)
+        # GPUPREF: the first context is up. Clear the start marker, remember
+        # the adapter for the diagnostics, fall back from a software renderer.
+        try:
+            from foammesh.rendering import gpu_preference
+            from foammesh.app import app as _app
+            gpu_preference.confirm_render(
+                info, _app.settings, lifecycle.log_directory())
+            notice = gpu_preference.take_notice()
+            if notice:
+                self._setRenderNote(notice, part='gpu')
+        except Exception:                                  # noqa: BLE001
+            logger.debug('GPU preference check failed', exc_info=True)
         hint = gpu_profile.switch_hint(profile)
         if hint:
             logger.warning('Viewport GPU: %s', hint)
@@ -1182,6 +1840,9 @@ class RenderingWidget(QWidget):
             return
         self._disposed = True
         disposal.untrack(self, 'RenderingWidget')
+        for timer in ('_holdCoverTimer', '_holdCoverWatch',
+                      '_presentNowTimer', '_presentSettleTimer'):
+            _quietly(getattr(self.__dict__.get(timer), 'stop', None))
         from foammesh.app import app
         if app.themeManager is not None:
             try:
@@ -1190,6 +1851,11 @@ class RenderingWidget(QWidget):
                 pass
         self._hoverTimer.stop()
         self._interactionDetailTimer.stop()
+        glTimer = self.__dict__.get('_glErrorTimer')
+        if glTimer is not None:
+            glTimer.stop()
+        self._gpuTimerPoll.stop()
+        _quietly(self._dropGpuTimers)
         _quietly(self._interactionDetail.clear)
         widget = self._widget
         # Plan 35 CR8. The interactor widget's guard is a bound method of
@@ -1209,6 +1875,14 @@ class RenderingWidget(QWidget):
         if getattr(self, '_originAxes', None) is not None:
             _quietly(self._originAxes.EnabledOff)
             _quietly(self._originAxes.SetInteractor, None)
+        if self._cornerObserver is not None:
+            old, tag = self._cornerObserver
+            _quietly(old.RemoveObserver, tag)
+            self._cornerObserver = None
+        if self._originRenderer is not None:
+            _quietly(self._originRenderer.RemoveAllViewProps)
+            _quietly(getattr(self.renderWindow(), 'RemoveRenderer', None),
+                     self._originRenderer)
         _quietly(self._logoWidget.Off)
         _quietly(self._logoWidget.SetInteractor, None)
         _quietly(getattr(self._renderer, 'RemoveAllViewProps', None))
@@ -1225,9 +1899,34 @@ class RenderingWidget(QWidget):
 
         return super().close()
 
+    #: Plan 39 VI4 (F1e). ``resolver(actor, x, y, renderer) -> actor`` hands a
+    #: pick on a prop back to the part it stands for: a patch drawn by the
+    #: volume's exterior is picked as the exterior, and the click is the
+    #: patch's. None leaves every pick as it is.
+    _pickResolver = None
+
+    def setPickResolver(self, resolver) -> None:
+        self._pickResolver = resolver
+
+    def cellPickedActor(self, x, y):
+        """The actor the cell picker finds at a display point, or ``None``."""
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        if not picker.Pick(float(x), float(y), 0.0, self._renderer):
+            return None
+        actor = picker.GetActor()
+        resolver = self._pickResolver
+        if actor is not None and resolver is not None:
+            actor = resolver(actor, x, y, self._renderer) or actor
+        return actor
+
     def pickActor(self, x, y):
-        self._actorPicker.PickProp(x, y, self._renderer)
+        # DP-2713. Only this renderer is drawn in the selection pass.
+        pick_prop(self._actorPicker, x, y, self._renderer)
         actor = self._actorPicker.GetActor()
+        resolver = self._pickResolver
+        if actor is not None and resolver is not None:
+            actor = resolver(actor, x, y, self._renderer) or actor
 
         return actor
 
@@ -1237,6 +1936,10 @@ class RenderingWidget(QWidget):
         # re-registers the watermark instead of returning as already enabled.
         self._logoWidget.Off()
         self._renderer.RemoveAllViewProps()
+        self._measureActors = []
+        self._measureState.clear()
+        if getattr(self, '_measureReadout', None) is not None:
+            self._measureReadout.show_lines([])
         self._showLogo()
         # DP-791. Only a project closing clears the view, and its views go
         # with it. DP-736's bounds test cannot tell two small models near
@@ -1288,7 +1991,7 @@ class RenderingWidget(QWidget):
             tuple(value / length for value in orientation), up)
         self.fitCamera()
 
-    def saveScreenshot(self, path, *, scale: int = 2) -> bool:
+    def saveScreenshot(self, path, *, scale: int = 2, includes=None) -> bool:
         """Capture the rendered viewport as a PNG at 1x, 2x or 4x resolution.
 
         Plan 35 CR8: drawn through the render hold and the guarded render;
@@ -1298,23 +2001,271 @@ class RenderingWidget(QWidget):
             raise ValueError('screenshot scale must be 1, 2 or 4')
         if isRenderingHold() or self._suspended is not None:
             return False
+        with self._pictureLegends(includes):
+            rgb = self._captureArray(int(scale),
+                                     hide=self._hiddenFor(includes))
+        if rgb is None:
+            return False
+        label_pass.write_array(rgb, path, 'PNG')
+        return True
+
+    def saveImage(self, path, fmt: str = 'PNG', *, scale: int = 2,
+                  includes=None):
+        """Write the viewport as PNG, JPEG, SVG, PDF, EPS or PS (Plan 42 SG10).
+
+        One writer for both engines.  Returns the path written (the suffix is
+        set to the format) or None while the view cannot draw.
+        """
+        from pathlib import Path
+
+        from foammesh.core.gmsh import session_display as sd
+
+        fmt = str(fmt).upper()
+        if fmt == 'JPG':
+            fmt = 'JPEG'
+        if fmt not in sd.RASTER_FORMATS and fmt not in sd.VECTOR_FORMATS:
+            raise ValueError(f'{fmt} is not an image format')
+        if isRenderingHold() or self._suspended is not None:
+            return None
         window = self._widget.GetRenderWindow()
-        capture = vtkWindowToImageFilter()
+        if not self._guardedRender(window.Render, 'save image'):
+            return None
+        with self._withoutTriad(includes), self._centredForCapture(), \
+                self._pictureLegends(includes):
+            return sd.export_view(
+                window, Path(path), fmt, scale=int(scale),
+                hide=self._hiddenFor(includes), font=self._labelStyle.font,
+                transparent=bool((includes or {}).get('transparent')))
+
+    # -- a capture as an image in memory (VI15, I3) -------------------------- #
+
+    def _captureArray(self, scale: int, hide=()):
+        """The rendered window at ``scale`` x as an (h, w, 3) uint8 array.
+
+        Labels are drawn at the picture's size (``label_pass``), not tiled.
+        """
+        window = self._widget.GetRenderWindow()
+        found = []
 
         def draw():
-            window.Render()
-            capture.SetInput(window)
-            capture.SetScale(int(scale))
-            capture.ReadFrontBufferOff()
-            capture.Update()
+            found.append(label_pass.capture(window, self._renderer,
+                                            int(scale), hide=hide))
 
-        if not self._guardedRender(draw, 'screenshot'):
-            return False
-        writer = vtkPNGWriter()
-        writer.SetFileName(str(path))
-        writer.SetInputConnection(capture.GetOutputPort())
-        writer.Write()
-        return True
+        with self._centredForCapture():
+            drawn = self._guardedRender(draw, 'capture')
+        if not drawn or not found:
+            return None
+        return found[0]
+
+    # -- label font, size and groups (Plan 43 LY15) -------------------------- #
+
+    @staticmethod
+    def _announce(signal, value) -> None:
+        """Emit, unless the widget is a bare stand-in without its QObject."""
+        try:
+            signal.emit(value)
+        except RuntimeError:
+            pass
+
+    def labelStyle(self):
+        return self._labelStyle
+
+    def setLabelStyle(self, style=None, *, font=None, size=None) -> None:
+        """Set the font and size of every label on the view."""
+        if style is None:
+            current = self._labelStyle
+            style = label_style.normalise(font or current.font,
+                                          size or current.size)
+        self._labelStyle = style
+        self.applyLabelStyle()
+        self._announce(self.labelStyleChanged, style)
+
+    def applyLabelStyle(self) -> None:
+        """Put the current font and size on every label prop of the view.
+
+        A label's own size is remembered the first time it is touched, so
+        Normal puts it back and the others are multiples of it.
+        """
+        for prop in label_pass.label_props(self._renderer, visible_only=False):
+            for text in label_pass.text_properties(prop):
+                key = text.__this__
+                base = self._labelBase.setdefault(key, text.GetFontSize())
+                label_style.apply(text, self._labelStyle, base)
+        self.refresh()
+
+    def registerLabelGroup(self, group: str, prop) -> None:
+        """Make *prop* one of the labels an Include box switches ('worst', 'caption')."""
+        self._labelGroups.setdefault(group, [])
+        if all(prop is not other for other in self._labelGroups[group]):
+            self._labelGroups[group].append(prop)
+        prop.SetVisibility(bool(self._labelGroupShown.get(group, True)))
+        self.applyLabelStyle()
+
+    def unregisterLabelGroup(self, group: str, prop=None) -> None:
+        items = self._labelGroups.get(group, [])
+        self._labelGroups[group] = [] if prop is None else [
+            other for other in items if other is not prop]
+
+    def setLabelGroupShown(self, group: str, shown: bool) -> None:
+        self._labelGroupShown[group] = bool(shown)
+        for prop in self._labelGroups.get(group, []):
+            prop.SetVisibility(bool(shown))
+        self.refresh()
+
+    def isLabelGroupShown(self, group: str) -> bool:
+        return bool(self._labelGroupShown.get(group, True))
+
+    def setLegendsShown(self, shown: bool) -> None:
+        self._legendsShown = bool(shown)
+        for key, bar in self._legends.items():
+            bar.SetVisibility(bool(shown)
+                              and key not in self._pictureOnlyLegends)
+        self.refresh()
+        self._announce(self.legendsShownChanged, bool(shown))
+
+    def areLegendsShown(self) -> bool:
+        return bool(getattr(self, '_legendsShown', True))
+
+    def _hiddenFor(self, includes) -> list:
+        """The label props an Include box that is off leaves out."""
+        if not includes:
+            return []
+        hidden = []
+        if includes.get('legend') is False:
+            hidden += list(self._legends.values())
+        for group in ('worst', 'caption'):
+            if includes.get(group) is False:
+                hidden += list(self._labelGroups.get(group, []))
+        return hidden
+
+    def isPictureOnlyLegend(self, key: str) -> bool:
+        """Plan 44 FX3. Whether legend *key* is drawn only into a saved picture."""
+        return key in self._pictureOnlyLegends
+
+    def _pictureLegends(self, includes):
+        """Plan 44 FX3. Show the picture-only scalar bars for one VTK capture.
+
+        A saved PNG/JPEG/SVG/PDF is the render window alone, so the legend the
+        screen draws in Qt is not in it; the picture-only bar stands in for
+        it there, under the same switches (*Show legend*, the standard's
+        legend, the Include box). On screen it stays hidden.
+        """
+        import contextlib
+
+        from foammesh.support import colour_standard
+
+        wanted = (self.areLegendsShown()
+                  and bool(colour_standard.current().legend)
+                  and (includes or {}).get('legend') is not False)
+        bars = [self._legends[key] for key in self._pictureOnlyLegends
+                if key in self._legends] if wanted else []
+        if not bars:
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def shown():
+            for bar in bars:
+                bar.SetVisibility(True)
+            try:
+                yield
+            finally:
+                for bar in bars:
+                    bar.SetVisibility(False)
+
+        return shown()
+
+    def _withoutTriad(self, includes):
+        """The corner triad is left out for the length of a capture when asked."""
+        import contextlib
+
+        marker = self._originAxes
+        if not includes or includes.get('triad') is not False or marker is None:
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def hidden():
+            was = bool(_quietly(marker.GetEnabled))
+            marker.SetEnabled(0)
+            try:
+                yield
+            finally:
+                if was:
+                    marker.SetEnabled(1)
+
+        return hidden()
+
+    def grabImage(self, scale: int = 2, *, transparent: bool = False,
+                  legends: bool = True, includes=None):
+        """The picture as a ``QImage`` at 1x, 2x or 4x, or None if it cannot draw.
+
+        ``transparent`` leaves the background clear: the scene is drawn once
+        on black and once on white and the difference is the opacity of each
+        pixel, which needs no alpha buffer in the window. ``legends=False``
+        takes the scalar bars out of the picture.
+        """
+        import numpy as np
+        import numpy as np
+        from PySide6.QtGui import QImage
+
+        if int(scale) not in {1, 2, 4}:
+            raise ValueError('capture scale must be 1, 2 or 4')
+        if isRenderingHold() or self._suspended is not None:
+            return None
+        hidden = []
+        includes = dict(includes or {})
+        if not legends:
+            includes['legend'] = False
+        # The labels an Include box leaves out are dropped inside the capture;
+        # what is hidden here is the logo, which is not the model.
+        omit = self._hiddenFor(includes)
+        renderer = self._renderer
+        gradient = renderer.GetGradientBackground()
+        textured = renderer.GetTexturedBackground()
+        low, high = renderer.GetBackground(), renderer.GetBackground2()
+        try:
+            if not transparent:
+                rgb = self._captureArray(scale, hide=omit)
+                alpha = None
+            else:
+                # The logo is a picture of its own: it is not the model.
+                logo = self._logoRepresentation
+                if logo is not None and logo.GetVisibility():
+                    logo.SetVisibility(False)
+                    hidden.append(logo)
+                renderer.GradientBackgroundOff()
+                renderer.TexturedBackgroundOff()
+                renderer.SetBackground(0.0, 0.0, 0.0)
+                black = self._captureArray(scale, hide=omit)
+                renderer.SetBackground(1.0, 1.0, 1.0)
+                white = self._captureArray(scale, hide=omit)
+                if black is None or white is None:
+                    return None
+                coverage = 1.0 - (white.astype(np.float32)
+                                  - black.astype(np.float32)).mean(axis=2) / 255.0
+                coverage = np.clip(coverage, 0.0, 1.0)
+                safe = np.where(coverage > 0.003, coverage, 1.0)[:, :, None]
+                rgb = np.clip(black.astype(np.float32) / safe, 0, 255).astype(np.uint8)
+                alpha = (coverage * 255.0 + 0.5).astype(np.uint8)
+        finally:
+            renderer.SetBackground(*low)
+            renderer.SetBackground2(*high)
+            renderer.SetGradientBackground(gradient)
+            renderer.SetTexturedBackground(textured)
+            for bar in hidden:
+                bar.SetVisibility(True)
+            self._widget.Render()
+        if rgb is None:
+            return None
+        height, width = rgb.shape[:2]
+        if alpha is None:
+            data = np.ascontiguousarray(rgb)
+            image = QImage(data.data, width, height, 3 * width,
+                           QImage.Format.Format_RGB888)
+        else:
+            data = np.ascontiguousarray(np.dstack([rgb, alpha]))
+            image = QImage(data.data, width, height, 4 * width,
+                           QImage.Format.Format_RGBA8888)
+        return image.copy()
 
     def setOrderIndependentTransparency(self, enabled: bool):
         """Turn depth peeling on exactly while something translucent is drawn.
@@ -1525,20 +2476,70 @@ class RenderingWidget(QWidget):
             logger.exception('Adding a reduced copy to the scene')
 
     def _cameraMoving(self, obj, event):
-        """The first moving frame of a drag: draw the reduced copies."""
-        if self._interactionDetailTried:
+        """A moving frame of a drag: draw the reduced copies once they apply.
+
+        The first moving frame tries; a scene that was not slow then is tried
+        again when three full-detail frames have shown it is (Plan 39 VI3), so
+        the copies engage within three frames of a drag that stutters.
+        """
+        detail = self._interactionDetail
+        if detail.active() or detail.ready() == 0:
+            return
+        if self._interactionDetailTried and not detail.slow():
             return
         self._interactionDetailTried = True
         try:
-            swapped = self._interactionDetail.begin()
+            swapped = detail.begin()
         except Exception:                                   # noqa: BLE001
             logger.exception('Swapping in the interaction detail')
             swapped = 0
         if swapped:
             self.detailReduced.emit(True)
 
+    def beginHandleDrag(self) -> bool:
+        """A handle (a section plane) is being dragged: draw the reduced
+        copies while it moves, as for a camera drag.
+
+        Closing round 2026-10-12 (VI14). Only the camera's own drag used to
+        swap them in, so every step of a plane drag drew the full scene:
+        150 ms of GPU each on the 6.6 M-cell impeller. Returns whether the
+        copies stand in now.
+        """
+        self._interactionInFlight = True
+        self._hoverTimer.stop()
+        if not self.__dict__.get('_handleDragHeld'):
+            self._handleDragHeld = True
+            from foammesh.rendering.actor_info import hold_cut_installs
+            hold_cut_installs(True)
+        detail = self._interactionDetail
+        if detail.active():
+            return True
+        if detail.ready() == 0:
+            self._scheduleInteractionDetail()
+            return False
+        try:
+            swapped = detail.begin()
+        except Exception:                                   # noqa: BLE001
+            logger.exception('Swapping in the interaction detail')
+            swapped = 0
+        if swapped:
+            self.detailReduced.emit(True)
+        return bool(swapped)
+
+    def endHandleDrag(self) -> None:
+        """The handle was let go: the full parts are drawn again."""
+        self._interactionInFlight = False
+        if self.__dict__.get('_handleDragHeld'):
+            self._handleDragHeld = False
+            from foammesh.rendering.actor_info import hold_cut_installs
+            hold_cut_installs(False)
+        if self._interactionDetail.end():
+            self.detailReduced.emit(False)
+        self._scheduleInteractionDetail()
+
     def _cameraInteractionEnded(self, obj, event):
         """Full detail back before the frame the style draws at release."""
+        self._interactionInFlight = False
         self._interactionDetailTried = False
         if self._interactionDetail.end():
             self.detailReduced.emit(False)
@@ -1715,6 +2716,52 @@ class RenderingWidget(QWidget):
         self._widget.Render()
         return True
 
+    def flyToPoint(self, centre, distance: float) -> bool:
+        """Put the camera ``distance`` from ``centre``, looking at it.
+
+        Plan 39 VI8 (F5b). The direction the user is looking along is kept --
+        turning the model under someone who asked to go to a cell is a second
+        thing they did not ask for -- and the move is recorded, so Back returns
+        to where they were. Parallel projection has no distance, so the scale
+        is set to show the same width.
+        """
+        import math
+
+        centre = tuple(float(value) for value in centre)
+        distance = float(distance)
+        if len(centre) != 3 or not (distance > 0.0) or not all(
+                math.isfinite(value) for value in centre + (distance,)):
+            return False
+        camera = self._renderer.GetActiveCamera()
+        position = camera.GetPosition()
+        focal = camera.GetFocalPoint()
+        direction = [position[i] - focal[i] for i in range(3)]
+        length = math.sqrt(sum(value * value for value in direction))
+        if length <= 0.0:
+            direction, length = [1.0, 1.0, 1.0], math.sqrt(3.0)
+        self.rememberView()
+        camera.SetFocalPoint(*centre)
+        camera.SetPosition(*[centre[i] + direction[i] / length * distance
+                             for i in range(3)])
+        camera.SetParallelScale(
+            distance * math.tan(math.radians(camera.GetViewAngle()) / 2.0))
+        self._renderer.ResetCameraClippingRange()
+        self._widget.Render()
+        return True
+
+    def flyToBounds(self, bounds) -> bool:
+        """Frame ``bounds`` (xmin, xmax, ymin, ymax, zmin, zmax), Back-able."""
+        import math
+
+        bounds = tuple(float(value) for value in bounds)
+        if len(bounds) != 6 or not all(math.isfinite(v) for v in bounds) \
+                or bounds[0] > bounds[1]:
+            return False
+        self.rememberView()
+        self._renderer.ResetCamera(bounds)
+        self._widget.Render()
+        return True
+
     def modelExtent(self) -> float:
         """The model's largest dimension, for the scale readout.
 
@@ -1737,12 +2784,14 @@ class RenderingWidget(QWidget):
         self._widget.Render()
 
     def setAxisVisible(self, checked):
-        if checked:
-            self._showOriginAxes()
-        else:
-            self._hideOriginAxes()
+        """Show or hide the axes at the world origin (Plan 39 VI15, I10).
 
-        # self._resizeOriginAxis()
+        The viewport triad in the corner is not this: it is always on.
+        """
+        if checked:
+            self._showOriginTriad()
+        else:
+            self._hideOriginTriad()
         self._widget.Render()
 
     def setCubeAxisVisible(self, checked):
@@ -1758,10 +2807,12 @@ class RenderingWidget(QWidget):
     def setBackground1(self, r, g, b):
         self._userBackground['bottom'] = (r, g, b)
         self._renderer.SetBackground(r, g, b)
+        self._renderer.TexturedBackgroundOff()
 
     def setBackground2(self, r, g, b):
         self._userBackground['top'] = (r, g, b)
         self._renderer.SetBackground2(r, g, b)
+        self._renderer.TexturedBackgroundOff()
 
     def _keepUserBackground(self):
         """Put back the gradient ends the user picked after a theme pass.
@@ -1771,6 +2822,9 @@ class RenderingWidget(QWidget):
         or the origin axes are first shown, so a colour picked from the
         swatches lasted only until the next of those.
         """
+        if self._userBackground:
+            # MF15. A picked gradient replaces the theme's radial texture.
+            self._renderer.TexturedBackgroundOff()
         bottom = self._userBackground.get('bottom')
         if bottom is not None:
             self._renderer.SetBackground(*bottom)
@@ -1804,6 +2858,10 @@ class RenderingWidget(QWidget):
         self._loadLogo(tokens.name)
         apply_vtk_theme(self._renderer, tokens, cube_axes=self._cubeAxesActor,
                         origin_axes=self._originAxesActor, logo=self._logoRepresentation)
+        apply_triad_theme(self._cornerCube, self._originAxesActor, tokens)
+        if self._originTriad is not None:
+            apply_vtk_theme(self._renderer, tokens, origin_axes=self._originTriad)
+            styleOriginLabels(self._originTriad, tokens)
         self._keepUserBackground()
         self.refresh()
 
@@ -1811,6 +2869,126 @@ class RenderingWidget(QWidget):
         from foammesh.app import app
         if app.themeManager is not None and app.themeManager.tokens is not None:
             self.applyTheme(app.themeManager.tokens)
+
+    # -- UXB5 (N4): no black frame while a hold drops the paints ----------- #
+
+    def holdCover(self):
+        return self._holdCover
+
+    def _heldPaint(self):
+        """A paint was dropped because a VTK job or a scene swap holds
+        rendering. A frame is owed from now on, whether or not the hold
+        lasts long enough to raise the cover (DP-2705)."""
+        self._frameOwed = True
+        if not self._holdCoverWatch.isActive():
+            self._holdCoverWatch.start()
+        cover = self._holdCover
+        if cover is None or not cover.isHidden():
+            return
+        if not self._holdCoverTimer.isActive():
+            self._holdCoverTimer.start()
+
+    def _showHoldCover(self):
+        cover = self._holdCover
+        if (cover is None or not isRenderingHold() or self._disposed
+                or self._suspended is not None):
+            # The placeholder stands in for a suspended view: nothing to
+            # cover, and nothing would ever draw over the cover.
+            return
+        top = QColor.fromRgbF(*self._renderer.GetBackground2())
+        bottom = QColor.fromRgbF(*self._renderer.GetBackground())
+        cover.setColors(top, bottom)
+        tokens = self._themeTokens
+        if tokens is not None and not self._userBackground:
+            try:
+                cover.setRadial(tokens.value('viewport.centre'),
+                                tokens.value('viewport.mid'),
+                                tokens.value('viewport.edge'))
+            except (KeyError, AttributeError):
+                pass
+        cover.setText(self.tr('Updating the view…'))
+        cover.setGeometry(self.rect())
+        cover.show()
+        cover.raise_()
+        self._holdCoverWatch.start()
+
+    def _watchHoldCover(self):
+        """DP-2705. The hold is over: take the cover down and draw.
+
+        The view under the cover cannot paint while the cover is up, so the
+        hold ending is what decides, not a frame. The watch runs while the
+        cover is up or a frame is owed, and stops only here, once both are
+        settled."""
+        cover = self._holdCover
+        covered = cover is not None and not cover.isHidden()
+        if covered and (self._disposed or self._suspended is not None):
+            self._lowerHoldCover()
+            covered = False
+        if not covered and not self._frameOwed:
+            self._holdCoverWatch.stop()
+            return
+        if isRenderingHold() and not self._disposed:
+            return
+        self._holdCoverWatch.stop()
+        self._holdCoverTimer.stop()
+        if covered:
+            self._lowerHoldCover()
+        self._presentFrame()
+        # The window system repaints the area the cover leaves; if that
+        # lands after this frame the view draws once more.
+        self._presentSettleTimer.start()
+
+    def _lowerHoldCover(self):
+        cover = self._holdCover
+        if cover is None:
+            return
+        cover.hide()
+        # Below the view in the sibling order as well, so a native window
+        # left mapped (or shown by anything else) cannot stay over it.
+        cover.lower()
+
+    def _presentFrame(self) -> bool:
+        """DP-2705. Draw a real frame into the native window now.
+
+        Not ``Render()`` on the QVTK widget: that only calls ``update()``,
+        and the native window the cover was over gets no paint for it (the
+        live view kept the cover's pixels 4 to 30 s after Qt hid it). The
+        render window's own ``Render`` draws and swaps buffers into the
+        window, through the guard. Returns True if a frame was drawn."""
+        if self._disposed or self._suspended is not None:
+            self._frameOwed = False
+            return False
+        cover = self._holdCover
+        if isRenderingHold() or (cover is not None and not cover.isHidden()):
+            # Owed still: the watch draws it when the hold ends.
+            self._frameOwed = True
+            if not self._holdCoverWatch.isActive():
+                self._holdCoverWatch.start()
+            return False
+        window = self.renderWindow()
+        if window is None or self._inRender:
+            return False
+        if not self._guardedRender(window.Render, 'hold over'):
+            return False
+        self._frameOwed = False
+        return True
+
+    def _frameDrawn(self):
+        """A real frame reached the window.
+
+        If the cover was still up the frame was drawn under it -- the cover
+        is a native sibling, so it clipped the frame -- and the pixels the
+        cover leaves are its own. It comes down and the view draws again."""
+        self._holdCoverTimer.stop()
+        cover = self._holdCover
+        if cover is not None and not cover.isHidden():
+            self._holdCoverWatch.stop()
+            self._lowerHoldCover()
+            self._frameOwed = True
+            self._presentNowTimer.start()
+            self._presentSettleTimer.start()
+            return
+        self._frameOwed = False
 
     def background1(self):
         return self._renderer.GetBackground()
@@ -1911,40 +3089,500 @@ class RenderingWidget(QWidget):
             self._renderer.RemoveActor(self._cubeAxesActor)
             self._cubeAxesActor = None
 
-    def _showOriginAxes(self):
-        if self._originAxes is None:
-            self._originAxes = vtkOrientationMarkerWidget()
-            self._originAxes.SetViewport(0.0, 0.0, 0.2, 0.2)
-            self._originAxesActor = vtkAxesActor()
-            self._originAxes.SetOrientationMarker(self._originAxesActor)
-            self._originAxes.SetInteractor(self._widget)
+    # -- the corner: one triad, one cube, always on (VI15, I5, I10) --------- #
+
+    def _showCornerTriad(self) -> None:
+        """Put the viewport triad in the bottom-left corner, once.
+
+        An axes triad inside an annotated cube, drawn by one orientation
+        marker; a click on a cube face is a view preset (`cornerFaceAt`).
+        Decoration must never take the viewport down, so a failure is logged.
+        """
+        if self._disposed or self._originAxes is not None:
+            return
+        try:
+            axes = vtkAxesActor()
+            axes.AxisLabelsOff()
+            axes.PickableOff()
+            axes.SetShaftTypeToLine()
+            axes.SetConeRadius(0.0)
+            # MF27. The marker fits the assembly's bounds; unit axes ran a
+            # half cube past the cube's faces, so the cube drew 22 px in the
+            # 52 px corner (the mockup's is about 45). Axes from the centre
+            # to the faces, as the mockup draws them, let the cube fill it.
+            axes.SetTotalLength(*CORNER_AXES_LENGTH)
+            dpr = max(self.devicePixelRatioF(), 1.0)
+            for shaft in (axes.GetXAxisShaftProperty(),
+                          axes.GetYAxisShaftProperty(),
+                          axes.GetZAxisShaftProperty()):
+                shaft.SetLineWidth(TRIAD_AXIS_WIDTH * dpr)
+            cube = vtkAnnotatedCubeActor()
+            for face, text in (('XPlus', '+X'), ('XMinus', '-X'),
+                               ('YPlus', '+Y'), ('YMinus', '-Y'),
+                               ('ZPlus', '+Z'), ('ZMinus', '-Z')):
+                getattr(cube, f'Set{face}FaceText')(text)
+            cube.SetFaceTextScale(0.4)
+            cube.GetCubeProperty().SetColor(0.78, 0.8, 0.86)
+            cube.GetCubeProperty().SetOpacity(0.55)
+            cube.GetTextEdgesProperty().SetColor(0.3, 0.3, 0.34)
+            cube.GetTextEdgesProperty().SetLineWidth(1)
+            # 52 px is too small to read a face's name; the cube is a flat
+            # fill with a stroke (MF15), the faces still pick as presets.
+            cube.SetTextEdgesVisibility(False)
+            cube.SetCubeVisibility(True)
+            cube.SetFaceTextVisibility(False)
+            cube.GetCubeProperty().EdgeVisibilityOn()
+            cube.GetCubeProperty().SetLineWidth(max(self.devicePixelRatioF(), 1.0))
+            for face, colour in (('X', (0.85, 0.3, 0.3)), ('Y', (0.3, 0.7, 0.35)),
+                                 ('Z', (0.3, 0.45, 0.9))):
+                for sign in ('Plus', 'Minus'):
+                    prop = getattr(cube, f'Get{face}{sign}FaceProperty')()
+                    prop.SetColor(*colour)
+                    prop.SetOpacity(TRIAD_FACE_OPACITY)
+            cube.GetCubeProperty().SetOpacity(TRIAD_FACE_OPACITY)
+            assembly = vtkPropAssembly()
+            assembly.AddPart(cube)
+            assembly.AddPart(axes)
+            marker = vtkOrientationMarkerWidget()
+            marker.SetOrientationMarker(assembly)
+            marker.SetViewport(0.0, 0.0, 0.2, 0.2)
+            marker.SetInteractor(self._widget)
+            marker.EnabledOn()
+            marker.InteractiveOff()
+            self._originAxes = marker
+            self._originAxesActor = axes
+            self._cornerCube = cube
             if self._themeTokens is not None:
-                apply_vtk_theme(self._renderer, self._themeTokens,
-                                cube_axes=self._cubeAxesActor,
-                                origin_axes=self._originAxesActor,
-                                logo=self._logoRepresentation)
-                self._keepUserBackground()
+                self._themeAxes()
+            self._layoutCorner()
+            self._installCornerClick()
+        except Exception:                                   # noqa: BLE001
+            logger.exception('The viewport triad could not be drawn')
 
-        self._originAxes.EnabledOn()
+    def isCornerTriadShown(self) -> bool:
+        marker = self._originAxes
+        return marker is not None and bool(_quietly(marker.GetEnabled))
 
-    def _hideOriginAxes(self):
-        if self._originAxes is not None:
-            self._originAxes.EnabledOff()
+    def _themeAxes(self) -> None:
+        apply_vtk_theme(self._renderer, self._themeTokens,
+                        cube_axes=self._cubeAxesActor,
+                        origin_axes=self._originAxesActor,
+                        logo=self._logoRepresentation)
+        apply_triad_theme(self._cornerCube, self._originAxesActor,
+                          self._themeTokens)
+        if self._originTriad is not None:
+            apply_vtk_theme(self._renderer, self._themeTokens,
+                            origin_axes=self._originTriad)
+            styleOriginLabels(self._originTriad, self._themeTokens)
+        self._keepUserBackground()
 
-    # def _resizeOriginAxis(self):
-    #     if self._originActor:
-    #         camera = self._renderer.GetActiveCamera()
+    def _layoutCorner(self) -> None:
+        """Size the corner to the clear area, put the triad in its bottom
+        left, and give the overlay layout the same rectangle (MF7)."""
+        from foammesh.view.main_window.clear_area import (
+            OVERLAY_INSET, Insets, clear_rect)
+        width, height = self.width(), self.height()
+        x0, y0, x1, y1 = clear_rect(width, height, Insets(*self.clearInsets()))
+        inset = OVERLAY_INSET
+        # The triad's box in logical pixels (y down): 52 square, 20 right of
+        # the clear area's left edge, 22 above its bottom.
+        room = int(min(x1 - x0 - CORNER_LEFT, y1 - y0 - CORNER_BOTTOM))
+        size = max(min(CORNER_SIZE, room), 0) if width > 0 and height > 0 else 0
+        self._cornerPixels = size
+        layout = self._overlayLayout
+        layout.setBounds((x0, y0, x1, y1), inset)
+        layout.setCorner(CORNER_BOTTOM + size if size > 0 else 0)
+        marker = self._originAxes
+        if marker is not None and size > 0:
+            left = x0 + CORNER_LEFT
+            bottom = height - (y1 - CORNER_BOTTOM)   # GL origin: bottom left
+            marker.SetViewport(left / width, bottom / height,
+                               (left + size) / width, (bottom + size) / height)
+        self._updateLogoLayout()
 
-    #         d = camera.GetDirectionOfProjection()
-    #         p = camera.GetPosition()
-    #         distance = abs(-p[0]*d[0]-p[1]*d[1]-p[2]*d[2])
+    def cornerPixels(self) -> int:
+        return self._cornerPixels
 
-    #         degree = camera.GetViewAngle()
-    #         radian = math.radians(degree/3.0)
-    #         length = distance * math.tan(radian)
+    def cornerFaceAt(self, x, y) -> str | None:
+        """The view preset of the cube face under a display point, or None.
 
-    #         # length = self._style.getOriginActorLength()
-    #         self._originActor.SetTotalLength(length, length, length)
+        ``x``, ``y`` are render-window pixels (origin bottom-left), as the
+        interactor reports them.
+        """
+        marker = self._originAxes
+        if marker is None or not self.isCornerTriadShown():
+            return None
+        renderer = marker.GetRenderer()
+        if renderer is None:
+            return None
+        viewport = marker.GetViewport()
+        window = self.renderWindow().GetSize()
+        if (x < viewport[0] * window[0] or x > viewport[2] * window[0]
+                or y < viewport[1] * window[1] or y > viewport[3] * window[1]):
+            return None
+        picker = vtkPropPicker()
+        if not pick_prop(picker, float(x), float(y), renderer):
+            return None
+        return facePresetAt(picker.GetPickPosition())
+
+    def cornerFaceDisplayPoint(self, preset: str):
+        """Display point (render-window pixels) of a cube face's centre."""
+        index = 'xyz'.index(preset[1])
+        world = [0.0, 0.0, 0.0, 1.0]
+        world[index] = 0.5 if preset[0] == '+' else -0.5
+        renderer = self._originAxes.GetRenderer()
+        renderer.SetWorldPoint(*world)
+        renderer.WorldToDisplay()
+        point = renderer.GetDisplayPoint()
+        return point[0], point[1]
+
+    def _installCornerClick(self) -> None:
+        """A press on a cube face turns the view and is not a rotation."""
+        interactor = getattr(self._widget, '_Iren', None)
+        if interactor is None or not hasattr(interactor, 'AddObserver'):
+            return
+        if self._cornerObserver is not None:
+            old, tag = self._cornerObserver
+            _quietly(old.RemoveObserver, tag)
+        tag = interactor.AddObserver(
+            'LeftButtonPressEvent', self._cornerPressed, 2.0)
+        self._cornerObserver = (interactor, tag)
+
+    def _cornerPressed(self, interactor, _event) -> None:
+        if self._disposed or self._suspended is not None:
+            return
+        x, y = interactor.GetEventPosition()
+        preset = self.cornerFaceAt(x, y)
+        if preset is None:
+            return
+        command = interactor.GetCommand(self._cornerObserver[1])
+        if command is not None:
+            command.SetAbortFlag(1)
+        self.setViewPreset(preset)
+
+    # -- the world origin: the toolbar's Origin axes (VI15, I10) ------------- #
+
+    def _showOriginTriad(self) -> None:
+        if self._originTriad is None:
+            actor = vtkAxesActor()
+            actor.SetPosition(0.0, 0.0, 0.0)
+            actor.PickableOff()
+            actor.SetShaftTypeToCylinder()
+            styleOriginLabels(actor, None)
+            self._originTriad = actor
+            renderer = vtkRenderer()
+            renderer.SetLayer(1)
+            renderer.InteractiveOff()
+            renderer.AddActor(actor)
+            # The same camera: the triad is in the model's own space, and
+            # nothing in it counts toward the main scene's bounds or fit.
+            renderer.SetActiveCamera(self._renderer.GetActiveCamera())
+            self._originRenderer = renderer
+            if self._themeTokens is not None:
+                self._themeAxes()
+        self._originTriadOn = True
+        self._attachOriginRenderer(self.renderWindow())
+        self._originTriad.SetVisibility(True)
+        self._resizeOriginTriad()
+
+    def _hideOriginTriad(self) -> None:
+        self._originTriadOn = False
+        if self._originTriad is not None:
+            self._originTriad.SetVisibility(False)
+
+    def _attachOriginRenderer(self, window) -> None:
+        """Put the origin triad's layer in *window* (a new one after a reset)."""
+        renderer = self._originRenderer
+        if renderer is None or window is None:
+            return
+        _quietly(window.SetNumberOfLayers, 2)
+        if not window.HasRenderer(renderer):
+            window.AddRenderer(renderer)
+
+    def isOriginTriadShown(self) -> bool:
+        return bool(self._originTriadOn)
+
+    def originTriadInfo(self) -> dict:
+        """Where the world-origin triad is and how long its arms are."""
+        actor = self._originTriad
+        if actor is None:
+            return {'visible': False, 'position': (0.0, 0.0, 0.0),
+                    'arm': 0.0, 'span': 0.0}
+        return {'visible': bool(self._originTriadOn),
+                'position': tuple(actor.GetPosition()),
+                'arm': float(actor.GetTotalLength()[0]),
+                'span': self._sceneSpan()}
+
+    def _sceneSpan(self) -> float:
+        bounds = self._renderer.ComputeVisiblePropBounds()
+        if bounds is None or bounds[0] > bounds[1]:
+            return 0.0
+        return float(max(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                         bounds[5] - bounds[4]))
+
+    def _resizeOriginTriad(self) -> None:
+        """Arms of 25 % of the visible bounds' longest span, on every fit."""
+        if self._originTriad is None:
+            return
+        span = self._sceneSpan()
+        arm = ORIGIN_ARM_SHARE * span if span > 0 else 1.0
+        self._originTriad.SetTotalLength(arm, arm, arm)
+
+    # -- one layout for the overlays (VI15, I4) ------------------------------ #
+
+    def overlayLayout(self) -> OverlayLayout:
+        return self._overlayLayout
+
+    def addLegend(self, key: str, bar, size=(190, 260), *,
+                  onScreen: bool = True) -> None:
+        """Put a scalar bar in the stack of legends at the bottom left.
+
+        Plan 44 FX3 (L2). ``onScreen=False`` keeps the bar for saved pictures
+        only (`_pictureLegends`): it is never shown on the screen, where the
+        themed Qt legend is the one scale of the field.
+        """
+        if key in self._legends:
+            self.removeLegend(key)
+        self._legends[key] = bar
+        if onScreen:
+            self._pictureOnlyLegends.discard(key)
+        else:
+            self._pictureOnlyLegends.add(key)
+        self._renderer.AddActor2D(bar)
+        self._applyLegendStandard(bar)
+        self._styleLabels(bar)
+        self._overlayLayout.register(
+            key, Slot.BOTTOM_LEFT, size,
+            lambda rect, bar=bar: apply_to_scalar_bar(
+                bar, rect, max(self.width(), 1), max(self.height(), 1)))
+        self.arrangeOverlays()
+
+    def setLegendOnScreen(self, key: str, onScreen: bool) -> None:
+        """Plan 44 FX3 (L2). Whether legend *key* may show on the screen.
+
+        Off, the bar is kept for saved pictures only (see `addLegend`).
+        """
+        bar = self._legends.get(key)
+        if bar is None:
+            return
+        if onScreen:
+            self._pictureOnlyLegends.discard(key)
+        else:
+            self._pictureOnlyLegends.add(key)
+        self._applyLegendStandard(bar)
+
+    def _styleLabels(self, prop) -> None:
+        for text in label_pass.text_properties(prop):
+            base = self._labelBase.setdefault(text.__this__, text.GetFontSize())
+            label_style.apply(text, self._labelStyle, base)
+
+    def removeLegend(self, key: str) -> None:
+        bar = self._legends.pop(key, None)
+        self._pictureOnlyLegends.discard(key)
+        if bar is not None:
+            _quietly(self._renderer.RemoveActor2D, bar)
+        self._overlayLayout.unregister(key)
+        self.arrangeOverlays()
+
+    def _applyLegendStandard(self, bar) -> None:
+        """Plan 43 LY12. *Show legend* off hides the scales, not the keys."""
+        from foammesh.support import colour_standard
+        table = bar.GetLookupTable() if hasattr(bar, 'GetLookupTable') else None
+        if any(bar is self._legends.get(key)
+               for key in self._pictureOnlyLegends):
+            bar.SetVisibility(False)
+            return
+        if table is not None and table.GetIndexedLookup():
+            return
+        bar.SetVisibility(bool(colour_standard.current().legend)
+                          and self.areLegendsShown())
+
+    def applyColourStandard(self) -> None:
+        """The colour standard changed: legends follow, the picture redraws."""
+        for bar in self._legends.values():
+            self._applyLegendStandard(bar)
+        self.refresh()
+
+    def legendKeys(self) -> list:
+        return list(self._legends)
+
+    def _installViewportOverlays(self) -> None:
+        """The progress strip, the preset bar and the hover tip (VI15).
+
+        They are children of the view and sit in the overlay layout's slots.
+        The view is a native window, so each is one too, or it would be drawn
+        under it.
+        """
+        from foammesh.view.display_control.viewport_extras import (
+            CameraPresetBar, HoverTip, MeasureReadout,
+            ProgressStrip)
+        from widgets.progress_dialog import localTasks
+
+        self._strip = ProgressStrip(self)
+        self._presetBar = CameraPresetBar(self)
+        self._hoverTip = HoverTip(self)
+        self._measureReadout = MeasureReadout(self)
+        for widget in (self._strip, self._presetBar, self._hoverTip,
+                       self._measureReadout):
+            widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        # Plan 43 LY7. The progress strip stands in the notice strip (top
+        # centre), which takes the TOP slot; the preview notice joins it.
+        from foammesh.view.display_control.notice_strip import NoticeStrip
+        self._noticeStrip = NoticeStrip(self)
+        self._noticeStrip.adoptStrip(self._strip)
+        self._noticeStrip.install(self)
+        self.registerOverlay('camera-presets', Slot.TOP_RIGHT, self._presetBar)
+        self.registerOverlay(
+            'measure-readout', Slot.BOTTOM_RIGHT, self._measureReadout,
+            size=lambda: ((0, 0) if self._measureReadout.isHidden() else (
+                self._measureReadout.sizeHint().width(),
+                self._measureReadout.sizeHint().height())))
+        self._presetBar.measureToggled.connect(self.setMeasureActive)
+        self._measureReadout.clearRequested.connect(self.clearMeasure)
+        localTasks().changed.connect(self.arrangeOverlays)
+        self._presetBar.copyViewRequested.connect(self._copyView)
+        self._presetBar.saveViewRequested.connect(self._saveViewAs)
+        self.hoverReadout.connect(self._hoverTip.show_at)
+        self._installResourceOverlay()
+
+    def _installResourceOverlay(self) -> None:
+        """The CPU / RAM panel (VI13): a Qt widget, off until asked for."""
+        from foammesh.view.display_control.resource_overlay import (
+            ResourceOverlay)
+
+        def gpuMemory():
+            return (self._glInfo or {}).get('gpu_memory_bytes')
+
+        self._resource = ResourceOverlay(self, gpu=gpuMemory)
+        self._resource.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.registerOverlay(
+            'resource-usage', Slot.TOP_RIGHT, self._resource,
+            size=lambda: (0, 0) if self._resource.isHidden() else (
+                self._resource.sizeHint().width(),
+                self._resource.sizeHint().height()))
+
+    def resourceOverlay(self):
+        return self._resource
+
+    def noticeStrip(self):
+        """Plan 43 LY7. The Viewport notice strip (top centre)."""
+        return self._noticeStrip
+
+    def presetBar(self):
+        """Measure and the view-capture menu (the top bar takes them, LY6)."""
+        return self._presetBar
+
+    def measureReadout(self):
+        """The Measure tool's answer and Clear (the bottom bar takes it, LY6)."""
+        return self._measureReadout
+
+    def setResourceOverlayVisible(self, on: bool) -> None:
+        """View > Show resource usage."""
+        self._resource.setShown(on)
+        self.arrangeOverlays()
+
+    def resourceOverlayVisible(self) -> bool:
+        return self._resource.isShown()
+
+    # -- the Measure tool (VI17, I8) ---------------------------------------- #
+
+    def isMeasuring(self) -> bool:
+        return self._measureState.active
+
+    def measureLines(self) -> list:
+        return self._measureState.lines()
+
+    def setMeasureActive(self, on: bool) -> None:
+        """Clicks measure instead of picking a part while this is on."""
+        self._measureState.setActive(on)
+        button = self._presetBar.measureButton()
+        if button.isChecked() != bool(on):
+            button.blockSignals(True)
+            button.setChecked(bool(on))
+            button.blockSignals(False)
+        self._showMeasure()
+
+    def clearMeasure(self) -> None:
+        self._measureState.clear()
+        self._showMeasure()
+
+    def measureAt(self, x, y) -> bool:
+        """Measure what is at a display point; False if nothing is there."""
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        if not picker.Pick(float(x), float(y), 0.0, self._renderer):
+            return False
+        try:
+            info = measure.describe_cell(picker.GetDataSet(),
+                                         int(picker.GetCellId()))
+        except Exception:                                   # noqa: BLE001
+            info = {}
+        self._measureState.click(picker.GetPickPosition(), info)
+        self._showMeasure()
+        return True
+
+    def _showMeasure(self) -> None:
+        """Draw the line between the two points, labelled, and the readout."""
+        from vtkmodules.vtkFiltersSources import vtkLineSource
+        from vtkmodules.vtkRenderingCore import (
+            vtkBillboardTextActor3D, vtkPolyDataMapper)
+
+        for actor in self._measureActors:
+            _quietly(self._renderer.RemoveActor, actor)
+        self._measureActors = []
+        state = self._measureState
+        if len(state.points) == 2:
+            line = vtkLineSource()
+            line.SetPoint1(*state.points[0])
+            line.SetPoint2(*state.points[1])
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputConnection(line.GetOutputPort())
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(1.0, 0.8, 0.1)
+            actor.GetProperty().SetLineWidth(3.0)
+            actor.SetPickable(False)
+            self._renderer.AddActor(actor)
+            label = vtkBillboardTextActor3D()
+            label.SetInput(measure.length_text(state.distance()))
+            middle = [(a + b) / 2.0 for a, b in zip(*state.points)]
+            label.SetPosition(*middle)
+            label.GetTextProperty().SetFontSize(16)
+            label.GetTextProperty().SetColor(1.0, 0.8, 0.1)
+            label.GetTextProperty().SetBold(True)
+            label.SetPickable(False)
+            self._renderer.AddActor(label)
+            self._measureActors = [actor, label]
+        self._measureReadout.show_lines(state.lines() if state.active else [])
+        self.arrangeOverlays()
+        self.refresh()
+
+    def _copyView(self) -> None:
+        from foammesh.view.main_window.view_capture import copyView
+        copyView(self)
+
+    def _saveViewAs(self) -> None:
+        from foammesh.view.main_window.view_capture import saveViewAs
+        saveViewAs(self, self.window())
+
+    def registerOverlay(self, key: str, slot: Slot, widget, size=None) -> None:
+        """Place a Qt widget in a slot; it is moved and sized by the layout."""
+        wanted = size if size is not None else (
+            lambda: (widget.sizeHint().width(), widget.sizeHint().height()))
+        self._overlayLayout.register(
+            key, slot, wanted,
+            lambda rect, widget=widget: widget.setGeometry(
+                rect.x, rect.y, rect.w, rect.h))
+        self.arrangeOverlays()
+
+    def unregisterOverlay(self, key: str) -> None:
+        self._overlayLayout.unregister(key)
+        self.arrangeOverlays()
+
+    def arrangeOverlays(self) -> dict:
+        if self.width() <= 0 or self.height() <= 0:
+            return {}
+        return self._overlayLayout.arrange(self.width(), self.height())
 
     def _leftButtonPressEvent(self, obj, event):
         self._mouseObserver.leftButtonPressed(obj, event)
@@ -1963,7 +3601,7 @@ class RenderingWidget(QWidget):
         and a name that flickers as the cursor crosses the mesh is worse than
         no name at all.
         """
-        if not self._hoverEnabled:
+        if not self._hoverEnabled or self._interactionInFlight:
             return
         self._hoverTimer.start()
 
@@ -1975,16 +3613,116 @@ class RenderingWidget(QWidget):
                 self._hoveredName = ''
                 self.actorHovered.emit('')
 
+    def _hoverPickSuppressed(self) -> bool:
+        """Plan 39 VI3 (F1e). No pick render while a frame is in flight.
+
+        A pick draws the scene once more. During a drag, while the reduced
+        copies stand in for the parts, or inside another draw, that is a
+        frame the user would wait for and learn nothing from.
+        """
+        return (self._interactionInFlight or self._inRender
+                or self._interactionDetail.active()
+                or self._hoverPickCostsAFrame())
+
+    def _hoverPickCostsAFrame(self) -> bool:
+        """Plan 39 VI14d. A prop pick draws the scene in selection mode
+        (MEASURED 110 ms on the 6.6 M-cell impeller) on the GUI thread, so
+        not while a load or cut holds the view: the dwell lands on a scene
+        that is being replaced. Once released, hover picks again."""
+        return bool(isRenderingHold())
+
     def _hoverPick(self):
+        if self._hoverPickSuppressed():
+            self.hoverPicksSkipped += 1
+            return
         interactor = self._widget._Iren
         x, y = interactor.GetEventPosition()
         actor = self.pickActor(x, y)
+        if actor is None:
+            # VI14 (LIVEV). The prop pick can come back empty over a part the
+            # cell pick finds (measured on a smooth clip of the elbow: 0 of 3
+            # points by prop pick, 3 of 3 by cell pick), and the readout is
+            # built from the cell pick. The part under the cursor is named by
+            # the same pick that reads its cell.
+            actor = self.cellPickedActor(x, y)
         name = actor.GetObjectName() if actor is not None else ''
         if name != self._hoveredName:
             self._hoveredName = name
             self.actorHovered.emit(name)
+        self._hoverReadoutAt(x, y, name)
+
+    def setHoverReadoutEnabled(self, enabled: bool) -> None:
+        self._readoutEnabled = bool(enabled)
+        if not self._readoutEnabled:
+            self._clearReadout()
+
+    def hoverReadoutEnabled(self) -> bool:
+        return self._readoutEnabled
+
+    def setHoverInfoProvider(self, provider) -> None:
+        """``provider(name)`` -> ``{'type', 'deviation', 'unit'}`` for a patch."""
+        self._hoverInfo = provider
+
+    def setHoverVolumeProvider(self, provider) -> None:
+        """``provider(name)`` -> the whole volume dataset a picked actor was
+        cut from, or ``None``. Lets a cut's surface answer with the values of
+        the volume cell it stands for."""
+        self._hoverVolume = provider
+
+    def hoverReadoutText(self) -> str:
+        return self._readoutText
+
+    def _clearReadout(self) -> None:
+        if self._readoutText:
+            self._readoutText = ''
+            self.hoverReadout.emit('', 0, 0)
+
+    def readoutAt(self, x, y, name: str = '') -> list:
+        """The readout's lines for the cell or face at a display point."""
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.0005)
+        if not picker.Pick(float(x), float(y), 0.0, self._renderer):
+            return []
+        info = {}
+        if self._hoverInfo is not None and name:
+            try:
+                info = self._hoverInfo(name) or {}
+            except Exception:                               # noqa: BLE001
+                info = {}
+        volume = None
+        if self._hoverVolume is not None and name:
+            try:
+                volume = self._hoverVolume(name)
+            except Exception:                               # noqa: BLE001
+                volume = None
+        return hover_readout.describe(
+            picker.GetDataSet(), int(picker.GetCellId()), name, volume=volume,
+            patch_type=str(info.get('type', '') or ''),
+            deviation_array=info.get('deviation'),
+            deviation_unit=str(info.get('unit', '') or ''))
+
+    def _hoverReadoutAt(self, x, y, name: str) -> None:
+        """Show the cell or face under the cursor; off with the pick itself."""
+        if not self._readoutEnabled:
+            return
+        # Off above the LOD threshold: a scene that needs reduced copies to
+        # turn is not one to ray-cast on every dwell.
+        if self._interactionDetail.wanted():
+            self._clearReadout()
+            return
+        lines = self.readoutAt(x, y, name)
+        if not lines:
+            self._clearReadout()
+            return
+        text = '\n'.join(lines)
+        dpr = self.devicePixelRatioF() or 1.0
+        self._readoutText = text
+        self.hoverReadout.emit(text, int(x / dpr), int(self.height() - y / dpr))
 
     def _cameraInteractionStarted(self, obj, event):
+        self._interactionInFlight = True
+        self._hoverTimer.stop()
+        self._clearReadout()
         # The first drag after a programmatic framing is exactly the view a
         # user wants "back" to return to; later drags would only flood history.
         if not self._cameraMovedByUser:
@@ -1992,6 +3730,9 @@ class RenderingWidget(QWidget):
         self._cameraMovedByUser = True
 
     def _mouseClicked(self, x, y, controlKeyPressed, shiftKeyPressed=False):
+        if self._measureState.active:
+            self.measureAt(x, y)
+            return
         self.actorPicked.emit(self.pickActor(x, y), controlKeyPressed,
                               shiftKeyPressed)
 
@@ -2030,9 +3771,36 @@ class RenderingWidget(QWidget):
         theme = self._themeTokens.name if self._themeTokens is not None else 'light'
         self._loadLogo(theme)
         self._updateLogoLayout()
-        self._logoRepresentation.GetImageProperty().SetOpacity(0.34)
+        self._logoRepresentation.GetImageProperty().SetOpacity(
+            watermark_opacity(self._themeTokens)
+            if self._themeTokens is not None else WATERMARK_OPACITY_DARK)
+        self._applyWatermarkShown()
         self._logoWidget.On()
         self.refresh()
+
+    def isWatermarkShown(self) -> bool:
+        """Plan 44 F1 (MF15, decision Q9): whether the watermark is drawn."""
+        return bool(getattr(self, '_watermarkShown', True))
+
+    def setWatermarkShown(self, shown: bool) -> None:
+        """Show or hide the watermark (View > Overlays and rendering).
+
+        Only the logo's visibility changes: the widget stays on and keeps its
+        place in the clear area's corner, so showing it again needs no
+        re-layout.
+        """
+        shown = bool(shown)
+        if shown == self.isWatermarkShown():
+            return
+        self._watermarkShown = shown
+        self._applyWatermarkShown()
+        self.refresh()
+        self._announce(self.watermarkShownChanged, shown)
+
+    def _applyWatermarkShown(self) -> None:
+        set_visibility = getattr(self._logoRepresentation, 'SetVisibility', None)
+        if set_visibility is not None:
+            set_visibility(self.isWatermarkShown())
 
     def _loadLogo(self, theme):
         if self._logoRepresentation is None or self._logoTheme == theme:
@@ -2047,19 +3815,27 @@ class RenderingWidget(QWidget):
         if self._logoRepresentation is None:
             return
         dpr = self.devicePixelRatioF()
+        from foammesh.view.main_window.clear_area import Insets, clear_rect
+        clear = clear_rect(self.width(), self.height(),
+                           Insets(*self.clearInsets()))
         position, size = watermark_geometry(
-            round(self.width() * dpr), round(self.height() * dpr), dpr)
+            round(self.width() * dpr), round(self.height() * dpr), dpr, clear)
         self._logoRepresentation.SetPosition(*position)
         self._logoRepresentation.SetPosition2(*size)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._holdCover is not None and not self._holdCover.isHidden():
+            self._holdCover.setGeometry(self.rect())
         self._updateLogoLayout()
         self._logoWidget.On()
+        self._layoutCorner()
+        self.arrangeOverlays()
         # F-44. The label budget is a function of the pixel extent, so it is
         # re-spent whenever the extent changes -- docking the pane is the
         # commonest way to arrive at a viewport too narrow for six numbers.
         self._applyCubeAxesPolicy()
+        self._applyClearInsets()
 
         if self._refitOnResize and not self._cameraMovedByUser:
             # Re-fit only while the framing is still the one this widget chose.

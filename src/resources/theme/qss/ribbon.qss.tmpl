@@ -1,0 +1,31 @@
+/* -- Plan 44 MF4: the step ribbon ----------------------------------------
+   The band and its tabs are painted by StepRibbon / StepTab from the
+   step.<state>.* tokens (a border-bottom cannot be inset or rounded). What is
+   styled here is what Qt draws itself: the "?" key, the number read-out and
+   the marks popover. */
+
+QToolButton#stepRibbonMarks {
+    background: transparent;
+    color: {{foreground.secondary}};
+    border: 1px solid transparent;
+    border-radius: {{radius.control}}px;
+    /* QSS sizes the content box: 22 + the 1px border each side = the 24px
+     * key the ribbon fixes (SG2: 24 made it 26 under the theme). */
+    min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px;
+    padding: 0;
+    font-weight: 600;
+}
+QToolButton#stepRibbonMarks:hover { background: {{background.control}}; color: {{foreground.strong}}; }
+QToolButton#stepRibbonMarks:focus { border-color: {{focus.ring}}; }
+
+QLabel#stepRibbonReadout {
+    color: {{foreground.strong}};
+    font-size: 13px;
+    font-weight: 600;
+    background: transparent;
+}
+
+QFrame#stepRibbonLegend {
+    background: {{background.raised}};
+    border: 1px solid {{border.default}};
+}

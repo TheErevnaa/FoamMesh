@@ -29,6 +29,10 @@ HISTORY_FILE = 'foammesh_history.json'
 PROPOSALS_FILE = 'foammesh_proposals.json'
 
 
+class StateSaveCancelled(Exception):
+    """Save as was cancelled before the copy was complete; nothing was made."""
+
+
 class Project(QObject):
     def __init__(self, path, *, storage_path=None, event_bus=None):
         super().__init__()
@@ -165,8 +169,18 @@ class Project(QObject):
         finally:
             self._settings._settings = original
 
-    def saveStateAsCase(self, case_path):
-        """Atomically create a state-only case; native artifacts are not copied."""
+    def saveStateAsCase(self, case_path, cancelled=None):
+        """Atomically create a state-only case; native artifacts are not copied.
+
+        ``cancelled`` is polled between the writes, from the worker thread
+        this runs in (Plan 39 VI1, F6b). When it answers true the staging copy
+        is removed and :class:`StateSaveCancelled` is raised, so the destination
+        is never half made: it either appears whole or not at all.
+        """
+        def checkpoint():
+            if cancelled is not None and cancelled():
+                raise StateSaveCancelled(str(case_path))
+
         destination = Path(case_path).resolve()
         if destination.exists():
             raise FileExistsError(f'destination already exists: {destination}')
@@ -177,13 +191,17 @@ class Project(QObject):
         try:
             sidecar = staging / 'foammesh'
             sidecar.mkdir(parents=True)
+            checkpoint()
             self._db.saveAs(sidecar)
+            checkpoint()
             self._saveLocalSettingsCopy(sidecar)
             self._saveHistory(sidecar)
+            checkpoint()
             save_case_metadata(staging, CaseMetadata(provenance={
                 'state_saved_from': str(self._path),
                 'copy_policy': 'foammesh-state-only-no-native-artifacts',
             }))
+            checkpoint()
             os.replace(staging, destination)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)

@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from datetime import datetime
 from pathlib import Path
 from functools import partial
 
 import qasync
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QDialog, QListWidgetItem
 
 from app_properties import meshAppProperties
@@ -13,6 +14,7 @@ from foammesh.support.utils import getFit
 from widgets.async_message_box import AsyncMessageBox
 
 from foammesh.app import app
+from foammesh.view.theming import fonts
 from .project_dialog_ui import Ui_ProjectSelector
 from .project_widget import ProjectWidget
 
@@ -36,6 +38,11 @@ class ProjectDialog(QDialog):
         self.setWindowTitle(
             self.tr('Start {0}').format(meshAppProperties.fullName))
 
+        # Plan 44 MF25. The section title is a small-caps caption (the
+        # `.snap .st` language); QSS has no letter-spacing, so it is a font.
+        self._ui.recentCaps.setFont(fonts.caps_font(10.5))  # a caps label, not a page heading (DP-219)
+        self._refreshEmptyState()
+
         self._dialog = None
         self._projectDirectory = None
 
@@ -52,10 +59,32 @@ class ProjectDialog(QDialog):
         for i in range(min(RECENT_PROJECTS_NUMBER, len(paths))):
             item = QListWidgetItem()
             widget = ProjectWidget(Path(paths[i]))
+            self._styleCard(widget, Path(paths[i]))
             item.setSizeHint(widget.sizeHint())
             self._ui.recentCases.addItem(item)
             self._ui.recentCases.setItemWidget(item, widget)
             widget.removeClicked.connect(partial(self._remove, widget))
+
+        self._refreshEmptyState()
+
+    @staticmethod
+    def _styleCard(widget, path):
+        """Plan 44 MF25. A recent case is a card: name, path and the date the
+        folder was last changed, in a 1 px `border.group` outline (QSS)."""
+        widget.setProperty('foammeshStartCard', True)
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        try:
+            stamp = datetime.fromtimestamp(path.stat().st_mtime)
+            widget._ui.status.setText(stamp.strftime('%Y-%m-%d'))
+        except OSError:
+            widget._ui.status.setText('')
+
+    def _refreshEmptyState(self):
+        """First run: no recents means the list is replaced by a sentence
+        that says what the two buttons do."""
+        empty = self._ui.recentCases.count() == 0
+        self._ui.emptyState.setVisible(empty)
+        self._ui.recentCases.setVisible(not empty)
 
     def getProjectDirectory(self):
         return self._projectDirectory
@@ -81,6 +110,7 @@ class ProjectDialog(QDialog):
                                            self.tr('Do you want to remove project "{0}" from the list?').format(path)):
             self._ui.recentCases.takeItem(selectedPos)
             app.settings.removeProject(selectedPos)
+            self._refreshEmptyState()
 
     def _new(self):
         self.actionNewSelected.emit()

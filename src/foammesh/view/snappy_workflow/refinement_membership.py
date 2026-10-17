@@ -19,7 +19,7 @@ the group's name, where the decision is made.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QLabel, QListWidget, QListWidgetItem, QVBoxLayout, QWidget,
 )
@@ -28,6 +28,7 @@ from foammesh.db.configurations_schema import GeometryType, Shape
 from foammesh.view.facade_client import submit
 from foammesh.view.geometry.display_name import readable_geometry_name
 from foammesh.view.geometry.merged_boundaries import MergedBoundaries
+from foammesh.view.snappy_workflow.membership_pick import ViewportPick
 
 SURFACE = GeometryType.SURFACE.value
 VOLUME = GeometryType.VOLUME.value
@@ -95,7 +96,11 @@ class RefinementMembership(QWidget):
     through ``geometry.items.patch`` once the group has its id.
     """
 
-    def __init__(self, client, kind: str, parent=None):
+    #: Plan 43 LY13 D1. The ticked rows changed, so the rows of the editor
+    #: this list sits in that depend on them (`unreadKeys`) must be re-judged.
+    unreadChanged = Signal()
+
+    def __init__(self, client, kind: str, parent=None, service=None):
         super().__init__(parent)
         self._client = client
         self._kind = kind
@@ -120,12 +125,20 @@ class RefinementMembership(QWidget):
             self.tr('The volumes this group refines. A group that refines '
                     'no volume is not written to the mesher.'))
         layout.addWidget(self.list)
+        # Plan 43 LY13 D1 (C-074, C-089). The legacy dialogs ticked rows by
+        # clicking the surface in the viewport; so does this list.
+        self.pick = ViewportPick(
+            self.list, self._rowsPicked, self._pickable, service=service,
+            parent=self, name=self.tr('Pick in view'))
+        self.pick.toggle.setObjectName(f'castellation{kind.title()}PickInView')
+        layout.addWidget(self.pick.toggle)
         self._empty = QLabel(
             self.tr('There is no surface to refine yet.') if kind == SURFACE
             else self.tr('There is no volume to refine yet. Add one on the '
                          'Geometry page.'))
         self._empty.setWordWrap(True)
         layout.addWidget(self._empty)
+        self.list.itemChanged.connect(lambda *_: self.unreadChanged.emit())
 
     # -- reading ----------------------------------------------------------- #
 
@@ -196,8 +209,69 @@ class RefinementMembership(QWidget):
                 self._initial.add(gId)
         self._empty.setVisible(self.list.count() == 0)
         self.list.setVisible(self.list.count() > 0)
+        self.pick.setVisible(self.list.count() > 0)
+        self.pick.refresh()
         self._loadedFor = group
         self._loaded = True
+
+    def _effectiveCfdType(self, rows: dict, gId) -> str:
+        """What a surface is for, as `CaseBuilder` decides it (DP-387).
+
+        The cell-zone choice sits on the *volume*; the surfaces that bound
+        it stay ``boundary`` in their own row and are read as ``cellZone``.
+        """
+        row = rows.get(str(gId)) or {}
+        cfd = str(row.get('cfdType') or 'boundary')
+        if cfd != 'boundary':
+            return cfd
+        owner = rows.get(_key(row.get('volume')) or '')
+        if owner and str(owner.get('cfdType') or 'none') == 'cellZone':
+            return 'cellZone'
+        return cfd
+
+    def unreadKeys(self) -> frozenset:
+        """Row-editor fields the ticked surfaces do not read.
+
+        Plan 43 LY13 D1, as the legacy surface dialog's
+        ``_showTheRowsThatAreRead``: ``patchGroups`` lands in ``patchInfo``,
+        which only a surface that makes a patch has; the zone side and its
+        seed are read only on a surface that writes a cell zone. A volume
+        group reads every field, so it hides none.
+        """
+        if self._kind != SURFACE:
+            return frozenset()
+        rows = geometry_rows(self._configuration())
+        ticked = {gId: None for gId in self.checked()}
+        covered = self._merged.expand(ticked) if ticked else {}
+        kinds = {self._effectiveCfdType(rows, gId) for gId in covered}
+        hidden = set()
+        if not (kinds - {'none', 'cellZone'}):
+            hidden.add('patch_groups')
+        if 'cellZone' not in kinds:
+            hidden |= {'zone_mode', 'zone_inside_point.x',
+                       'zone_inside_point.y', 'zone_inside_point.z'}
+        return frozenset(hidden)
+
+    def _listed(self) -> list:
+        return [str(self.list.item(index).data(Qt.ItemDataRole.UserRole))
+                for index in range(self.list.count())]
+
+    def _pickable(self) -> set:
+        """Every stable id a viewport pick may tick: a row, or what it folds."""
+        out = set()
+        for key in self._listed():
+            out.update(self._merged.cover(key))
+        return out
+
+    def _rowsPicked(self, stable_id) -> list:
+        stable_id = str(stable_id)
+        return [key for key in self._listed()
+                if stable_id in self._merged.cover(key)]
+
+    def hideEvent(self, event):
+        self.pick.detach()
+        self.pick.toggle.setChecked(False)
+        super().hideEvent(event)
 
     def checked(self) -> set:
         return {str(self.list.item(index).data(Qt.ItemDataRole.UserRole))

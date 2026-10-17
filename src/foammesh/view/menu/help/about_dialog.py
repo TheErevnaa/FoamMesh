@@ -25,6 +25,11 @@ class AboutDialog(QDialog):
             '<p>Free and open-source software licensed under GPL-3.0-or-later.</p>'
             '<p>Derived from NEXTfoam BaramMesh 26.2.1. Upstream copyright and '
             'licence notices are retained.</p>'
+            '<p>The automatic mesh size field is derived from Gmsh 4.15.2 '
+            '(C. Geuzaine, J.-F. Remacle; automatic size field by Arthur Bawin) '
+            'and HXT (Université catholique de Louvain), GPL-2.0-or-later, '
+            'and uses p4est and libsc. Gmsh is not endorsed by, and does not '
+            'endorse, FoamMesh.</p>'
             '<p>Not approved or endorsed by OpenCFD Limited, the OpenFOAM Foundation, '
             'CFD Direct, or NEXTfoam Co., Ltd.</p>').format(
                 name=meshAppProperties.fullName,

@@ -107,8 +107,9 @@ LABELS = {
 #: model grows 98 -> 107 (S5 pipe), 71 -> 79 (heat sink), 87 -> 98 (G6 tee),
 #: with the median brighter by 5-9 levels and no clipped highlights.
 LIGHT_KIT = {
-    'KeyLightIntensity': 0.9,
-    'KeyToFillRatio': 3.5,
+    # Plan 44 MF15: a softer key and more fill (the mockup's gentler shading).
+    'KeyLightIntensity': 0.85,
+    'KeyToFillRatio': 3.0,
     'KeyToHeadRatio': 6.0,
     'KeyToBackRatio': 2.5,
     'KeyLightWarmth': 0.55,

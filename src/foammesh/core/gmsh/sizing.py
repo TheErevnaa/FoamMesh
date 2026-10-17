@@ -102,8 +102,20 @@ def bounding_box_diagonal(bbox) -> float | None:
     return diagonal if diagonal > 0 else None
 
 
-def derive_global_sizing(values: dict, bbox=None) -> GlobalSizing:
-    """Turn persisted sizing values into the numbers the runner will set."""
+def derive_global_sizing(values: dict, bbox=None,
+                         diagonal_divisor: float | None = None,
+                         curvature_default: int | None = None,
+                         *, check_memory: bool = True
+                         ) -> GlobalSizing:
+    """Turn persisted sizing values into the numbers the runner will set.
+
+    Plan 40 UXA1. ``diagonal_divisor`` is what an unset target size divides
+    the bounding diagonal by: the Mesh size choice (core/sizing/derive.py).
+    ``check_memory`` refuses a size the machine cannot mesh *now*; a reader
+    asking what size a finished mesh was asked for passes False, because the
+    free RAM of the moment says nothing about a request already made.
+    """
+    divisor = float(diagonal_divisor or DEFAULT_DIAGONAL_DIVISOR)
     values = dict(values or {})
     warnings: list[str] = []
     sources: dict[str, str] = {}
@@ -115,13 +127,13 @@ def derive_global_sizing(values: dict, bbox=None) -> GlobalSizing:
             raise SizingError(
                 'a target element size is required: it could not be derived '
                 'because the geometry has no usable bounding box')
-        target = diagonal / DEFAULT_DIAGONAL_DIVISOR
+        target = diagonal / divisor
         sources['targetSize'] = 'derived'
         # DP-614: the number itself, because this is where the Global
         # Sizing page tells the user what "Auto" came to.
         warnings.append(
             f'target size {target:.4g} m derived from the bounding-box '
-            f'diagonal ({diagonal:.6g} m / {DEFAULT_DIAGONAL_DIVISOR:g}); '
+            f'diagonal ({diagonal:.6g} m / {divisor:g}); '
             'type a size to override it')
     else:
         sources['targetSize'] = 'configured'
@@ -143,11 +155,18 @@ def derive_global_sizing(values: dict, bbox=None) -> GlobalSizing:
     if not 0.01 <= factor <= 100:
         raise SizingError(f'sizeFactor {factor} is outside 0.01-100')
 
-    curvature = int(values.get('fromCurvature', 12) or 0)
+    # UXA1: unset means the Mesh size choice's points per circle; a typed
+    # value (including zero) is never replaced.
+    typed_curvature = values.get('fromCurvature')
+    if typed_curvature is None:
+        curvature = int(curvature_default if curvature_default is not None
+                        else 12)
+    else:
+        curvature = int(typed_curvature or 0)
     if not 0 <= curvature <= 50:
         raise SizingError(f'fromCurvature {curvature} is outside 0-50')
 
-    if diagonal is not None:
+    if diagonal is not None and check_memory:
         estimate = _element_estimate(diagonal, target * factor)
         from foammesh.support.resource_budget import mesher_memory_refusal
 

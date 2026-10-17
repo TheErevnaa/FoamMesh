@@ -53,8 +53,16 @@ OPERATIONS = (OPERATION, VOLUME_OPERATION)
 VOLUME_AUTO_MAX_CELLS = 200_000
 #: Opening the volume's ``.vtu`` in the window holds about this many times
 #: its bytes (the reader's buffer and the grid it builds), checked against
-#: the free RAM before it is opened -- there is no fixed size cap.
-VOLUME_LOAD_FACTOR = 3
+#: the free RAM before it is opened -- there is no fixed size cap. The file
+#: is LZ4-compressed (Plan 39 VI4), which measured 2.25-2.28x smaller than the
+#: raw one on hexahedral boxes, so the factor is the raw 3x times that.
+VOLUME_LOAD_FACTOR = 7
+#: Field-data array on a zone or region part: the polyMesh cell ids of its
+#: cells in the region's ``internalMesh`` grid. Set by the reader's loader on
+#: a reconstructed single read; the worker hands over the ids instead of a
+#: second copy of the cells, and the window extracts the part from the one
+#: grid (Plan 39 VI4, "zones as id arrays").
+ZONE_CELL_IDS = '_foammeshCellIds'
 #: Must equal ``actor_info.SILHOUETTE_FEATURE_ANGLE``: the precomputed edges
 #: stand in for the ones the actor would have computed itself.
 FEATURE_ANGLE = 30.0
@@ -149,6 +157,9 @@ def case_counts(case, layout: str | None = None) -> dict | None:
     which are not boundary. Only headers and the boundary tables are read.
     """
     case = Path(case)
+    if case.is_file() and case.suffix.lower() in ('.vtu', '.msh'):
+        from foammesh.core.mesh import native_mesh
+        return native_mesh.header_counts(case)
     layout = layout or case_layout(case)
     try:
         if layout == 'reconstructed':
@@ -464,6 +475,12 @@ def feature_edges(polydata):
     return edges.GetOutput()
 
 
+#: Cell data on an internalMesh exterior built from its patches: the index of
+#: the patch (in the region's boundary order) each face belongs to. Plan 39
+#: VI4. It reaches the window as the exterior's ``patchId``.
+SKIN_ARRAY = 'skinPatch'
+
+
 def exterior_surface(grid):
     """What ``MeshActor``'s ``vtkGeometryFilter`` sends to the renderer."""
     from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
@@ -472,6 +489,62 @@ def exterior_surface(grid):
     surface.SetInputData(grid)
     surface.Update()
     return surface.GetOutput()
+
+
+def exterior_from_patches(region: str, surfaces: list, counts: dict | None):
+    """The exterior of ``region``'s ``internalMesh`` out of its boundary patches.
+
+    Plan 39 VI4. The faces on the outside of the internal mesh *are* the
+    boundary patches' faces, which the reader already holds as polydata, so
+    appending them replaces a ``vtkGeometryFilter`` pass over the whole volume
+    (25-27 % of the load, measured). Points are merged exactly so the feature
+    edges between two patches are the ones the filter's output had.
+
+    Answers None -- and the caller runs the filter -- unless the patches
+    provably cover every boundary face: a reconstructed single-region read
+    whose patch faces add up to the headers' boundary face count (a decomposed
+    read exposes the processor interfaces; a named region has no headers
+    here).
+    """
+    from vtkmodules.vtkCommonDataModel import vtkPolyData
+    from vtkmodules.vtkFiltersCore import vtkAppendPolyData, vtkCleanPolyData
+
+    if region != '' or (counts or {}).get('layout') != 'reconstructed':
+        return None
+    patches = [data for r, category, _name, data in surfaces
+               if r == region and category == 'boundary']
+    expected = (counts or {}).get('boundary_faces')
+    if (not patches or expected is None
+            or not all(isinstance(data, vtkPolyData) for data in patches)
+            or sum(data.GetNumberOfCells() for data in patches) != expected):
+        return None
+    append = vtkAppendPolyData()
+    for data in patches:
+        append.AddInputData(data)
+    clean = vtkCleanPolyData()
+    clean.SetInputConnection(append.GetOutputPort())
+    clean.PointMergingOn()
+    clean.SetToleranceIsAbsolute(True)
+    clean.SetAbsoluteTolerance(0.0)
+    clean.ConvertPolysToLinesOff()
+    clean.ConvertLinesToPointsOff()
+    clean.ConvertStripsToPolysOff()
+    clean.Update()
+    result = vtkPolyData()
+    result.ShallowCopy(clean.GetOutput())
+    # Plan 39 VI4 (F1e). The appended faces stay in the patches' order, so
+    # the face's patch is known: its index in `patches`, the region's
+    # boundary order. The window colours the exterior by it and draws the
+    # patches as edges only over it. Not given if the clean pass dropped a
+    # face (the counts would no longer line up).
+    counts_per = [data.GetNumberOfCells() for data in patches]
+    if result.GetNumberOfPolys() == sum(counts_per):
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+        ids = numpy_to_vtk(np.repeat(
+            np.arange(len(patches), dtype=np.int32), counts_per), deep=True)
+        ids.SetName(SKIN_ARRAY)
+        result.GetCellData().AddArray(ids)
+    return result
 
 
 def _triangles(polydata) -> int:
@@ -529,7 +602,14 @@ def decimate_parts(parts: list, *, max_triangles: int, max_bytes: int):
     return decimated, True
 
 
-def _write_xml(data, path: Path) -> int:
+def _write_xml(data, path: Path, *, compress: bool = False) -> int:
+    """Write ``data`` as appended-binary XML; ``compress`` is LZ4.
+
+    The volume is written compressed (Plan 39 VI4): half the bytes for
+    +0.3 s / +0.8 s of worker time at 5 M / 15 M cells, and read back no
+    slower than raw (``plans/evidence/plan39/volume-load.md``). zlib is out:
+    6x the raw write. The surface file stays raw; it is small.
+    """
     from vtkmodules.vtkIOXML import (
         vtkXMLPolyDataWriter, vtkXMLUnstructuredGridWriter)
     from vtkmodules.vtkCommonDataModel import vtkPolyData
@@ -541,13 +621,76 @@ def _write_xml(data, path: Path) -> int:
     writer.SetInputData(data)
     writer.SetDataModeToAppended()
     writer.EncodeAppendedDataOff()
-    writer.SetCompressorTypeToNone()
+    if compress:
+        writer.SetCompressorTypeToLZ4()
+    else:
+        writer.SetCompressorTypeToNone()
     writer.SetHeaderTypeToUInt64()
     if not writer.Write():
         temporary.unlink(missing_ok=True)
         raise OSError(f'could not write {path}')
     os.replace(temporary, path)
     return path.stat().st_size
+
+
+def zone_cell_ids(grid):
+    """The ``ZONE_CELL_IDS`` of a zone or region part, or None.
+
+    Only when the ids name exactly the part's cells: a part the loader could
+    not number (a decomposed read, a decomposed polyhedron) is written whole.
+    """
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    array = grid.GetFieldData().GetArray(ZONE_CELL_IDS)
+    if array is None:
+        return None
+    ids = np.asarray(vtk_to_numpy(array), dtype=np.int64).ravel()
+    if ids.size != grid.GetNumberOfCells() or ids.size == 0:
+        return None
+    return ids
+
+
+def _write_ids(ids, path: Path) -> int:
+    """Cell ids as ``.npy``, int32 when they fit; returns the bytes."""
+    ids = np.sort(np.asarray(ids, dtype=np.int64))
+    if ids.size and int(ids[-1]) < 2 ** 31:
+        ids = ids.astype(np.int32)
+    temporary = path.with_name(path.name + '.part')
+    with open(temporary, 'wb') as stream:
+        np.save(stream, ids, allow_pickle=False)
+    os.replace(temporary, path)
+    return path.stat().st_size
+
+
+def extract_cells(grid, ids):
+    """The cells ``ids`` of ``grid`` as a grid of their own.
+
+    A ``vtkSelectionNode`` of cell indices, so the zone is no second copy of
+    the cells on the wire. The extractor's bookkeeping arrays are dropped so
+    the part holds what a zone read from its own file held.
+    """
+    from vtkmodules.util.numpy_support import numpy_to_vtkIdTypeArray
+    from vtkmodules.vtkCommonDataModel import (
+        vtkSelection, vtkSelectionNode, vtkUnstructuredGrid)
+    from vtkmodules.vtkFiltersExtraction import vtkExtractSelection
+
+    node = vtkSelectionNode()
+    node.SetContentType(vtkSelectionNode.INDICES)
+    node.SetFieldType(vtkSelectionNode.CELL)
+    node.SetSelectionList(numpy_to_vtkIdTypeArray(
+        np.ascontiguousarray(ids, dtype=np.int64), deep=True))
+    selection = vtkSelection()
+    selection.AddNode(node)
+    extract = vtkExtractSelection()
+    extract.SetInputData(0, grid)
+    extract.SetInputData(1, selection)
+    extract.Update()
+    result = vtkUnstructuredGrid()
+    result.ShallowCopy(extract.GetOutput())
+    for name in ('vtkOriginalCellIds', 'vtkOriginalPointIds'):
+        result.GetCellData().RemoveArray(name)
+        result.GetPointData().RemoveArray(name)
+    return result
 
 
 def pack_parts(parts: list, edges: list):
@@ -626,6 +769,21 @@ def pack_parts(parts: list, edges: list):
     patch_id = numpy_to_vtk(ids, deep=True)
     patch_id.SetName('patchId')
     packed.GetCellData().AddArray(patch_id)
+    # Plan 39 VI4 (F1e). A part that knows which patch each face is (the
+    # internalMesh exterior built from the patches) hands that over beside
+    # the part index; -1 where a part does not say.
+    if any(data.GetCellData().GetArray(SKIN_ARRAY) is not None
+           for _r, _c, _n, data in parts):
+        columns = []
+        for _r, _c, _n, data in parts:
+            array = data.GetCellData().GetArray(SKIN_ARRAY)
+            columns.append(
+                vtk_to_numpy(array).astype(np.int32) if array is not None
+                else np.full(data.GetNumberOfPolys(), -1, np.int32))
+        skin = numpy_to_vtk(np.concatenate(
+            [np.full(line_at, -1, np.int32)] + columns), deep=True)
+        skin.SetName(SKIN_ARRAY)
+        packed.GetCellData().AddArray(skin)
     field = packed.GetFieldData()
     table = numpy_to_vtk(ranges.reshape(-1), deep=True)
     table.SetName('partRanges')
@@ -753,8 +911,11 @@ def build_preview(operation: str, args: dict) -> dict:
     # would otherwise run vtkGeometryFilter over the whole grid on first paint.
     parts = list(surfaces)
     for region, category, name, grid in volumes:
+        exterior = (exterior_from_patches(region, surfaces, counts)
+                    if category == 'internalMesh' else None)
         parts.append((region, f'exterior:{category}', name,
-                      exterior_surface(grid)))
+                      exterior if exterior is not None
+                      else exterior_surface(grid)))
     edges = [feature_edges(data) for *_key, data in parts]
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -766,14 +927,22 @@ def build_preview(operation: str, args: dict) -> dict:
         written.append(surface_path)
         total = surface_bytes
         volume_docs = []
+        with_internal = {region for region, category, _n, _g in volumes
+                         if category == 'internalMesh'}
         for index, (region, category, name, grid) in enumerate(volumes):
-            path = out_dir / f'{stem}-v{index}.vtu'
-            size = _write_xml(grid, path)
+            ids = (zone_cell_ids(grid) if category != 'internalMesh'
+                   and region in with_internal else None)
+            if ids is not None:
+                path = out_dir / f'{stem}-v{index}.npy'
+                size = _write_ids(ids, path)
+            else:
+                path = out_dir / f'{stem}-v{index}.vtu'
+                size = _write_xml(grid, path, compress=True)
             written.append(path)
             total += size
             volume_docs.append({'region': region, 'category': category,
                                 'name': name, 'path': str(path),
-                                'bytes': size,
+                                'bytes': size, 'ids': ids is not None,
                                 'cells': int(grid.GetNumberOfCells())})
         if max_bytes is not None and total > max_bytes:
             raise PreviewRefused(
@@ -844,10 +1013,21 @@ def unpack_parts(packed) -> list:
         (data.SetLines if lines else data.SetPolys)(cells)
         return data
 
+    skin = packed.GetCellData().GetArray(SKIN_ARRAY)
+    skin = (vtk_to_numpy(skin).astype(np.int32) if skin is not None else None)
     parts = []
     for index, row in enumerate(ranges):
         surface = piece(row[0], row[1], row[2], row[3], poly_off, poly_conn,
                         False)
+        if skin is not None:
+            # The lines come first in the packed cell data, then each part's
+            # polygons in order (see `pack_parts`).
+            first = int(ranges[:, 7].sum() + ranges[:index, 3].sum())
+            values = skin[first:first + int(row[3])]
+            if values.size and values.min() >= 0:
+                ids = numpy_to_vtk(np.ascontiguousarray(values), deep=True)
+                ids.SetName('patchId')
+                surface.GetCellData().AddArray(ids)
         edges = piece(row[4], row[5], row[6], row[7], line_off, line_conn,
                       True)
         parts.append((labels[0].GetValue(index), labels[1].GetValue(index),
@@ -905,7 +1085,11 @@ def scene_from_payload(payload: dict) -> tuple[dict, dict]:
             elif category.startswith('exterior:'):
                 exteriors[(rname, category.split(':', 1)[1], name)] = {
                     'surface': data, 'edges': edges}
+    by_ids = []
     for item in payload.get('volumes') or ():
+        if item.get('ids'):
+            by_ids.append(item)
+            continue
         grid = read_volume_file(item['path'])
         body = region(item['region'])
         key = (item['region'], item['category'], item['name'])
@@ -913,6 +1097,18 @@ def scene_from_payload(payload: dict) -> tuple[dict, dict]:
             body['internalMesh'] = grid
         else:
             body['zones'].setdefault(item['category'], {})[item['name']] = grid
+        if key in exteriors:
+            precomputed[key] = exteriors[key]
+    for item in by_ids:
+        # A zone or region the worker sent as cell ids of the region's one
+        # grid (Plan 39 VI4): cut it out of that grid here.
+        body = region(item['region'])
+        internal = body['internalMesh']
+        if internal is None:
+            continue
+        grid = extract_cells(internal, np.load(item['path']))
+        key = (item['region'], item['category'], item['name'])
+        body['zones'].setdefault(item['category'], {})[item['name']] = grid
         if key in exteriors:
             precomputed[key] = exteriors[key]
     return scene, precomputed

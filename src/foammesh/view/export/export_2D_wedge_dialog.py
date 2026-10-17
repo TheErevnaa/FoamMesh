@@ -11,7 +11,10 @@ from widgets.selector_dialog import SelectorDialog, SelectorItem
 from foammesh.app import app
 from foammesh.db.configurations_schema import CFDType
 from foammesh.core.mesh.extrusion_options import ExtrudeOptions, ExtrudeModel
+from foammesh.view import inline_error
+from foammesh.core import display_unit
 from foammesh.view.theming.metrics import FORM_MARGIN, place_unit
+from foammesh.view.workflow_controls.length_box import model_text
 from .export_2D_wedge_dialog_ui import Ui_Export2DWedgeDialog
 from .export_2D_region_widgets import Export2DWedgeRegionWidget
 
@@ -38,6 +41,9 @@ class Export2DWedgeDialog(QDialog):
         # DP-198. The row said `Angle (deg)` while the refusal beneath it
         # said `Angle`; one name, and the unit beside the box.
         place_unit(self._ui.angle, 'deg')
+        # UXB3c. The origin is a point, typed in the project display unit.
+        for edit in (self._ui.originX, self._ui.originY, self._ui.originZ):
+            place_unit(edit, display_unit.current())
 
         self._regionWidgets = []
 
@@ -81,7 +87,9 @@ class Export2DWedgeDialog(QDialog):
     def extrudeOptions(self):
         return ([(b.rname(), b.p1(), b.p2()) for b in self._regionWidgets],
                 ExtrudeOptions(ExtrudeModel.WEDGE,
-                               point=[self._ui.originX.text(), self._ui.originY.text(), self._ui.originZ.text()],
+                               point=[model_text(self._ui.originX.text()),
+                                      model_text(self._ui.originY.text()),
+                                      model_text(self._ui.originZ.text())],
                                axis=[self._ui.directionX.text(), self._ui.directionY.text(), self._ui.directionZ.text()],
                                angle=self._ui.angle.text()))
 
@@ -101,21 +109,19 @@ class Export2DWedgeDialog(QDialog):
         path = self._pathWidget.projectPath()
         if path is None:
             if self._pathWidget.validationMessage():
-                await AsyncMessageBox().warning(self, self.tr('Input error'), self._pathWidget.validationMessage())
+                inline_error.show(self, self._pathWidget.validationMessage())
                 return
             else:
-                await AsyncMessageBox().warning(self, self.tr('Input error'), self.tr('Enter a project name.'))
+                inline_error.show(self, self.tr('Enter a project name.'))
                 return
 
         for widget in self._regionWidgets:
             if not widget.p1():
-                await AsyncMessageBox().warning(
-                    self, self.tr('Input error'), self.tr('Select P1 — {0}').format(widget.rname()))
+                inline_error.show(self, self.tr('Select P1 — {0}').format(widget.rname()))
                 return
 
             if not widget.p2():
-                await AsyncMessageBox().warning(
-                    self, self.tr('Input error'), self.tr('Select P2 — {0}').format(widget.rname()))
+                inline_error.show(self, self.tr('Select P2 — {0}').format(widget.rname()))
                 return
 
         try:
@@ -127,15 +133,14 @@ class Export2DWedgeDialog(QDialog):
             self._ui.directionY.validate(self.tr('Direction Y'))
             self._ui.directionZ.validate(self.tr('Direction Z'))
         except ValueError as e:
-            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
+            inline_error.show(self, str(e))
             return
 
 
         if (0   == float(self._ui.directionX.text())
                 == float(self._ui.directionY.text())
                 == float(self._ui.directionZ.text())):
-            await AsyncMessageBox().warning(self, self.tr('Input error'),
-                                                self.tr('Direction cannot be a zero vector.'))
+            inline_error.show(self, self.tr('Direction cannot be a zero vector.'))
             return
 
         super().accept()

@@ -12,8 +12,8 @@ from vtkmodules.vtkCommonDataModel import (
 from vtkmodules.util.numpy_support import (
     numpy_to_vtk, numpy_to_vtkIdTypeArray)
 from foammesh.core.mesh.poly_mesh_boundary import (
-    PolyMeshReadError, read_face_zone_surfaces)
-from foammesh.core.mesh.mesh_preview import case_layout
+    PolyMeshReadError, _read_zones, read_face_zone_surfaces)
+from foammesh.core.mesh.mesh_preview import ZONE_CELL_IDS, case_layout
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 from vtkmodules.vtkRenderingLOD import vtkQuadricLODActor
 from vtkmodules.vtkCommonCore import vtkCommand
@@ -186,13 +186,14 @@ def _mergeFaceZones(zones: dict, roots) -> dict:
 class PolyMeshLoader(QObject):
     progress = Signal(str)
 
-    def __init__(self, foamFile, regionSeeds=()):
+    def __init__(self, foamFile, regionSeeds=(), *, cellToPoint=False):
         super().__init__()
 
         # DP-711. ``[(name, point), ...]`` from the Regions page, so a mesh
         # that holds several regions without naming them (snappy's multi-
         # region output) still reaches the viewport as named parts.
         self._regionSeeds = [(name, point) for name, point in regionSeeds]
+        self._regionCells = {}
         self._reader = vtkPOpenFOAMReader()
         self._caseDir = Path(foamFile).parent
         self._processorPath = self._caseDir / 'processor0'
@@ -202,7 +203,14 @@ class PolyMeshLoader(QObject):
         self._reader.EnableAllPointArrays()
         self._reader.EnableAllPatchArrays()
         self._reader.EnableAllLagrangianArrays()
-        self._reader.CreateCellToPointOn()
+        # Plan 39 VI4. Cell-to-point interpolation costs no seconds on a mesh
+        # without fields but holds 4-5x the reader's resident memory (550 ->
+        # 114 MB at 5 M cells, 1638 -> 343 MB at 15 M, measured). Nothing on
+        # screen reads a point array, so it is off unless a caller asks.
+        if cellToPoint:
+            self._reader.CreateCellToPointOn()
+        else:
+            self._reader.CreateCellToPointOff()
         self._reader.CacheMeshOn()
         self._reader.ReadZonesOn()
         self._reader.SkipZeroTimeOff()
@@ -394,8 +402,57 @@ class PolyMeshLoader(QObject):
 
         self._addUnreadFaceZones(vtkMesh)
         self._addSeededRegions(vtkMesh)
+        self._numberZoneCells(vtkMesh)
 
         return vtkMesh
+
+    @staticmethod
+    def _tagCellIds(part, ids) -> None:
+        """Carry ``ids`` (polyMesh cells of ``part``) on the part's field data."""
+        array = numpy_to_vtkIdTypeArray(
+            np.ascontiguousarray(ids, dtype=np.int64), deep=True)
+        array.SetName(ZONE_CELL_IDS)
+        part.GetFieldData().AddArray(array)
+
+    def _numberZoneCells(self, vtkMesh: dict) -> None:
+        """Plan 39 VI4. Say which cells of ``internalMesh`` each zone holds.
+
+        The preview worker hands a zone or region over as those ids instead of
+        writing its cells a second time. Only for a reconstructed
+        single-region read; the worker writes ids only where their count is the
+        part's cell count, so any other read (a decomposed polyhedron) is
+        written whole.
+        """
+        if (list(vtkMesh) != [''] or self._caseType()
+                != vtkPOpenFOAMReader.RECONSTRUCTED_CASE):
+            return
+        region = vtkMesh['']
+        internal = region.get('internalMesh')
+        zones = region.get('zones')
+        if internal is None or not isinstance(zones, dict):
+            return
+        count = internal.GetNumberOfCells()
+        regions = zones.get('regions') or {}
+        for name, part in regions.items():
+            ids = self._regionCells.get(name)
+            if ids is not None:
+                ids = np.unique(ids[(ids >= 0) & (ids < count)])
+                self._tagCellIds(part, ids)
+        cell_zones = zones.get('cellZones') or {}
+        if not cell_zones:
+            return
+        try:
+            mesh = self._caseDir / 'constant' / 'polyMesh'
+            labelled = {zone.name: zone.labels
+                        for zone in _read_zones(mesh, 'cellZones')}
+        except (PolyMeshReadError, OSError, ValueError):
+            return
+        for name, part in cell_zones.items():
+            ids = labelled.get(name)
+            if ids is not None and hasattr(part, 'GetFieldData'):
+                ids = np.unique(np.asarray(ids, dtype=np.int64))
+                if ids.size and ids[0] >= 0 and ids[-1] < count:
+                    self._tagCellIds(part, ids)
 
     def _addSeededRegions(self, vtkMesh: dict) -> None:
         """DP-711. Name the regions of a mesh that holds them unnamed.
@@ -427,6 +484,8 @@ class PolyMeshLoader(QObject):
                 expected_cells=internal.GetNumberOfCells())
             if cells:
                 zones['regions'] = region_grids(internal, cells)
+                self._regionCells = {name: np.asarray(ids, dtype=np.int64)
+                                     for name, ids in cells.items()}
         except Exception:                                    # noqa: BLE001
             # Best-effort, like the face zones above: the whole mesh still
             # draws, it just is not split.

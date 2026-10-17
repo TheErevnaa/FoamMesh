@@ -12,7 +12,7 @@ from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QGroupBox, QHBoxLayout, QHeaderView,
-    QMessageBox, QPushButton, QStyle, QStyleOptionHeaderV2, QTableWidget,
+    QLabel, QMessageBox, QPushButton, QStyle, QStyleOptionHeaderV2, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -22,9 +22,14 @@ from foammesh.app import app
 from foammesh.core.selection import SelectionKind, SelectionStatus
 from foammesh.view.facade_client import submit
 from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT
+from foammesh.view.theming.status_colors import (
+    style_tight_headings, style_tightest_headings)
 
-from .field_widgets import FieldEditor
+from foammesh.core import display_unit
+
+from .field_widgets import FieldEditor, _is_length
 from .labels import humanise_option
+from widgets import async_message_box as messages
 
 
 def collection_adapter(collection_id: str) -> EntityAdapter:
@@ -68,7 +73,12 @@ class _NumericFloorHeader(QHeaderView):
     def numeric_floor(self) -> int:
         margin = self.style().pixelMetric(
             self.style().PixelMetric.PM_HeaderMargin, None, self)
-        return self.fontMetrics().horizontalAdvance(self.SAMPLE) + 4 * margin
+        # SG44. The coordinate is drawn in the cells, so it is measured in
+        # the table's face: the theme now gives the header its own smaller
+        # caption face (Plan 44 MF2), which would have floored the column at
+        # the width of a caption rather than of the number under it.
+        return ((self.parentWidget() or self).fontMetrics()
+                .horizontalAdvance(self.SAMPLE) + 4 * margin)
 
     def sectionSizeFromContents(self, logical_index):       # noqa: N802
         return self.measure(logical_index, self._wrap)
@@ -96,6 +106,24 @@ class _NumericFloorHeader(QHeaderView):
     #: Whether a heading of several words may break onto a second line.
     #: The panel turns it on only when the one-line headings would not fit.
     _wrap = False
+    #: CHL (DP-2664). How many lines a heading may take: two, until a table
+    #: that still overflows its viewport (a word cut by the sideways scroll)
+    #: lets a long heading take a line per word.
+    _maxLines = 2
+
+    def set_max_lines(self, lines: int) -> bool:
+        """Allow up to ``lines`` lines per heading; True when that changed."""
+        lines = max(2, int(lines))
+        if lines == self._maxLines:
+            return False
+        self._maxLines = lines
+        count = self.count()
+        if count:
+            self.headerDataChanged(self.orientation(), 0, count - 1)
+        return True
+
+    def max_lines(self) -> int:
+        return self._maxLines
 
     def set_wrapping(self, wrap: bool) -> bool:
         """Let headings break onto two lines; True when that changed."""
@@ -135,13 +163,29 @@ class _NumericFloorHeader(QHeaderView):
         if not wrap or len(words) < 2:
             return [text]
         metrics = self._bold_metrics()
+        widths = [metrics.horizontalAdvance(word) for word in words]
+        space = metrics.horizontalAdvance(' ')
         best = None
-        for cut in range(1, len(words)):
-            lines = [' '.join(words[:cut]), ' '.join(words[cut:])]
-            widest = max(metrics.horizontalAdvance(line) for line in lines)
-            if best is None or widest < best[0]:
+        # Every way to cut the words into at most ``_maxLines`` runs; the
+        # narrowest widest-line wins (the first, on a tie, so two lines stay
+        # the balanced pair they were).
+        for cuts in self._cuts(len(words), min(self._maxLines, len(words))):
+            lines, widest, start = [], 0, 0
+            for end in (*cuts, len(words)):
+                lines.append(' '.join(words[start:end]))
+                widest = max(widest, sum(widths[start:end]) + space * (end - start - 1))
+                start = end
+            if best is None or widest < best[0] or (
+                    widest == best[0] and len(lines) < len(best[1])):
                 best = (widest, lines)
         return best[1]
+
+    @staticmethod
+    def _cuts(count: int, lines: int):
+        """Cut positions for 2..``lines`` runs of ``count`` words, fewest runs first."""
+        from itertools import combinations
+        for runs in range(2, lines + 1):
+            yield from combinations(range(1, count), runs - 1)
 
     def paintSection(self, painter, rect, logical_index):   # noqa: N802
         lines = self.wrapped_lines(logical_index)
@@ -184,8 +228,15 @@ class ChildControlPanel(QGroupBox):
 
     def __init__(self, facade_client, collection_id: str, title: str,
                  columns=(), parent=None, *, choices=None, annotations=None,
-                 headings=None, unscoped_note=None, stretch=None):
+                 headings=None, unscoped_note=None, stretch=None,
+                 inline=False, short_headings=None):
         super().__init__(title, parent)
+        #: Plan 41 GN18. An inline panel never blocks: its form opens inside
+        #: the panel, a notice is a line under the table and a removal asks
+        #: on a strip. The Gmsh route builds every panel this way.
+        self._inline = bool(inline)
+        self._inlineDialog = None
+        self._inlineAccepted = None
         self._client = facade_client
         self.collection_id = collection_id
         # R60/R152. Fields whose value is an opaque index the app can name --
@@ -215,6 +266,12 @@ class ChildControlPanel(QGroupBox):
         self._headings = {key: str(value)
                           for key, value in dict(headings or {}).items()
                           if str(value).strip()}
+        # Plan 44 GFIT (DP-2693). A narrow table may draw a column under a
+        # shorter word; only the table heading is shortened, the editor label
+        # keeps the full one, and the heading tooltip says the full word.
+        self._shortHeadings = {key: str(value)
+                               for key, value in dict(short_headings or {}).items()
+                               if str(value).strip()}
         self._adapter = collection_adapter(collection_id)
         self._descriptors = {relative_id: field.descriptor
                              for relative_id, field in self._adapter.fields.items()}
@@ -253,6 +310,7 @@ class ChildControlPanel(QGroupBox):
         self.table.setHorizontalHeader(_NumericFloorHeader(self.table))
         self.table.setHorizontalHeaderLabels(
             [self._heading(name) for name in self._columns])
+        display_unit.subscribe(self._on_display_unit)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # DP-1193. Several rows may be selected and removed together; Edit
         # still opens on one (it is offered only while one is selected).
@@ -290,7 +348,7 @@ class ChildControlPanel(QGroupBox):
         for column, name in enumerate(self._columns):
             item = self.table.horizontalHeaderItem(column)
             if item is not None:
-                item.setToolTip(self._heading(name))
+                item.setToolTip(self._heading(name, full=True))
         self._floor_numeric_columns()
         # DP-559. Re-fit the headings whenever the width they share changes.
         self.table.viewport().installEventFilter(self)
@@ -318,6 +376,11 @@ class ChildControlPanel(QGroupBox):
             if descriptor.default is not None:
                 editor.set_value(descriptor.default)
         self._dialog = None
+        if self._inline:
+            # Plan 41 GN18. A scope field takes the entity selected in the
+            # viewport, and a chip names what it holds.
+            from .scope_pick import addScopePickers
+            addScopePickers(self)
 
         # Plan 33 FORM-03/LAYER-05. Two wrapped lines under an empty table
         # on every child collection in the product -- MEASURED, the sentence
@@ -350,6 +413,7 @@ class ChildControlPanel(QGroupBox):
             buttons.addWidget(button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+        self._buildInlineParts(layout)
         self.table.doubleClicked.connect(self.open_edit_dialog)
         # DP-518. The scrollbar is reserved only while there is something to
         # scroll, so the height follows the columns as they are sized.
@@ -402,9 +466,32 @@ class ChildControlPanel(QGroupBox):
             header.setMinimumSectionSize(
                 max(header.minimumSectionSize(), header.numeric_floor()))
 
-    def _heading(self, name: str) -> str:
-        """The text over one column of the table."""
-        return self.tr(self._label_for(name, self._descriptors.get(name)))
+    def _heading(self, name: str, full: bool = False) -> str:
+        """The text over one column of the table.
+
+        UXB3 (#44): a length column says its unit, the project display unit.
+        ``full`` ignores a short heading (the header tooltip's text).
+        """
+        short = None if full else getattr(self, '_shortHeadings', {}).get(name)
+        text = self.tr(short or self._label_for(
+            name, self._descriptors.get(name)))
+        descriptor = self._descriptors.get(name)
+        if descriptor is not None and _is_length(descriptor):
+            return f'{text} ({display_unit.current()})'
+        return text
+
+    def _on_display_unit(self) -> None:
+        """The display unit changed: new headers, same stored metres."""
+        try:
+            self.table.setHorizontalHeaderLabels(
+                [self._heading(name) for name in self._columns])
+            for column, name in enumerate(self._columns):
+                item = self.table.horizontalHeaderItem(column)
+                if item is not None:
+                    item.setToolTip(self._heading(name, full=True))
+            self.refresh()
+        except RuntimeError:
+            pass
 
     def _label_for(self, name: str, descriptor=None) -> str:
         """The one name a field is shown under on this panel."""
@@ -500,6 +587,7 @@ class ChildControlPanel(QGroupBox):
         self._dialog = None
         if dialog is None:
             return
+        self._closeInline()
         dialog.releaseEditors(self._form)
         dialog.setParent(None)
         dialog.deleteLater()
@@ -567,6 +655,103 @@ class ChildControlPanel(QGroupBox):
         except (AttributeError, FileNotFoundError, OSError, ValueError):
             pass
 
+    # -- Plan 41 GN18: the non-modal way ------------------------------------ #
+
+    def isInline(self) -> bool:
+        return self._inline
+
+    def _buildInlineParts(self, layout) -> None:
+        """The notice line, the removal strip and the form's own place."""
+        self._notice = QLabel(self)
+        self._notice.setObjectName('childPanelNotice')
+        self._notice.setWordWrap(True)
+        self._notice.setProperty('foammeshStatus', 'warning')
+        self._notice.setVisible(False)
+        layout.addWidget(self._notice)
+
+        self._confirm = QWidget(self)
+        self._confirm.setObjectName('childPanelConfirm')
+        row = QHBoxLayout(self._confirm)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(GAP_TIGHT)
+        self._confirmText = QLabel(self._confirm)
+        self._confirmText.setWordWrap(True)
+        self._confirmYes = QPushButton(self.tr('Remove'), self._confirm)
+        self._confirmYes.setObjectName('childPanelConfirmYes')
+        self._confirmNo = QPushButton(self.tr('Keep'), self._confirm)
+        self._confirmNo.setObjectName('childPanelConfirmNo')
+        row.addWidget(self._confirmText, 1)
+        row.addWidget(self._confirmYes)
+        row.addWidget(self._confirmNo)
+        self._confirmNo.clicked.connect(self._dropConfirm)
+        self._confirmKeys = []
+        self._confirmYes.clicked.connect(self._confirmed)
+        self._confirm.setVisible(False)
+        layout.addWidget(self._confirm)
+
+        self._editorHost = QWidget(self)
+        self._editorHost.setObjectName('childPanelEditorHost')
+        QVBoxLayout(self._editorHost).setContentsMargins(0, 0, 0, 0)
+        self._editorHost.setVisible(False)
+        layout.addWidget(self._editorHost)
+
+    def notice(self) -> str:
+        """The sentence an inline panel is showing, or ''."""
+        return self._notice.text() if self._notice.isVisibleTo(self) else ''
+
+    def _tell(self, title: str, text: str) -> None:
+        """Say *text*: a line in the panel inline, a box otherwise."""
+        if self._inline:
+            self._notice.setText(f'{title}: {text}' if title else text)
+            self._notice.setVisible(True)
+            return
+        messages.warning(self, title, text)
+
+    def clearNotice(self) -> None:
+        if self._inline:
+            self._notice.setVisible(False)
+
+    def isEditing(self) -> bool:
+        return self._inlineDialog is not None
+
+    def _run_inline(self, dialog, accepted) -> None:
+        self._closeInline()
+        self._inlineDialog = dialog
+        self._inlineAccepted = accepted
+        dialog.finished.connect(self._inlineFinished)
+        dialog.showDocked(self._editorHost)
+        self._editorHost.setVisible(True)
+
+    def _inlineFinished(self, result) -> None:
+        accepted = self._inlineAccepted
+        self._closeInline()
+        if result == QDialog.DialogCode.Accepted and accepted is not None:
+            accepted()
+
+    def _closeInline(self) -> None:
+        dialog, self._inlineDialog = self._inlineDialog, None
+        self._inlineAccepted = None
+        if dialog is not None:
+            try:
+                dialog.finished.disconnect(self._inlineFinished)
+            except (RuntimeError, TypeError):
+                pass
+        self._editorHost.setVisible(False)
+
+    def _askRemoval(self, keys, question: str) -> None:
+        self._confirmKeys = list(keys)
+        self._confirmText.setText(question)
+        self._confirm.setVisible(True)
+
+    def _dropConfirm(self) -> None:
+        self._confirmKeys = []
+        self._confirm.setVisible(False)
+
+    def _confirmed(self) -> None:
+        keys, self._confirmKeys = self._confirmKeys, []
+        self._confirm.setVisible(False)
+        self._removeKeys(keys)
+
     def editor_dialog(self):
         """The shared editor, built on first use.
 
@@ -574,15 +759,37 @@ class ChildControlPanel(QGroupBox):
         between dialogs on every open would reparent live widgets for nothing.
         """
         if self._dialog is None:
-            from .child_editor_dialog import ChildEditorDialog, relevance_rules
+            from .child_editor_dialog import (
+                ChildEditorDialog, greying_rules, relevance_rules)
 
             self._dialog = ChildEditorDialog(
                 self.title(), self._editors, self,
                 relevance=relevance_rules(self.collection_id),
-                annotations=self._annotations)
+                annotations=self._annotations,
+                hidden=self.unread_rows,
+                greyed=greying_rules(self.collection_id))
+            for widget in self._annotations.values():
+                changed = getattr(widget, 'unreadChanged', None)
+                if changed is not None:
+                    changed.connect(self._dialog.applyRelevance)
             if self._rowsLocked:
                 self._dialog.setLockedNote(self._lockNote)
         return self._dialog
+
+    def unread_rows(self) -> frozenset:
+        """Plan 43 LY13 D1. Field keys the row being edited does not read.
+
+        Beyond the choice rules of the editor, a row may depend on something
+        outside its own fields -- a surface refinement group on what its
+        bound surfaces are. An annotation that knows says so by offering
+        ``unreadKeys()``; its keys are hidden, never cleared.
+        """
+        out: set = set()
+        for widget in self._annotations.values():
+            reader = getattr(widget, 'unreadKeys', None)
+            if callable(reader):
+                out |= set(reader())
+        return frozenset(out)
 
     def open_add_dialog(self) -> None:
         """Edit a fresh item, then create it.
@@ -591,11 +798,16 @@ class ChildControlPanel(QGroupBox):
         row happened to hold means a user who presses Add and then OK has
         silently duplicated a row they were only looking at.
         """
+        self.clearNotice()
         self.refreshChoices()
         if self.awaitsPreparedScope():
-            QMessageBox.information(
-                self, self.tr('Geometry not prepared yet'),
-                self._unscopedNote)
+            if self._inline:
+                self._tell(self.tr('Geometry not prepared yet'),
+                           self._unscopedNote)
+            else:
+                messages.information(
+                    self, self.tr('Geometry not prepared yet'),
+                    self._unscopedNote)
             return
         for key, editor in self._editors.items():
             # DP-595: a panel may start a new row from something other than
@@ -615,6 +827,7 @@ class ChildControlPanel(QGroupBox):
     def open_edit_dialog(self, *_args) -> None:
         if self.selected_key() is None:
             return
+        self.clearNotice()
         self.refreshChoices()
         self._load_selected()
         dialog = self.editor_dialog()
@@ -632,6 +845,9 @@ class ChildControlPanel(QGroupBox):
         while `exec()` runs. Such a panel overrides this to show the same
         dialog without blocking and to call *accepted* when OK is pressed.
         """
+        if self._inline:
+            self._run_inline(dialog, accepted)
+            return
         if dialog.exec() == QDialog.DialogCode.Accepted:
             accepted()
 
@@ -716,6 +932,8 @@ class ChildControlPanel(QGroupBox):
     #: annotates -- the geometry tree -- and a table that keeps growing takes
     #: that space from the tree, which is what the user is actually looking at.
     MAX_VISIBLE_ROWS = 6
+    #: The table's floor, in rows: it is what carries the empty state.
+    MIN_VISIBLE_ROWS = 2
 
     def eventFilter(self, watched, event):                   # noqa: N802
         if (event.type() == QEvent.Type.Resize
@@ -773,7 +991,7 @@ class ChildControlPanel(QGroupBox):
         """True (after saying so) when the step is locked."""
         if not self._rowsLocked:
             return False
-        QMessageBox.warning(self, self.tr('Step locked'), self._lockNote)
+        self._tell(self.tr('Step locked'), self._lockNote)
         return True
 
     def _column_need(self, column: int, wrap: bool) -> int:
@@ -807,9 +1025,60 @@ class ChildControlPanel(QGroupBox):
         available = self.table.viewport().width()
         one_line = sum(self._column_need(column, False)
                        for column in range(len(self._columns)))
-        if header.set_wrapping(one_line > available):
+        changed = header.set_wrapping(one_line > available)
+
+        def wrapped_need() -> int:
+            return sum(header.measure(column, True).width()
+                       for column in range(len(self._columns)))
+
+        # Plan 43 LY3. At the 300 px sheet a four-column table in the themed
+        # app (Pretendard 10, 8 px of heading padding either side) asked 314
+        # of 302 px even with every heading wrapped, and the stretched
+        # column's heading was cut. Only then do the headings give up 3 px of
+        # padding each side; a table that fits keeps the theme's padding.
+        if header.wrapping() and wrapped_need() > available:
+            if not header.property('tightHeadings'):
+                header.setProperty('tightHeadings', True)
+                style_tight_headings(header)
+                changed = True
+        # D3 (DP-2664). MEASURED in the MF27b live pass at the 300 px sheet:
+        # "Volume" 38 of 46 px, "Target size (m)" 73 of 86, "Exclude point"
+        # 54 of 77. Wrapped and tight, four columns still asked more than the
+        # table has, and the stretched one gave way. 2 px of padding each side
+        # is the next step; after that the stretched heading keeps the width it
+        # asks and the table scrolls sideways (the R59 scroll bar) rather than
+        # cut a word.
+        if header.property('tightHeadings') and wrapped_need() > available:
+            if not header.property('tightestHeadings'):
+                header.setProperty('tightestHeadings', True)
+                style_tightest_headings(header)
+                changed = True
+        # CHL (DP-2664). MEASURED live in MF27c, with the real faces: two lines
+        # of 2 px padding still asked more than the 213 px viewport (a settings
+        # column that scrolls loses 16 px to its bar) and the sideways scroll
+        # cut "Transfinite" to "Trans". A heading may now take a line per
+        # word, which is narrower than any padding step.
+        if header.property('tightestHeadings') and wrapped_need() > available:
+            if header.set_max_lines(4):
+                changed = True
+        floor = self._base_minimum_section()
+        if (header.wrapping() and self._stretch is not None
+                and wrapped_need() > available):
+            floor = max(floor, header.measure(self._stretch, True).width())
+        if header.minimumSectionSize() != floor:
+            header.setMinimumSectionSize(floor)
+            changed = True
+        if changed:
             header.resizeSections()
             self._fit_table_height()
+
+    def _base_minimum_section(self) -> int:
+        """The header's own minimum section size, as the table was built."""
+        header = self.table.horizontalHeader()
+        base = getattr(self, '_baseMinimumSection', None)
+        if base is None:
+            base = self._baseMinimumSection = header.minimumSectionSize()
+        return base
 
     def _fit_table_height(self) -> None:
         """Size the table to its contents, floored at two rows.
@@ -819,7 +1088,8 @@ class ChildControlPanel(QGroupBox):
         state, and the sentence that used to sit under them is the table's
         accessible description.
         """
-        rows = max(2, min(len(self._rows), self.MAX_VISIBLE_ROWS))
+        rows = max(self.MIN_VISIBLE_ROWS,
+                   min(len(self._rows), self.MAX_VISIBLE_ROWS))
         row_height = self.table.verticalHeader().defaultSectionSize()
         header = self.table.horizontalHeader().height()
         # R59. The columns are sized to their contents now, so the table can
@@ -849,6 +1119,12 @@ class ChildControlPanel(QGroupBox):
         text = _display(value)
         if not text:
             return text, ''
+        descriptor = self._descriptors.get(key)
+        if (descriptor is not None and _is_length(descriptor)
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)):
+            # UXB3: a stored length is shown in the project display unit.
+            text = display_unit.format_length(value, unit=False)
         detail = self._cellDetails.get(key)
         if detail is not None:
             # DP-1251. A page-supplied tooltip, the level's cell size.
@@ -1067,14 +1343,20 @@ class ChildControlPanel(QGroupBox):
                     'become stale.') if len(keys) == 1 else
             self.tr('Remove the %n selected items? Downstream mesh artifacts '
                     'become stale.', '', len(keys)))
+        if self._inline:
+            self._askRemoval(keys, question)
+            return
         if len(keys) == 1:
-            confirm = QMessageBox.question(
+            confirm = messages.question(
                 self, self.tr('Remove item'), question)
         else:
-            confirm = QMessageBox.question(
+            confirm = messages.question(
                 self, self.tr('Remove items'), question)
         if confirm != QMessageBox.Yes:
             return
+        self._removeKeys(keys)
+
+    def _removeKeys(self, keys) -> None:
         for key in keys:
             self._run(f'{self.collection_id}.remove', {'entity_id': str(key)})
 
@@ -1143,9 +1425,9 @@ class ChildControlPanel(QGroupBox):
             text = refusal_message(
                 result, self.tr('The facade rejected the change.'))
             if locked_titles(result) is not None:
-                QMessageBox.warning(self, self.tr('Step locked'), text)
+                self._tell(self.tr('Step locked'), text)
             else:
-                QMessageBox.warning(self, self.tr('Operation failed'), text)
+                self._tell(self.tr('Operation failed'), text)
         if ok:
             self.editCommitted.emit()
             host = self.parent()
@@ -1225,14 +1507,14 @@ class ChildControlPanel(QGroupBox):
             scope = values.get(field)
             entity = app.selectionService.entity(str(scope or ''))
             if not scope or entity is None:
-                QMessageBox.warning(
-                    self, self.tr('Geometry scope required'),
+                self._tell(
+                    self.tr('Geometry scope required'),
                     self.tr('Choose a prepared geometry scope before applying '
                             'this control.'))
                 return None
             if entity.status is not SelectionStatus.VALID:
-                QMessageBox.warning(
-                    self, self.tr('Geometry scope unavailable'),
+                self._tell(
+                    self.tr('Geometry scope unavailable'),
                     self.tr('The selected scope is stale or missing. Re-prepare '
                             'the geometry and choose a valid scope.'))
                 return None
@@ -1296,6 +1578,9 @@ def _field_label(name: str, descriptor=None) -> str:
         prefix = name[:-len('scope_token')].strip('_')
         if not prefix:
             return 'Geometry scope'
+        # Plan 40 UXB1 (#34). A pair maps one side onto the other, so the
+        # sides are the source and the target, whatever the stored keys say.
+        prefix = {'master': 'source', 'slave': 'target'}.get(prefix, prefix)
         return '%s geometry scope' % humanise_option(prefix)
     title = str(getattr(descriptor, 'title', '') or '').strip()
     return title or _humanise(name)

@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget)
 
 from foammesh.app import app
+from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
+from foammesh.core import display_unit
 from foammesh.core.mesh.domain_box import domain_box
 from foammesh.core.mesh.presentation import count_text
 from foammesh.db.configurations_schema import Step
@@ -32,11 +34,12 @@ from foammesh.rendering.domain_box_actor import domainBoxActor
 from foammesh.rendering.farfield_actor import farfieldActor, farfieldLabelActor
 from foammesh.rendering.region_labels import regionLabelActors
 from foammesh.view.facade_client import query
-from foammesh.view.region.seed_feedback import SeedFeedback
+from foammesh.view.region.seed_feedback import MESSAGES as SEED_MESSAGES, SeedFeedback
 from foammesh.view.theming.metrics import MARGIN_TIGHT
 from foammesh.view.theming.patch_palette import region_zone_colours
 from foammesh.view.theming.status_colors import set_status
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
+from foammesh.view.workflow_controls.field_widgets import _is_length
 
 from .base import SnappyTaskPage
 from .region_detection_panel import (
@@ -45,6 +48,35 @@ from .region_detection_panel import (
 
 #: The coordinates a seed is typed into, in the order of a point.
 _POINT_KEYS = ('point.x', 'point.y', 'point.z')
+
+
+def _point_cell_text(panel, key: str, value):
+    """One seed coordinate as its table cell shows it, or None.
+
+    DP-920: six significant figures, the stored value in the tooltip.
+    DP-2637: the coordinate is stored in metres and the column heading
+    names the project display unit (`ChildControlPanel._heading` writes
+    ``X (mm)`` for a length), so the cell shows it in that unit too. It
+    printed the stored metres, so a seed at 11.4 mm read ``0.0114`` under
+    ``X (mm)``. The tooltip keeps the stored metres, labelled when the
+    display unit is not the metre.
+    """
+    if key not in panel.POINT_KEYS or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    descriptor = getattr(panel, '_descriptors', {}).get(key)
+    length = descriptor is None or _is_length(descriptor)
+    shown = display_unit.to_display(number) if length else number
+    text = format(shown, f'.{panel.POINT_DIGITS}g')
+    stored = str(value)
+    if stored == text:
+        return text, ''
+    if length and display_unit.current() != 'm':
+        stored = f'{stored} m'
+    return text, stored
 
 
 def _geometryManager():
@@ -169,7 +201,7 @@ class RegionSeedPanel(ChildControlPanel):
     launch uses to warn or refuse.
 
     Plan 36 RP10. A seed is placed by keyboard as well as by mouse: Add
-    (Alt+A) opens the editor, the coordinates are typed, Alt and an arrow
+    opens the editor, the coordinates are typed, Alt and an arrow
     nudges the seed along X or Y (Page Up/Down for Z, Shift for ten steps)
     and Enter is OK. Every drag, nudge or typed coordinate is one placement,
     which Ctrl+Z takes back and Ctrl+Y puts again -- the fields and the
@@ -202,16 +234,8 @@ class RegionSeedPanel(ChildControlPanel):
     POINT_DIGITS = 6
 
     def _cell_text(self, key: str, value) -> tuple[str, str]:
-        if key in self.POINT_KEYS and not isinstance(value, bool):
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                number = None
-            if number is not None:
-                text = format(number, f'.{self.POINT_DIGITS}g')
-                stored = str(value)
-                return text, (stored if stored != text else '')
-        return super()._cell_text(key, value)
+        shown = _point_cell_text(self, key, value)
+        return shown if shown is not None else super()._cell_text(key, value)
 
     #: Plan 36 RP2. True while the editor is open, False when it closes.
     editingChanged = Signal(bool)
@@ -226,8 +250,19 @@ class RegionSeedPanel(ChildControlPanel):
         self.seedFeedback = SeedFeedback()
         annotations = dict(kwargs.pop('annotations', None) or {})
         annotations.setdefault('point.z', self.seedFeedback)
+        # M6. Where the geometry is, under the coordinates, in the shown unit.
+        self.boundsHint = QLabel()
+        self.boundsHint.setObjectName('regionBoundsHint')
+        self.boundsHint.setWordWrap(True)
+        annotations.setdefault('point.x', self.boundsHint)
         super().__init__(facade_client, collection_id, title, *args,
                          annotations=annotations, **kwargs)
+        # M8. What an empty table means for a region, in the live behaviour's
+        # words (a run with none adopts one fluid region named "fluid").
+        self._emptyDescription = self.tr(
+            'No regions yet. Add one, or Detect the spaces the surfaces '
+            'close off. Proceeding with none adds a default Fluid region '
+            'named "fluid".')
         self._watched = []
         self._placingRegion = None
         self._editorAccepted = None
@@ -259,6 +294,7 @@ class RegionSeedPanel(ChildControlPanel):
         self._detect = QPushButton(self.tr('Detect…'), self)
         self._detect.setObjectName('regionDetect')
         self._detect.setShortcut(QKeySequence(self.DETECT_SHORTCUT))
+        adoptShortcut('regions.detect', self._detect)
         self._detect.setToolTip(self.tr(
             'Find the spaces the surfaces close off, and place a region in '
             'each one you keep (%s).') % self.DETECT_SHORTCUT)
@@ -268,6 +304,7 @@ class RegionSeedPanel(ChildControlPanel):
         self._merge = QPushButton(self.tr('Merge'), self)
         self._merge.setObjectName('regionMerge')
         self._merge.setShortcut(QKeySequence(self.MERGE_SHORTCUT))
+        adoptShortcut('regions.merge', self._merge)
         self._merge.setToolTip(self.tr(
             'Drop the selected region when its seed is in the same space as '
             "another region's: one seed per space is enough (%s).")
@@ -454,6 +491,7 @@ class RegionSeedPanel(ChildControlPanel):
         button.setText(self.tr('Section'))
         button.setCheckable(True)
         button.setShortcut(QKeySequence(self.SECTION_SHORTCUT))
+        adoptShortcut('regions.section', button)
         button.setToolTip(self.tr(
             'Cut the model on a plane through the seed, across the view. '
             'The seed stays on the plane; push the plane to move it deeper, '
@@ -673,7 +711,9 @@ class RegionSeedPanel(ChildControlPanel):
 
     def editor_dialog(self):
         dialog = super().editor_dialog()
+        dialog.acceptGuard = self._acceptProblem
         self._addSectionButton(dialog)
+        self._sayBounds()
         # Both open paths call this after the values are set and before the
         # dialog is shown, so this is where the first verdict is given.
         if self.seedFeedback.isActive():
@@ -687,6 +727,48 @@ class RegionSeedPanel(ChildControlPanel):
         self._freshPoint = None
         super().open_add_dialog()
 
+    # -- M5/M6/M7: what the editor says about the box and the name -------- #
+
+    def _box(self):
+        """``(xmin, xmax, ymin, ymax, zmin, zmax)`` of the background box, or None."""
+        if self._seedBounds is None:
+            return None
+        try:
+            bounds = self._seedBounds()
+            box = tuple(float(value) for value in bounds)
+        except Exception:  # noqa: BLE001 - no domain yet
+            return None
+        return box if len(box) == 6 else None
+
+    def _sayBounds(self) -> None:
+        """M6. The geometry's extent, in the unit the fields are shown in."""
+        box = self._box()
+        if box is None:
+            self.boundsHint.setText('')
+            self.boundsHint.setVisible(False)
+            return
+        shown = [display_unit.format_length(value, unit=False) for value in box]
+        self.boundsHint.setText(self.tr(
+            'The geometry spans X {0} to {1}, Y {2} to {3}, Z {4} to {5} '
+            '{6}.').format(*shown, display_unit.current()))
+        self.boundsHint.setVisible(True)
+
+    def _acceptProblem(self) -> str:
+        """The sentence that stops OK, or ``''`` (M5, M7)."""
+        name = self.editor('name')
+        if name is not None and not str(name.value() or '').strip():
+            return self.tr('A region needs a name.')
+        point = self.seedPoint()
+        box = self._box()
+        if point is not None and box is not None and not self._inBox(point, box):
+            return self.tr('The point is outside the bounding box.')
+        return ''
+
+    @staticmethod
+    def _inBox(point, box) -> bool:
+        return all(box[2 * axis] <= point[axis] <= box[2 * axis + 1]
+                   for axis in range(3))
+
     def fresh_value(self, key: str, descriptor):
         """Plan 37 #1(d): a new region's seed starts inside the fluid.
 
@@ -698,6 +780,13 @@ class RegionSeedPanel(ChildControlPanel):
         enclosed space, judged as launch judges it), asked once per Add.
         When nothing inside is found the schema default stands, as before.
         """
+        if key == 'name':
+            # M7. Region_N, the next one nobody has taken.
+            taken = {str(row.get('name', '')) for row in self._rows}
+            number = len(self._rows) + 1
+            while f'Region_{number}' in taken:
+                number += 1
+            return f'Region_{number}'
         if key in self.POINT_KEYS:
             point = self._suggestedPoint()
             if point is not None:
@@ -1319,6 +1408,48 @@ class RegionSeedPanel(ChildControlPanel):
                 for key, row in dict(regions or {}).items()
                 if isinstance(row, dict)}
 
+    def _seedProblem(self, row, seed) -> str:
+        """M4. Why a saved seed is not a material point, or ``''``."""
+        try:
+            point = tuple(float(row[key]) for key in self.POINT_KEYS)
+        except (KeyError, TypeError, ValueError):
+            return ''
+        box = self._box()
+        if box is not None and not self._inBox(point, box):
+            return self.tr('Invalid point — outside bounding box.')
+        if seed.get('space') is not None:
+            if seed.get('outside'):
+                return self.tr(SEED_MESSAGES['outside'])
+            return ''
+        try:
+            payload = query(self._client, 'geometry.fluid_seed.check',
+                            {'point': list(point)}).payload or {}
+        except Exception:  # noqa: BLE001 - what cannot be judged is not wrong
+            return ''
+        if not payload.get('known'):
+            return ''
+        if payload.get('on_surface'):
+            return self.tr('Invalid point — on the geometry surface.')
+        if not (payload.get('inside') or payload.get('external')):
+            return self.tr('Invalid point — outside the geometry.')
+        return ''
+
+    def _clashMessage(self, seed) -> str:
+        """DP-2638. Why a Fluid and a Solid seed in *seed*'s space refuse
+        the launch: the facade's `fluid_regions.clash_message`, or the same
+        sentence built from the rows sharing the space."""
+        from foammesh.core.mesh.fluid_regions import clash_message
+
+        if seed.get('clash_message'):
+            return str(seed['clash_message'])
+        space = seed.get('space')
+        members = [row for row in (self._seedSpaces or {}).values()
+                   if row.get('clash') and row.get('space') == space]
+        return clash_message({
+            'regions': [str(row.get('name')) for row in members],
+            'types': [str(row.get('type')) for row in members],
+            'outside': bool(seed.get('outside'))})
+
     def _decorateRows(self) -> None:
         """The colour chip, the space's volume, and a shared space."""
         self._placementWarnings = []
@@ -1339,8 +1470,9 @@ class RegionSeedPanel(ChildControlPanel):
                              % format_volume(seed['volume']))
             warning = ''
             if seed.get('clash'):
-                warning = self.tr('Fluid and Solid seeds in one space: '
-                                  'snappy cannot keep both.')
+                # DP-2638: the launch gate's own sentence, so the page says
+                # exactly what Run to end refuses.
+                warning = self._clashMessage(seed)
                 if seed.get('space') not in clashed:
                     clashed.add(seed.get('space'))
                     lines.append(warning)
@@ -1349,6 +1481,13 @@ class RegionSeedPanel(ChildControlPanel):
                                    'nothing.') % seed['same_as'])
                 name = seed.get('name') or row.get('name') or key
                 lines.append('%s — %s' % (name, warning))
+            if not warning:
+                # M4. The saved seed keeps its own warning, as the legacy
+                # card did: outside the box, on a surface, outside the body.
+                warning = self._seedProblem(row, seed)
+                if warning:
+                    name = seed.get('name') or row.get('name') or key
+                    lines.append('%s — %s' % (name, warning))
             if warning:
                 notes.append(warning)
                 item.setStatusTip(warning)
@@ -1386,15 +1525,8 @@ class ExcludePointPanel(ChildControlPanel):
 
     def _cell_text(self, key: str, value) -> tuple[str, str]:
         """Coordinates to six significant figures, as a region's (DP-920)."""
-        if key in self.POINT_KEYS and not isinstance(value, bool):
-            try:
-                text = format(float(value), f'.{self.POINT_DIGITS}g')
-            except (TypeError, ValueError):
-                text = None
-            if text is not None:
-                stored = str(value)
-                return text, (stored if stored != text else '')
-        return super()._cell_text(key, value)
+        shown = _point_cell_text(self, key, value)
+        return shown if shown is not None else super()._cell_text(key, value)
 
     def __init__(self, facade_client, collection_id: str, title: str,
                  *args, **kwargs):
@@ -1722,13 +1854,14 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
     #: absent from the task descriptor. They are not ``castellatedMeshControls``
     #: keys -- they describe the surfaces themselves -- so they are named here
     #: rather than declared on a stage that does not own them.
+    #:
+    #: Plan 40 UXD9 (#38). Only the two that say what the surfaces *are* stay
+    #: here: whether they are closed, which is what a region seed's inside and
+    #: outside depend on, and their scale. How the surfaces are searched and
+    #: how narrow a gap counts as closed act when castellation intersects the
+    #: base grid with them, so they are edited on Castellation.
     extra_field_ids = (
         'meshing.geometry.tri_surface_declaration',
-        'meshing.geometry.gap_detection',
-        'meshing.geometry.gap_width',
-        'meshing.geometry.tolerance',
-        'meshing.geometry.max_tree_depth',
-        'meshing.geometry.min_quality',
         'meshing.geometry.scale',
     )
 
@@ -1745,8 +1878,8 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         'meant to be watertight that has a pinhole or arrives in several '
         'parts answers "neither" — and refinement regions and cell zones '
         'built on it are then dropped with a note in the log. Declare the '
-        'surfaces closed to override that, and close narrow gaps when the '
-        'geometry has slots the base grid is too coarse to see. '
+        'surfaces closed to override that. Narrow gaps and the surface '
+        'search are set on Castellation. '
         'Detect (Alt+T) finds the spaces the surfaces close off and places '
         'a region in each one you keep; one Undo takes them all back. A '
         'seed can be dragged in the view, nudged with Alt and an arrow key '
@@ -1767,6 +1900,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self.panel.childrenChanged.connect(self.refresh_keeping_edits)
         # DP-818. The glyphs follow the table: added, moved or deleted.
         self.panel.childrenChanged.connect(self._reloadSeedMarkers)
+        self.panel.childrenChanged.connect(self._sayInterface)
         # Plan 36 RP2. The open editor is the only thing that edits here.
         self.panel.editingChanged.connect(self._lockWhileEditing)
         # Plan 36 RP3. A dragged seed stays in the box drawn around it (RP1).
@@ -1791,6 +1925,41 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self.farfieldNote.setWordWrap(True)
         self.farfieldNote.hide()
         layout.insertWidget(2, self.farfieldNote)
+        # DP-2265. The legacy Region page's interface warning, in place.
+        self.interfaceNote = QLabel(self)
+        self.interfaceNote.setObjectName('regionInterfaceWarning')
+        self.interfaceNote.setWordWrap(True)
+        set_status(self.interfaceNote, 'warning')
+        self.interfaceNote.hide()
+        layout.insertWidget(3, self.interfaceNote)
+        # DP-2636. Imported bodies that share walls: offer the cut, in view.
+        self.splitPrompt = QFrame(self)
+        self.splitPrompt.setObjectName('regionSplitPrompt')
+        prompt = QVBoxLayout(self.splitPrompt)
+        prompt.setContentsMargins(0, 0, 0, 0)
+        self.splitPromptText = QLabel(self.splitPrompt)
+        self.splitPromptText.setObjectName('regionSplitPromptText')
+        self.splitPromptText.setWordWrap(True)
+        set_status(self.splitPromptText, 'warning')
+        prompt.addWidget(self.splitPromptText)
+        self.splitButton = QPushButton(
+            self.tr('Split interfaces…'), self.splitPrompt)
+        self.splitButton.setObjectName('regionSplitInterfaces')
+        self.splitButton.setToolTip(self.tr(
+            'Open the Geometry step and cut each wall two bodies share into '
+            'an interface that couples their regions'))
+        self.splitButton.clicked.connect(self._openSplitInterfaces)
+        prompt.addWidget(self.splitButton, 0, Qt.AlignmentFlag.AlignLeft)
+        self.splitPrompt.hide()
+        layout.insertWidget(4, self.splitPrompt)
+        # Item 7 (CHT2). A cell zone written under another name says so.
+        self.writtenNamesNote = QLabel(self)
+        self.writtenNamesNote.setObjectName('regionWrittenNames')
+        self.writtenNamesNote.setWordWrap(True)
+        set_status(self.writtenNamesNote, 'info')
+        self.writtenNamesNote.hide()
+        layout.insertWidget(5, self.writtenNamesNote)
+        self._sharedWallsFound.connect(self._onSharedWalls)
 
     #: Plan 36 RP2. What each control's enabled state was before an editor
     #: opened, so closing it gives back exactly that -- a Run button shut for
@@ -1962,6 +2131,266 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         note.setText(text)
         note.setVisible(bool(text))
 
+    def _regionPoints(self) -> list:
+        points = []
+        for row in self.panel.rows():
+            try:
+                points.append(tuple(float(row[key]) for key in
+                                    ('point.x', 'point.y', 'point.z')))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return points
+
+    def interfaceWarning(self) -> str:
+        """DP-2265. Do the regions and the inter-region interfaces agree?
+
+        Ported from the removed Region page. More than one region with no
+        inter-region interface on the Geometry page means the regions may
+        share a boundary nothing couples; one region with such an interface
+        means the interface has nothing to join. DP-543: regions whose seeds
+        provably sit in shells that never touch have nothing to couple, so
+        the first case stays quiet for them (anything unjudgeable keeps it).
+        """
+        from foammesh.db.configurations_schema import CFDType
+
+        try:
+            db = self._client.checkout()
+            interfaces = db.elementCount(
+                'geometry', lambda i, e: e['cfdType'] == CFDType.INTERFACE.value
+                and e['interRegion'])
+            # DP-2636. Split interfaces makes conformal interfaces (internal
+            # faces, ``interRegion`` off) that couple the regions too:
+            # MEASURED live (CHT2 walk SR) the note said nothing coupled
+            # three regions the cut had just joined.
+            conformal = db.elementCount(
+                'geometry', lambda i, e: e['cfdType'] == CFDType.INTERFACE.value
+                and not e['interRegion'])
+        except Exception:  # noqa: BLE001 - no case open yet
+            return ''
+        regions = len(self.panel.rows())
+        multiRegion = regions > 1
+        if multiRegion and conformal > 0:
+            return ''
+        if multiRegion == (interfaces > 0):
+            return ''
+        if multiRegion:
+            if self._regionsSeparated():
+                return ''
+            # DP-2636: the step has no "add an interface" control; the
+            # interface is made by cutting the shared walls.
+            return self.tr(
+                'No inter-region interface is configured, and these regions '
+                'may share a boundary that nothing couples. Split interfaces '
+                'on the Geometry step cuts each wall two bodies share into an '
+                'interface that couples them.')
+        return self.tr(
+            'Only one region point is configured while an inter-region '
+            'interface is configured on the Geometry step.')
+
+    def _regionsSeparated(self) -> bool:
+        """DP-543. Do the seeds sit in closed shells that never touch?"""
+        project = getattr(app, 'project', None)
+        if project is None or getattr(project, 'path', None) is None:
+            return False
+        try:
+            from foammesh.core.geometry import GeometryArtifactStore
+            from foammesh.core.geometry.region_contact import regions_separated
+            return regions_separated(
+                GeometryArtifactStore(project.path).entries(),
+                self._regionPoints())
+        except Exception:  # noqa: BLE001 - what cannot be judged keeps the warning
+            return False
+
+    def _sayInterface(self) -> None:
+        note = getattr(self, 'interfaceNote', None)
+        if note is None:
+            return
+        text = self.interfaceWarning()
+        note.setText(text)
+        # DP-2636: the Split prompt below says it with the walls named.
+        prompt = getattr(self, 'splitPrompt', None)
+        note.setVisible(bool(text) and not (
+            prompt is not None and not prompt.isHidden()))
+        self._sayWrittenNames()
+
+    def writtenNames(self) -> list[tuple[str, str]]:
+        """(volume name, cell zone written) where the two differ.
+
+        CHT2 item 7. A volume typed cell zone whose name starts with a digit
+        (the issue's ``02_pipe_solid_r10to12mm_L500mm``, named after its file)
+        is written ``zone_02_pipe_...``: OpenFOAM reads a leading digit as a
+        number. That is the name the mesh, checkMesh and the solver show, so
+        the page names it beside the one the user sees on the Geometry step.
+        """
+        from foammesh.db.configurations_schema import CFDType
+        from foammesh.core.mesh.zone_names import cell_zone_word
+
+        try:
+            volumes = self._client.checkout().getElements(
+                'geometry', lambda _key, item: item.get('gType') == 'volume'
+                and item.get('cfdType') == CFDType.CELL_ZONE.value)
+        except Exception:  # noqa: BLE001 - no case open yet
+            return []
+        pairs = []
+        for _key, volume in sorted(volumes.items()):
+            try:
+                name = str(volume.value('name') or '')
+            except Exception:  # noqa: BLE001 - a row without a name
+                continue
+            written = cell_zone_word(name)
+            if name and written != name:
+                pairs.append((name, written))
+        return pairs
+
+    def _sayWrittenNames(self) -> None:
+        note = getattr(self, 'writtenNamesNote', None)
+        if note is None:
+            return
+        pairs = self.writtenNames()
+        if pairs:
+            note.setText(self.tr(
+                'Written to the mesh as {0}. An OpenFOAM name cannot start '
+                'with a digit, so checkMesh and the solver show these '
+                'names.').format('; '.join(
+                    f'{name} \u2192 {written}' for name, written in pairs)))
+        note.setVisible(bool(pairs))
+
+    # -- DP-2636: bodies that share walls ------------------------------------ #
+
+    #: From the worker that measured the shared walls: (key, names).
+    _sharedWallsFound = Signal(object, object)
+    _sharedWallsKey = None
+    _sharedWallsNames: list = []
+    _sharedWallsBusy = None
+
+    @staticmethod
+    def _geometryStore():
+        project = getattr(app, 'project', None)
+        path = getattr(project, 'path', None) if project is not None else None
+        if path is None:
+            return None
+        from foammesh.core.geometry import GeometryArtifactStore
+
+        return GeometryArtifactStore(path)
+
+    def _checkSharedWalls(self) -> None:
+        """Do the imported bodies share walls? Measured off the GUI thread.
+
+        DP-2636. Three bodies drawn conformally -- a hot core, a pipe, a cold
+        annulus -- share two walls. Seeded as they are, each region meshes on
+        its own and nothing couples them; the cut that makes the interfaces
+        (`Split interfaces`) sat on the Geometry step with nothing here
+        pointing at it. The same preview that button runs answers it, once
+        per set of geometry revisions; it writes nothing.
+        """
+        try:
+            store = self._geometryStore()
+            entries = store.entries() if store is not None else []
+        except Exception:  # noqa: BLE001 - no case, nothing to offer
+            entries = []
+        if len(entries) < 2:
+            self._showSplitPrompt([])
+            return
+        key = tuple(str(entry.get('artifact')) for entry in entries)
+        if key == self._sharedWallsKey:
+            self._showSplitPrompt(self._sharedWallsNames)
+            return
+        if key == self._sharedWallsBusy:
+            return
+        self._sharedWallsBusy = key
+        import threading
+
+        threading.Thread(target=self._measureSharedWalls, args=(store, key),
+                         name='shared-walls', daemon=True).start()
+
+    def _measureSharedWalls(self, store, key) -> None:
+        """Worker: the interfaces `split_interfaces` would cut."""
+        try:
+            found = store.split_interfaces(None, preview=True)
+            names = [str(item.get('name'))
+                     for item in found.get('interfaces') or ()]
+        except Exception:  # noqa: BLE001 - what cannot be cut offers nothing
+            names = []
+        try:
+            self._sharedWallsFound.emit(key, names)
+        except RuntimeError:      # the page went while the walls were read
+            pass
+
+    def _onSharedWalls(self, key, names) -> None:
+        self._sharedWallsKey = key
+        self._sharedWallsNames = list(names)
+        self._sharedWallsBusy = None
+        self._showSplitPrompt(self._sharedWallsNames)
+
+    def _showSplitPrompt(self, names) -> None:
+        prompt = getattr(self, 'splitPrompt', None)
+        if prompt is None:
+            return
+        names = list(names or ())
+        if names and self._interfaceCount() > 0:
+            names = []          # already split: the interfaces couple them
+        if names:
+            self.splitPromptText.setText(self.tr(
+                'The imported bodies share {0}: {1}. Seeded as they are, '
+                'each region is meshed on its own and nothing couples them '
+                'across those walls. Split interfaces cuts each shared wall '
+                'into an interface between the two regions. Nothing is '
+                'split until you do.').format(
+                    count_text(len(names), 'wall'), ', '.join(names)))
+        prompt.setVisible(bool(names))
+        self._sayInterface()
+
+    def _interfaceCount(self) -> int:
+        from foammesh.db.configurations_schema import CFDType
+
+        try:
+            return int(self._client.checkout().elementCount(
+                'geometry', lambda i, e: e['cfdType']
+                == CFDType.INTERFACE.value and e['interRegion']))
+        except Exception:  # noqa: BLE001 - no case open yet
+            return 0
+
+    def splitPromptText_(self) -> str:
+        """The prompt as shown, or '' while it is hidden (for tests)."""
+        prompt = getattr(self, 'splitPrompt', None)
+        if prompt is None or prompt.isHidden():
+            return ''
+        return self.splitPromptText.text()
+
+    def _openSplitInterfaces(self) -> None:
+        """Go to the Geometry step and start its Split interfaces.
+
+        The cut is the Geometry step's own action, with its own preview and
+        confirmation; nothing is split from here. A Geometry step locked by
+        Proceed is unlocked through its own question first (editing the
+        geometry discards what was made after it), and the cut starts once
+        the step is open again.
+        """
+        window = app.window
+        navigation = getattr(window, '_navigationView', None)
+        manager = getattr(window, '_stepManager', None)
+        page = (getattr(manager, '_pages', {}) or {}).get(Step.GEOMETRY)
+        if navigation is None or page is None:
+            return
+        navigation.setCurrentStep(Step.GEOMETRY)
+        if getattr(page, '_locked', False):
+            page._editLockedGeometry()
+            self._splitWhenUnlocked(page, attempts=40)
+            return
+        page._splitInterfacesClicked()
+
+    def _splitWhenUnlocked(self, page, attempts: int) -> None:
+        """Start the cut once the step manager has unlocked the page."""
+        from PySide6.QtCore import QTimer
+
+        if not getattr(page, '_locked', False):
+            page._splitInterfacesClicked()
+            return
+        if attempts <= 0:
+            return            # the user kept the geometry: nothing to cut
+        QTimer.singleShot(
+            50, lambda: self._splitWhenUnlocked(page, attempts - 1))
+
     def showEvent(self, event) -> None:
         """DP-818. The seed glyphs are drawn while this page is up."""
         super().showEvent(event)
@@ -1971,6 +2400,8 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             # DP-925. The saved regions carry their labels on this page.
             self.panel.setRegionLabelsShown(True)
             self._offerDetection()
+            # DP-2636. Bodies sharing walls are offered the cut, here.
+            self._checkSharedWalls()
 
     def _offerDetection(self) -> None:
         """Plan 36 RP7 (D7). Ask once per case, while it has no regions.
@@ -1996,44 +2427,11 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             self._showDomainBox(False)
             self.panel.setRegionLabelsShown(False)
 
-    #: DP-517. `CaseBuilder._gap_width` reads the width only while the
-    #: switch is on, so the box is live only then.
-    _GAP_SWITCH = 'meshing.geometry.gap_detection'
-    _GAP_WIDTH = 'meshing.geometry.gap_width'
-
     def refresh(self) -> None:
         super().refresh()
         self._moveProseBehindHelp()
         self._sayFarfield()
-
-    def reload_values(self) -> None:
-        super().reload_values()
-        self._syncGapWidth()
-
-    def _on_field_changed(self, field_id: str, value) -> None:
-        super()._on_field_changed(field_id, value)
-        if field_id == self._GAP_SWITCH:
-            self._syncGapWidth()
-
-    def _syncGapWidth(self) -> None:
-        """Gap width is editable only while Close narrow gaps is on.
-
-        DP-517 (audit 2026-09-23, the user's annotated Domain & regions >
-        Advanced): the width box was live with the switch off, where the
-        writer never reads it. The switch's own box is read, not the stored
-        value, so ticking it enables the width before Apply. The row stays --
-        a greyed width says what the switch will bring -- and applicability
-        (`FieldEditor.setApplicability`) still owns whether it is shown.
-        """
-        switch = self._editors.get(self._GAP_SWITCH)
-        width = self._editors.get(self._GAP_WIDTH)
-        if switch is None or width is None:
-            return
-        live = (bool(switch.value()) and width.applies()
-                and not width.descriptor.read_only)
-        width.editor.setEnabled(live)
-        width.label.setEnabled(live)
-        width.unit_label.setEnabled(live)
+        self._sayInterface()
 
     def _moveProseBehindHelp(self) -> None:
         """Say the rest of it through the control DP-230 already built.

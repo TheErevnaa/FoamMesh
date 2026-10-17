@@ -36,8 +36,10 @@ from foammesh.core.facade.errors import FacadeError
 from foammesh.core.geometry.features.manifest import DEFAULT_FEATURE_ANGLE_DEG
 from foammesh.db.configurations_schema import GeometryType
 from foammesh.view.facade_client import FailedResult, query, submit
+from foammesh.view.geometry.feature_angle_panel import seed_from_project
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, UnitLabel
 from widgets.fit_to_text import FlowLayout, fit_to_text
+from widgets import async_message_box as messages
 
 # DP-185. One sentence per control, written once: the action row and the
 # repair page panel offer the same two controls and say the same thing.
@@ -135,7 +137,7 @@ class BoundaryOperations:
                     'No feature edge sharper than {0:g}°: the surface stays one '
                     'boundary. Try a smaller angle.').format(parameters['angle_deg']))
                 return
-            answer = QMessageBox.question(
+            answer = messages.question(
                 self, self.tr('Split by feature angle'),
                 self.tr('Split the surface into {0} boundaries at {1:g}°?\n\n'
                         'This writes a new geometry revision; the current one stays '
@@ -295,7 +297,7 @@ class BoundaryActions(QWidget, BoundaryOperations):
             self._editMenu.addAction(action)
         self._editButton = QToolButton(self)
         self._editButton.setObjectName('editBoundaryMenu')
-        self._editButton.setText(self.tr('Edit'))
+        self._editButton.setText(self.tr('Edit boundaries'))
         self._editButton.setToolTip(self.tr(
             'Rename, merge or split the selected boundaries'))
         self._editButton.setToolButtonStyle(
@@ -313,7 +315,9 @@ class BoundaryActions(QWidget, BoundaryOperations):
         self._featureAngle.setRange(1.0, 179.0)
         self._featureAngle.setDecimals(1)
         self._featureAngle.setSingleStep(5.0)
-        self._featureAngle.setValue(DEFAULT_FEATURE_ANGLE_DEG)
+        seed_from_project(self._featureAngle)
+        self._featureAngleTyped = False
+        self._featureAngle.valueChanged.connect(self._markAngleTyped)
         self._featureAngle.setToolTip(self.tr(FEATURE_ANGLE_TOOLTIP))
         angleLabel.setBuddy(self._featureAngle)
         fit_to_text(angleLabel, padding=4)
@@ -460,7 +464,17 @@ class BoundaryActions(QWidget, BoundaryOperations):
             return out
         return out
 
+    def _markAngleTyped(self, _value=None):
+        """A box the user changed is theirs; a project change does not move it."""
+        self._featureAngleTyped = True
+
+    def _seedAngleFromProject(self):
+        """Plan 42 SG5. Start from the project angle until the user types."""
+        if not getattr(self, '_featureAngleTyped', False):
+            seed_from_project(self._featureAngle)
+
     def refresh(self):
+        self._seedAngleFromProject()
         try:
             payload = query(app.facadeClient, 'geometry.patches.list').payload
         except (FacadeError, OSError, RuntimeError, ValueError) as error:
@@ -534,7 +548,7 @@ class BoundaryActions(QWidget, BoundaryOperations):
                               'boundaries.'))
             return None
         if patch is None:
-            QMessageBox.information(self, self.tr('Rename'), why)
+            messages.information(self, self.tr('Rename'), why)
             return None
         name, accepted = QInputDialog.getText(
             self, self.tr('Rename boundary'), self.tr('Boundary name'),
@@ -618,7 +632,9 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         self._featureAngle.setRange(1.0, 179.0)
         self._featureAngle.setDecimals(1)
         self._featureAngle.setSingleStep(5.0)
-        self._featureAngle.setValue(DEFAULT_FEATURE_ANGLE_DEG)
+        seed_from_project(self._featureAngle)
+        self._featureAngleTyped = False
+        self._featureAngle.valueChanged.connect(self._markAngleTyped)
         self._featureAngle.setToolTip(self.tr(FEATURE_ANGLE_TOOLTIP))
         angleLabel.setBuddy(self._featureAngle)
         # R128. `Split by feature angle...` is wider than the whole content
@@ -661,7 +677,17 @@ class BoundaryPanel(QWidget, BoundaryOperations):
 
     # -- the list ---------------------------------------------------------- #
 
+    def _markAngleTyped(self, _value=None):
+        """A box the user changed is theirs; a project change does not move it."""
+        self._featureAngleTyped = True
+
+    def _seedAngleFromProject(self):
+        """Plan 42 SG5. Start from the project angle until the user types."""
+        if not getattr(self, '_featureAngleTyped', False):
+            seed_from_project(self._featureAngle)
+
     def refresh(self):
+        self._seedAngleFromProject()
         try:
             payload = query(app.facadeClient, 'geometry.patches.list').payload
         except (FacadeError, OSError, RuntimeError, ValueError) as error:

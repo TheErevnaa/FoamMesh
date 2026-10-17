@@ -1,0 +1,123 @@
+/* -- menus, bars, containers -------------------------------------------- */
+
+/* Plan 44 MF3. The menu bar is the top 24 px of the 60 px band (the ribbon
+   is the other 36): chrome ground, 12.5 px strong text, an item that is a
+   small rounded plate and fills with the selection colour. */
+QMenuBar {
+    background: {{background.chrome}};
+    color: {{foreground.strong}};
+    font-size: 12.5px;
+    padding: 0;
+}
+QMenuBar::item {
+    padding: 2px 8px;
+    margin: 2px 0;
+    border-radius: 3px;
+    background: transparent;
+}
+QMenuBar::item:selected, QMenuBar::item:pressed {
+    background: {{selection.background}};
+    color: {{foreground.strong}};
+}
+QMenu {
+    background: {{background.surface}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    padding: 4px;
+}
+QMenu::item { padding: 5px 24px 5px 8px; border-radius: 4px; }
+QMenu::item:selected { background: {{selection.background}}; }
+QMenu::item:disabled { color: {{disabled.foreground}}; }
+QMenu::separator { height: 1px; background: {{border.default}}; margin: 4px; }
+QToolBar { background: {{background.surface}}; border: none; spacing: 3px; }
+QToolBar::separator { background: {{border.default}}; width: 1px; margin: 4px; }
+/* Plan 44 MF3. The status strip: 24 px, a quiet rule on top, no item
+   borders. The Notifications chip is an 18 px plate; the run host (a 4 px
+   bar, the stage text, a small Cancel) stands to the left of it. */
+QStatusBar {
+    background: {{background.status}};
+    border-top: 1px solid {{border.quiet}};
+    color: {{foreground.secondary}};
+    font-size: 12px;
+}
+QStatusBar::item { border: none; }
+QStatusBar QLabel { color: {{foreground.secondary}}; }
+QStatusBar QPushButton {
+    padding: 0 8px;
+    min-height: 16px;
+    max-height: 18px;
+    font-size: 11px;
+}
+QToolButton#notificationBell {
+    border: 1px solid {{border.default}};
+    border-radius: 3px;
+    padding: 1px 10px;
+    color: {{foreground.secondary}};
+}
+QToolButton#notificationBell:hover {
+    background: {{background.raised}};
+    color: {{foreground.strong}};
+}
+/* Plan 44 MF3. The status strip's size grip is flat: no dotted triangle,
+   the corner still resizes the window while it is not maximised. */
+QStatusBar QSizeGrip { image: none; background: transparent; width: 12px; height: 12px; }
+
+QFrame#viewportGroupSeparator { background: {{border.default}}; border: none; }
+QProgressBar#statusRunBar {
+    border: none;
+    border-radius: 2px;
+    background: {{border.default}};
+    min-height: 4px;
+    max-height: 4px;
+    max-width: 160px;
+}
+QProgressBar#statusRunBar::chunk {
+    background: {{accent.default}};
+    border-radius: 2px;
+}
+QDockWidget { background: {{background.surface}}; }
+QDockWidget::title { background: {{background.elevated}}; color: {{foreground.primary}}; padding: 5px; }
+
+QProgressBar {
+    border: 1px solid {{border.default}};
+    border-radius: 6px;
+    text-align: center;
+    color: {{foreground.primary}};
+}
+QProgressBar::chunk { background: {{accent.default}}; border-radius: 5px; }
+/* F6. Rounding the groove *and* the chunk is right for a bar that fills, but
+ * Qt draws a busy bar by sweeping one chunk across the groove -- with both
+ * rounded that read on screen as two detached blue blocks rather than a bar.
+ * The run dialog's bar is always the busy kind, so its chunk stays square. */
+ProgressDialog QProgressBar::chunk { border-radius: 0px; margin: 0px; }
+
+
+/* Plan 44 MF3. The viewport is the whole of the area under the ribbon: the
+   group box that wrapped it draws no frame and keeps no title room. */
+QGroupBox#groupBox_24 {
+    border: none;
+    margin-top: 0;
+    padding: 0;
+}
+
+/* Plan 44 MF3 (U2). The tools of the two pills: the glyph is tinted from the
+   foreground token of the theme, hover is the raised ground, and a checked
+   tool is the soft accent with a ring. */
+QFrame#toolEdgeFrame_top QToolButton, QFrame#toolEdgeFrame_bottom QToolButton {
+    color: {{foreground.primary}};
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+}
+QFrame#toolEdgeFrame_top QToolButton:hover, QFrame#toolEdgeFrame_bottom QToolButton:hover {
+    background: {{background.raised}};
+    color: {{foreground.strong}};
+}
+QFrame#toolEdgeFrame_top QToolButton:checked, QFrame#toolEdgeFrame_bottom QToolButton:checked {
+    background: {{accent.soft}};
+    border: 1px solid {{accent.default}};
+    color: {{foreground.strong}};
+}
+QFrame#toolEdgeFrame_top QToolButton:disabled, QFrame#toolEdgeFrame_bottom QToolButton:disabled {
+    color: {{disabled.foreground}};
+}

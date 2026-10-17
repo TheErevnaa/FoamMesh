@@ -12,8 +12,6 @@ from foammesh.app import app
 from foammesh.rendering.actor_info import (
     DisplayMode, Properties, RegionMarkerActor)
 from widgets.rendering.rendering_widget import RenderingWidget
-from foammesh.view.main_window.mesh_lines_control import MeshLinesPanel
-from foammesh.view.widgets.folder_header import FolderHeader
 from .mesh_quality_info import MeshQualityInfo
 
 from .opacity_dialog import OpacityDialog
@@ -143,8 +141,8 @@ class DisplayControl(QObject):
 
         self._cutTool = CutTool(ui)
         self._meshQualityInfo = MeshQualityInfo(ui)
-        self._meshLines = self._addMeshLinesFold(ui)
         self._menu = ContextMenu(self._list)
+        self._elements = self._makeElementDisplay(ui)
 
         self._items: dict[str, DisplayItem] = {}
         self._groups: dict[tuple[str, ...], QTreeWidgetItem] = {}
@@ -162,35 +160,30 @@ class DisplayControl(QObject):
 
         self._connectSignalsSlots()
 
-    def _addMeshLinesFold(self, ui) -> Optional[MeshLinesPanel]:
-        """DP-738. The mesh-line control, in the panel with the other folds.
+    def _makeElementDisplay(self, ui):
+        """Plan 42 SG9. The Elements group of the Display popover.
 
-        DP-710 put it only behind a toolbar icon. It is the same control on
-        the same global style, so the two cannot disagree; it sits just above
-        the parts list, after Cut and Mesh Quality.
+        One panel for both engines. The rail's Display popover takes it from
+        ``ui.elementDisplayPanel``; it draws the producer's actors in the same
+        viewport and follows the Section tool.
         """
-        layout = ui.displayControl.layout()
-        if layout is None or layout.indexOf(ui.actors) < 0:
-            return None
-        fold = QWidget(ui.displayControl)
-        fold.setObjectName('meshLinesTool')
-        foldLayout = QVBoxLayout(fold)
-        foldLayout.setContentsMargins(0, 0, 0, 0)
-        foldLayout.setSpacing(GAP)
-        header = FolderHeader(fold)
-        header.setObjectName('meshLinesHeader')
-        header.setText(self.tr('Mesh lines'))
-        panel = MeshLinesPanel(fold)
-        panel.setToolTip(self.tr(
-            'Opacity, colour and width of the grid drawn on every part; '
-            'the same setting as the Mesh lines button on the viewport '
-            'toolbar'))
-        foldLayout.addWidget(header)
-        foldLayout.addWidget(panel)
-        header.setContents(panel)
-        layout.insertWidget(layout.indexOf(ui.actors), fold)
-        panel.styleChanged.connect(self._view.refresh)
+        from .element_display_panel import ElementDisplayPanel, sceneSource
+
+        panel = ElementDisplayPanel(self._view)
+        panel.setSourceProvider(lambda: sceneSource(
+            getattr(getattr(app, 'window', None), 'meshManager', None)))
+        panel.setLegendSink(self.addLegend, self.removeLegend)
+        panel.attachSection(self._cutTool)
+        self.partsChanged.connect(panel.sceneChanged)
+        try:
+            ui.elementDisplayPanel = panel
+        except AttributeError:
+            pass
         return panel
+
+    def elementDisplay(self):
+        """The Elements group (Plan 42 SG9)."""
+        return self._elements
 
     def setEnabled(self, enabled):
         self._ui.displayControl.setEnabled(enabled)
@@ -343,6 +336,18 @@ class DisplayControl(QObject):
         self._view.removeActor(actor)
         self._view.refresh()
 
+    def addLegend(self, key, bar):
+        """Put a scalar bar in the viewport's stack of legends (Plan 39 VI15).
+
+        The overlay layout places it: two legends never share a corner.
+        """
+        self._view.addLegend(key, bar)
+        self._view.refresh()
+
+    def removeLegend(self, key):
+        self._view.removeLegend(key)
+        self._view.refresh()
+
     def fitView(self):
         # DP-736. A load's fit: the view decides whether the model is the one
         # its Back/Forward history was recorded on (record the refit) or not
@@ -399,8 +404,9 @@ class DisplayControl(QObject):
             self._cutTool.hide()
 
         if hasMesh:
-            if not self._meshQualityInfo.isVisible():
-                self._meshQualityInfo.show()
+            # Plan 41 GN13. Every content change, not only the first: a new
+            # mesh may be measured by other metrics (Gmsh's, not OpenFOAM's).
+            self._meshQualityInfo.show()
         elif self._meshQualityInfo.isVisible():
             self._meshQualityInfo.hide()
 
@@ -454,11 +460,17 @@ class DisplayControl(QObject):
         """
         wanted = {str(value) for value in ids}
         governed = app.selectionService.governed_actor_ids()
-        for key, item in self._items.items():
-            if key in wanted:
-                item.setSelected(True)
-            elif key in governed:
-                item.setSelected(False)
+        for key, item in list(self._items.items()):
+            try:
+                if key in wanted:
+                    item.setSelected(True)
+                elif key in governed:
+                    item.setSelected(False)
+            except RuntimeError:
+                # DP-2109.  The selection service is app-wide and keeps the
+                # renderer of the last manager that bound one; a row whose
+                # window has been deleted is not the service's to light.
+                self._items.pop(key, None)
         # A heading has no actor, so it is not in the loop above; leaving it
         # lit while every part under it has just been deselected is the same
         # control keeping its own idea of the selection that this package

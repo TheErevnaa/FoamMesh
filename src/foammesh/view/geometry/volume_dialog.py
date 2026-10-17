@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QDialog, QMessageBox
 from PySide6.QtCore import QEvent, QTimer
 
 from foammesh.support.simple_db.simple_schema import ValidationError
+from foammesh.view import inline_error
 from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
 from widgets.async_message_box import AsyncMessageBox
@@ -21,6 +22,7 @@ from .geometry import RESERVED_NAMES
 from .open_surface_page import OpenSurfacePage
 from .transform_widget import TransformWidget
 from .volume_dialog_ui import Ui_VolumeDialog
+from widgets import async_message_box as messages
 
 
 BASE_NAMES = {
@@ -264,25 +266,57 @@ class VolumeDialog(QDialog):
 
         self._ui.cylinderRadius.setText(self._dbElement.getValue('radius'))
 
-        self._ui.annulusRadius.hide()
+        # LY13-D3 (A-088a): the annulus group is live. Outer R is the same
+        # number as R (the stored `radius`); Inner R is the bore, 0 = solid.
+        self._ui.outerRadius.setText(self._ui.cylinderRadius.text())
+        try:
+            inner = float(self._dbElement.getValue('innerRadius') or 0)
+        except (KeyError, TypeError, ValueError):
+            inner = 0.0
+        self._ui.innerRadius.setText(str(inner) if inner else '0')
+        self._wireAnnulus()
+
+    def _wireAnnulus(self):
+        if getattr(self, '_annulusWired', False):
+            return
+        self._annulusWired = True
+        radius, outer = self._ui.cylinderRadius, self._ui.outerRadius
+
+        def mirror(source, target):
+            def sync(text):
+                if target.text() != text:
+                    target.setText(text)
+            source.textChanged.connect(sync)
+        mirror(radius, outer)
+        mirror(outer, radius)
+
+    def _annulusError(self):
+        """Why the Inner R / Outer R pair is unusable, or ``None``."""
+        try:
+            inner = float(self._ui.innerRadius.text() or 0)
+            outer = float(self._ui.cylinderRadius.text())
+        except ValueError:
+            return self.tr('Inner R and Outer R must be numbers.')
+        if inner < 0:
+            return self.tr('Inner R cannot be negative.')
+        if inner > 0 and inner >= outer:
+            return self.tr('Inner R must be smaller than Outer R.')
+        return None
 
     async def _updateElement(self):
         name = self._ui.name.text()
 
         if name in RESERVED_NAMES:
-            await AsyncMessageBox().warning(
-                self, self.tr('Input error'), self.tr('"{0}" is an invalid geometry name.').format(name))
+            inline_error.show(self, self.tr('"{0}" is an invalid geometry name.').format(name))
             return
 
         if name.find(' ') > -1:
-            await AsyncMessageBox().warning(
-                self, self.tr('Input error'), self.tr('Geometry name cannot contain spaces.'))
+            inline_error.show(self, self.tr('Geometry name cannot contain spaces.'))
             return
 
         if app.facadeClient.checkout().getKeys(
                 'geometry', lambda i, e: e['name'] == name and i != self._gId):
-            await AsyncMessageBox().warning(self, self.tr('Input error'),
-                                                self.tr('Geometry "{0}" already exists.').format(name))
+            inline_error.show(self, self.tr('Geometry "{0}" already exists.').format(name))
             return False
 
         self._dbElement.setValue('gType', GeometryType.VOLUME.value)
@@ -306,7 +340,7 @@ class VolumeDialog(QDialog):
 
     def _updateHexData(self):
         if not self._validateHex():
-            QMessageBox.warning(self, self.tr('Add geometry failed'), self.tr('Invalid coordinates.'))
+            messages.warning(self, self.tr('Add geometry failed'), self.tr('Invalid coordinates.'))
             return False
 
         self._dbElement.setValue('point1/x', self._ui.minX.text(), self.tr('Minimum X'))
@@ -319,6 +353,9 @@ class VolumeDialog(QDialog):
         return True
 
     def _updateCylinderData(self):
+        if (message := self._annulusError()):
+            inline_error.show(self, message)
+            return False
         self._dbElement.setValue('point1/x', self._ui.axis1X.text(), self.tr('Axis point 1 X'))
         self._dbElement.setValue('point1/y', self._ui.axis1Y.text(), self.tr('Axis point 1 Y'))
         self._dbElement.setValue('point1/z', self._ui.axis1Z.text(), self.tr('Axis point 1 Z'))
@@ -326,6 +363,8 @@ class VolumeDialog(QDialog):
         self._dbElement.setValue('point2/y', self._ui.axis2Y.text(), self.tr('Axis point 2 Y'))
         self._dbElement.setValue('point2/z', self._ui.axis2Z.text(), self.tr('Axis point 2 Z'))
         self._dbElement.setValue('radius', self._ui.cylinderRadius.text(), self.tr('radius'))
+        self._dbElement.setValue('innerRadius', self._ui.innerRadius.text() or '0',
+                                 self.tr('Inner radius'))
 
         return True
 
@@ -382,7 +421,8 @@ class VolumeDialog(QDialog):
                 polyData = cylinderPolyData(
                     (float(self._ui.axis1X.text()), float(self._ui.axis1Y.text()), float(self._ui.axis1Z.text())),
                     (float(self._ui.axis2X.text()), float(self._ui.axis2Y.text()), float(self._ui.axis2Z.text())),
-                    float(self._ui.cylinderRadius.text()))
+                    float(self._ui.cylinderRadius.text()),
+                    float(self._ui.innerRadius.text() or 0))
             elif self._shape == Shape.SPHERE:
                 polyData = spherePolyData(
                     (float(self._ui.centerX.text()), float(self._ui.centerY.text()), float(self._ui.centerZ.text())),
@@ -449,7 +489,7 @@ class VolumeDialog(QDialog):
                 await AsyncMessageBox().warning(
                     self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
-                await AsyncMessageBox().warning(self, self.tr("Input error"), e.toMessage())
+                inline_error.show(self, e.toMessage())
 
     def _openSurfacePolyData(self):
         """What the preview draws for a plane, a disk or a plate.

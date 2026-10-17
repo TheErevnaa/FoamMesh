@@ -16,7 +16,9 @@ Both editors now take their field list from :mod:`foammesh.core.quality.policy`
 someone remembered to do.
 """
 
-from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QDialog, QFormLayout, QLineEdit, QMessageBox  # noqa: F401 (tests patch it)
+
+from widgets import async_message_box as messages
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 
@@ -28,8 +30,12 @@ from foammesh.core.quality.policy import (
     RELAXABLE_LIMITS,
     RELAXED_WITH_DEFAULT,
     STORAGE_ROOT,
+    TIER_RELAXED,
+    TIER_STRICT,
     storage_paths,
 )
+from foammesh.view.quality_tier_note import TierNote, tier_tag
+from foammesh.view import inline_error
 from foammesh.view.theming.metrics import align_unit_column, place_unit
 from .mesh_quality_parameters_dialog_ui import Ui_MeshQualityParametersDialog
 
@@ -67,6 +73,11 @@ class MeshQualityParametersDialog(QDialog):
         self._relaxed = {path.split('/', 1)[1]: edit
                          for path, edit in self._editors.items()
                          if path.startswith('relaxed/')}
+
+        # Plan 44 MF26. The sheet look: a caps title, the 78 px label column
+        # and the buttons on the right, Cancel then OK.
+        self.sheetTitle = messages.makeSheet(self, self.windowTitle())
+        messages.labelGrid(self._ui.formLayout)
 
         self._dbElement = app.facadeClient.checkout(STORAGE_ROOT)
         for path, edit in self._editors.items():
@@ -112,6 +123,31 @@ class MeshQualityParametersDialog(QDialog):
         for edit, unit in units:
             place_unit(edit, unit)
         align_unit_column((self._ui.formLayout,))
+        self._markTiers()
+
+    def _markTiers(self):
+        """Plan 40 UXD9 (N7). Say which tier of max non-orthogonality is which.
+
+        Three values stay three (65 strict gate, 70 checkMesh report, 75
+        relaxed gate). The two this dialog edits get a tag beside the box; the
+        line above the form names all three and where the third is edited.
+        """
+        self._tierTags = {}
+        for path, tier in (('maxNonOrtho', TIER_STRICT),
+                           ('relaxed/maxNonOrtho', TIER_RELAXED)):
+            edit = self._editors.get(path)
+            cell = None if edit is None else edit.parentWidget()
+            layout = None if cell is None else cell.layout()
+            if layout is None:
+                continue
+            tag = tier_tag(tier, cell)
+            layout.insertWidget(1, tag)
+            self._tierTags[tier] = tag
+        self._tierNote = TierNote('', app.facadeClient, self)
+        self._ui.formLayout.insertRow(0, self._tierNote)
+
+    def tier_tags(self) -> dict:
+        return {tier: tag.text() for tier, tag in self._tierTags.items()}
 
     def _registryTitle(self, storage_path):
         """The one name this field has, with its unit if it has one.
@@ -209,4 +245,4 @@ class MeshQualityParametersDialog(QDialog):
 
             super().accept()
         except ValidationError as e:
-            QMessageBox.warning(self, self.tr("Input error"), e.toMessage())
+            inline_error.show(self, e.toMessage())

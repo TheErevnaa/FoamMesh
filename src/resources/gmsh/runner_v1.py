@@ -51,6 +51,11 @@ try:
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
     import farfield_primitives
+    import native_fields_v1
+    import point_sizes_v1
+    import entity_controls_v1
+    import structure_v1
+    import sizefield_consumer_v1
 except ImportError:  # pragma: no cover - exercised only by the module loader
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from shell_topology import ShellTopologyError, resolve_topology
@@ -59,6 +64,11 @@ except ImportError:  # pragma: no cover - exercised only by the module loader
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
     import farfield_primitives
+    import native_fields_v1
+    import point_sizes_v1
+    import entity_controls_v1
+    import structure_v1
+    import sizefield_consumer_v1
 
 SCHEMA_VERSION = 1
 RUNNER_VERSION = 'gmsh-runner-v1'
@@ -487,6 +497,10 @@ ALGORITHM_NAMES = {
     6: 'Frontal-Delaunay',
     8: 'Frontal-Delaunay for Quads',
     9: 'Packing of Parallelograms',
+    # Plan 41 GN2. MEASURED in the log of a real run: 3 and 7 are logged as
+    # `Initial Mesh Only` and `Bamg`.
+    3: 'Initial Mesh Only',
+    7: 'Bamg',
     11: 'Quasi-structured Quad',
 }
 #: Plan 31 FC-B. ``Mesh.MaxRetries`` when algorithm fallback is on. Gmsh's own
@@ -533,11 +547,35 @@ AUTO_FORMAT_CODE = 10
 #: used to translate only ``sicn``, so selecting ``sige`` or ``disto`` reached
 #: the API as its configuration spelling and raised ``Unknown quality name``,
 #: taking the whole meshing run with it.
-QUALITY_QUERY_NAME = {'sicn': 'minSICN', 'sige': 'minSIGE', 'gamma': 'gamma'}
-#: ``disto`` is a legitimate ``Mesh.QualityType`` for the optimiser -- 0..3 all
-#: set cleanly -- but the gate cannot query it, so it is judged against this
-#: instead and the substitution is recorded rather than performed silently.
+QUALITY_QUERY_NAME = {'sicn': 'minSICN', 'sige': 'minSIGE', 'gamma': 'gamma',
+                      'disto': 'disto'}
+#: Plan 41 GN14 (F5a). ``getElementQualities`` has no name for ``disto``, but
+#: Gmsh's own distortion measure is the ratio of an element's smallest to its
+#: largest Jacobian determinant, and both of those it does name. ``disto`` is
+#: therefore measured from ``minDetJac`` and ``maxDetJac`` (see
+#: :func:`element_qualities`) and nothing stands in for it. A measure that is
+#: in neither table is still judged against this, recorded rather than silent.
 QUALITY_SUBSTITUTE = 'sicn'
+
+
+def element_qualities(mesh, tags, native):
+    """``mesh.getElementQualities`` plus the one measure it has no name for.
+
+    ``disto`` is min / max of the Jacobian determinant over the element, at
+    most 1; an element whose determinant changes sign or is zero reads zero or
+    below, so the gate's inverted count still means what it says.
+    """
+    if native != 'disto':
+        return mesh.getElementQualities(tags, native)
+    low = mesh.getElementQualities(tags, 'minDetJac')
+    high = mesh.getElementQualities(tags, 'maxDetJac')
+    values = []
+    for small, large in zip(low, high):
+        if large > 0:
+            values.append(min(1.0, small / large))
+        else:
+            values.append(0.0 if large == 0 else -1.0)
+    return values
 #: Offending elements recorded per metric. Enough to browse, bounded so a mesh
 #: where every element is bad cannot produce a gigabyte of manifest.
 OFFENDER_CAP = 1000
@@ -567,6 +605,11 @@ class _Classification:
 
 
 class GmshRun:
+    #: DP-2102. Also set in `__init__`; the class default keeps a run that a
+    #: test (or a resumed job) builds without `__init__` readable. Plan 42
+    #: SG22 added the reads without it, which failed 31 older tests.
+    nonconformal_unfused = False
+
     def __init__(self, job: dict, reporter: Reporter):
         self.job = job
         self.intent = job['intent']
@@ -657,6 +700,10 @@ class GmshRun:
         #: How many faces the duplicate fusion took away, which is the one
         #: cause of the above this runner can name.
         self.duplicate_faces_fused = 0
+        #: Plan 42 SG22 Q2. True when duplicate-face fusion was skipped
+        #: because a non-conformal pair asked for its two bodies to be
+        #: meshed apart.
+        self.nonconformal_unfused = False
         #: DP-410. ``{dropped tag: surviving tag}`` for every coincident face
         #: the fusion consumed, matched by centre of mass and area. The pair
         #: is one face now and the identity that pointed at the dropped tag
@@ -685,6 +732,8 @@ class GmshRun:
         #: fields and per-volume sizes must share it, or whichever was set
         #: last would silently replace the other.
         self.background_fields: list[int] = []
+        #: Plan 41 GN6. Metric fields (BAMG, MMG3D) and the layer field.
+        self.anisotropic_fields: list[int] = []
         #: DP-504. ``(row name, local size)`` for each background source, so
         #: the combination can tell whether anything asked for a size the
         #: boundary could outvote. ``None`` is a size the runner cannot read
@@ -743,6 +792,42 @@ class GmshRun:
         effective = self.gmsh.option.getNumber(name)
         self.ledger.record(control or name, value, effective)
         return effective
+
+    def apply_option_overrides(self, *, geometry=False):
+        """The options the user set from the option catalogue, applied last.
+
+        ``geometry=True`` applies the ``Geometry.*`` rows only, and is called
+        once before ``importShapes``: they configure the importer, so a value
+        set after the import changes nothing. The other call applies every
+        other row, after every page control.
+
+        Plan 41 GN2 (G3). Every page control has already been written, so a
+        catalogue value wins -- a value the user typed is never overwritten --
+        and the ledger records each one, requested against what Gmsh reads
+        back. A name this build does not know is refused by the derivation
+        before the run; one that slips through is recorded as not applied.
+        """
+        for row in self.intent.get('options') or ():
+            name = row.get('name')
+            if str(name).startswith('Geometry.') != bool(geometry):
+                continue
+            storage = row.get('storage', 'number')
+            value = row.get('value')
+            control = f'gmsh/options/{name}'
+            try:
+                if storage == 'string':
+                    effective = self.set_string(name, value, control=control)
+                elif storage == 'color':
+                    self.gmsh.option.setColor(name, *[int(v) for v in value])
+                    effective = list(self.gmsh.option.getColor(name))
+                    self.ledger.record(control, list(value), effective)
+                else:
+                    self.set_number(name, value, control=control)
+            except Exception as error:                   # noqa: BLE001
+                self.warnings.append(
+                    f'option {name} could not be set to {value!r}: {error}')
+                self.ledger.record(control, value, None, applied=False,
+                                   note=str(error))
 
     def set_string(self, name, value, *, control=None):
         self.gmsh.option.setString(name, str(value))
@@ -1036,6 +1121,9 @@ class GmshRun:
                         float(healing.get('booleanTolerance', 0.0) or 0.0),
                         control='gmsh/healing/booleanTolerance')
         # -- end Geometry.* block ----------------------------------------- #
+        # Plan 41 GN2. The importer options the user chose in the catalogue
+        # win over the ones just written, and must precede importShapes.
+        self.apply_option_overrides(geometry=True)
 
         self.reporter.emit('progress', 'import', 0.05, 'importing geometry')
         if tessellated:
@@ -1093,7 +1181,25 @@ class GmshRun:
             # and the volume mesher then fails with "Could not recover boundary
             # mesh". Fusing the duplicates makes the interface conformal, which
             # is what a multi-region assembly needs.
-            if healing.get('removeDuplicateFaces', True):
+            nonconformal = self.non_conformal_pairs()
+            if nonconformal:
+                # Plan 42 SG22 Q2. A non-conformal pair means its two bodies
+                # are meshed apart, so the copies of the face they share must
+                # stay two faces. Fusion is one operation on the whole model,
+                # so it is skipped for the job, and every contact that is left
+                # unfused is checked to belong to a non-conformal pair
+                # (:meth:`check_nonconformal_contacts`).
+                self.nonconformal_unfused = True
+                self.ledger.record(
+                    'gmsh/healing/removeDuplicateFaces',
+                    bool(healing.get('removeDuplicateFaces', True)), False,
+                    applied=False,
+                    note='not applied: non-conformal pair '
+                         + ', '.join(repr(str(pair.get('name') or
+                                              pair.get('pairId') or ''))
+                                     for pair in nonconformal)
+                         + ' asks for its bodies to be meshed apart')
+            elif healing.get('removeDuplicateFaces', True):
                 signatures = self._entity_signatures((2, 3))
                 before = len(gmsh.model.getEntities(2))
                 gmsh.model.occ.removeAllDuplicates()
@@ -1180,6 +1286,7 @@ class GmshRun:
                 self.warnings.append(
                     f'{receipt["path"]} contributed no geometry to the model')
         self.resolve_scopes(surfaces, volumes)
+        self.check_nonconformal_contacts()
         census = self.describe_surfaces([tag for _dim, tag in surfaces])
         self.statistics['import'].update(census['statistics'])
         self.reporter.emit(
@@ -3569,6 +3676,187 @@ class GmshRun:
             'graph': report,
         }
 
+    def apply_point_sizes(self):
+        """Plan 41 GN7 (M-01). Size at the points the user picked.
+
+        Independent of "From points" on Global sizing: Gmsh reads point sizes
+        only while ``Mesh.MeshSizeFromPoints`` is on, and a row here is an
+        explicit request, so the option is switched on and the ledger shows the
+        value asked for, the value read back, and that it was switched. The
+        size set is read back from Gmsh (``mesh.getSizes``).
+        """
+        rows = self.intent.get('pointSizes') or []
+        if not [r for r in rows if r.get('enabled', True)]:
+            return
+        result = point_sizes_v1.apply(self.gmsh, rows)
+        for item in result['applied']:
+            self.ledger.record(
+                f'pointSize:{item["name"]}', item['requested'],
+                item['effective'], note=(item['note'] or f'point {item["tag"]}'))
+        for item in result['skipped']:
+            self.warnings.append(
+                f'point size {item["name"]!r} was skipped: {item["reason"]}')
+            self.ledger.record(f'pointSize:{item["name"]}', None, None,
+                               applied=False, note=item['reason'])
+        if result['filled']:
+            self.ledger.record(
+                'gmsh/pointSizes/otherPoints', result['fillSize'],
+                result['fillSize'],
+                note=f'{count_text(len(result["filled"]), "other point")} '
+                     'without a size took the global maximum size; Gmsh '
+                     'blends a sized point with an unsized neighbour as if '
+                     'that were unlimited, which left the picked point '
+                     'coarser than the rest')
+        if result['applied']:
+            was, now = point_sizes_v1.switch_on_point_sizes(self.gmsh)
+            note = ('Gmsh reads point sizes only with this on; '
+                    + ('it was off and is on for these rows'
+                       if not was else 'it was already on'))
+            self.ledger.record('gmsh/pointSizes/fromPoints', True, bool(now),
+                               note=note)
+        self.statistics['pointSizes'] = {
+            'applied': len(result['applied']),
+            'skipped': len(result['skipped'])}
+
+    def apply_entity_controls(self):
+        """Plan 41 GN9 (M-28..M-32, A-17). Embedded entities and the per-entity
+        meshing constraints, set before anything is meshed.
+
+        The tags are those of the geometry as it was imported; an entity the
+        model lacks is a failure that names the row. Where Gmsh has a getter
+        the ledger carries what it read back (``getEmbedded``, the compound
+        options); the rest are recorded as set.
+        """
+        ops = self.intent.get('entityControls') or []
+        if not [o for o in ops if o.get('enabled', True)]:
+            return
+        try:
+            result = entity_controls_v1.apply(self.gmsh, ops)
+        except entity_controls_v1.BuildError as error:
+            raise MeshFailure(str(error)) from error
+        for name, option, requested, effective in result['applied']:
+            self.ledger.record(f'entityControl:{name}/{option}', requested,
+                               effective)
+        self.statistics['entityControls'] = {'applied': result['count']}
+
+    def apply_structure(self):
+        """Plan 41 GN8 (M-24..M-26). Transfinite surfaces and volumes with
+        their corners and arrangement, and automatic transfinite, set before
+        anything is meshed.
+
+        Gmsh has no getter for these, so the ledger says they were set and
+        :meth:`measure_structure_rows` proves them on the mesh afterwards. A
+        curve count a curve control already set is not overwritten by a row's
+        ``curve_elements``.
+        """
+        ops = self.intent.get('structure') or []
+        if not [o for o in ops if o.get('enabled', True)]:
+            return
+        try:
+            result = structure_v1.apply(
+                self.gmsh, ops, skip_curves=list(self.transfinite_curves))
+        except structure_v1.BuildError as error:
+            raise MeshFailure(str(error)) from error
+        for name, option, requested, effective in result['applied']:
+            self.ledger.record(f'structure:{name}/{option}', requested,
+                               effective)
+        self.statistics['structure'] = {'applied': result['count']}
+
+    def measure_structure_rows(self):
+        """Plan 41 GN8. What Gmsh made of each structure row, off the mesh."""
+        ops = self.intent.get('structure') or []
+        if not [o for o in ops if o.get('enabled', True)]:
+            return
+        measured = structure_v1.measure(self.gmsh, ops)
+        unstructured = []
+        for item in measured:
+            self.ledger.record(
+                f'structure:{item["name"]}/{item["kind"]}.produced/'
+                f'{item["dim"]}:{item["tag"]}',
+                'structured', item['structured'],
+                applied=item['structured'] is not False,
+                note=item['note'])
+            if item['structured'] is False:
+                unstructured.append(f'{("surface", "volume")[item["dim"] - 2]}'
+                                    f' {item["tag"]} ({item["name"]})')
+        if unstructured:
+            self.warnings.append(
+                'a transfinite constraint was set and the mesh did not come '
+                'out structured: ' + ', '.join(unstructured)
+                + '; Gmsh does not refuse such a request, so check the '
+                  'element counts on the bounding curves')
+        self.statistics.setdefault('structure', {})['measured'] = measured
+
+    def apply_native_fields(self):
+        """Plan 41 GN6. Build the fields made from any Gmsh field type.
+
+        The nodes arrive validated and name each other; they are built in
+        dependency order, every option is read back into the ledger, and the
+        ones marked background join the background (isotropic sizes with the
+        other size fields, metrics on their own).
+        """
+        nodes = self.intent.get('nativeFields') or []
+        if not nodes:
+            return
+        try:
+            built = native_fields_v1.build(self.gmsh, nodes)
+        except native_fields_v1.BuildError as error:
+            raise MeshFailure(str(error)) from error
+        for name, option, requested, effective in built['applied']:
+            self.ledger.record(f'nativeField:{name}/{option}', requested,
+                               effective)
+        anisotropic = set(built['anisotropic'])
+        for tag in built['background']:
+            if tag in anisotropic:
+                self.anisotropic_fields.append(tag)
+            else:
+                self.background_fields.append(tag)
+        field = self.gmsh.model.mesh.field
+        for tag in built['layer']:
+            field.setAsBoundaryLayer(tag)
+        self.statistics['nativeFields'] = {
+            'created': len(built['tags']),
+            'background': len(built['background']),
+            'layer': len(built['layer'])}
+
+    def apply_automatic_field(self):
+        """Plan 41 GN25f. The saved automatic size field as a background field.
+
+        ``automaticField`` is in the job only when the project switched
+        ``sizeField/useAsBackground`` on. The field joins the user's own
+        fields in the one background (combined as they chose), and the three
+        options that would outvote it are held at 0 -- recorded, not hidden:
+        the ledger says what each was and that it was held.
+        """
+        block = self.intent.get('automaticField') or {}
+        self.automatic_field = None
+        if not block:
+            return
+        consumer = sizefield_consumer_v1
+        try:
+            built = consumer.build(self.gmsh, str(block['directory']),
+                                   octree=bool(block.get('octree')))
+        except consumer.FieldError as error:
+            raise MeshFailure(
+                f'the automatic size field cannot be used: {error}') from error
+        held = consumer.hold(self.gmsh)
+        self.automatic_field = {'built': built, 'held': held}
+        self.background_fields.append(built['field'])
+        self.ledger.record(
+            'gmsh/sizeField/useAsBackground', True, True,
+            note=f"{built['hexes']} cells, sizes {built['sizeMin']:g} to "
+                 f"{built['sizeMax']:g} m, key {str(block.get('key'))[:12]}")
+        for name, was in held.items():
+            self.ledger.record(
+                f'gmsh/sizeField/held/{name}', was, 0.0,
+                note='held at 0 while the automatic size field is the '
+                     'background; it would outvote the field')
+        self.statistics['automaticField'] = {
+            'nodes': built['nodes'], 'cells': built['hexes'],
+            'sizeMin': built['sizeMin'], 'sizeMax': built['sizeMax'],
+            'held': {name: 0.0 for name in held},
+            'was': dict(held)}
+
     def assemble_background_field(self):
         """Combine every size source into one background field.
 
@@ -3576,8 +3864,19 @@ class GmshRun:
         per-volume sizes have to be merged here; setting one after the other
         would silently discard whichever went first.
         """
+        if self.anisotropic_fields:
+            # The derivation refuses a metric beside isotropic sizes.
+            chosen = native_fields_v1.set_background(
+                self.gmsh, self.anisotropic_fields, anisotropic=True)
+            self.ledger.record('gmsh/nativeFields/background', 'metric',
+                               'metric', note=f'field {chosen}')
+            return
         if not self.background_fields:
             return
+        if getattr(self, 'automatic_field', None):
+            # A later step (point sizes) may have switched one back on.
+            sizefield_consumer_v1.hold(self.gmsh,
+                                       self.automatic_field['held'])
         field = self.gmsh.model.mesh.field
         # Plan 30 WP12. Which way the combination runs is a control now. Min
         # means the finest request at any point wins, which is what shipped;
@@ -3605,6 +3904,8 @@ class GmshRun:
                      (('extend from boundary', 'extendFromBoundary'),
                       ('sizes from points', 'fromPoints'))
                      if bool(sizing.get(key, True))]
+        if getattr(self, 'automatic_field', None):
+            outvoting = []      # held at 0 by apply_automatic_field
         # DP-504. Those sources can only outvote a row asking for a larger
         # size than the smallest they can give. Without curvature sizing or a
         # sized curve that is the global target, so a row at or below it is
@@ -4163,10 +4464,26 @@ class GmshRun:
         gmsh = self.gmsh
         heights = [float(item) for item in layers['cumulativeHeights']]
         count = int(layers['layerCount'])
+        elements = int(layers.get('elementsPerLayer') or 1)
 
         surfaces = [tag for _dim, tag in gmsh.model.getEntities(2)]
         volumes = [tag for _dim, tag in gmsh.model.getEntities(3)]
         selected, skipped = self.layer_surfaces(surfaces, layers)
+        # Plan 41 GN10 (M-34). A patch with a stack row of its own grows that
+        # stack and nothing else: its row selects it, whatever the list above
+        # says, and the list's stack is kept for every other patch.
+        stack_rows = [dict(row) for row in (layers.get('stacks') or ())]
+        stack_of = {}
+        for number, row in enumerate(stack_rows, start=1):
+            chosen, _left = self.layer_surfaces(
+                surfaces, {**layers, 'patchMode': 'selected',
+                           'patches': [row['patch']]})
+            for tag in chosen:
+                stack_of[int(tag)] = number
+        if stack_of:
+            held = {int(tag) for tag in selected} | set(stack_of)
+            selected = [tag for tag in surfaces if int(tag) in held]
+            skipped = [tag for tag in surfaces if int(tag) not in held]
         if not selected:
             # Growing on nothing is not the same as growing on everything, and
             # quietly doing the latter is how a user gets prisms on an inlet.
@@ -4298,32 +4615,62 @@ class GmshRun:
                    else self.outward_normals(selected, carved))
         self.remove_entities([(3, tag) for tag in carved])
 
-        groups = self.layer_height_groups(selected, heights, internal=internal,
-                                          outward=outward)
-        # DP-91. Two directions that meet on a shared edge extrude that edge
-        # twice, and Gmsh says so only part-way through the 3D pass, in a
-        # sentence with no patch name in it. Asked here, while the patches
-        # still have names and before anything has been built.
-        meetings = self.directions_that_meet(groups)
-        inward = [tag for _signed, tags, flipped in groups if flipped
-                  for tag in tags]
-        # DP-404. The refusal below used to stand here, in front of the
-        # extrusion. It stands behind it now, because the premise it was
-        # written on is only half true: the *height* is signed once per call,
-        # the *call* is not limited to one direction. A dim-tag carries a sign
-        # of its own and `extrudeBoundaryLayer` reads it.
-        refusal = ''
-        if meetings:
-            refusal = self.opposed_directions_refusal(selected, groups,
-                                                      meetings, skipped)
-            groups = self.one_call_for_both_directions(groups)
+        # Plan 41 GN10 (M-34). Every stack is its own set of calls: the
+        # heights, the elements in each layer and the cell shape are
+        # arguments of `extrudeBoundaryLayer`, so patches with different
+        # stacks cannot share one. The list's stack is stack 0.
+        stacks = {0: {'heights': heights, 'count': count,
+                      'elements': elements, 'name': '',
+                      'quads': bool(layers.get('quads', True))}}
+        for number, row in enumerate(stack_rows, start=1):
+            stacks[number] = {
+                'heights': [float(item) for item in row['cumulativeHeights']],
+                'count': int(row['layerCount']),
+                'elements': int(row.get('elementsPerLayer') or 1),
+                'quads': bool(row.get('quads', True)), 'name': row['patch']}
+        calls, inward, refusal = [], [], ''
+        for number in sorted({stack_of.get(int(tag), 0) for tag in selected}):
+            members = [tag for tag in selected
+                       if stack_of.get(int(tag), 0) == number]
+            stack = stacks[number]
+            groups = self.layer_height_groups(
+                members, stack['heights'], internal=internal,
+                outward=outward)
+            # DP-91. Two directions that meet on a shared edge extrude that
+            # edge twice, and Gmsh says so only part-way through the 3D pass,
+            # in a sentence with no patch name in it. Asked here, while the
+            # patches still have names and before anything has been built.
+            meetings = self.directions_that_meet(groups)
+            inward.extend(tag for _signed, tags, flipped in groups if flipped
+                          for tag in tags)
+            # DP-404. The refusal below used to stand here, in front of the
+            # extrusion. It stands behind it now, because the premise it was
+            # written on is only half true: the *height* is signed once per
+            # call, the *call* is not limited to one direction. A dim-tag
+            # carries a sign of its own and `extrudeBoundaryLayer` reads it.
+            if meetings:
+                refusal = refusal or self.opposed_directions_refusal(
+                    members, groups, meetings, skipped)
+                groups = self.one_call_for_both_directions(groups)
+            calls.extend((stack, signed, tags) for signed, tags, _flipped
+                         in groups)
+        # MEASURED on Gmsh 4.15.2 (duct.step, wall_y0 five layers of two
+        # cells beside three walls of three layers): the run fails in the
+        # volume pass with "Could not find extruded node ... in surface N",
+        # a sentence that names a coordinate and no patch. The same row equal
+        # to the list's stack meshes, so the cause is the unlike stacks on one
+        # edge, and it is said here, before anything is built.
+        contacts = self.stacks_that_meet(selected, stack_of, stacks)
+        if contacts:
+            raise MeshFailure(self.stack_contact_refusal(contacts))
         try:
             extruded = []
             columns = []
-            for signed, tags, _flipped in groups:
+            for stack, signed, tags in calls:
                 produced = list(gmsh.model.geo.extrudeBoundaryLayer(
-                    [(2, tag) for tag in tags], [1] * count, signed,
-                    bool(layers.get('quads', True))))
+                    [(2, tag) for tag in tags],
+                    [stack['elements']] * stack['count'], signed,
+                    stack['quads']))
                 extruded.extend(produced)
                 # DP-74. The inner face of each stack, paired with the wall it
                 # grew from. The pairing only holds within one call: the two
@@ -4416,6 +4763,22 @@ class GmshRun:
             'measuredSurfaces': len(outward),
             'patches': sorted({self.surface_patch_name(tag)[0]
                                for tag in selected}),
+            # Plan 41 GN10 (M-34). What each patch was asked for, so the
+            # measured stack can be read against its own request.
+            'elementsPerLayer': elements,
+            'requestedByPatch': {
+                self.surface_patch_name(tag)[0]: {
+                    'stack': stack_of.get(int(tag), 0),
+                    'layers': stacks[stack_of.get(int(tag), 0)]['count'],
+                    'elementsPerLayer':
+                        stacks[stack_of.get(int(tag), 0)]['elements'],
+                    'firstHeight': abs(
+                        stacks[stack_of.get(int(tag), 0)]['heights'][0]),
+                    'totalThickness': abs(
+                        stacks[stack_of.get(int(tag), 0)]['heights'][-1]),
+                    'quads': stacks[stack_of.get(int(tag), 0)]['quads']}
+                for tag in selected},
+            'stackCount': len(stacks) if stack_of else 1,
             'scope': layers.get('scope', 'all_boundary_surfaces'),
             # R118. Which volume was carved and rebuilt, and which ones were
             # left as they were imported. On a single-solid case this is the
@@ -4432,6 +4795,18 @@ class GmshRun:
                      'other way, into the fluid')
         self.ledger.record('gmsh/boundaryLayers/layerCount', count, count,
                            note=note)
+        self.ledger.record(
+            'gmsh/boundaryLayers/elementsPerLayer', elements, elements,
+            note='the cells each layer is divided into, in the first stack')
+        if stack_rows:
+            grown = sorted({stack_of[tag] for tag in stack_of
+                            if int(tag) in {int(item) for item in selected}})
+            self.ledger.record(
+                'gmsh/boundaryLayers/stacks', len(stack_rows), len(grown),
+                applied=len(grown) == len(stack_rows),
+                note=f'{count_text(len(grown), "stack")} of its own grown '
+                     'on ' + ', '.join(sorted(
+                         stacks[number]['name'] for number in grown)))
 
     def surface_facets(self, tag, points):
         """One surface's faces as corner triangles, in element order.
@@ -4584,6 +4959,11 @@ class GmshRun:
         if not stack or not self.layer_columns:
             return
         asked = abs(float(stack[-1]))
+        # Plan 41 GN10. A patch with a deeper stack of its own is the one the
+        # fold reading has to hold the measured thickness against.
+        for row in (self.intent.get('layers') or {}).get('stacks') or ():
+            if row.get('cumulativeHeights'):
+                asked = max(asked, abs(float(row['cumulativeHeights'][-1])))
         if asked <= 0.0:
             return
         tags, flat, _ = self.gmsh.model.mesh.getNodes()
@@ -4861,6 +5241,34 @@ class GmshRun:
                 f'volume and {agreeing(len(flip), "was", "were")} grown '
                 'inwards from it, away from the void')
         return groups
+
+    def stacks_that_meet(self, selected, stack_of, stacks):
+        """Which patches with different stacks share an edge.
+
+        Plan 41 GN10. One edge is extruded by one call, and a call carries one
+        stack. Patches with unlike stacks that meet on an edge are returned
+        as ``(tag, other tag)`` so the failure can name them.
+        """
+        if len({stack_of.get(int(tag), 0) for tag in selected}) < 2:
+            return []
+        curves = {int(tag): set(self.surface_curves(tag)) for tag in selected}
+        meetings = []
+        ordered = [int(tag) for tag in selected]
+        for index, tag in enumerate(ordered):
+            for mate in ordered[index + 1:]:
+                if (stack_of.get(tag, 0) != stack_of.get(mate, 0)
+                        and curves[tag] & curves[mate]):
+                    meetings.append((tag, mate))
+        return meetings
+
+    def stack_contact_refusal(self, meetings):
+        names = sorted({self.surface_patch_name(tag)[0]
+                        for pair in meetings for tag in pair})
+        return ('layer stacks that differ were asked for on patches that '
+                f'share an edge ({", ".join(names)}): an edge is extruded '
+                'once, by one stack, so the stacks cannot differ across it. '
+                'Give the neighbouring patches the same stack, or put a '
+                'patch without layers between them.')
 
     def directions_that_meet(self, groups):
         """Which layer bases grow opposite ways and share an edge.
@@ -6251,8 +6659,8 @@ class GmshRun:
             self.warnings.append(
                 f'Gmsh cannot report {substituted_for} per element, so the '
                 f'quality gate measured {measure} against the same limit')
-        values = gmsh.model.mesh.getElementQualities(
-            all_tags, QUALITY_QUERY_NAME[measure])
+        values = element_qualities(
+            gmsh.model.mesh, all_tags, QUALITY_QUERY_NAME[measure])
 
         threshold = float(limit.get('minQuality', limit.get('minimum', 0.0)) or 0.0)
         inverted = sum(1 for item in values if item <= 0)
@@ -6314,8 +6722,8 @@ class GmshRun:
             tags.extend(int(item) for item in group)
         if not tags:
             return None
-        values = list(gmsh.model.mesh.getElementQualities(
-            tags, QUALITY_QUERY_NAME[measure]))
+        values = list(element_qualities(
+            gmsh.model.mesh, tags, QUALITY_QUERY_NAME[measure]))
         if not values:
             return None
         record = getattr(self, 'statistics', {}).get('classification')
@@ -6537,8 +6945,8 @@ class GmshRun:
             tags = [int(item) for group in groups for item in group]
             if not tags:
                 return None
-            return float(min(self.gmsh.model.mesh.getElementQualities(
-                tags, measure)))
+            return float(min(element_qualities(
+                self.gmsh.model.mesh, tags, measure)))
         except Exception:                                    # noqa: BLE001
             return None
 
@@ -6578,19 +6986,20 @@ class GmshRun:
             self.ledger.record('gmsh/output/renumber', True, False,
                                applied=False, note=reason)
             return
+        method = str(export.get('renumberMethod') or 'RCMK')
         before = self.node_bandwidth()
         try:
-            old_tags, new_tags = self.gmsh.model.mesh.computeRenumbering('RCMK')
+            old_tags, new_tags = self.gmsh.model.mesh.computeRenumbering(method)
             self.gmsh.model.mesh.renumberNodes(old_tags, new_tags)
         except Exception as error:                           # noqa: BLE001
             self.warnings.append(f'renumbering did not run: {error}')
             self.ledger.record('gmsh/output/renumber', True, False,
                                applied=False,
-                               note=f'RCMK renumbering failed: {error}')
+                               note=f'{method} renumbering failed: {error}')
             return
         after = self.node_bandwidth()
         self.statistics['renumbering'] = {
-            'method': 'RCMK', 'bandwidthBefore': before,
+            'method': method, 'bandwidthBefore': before,
             'bandwidthAfter': after,
         }
         moved = ''
@@ -6599,7 +7008,7 @@ class GmshRun:
         self.statistics['renumbering']['carriedBy'] = carriers
         self.ledger.record(
             'gmsh/output/renumber', True, True,
-            note='RCMK, by computeRenumbering, carried by '
+            note=f'{method}, by computeRenumbering, carried by '
                  + ', '.join(carriers) + moved)
 
     def renumbering_carriers(self):
@@ -6841,6 +7250,20 @@ class GmshRun:
         """
         healing = self.intent.get('healing') or {}
         if not healing.get('removeDuplicateNodes', True):
+            return
+        if self.nonconformal_unfused:
+            # Plan 42 SG22 Q2. The two copies of a non-conformal pair's
+            # contact face are meshed alike (same shape, same size), so
+            # welding their coincident nodes would glue the two bodies into
+            # one conformal mesh and leave no patch for
+            # createNonConformalCouples to couple. MEASURED on
+            # jacketed_pipe: the weld turned the interface into 918
+            # internal faces and both patches vanished from the publication.
+            self.ledger.record(
+                'gmsh/healing/removeDuplicateNodes', True, False,
+                applied=False,
+                note='not applied: a non-conformal pair keeps its two bodies '
+                     'apart, so the nodes on their contact are not welded')
             return
         gmsh = self.gmsh
         tolerance = self.merge_tolerance()
@@ -8139,11 +8562,19 @@ class GmshRun:
         record['lateralFaces'] = lateral
         quads = bool((self.intent.get('layers') or {}).get('quads', True))
         recombined = any(name.startswith('Quadrilateral') for name in lateral)
+        # Plan 41 GN10. Stacks may differ in cell shape: the sides then come
+        # out as both families, and the ledger asks for both.
+        asked = {quads} | {bool(row.get('quads', True)) for row in
+                           (self.intent.get('layers') or {}).get('stacks')
+                           or ()}
+        triangles = any(name.startswith('Triangle') for name in lateral)
+        agreed = (recombined and triangles if len(asked) == 2
+                  else recombined == quads)
         self.ledger.record(
             'gmsh/boundaryLayers/quads', quads,
             ', '.join(sorted(lateral)) or None,
-            applied=bool(lateral) and recombined == quads,
-            matched=bool(lateral) and recombined == quads,
+            applied=bool(lateral) and agreed,
+            matched=bool(lateral) and agreed,
             note='the family the sides of the layer came out as')
 
         owner, faces = {}, {}
@@ -8217,10 +8648,18 @@ class GmshRun:
         for name, entry in sorted(columns.items()):
             total = faces.get(name)
             coverage = (entry['columns'] / total) if total else None
+            # Plan 41 GN10. A column holds `elementsPerLayer` cells per
+            # layer; the patch is read in layers, against its own request.
+            asked = (record.get('requestedByPatch') or {}).get(name) or {}
+            split = int(asked.get('elementsPerLayer') or 1)
             by_patch[name] = {
                 'selected': name in wanted, 'faces': total,
                 'columns': entry['columns'], 'coverage': coverage,
-                'layersPerColumn': sorted(entry['layers']),
+                'layersPerColumn': sorted(
+                    {n // split if n % split == 0 else n
+                     for n in entry['layers']}),
+                'cellsPerColumn': sorted(entry['layers']),
+                'requested': asked or None,
                 'firstHeight': self.spread(entry['first']),
                 'travelled': self.spread(entry['travelled']),
                 'reach': self.spread(entry['reach']),
@@ -8265,21 +8704,70 @@ class GmshRun:
                 + ', which the plan did not select')
         requested = record['requestedTotalThickness']
         reach = record['achieved']['reach']
+        first_measured = record['achieved']['firstHeight']
+        # The first cell is the first layer divided by its cells per layer.
+        first_asked = (record['requestedFirstHeight']
+                       / max(1, int(record.get('elementsPerLayer') or 1)))
+        asked_by_patch = record.get('requestedByPatch') or {}
+        # Plan 41 GN10 (M-34). With stacks of its own on some patches the
+        # run-wide reading mixes unlike stacks, so the list's rows are read
+        # over the patches that kept the list's stack, and each patch with a
+        # stack of its own is read against that stack on rows of its own.
+        stacked = any(item.get('stack') for item in asked_by_patch.values())
+        if stacked:
+            plain = [by_patch[name] for name, item in asked_by_patch.items()
+                     if not item.get('stack') and name in by_patch
+                     and by_patch[name].get('reach')]
+            reach = self.spread([item['reach']['median'] for item in plain
+                                 if item.get('reach')]) if plain else None
+            first_measured = self.spread(
+                [item['firstHeight']['median'] for item in plain
+                 if item.get('firstHeight')]) if plain else None
+            for name, item in sorted(asked_by_patch.items()):
+                if not item.get('stack') or name not in by_patch:
+                    continue
+                measured = by_patch[name]
+                depth = (measured.get('layersPerColumn') or [None])[0]
+                cell = (measured.get('firstHeight') or {}).get('median')
+                got = (measured.get('reach') or {}).get('median')
+                prefix = f'gmsh/boundaryLayers/stacks/{name}'
+                split = int(item.get('elementsPerLayer') or 1)
+                self.ledger.record(
+                    f'{prefix}/layerCount', item['layers'], depth,
+                    note=f'layers on {name}, read from its columns '
+                         f'({count_text(split, "cell")} each)')
+                self.ledger.record(
+                    f'{prefix}/firstHeight', item['firstHeight'] / split,
+                    cell, matched=bool(cell) and abs(
+                        cell - item['firstHeight'] / split)
+                    <= 0.02 * item['firstHeight'] / split,
+                    note='the first cell of the stack, measured from paired '
+                         'prism nodes')
+                self.ledger.record(
+                    f'{prefix}/totalThickness', item['totalThickness'], got,
+                    matched=bool(got) and abs(
+                        got - item['totalThickness'])
+                    <= 0.1 * item['totalThickness'],
+                    note='measured perpendicular to the wall the stack grew '
+                         'from')
         if requested and reach and reach['min'] < .5 * requested:
             self.warnings.append(
                 f'the boundary layer is pinched: it reaches {reach["min"]:.3g} '
                 f'm into the domain where it was asked for {requested:.3g} m, '
                 'which happens where walls meet at a sharp angle')
-        self.ledger.record(
-            'gmsh/boundaryLayers/totalThickness', requested,
-            reach and reach['median'],
-            note='measured perpendicular to the wall the stack grew from; at '
-                 'a junction the shared node moves along the bisector, so the '
-                 'stack reaches less far than its nodes travelled')
-        self.ledger.record(
-            'gmsh/boundaryLayers/firstHeight', record['requestedFirstHeight'],
-            record['achieved']['firstHeight']['median'],
-            note='measured from paired prism nodes')
+        if reach:
+            self.ledger.record(
+                'gmsh/boundaryLayers/totalThickness', requested,
+                reach['median'],
+                note='measured perpendicular to the wall the stack grew '
+                     'from; at a junction the shared node moves along the '
+                     'bisector, so the stack reaches less far than its nodes '
+                     'travelled')
+        if first_measured:
+            self.ledger.record(
+                'gmsh/boundaryLayers/firstHeight', first_asked,
+                first_measured['median'],
+                note='measured from paired prism nodes')
         covered = [item['coverage'] for item in by_patch.values()
                    if item['selected'] and item['coverage'] is not None]
         self.ledger.record(
@@ -8385,10 +8873,64 @@ class GmshRun:
 
     #: DP-548. What the Gmsh route does with an interface pair, said once.
     INTERFACE_PAIR_ACTION = (
-        'the Gmsh runner builds no coupling from a pair: two solids are '
-        'conformal where they share one CAD face or where duplicate-face '
-        'fusion merged their copies, and nowhere else; a translated or '
-        'rotated cyclic pair is built by setPeriodic (DP-641)')
+        'two solids are conformal where they share one CAD face or where '
+        'duplicate-face fusion merged their copies; a non-conformal pair '
+        'keeps its two bodies apart (no fusion) and OpenFOAM '
+        'createNonConformalCouples couples them after conversion (SG22); a '
+        'translated or rotated cyclic pair is built by setPeriodic (DP-641)')
+
+    def non_conformal_pairs(self) -> list:
+        """The enabled coincident pairs that ask to be coupled non-conformally.
+
+        Plan 42 SG22 Q2. Their two bodies are meshed apart.
+        """
+        return [pair for pair in self.job.get('interfacePairs') or ()
+                if isinstance(pair, dict)
+                and str(pair.get('coupling') or '') == 'non_conformal'
+                and str(pair.get('transform') or 'coincident') == 'coincident']
+
+    def check_nonconformal_contacts(self):
+        """Refuse a job whose unfused contacts are not all non-conformal pairs.
+
+        Plan 42 SG22 Q2. With fusion skipped, every pair of coincident faces
+        stays two faces; each is then two boundary patches. That is what a
+        non-conformal pair wants and nothing else does: a contact no pair
+        covers would publish as two unnamed walls, or as a conformal pair the
+        user asked for and did not get. So the job is stopped, naming the
+        contact, rather than meshed as something it was not asked to be.
+        """
+        if not self.nonconformal_unfused:
+            return
+        groups: dict = {}
+        for (_dim, tag), signature in self._entity_signatures((2,)).items():
+            groups.setdefault(signature, []).append(int(tag))
+        contacts = [sorted(tags) for tags in groups.values() if len(tags) > 1]
+        sides = []
+        for pair in self.non_conformal_pairs():
+            master = {int(tag) for tag in self.scope_surfaces.get(
+                str(pair.get('masterScope') or '')) or ()}
+            slave = {int(tag) for tag in self.scope_surfaces.get(
+                str(pair.get('slaveScope') or '')) or ()}
+            sides.append((master, slave))
+        uncovered = []
+        for tags in contacts:
+            if len(tags) == 2 and any(
+                    (tags[0] in master and tags[1] in slave)
+                    or (tags[1] in master and tags[0] in slave)
+                    for master, slave in sides):
+                continue
+            uncovered.append(tags)
+        if not uncovered:
+            return
+        named = '; '.join(
+            ' and '.join(self.surface_patch_name(tag)[0] for tag in tags)
+            for tags in uncovered)
+        raise MeshFailure(
+            'a non-conformal interface pair keeps its bodies apart, and a '
+            'Gmsh job fuses coincident faces for every contact or for none, '
+            f'so the contact at {named} would be left as unmatched walls. '
+            'Author a non-conformal pair for that contact too, or make the '
+            'non-conformal pair conformal.')
 
     def trace_interface_pairs(self):
         """Say, pair by pair, what the finished mesh holds where it points.
@@ -8416,7 +8958,8 @@ class GmshRun:
         for pair in pairs:
             row = self._trace_interface_pair(pair)
             traced.append(row)
-            applied = row['state'] in ('conformal', 'periodic')
+            applied = row['state'] in ('conformal', 'periodic',
+                                       'non_conformal')
             self.ledger.record(
                 f'interfacePair:{row["name"]}', row['coupling'],
                 row['state'], applied=applied, matched=applied,
@@ -8480,11 +9023,15 @@ class GmshRun:
                         f' periodic pair; master is {described("master")}, '
                         f'slave is {described("slave")}')
                     return row
+        if coupling == 'non_conformal' and transform == 'coincident':
+            return self._trace_non_conformal_pair(row, master, slave,
+                                                  described)
         if coupling == 'non_conformal':
             row['reason'] = (
-                'Gmsh builds no non-conformal (NCC) coupling, so this pair '
-                'is not built on the Gmsh route; master '
-                f'is {described("master")}, slave is {described("slave")}')
+                f'a non-conformal {transform} coupling is not built on the '
+                'Gmsh route (a transformed match is authored on the Periodic '
+                f'page); master is {described("master")}, slave is '
+                f'{described("slave")}')
             return row
         if coupling != 'conformal' or transform != 'coincident':
             row['reason'] = (
@@ -8506,6 +9053,53 @@ class GmshRun:
             f'master is {described("master")} and slave is '
             f'{described("slave")}; they are not one face between two '
             'volumes, and the Gmsh runner does not merge faces for a pair')
+        return row
+
+    def _trace_non_conformal_pair(self, row, master, slave, described) -> dict:
+        """Grade a non-conformal pair the job kept apart (Plan 42 SG22 Q2).
+
+        Each side must be exactly one surface bounding one volume: the two
+        copies of the contact face, now two boundary patches, which
+        createNonConformalCouples takes by name. The pair is ``non_conformal``
+        (coupled after the OpenFOAM conversion) for an OpenFOAM target, and
+        ``unmatched`` for any other output, which has no such coupling and is
+        never reported as coupled.
+        """
+        if len(master) != 1 or len(slave) != 1 or master == slave:
+            row['reason'] = (
+                'each side of a non-conformal pair must be exactly one '
+                f'boundary surface, but master is {described("master")} and '
+                f'slave is {described("slave")}; group the faces of a side '
+                'into one named boundary on the Geometry page')
+            return row
+        sides = (master[0], slave[0])
+        if any(self._bounds_two_volumes(tag) for tag in sides):
+            row['reason'] = (
+                f'master is {described("master")} and slave is '
+                f'{described("slave")}; a side that is shared by two volumes '
+                'was fused, so the bodies were not kept apart there')
+            return row
+        row['masterPatch'] = self.surface_patch_name(master[0])[0]
+        row['slavePatch'] = self.surface_patch_name(slave[0])[0]
+        row['matchedFaces'] = sum(self._surface_face_count(tag)
+                                  for tag in sides)
+        target = str((self.intent.get('export') or {}).get(
+            'targetSolver') or '').lower()
+        if target == 'openfoam':
+            row['state'] = 'non_conformal'
+            row['label'] = 'non-conformal'
+            row['reason'] = (
+                f'{row["masterPatch"]} and {row["slavePatch"]} were meshed '
+                'apart as two boundary patches; OpenFOAM '
+                'createNonConformalCouples couples them after conversion')
+        else:
+            row['state'] = 'unmatched'
+            row['label'] = 'unmatched surfaces'
+            row['reason'] = (
+                f'{row["masterPatch"]} and {row["slavePatch"]} were meshed '
+                'apart; only an OpenFOAM target couples them, so for this '
+                'output they are unmatched surfaces and no coupling is '
+                'claimed')
         return row
 
     def _authored_surface_names(self, token) -> list:
@@ -9155,11 +9749,18 @@ class GmshRun:
             self.import_geometry()
             self.apply_sizing()
             self.apply_size_fields()
+            self.apply_native_fields()
+            self.apply_automatic_field()
             # Before the curve controls: a three-sided face they make
             # transfinite is filled according to this option.
             self.apply_structuring_options()
             self.apply_curve_controls()
+            # After the curve controls: a size the user put on a picked point
+            # outranks the end-point size a curve control gave it.
+            self.apply_point_sizes()
             self.apply_volume_controls()
+            self.apply_entity_controls()
+            self.apply_structure()
             self.assemble_background_field()
             # R65. The boundary is read off the intact volume; the layer
             # extrusion below destroys the adjacency that identifies it.
@@ -9178,11 +9779,15 @@ class GmshRun:
             # what it structures, so it has to see the surfaces that
             # exist at meshing time.
             self.apply_automatic_structuring()
+            # Last, so a value the user chose from the option catalogue is
+            # the one Gmsh meshes with.
+            self.apply_option_overrides()
             self.generate()
             self.measure_algorithms()
             self.measure_families()
             self.measure_structuring()
             self.measure_structure()
+            self.measure_structure_rows()
             self.measure_layers()
             self.measure_periodic()
             self.trace_interface_pairs()
@@ -9321,6 +9926,14 @@ def refitted_job(job, factor):
     for key in ('firstHeight', 'totalThickness'):
         if layers.get(key) is not None:
             layers[key] = float(layers[key]) * factor
+    # Plan 41 GN10. The per-patch stacks are cut back by the same factor.
+    for row in layers.get('stacks') or ():
+        row['cumulativeHeights'] = [
+            float(value) * factor for value in row.get('cumulativeHeights')
+            or ()]
+        for key in ('firstHeight', 'totalThickness'):
+            if row.get(key) is not None:
+                row[key] = float(row[key]) * factor
     return document
 
 

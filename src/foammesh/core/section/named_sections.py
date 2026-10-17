@@ -32,6 +32,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .modes import SectionMode
+from .pieces import CellRule, Combine, ScalePolicy
 from .plane_state import PlaneState
 
 __all__ = [
@@ -115,10 +116,20 @@ class NamedPlane:
     state: PlaneState
     pivot: tuple = (0.0, 0.0, 0.0)
     enabled: bool = True
+    #: Plan 39 VI10 (F3a, F3b). Whether the plane's handle and its sheet are
+    #: drawn. Written only when hidden, so a section whose planes are all
+    #: shown reads and writes exactly as it did before.
+    handle_visible: bool = True
+    surface_visible: bool = True
 
     def to_dict(self) -> dict:
-        return {'name': self.name, 'enabled': bool(self.enabled),
-                'pivot': list(self.pivot), **self.state.to_dict()}
+        result = {'name': self.name, 'enabled': bool(self.enabled),
+                  'pivot': list(self.pivot), **self.state.to_dict()}
+        if not self.handle_visible:
+            result['handle_visible'] = False
+        if not self.surface_visible:
+            result['surface_visible'] = False
+        return result
 
     @classmethod
     def from_dict(cls, data: dict, fallback_name='Plane') -> 'NamedPlane':
@@ -129,7 +140,9 @@ class NamedPlane:
         pivot = data.get('pivot')
         pivot = state.project(_vector(pivot, 'pivot')) if pivot else \
             state.origin
-        return cls(name, state, tuple(pivot), bool(data.get('enabled', True)))
+        return cls(name, state, tuple(pivot), bool(data.get('enabled', True)),
+                   bool(data.get('handle_visible', True)),
+                   bool(data.get('surface_visible', True)))
 
 
 @dataclass(frozen=True)
@@ -234,8 +247,23 @@ class SectionDefinition:
     mask: dict = field(default_factory=lambda: {'caps': True})
     target: StagePolicy = field(default_factory=StagePolicy)
     frozen: FrozenSelection | None = None
+    #: Plan 39 VI10b (F2f, F2g, F2h). How the planes combine, which whole
+    #: cells survive, and how the cut's colour scale is fitted (a fixed one
+    #: with its ``(low, high)``). Written only when not the default.
+    combine: str = Combine.COMMON.value
+    cell_rule: str = CellRule.ANY.value
+    scale: str = ScalePolicy.CUT.value
+    scale_range: tuple | None = None
 
     def __post_init__(self):
+        Combine(self.combine)
+        CellRule(self.cell_rule)
+        ScalePolicy(self.scale)
+        if self.scale_range is not None:
+            low, high = (float(v) for v in self.scale_range)
+            if not (math.isfinite(low) and math.isfinite(high)
+                    and low < high):
+                raise ValueError('a fixed colour scale needs low < high')
         if not self.planes:
             raise ValueError('a section has at least one plane')
         if len(self.planes) > MAX_PLANES:
@@ -273,6 +301,15 @@ class SectionDefinition:
         }
         if self.frozen is not None:
             result['frozen'] = self.frozen.to_dict()
+        if self.combine != Combine.COMMON.value:
+            result['combine'] = self.combine
+        if self.cell_rule != CellRule.ANY.value:
+            result['cell_rule'] = self.cell_rule
+        if self.scale != ScalePolicy.CUT.value:
+            result['scale'] = {'policy': self.scale}
+            if self.scale_range is not None:
+                result['scale']['range'] = [float(v)
+                                            for v in self.scale_range]
         return result
 
     @classmethod
@@ -298,7 +335,21 @@ class SectionDefinition:
             {'caps': bool(mask.get('caps', True))} if isinstance(mask, dict)
             else {'caps': True},
             StagePolicy.from_dict(data.get('target')),
-            FrozenSelection.from_dict(frozen) if frozen else None)
+            FrozenSelection.from_dict(frozen) if frozen else None,
+            str(data.get('combine', Combine.COMMON.value)),
+            str(data.get('cell_rule', CellRule.ANY.value)),
+            *_scale(data.get('scale')))
+
+
+def _scale(data) -> tuple:
+    """``(policy, range)`` of a saved ``scale`` entry (VI10b)."""
+    if not data:
+        return ScalePolicy.CUT.value, None
+    if not isinstance(data, dict):
+        raise ValueError('the colour scale is not an object')
+    wanted = data.get('range')
+    return (str(data.get('policy', ScalePolicy.CUT.value)),
+            tuple(float(v) for v in wanted) if wanted else None)
 
 
 # -- the file ------------------------------------------------------------ #

@@ -4,7 +4,7 @@
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QTranslator, QCoreApplication, QLocale, Signal
+from PySide6.QtCore import QObject, QLocale, Signal
 from PySide6.QtWidgets import QApplication
 
 from foammesh.db.project import Project
@@ -22,6 +22,7 @@ from foammesh.core.case import (
     load_case_metadata,
     resolve_workflow,
 )
+from foammesh.core import display_unit
 from foammesh.core.jobs import JobManager
 from foammesh.core.project import Event, EventBus
 from foammesh.core.facade import CaseSession, FoamMeshFacade
@@ -47,7 +48,6 @@ class App(QObject):
             WorkflowMode.NONE, MeshOrigin.NONE, ArtifactState.ABSENT, 'no case is open')
 
         self._window = None
-        self._translator = None
         self._events = EventBus()
         self._projectManager = ProjectManager(self._events)
 
@@ -267,9 +267,11 @@ class App(QObject):
         return found
 
     def applyLanguage(self):
-        """Keep the desktop UI on its source-language English strings."""
-        QCoreApplication.removeTranslator(self._translator)
-        self._translator = QTranslator()
+        """Keep the desktop UI on its source-language English strings.
+
+        No translation catalogue is loaded: strings stay wrapped in tr() so a
+        catalogue can be added later, but there is no loader (Plan 40 Q6).
+        """
         QLocale.setDefault(QLocale('en'))
 
     def createProject(self, path):
@@ -282,6 +284,7 @@ class App(QObject):
             self._fileSystem = FileSystem(self._project.path)
             self._fileSystem.createCase(resource.file('openfoam/case'))
             self._attachFacadeSession()
+            display_unit.adopt_from_case(self._project.path)
             self._events.publish(Event.PROJECT_OPENED, case_id=str(resolved), path=str(resolved))
             return self._project
         except Exception as error:
@@ -371,6 +374,7 @@ class App(QObject):
                 self._refreshWorkflowResolution()
                 self._project.acceptExternalChanges()
                 self._attachFacadeSession()
+                display_unit.adopt_from_case(self._project.path)
                 self._events.publish(Event.PROJECT_OPENED, case_id=str(path), path=str(path))
                 return self._project
             except Exception as error:
@@ -453,6 +457,7 @@ class App(QObject):
             self._project.close()
         self._project = None
         self._fileSystem = None
+        display_unit.reset()
         self._workflowResolution = WorkflowResolution(
             WorkflowMode.NONE, MeshOrigin.NONE, ArtifactState.ABSENT, 'no case is open')
         if closing is not None:

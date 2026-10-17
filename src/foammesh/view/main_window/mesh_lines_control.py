@@ -35,7 +35,7 @@ _ICON_SVG = (
     'stroke-opacity="0.75"/></svg>')
 
 COLOR_CHOICES = (
-    ('auto', 'Auto (contrast with the surface)'),
+    ('auto', 'Auto (theme: light on dark, dark on light)'),
     (MESH_LINE_DARK, 'Dark'),
     (MESH_LINE_LIGHT, 'Light'),
     ('custom', 'Custom…'),

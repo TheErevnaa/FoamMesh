@@ -1,0 +1,39 @@
+/* -- Plan 44 MF11: the menu popup (mockup .menu / .mi / .mh / .msep) ------ */
+/* The rounded, shadowed panel and the rows are painted by                  */
+/* view/theming/menus.py; these rules give the same sizes to Qt's layout     */
+/* (row 25 px, 30 px gutter) and to any menu that is not a ThemedMenu.      */
+
+QMenu {
+    background: {{background.raised}};
+    color: {{foreground.primary}};
+    border: 1px solid {{border.default}};
+    padding: 4px 0;
+}
+QMenu::item {
+    padding: 4px 12px 4px 30px;
+    min-height: 17px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+QMenu::item:selected { background: {{selection.background}}; color: {{foreground.strong}}; }
+QMenu::item:disabled { color: {{disabled.foreground}}; background: transparent; }
+QMenu::separator { height: 1px; background: {{border.default}}; margin: 4px 0; }
+QMenu::indicator { width: 12px; height: 12px; left: 10px; }
+/* DP-203: an arrow sized on the sheet path with no `image` is drawn as   */
+/* nothing, so a submenu of a plain QMenu showed an empty cell. ThemedMenu */
+/* paints its own chevron and never reaches this rule.                    */
+QMenu::right-arrow {
+    image: url(:/{{icon.ink}}/chevron-forward.svg);
+    width: 10px; height: 10px; margin-right: 6px;
+}
+/* F1 (MF11): the scroll-arrow band of a menu that scrolls inside itself.    */
+/* ThemedMenu paints its own chevrons in this band (menus.py).              */
+QMenu::scroller { height: 12px; background: {{background.raised}}; border: 0; }
+
+QLabel[foammeshMenuHeading="true"] {
+    background: transparent;
+    color: {{foreground.muted}};
+    padding: 7px 12px 3px 12px;
+}
+QLabel[foammeshMenuHeading="true"][foammeshMenuFirst="true"] { padding-top: 4px; }

@@ -128,9 +128,35 @@ class GmshRuntimeProbe:
         key = profile.fingerprint
         if not refresh and key in self._cache:
             return self._cache[key]
-        report = self._probe_uncached(profile)
+        # Plan 41 GN1. The resident session's first answer is the probe: when
+        # one is up there is no second process to start (the cold probe held
+        # the command scheduler for ~32 s after every commit, Plan 40 F6e).
+        from foammesh.core.gmsh.session import session_hello
+        hello = session_hello(profile)
+        if hello is not None:
+            report = self._report_from_payload(profile, hello)
+            self._cache[key] = report
+            return report
+        report = None
+        if self._runner == self._run:
+            report = self._probe_by_session(profile)
+        if report is None:
+            report = self._probe_uncached(profile)
         self._cache[key] = report
         return report
+
+    def _probe_by_session(self, profile):
+        """Probe by starting the resident session (one launch, GN1)."""
+        from foammesh.core.gmsh.session import (
+            GmshSessionCrashed, start_idle_session)
+        try:
+            session = start_idle_session(
+                profile, start_timeout=self.timeout_seconds)
+        except (GmshSessionCrashed, OSError):
+            # Not importable, no distribution, a bad interpreter: the identity
+            # probe still names which of those it is.
+            return None
+        return self._report_from_payload(profile, session.hello)
 
     def _failure(self, profile, category, reason, raw=''):
         return GmshRuntimeReport(
@@ -180,6 +206,10 @@ class GmshRuntimeProbe:
                 profile, category,
                 f'{profile.distribution}: {detail.splitlines()[0][:200]}', raw)
 
+        return self._report_from_payload(profile, payload, raw)
+
+    def _report_from_payload(self, profile, payload, raw=''):
+        """The report for one identity payload (probe process or session)."""
         if payload.get('error'):
             category = GmshFailureCategory(
                 payload.get('category') or GmshFailureCategory.PROBE_FAILED.value)

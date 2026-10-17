@@ -10,7 +10,6 @@ from foammesh.app import app
 from foammesh.view.step_page import StepPage
 from widgets.progress_dialog import ProgressDialog
 
-from .export_dialog import ExportDialog
 from .export_form import (
     EXPORT_OPERATIONS, MESH_FORMATS, extrude_payload, inline_export_page)
 from .export_2D_plane_dialog import Export2DPlaneDialog
@@ -122,49 +121,37 @@ class ExportPage(StepPage):
         """
         step = inline_export_page()
         if step is not None:
+            # UXA7 (#56). Once the mesh is written and nothing has been
+            # changed, the press opens the folder and exports nothing.
+            if step.openFolderMode():
+                step.openFolder()
+                return False
             return bool(await step.runExport())
-        entries, recommended, solver_name = await self._exportFormats()
-        dialog = ExportDialog(self._widget, entries, recommended, solver_name)
-        if not await self._askDialog(dialog):
+        # Plan 43 LY13 (D6). There is no second window: the Export page is
+        # the one place an export is asked for. A press that arrives while
+        # that page is not on screen takes the reader to it, and the export
+        # is then the reader's to start with what the page shows.
+        if not self._showExportPage():
             return False
-        return await self._runExport()
+        step = inline_export_page()
+        if step is None:
+            return False
+        return bool(await step.runExport())
 
-    async def _askDialog(self, dialog) -> bool:
-        """Show a modeless dialog and wait for the user to answer it."""
-        self._dialog = dialog
-        answered = asyncio.get_event_loop().create_future()
-
-        def settle(accepted):
-            if not answered.done():
-                answered.set_result(accepted)
-
-        dialog.accepted.connect(lambda: settle(True))
-        dialog.rejected.connect(lambda: settle(False))
-        dialog.open()
-        accepted = await answered
-        if not accepted:
-            self._ui.menubar.repaint()
-        return accepted
-
-    async def _exportFormats(self):
-        """Ask the facade what this case can be exported as, and to what.
-
-        A failure here is not a reason to refuse to export: the dialog falls
-        back to its historical single-format behaviour, which is the OpenFOAM
-        case it could always write.
-        """
+    def _showExportPage(self) -> bool:
+        """Select the Export task of the workflow so its page is on screen."""
+        window = getattr(app, 'window', None)
+        manager = getattr(window, '_stepManager', None)
+        branch = getattr(getattr(manager, '_methodBranch', None),
+                         'branch', None)
+        view = getattr(manager, '_methodBranch', None)
+        select = getattr(view, 'select', None)
+        if branch is None or select is None:
+            return False
         try:
-            result = await app.facadeClient.run('case.export.entries')
-        except Exception:
-            return (), 'openfoam', ''
-        payload = result.payload or {}
-        entries = tuple(entry for entry in payload.get('entries', ())
-                        if entry.get('entry_id') in self.MESH_FORMATS)
-        solver = str(payload.get('target_solver') or 'unselected')
-        return (entries,
-                str(payload.get('recommended_entry_id') or 'openfoam'),
-                str(payload.get('target_solver_name') or '')
-                if solver != 'unselected' else '')
+            return bool(select('common.export'))
+        except Exception:                                    # noqa: BLE001
+            return False
 
     def _openExport2DPlaneDialog(self):
         self._openExportDialog(Export2DPlaneDialog(self._widget), True)
@@ -238,9 +225,25 @@ class ExportPage(StepPage):
         # gets a home first.
         if not await app.window._requireSavedCase(self.tr('exporting')):
             return False
-        progress = ProgressDialog(self._widget, self.tr('Mesh exporting'))
+        # Plan 39 VI1 (F6b). Cancel asks the case to stop what it is running
+        # (the OpenFOAM utilities of the authored export, a snapshot copy), the
+        # same request every other progress surface makes. A writer that runs in
+        # this process and is already writing finishes its file, and the dialog
+        # then says so rather than claiming a stop that did not happen.
+        progress = ProgressDialog(self._widget, self.tr('Mesh exporting'),
+                                  cancelable=True, autoCloseOnCancel=False,
+                                  onViewport=True)
         progress.setLabelText(self.tr('Preparing…'))
         progress.open()
+        cancelRequested = []
+
+        def _cancelExport():
+            cancelRequested.append(True)
+            progress.setLabelText(self.tr('Cancelling the export…'))
+            self._cancelTask = asyncio.ensure_future(
+                app.facadeClient.cancel_active_jobs())
+
+        progress.cancelClicked.connect(_cancelExport)
         self.lock()
         # C31-12. `clearResult()` schedules its write now, and this one clears
         # the stage *before* the export writes it again, so it is awaited: a
@@ -282,7 +285,11 @@ class ExportPage(StepPage):
             # native result stays inspectable; the pre-write clear above is
             # the only clear this method performs.
             console.appendError(str(error))
-            progress.finish(self.tr('Export failed: {0}').format(error))
+            if cancelRequested:
+                console.appendError(self.tr('Export cancelled.'))
+                progress.finish(self.tr('Export cancelled'))
+            else:
+                progress.finish(self.tr('Export failed: {0}').format(error))
             return False
         finally:
             self.unlock()

@@ -27,9 +27,27 @@ from .dict_format import format_dictionary_file
 from foammesh.core.layer_patterns import (
     PatternError, matching_patches, quoted_key)
 from foammesh.core.quantities import agreeing, count_text
+from foammesh.core.mesh.zone_names import cell_zone_word  # noqa: F401 - CHT2: one rule, re-exported
 from .snappy_controls import (
     BACKGROUND_PATCH_GROUP, BOUNDARY_FACES, DEBUG_FLAGS, WRITE_FLAGS)
 from .target import FoamTarget, DEFAULT_TARGET, mesh_quality_controls
+
+
+#: CHT1. The characters ``word::valid`` refuses (OpenFOAM ``word.H``).
+_NOT_IN_A_WORD = re.compile(r"""[\s"'/;{}]""")
+
+
+def foam_word(name) -> str:
+    """The solid name as OpenFOAM's STL reader keys it: refused characters gone.
+
+    CHT1. A staged solid ``solid Visualization Toolkit generated SLA File``
+    is read by OpenFOAM as region ``VisualizationToolkitgeneratedSLAFile``
+    (MEASURED, DP-486's "valid region" line), but the ``regions`` entry was
+    keyed on the name as FoamMesh read it, four words and three blanks: the
+    dictionary did not parse (``keyword castellatedMeshControls is
+    undefined``). The key is written the way snappy will look it up.
+    """
+    return _NOT_IN_A_WORD.sub('', str(name)) or str(name)
 
 
 _DEFAULT_MESH_QUALITY: dict | None = None
@@ -277,6 +295,12 @@ class CaseBuilder:
         castellation = dict(document.get('castellation', {}) or {})
         if not castellation.get('excludePoints'):
             castellation.pop('excludePoints', None)
+        # Plan 40 UXA2. `defaulted` records that the case was given its
+        # "walls" refinement group once; the mesher never reads it. Hashed,
+        # it made every castellation and snappyHexMesh fingerprint recorded
+        # before UXA2 stale -- a saved case migrates it to true -- and the
+        # walls group being made staled castellation a second time.
+        castellation.pop('defaulted', None)
         payloads = {
             'blockMesh': {
                 'baseGrid': document.get('baseGrid', {}),
@@ -532,7 +556,8 @@ class CaseBuilder:
                 if stored is not None and str(stored).strip() != '':
                     return float(stored)
                 from foammesh.core.mesh.sizing import auto_target_cell_size
-                return auto_target_cell_size(tuple(bounds))
+                return auto_target_cell_size(
+                    tuple(bounds), self._size_divisor())
             counts = (self._int('baseGrid/numCellsX', 10),
                       self._int('baseGrid/numCellsY', 10),
                       self._int('baseGrid/numCellsZ', 10))
@@ -1060,22 +1085,26 @@ class CaseBuilder:
             if refinement is not None:
                 angles.append(float(
                     self._item_value(refinement, 'includedAngle', 150.0)))
+        # Plan 40 UXA2. A surface no group names is extracted at the
+        # project feature angle, not at a number of its own.
+        from foammesh.core.facade.feature_angle import included_angle
+        fallback = included_angle(self._v('mesh/featureAngle', 30.0))
         if not angles and not surface.get('groups'):
             angles = [
-                float(self._item_value(item, 'includedAngle', 150.0))
+                float(self._item_value(item, 'includedAngle', fallback))
                 for item in self._elements(
                     'castellation/refinementSurfaces').values()]
             # Legacy DB-only cases have one combined surface with no stable
             # group map. Keep their historical inclusive policy; prepared
             # geometry never takes this compatibility branch.
-            return max(angles) if angles else 150.0
+            return max(angles) if angles else fallback
         unique = sorted(set(angles))
         if len(unique) > 1:
             raise ValueError(
                 f'Foundation 13 surfaceFeatures applies one includedAngle per '
                 f'surface file; split {surface["file"]} into per-group sources '
                 f'or use one angle (configured: {unique})')
-        return unique[0] if unique else 150.0
+        return unique[0] if unique else fallback
 
     def _surface_feature_level(self, surface: dict) -> int:
         bindings = self._group_geometry_bindings()
@@ -1135,6 +1164,15 @@ class CaseBuilder:
                 self._int('baseGrid/numCellsY', 10),
                 self._int('baseGrid/numCellsZ', 10))
 
+    def _size_divisor(self) -> float:
+        """Plan 40 UXA1: the divisor the Mesh size choice gives an Auto cell."""
+        from foammesh.core.sizing import diagonal_divisor
+
+        try:
+            return diagonal_divisor(self._v('mesh/sizePreset'))
+        except Exception:                                   # noqa: BLE001
+            return diagonal_divisor(None)
+
     def _auto_target_cell_size(self, b) -> float:
         """The base cell an unset ("Auto") target size stands for (DP-669).
 
@@ -1142,12 +1180,11 @@ class CaseBuilder:
         follows (DP-614), and said with the number so the manifest shows what
         "Auto" came to.
         """
-        from foammesh.core.mesh.sizing import (
-            AUTO_CELL_DIAGONAL_DIVISOR, auto_target_cell_size,
-        )
+        from foammesh.core.mesh.sizing import auto_target_cell_size
 
+        divisor = self._size_divisor()
         size = auto_target_cell_size(
-            (b.xmin, b.xmax, b.ymin, b.ymax, b.zmin, b.zmax))
+            (b.xmin, b.xmax, b.ymin, b.ymax, b.zmin, b.zmax), divisor)
         if size is None:
             raise ValueError(
                 'base-grid target cell size is Auto, and the background '
@@ -1156,7 +1193,7 @@ class CaseBuilder:
         self.warn(
             'base_grid.target_cell_size.auto',
             f'target cell size {size:.4g} m derived from the background '
-            f'block diagonal (/ {AUTO_CELL_DIAGONAL_DIVISOR:g}); type a size '
+            f'block diagonal (/ {divisor:g}); type a size '
             f'to override it',
             field_id='meshing.base_grid.target_cell_size',
             requested='Auto', applied=size, severity='info')
@@ -2177,6 +2214,150 @@ class CaseBuilder:
         restored = getattr(self, '_restored_fluid_seed', None)
         return () if restored is None else (tuple(restored),)
 
+    def _seed_names(self) -> list[str]:
+        """What to call each `_fluid_seeds` point in a warning."""
+        try:
+            regions = list(self.db.getElements('region').items())
+        except Exception:  # noqa: BLE001 - no regions: the import's seed
+            regions = []
+        names = []
+        for key, region in regions:
+            try:
+                name = region.value('name')
+            except Exception:  # noqa: BLE001 - a row without a name
+                name = None
+            names.append(str(name) if name else f'region {key}')
+        return names
+
+    #: DP-2639. Staged surfaces read once per file revision.
+    _staged_surface_cache: dict = {}
+
+    def _staged_surfaces(self) -> list:
+        """The staged triSurface files as polydata, for `_surface_room`."""
+        if not self.case_dir:
+            return []
+        folder = Path(self.case_dir) / 'constant' / 'triSurface'
+        found = []
+        for surface in self.surfaces:
+            path = folder / str(surface.get('file') or '')
+            if path.suffix.lower() != '.stl':
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            key = (str(path), stat.st_mtime_ns, stat.st_size)
+            polydata = CaseBuilder._staged_surface_cache.get(key)
+            if polydata is None:
+                try:
+                    from vtkmodules.vtkIOGeometry import vtkSTLReader
+
+                    reader = vtkSTLReader()
+                    reader.SetFileName(str(path))
+                    reader.Update()
+                    polydata = reader.GetOutput()
+                except Exception:  # noqa: BLE001 - an unreadable file is
+                    continue       # no room measured, not a failed write
+                CaseBuilder._staged_surface_cache[key] = polydata
+            if polydata is not None and polydata.GetNumberOfPoints():
+                found.append(polydata)
+        return found
+
+    @staticmethod
+    def _surface_room(point, surfaces) -> float | None:
+        """Distance from *point* to the nearest staged surface, or ``None``."""
+        if not surfaces:
+            return None
+        from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+
+        nearest = math.inf
+        for polydata in surfaces:
+            implicit = vtkImplicitPolyDataDistance()
+            implicit.SetInput(polydata)
+            nearest = min(nearest, abs(float(implicit.EvaluateFunction(
+                tuple(float(value) for value in point)))))
+        return nearest if math.isfinite(nearest) else None
+
+    #: DP-2639. How a `NUDGE_FRACTIONS` share is said.
+    _NUDGE_SHARES = {1: 'a third', 10: 'a thirtieth', 100: 'a three-hundredth'}
+
+    def _seeds_off_faces(self, seeds) -> tuple:
+        """DP-2639. Every seed on a face of the mesh, moved a sliver off it.
+
+        snappy finds the cell holding each ``insidePoint``; on a blockMesh
+        face (or one castellation adds) it finds two or none, and stops with
+        "Point ... is not inside the mesh or on a face or edge". Such a seed
+        is moved by `face_clearance.nudge_seed` -- a third of the finest cell,
+        or a thirtieth or a three-hundredth near a wall -- and only when the
+        move is shorter than half its distance to the nearest staged surface,
+        so it cannot cross into another space. What is written is recorded
+        (``region.seed.nudged``, requested and applied side by side); a seed
+        that cannot be moved provably is written as typed and said
+        (``region.seed.on_face``).
+        """
+        if not seeds:
+            return seeds
+        try:
+            from foammesh.core.mesh.face_clearance import (
+                MIN_CLEARANCE, grid_from_topology, max_refinement_level,
+                nudge_seed, seed_face_clearance,
+            )
+            grid = grid_from_topology(self.background_topology())
+            level = max_refinement_level(self.db) if grid is not None else 0
+        except Exception:  # noqa: BLE001 - no grid: no face to be on
+            return seeds
+        if grid is None:
+            return seeds
+        names = self._seed_names()
+        surfaces = None
+        written = []
+        for index, seed in enumerate(seeds):
+            try:
+                point = tuple(float(value) for value in seed)
+                clearance = seed_face_clearance(point, grid, level)
+            except Exception:  # noqa: BLE001 - an unreadable seed is kept
+                clearance = None
+            if clearance is None or clearance.relative >= MIN_CLEARANCE:
+                written.append(seed)
+                continue
+            if surfaces is None:
+                surfaces = self._staged_surfaces()
+            room = self._surface_room(point, surfaces)
+            nudge = nudge_seed(point, grid, level, room)
+            name = names[index] if index < len(names) else f'seed {index + 1}'
+            axis = 'xyz'[clearance.axis]
+            where = (f'{clearance.relative:.3g} of a {clearance.cell:.4g} m '
+                     f'cell from a face along {axis}')
+            typed = [float(value) for value in point]
+            if nudge is None or not nudge.fraction:
+                why = ('there is no staged surface to measure its room '
+                       'against' if room is None else
+                       f'it is {room:.3g} m from a wall, too near to move '
+                       'it provably within its own space')
+                self.warn(
+                    'region.seed.on_face',
+                    f'{name} seed lies on a face of the mesh ({where}) and '
+                    f'was written as typed: {why}. snappy may not find the '
+                    'cell it is in. Move the seed off the face on the '
+                    'Domain & regions page.',
+                    field_id='regions.items', requested=typed,
+                    applied=typed)
+                written.append(seed)
+                continue
+            ratio = round((1.0 / 3.0) / nudge.fraction)
+            share = self._NUDGE_SHARES.get(ratio, f'{nudge.fraction:.3g}')
+            self.warn(
+                'region.seed.nudged',
+                f'{name} seed lay on a face of the mesh ({where}), where '
+                'snappy finds no cell for it. It is written '
+                f'{nudge.distance:.3g} m off the face ({share} of the finest '
+                f'cell), well inside the {room:.3g} m between the seed and '
+                'the nearest surface, so it is still in the same space.',
+                field_id='regions.items', requested=typed,
+                applied=[float(value) for value in nudge.moved])
+            written.append(tuple(nudge.moved))
+        return tuple(written)
+
     def _fluid_seed(self):
         """The first material point, for the single-valued manifest record.
 
@@ -2263,7 +2444,7 @@ class CaseBuilder:
                 f'{name!r} is not a valid OpenFOAM cell zone name; a zone '
                 f'name is a word, so it may not contain spaces or '
                 f'punctuation other than _ and .')
-        return name
+        return cell_zone_word(name)     # CHT1: a digit-led name, made a word
 
     def _carved_by_an_interface(self, volume_id) -> bool:
         """Does a surface typed ``interface`` hang off this volume?
@@ -2428,7 +2609,7 @@ class CaseBuilder:
                 # `wall_shell` beside it.
                 for region in (group.get('source_regions') or
                                (group['source_region'],)):
-                    group_entries[region] = dict(entry)
+                    group_entries[foam_word(region)] = dict(entry)
             if len(group_entries) == 1:
                 result[surface['name']] = next(iter(group_entries.values()))
             else:
@@ -2727,6 +2908,18 @@ class CaseBuilder:
             point = self._item_element(refinement, 'zoneInsidePoint')
             coordinates = [float(self._item_value(point, axis, 0.0))
                            for axis in ('x', 'y', 'z')]
+            # LY13-D1 (DP-2374). The point starts at (0 0 0); writing that for
+            # a seed nobody placed put the zone on the wrong side without a
+            # word. A coordinate that was given, or a non-zero one an older
+            # project holds, is a point; nothing else is.
+            if not (bool(self._item_value(
+                    refinement, 'zoneInsidePointSet', False))
+                    or any(coordinates)):
+                raise ValueError(
+                    f'{group["solver_name"]} selects its cell zone by a '
+                    f'point and has no point; a cell zone selected by a '
+                    f'point needs the point. Give a coordinate inside the '
+                    f'region you want')
             if not all(math.isfinite(value) for value in coordinates):
                 raise ValueError(
                     f'the inside point for {group["solver_name"]} is not a '
@@ -3164,6 +3357,29 @@ class CaseBuilder:
             return None
         return width if width > 0 else None
 
+    def _cylinder_bore(self, geometry) -> float:
+        """The cylinder's Inner R (0 = solid or a row from before LY13)."""
+        try:
+            return float(self._item_value(geometry, 'innerRadius', 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _annulus_entry(self, name, geometry, p1, p2) -> dict:
+        from foammesh.core.geometry.annulus import annulus_triangles, stl_text
+
+        triangles = annulus_triangles(
+            p1, p2, float(self._item_value(geometry, 'radius', 1.0)),
+            self._cylinder_bore(geometry))
+        file_name = f'{name}_annulus.stl'
+        if self.case_dir:
+            folder = Path(self.case_dir) / 'constant' / 'triSurface'
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / file_name
+            temporary = target.with_suffix('.stl.tmp')
+            temporary.write_text(stl_text(name, triangles), encoding='utf-8')
+            os.replace(temporary, target)
+        return {'type': 'triSurface', 'file': f'"{file_name}"'}
+
     def _geometry_dictionary(self) -> dict:
         data: dict[str, dict] = {}
         surface_type = self._tri_surface_type()
@@ -3184,7 +3400,7 @@ class CaseBuilder:
                 # named -- `surface_<uuid>_wall_bore`, 1,080 faces, beside the
                 # `wall` that was supposed to contain it.
                 entry['regions'] = {
-                    region: {'name': group['solver_name']}
+                    foam_word(region): {'name': group['solver_name']}
                     for group in groups
                     for region in (group.get('source_regions') or
                                    (group['source_region'],))
@@ -3254,6 +3470,11 @@ class CaseBuilder:
                     'centre': p1,
                     'radius': self._item_value(geometry, 'radius', 1.0),
                 }
+            elif (shape == 'cylinder' and p1 is not None
+                  and self._cylinder_bore(geometry) > 0):
+                # LY13-D3 (A-088a). searchableCylinder is solid-only, so a
+                # hollow cylinder is a closed tessellation staged as a STL.
+                data[name] = self._annulus_entry(name, geometry, p1, p2)
             elif shape == 'cylinder' and p1 is not None:
                 data[name] = {
                     'type': 'searchableCylinder',
@@ -3629,25 +3850,31 @@ class CaseBuilder:
         FatalError inside snappyHexMesh is a failed stage with the reason in a
         log, so the same rule is enforced here where the user can still fix it.
         """
-        rows: list[tuple[float, int]] = []
-        try:
-            elements = refinement.elements('bands')
-        except Exception:
-            elements = {}
-        def order(item):
-            # ``IntKeyList`` hands back stringified integers, and "10" sorts
-            # before "2" as text -- which would silently reorder a ramp.
-            try:
-                return (0, int(str(item)), '')
-            except (TypeError, ValueError):
-                return (1, 0, str(item))
-
-        for key in sorted(elements, key=order):
-            band = elements[key]
-            rows.append((float(self._item_value(band, 'distance', 0.0)),
-                         int(self._item_value(band, 'level', 0))))
+        # DP-2210. ``castellation/volumeBands`` is the one store the guided
+        # editor shows and edits, so it is read first; the nested ``bands`` of
+        # a project that was never migrated (a volume with no group name) only
+        # stands in for a group with no live rows.
+        rows: list[tuple[float, int]] = self._volume_band_ramp(
+            refinement, name, mode)
         if not rows:
-            rows = self._volume_band_ramp(refinement, name, mode)  # DP-586
+            try:
+                elements = refinement.elements('bands')
+            except Exception:
+                elements = {}
+
+            def order(item):
+                # ``IntKeyList`` hands back stringified integers, and "10"
+                # sorts before "2" as text -- which would silently reorder a
+                # ramp.
+                try:
+                    return (0, int(str(item)), '')
+                except (TypeError, ValueError):
+                    return (1, 0, str(item))
+
+            for key in sorted(elements, key=order):
+                band = elements[key]
+                rows.append((float(self._item_value(band, 'distance', 0.0)),
+                             int(self._item_value(band, 'level', 0))))
         if not rows:
             rows = [(float(self._item_value(refinement, 'distance', 1.0)),
                      int(self._item_value(
@@ -3873,7 +4100,7 @@ class CaseBuilder:
         # F-06. One seed is written singular, several are written as the
         # ``List<point>`` v13 reads; nothing is dropped and nothing is warned
         # about, because Foundation 13 keeps every region the list names.
-        seeds = self._fluid_seeds()
+        seeds = self._seeds_off_faces(self._fluid_seeds())
         # F-18. ``refinementParameters.C`` reads ``insidePoints`` first, then
         # ``insidePoint``, then ``locationInMesh`` -- the last is the
         # backwards-compatible fallback the annotated dictionary no longer

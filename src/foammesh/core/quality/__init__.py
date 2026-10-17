@@ -11,6 +11,7 @@ from .layer_report import (
 from .failed_cells import (
     parse_set_ids, read_set_file, set_entity_kind,
     discover_cell_set_files, discover_set_details, extract_selected_cells,
+    sets_of_this_mesh,
     discover_check_surfaces, face_owner_cells,
 )
 from .checkmesh_service import (
@@ -21,7 +22,8 @@ from .policy import (
     AcceptanceLimits, DEFAULT_POLICY, QualityPolicy, QualityPolicyError,
 )
 from .verdict import (apply_layer_coverage, apply_waivers,
-                      layer_shortfall_line, verdict_from_report)
+                      layer_shortfall_line, verdict_from_report,
+                      verdict_with_gate)
 
 __all__ = [
     'CheckMeshResult', 'parse_checkmesh',
@@ -29,12 +31,12 @@ __all__ = [
     'readiness_verdict',
     'NO_LAYERS_MARKER', 'LayerReport', 'PatchLayerCoverage', 'parse_layer_log',
     'parse_set_ids', 'read_set_file', 'set_entity_kind',
-    'discover_cell_set_files', 'extract_selected_cells',
+    'discover_cell_set_files', 'extract_selected_cells', 'sets_of_this_mesh',
     'discover_set_details', 'discover_check_surfaces', 'face_owner_cells',
     'CheckMeshProfile', 'CheckMeshRequest', 'MeshCheckRun', 'MeshCheckService',
     'QualityReport', 'checkmesh_command', 'checkmesh_flags',
     'checkmesh_request',
-    'verdict_from_report', 'apply_waivers',
+    'verdict_from_report', 'verdict_with_gate', 'apply_waivers',
     'apply_layer_coverage', 'layer_shortfall_line',
     'AcceptanceLimits', 'DEFAULT_POLICY', 'QualityPolicy',
     'QualityPolicyError',

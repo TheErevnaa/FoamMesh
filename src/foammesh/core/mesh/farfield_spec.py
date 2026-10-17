@@ -354,6 +354,36 @@ def support(spec: FarfieldSpec, engine: str, geometry_kind: str = CAD) -> Suppor
     return Support(engine, True, '')
 
 
+def engine_refusal(db, engine: str, entries=()) -> str | None:
+    """Why *engine* cannot build the case's farfield intent, or ``None``.
+
+    SG22b. The farfield is authored on Geometry before an engine is chosen;
+    what one engine cannot build is said where the engine is chosen
+    (``mesh.engine.select``, dry run included), the way DP-638 says it for
+    mixed sources. *entries* are the geometry store's records: with no CAD
+    entry among them the import is tessellated, and Gmsh has no solid to
+    cut the farfield out of. An engine with no adapter, or a spec the
+    dialog would already refuse, is not this function's to refuse.
+    """
+    spec = read(db)
+    if not spec.enabled or spec.problems():
+        return None
+    engine = str(engine or '').strip().lower()
+    if engine not in _ENGINES:
+        return None
+    from foammesh.core.geometry.store import is_cad_entry
+
+    entries = list(entries or ())
+    kind = (CAD if not entries or any(is_cad_entry(e) for e in entries)
+            else TESSELLATED)
+    answer = support(spec, engine, kind)
+    if answer.supported:
+        return None
+    return (f'{answer.reason[:1].upper()}{answer.reason[1:]}. Switch the '
+            'farfield off on Geometry, import the geometry as STEP or IGES, '
+            'or choose snappyHexMesh, which takes either.')
+
+
 def on_engine_switch(spec: FarfieldSpec, engine: str,
                      geometry_kind: str = CAD) -> dict:
     """What an engine switch does to the farfield: nothing, and it says so.

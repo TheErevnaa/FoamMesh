@@ -22,6 +22,20 @@ How, so that nothing heavy runs on the GUI thread:
   that input's modification time. A clip, a slice, a threshold or a reload
   changes the input, the copy is stale, and the part is drawn in full until a
   new copy is ready -- a drag never shows a cut that is not there (DP-814).
+* **A clip does not cost the copy (Plan 39 VI3, DP-1270).** The copy follows
+  the part's mapper clipping planes, so a half-space clip leaves it current
+  and it is drawn clipped. A cut that changes the part's input (a filter)
+  keeps the copy of the input it replaced, hidden, beside the new one
+  (at most :data:`VARIANTS_KEPT` per part, matched by address and
+  modification time so the old output is not kept alive), so taking
+  the cut off brings the copy back without making it again.
+* **Engaged on frame time, not only on faces (VI3, DP-1270).** The view tells
+  :meth:`InteractionDetail.noteFrame` how long each full-detail frame took
+  (the view waits for the GPU to finish the frame; MEASURED, the renderer's own
+  ``GetLastRenderTimeInSeconds`` reads 1 ms for a frame that took 32 ms). When
+  the last three averaged
+  more than :data:`FRAME_BUDGET_SECONDS` the scene wants its copies, whatever
+  its face count; they are made once idle, as before.
 * **Said on screen.** The view emits ``detailReduced(True)`` when it swaps.
 
 ``vtkQuadricLODActor`` (``MeshActor``) built its copy on the GUI thread on
@@ -33,6 +47,7 @@ No Qt here; ``RenderingWidget`` owns the timing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import logging
 import math
 
@@ -43,6 +58,13 @@ logger = logging.getLogger(__name__)
 MIN_PART_CELLS = 50_000
 #: The most clustering divisions along one axis.
 MAX_DIVISIONS = 2048
+#: A full-detail frame slower than this (33 ms, 30 fps) is a stuttering one.
+FRAME_BUDGET_SECONDS = 0.033
+#: How many full-detail frames are averaged to decide a scene is too slow.
+FRAMES_AVERAGED = 3
+#: Copies kept per part: the one for what it shows now and the one for what it
+#: showed before a cut, so taking the cut off needs no new copy.
+VARIANTS_KEPT = 2
 #: The object name the reduced copies carry; ``gl_health.visible_faces`` and
 #: pickers see them only while they are shown.
 LOD_SUFFIX = ':interaction-detail'
@@ -57,6 +79,13 @@ def _cells(data) -> int:
             return int(data.GetNumberOfCells())
         except Exception:                                  # noqa: BLE001
             return 0
+
+
+def _address(data) -> str:
+    try:
+        return str(data.__this__)
+    except Exception:                                      # noqa: BLE001
+        return str(id(data))
 
 
 def _polydata_input(actor):
@@ -171,11 +200,14 @@ class Job:
 
 
 class _Record:
-    __slots__ = ('actor', 'data', 'mtime', 'lod', 'hidden')
+    __slots__ = ('actor', 'key', 'mtime', 'lod', 'hidden')
 
     def __init__(self, actor, data, mtime, lod):
         self.actor = actor
-        self.data = data
+        #: Which data object it was made from, by address: a cut's old output
+        #: is not kept alive by its copy. A freed address can only come back
+        #: with a newer modification time, so the pair never matches wrongly.
+        self.key = _address(data)
         self.mtime = mtime
         self.lod = lod
         self.hidden = False
@@ -188,9 +220,12 @@ class InteractionDetail:
         self._renderer = renderer
         #: A callable returning the ``DisplayBudget`` in force.
         self._budget = budget
-        self._records: dict[int, _Record] = {}
+        #: Per part (by ``id(actor)``): its copies, newest last.
+        self._records: dict[int, list[_Record]] = {}
         self._lods: set[int] = set()
         self._active = False
+        #: Seconds of the last full-detail frames (copies not drawn).
+        self._frames: deque = deque(maxlen=FRAMES_AVERAGED)
         #: "Reduce detail while moving" on: copies for every large part,
         #: whatever the scene's size.
         self.forced = False
@@ -230,21 +265,90 @@ class InteractionDetail:
     def sceneCells(self) -> int:
         return sum(cells for _, _, cells in self.parts())
 
+    # -- frame time -------------------------------------------------------
+
+    def noteFrame(self, seconds: float) -> None:
+        """Record how long a frame took to draw (Plan 39 VI3).
+
+        Only full-detail frames count: a frame drawn from the copies says
+        nothing about what the full part costs, and counting it would switch
+        the copies off the moment they worked.
+        """
+        if self._active:
+            return
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if seconds > 0.0 and math.isfinite(seconds):
+            self._frames.append(seconds)
+
+    def frameSeconds(self):
+        """The mean of the last full-detail frames, or None before three."""
+        if len(self._frames) < FRAMES_AVERAGED:
+            return None
+        return sum(self._frames) / len(self._frames)
+
+    def worthTiming(self) -> bool:
+        """True when the scene is big enough that reducing it could help.
+
+        Timing a frame means waiting for the GPU to finish it, so a scene
+        smaller than the copy would be is not timed at all.
+        """
+        return self.sceneCells() > self.budget().lod_target_triangles
+
+    def slow(self) -> bool:
+        """True when the last three full-detail frames averaged over 33 ms."""
+        mean = self.frameSeconds()
+        return mean is not None and mean > FRAME_BUDGET_SECONDS
+
     def wanted(self) -> bool:
-        """True when a drag of this scene should draw reduced copies."""
+        """True when a drag of this scene should draw reduced copies.
+
+        Faces over the GPU's budget, or "Reduce detail while moving", or --
+        the case a face count cannot see -- frames that took too long. A scene
+        no bigger than the copy would be is never reduced.
+        """
         cells = self.sceneCells()
         if cells <= 0:
             return False
+        target = self.budget().lod_target_triangles
         if self.forced:
-            return cells > self.budget().lod_target_triangles
-        return cells > self.budget().interactive_lod_faces
+            return cells > target
+        if cells > self.budget().interactive_lod_faces:
+            return True
+        return cells > target and self.slow()
 
-    def _current(self, record: _Record) -> bool:
+    def _isCurrent(self, record: _Record, actor=None) -> bool:
+        """The copy matches the part's input now."""
         try:
-            data = _polydata_input(record.actor)
-            return data is record.data and int(data.GetMTime()) == record.mtime
+            data = _polydata_input(record.actor if actor is None else actor)
+            return (data is not None and _address(data) == record.key
+                    and int(data.GetMTime()) == record.mtime)
         except Exception:                                  # noqa: BLE001
             return False
+
+    def _stale(self, record: _Record) -> bool:
+        """The input it was made from is still shown, but has changed."""
+        try:
+            data = _polydata_input(record.actor)
+            return (data is not None and _address(data) == record.key
+                    and int(data.GetMTime()) != record.mtime)
+        except Exception:                                  # noqa: BLE001
+            return True
+
+    def _current(self, record: _Record) -> bool:
+        return self._isCurrent(record, record.actor)
+
+    def _currentFor(self, actor):
+        for record in reversed(self._records.get(id(actor), ())):
+            if self._current(record):
+                return record
+        return None
+
+    def _all(self):
+        for records in self._records.values():
+            yield from records
 
     def jobs(self) -> list[Job]:
         """The copies this scene still lacks, sized to share the budget."""
@@ -259,8 +363,7 @@ class InteractionDetail:
             share = max(1, int(target * cells / total))
             if cells < MIN_PART_CELLS or cells < 2 * share:
                 continue
-            record = self._records.get(id(actor))
-            if record is not None and self._current(record):
+            if self._currentFor(actor) is not None:
                 continue
             if _colours_by_points(actor.GetMapper(), data):
                 continue
@@ -283,8 +386,9 @@ class InteractionDetail:
         if _polydata_input(actor) is not job.data or \
                 int(job.data.GetMTime()) != job.mtime:
             return False
-        old = self._records.pop(id(actor), None)
-        if old is not None:
+        records = self._records.setdefault(id(actor), [])
+        for old in [r for r in records if r.key == _address(job.data)]:
+            records.remove(old)
             self._drop(old)
         mapper = vtkPolyDataMapper()
         mapper.SetInputData(reduced)
@@ -304,7 +408,14 @@ class InteractionDetail:
             pass
         self._renderer.AddActor(lod)
         self._lods.add(id(lod))
-        self._records[id(actor)] = _Record(actor, job.data, job.mtime, lod)
+        records.append(_Record(actor, job.data, job.mtime, lod))
+        # Keep the newest few; a copy being drawn is never the one to go.
+        while len(records) > VARIANTS_KEPT:
+            victim = next((r for r in records if not r.hidden), None)
+            if victim is None:
+                break
+            records.remove(victim)
+            self._drop(victim)
         return True
 
     def _drop(self, record: _Record) -> None:
@@ -317,22 +428,33 @@ class InteractionDetail:
             pass
 
     def prune(self) -> None:
-        """Forget copies whose part left the scene or changed."""
-        for key, record in list(self._records.items()):
-            if record.hidden:
-                continue
-            if not self._renderer.HasViewProp(record.actor) or \
-                    not self._current(record):
-                self._drop(self._records.pop(key))
+        """Forget copies whose part left the scene or whose input changed.
+
+        A copy of an input the part no longer shows stays while that input is
+        alive and unchanged (a cut that was taken off brings it back).
+        """
+        for key, records in list(self._records.items()):
+            for record in list(records):
+                if record.hidden:
+                    continue
+                if not self._renderer.HasViewProp(record.actor) or \
+                        self._stale(record):
+                    records.remove(record)
+                    self._drop(record)
+            if not records:
+                del self._records[key]
 
     def clear(self) -> None:
         self.end()
-        for record in self._records.values():
+        for record in list(self._all()):
             self._drop(record)
         self._records.clear()
+        self._frames.clear()
 
     def ready(self) -> int:
-        return sum(1 for r in self._records.values() if self._current(r))
+        """Parts that have a copy matching what they show now."""
+        return sum(1 for records in self._records.values()
+                   if any(self._current(r) for r in records))
 
     # -- the swap ---------------------------------------------------------
 
@@ -343,14 +465,17 @@ class InteractionDetail:
         part is drawn in full.
         """
         if self._active:
-            return sum(1 for r in self._records.values() if r.hidden)
+            return sum(1 for r in self._all() if r.hidden)
         if not self.wanted():
             return 0
         swapped = 0
-        for record in self._records.values():
+        for key in list(self._records):
+            record = self._currentFor(self._records[key][0].actor)
+            if record is None:
+                continue
             actor = record.actor
             try:
-                if not actor.GetVisibility() or not self._current(record):
+                if not actor.GetVisibility():
                     continue
                 _followMapper(record.lod.GetMapper(), actor.GetMapper())
                 record.lod.SetUserMatrix(actor.GetUserMatrix())
@@ -371,7 +496,7 @@ class InteractionDetail:
         """Every part back in full; True if anything was swapped."""
         if not self._active:
             return False
-        for record in self._records.values():
+        for record in self._all():
             if record.hidden:
                 record.lod.SetVisibility(False)
                 record.actor.SetVisibility(True)
@@ -382,12 +507,35 @@ class InteractionDetail:
     def active(self) -> bool:
         return self._active
 
+    def standIn(self, actor):
+        """The reduced copy drawn in place of ``actor`` right now, or None.
+
+        Plan 39 VI14c. A section plane dragged while the copies stand in is
+        applied to these and not to the full parts, whose mappers would
+        otherwise be modified (every buffer of a multi-million-face part
+        rebuilt on the next full frame) for a picture nobody sees.
+        """
+        for record in self._all():
+            if record.hidden and record.actor is actor:
+                return record.lod
+        return None
+
     def isCopy(self, actor) -> bool:
         return id(actor) in self._lods
 
 
 def _followMapper(lod, source) -> None:
     """Colour the copy the way the part is coloured now."""
+    # A mapper clipping plane is a clip that costs the part nothing and
+    # leaves its input alone, so the copy is clipped by the same planes.
+    try:
+        planes = source.GetClippingPlanes()
+        lod.RemoveAllClippingPlanes()
+        if planes is not None:
+            for index in range(planes.GetNumberOfItems()):
+                lod.AddClippingPlane(planes.GetItemAsObject(index))
+    except Exception:                                      # noqa: BLE001
+        logger.debug('interaction detail clip follow failed', exc_info=True)
     try:
         lod.SetScalarVisibility(source.GetScalarVisibility())
         lod.SetScalarMode(source.GetScalarMode())
@@ -415,5 +563,6 @@ def _followMapper(lod, source) -> None:
         logger.debug('interaction detail offset follow failed', exc_info=True)
 
 
-__all__ = ['InteractionDetail', 'Job', 'LOD_SUFFIX', 'MIN_PART_CELLS',
+__all__ = ['FRAME_BUDGET_SECONDS', 'FRAMES_AVERAGED', 'InteractionDetail',
+           'Job', 'LOD_SUFFIX', 'MIN_PART_CELLS', 'VARIANTS_KEPT',
            'divisions_for', 'reduce', 'shared_view']

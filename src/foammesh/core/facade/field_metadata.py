@@ -117,6 +117,12 @@ def stales(*fingerprints: str) -> tuple[str, ...]:
     return expand_fingerprints(fingerprints)
 
 
+#: Plan 40 UXD9 (#38) moved five `snappyGeometry` leaves -- the intersection
+#: tolerance, the octree depth, the triangle quality floor and the gap
+#: closure -- onto the Castellation page, because castellation's surface
+#: intersection is what reads them. What they stale follows the page.
+CASTELLATION_SURFACE_SEARCH = stales('mesh.castellated', 'quality', 'exports')
+
 # Fallback when a field's group is not listed below. An unclassified field is
 # assumed to reach the mesher, so it stales from the first stage onwards.
 DEFAULT_INVALIDATION = stales('mesh.base_grid', 'quality')
@@ -139,6 +145,15 @@ GROUP_METADATA: dict[str, dict] = {
         # and the table stales the rest.
         'invalidates': stales('engine_plan', 'mesh.base_grid', 'quality'),
         'ui_location': 'preferences.execution',
+    },
+    'sizeField': {
+        # Plan 41 GN25b. These shape the size field only. Editing one makes
+        # the saved field stale (its Reuse key changes) but touches no mesh:
+        # the sizes reach a control only when the user applies a proposal.
+        # The one thing a change does stale is the engine plan summary.
+        'invalidates': stales('engine_plan'),
+        'ui_location': 'workflow.automatic_sizing',
+        'units': {'minimum_size': 'm', 'maximum_size': 'm', 'bulk_size': 'm'},
     },
     'geometryPreparation': {
         'invalidates': (),
@@ -235,8 +250,9 @@ GROUP_METADATA: dict[str, dict] = {
         'invalidates': stales('mesh', 'quality', 'exports'),
         'ui_location': 'workflow.gmsh.describe_geometry',
         # Plan 37 UF14: snappyHexMesh reads the same record as its outer
-        # boundary, so the one engine that ignores it is none at all.
-        'applies_when': ('mesh.engine != unselected',),
+        # boundary. SG22b: the record is authored on Geometry before an
+        # engine is chosen, so it applies whatever the engine is (or none);
+        # an engine that cannot build it says so at selection.
         'units': {'padding': 'diagonals', 'radius': 'm', 'length': 'm'},
     },
     'gmsh/parallel': {
@@ -302,9 +318,12 @@ GROUP_METADATA: dict[str, dict] = {
         # both orders. So the control is live exactly where no exporter has
         # a say -- which is the opposite of what the old clause said, and the
         # old clause greyed the spin box out on the only route that works.
-        'applies_when': ('mesh.engine == gmsh',
-                         'mesh.target_solver != openfoam',
-                         'mesh.target_solver != su2'),
+        #
+        # Plan 41 GN2 (DP-1396, G2). The clause is gone altogether: the mesher
+        # makes the order the user chooses whatever the target, and the export
+        # that cannot take it declines it at the export, with the reason
+        # (plan_derivation.export_refusals).
+        'applies_when': ('mesh.engine == gmsh',),
         # DP-204. The element order is 1 or 2 and order is not a
         # dimension, so the number stands on its own.
     },
@@ -340,6 +359,8 @@ GROUP_METADATA: dict[str, dict] = {
         'invalidates': stales('engine_plan', 'mesh.base_grid', 'quality',
                               'exports'),
         'ui_location': 'workflow.geometry.interfaces',
+        # Plan 40 UXB1 (#34). A match tolerance is a distance.
+        'units': {'match_tolerance': 'm'},
     },
     'region': {
         'invalidates': stales('mesh.base_grid', 'quality'),
@@ -445,7 +466,9 @@ GROUP_METADATA: dict[str, dict] = {
         'invalidates_by_engine': {
             'snappy': stales('mesh.snapped', 'quality'),
         },
-        'ui_location': 'workflow.quality',
+        # Plan 40 UXD9. Edited on Snap, the first stage that is reverted
+        # against them; the relaxed copies on Layers (below).
+        'ui_location': 'workflow.snap',
         # DP-170. Two of these are angles and two are not. OpenFOAM 13
         # says so itself: `src/meshCheck/checkMesh.C` reads maxNonOrtho
         # and maxConcave with `unitDegrees` and every other limit as a
@@ -479,6 +502,11 @@ GROUP_METADATA: dict[str, dict] = {
                   'max_feature_proximity': 'm'},
     },
 }
+
+# Plan 40 UXD9. The relaxed limits are read only while layers are added, so
+# they are edited on Layers. The longest prefix wins in `_group_metadata`.
+GROUP_METADATA['meshQuality/relaxed'] = {
+    **GROUP_METADATA['meshQuality'], 'ui_location': 'workflow.layers'}
 
 
 # Per-field overrides keyed by semantic field ID. Any FieldDescriptor attribute
@@ -541,7 +569,15 @@ FIELD_OVERRIDES: dict[str, dict] = {
             'relaxed block alone, so empty means no flatness check in the '
             'relaxed phase. Between 0 and 1.'),
     },
-    'quality.thresholds.n_smooth_scale': {'title': 'Smoothing iterations'},
+    # Plan 40 UXB1 (#49). The OpenFOAM keywords (nSmoothScale, errorReduction,
+    # mergeTolerance) are what the help pane shows; the label says what the
+    # setting does, and the merge tolerance is a fraction of the model size.
+    'quality.thresholds.n_smooth_scale':
+        {'title': 'Passes spreading the error to neighbours'},
+    'quality.thresholds.error_reduction':
+        {'title': 'Displacement kept at bad cells'},
+    'quality.thresholds.merge_tolerance':
+        {'title': 'Point merge tolerance', 'unit': 'ratio'},
     # Plan 31 -- the geometry-entry options. Every key named here was read
     # out of the OpenFOAM 13 source, not from documentation; the file and line
     # are in the schema comment beside each field.
@@ -557,18 +593,36 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'of being warned away and silently dropped.',
     },
     'meshing.geometry.tolerance': {
+        # Plan 40 UXD9 (#38): acts at castellation's surface intersection.
+        'ui_location': 'workflow.castellation',
+        # DP-242: a field on a stage page stales that stage onwards, never the
+        # stages before it. The surface search is castellation's; the base
+        # grid and the feature edges are built without it.
+        'invalidates': CASTELLATION_SURFACE_SEARCH,
         'title': 'Intersection tolerance',
         'documentation': 'Non-default perturbation tolerance for the surface '
                          'intersection octree. Unset uses the OpenFOAM '
                          'default; raise it when a gappy surface leaks.',
     },
     'meshing.geometry.max_tree_depth': {
+        # Plan 40 UXD9 (#38): acts at castellation's surface intersection.
+        'ui_location': 'workflow.castellation',
+        # DP-242: a field on a stage page stales that stage onwards, never the
+        # stages before it. The surface search is castellation's; the base
+        # grid and the feature edges are built without it.
+        'invalidates': CASTELLATION_SURFACE_SEARCH,
         'title': 'Octree depth',
         'documentation': 'Maximum depth of the surface search octree. Unset '
                          'uses the OpenFOAM default of 10; lower it only to '
                          'cut memory, at the cost of slower searches.',
     },
     'meshing.geometry.min_quality': {
+        # Plan 40 UXD9 (#38): acts at castellation's surface intersection.
+        'ui_location': 'workflow.castellation',
+        # DP-242: a field on a stage page stales that stage onwards, never the
+        # stages before it. The surface search is castellation's; the base
+        # grid and the feature edges are built without it.
+        'invalidates': CASTELLATION_SURFACE_SEARCH,
         'title': 'Triangle quality floor',
         'documentation': 'Triangles below this quality are ignored when '
                          'surface normals are calculated. Unset leaves every '
@@ -584,6 +638,12 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'import.',
     },
     'meshing.geometry.gap_detection': {
+        # Plan 40 UXD9 (#38): acts at castellation's surface intersection.
+        'ui_location': 'workflow.castellation',
+        # DP-242: a field on a stage page stales that stage onwards, never the
+        # stages before it. The surface search is castellation's; the base
+        # grid and the feature edges are built without it.
+        'invalidates': CASTELLATION_SURFACE_SEARCH,
         'title': 'Close narrow gaps',
         'documentation': 'Wrap each staged surface in a withGaps surface, so '
                          'a gap narrower than the gap width is reported as '
@@ -591,6 +651,12 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'through it. Costs extra intersection tests.',
     },
     'meshing.geometry.gap_width': {
+        # Plan 40 UXD9 (#38): acts at castellation's surface intersection.
+        'ui_location': 'workflow.castellation',
+        # DP-242: a field on a stage page stales that stage onwards, never the
+        # stages before it. The surface search is castellation's; the base
+        # grid and the feature edges are built without it.
+        'invalidates': CASTELLATION_SURFACE_SEARCH,
         'title': 'Gap width',
         'documentation': 'How wide a gap still counts as closed. Read only '
                          'when "Close narrow gaps" is on.',
@@ -645,6 +711,39 @@ FIELD_OVERRIDES: dict[str, dict] = {
         # at all. The reasoning above is unchanged; only the spelling is.
         'invalidates': stales('exports', 'engine'),
         'ui_location': 'meshing_method',
+    },
+    # Plan 40 UXA1 (F1a, F1b). One choice sizes both meshers.
+    'mesh.size_preset': {
+        'title': 'Mesh size',
+        'documentation': 'Coarse, Medium or Fine sets every size you leave '
+                         'on Auto, for either mesher: the snappyHexMesh '
+                         'background cell and the Gmsh target size are the '
+                         "model's bounding diagonal divided by 40, 80 or "
+                         '160, the walls two levels finer. A size you type '
+                         'on a later page wins and turns this to Custom.',
+        'invalidates': stales('engine_plan', 'mesh.base_grid', 'quality'),
+        'ui_location': 'meshing_method',
+    },
+    # Plan 40 UXA2 (#31, F1c). The one feature angle; core/facade/feature_angle.py
+    # derives resolveFeatureAngle, the layer feature and slip angles, every
+    # group's includedAngle and the import dialog's split angle from it.
+    'mesh.feature_angle': {
+        'title': 'Feature angle',
+        'documentation': 'How far a surface must turn before the mesh treats '
+                         'it as a feature edge. One value for the project: '
+                         'the feature-edge extraction angle, the '
+                         'castellation resolve angle, the layer feature '
+                         'angles and the split angle on import all follow it.',
+        'unit': 'deg',
+        'invalidates': stales('engine_plan', 'quality'),
+        'ui_location': 'snappy_workflow',
+    },
+    'meshing.castellation.defaulted': {
+        'title': 'Default walls group made',
+        'documentation': 'Set once the case has been given its default walls '
+                         'refinement group, or a group has been removed, so a '
+                         'group the user deletes is not made again. The mesher '
+                         'never reads it.',
     },
     'geometry_preparation.decision': {
         'read_only': True,
@@ -705,7 +804,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': (
             'Edge length of a background cell, in metres. Each axis gets '
             'span / size cells, rounded up, so the cells are this size or '
-            'just under. Auto (empty) uses the block diagonal / 40. Read when '
+            'just under. Auto (empty) uses the block diagonal divided by the Mesh size choice (40, 80 or 160). Read when '
             'Sizing mode is target_size only.'),
     },
     # Plan 37 #9. The fields below reached the user with no unit and no
@@ -738,6 +837,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
             'old projects open, reported, and not applied.'),
     },
     'meshing.base_grid.bounding_hex6': {
+        'title': 'Box around geometry',
         'documentation': (
             'A Hex6 volume from the geometry list to use as the background '
             'block instead of the derived box; its two corners, in metres, '
@@ -1159,15 +1259,17 @@ FIELD_OVERRIDES: dict[str, dict] = {
             'belong to exactly one patch.'),
     },
     'base_grid.merge_pairs/{id}/master': {
+        'title': 'Target patch',
         'documentation': (
-            'Name of the patch on the master side of the merge. blockMesh '
-            'keeps the master face positions and removes both patches from the '
-            'delivered boundary.'),
+            'Name of the patch on the target side of the merge (blockMesh '
+            'calls it the master). blockMesh keeps the target face positions '
+            'and removes both patches from the delivered boundary.'),
     },
     'base_grid.merge_pairs/{id}/slave': {
+        'title': 'Source patch',
         'documentation': (
-            'Name of the patch on the slave side of the merge. Its points move '
-            'onto the master face.'),
+            'Name of the patch on the source side of the merge (blockMesh '
+            'calls it the slave). Its points move onto the target face.'),
     },
     # DP-204. Each of these three says cells in its own label, so the
     # column that also said cells has gone. The rule the whole registry is
@@ -1195,6 +1297,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'Buffer cells inserted between adjacent refinement levels.',
     },
     'meshing.snap.tolerance': {
+        'title': 'Snap tolerance (× local cell size)',
         'documentation': 'Snapping distance as a multiple of local edge length.',
     },
     'meshing.snap.smooth_patch_iterations': {
@@ -1317,8 +1420,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
         # the section itself (NDIME= 2) and has no front, back, thickness or
         # wedge, so on that route they are offered as what they are: unused.
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode == two_d',
-                         'mesh.target_solver != su2'),
+                         'gmsh.dimensionality.mode == two_d',),
         'documentation': 'Distance between the front and back empty patches '
                          'of the one-cell-thick OpenFOAM mesh. Not used for '
                          'SU2, which reads the section as a 2D mesh.',
@@ -1326,8 +1428,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
     'gmsh.dimensionality.wedge_angle': {
         'unit': 'deg',
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode == axisymmetric',
-                         'mesh.target_solver != su2'),
+                         'gmsh.dimensionality.mode == axisymmetric',),
         'documentation': 'Opening angle of the one-cell OpenFOAM wedge, 0.1 '
                          'to 10 degrees (5 is advised). Not used for SU2, '
                          'which reads the section as a 2D mesh and is run '
@@ -1345,8 +1446,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
     },
     'gmsh.dimensionality.wedge_axis': {
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode == axisymmetric',
-                         'mesh.target_solver != su2'),
+                         'gmsh.dimensionality.mode == axisymmetric',),
         'documentation': 'Axis the section is revolved about. The section '
                          'must lie on one side of it, in a plane through it. '
                          'Not used for SU2, whose AXISYMMETRIC= YES option '
@@ -1354,8 +1454,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
     },
     'gmsh.dimensionality.front_patch': {
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode != three_d',
-                         'mesh.target_solver != su2'),
+                         'gmsh.dimensionality.mode != three_d',),
         'documentation': 'Name of the patch on the front face of the '
                          'one-cell OpenFOAM mesh (empty, or wedge for an '
                          'axisymmetric mesh). SU2 has no front face.',
@@ -1367,7 +1466,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
         # become the SU2 markers as well as the polyMesh patches.
         'title': 'Edge names',
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode != three_d'),
+                         'gmsh.dimensionality.mode != three_d',),
         'documentation': 'Patch names for the boundary curves of the '
                          'section, as "inlet: 1; outlet: 3; walls: 2, 4". '
                          'The numbers are the curve tags a run without names '
@@ -1379,8 +1478,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
     },
     'gmsh.dimensionality.back_patch': {
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.dimensionality.mode != three_d',
-                         'mesh.target_solver != su2'),
+                         'gmsh.dimensionality.mode != three_d',),
         'documentation': 'Name of the patch on the back face of the '
                          'one-cell OpenFOAM mesh. SU2 has no back face.',
     },
@@ -1426,6 +1524,25 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # DP-606 (field audit 0924 gmsh-sizing D8). The Gmsh row editors had a
     # tooltip for one setting in five collections; the rest were a generated
     # label and nothing else. Each now says what it sizes and what it reads.
+    # DP-152. Four stored row collections end in the leaf `rows`, so the
+    # generated title was `Rows` on all four and two pages (Sizing and
+    # Structure) listed two rows of that name. Each says whose rows it holds.
+    #
+    # Plan 32 section 4.6 / check 14. These four, and the option overrides
+    # below, fell to the `gmsh` group's own `workflow.gmsh`, a location no
+    # row owns, so the command palette sent all five to Size fields. Each
+    # names the row that edits it (Plan 41 GN18: Sizing carries the size
+    # fields, Structure the entity controls, Generate the options).
+    'gmsh.native_fields.rows': {'title': 'Native field rows',
+                                'ui_location': 'workflow.gmsh.size_fields'},
+    'gmsh.point_sizes.rows': {'title': 'Point size rows',
+                              'ui_location': 'workflow.gmsh.size_fields'},
+    'gmsh.entity_controls.rows': {
+        'title': 'Entity control rows',
+        'ui_location': 'workflow.gmsh.volume_controls'},
+    'gmsh.structure.rows': {'title': 'Structure rows',
+                            'ui_location': 'workflow.gmsh.volume_controls'},
+    'gmsh.options.overrides': {'ui_location': 'workflow.gmsh.compute'},
     'gmsh.size_fields.controls/{id}/size_inside': {
         'documentation': 'Element size the field asks for inside its region '
                          '(on the scope, inside the ball, box or cylinder).',
@@ -1566,8 +1683,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
                              f'metres. For a cylinder it is the midpoint '
                              f'between the two caps.',
             'unit': 'm',
-            'applies_when': ('mesh.engine != unselected',
-                             'gmsh.describe_geometry.centre_mode == explicit'),
+            'applies_when': ('gmsh.describe_geometry.centre_mode == explicit',),
         }
         for axis in 'xyz'
     },
@@ -1575,8 +1691,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'Box only: the gap added on every side of the '
                          'geometry, as a multiple of its bounding-box '
                          'diagonal.',
-        'applies_when': ('mesh.engine != unselected',
-                         'gmsh.describe_geometry.shape == box'),
+        'applies_when': ('gmsh.describe_geometry.shape == box',),
     },
     'gmsh.describe_geometry.radius': {
         'title': 'Farfield radius',
@@ -1585,8 +1700,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'refused before meshing with the radius that would '
                          'fit, never clipped.',
         'unit': 'm',
-        'applies_when': ('mesh.engine != unselected',
-                         'gmsh.describe_geometry.shape != box'),
+        'applies_when': ('gmsh.describe_geometry.shape != box',),
     },
     'gmsh.describe_geometry.length': {
         'title': 'Cylinder length',
@@ -1594,8 +1708,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'centre. It must hold every body with clearance '
                          'along the axis.',
         'unit': 'm',
-        'applies_when': ('mesh.engine != unselected',
-                         'gmsh.describe_geometry.shape == cylinder'),
+        'applies_when': ('gmsh.describe_geometry.shape == cylinder',),
     },
     **{
         f'gmsh.describe_geometry.axis.{axis}': {
@@ -1604,8 +1717,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
                              f'Any direction; only the direction is read, '
                              f'not the length, and a zero axis is refused. '
                              f'The inlet cap is at the negative end.',
-            'applies_when': ('mesh.engine != unselected',
-                             'gmsh.describe_geometry.shape == cylinder'),
+            'applies_when': ('gmsh.describe_geometry.shape == cylinder',),
         }
         for axis in 'xyz'
     },
@@ -1656,11 +1768,92 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'direction.',
     },
 
+    'gmsh.periodic_pairs.controls/{id}/affine_row_x.x': {
+        'title': 'Matrix row X, column X',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_x.y': {
+        'title': 'Matrix row X, column Y',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_x.z': {
+        'title': 'Matrix row X, column Z',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_y.x': {
+        'title': 'Matrix row Y, column X',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_y.y': {
+        'title': 'Matrix row Y, column Y',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_y.z': {
+        'title': 'Matrix row Y, column Z',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_z.x': {
+        'title': 'Matrix row Z, column X',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_z.y': {
+        'title': 'Matrix row Z, column Y',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
+    'gmsh.periodic_pairs.controls/{id}/affine_row_z.z': {
+        'title': 'Matrix row Z, column Z',
+        'documentation': 'Entry of the 3×3 matrix of an affine pair. The '
+                         'target point is this matrix times the source '
+                         'point, plus the translation. The matrix must be '
+                         'invertible; the identity with no translation maps '
+                         'the surface onto itself and is refused. Read only '
+                         'by the affine transform.',
+    },
     'gmsh.periodic_pairs.controls/{id}/rotation_angle_degrees': {
         'title': 'Rotation angle',
         'unit': 'deg',
         'documentation': 'Angle turned about the rotation axis to carry the '
-                         'master surface onto the slave one. Read only by the '
+                         'source surface onto the target one. Read only by the '
                          'rotational transform; the translational one ignores '
                          'it.',
     },
@@ -1799,6 +1992,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
                          'log, so check the preview beneath the field.',
     },
     'meshing.snap.detect_near_surfaces_snap': {
+        'title': 'Snap to nearby surfaces',
         'documentation': 'Whether snapping also attracts points to surfaces '
                          'that are near but not the closest, which helps thin '
                          'gaps and hurts nothing else. OpenFOAM 13 defaults '
@@ -2085,9 +2279,10 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # but SU2, with a warning -- so on the OpenFOAM route it was a switch
     # the run throws away, offered as a choice. The clause is the guard the
     # derivation applies, written where the form can read it.
+    # Plan 41 GN2 (DP-1396, G2): the guard is gone. It reaches Gmsh whatever
+    # the target; the polyMesh publisher declines the result at export.
     'gmsh.volume_controls.automatic': {
         'title': 'Automatic structured meshing',
-        'applies_when': ('mesh.engine == gmsh', 'mesh.target_solver == su2'),
     },
     # No guard: this one changes how a three-sided face is filled, not what
     # family it is filled with. MEASURED on the elbow: 120 triangles became
@@ -2095,14 +2290,74 @@ FIELD_OVERRIDES: dict[str, dict] = {
     'gmsh.volume_controls.transfinite_tri': {
         'title': 'Structured triangular surfaces',
     },
+    # Plan 40 UXB1 (#51, #47, #54). The OpenFOAM or Gmsh keyword is what the
+    # help pane shows (documentation, the registry's id); the label is what
+    # the setting does, in the words a user would say it.
+    'gmsh.global_sizing.field_combiner': {
+        'title': 'How size fields combine',
+    },
+    'gmsh.global_sizing.minimum_elements_per_two_pi': {
+        'title': 'Cells per full circle',
+    },
+    'gmsh.global_sizing.barycentric_refinement': {
+        'title': 'Split every cell about its centre',
+    },
+    'gmsh.global_sizing.recombine': {
+        'title': 'Quadrilateral surface cells',
+    },
+    'gmsh.global_sizing.surface': {
+        'title': 'Surface algorithm',
+    },
+    'gmsh.global_sizing.volume': {
+        'title': 'Volume algorithm',
+    },
+    'gmsh.boundary_layers.quads': {
+        'title': 'Prism and brick layer cells',
+    },
+    'gmsh.compute.quality_type': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Quality measure',
+    },
+    'gmsh.compute.min_quality': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Worst cell quality allowed',
+    },
+    'gmsh.compute.allowed_fraction': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Share of cells allowed below it',
+    },
+    'gmsh.compute.allowed_count': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Number of cells allowed below it',
+    },
+    'gmsh.compute.hard_floor': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Quality no cell may fall below',
+    },
+    'gmsh.compute.extra_limits': {
+        # Plan 40 UXD9 (#54): the gate is edited where its verdict is read.
+        'ui_location': 'workflow.quality',
+        'title': 'Further quality limits',
+    },
     # DP-621 (field audit 0924 gmsh-generate-export D1). Renumbering sat in
     # `gmsh/output` and inherited the element-order clause, which rules out
     # both named targets -- while `derive_export` keeps the renumbering on
     # the SU2 route only, because MSH 2.2 throws the numbering away. So no
     # target both offered the control and applied it. Its clause is the
     # derivation's own guard.
+    # Plan 41 GN2 (DP-1396, G2): live whatever the target. The runner
+    # renumbers and says in the ledger which written file carries it.
     'gmsh.compute.renumber': {
-        'applies_when': ('mesh.engine == gmsh', 'mesh.target_solver == su2'),
+        'applies_when': ('mesh.engine == gmsh',),
+    },
+    'gmsh.compute.renumber_method': {
+        'applies_when': ('mesh.engine == gmsh',
+                         'gmsh.compute.renumber == true'),
     },
     # DP-624 (field audit 0924 gmsh-generate-export D4). The high-order
     # optimiser moves the midside nodes of curved elements, so the runner
@@ -2111,8 +2366,6 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # element order's own clause and asks for order 2 on top of it.
     'gmsh.compute.high_order_optimize': {
         'applies_when': ('mesh.engine == gmsh',
-                         'mesh.target_solver != openfoam',
-                         'mesh.target_solver != su2',
                          'gmsh.compute.element_order == 2'),
     },
     # DP-625 (field audit 0924 gmsh-generate-export D6). Which recombiner,
@@ -2131,10 +2384,11 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # DP-626 (field audit 0924 gmsh-generate-export D8). Order 2 is offered
     # only while no target solver is chosen, and nothing said so.
     'gmsh.compute.element_order': {
-        'documentation': 'Second order needs no target solver: both '
-                         'solver routes read first-order elements only, so '
-                         'this is offered only while Target solver is '
-                         'unselected.',
+        'documentation': 'Second order needs no target solver: Gmsh meshes '
+                         'at the order you choose whatever the target. An '
+                         'export that cannot carry that order declines it '
+                         'at Export, with the reason, and the native mesh '
+                         'is kept.',
     },
     # DP-627 (field audit 0924 gmsh-generate-export D2). Netgen, the Netgen
     # passes and the threshold belong to the optimiser that Optimize turns
@@ -2157,4 +2411,28 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'Number of smoothing steps Gmsh applies to the '
                          'final mesh (Mesh.Smoothing).',
     },
+}
+
+#: Plan 40 UXB6 (#43, #47). A dependant is judged on its master checkbox as
+#: well as on whatever its field or group already says: unticking the master
+#: takes the rows that only it reads off the page, on every page that draws
+#: them. ``fields._build_descriptor`` appends these to ``applies_when``.
+MASTER_CLAUSES = {
+    'meshing.surface_features.internal_angle_tolerance':
+        ('meshing.surface_features.face_closeness == true',),
+    'meshing.surface_features.external_angle_tolerance':
+        ('meshing.surface_features.face_closeness == true',),
+    'meshing.surface_features.max_feature_proximity':
+        ('meshing.surface_features.feature_proximity == true',),
+    'meshing.surface_features.verbose_obj':
+        ('meshing.surface_features.write_obj == true',),
+    'meshing.geometry.gap_width':
+        ('meshing.geometry.gap_detection == true',),
+    **{f'gmsh.boundary_layers.{name}':
+       ('gmsh.boundary_layers.enabled == true',)
+       for name in ('first_height', 'layer_count', 'mode', 'quads', 'ratio',
+                    'total_thickness')},
+    # `patch_mode` and `patches` are deliberately not here: the layers page
+    # stores a proposed selection while the switch is off, and its tick list
+    # is disabled with the switch by the page itself.
 }

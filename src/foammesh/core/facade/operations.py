@@ -299,6 +299,10 @@ def _geometry_operations() -> list[OperationDescriptor]:
                             'Split a surface into boundaries by feature angle',
                             'case', ImpactClass.MESH_MUTATION,
                             recovery='artifact_backup'),
+        OperationDescriptor('geometry.cad.convert_to_surface',
+                            'Convert CAD sources to surface files',
+                            'case', ImpactClass.MESH_MUTATION,
+                            recovery='artifact_backup'),
         OperationDescriptor('geometry.split_interfaces',
                             'Cut an assembly into its interfaces and outer skin',
                             'case', ImpactClass.MESH_MUTATION,
@@ -412,6 +416,8 @@ def _workflow_operations() -> list[OperationDescriptor]:
                                     'record requested against achieved.'),
         OperationDescriptor('mesh.gmsh.runs', 'List Gmsh runs', 'case',
                             ImpactClass.READ),
+        OperationDescriptor('mesh.runs', 'List the runs of both engines',
+                            'case', ImpactClass.READ),
         # Plan 31 CP-05 item 4. Accepting a candidate is not the same act as
         # making one, and it used to be spelled as one: **Accept anyway** ran
         # `mesh.gmsh.run` again, so the mesh that got accepted was never the
@@ -559,6 +565,62 @@ def _mesh_operations() -> list[OperationDescriptor]:
                             'Check the mesh is readable by SU2', 'case',
                             ImpactClass.READ,
                             artifact_contract=('quality',)),
+        # Plan 41 GN25b S3. The automatic size field. Compute is the one
+        # expensive job (the tool runs in the WSL runtime, or Reuse hands back
+        # the saved field); the rest are cheap. A proposal never overwrites a
+        # value the user typed.
+        OperationDescriptor('sizing.field.compute', 'Compute the size field',
+                            'case', ImpactClass.EXPENSIVE_JOB,
+                            artifact_contract=('sizing-field',),
+                            summary='Run foammesh-sizefield on the prepared '
+                                    'surfaces (or reuse the saved field) and '
+                                    'propose sizes for the active route.'),
+        # Plan 41 GN25e. The size-field tool is a file FoamMesh ships; this
+        # finds it in the runtime, and the set-up copies it there on request.
+        OperationDescriptor('sizing.tool.status', 'Size-field tool status',
+                            'case', ImpactClass.READ,
+                            summary='Where foammesh-sizefield is in the '
+                                    'OpenFOAM 13 runtime and whether it is '
+                                    'the shipped one.'),
+        OperationDescriptor('sizing.tool.setup', 'Set up automatic sizing',
+                            'case', ImpactClass.FILE_PRODUCING,
+                            summary='Copy the shipped foammesh-sizefield '
+                                    'into the home folder of the runtime user, check its '
+                                    'SHA-256 and --version. No download, no '
+                                    'administrator rights.'),
+        OperationDescriptor('sizing.field.status', 'Size field status', 'case',
+                            ImpactClass.READ),
+        OperationDescriptor('sizing.proposals.get', 'Size field proposals',
+                            'case', ImpactClass.READ),
+        OperationDescriptor('sizing.proposals.apply',
+                            'Apply size field proposals', 'case',
+                            ImpactClass.REVERSIBLE_EDIT, reversible=True,
+                            recovery='undo',
+                            summary='Fill the empty or field-sourced controls '
+                                    'with the proposals; never a typed value.'),
+        OperationDescriptor('sizing.proposals.lock', 'Lock a size proposal',
+                            'case', ImpactClass.FILE_PRODUCING,
+                            artifact_contract=('sizing-proposals',),
+                            summary='Pin one proposal so a re-derive keeps it.'),
+        # Plan 41 GN25c. What the Automatic Sizing card shows beside the
+        # proposals: the histogram, the estimate with its RAM, the thin
+        # regions and split offers, the overlay arrays; the size conformity of
+        # a mesh; and the opt-in Refine to field pass after castellation.
+        OperationDescriptor('sizing.field.preview', 'Size field preview', 'case',
+                            ImpactClass.READ,
+                            summary='Histogram, estimate with RAM, thin '
+                                    'regions, split offers and the arrays the '
+                                    'viewport draws, from the computed field.'),
+        OperationDescriptor('sizing.conformity', 'Size conformity', 'case',
+                            ImpactClass.READ,
+                            summary='Cell size over field size for every cell '
+                                    'of the mesh; counts above 2 and below 0.5.'),
+        OperationDescriptor('sizing.refine_to_field', 'Refine to field', 'case',
+                            ImpactClass.EXPENSIVE_JOB,
+                            capabilities=('refineMesh',),
+                            artifact_contract=('mesh',),
+                            summary='Run refineMesh on the cells larger than '
+                                    '1.5 times the size field.'),
         OperationDescriptor('mesh.reconstruct', 'Gather the decomposed mesh', 'case',
                             ImpactClass.EXPENSIVE_JOB,
                             capabilities=('reconstructPar',),

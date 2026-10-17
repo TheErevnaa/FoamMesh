@@ -19,10 +19,10 @@ Plan 31 CP-09 items 2 and 3 finish it. ``gmsh.publish`` is in
 :attr:`GmshMeshingEngine.ATOMIC_RUN_TASKS`, so "Run to end" already published
 before the user ever reached this page -- and the button said "Run this step",
 which reads as a step still owed. It says "Publish again" now, and the page
-says who already did it. And publication is not unconditional: an SU2 case
-publishes nothing, and neither does a second-order mesh, so on those cases
-the button is shut and carries the reason instead of writing a polyMesh
-nothing in the case asked for.
+says who already did it. Plan 41 GN16: the page never reads the target
+solver. A second-order mesh cannot be a polyMesh (a first-order format), so
+there the button is shut and carries the reason; on any first-order mesh it
+is live, whatever the Method preset is.
 """
 from __future__ import annotations
 
@@ -66,14 +66,14 @@ class GmshPublishPage(GmshTaskPage):
         if publishes:
             note.setText(self.tr(
                 'Publishing converts the native Gmsh mesh into '
-                'constant/polyMesh for {0} and writes the manifest that '
+                'constant/polyMesh and writes the manifest that '
                 'records which prepared surface each patch came from. It '
                 're-reads the mesh Gmsh already produced; it does not '
                 're-mesh.\n\n'
                 'Run to end already publishes, so you do not have to: use '
                 'Publish again only to republish after changing patch '
                 'categories without re-running Gmsh.'
-            ).format(self.target_solver_name()))
+            ))
             note.setProperty('foammeshStatus', '')
             # W-O1. What the press does is the press's own description, not
             # a paragraph above it. `setRunStageAvailable` clears the tooltip

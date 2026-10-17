@@ -18,7 +18,7 @@ def derive_background_counts(bounds, target_cell_size: float) -> tuple[int, int,
 AUTO_CELL_DIAGONAL_DIVISOR = 40.0
 
 
-def auto_target_cell_size(bounds) -> float | None:
+def auto_target_cell_size(bounds, divisor: float | None = None) -> float | None:
     """The base cell an unset ("Auto") target cell size stands for, in metres.
 
     DP-669 (DP-587 left it). The diagonal of *bounds* -- the six-number
@@ -36,7 +36,9 @@ def auto_target_cell_size(bounds) -> float | None:
                              for i in range(3)))
     if not math.isfinite(diagonal) or diagonal <= 0:
         return None
-    return diagonal / AUTO_CELL_DIAGONAL_DIVISOR
+    # Plan 40 UXA1. The divisor follows the Mesh size choice
+    # (core/sizing/derive.py); without one, the rule this had before it.
+    return diagonal / float(divisor or AUTO_CELL_DIAGONAL_DIVISOR)
 
 
 def stand_off_bounds(bounds, standoff: float):

@@ -164,7 +164,8 @@ def gl_error() -> int:
         return 0
 
 
-def lost_context(window, was_initialized: bool = True) -> str | None:
+def lost_context(window, was_initialized: bool = True,
+                 check_error: bool = True) -> str | None:
     """Why ``window`` can no longer draw after a render, or None.
 
     A finalised window (``GetInitialized`` false although it had a context
@@ -172,6 +173,12 @@ def lost_context(window, was_initialized: bool = True) -> str | None:
     error flag says it was lost or ran out of memory. The error is read
     only while this window's context is current, since with no context
     bound ``glGetError`` answers GL_INVALID_OPERATION.
+
+    Plan 39 VI14c. ``glGetError`` makes the driver finish the frame in
+    flight: measured 1.5 s inside the GUI thread's end-of-render observer on
+    the 6.6 M-cell impeller (AMD integrated GPU). ``check_error=False``
+    answers from the window's own state only; the caller asks for the error
+    flag later, when the GPU is idle.
     """
     try:
         initialized = window.GetInitialized()
@@ -184,7 +191,7 @@ def lost_context(window, was_initialized: bool = True) -> str | None:
         current = window.IsCurrent()
     except Exception:                                      # noqa: BLE001
         current = False
-    if current:
+    if current and check_error:
         error = gl_error()
         if error in LOST_ERRORS:
             return f'OpenGL reported {LOST_ERRORS[error]}'

@@ -29,6 +29,7 @@ a stage, as the tests do) or another ``batch_runner``.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import time
@@ -38,16 +39,35 @@ from pathlib import Path
 
 import numpy as np
 
+from foammesh.core.gmsh import pass_snapshots
 from foammesh.core.jobs import stage_snapshots as snapshots
 from foammesh.core.section import section_colour
 from foammesh.core.section.section_jobs import SectionRequest
 
 __all__ = ['CompareTarget', 'StageSection', 'CompareResult',
            'compare_targets', 'compare_requests', 'run_compare',
-           'shared_legend', 'STAGES']
+           'shared_legend', 'STAGES', 'GMSH_STAGES', 'stage_list']
 
 #: The stages a snappy run keeps, in order.
 STAGES = tuple(snapshots.STAGE_ORDER)
+#: The stages a Gmsh session keeps (Plan 41 GN23), one per pass.
+GMSH_STAGES = tuple(pass_snapshots.stage_name(key)
+                    for key, _label in pass_snapshots.PASSES)
+
+#: Plan 42 SG6. The one Compare list: (stage, label, ticked at first) for
+#: the family of the mesh on screen, snappy stages or Gmsh passes.
+_STAGE_LABELS = (('blockMesh', 'Base grid', True),
+                 ('castellation', 'Castellation', True),
+                 ('snap', 'Snap', True), ('layers', 'Layers', False))
+_GMSH_LABELS = (('gmsh.1d', '1D', False), ('gmsh.2d', '2D', False),
+                ('gmsh.3d', '3D', True), ('gmsh.optimise', 'Optimise', True),
+                ('gmsh.order', 'Order', False))
+
+
+def stage_list(gmsh: bool) -> tuple:
+    """The stages to offer for a Gmsh mesh (``True``) or a snappy one."""
+    return _GMSH_LABELS if gmsh else _STAGE_LABELS
+
 
 #: The prefix of a compare job's case id (never the live case's id, so a
 #: compare can never be taken for, or cancel, the live section).
@@ -106,6 +126,26 @@ def _missing_reason(case, stage, revision) -> str:
     return f'no {stage} snapshot is kept{where}.'
 
 
+def _gmsh_pass_target(case, stage, verify) -> CompareTarget:
+    """Plan 41 GN23. A pass of the Gmsh session, kept as its hand-over."""
+    key = str(stage)[len(pass_snapshots.PREFIX):]
+    manifest = pass_snapshots.read_manifest(case, key)
+    path = pass_snapshots.mesh_path(case, key)
+    if manifest is None or path is None:
+        return CompareTarget(
+            stage, reason=f'no {key} pass is kept: run it in the Gmsh '
+                          'session first.')
+    fields = dict(revision=key, digest=manifest.get('digest'),
+                  mesh_identity=json.dumps(manifest.get('mesh_identity') or {},
+                                           sort_keys=True),
+                  captured_at=manifest.get('captured_at'))
+    if verify and not pass_snapshots.verify(case, key).get('ok'):
+        return CompareTarget(
+            stage, reason=f'the {key} pass cannot be verified: mesh.vtu no '
+                          'longer matches what was kept.', **fields)
+    return CompareTarget(stage, path=str(path), **fields)
+
+
 def compare_targets(case_path, stages=STAGES, revision: str | None = None, *,
                     verify: bool = True, cancel=None) -> list[CompareTarget]:
     """Where each of *stages* is kept for *revision* (the newest by default).
@@ -114,9 +154,14 @@ def compare_targets(case_path, stages=STAGES, revision: str | None = None, *,
     is the evidence; a changed one is refused, not cut).
     """
     case = Path(case_path)
-    resolved = snapshots.resolve(case, revision)
+    resolved = None
     targets = []
     for stage in stages:
+        if str(stage).startswith(pass_snapshots.PREFIX):
+            targets.append(_gmsh_pass_target(case, stage, verify))
+            continue
+        if resolved is None:
+            resolved = snapshots.resolve(case, revision)
         holder = resolved.get(stage)
         manifest = snapshots.read_manifest(case, stage, holder) \
             if holder else None

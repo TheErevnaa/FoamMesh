@@ -12,14 +12,13 @@ All mutation goes through the facade (``configuration.patch`` /
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QPushButton, QScrollArea, QStyledItemDelegate, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from widgets.fit_to_text import FlowLayout, fit_to_text
 
 from foammesh.view.theming.metrics import (align_form_columns,
                                            align_unit_column,
@@ -31,9 +30,20 @@ from foammesh.core.facade.fields import REGISTRY as FIELD_REGISTRY
 
 from foammesh.view.menu.help.step_help_dialog import (StepDetailsDialog,
                                                       StepHelpDialog)
+from foammesh.view.theming.sheet_form import (LabelWidthWatcher, SheetForm,
+                                               guard_cards, share_label_width)
 from foammesh.view.widgets.folder_header import FolderHeader
-from .conditional_fields import refresh_applicability
-from .field_widgets import FieldEditor
+from .conditional_fields import follows_master, refresh_applicability
+from foammesh.core.facade.field_tiers import (
+    COMMON, ESSENTIAL, EXPERT, tier_of)
+from .field_widgets import FieldEditor, same_as_default
+from .page_action import PageAction
+from .page_filter import make_filter_box
+from .lock_chip import (CONFIRM, LOCKED, FilterRow, LockChip, ReadOnlyGuard,
+                        unlock_ask_text)
+from foammesh.view.widgets.notice_card import (NoticeCard,
+                                               WARNING as NOTICE_WARNING)
+from .tiers import expert_visibility, make_expert_toggle
 from foammesh.view.facade_client import query, submit
 
 
@@ -248,6 +258,39 @@ class CalculatedTable(QTableWidget):
             self.setColumnWidth(column, wanted[index])
 
 
+_DUPLICATE = 'foammeshDuplicateToggle'
+
+
+class _HoldHidden(QObject):
+    """Hide a duplicate switch again whenever something shows it."""
+
+    def __init__(self, toggle) -> None:
+        super().__init__(toggle)
+        self._toggle = toggle
+        toggle.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show and watched is self._toggle:
+            QTimer.singleShot(0, self._hide)
+        return False
+
+    def _hide(self) -> None:
+        from shiboken6 import isValid
+        if isValid(self._toggle) and self._toggle.property(_DUPLICATE):
+            self._toggle.hide()
+
+
+def _hold_duplicate(toggle) -> None:
+    if not toggle.property(_DUPLICATE):
+        toggle.setProperty(_DUPLICATE, True)
+        _HoldHidden(toggle)
+    toggle.hide()
+
+
+def _release_duplicate(toggle) -> None:
+    toggle.setProperty(_DUPLICATE, False)
+
+
 class EngineTaskPage(QWidget):
     """Base page for one engine workflow task.
 
@@ -330,6 +373,12 @@ class EngineTaskPage(QWidget):
         self._editors: dict[str, FieldEditor] = {}
         #: Field ids whose editor sits behind the Advanced disclosure.
         self._advanced_fields: list[str] = []
+        #: Plan 40 UXD4. Field ids in the Expert tier, whichever form holds
+        #: them: hidden unless *Show expert settings* is on.
+        self._expert_fields: list[str] = []
+        #: Whether the reader opened or closed the Common fold themselves, so
+        #: a refresh does not undo it.
+        self._advancedTouched = False
         self._pending: dict[str, object] = {}
         #: `FieldGroupPage` panels this page has adopted (DP-157). Their
         #: edits are this page's edits: they have no commit control left.
@@ -369,6 +418,8 @@ class EngineTaskPage(QWidget):
         # still open -- on Qualification summary most of the workflow -- and
         # on one line it asked 417 px, wider than the settings column.
         self._status.setWordWrap(True)
+        # Plan 44 MF18 (mockup `.hint`): a quiet 12.5 px line, not a banner.
+        self._status.setProperty('foammeshRole', 'hint')
         self._prerequisites = QLabel(self)
         self._prerequisites.setWordWrap(True)
         self._prerequisites.setVisible(False)
@@ -393,10 +444,10 @@ class EngineTaskPage(QWidget):
         # invalidates everything downstream, and the only place that was ever
         # said was inside Preview -- a button you have to press *after*
         # deciding to change something. This line says it on arrival.
-        self._revisit = QLabel(self)
-        self._revisit.setObjectName('engineTaskRevisit')
-        self._revisit.setWordWrap(True)
-        self._revisit.setProperty('foammeshStatus', 'warning')
+        # Plan 44 MF18 (VS9). A notice card: one line and "More…", not a
+        # wrapped orange paragraph above the first setting.
+        self._revisit = NoticeCard(self, kind=NOTICE_WARNING,
+                                   name='engineTaskRevisit')
         self._revisit.setAccessibleName(
             self.tr('What editing this task would invalidate'))
         self._revisit.setVisible(False)
@@ -414,33 +465,43 @@ class EngineTaskPage(QWidget):
         # the one way out beside it. It also says what selecting the row did
         # *not* do: an earlier step's page shows the settings that step was
         # run with, not a mesh of its own.
-        self._resultLock = QWidget(self)
-        self._resultLock.setObjectName('engineTaskResultLock')
-        lock_row = QHBoxLayout(self._resultLock)
-        lock_row.setContentsMargins(0, 0, 0, 0)
+        #
+        # Plan 44 MF18 (VS5, K1-K3, B14). The lock is one 24 px chip in the
+        # filter row (mockup `.frow` / `.lockt`), not a paragraph that wrapped
+        # to three or four lines beside a full-size button. Its words are the
+        # chip's tooltip and accessible description; `_resultLockText` keeps
+        # them, out of the layout, as `_description` keeps the page's. The
+        # chip asks inline before it unlocks: the first press turns it red
+        # with one line saying what goes, the second press is the unlock (the
+        # same `unlockRequested`), and the cross or Escape keeps the lock.
         self._resultLockText = QLabel(self.tr(
-            'Locked: the mesh on disk was made from these settings, so they '
-            'are read-only. Opening this step does not bring back its own '
-            'mesh — the mesh on screen is still the latest result.'),
-            self._resultLock)
+            'Locked: this step is finished, so its settings are read-only and '
+            'the mesh always matches them. Unlocking deletes the mesh and the '
+            'quality results; later steps keep their values but go back to '
+            'not done.'),
+            self)
         self._resultLockText.setObjectName('engineTaskResultLockText')
         self._resultLockText.setWordWrap(True)
-        self._resultLockText.setProperty('foammeshStatus', 'info')
-        self._unlock = QPushButton(
-            self.tr('Unlock and discard later results…'), self._resultLock)
-        self._unlock.setObjectName('engineTaskUnlock')
-        self._unlock.setAccessibleDescription(self.tr(
-            'Reopen this step and the steps after it that depend on it. '
-            'Their results are discarded; a copy is kept so the previous '
-            'result can be restored.'))
-        self._unlock.clicked.connect(
+        self._resultLockText.setVisible(False)
+        self._resultLock = LockChip(self, chip_name='engineTaskUnlock',
+                                    ask_provider=self._unlock_ask)
+        self._resultLock.setObjectName('engineTaskResultLock')
+        self._resultLock.setDescription(LOCKED, ' '.join((
+            self._resultLockText.text(), self.tr(
+                'A copy is kept so the previous result can be restored.'))))
+        self._unlock = self._resultLock.chip
+        self._unlock.setAccessibleName(self.tr('Unlock to edit'))
+        self._resultLock.unlockConfirmed.connect(
             lambda: self.unlockRequested.emit(self.task_id))
-        lock_row.addWidget(self._resultLockText, 1)
-        lock_row.addWidget(self._unlock, 0)
+        self._resultLock.confirmingChanged.connect(self._on_lock_confirming)
         self._resultLock.setVisible(False)
-        outer.addWidget(self._resultLock)
-        for widget in (self._status, self._revisit, self._warnings,
-                       self._preview_note):
+        # Plan 41 GN18. A refused write is a line on the page, not a box that
+        # holds the window: the fields it names stay in reach.
+        self._failureNote = NoticeCard(self, kind=NOTICE_WARNING,
+                                       name='engineTaskFailure')
+        self._failureNote.setVisible(False)
+        for widget in (self._status, self._failureNote, self._revisit,
+                       self._warnings, self._preview_note):
             outer.addWidget(widget)
         # Three pages -- Gmsh Size Fields, snappy Domain Regions, snappy Mesh
         # QA -- append a paragraph of their own to `_description` after
@@ -450,9 +511,29 @@ class EngineTaskPage(QWidget):
         # routes now read them.
         self._help = _StepHelpSink(self)
 
+        # Plan 40 UXD3 (F7a). Typing narrows the page to the settings whose
+        # name has the words; shown only when the page has settings.
+        self._filter = make_filter_box(self)
+        self._filter.setVisible(False)
+        self._filter.textChanged.connect(self._on_filter_text)
+        # Plan 44 MF18 (B14). One row: the filter box and the lock chip, gap
+        # 6 (mockup `.frow`). The row shows while either of them does.
+        self._filterRow = FilterRow(self._filter, self._resultLock, self)
+        self._filterRow.setObjectName('engineTaskFilterRow')
+        outer.addWidget(self._filterRow)
+
         self._body = QWidget(self)
         self._body_layout = QVBoxLayout(self._body)
+        # Plan 44 F4 (MF14 `SHEET_INSET`: one 8 px page margin a side). The
+        # page's own layout already insets the scroller, and the body inset
+        # its cards 8 px again, so a 1280 px window's sheet gave the cards
+        # 233 px of a 275 px column and Base grid, Castellation and Gmsh
+        # Quality were cut on the right.
+        body_margins = self._body_layout.contentsMargins()
+        self._body_layout.setContentsMargins(
+            0, body_margins.top(), 0, body_margins.bottom())
         scroll = QScrollArea(self)
+        self._scroll = scroll
         scroll.setWidgetResizable(True)
         # C5. The page scrolled sideways and so did the table inside it:
         # two horizontal scrollbars stacked a few pixels apart, and the
@@ -462,6 +543,13 @@ class EngineTaskPage(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self._body)
         outer.addWidget(scroll, 1)
+        # Plan 44 MF18 (B10). A locked page is read-only without being
+        # disabled: the text stays at full contrast and the editors carry the
+        # dashed look, while this guard refuses the input and the focus.
+        self._readOnly = ReadOnlyGuard(
+            self._body, exempt=self._stays_live_when_locked,
+            focus_target=lambda: self._unlock,
+            wheel_target=lambda: self._scroll.verticalScrollBar())
 
         self._guided = self._make_group(self.tr('Guided'))
         # DP-149. Advanced used to be a checkable QGroupBox, which in Qt
@@ -493,6 +581,18 @@ class EngineTaskPage(QWidget):
         self._body_layout.addWidget(self._advancedHeader)
         self._advanced = self._make_group('')
         self._advancedHeader.setContents(self._advanced)
+        # Plan 40 UXD4 (F3f). Common is folded unless something in it is off
+        # its default; the reader's own press is kept.
+        self._applyingTiers = False
+        self._advancedHeader.toggled.connect(self._on_advanced_touched)
+        # Expert settings: one switch for the whole application.
+        self._expertToggle = make_expert_toggle(self)
+        self._expertToggle.setVisible(False)
+        self._body_layout.addWidget(self._expertToggle)
+        self._expert = self._make_group('')
+        self._expert.setObjectName('expertSettings')
+        self._expert.setVisible(False)
+        expert_visibility().changed.connect(self._on_expert_visibility)
 
         self._calculated = CalculatedTable(4, self)
         self._calculated.setHorizontalHeaderLabels((
@@ -530,23 +630,28 @@ class EngineTaskPage(QWidget):
         self._body_layout.addWidget(self._detailsLink)
 
         self.build_sections(self._body_layout)
+        # Plan 44 MF14. A card with nothing visible in it is not drawn; the
+        # three the page manages itself keep their own rules.
+        guard_cards(self, skip=(self._guided, self._advanced, self._expert))
         self._body_layout.addStretch(1 if not self._bodyStretchClaimed else 0)
         self._bodySpacerIndex = self._body_layout.count() - 1
 
-        self._preview = QPushButton(self.tr('Preview'), self)
-        self._update = QPushButton(self.tr('Update'), self)
-        self._revert = QPushButton(self.tr('Revert and edit'), self)
+        # Plan 43 LY13 (D4, rows D-008 and D-009). Preview, Update, Revert
+        # and edit and the stage run are acts of this page, pressed from the
+        # footer drop-down (`footerActions`) and the header menu
+        # (`headerActions`). The page draws no button for any of them: they
+        # are `PageAction` objects, which hold the enabled state, the label
+        # and the press, and cannot be drawn.
+        self._preview = PageAction(self.tr('Preview'), self)
+        self._update = PageAction(self.tr('Update'), self)
+        self._revert = PageAction(self.tr('Revert and edit'), self)
         # Plan 30 WP-09 / F-23. The whole-pipeline run is not a per-task
-        # action: in this row it put "Run this step" and "Run complete mesh"
-        # within a button's width of each other, and only one of them meant
-        # this task. It was hidden rather than removed, which left a live
-        # button no user could reach and a second Run idiom in the source.
-        # It is the branch row's "Run to end" now (`EngineBranchView._runAll`)
-        # and nowhere else; `runRequested` survives for the branch to drive.
-        self._runStage = QPushButton(self.tr(self.run_stage_label), self)
-        self._runStage.setObjectName('runTaskStage')
-        self._runStage.setVisible(
-            bool(self.run_stage) and bool(self.run_stage_on_page))
+        # action; it is the branch row's "Run to end"
+        # (`EngineBranchView._runAll`) and `runRequested` survives for the
+        # branch to drive. The one stage a footer press does not perform --
+        # `gmsh.publish`, *Publish again* -- is offered by `footerActions`
+        # when the page sets `run_stage_on_page`.
+        self._runStage = PageAction(self.tr(self.run_stage_label), self)
         self._runStage.setAccessibleDescription(
             self.tr('Run only this step, leaving the rest of the mesh alone.'))
         self._preview.clicked.connect(self.preview)
@@ -555,17 +660,7 @@ class EngineTaskPage(QWidget):
         self._runStage.clicked.connect(
             lambda: self.stageRunRequested.emit(
                 self.task_id, str(self.run_stage or '')))
-        # C2. Five buttons that each refuse to shrink below their label add
-        # up to more width than the panel has, and the page answered with a
-        # horizontal scrollbar under the *whole* page -- so reading the last
-        # button meant scrolling the form away. The row wraps instead.
-        buttons = FlowLayout()
-        for button in (self._preview, self._update, self._revert,
-                       self._runStage):
-            fit_to_text(button)
-            buttons.addWidget(button)
         self._commitButtons = (self._preview, self._update, self._revert)
-        outer.addLayout(buttons)
 
         self.setRunStageAvailable(not self.run_stage_unavailable,
                                   self.run_stage_unavailable)
@@ -577,17 +672,25 @@ class EngineTaskPage(QWidget):
         Plan 37 UF5 DP-1043. The facade refuses the edit either way
         (DP-1040); this is so the page does not offer one it will refuse.
         The whole settings body goes read-only -- editors and adopted panels
-        alike -- and so do the commit buttons.
+        alike -- and so do the commit buttons. Plan 44 MF18: read-only, not
+        disabled; see :class:`ReadOnlyGuard`.
         """
         locked = bool(locked)
         self._resultLockedFlag = locked
+        if not locked or self._resultLock.state() != CONFIRM:
+            self._resultLock.setState(LOCKED)
         self._resultLock.setVisible(locked)
-        self._body.setEnabled(not locked)
+        # Plan 44 MF18 (B10). Not `self._body.setEnabled(False)`: that greyed
+        # every label and value on the page (DP-148 dims a disabled label on
+        # purpose). The guard holds the body read-only at full contrast.
+        self._readOnly.setLocked(locked)
         self._revert.setEnabled(not locked)
         if locked:
             self._update.setEnabled(False)
             self._preview.setEnabled(False)
         self._lockChildTables(locked)
+        if getattr(self, '_expertToggle', None) is not None:
+            self._apply_tiers()
 
     def _lockChildTables(self, locked: bool) -> None:
         """DP-1190. Tell this page's row tables -- and an editor open over
@@ -607,6 +710,38 @@ class EngineTaskPage(QWidget):
     def isResultLocked(self) -> bool:
         return self._resultLockedFlag
 
+    def isReadOnly(self) -> bool:
+        """Whether the settings body refuses input (the step is locked)."""
+        return self._readOnly.isLocked()
+
+    def _stays_live_when_locked(self, widget) -> bool:
+        """A locked page still folds, unfolds and shows its details: those
+        change what is on screen, never a setting."""
+        return (isinstance(widget, FolderHeader)
+                or widget is getattr(self, '_detailsLink', None)
+                or widget is getattr(self, '_expertToggle', None))
+
+    def _on_lock_confirming(self, confirming: bool) -> None:
+        """The ask line takes the filter box's place while it is up."""
+        if confirming:
+            self._filter.setVisible(False)
+        else:
+            self._filter.setVisible(bool(self._editors or self._panels))
+
+    def _unlock_ask(self) -> tuple:
+        """``(short, whole)``: what unlocking this step discards.
+
+        Read from the same preview the confirmation reads, so the line names
+        the later steps that go back to not done (mockup `.ask`).
+        """
+        try:
+            preview = query(self._client, 'mesh.workflow.unlock_preview',
+                            {'engine_id': self.engine_id,
+                             'task_id': self.task_id}).payload or {}
+        except Exception:                                    # noqa: BLE001
+            preview = {}
+        return unlock_ask_text(preview, self.task_id)
+
     def setRunStageAvailable(self, available: bool, reason: str = '') -> None:
         """Gate the per-stage run button and say why when it is shut.
 
@@ -619,6 +754,100 @@ class EngineTaskPage(QWidget):
         self._runStage.setAccessibleDescription(
             self.tr('Run only this step, leaving the rest of the mesh alone.')
             if available else str(reason or ''))
+
+    # -- Plan 40 UXA4: where the page's secondary acts live ---------------- #
+
+    def hasEditsToCommit(self) -> bool:
+        """Whether this page has anything an edit could be committed to."""
+        return bool(self._editors or self._panels)
+
+    def footerActions(self) -> list:
+        """``(object name, label, tooltip, callback)`` for the footer's menu.
+
+        Only the acts that can be pressed now: a disabled Preview is not
+        offered. Preview only shows what an edit would change; Update
+        preview saves the edit without leaving the page.
+        """
+        actions = []
+        # Plan 43 LY13 (D4, D-009). The one stage run no footer press
+        # performs (`gmsh.publish`, *Publish again*) is offered here, where
+        # the page used to draw a button for it.
+        if (self.run_stage and self.run_stage_on_page
+                and self._runStage.isEnabled()):
+            actions.append((
+                'footerPublishAgain' if self.run_stage == 'publish'
+                else 'footerRunStage',
+                self.tr(self.run_stage_label),
+                self._runStage.accessibleDescription(),
+                self._runStage.click))
+        if not self.hasEditsToCommit():
+            return actions
+        if self._preview.isEnabled():
+            actions.append((
+                'footerPreviewOnly', self.tr('Preview only'),
+                self.tr('Show what the pending edit would change, without '
+                        'saving it.'), self.preview))
+        if self._update.isEnabled():
+            actions.append((
+                'footerUpdatePreview', self.tr('Update preview'),
+                self.tr('Save the pending edit and stay on this page.'),
+                self.apply))
+        return actions
+
+    def headerActions(self) -> list:
+        """``(object name, label, enabled, tooltip, callback)`` per act.
+
+        The same four rows on every page, in the same order; the branch adds
+        *Restore previous mesh*, which belongs to the case, not the page.
+        """
+        commits = self.hasEditsToCommit()
+        unlocked = not self._resultLockedFlag
+        # Plan 40 UXD4: a saved setting off its default is something to reset
+        # as much as a pending one is.
+        resettable = any(editor.canReset() for editor in self._all_editors())
+        details = self.detailRows() > 0
+        return [
+            ('taskRevertAndEdit', self.tr('Revert and edit'),
+             commits and unlocked,
+             '' if commits and unlocked else self.tr(
+                 'Nothing on this page can be reverted.'),
+             self.revert),
+            ('taskDetails', self.tr('Details…'), details,
+             '' if details else self.tr(
+                 'This step has no calculated settings to show.'),
+             self.showDetails),
+            ('taskResetDefaults', self.tr('Reset page to defaults'),
+             resettable and unlocked,
+             '' if resettable and unlocked else self.tr(
+                 'Every setting on this page is already at its default.'),
+             self.resetToDefaults),
+        ]
+
+    def _all_editors(self) -> list:
+        """This page's editors and those of the panels it adopted."""
+        found = list(self._editors.values())
+        for panel in self._panels:
+            found.extend(getattr(panel, '_editors', {}).values())
+        return found
+
+    def resetToDefaults(self) -> int:
+        """Put every editable field back to its registry default.
+
+        Pending only: nothing is saved until the page is updated, so the
+        press can be undone with *Revert and edit*. Returns how many fields
+        moved.
+        """
+        moved = 0
+        for editor in list(self._all_editors()):
+            try:
+                # `resetToDefault` sets the default and announces the edit
+                # through `valueChanged`, which is `_on_field_changed` here.
+                if not editor.resetToDefault():
+                    continue
+            except Exception:                                # noqa: BLE001
+                continue
+            moved += 1
+        return moved
 
     def runAllRefusal(self) -> str:
         """Why the whole-pipeline run cannot start, or `''` if it can.
@@ -643,7 +872,6 @@ class EngineTaskPage(QWidget):
         do. Pages that can read the target say which one they mean.
         """
         self._runStage.setText(str(text))
-        fit_to_text(self._runStage)
 
     def runStageLabel(self) -> str:
         return self._runStage.text()
@@ -690,11 +918,17 @@ class EngineTaskPage(QWidget):
 
     def _make_group(self, title: str) -> QGroupBox:
         box = QGroupBox(title, self)
-        # DP-105. Guided and Advanced are two halves of one page and used to
-        # be laid out by whatever the style handed each of them; on Compute
-        # Mesh that put their field columns at different x and their rows at
-        # different pitches. One call, one scale, both groups.
-        apply_form_metrics(QFormLayout(box))
+        # Plan 44 MF14. The form is the sheet's grid -- label | editor | unit
+        # on one row, 6 px apart -- and not a QFormLayout, which sizes its
+        # label column per form and wraps a label above its editor in a
+        # narrow column. DP-105 (one scale for Guided and Advanced) is kept:
+        # `_align_field_columns` shares ONE label width between every form
+        # on the page, capped at 44 % of the page.
+        form = SheetForm(box)
+        form.setContentsMargins(0, 0, 0, 0)
+        # An untitled card (Advanced and Expert sit under their own fold
+        # header) does not reserve the title's 26 px.
+        box.setProperty('foammeshUntitled', not title)
         self._body_layout.addWidget(box)
         return box
 
@@ -837,6 +1071,10 @@ class EngineTaskPage(QWidget):
         self._populate_fields(fields)
         self._populate_calculated(self._task.get('fields', []))
         self._update_empty_sections()
+        # Plan 41 GN25c. "field: 4" beside every control the size field has
+        # proposed a value for.
+        from foammesh.view.sizing import badges as sizing_badges
+        sizing_badges.apply_to_page(self)
         # Plan 33 SIZE-01. The note is not a standing paragraph any more, so
         # a refresh clears it: it is written at the moment of an edit that
         # has a downstream cost and taken away again when the edit is gone.
@@ -943,6 +1181,14 @@ class EngineTaskPage(QWidget):
             return dict(self.page_model().get('titles') or {})
         except Exception:                                    # noqa: BLE001
             return {}
+
+    def tellFailure(self, title: str, text: str) -> None:
+        """Plan 41 GN18. Say why a write was refused, without blocking."""
+        self._failureNote.setText(f'{title}: {text}')
+        self._failureNote.setVisible(True)
+
+    def clearFailure(self) -> None:
+        self._failureNote.setVisible(False)
 
     def refresh_status(self) -> None:
         """Re-read just this task's live state.
@@ -1169,6 +1415,16 @@ class EngineTaskPage(QWidget):
         dialog.open()
         return dialog
 
+    def _box_has_live_row(self, box) -> bool:
+        """False only when the box holds editors and none of them applies."""
+        mine = [editor for editor in self._editors.values()
+                if box.isAncestorOf(editor.editor)]
+        if not mine:
+            return True
+        layout = box.layout()
+        rows = layout.rowCount() if hasattr(layout, 'rowCount')             else layout.count()
+        return rows > sum(1 for editor in mine if not editor.isRowShown())
+
     def _update_empty_sections(self) -> None:
         """Hide the boxes that have nothing in them.
 
@@ -1178,44 +1434,77 @@ class EngineTaskPage(QWidget):
         blank page. What the task does is in its description; the boxes only
         earn their space once they hold something.
         """
-        self._guided.setVisible(self._guided.layout().count() > 0)
-        has_advanced = self._advanced.layout().count() > 0
+        # Plan 40 UXB6 (#53). A box whose every row is taken away by its
+        # clause is as empty as one with no rows.
+        self._guided.setVisible(
+            self._guided.layout().count() > 0
+            and self._box_has_live_row(self._guided))
+        has_advanced = (self._advanced.layout().count() > 0
+                        and self._box_has_live_row(self._advanced))
         self._advancedHeader.setVisible(has_advanced)
         # Visible only when there is something to show *and* the disclosure is
         # open; setVisible(True) here would re-open a section the user closed.
+        # Plan 40 UXD3: while the filter has text it decides, not the fold.
         self._advanced.setVisible(
-            has_advanced and self._advancedHeader.isChecked())
+            has_advanced and (self._advancedHeader.isChecked()
+                              or bool(self.filterText())))
+        self._update_expert_chrome()
         # Plan 33 FORM-02. The link, not the table: the table belongs to the
         # Details dialog now, and the link is only worth a row on the form
         # when that dialog would have something in it.
-        self._detailsLink.setVisible(bool(self.detailRows()))
+        # Plan 40 UXA4 (#25). Details moved to the header's ... menu.
+        self._detailsLink.setVisible(False)
         # Plan 33 SIZE-05. Preview, Update and Revert and edit commit an edit
         # to this page's own settings. A page with no editor and no adopted
         # panel has no edit to commit -- MEASURED, the qualification and
         # report pages of both engines are in that position -- and on those
         # pages `apply` returned at its first line and `preview` at its own,
         # so three live-looking buttons did nothing at all.
-        commits = bool(self._editors or self._panels)
-        for button in self._commitButtons:
-            button.setVisible(commits)
+        # Plan 40 UXA4: these stay out of the page; see ``headerActions``.
 
     def _set_warnings(self, warnings) -> None:
-        """Show what the derivation changed about this task's request.
+        """Keep what the derivation changed, without a banner over the fields.
 
-        Hidden when empty rather than left as a blank line: an always-present
-        warning area reads as "checked, nothing wrong" even before anything has
-        been checked.
+        Plan 40 UXB2 (#50). The fields say what was derived ("Auto (15.4 mm)"),
+        so nothing sits above them. The sentences are still the status line's
+        tooltip and ``warningTexts()``, for a reader who wants the reasons.
         """
         texts = [str(text) for text in warnings if str(text).strip()]
-        self._warnings.setText(
-            '' if not texts else
-            self.tr('Applied with changes:') + '\n'
-            + '\n'.join(f'• {text}' for text in texts))
-        self._warnings.setVisible(bool(texts))
+        self._warningTexts = tuple(texts)
+        self._warnings.setText('')
+        self._warnings.setVisible(False)
+        status = getattr(self, '_status', None)
+        if status is not None:
+            status.setToolTip(
+                '\n'.join('- ' + text for text in texts))
+
+    def warningTexts(self) -> tuple:
+        """The derivation sentences the last status read carried."""
+        return tuple(getattr(self, '_warningTexts', ()))
+
+    def effective_values(self) -> dict:
+        """``{field id: 'words'}`` for the unset fields this page can resolve.
+
+        Plan 40 UXB2 (#38). The default asks the one sizing source; a page that
+        resolves more overrides it. A field missing here shows whose default
+        applies.
+        """
+        from foammesh.view.workflow_controls.effective_values import (
+            size_effective_texts,
+        )
+        return size_effective_texts(self._client, tuple(self._editors))
+
+    def _apply_effective_values(self) -> None:
+        try:
+            effective = self.effective_values()
+        except Exception:                                    # noqa: BLE001
+            effective = {}
+        for field_id, editor in self._editors.items():
+            editor.set_effective(effective.get(field_id))
 
     def _populate_fields(self, fields) -> None:
         for layout in (self._guided.layout(), self._advanced.layout(),
-                       *self.field_forms()):
+                       self._expert.layout(), *self.field_forms()):
             while layout.count():
                 item = layout.takeAt(0)
                 if item.widget() is not None:
@@ -1224,11 +1513,19 @@ class EngineTaskPage(QWidget):
             # rows are still there, now blank, and the next addRow lands below
             # them. Left alone, a page whose fields land in a form of its own
             # grew a row of blank space per refresh.
-            if isinstance(layout, QFormLayout):
+            if isinstance(layout, (QFormLayout, SheetForm)):
                 while layout.rowCount():
                     layout.removeRow(0)
         self._editors.clear()
         self._advanced_fields.clear()
+        self._expert_fields.clear()
+        # A page with no Essential field has nothing for a fold to sit under:
+        # its Common settings are the form, and are drawn as such.
+        has_essential = any(
+            tier_of(item['field_id']) == ESSENTIAL for item in fields
+            if '{id}' not in item['field_id']
+            and item['field_id'] not in FIELD_REGISTRY.collections
+            and self.renders_field(item['field_id']))
         for field in fields:
             field_id = field['field_id']
             # Repeatable child definitions carry an "/{id}/" template segment;
@@ -1252,13 +1549,22 @@ class EngineTaskPage(QWidget):
                 # silently rendering something the schema cannot back.
                 self._add_unbacked_notice(field_id)
                 continue
-            editor = FieldEditor(descriptor, self)
+            editor = FieldEditor(descriptor, self,
+                                 choices=self.field_choices(field_id))
             editor.valueChanged.connect(self._on_field_changed)
             classification = _classification(field.get('classification'))
-            advanced = classification not in _GUIDED
-            box = self._advanced if advanced else self._guided
-            if advanced:
+            # Plan 40 UXD4. The registry's tier, not the classification,
+            # decides where a field sits: Essential in the form, Common
+            # behind the fold, Expert behind the switch.
+            tier = editor.tier
+            if tier == EXPERT:
+                box = self._expert
+                self._expert_fields.append(field_id)
+            elif tier == COMMON and has_essential:
+                box = self._advanced
                 self._advanced_fields.append(field_id)
+            else:
+                box = self._guided
             form = self.field_form(field_id, classification)
             parent = box
             if form is None:
@@ -1276,6 +1582,7 @@ class EngineTaskPage(QWidget):
             # alignment gives every one of them the same width, so a row with
             # `deg` and a row with nothing end their editors at the same x.
             row.addWidget(editor.unit_label)
+            row.addWidget(editor.badge_label)
             container = QWidget(parent)
             container.setLayout(row)
             form.addRow(editor.label, container)
@@ -1285,6 +1592,21 @@ class EngineTaskPage(QWidget):
             editor.setRow(form, container)
             self._editors[field_id] = editor
         self.reload_values()
+        # Plan 40 UXD3. A rebuild keeps what the reader typed in the filter.
+        text = self.filterText()
+        for editor in self._editors.values():
+            editor.setFilterText(text)
+        self._filter.setVisible(bool(self._editors or self._panels))
+        self._apply_tiers()
+
+    def field_choices(self, field_id: str):
+        """Options to offer *field_id* as a picker, or ``None`` for its own editor.
+
+        Plan 43 D1. A page whose field names another row of the case (the
+        background box names a Hex6 volume) offers those rows by name,
+        ``[(label, value, status, enabled), ...]``, rather than a typed id.
+        """
+        return None
 
     def renders_field(self, field_id: str) -> bool:
         """Whether this page draws its own editor for one of its task's fields.
@@ -1352,6 +1674,7 @@ class EngineTaskPage(QWidget):
             self._inactive_fields = refresh_applicability(
                 self._client, self._editors, self._pending)
             self._refresh_advanced_header()
+        self._apply_effective_values()
         # After applicability, not before: CP-09 appends " (inactive)"
         # to a label it rules out, and a column measured before that
         # would be re-measured the moment the text changed. Outside the
@@ -1359,6 +1682,10 @@ class EngineTaskPage(QWidget):
         # panels with no editors of its own and those panels still need
         # aligning with each other (DP-154).
         self._align_field_columns()
+
+    #: Plan 44 MF14: the one label column of the page.
+    _labelWidths = None
+    _all_forms_cache = ()
 
     def _align_field_columns(self) -> None:
         """Guided and Advanced are two halves of one page: one column.
@@ -1372,14 +1699,24 @@ class EngineTaskPage(QWidget):
         claimed fields into is aligned with them, because it is on the
         same page and reads as part of the same form.
         """
-        forms = [self._guided.layout(), self._advanced.layout()]
+        forms = [self._guided.layout(), self._advanced.layout(),
+                 self._expert.layout()]
         forms.extend(self.field_forms())
         forms.extend(self.aligned_forms())
-        align_form_columns(forms)
+        forms = [form for form in forms if form is not None]
+        # Plan 44 MF14. One label column for every form on the page: the
+        # widest label, capped at 44 % of the width the page is given. The
+        # watcher re-measures when the page is resized.
+        if self._labelWidths is None:
+            self._labelWidths = LabelWidthWatcher(
+                self._body, lambda: self._all_forms_cache)
+        self._all_forms_cache = forms
+        self._labelWidths.run()
         # DP-156. The same set of forms, the other end of the row: one width
         # for the unit suffixes, so every editor in the column ends at the
         # same x whether its unit is `deg`, `cells` or nothing.
         align_unit_column(forms)
+        self._dedupe_expert_toggles()
 
     def aligned_forms(self):
         """Forms the page does not own but which read as part of its form.
@@ -1415,7 +1752,41 @@ class EngineTaskPage(QWidget):
         panel.setEmbedded()
         panel.dirtyChanged.connect(self._on_panel_dirty)
         self._panels.append(panel)
+        if hasattr(panel, 'setFilterText'):
+            panel.setFilterText(self.filterText())
+        self._filter.setVisible(True)
         return panel
+
+    # -- page filter (Plan 40 UXD3) ----------------------------------------- #
+
+    def filterText(self) -> str:
+        """What the filter box holds, one space between the words."""
+        return ' '.join(self._filter.text().split())
+
+    def setFilterText(self, text: str) -> None:
+        """Type into the filter box, as the reader would."""
+        self._filter.setText(str(text or ''))
+
+    def _on_filter_text(self, _text: str = '') -> None:
+        text = self.filterText()
+        for editor in self._editors.values():
+            editor.setFilterText(text)
+        for panel in self._panels:
+            if hasattr(panel, 'setFilterText'):
+                panel.setFilterText(text)
+        self._apply_tiers()
+        self._update_empty_sections()
+
+    def filterBox(self):
+        return self._filter
+
+    def visibleFieldIds(self) -> tuple:
+        """Field ids whose row is on screen now, this page and its panels."""
+        found = [field_id for field_id, editor in self._editors.items()
+                 if editor.isRowShown()]
+        for panel in self._panels:
+            found.extend(getattr(panel, 'visibleFieldIds', lambda: ())())
+        return tuple(found)
 
     def panels(self):
         """The panels this page has adopted, in mounting order."""
@@ -1424,6 +1795,131 @@ class EngineTaskPage(QWidget):
     def _on_panel_dirty(self, dirty: bool) -> None:
         self._set_dirty(bool(self._pending))
 
+    # -- tiers (Plan 40 UXD4) ---------------------------------------------- #
+
+    def _on_advanced_touched(self, *_args) -> None:
+        # Only a change the page did not make itself is the reader's.
+        if not self._applyingTiers:
+            self._advancedTouched = True
+
+    def _on_expert_visibility(self, _shown=None) -> None:
+        self._apply_tiers()
+        self._update_empty_sections()
+
+    def _apply_tiers(self) -> None:
+        """Show or take away Expert rows, and fold Common unless it is live.
+
+        Hidden rows keep their editors and their values: a field the reader
+        cannot see is still the value the run reads, and still in `_editors`.
+        """
+        shown = expert_visibility().shown()
+        for field_id in self._expert_fields:
+            editor = self._editors.get(field_id)
+            if editor is not None:
+                editor.setTierHidden(not shown)
+        if not self._advancedTouched:
+            # Open when a Common setting is off its default (a fold that hides
+            # a setting somebody changed is as misleading as a greyed one);
+            # folded otherwise.
+            self._applyingTiers = True
+            try:
+                # Plan 44 FIT (DP-2667). A finished step is read, not set:
+                # its Advanced stays folded, and the header still counts what
+                # is off its default, so nothing is hidden unsaid.
+                self._advancedHeader.setChecked(
+                    self._common_changed() > 0
+                    and not self._resultLockedFlag)
+            finally:
+                self._applyingTiers = False
+            self._advanced.setVisible(
+                self._advanced.layout().count() > 0
+                and self._advancedHeader.isChecked())
+        self._refresh_advanced_header()
+        self._update_expert_chrome()
+
+    def _off_default(self, field_id: str) -> bool:
+        """Whether a field, as the page now has it, is off its default."""
+        editor = self._editors.get(field_id)
+        if editor is None or not editor.applies():
+            return False
+        if field_id in self._pending:
+            return not same_as_default(
+                self._pending[field_id], editor.descriptor.default)
+        return not editor.isAtDefault()
+
+    def _common_changed(self) -> int:
+        return sum(1 for field_id in self._advanced_fields
+                   if self._off_default(field_id))
+
+    def _expert_changed(self) -> int:
+        return sum(1 for field_id in self._expert_fields
+                   if self._off_default(field_id))
+
+    def _update_expert_chrome(self) -> None:
+        """The switch, and the Expert box, only where there is something."""
+        live = [self._editors[field_id] for field_id in self._expert_fields
+                if self._editors.get(field_id) is not None
+                and self._editors[field_id].applies()]
+        filtering = bool(self.filterText())
+        self._expertToggle.setVisible(bool(live) and not filtering)
+        shown = expert_visibility().shown()
+        box_rows = [editor for editor in live
+                    if self._expert.isAncestorOf(editor.editor)]
+        if filtering:
+            self._expert.setVisible(
+                any(editor.isRowShown() for editor in box_rows))
+        else:
+            self._expert.setVisible(bool(box_rows) and shown)
+        changed = self._expert_changed()
+        base = self.tr('Show expert settings')
+        self._expertToggle.setText(
+            base if shown or not changed
+            else f'{base} ({changed} not at default)')
+        self._dedupe_expert_toggles()
+
+    def expertToggles(self) -> list:
+        """Every *Show expert settings* switch this page draws, page and panels.
+
+        Plan 44 MF14 (audit B12). The switch is one application-wide setting,
+        and a page that adopts a panel carrying expert settings of its own drew
+        two of them (snappy Snap: the page's, and the Mesher limits panel's).
+        """
+        from shiboken6 import isValid
+        toggles = [self._expertToggle]
+        for panel in self._panels:
+            toggles.append(getattr(panel, '_expertToggle', None))
+        return [toggle for toggle in toggles
+                if toggle is not None and isValid(toggle)]
+
+    def _dedupe_expert_toggles(self) -> None:
+        """Keep exactly one switch on the page: the page's, else a panel's.
+
+        The panel's switch is hidden while the page's is showing, and kept
+        hidden: the panel re-shows it each time its tiers are applied, so the
+        hide is a filter on the switch rather than a one-off ``setVisible``.
+        """
+        toggles = self.expertToggles()
+        if len(toggles) < 2:
+            return
+        own = self._expertToggle
+        keep = own if own in toggles and not own.isHidden() else None
+        if keep is None:
+            # The page has no expert setting of its own: the first panel's
+            # switch is the page's switch; the rest are duplicates of it.
+            keep = next((t for t in toggles if t is not own), None)
+        for toggle in toggles:
+            if toggle is keep:
+                _release_duplicate(toggle)
+            else:
+                _hold_duplicate(toggle)
+
+    def tierCounts(self) -> dict:
+        """``{tier: number of fields on this page}``, for a gate."""
+        counts = {ESSENTIAL: 0, COMMON: 0, EXPERT: 0}
+        for editor in self._editors.values():
+            counts[editor.tier] = counts.get(editor.tier, 0) + 1
+        return counts
+
     def _refresh_advanced_header(self) -> None:
         """Say on the closed header when something behind it is not default.
 
@@ -1431,15 +1927,7 @@ class EngineTaskPage(QWidget):
         one that greys a setting that is live.  The count is what the header
         is for: it is read without opening anything.
         """
-        changed = 0
-        for field_id in self._advanced_fields:
-            editor = self._editors.get(field_id)
-            if editor is None:
-                continue
-            default = editor.descriptor.default
-            value = self._pending.get(field_id, editor.value())
-            if default is not None and value != default:
-                changed += 1
+        changed = self._common_changed()
         self._advancedHeader.setText(
             self._advancedTitle if not changed
             else f'{self._advancedTitle}  ({changed} not at default)')
@@ -1492,6 +1980,12 @@ class EngineTaskPage(QWidget):
     def _on_field_changed(self, field_id: str, value) -> None:
         self._pending[field_id] = value
         self._set_dirty(True)
+        # Plan 40 UXB6. A dependant follows its master as it is ticked.
+        if follows_master(self._editors, field_id):
+            self._inactive_fields = refresh_applicability(
+                self._client, self._editors, None,
+                overrides=dict(self._pending))
+            self._update_empty_sections()
         # Plan 33 SIZE-01. Here and nowhere else: the moment of an edit with
         # a downstream consequence is the moment that consequence is worth a
         # line, and this is the path every edit on this page already takes.
@@ -1521,7 +2015,10 @@ class EngineTaskPage(QWidget):
         patch: dict = {}
         for panel in self._panels:
             patch.update(panel.pending_patch())
-        patch.update(self._pending)
+        patch.update(
+            (field_id, value) for field_id, value in self._pending.items()
+            if self._editors.get(field_id) is None
+            or self._editors[field_id].applies())
         return patch
 
     def preview(self) -> None:
@@ -1652,6 +2149,7 @@ class EngineTaskPage(QWidget):
         # only the edits it carried are taken off the page: a value typed
         # while it was on its way is the user's next edit, not this one.
         carried = self.pending_patch()
+        self._failureNote.setVisible(False)
         try:
             landed = asyncio.get_running_loop().create_future()
         except RuntimeError:
@@ -1660,8 +2158,8 @@ class EngineTaskPage(QWidget):
         def applied(result):
             try:
                 if not self._patch_accepted(result, carried):
-                    QMessageBox.warning(
-                        self, self.tr('Update failed'),
+                    self.tellFailure(
+                        self.tr('Update failed'),
                         str(getattr(result, 'message', '')
                             or self.tr('The facade rejected the edit.')))
             finally:
@@ -1781,8 +2279,8 @@ class EngineTaskPage(QWidget):
                 message = str(getattr(result, 'message', '') or '') or self.tr(
                     'This task edit is no longer the latest reversible '
                     'change; no unrelated change was undone.')
-                QMessageBox.warning(
-                    self, self.tr('Revert failed'),
+                self.tellFailure(
+                    self.tr('Revert failed'),
                     self.tr('The earlier values could not be restored, so the '
                             'task keeps the ones it has. It is reopened for '
                             'editing.\n\n{0}').format(message))

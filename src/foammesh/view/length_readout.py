@@ -15,6 +15,7 @@ it, and so that a triple meant to be compared is printed to one precision
 rather than to three.
 """
 
+from foammesh.core import display_unit
 from foammesh.core.quantities import aligned, format_group, unit_for
 
 __all__ = ['aligned', 'format_extent', 'format_lengths', 'unit_for']
@@ -28,7 +29,11 @@ def format_extent(extent: float) -> str:
     """
     if extent <= 0:
         return ''
-    scale, suffix = unit_for(extent)
+    if display_unit.is_chosen():
+        # Plan 40 UXB3 (#58): the project display unit, not a guess per number.
+        scale, suffix = 1.0 / display_unit.metres_per_unit(), display_unit.current()
+    else:
+        scale, suffix = unit_for(extent)
     return f'{extent * scale:.4g} {suffix} across'
 
 
@@ -41,4 +46,8 @@ def format_lengths(values) -> str:
     lengths = [float(value) for value in values]
     if not lengths or min(lengths) <= 0:
         return ''
+    if display_unit.is_chosen():
+        body = ' × '.join(aligned(
+            length / display_unit.metres_per_unit() for length in lengths))
+        return f'{body} {display_unit.current()}'
     return format_group(lengths)

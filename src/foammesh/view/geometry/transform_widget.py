@@ -7,6 +7,7 @@ from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
 
 from foammesh.support.pfloat import PFloat
+from foammesh.view import inline_error
 from foammesh.view.theming.metrics import place_unit
 from widgets.async_message_box import AsyncMessageBox
 
@@ -100,7 +101,7 @@ class TransformWidget(QWidget):
             y = float(PFloat(self._ui.scaleY.text(), self.tr('Scaling factor Y')))
             z = float(PFloat(self._ui.scaleZ.text(), self.tr('Scaling factor Z')))
         except ValueError as e:
-            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
+            inline_error.show(self, str(e))
             self._ui.scale.setEnabled(True)
             return
 
@@ -132,7 +133,7 @@ class TransformWidget(QWidget):
             axisY = float(PFloat(self._ui.axisY.text(), self.tr('Rotation axis Y')))
             axisZ = float(PFloat(self._ui.axisZ.text(), self.tr('Rotation axis Z')))
         except ValueError as e:
-            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
+            inline_error.show(self, str(e))
             self._ui.rotate.setEnabled(True)
             return
 
@@ -173,7 +174,7 @@ class TransformWidget(QWidget):
             y = float(PFloat(self._ui.translateY.text(), self.tr('Translation offset Y')))
             z = float(PFloat(self._ui.translateZ.text(), self.tr('Translation offset Z')))
         except ValueError as e:
-            await AsyncMessageBox().warning(self, self.tr('Input error'), str(e))
+            inline_error.show(self, str(e))
             self._ui.translate.setEnabled(True)
             return
 

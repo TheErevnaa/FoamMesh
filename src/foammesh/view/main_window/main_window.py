@@ -4,19 +4,23 @@
 import asyncio
 import logging
 import platform
+import warnings
 from functools import partial
 
 import qasync
 from filelock import Timeout
 from foammesh.core.quantities import aligned
 from logging.handlers import RotatingFileHandler
+from foammesh.support.deferred_log import DeferredHandler
 from pathlib import Path
 from typing import Optional
-from PySide6.QtWidgets import (QDialog, QLabel, QMainWindow, QFileDialog,
+from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QMainWindow, QMenu, QFileDialog,
                                QMessageBox, QInputDialog, QVBoxLayout,
-                               QTabWidget, QPlainTextEdit, QWidget)
-from PySide6.QtCore import Signal, QEvent, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeySequence
+                               QTabWidget, QPlainTextEdit, QSizePolicy,
+                               QWidget, QPushButton)
+from PySide6.QtCore import QObject, QRect, Signal, QEvent, Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction, QDesktopServices, QGuiApplication, QKeySequence, QShortcut)
 
 from analytics import Analytics
 from app_properties import meshAppProperties
@@ -28,7 +32,8 @@ from foammesh.db.configurations_schema import Shape, Step
 from widgets.async_dialog import asyncExec
 from widgets.async_message_box import AsyncMessageBox
 from widgets.new_project_dialog import NewProjectDialog
-from widgets.progress_dialog import ProgressDialog
+from widgets.progress_dialog import ProgressDialog, closeProgressWindowsOf
+from foammesh.db.project import StateSaveCancelled
 
 from foammesh.app import app
 from foammesh.core.facade import FacadeError
@@ -44,10 +49,14 @@ from foammesh.core.mesh import (
     RepairOperation, RepairRequest,
 )
 from foammesh.core.quality import MeshCheckService
-from foammesh.core.quality import discover_cell_set_files
+from foammesh.core.quality import discover_cell_set_files, sets_of_this_mesh
+from foammesh.rendering import layers_grown
+
+#: The legend of the volume's exterior colouring in the viewport's stack.
+VOLUME_LEGEND_KEY = 'meshColour'
 from foammesh.core.quality import (QualityReport, apply_layer_coverage,
                                    apply_waivers,
-                                   verdict_from_report)
+                                   verdict_from_report, verdict_with_gate)
 from foammesh.core.project import Event
 from foammesh.core.import_export import (
     ConverterFormat, ConverterImportService, extract_converter_warnings,
@@ -55,10 +64,13 @@ from foammesh.core.import_export import (
 from foammesh.view.display_control.display_control import (
     DisplayControl, countedPartIds)
 from foammesh.view.display_control import view_modes
+from foammesh.view.engine_context import (
+    configured_engine, engine_from_listing, refresh_engine_context,
+    refresh_mesh_provenance,
+    wire_mesh_provenance)
 from foammesh.view.widgets.job_progress import JobProgressWidget
 from foammesh.view.widgets.justification_dialog import JustificationDialog
 from foammesh.view.widgets.mesh_import_dialog import MeshImportDialog
-from foammesh.view.menu.mesh_quality.mesh_quality_parameters_dialog import MeshQualityParametersDialog
 from foammesh.view.menu.help.about_dialog import AboutDialog
 from foammesh.view.menu.help.license_dialog import LicenseDialog
 from foammesh.support import lifecycle
@@ -68,20 +80,28 @@ from foammesh.view.workflow_controls.task_page import EngineTaskPage
 from foammesh.view.menu.mesh import MeshInfoDialog, QualityDashboardDialog, TransformDialog
 from foammesh.view.geometry.geometry_manager import GeometryManager
 from widgets.themed_icon import load_themed_icon
+from foammesh.view.widget_factory import compose, make
 from .recent_files_menu import RecentFilesMenu
-from .naviagtion_view import NavigationView
+from .navigation_view import NavigationView
+from .step_ribbon import StepRibbon
 from .rendering_tool import RenderingTool
 from .console_view import Console
+from .run_panel import install_run_panel
 from foammesh.core.mesh.presentation import count_text
 from .mesh_composition import cell_count_text, composition_text
 from .mesh_manager import MeshManager
 from .step_manager import StepManager
+from .history_panel import HistoryPanel
+from .notification_centre import install_notification_centre
 from .main_window_ui import Ui_MainWindow
 from .recovery_offer import offer_recovery
 from .wsl_health_bar import WslHealthBar, show_runtime_diagnostics
 from .retry_prompt import RetryPrompt
+from .dock_layout import OUTLINE_DOCK, dock_the_regions
+from .settings_sheet import NOTE as SETTINGS_SHEET_NOTE, SettingsSheet
 from .three_region_shell import (
-    install_three_region_shell, layout_worth_recording, reveal_output_band,
+    REGION_A_MINIMUM, install_three_region_shell, layout_worth_recording,
+    reveal_output_band,
 )
 from .output_tabs import OutputTabRegistry
 from .capture_manager import CaptureManager
@@ -94,7 +114,13 @@ from foammesh.core.viewport_state import (
     ViewStateError, delete_view, load_views, save_view)
 from foammesh.view.display_control.region_picker import (
     RegionFilter, picker_entries)
-from foammesh.view.display_control.viewport_overlay import ViewportOverlay
+from foammesh.view.display_control.viewport_overlay import (
+    ViewportOverlay, part_role)
+from foammesh.view.main_window.shortcut_registry import (
+    REGISTRY as SHORTCUTS, adopt as adoptShortcut)
+from foammesh.view.main_window.viewport_rail import ViewportRail
+from foammesh.view.main_window.viewport_tool_edges import ViewportToolEdges
+from foammesh.view.main_window.legend_controller import LegendController
 from foammesh.view.display_control.deviation_panel import (
     DeviationPanel, deviationScalarBar)
 from foammesh.core.quality.geometry_fidelity import live_distance
@@ -107,6 +133,7 @@ from foammesh.view.outside_task import modal
 
 from .run_narration import describe_cancellation, describe_start
 from .run_status_strip import RunStatusStrip
+from widgets import async_message_box as messages
 
 
 logger = logging.getLogger(__name__)
@@ -146,6 +173,22 @@ def holdBatchLock(ui, locked: bool) -> None:
         ui.actionRedo.setEnabled(False)
 
 
+class _ChipClick(QObject):
+    """Turns a left click on the collapsed verdict chip into a signal."""
+
+    clicked = Signal()
+
+    def eventFilter(self, watched, event):
+        if (event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+                and watched.rect().contains(event.position().toPoint())):
+            # A click on Details has its own handler; leave it be.
+            child = watched.childAt(event.position().toPoint())
+            if not isinstance(child, QPushButton):
+                self.clicked.emit()
+        return False
+
+
 class MainWindow(QMainWindow):
     _vtkReaderProgress = Signal(str)
     _closeTriggered = Signal(bool)
@@ -154,6 +197,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._ui = Ui_MainWindow()
         self._ui.setupUi(self)
+        # Plan 40 UXE1 (F7b). The keys the user rebound apply to every
+        # shortcut made from here on.
+        SHORTCUTS.attach(app.settings)
+        # Plan 40 UXE4 (F7e): a model dragged from the file manager imports.
+        self.setAcceptDrops(True)
         self._threeRegionShell = install_three_region_shell(self._ui)
         # Non-visual compatibility alias for controller/tests that inspect the
         # former member. It is permanent and has no hide/toggle action.
@@ -162,13 +210,40 @@ class MainWindow(QMainWindow):
             app.settings, 'getThreeRegionLayout', lambda: {})()
         self._savedRegionSizes = layout_state.get('sizes')
         self._regionSplitterUserMoved = False
+        # Plan 40 UXC3. The regions live in Qt-ADS docks from here on; the
+        # saved arrangement (which dock floated, where, on which screen) is
+        # restored before the sizes are applied.
+        self._dockLayout = dock_the_regions(self._ui, self._threeRegionShell)
+        # Plan 43 LY3. A layout saved before the settings sheet is not
+        # applied (it is kept under a backup key for a release); whoever had
+        # one is told once.
+        self._layoutNoteDue = bool(getattr(
+            app.settings, 'migrateLayout', lambda: False)())
+        saved_docks = getattr(app.settings, 'getDockLayout', lambda: None)()
+        if saved_docks is not None:
+            self._dockLayout.restore(saved_docks)
+        self._settingsSheet = SettingsSheet(
+            layout=self._dockLayout, region_b=self._ui.regionBHost,
+            host=self._ui.regionCHost, stack=self._ui.content,
+            store=app.settings, step_name=self._currentStepName,
+            parent=self)
+        self._ui.settingsSheet = self._settingsSheet
+        if self._layoutNoteDue:
+            QTimer.singleShot(0, self._showLayoutNote)
+        self._dockLayout.regions.moved.connect(
+            lambda: setattr(self, '_regionSplitterUserMoved', True))
+        self._dockLayout.arrangementChanged.connect(
+            lambda: self._applyRegionSizes())
         self._threeRegionShell.apply_sizes(
             max(self.width(), 1280), self._savedRegionSizes)
-        self._ui.regionSplitter.splitterMoved.connect(
-            lambda *_args: setattr(
-                self, '_regionSplitterUserMoved', True))
         QTimer.singleShot(0, self._applyRegionSizes)
-        self.setMinimumWidth(self._threeRegionShell.minimum_window_width)
+        # Plan 43 LY2. The outline dock is retired, so its minimum width is
+        # not a width the window has to keep.
+        self.setMinimumWidth(
+            self._threeRegionShell.minimum_window_width - REGION_A_MINIMUM
+            - self._dockLayout.regions.handleWidth()
+            if self._dockLayout.isRetired(OUTLINE_DOCK)
+            else self._threeRegionShell.minimum_window_width)
 
         self._applyThemedIcons()
         if app.themeManager is not None:
@@ -178,10 +253,6 @@ class MainWindow(QMainWindow):
 
         self._ui.renderingSplitter.setStretchFactor(0, 0)
         self._ui.renderingSplitter.setStretchFactor(1, 1)
-        self._ui.regionSplitter.setStretchFactor(0, 0)
-        self._ui.regionSplitter.setStretchFactor(1, 0)
-        self._ui.regionSplitter.setStretchFactor(2, 1)
-        self._ui.regionSplitter.adjustSize()
 
         self._recentFilesMenu = RecentFilesMenu(self._ui.menuOpen_Recent)
         self._recentFilesMenu.setRecents(app.settings.getRecentCases())
@@ -192,6 +263,13 @@ class MainWindow(QMainWindow):
         # method is chosen -- so the pane has to be able to follow it.
         self._navigationView.paneWidthChanged.connect(
             lambda _width: self._applyRegionSizes())
+        # MF27. The sheet header read the outline's current row only when the
+        # page stack changed, which happens before an engine route moves the
+        # current row: snappy "5. Base grid" was headed "4. Domain & regions".
+        # Follow the outline itself, as the ribbon does.
+        self._navigationView.outlineChanged.connect(
+            self._settingsSheet.refresh_step_name)
+        self._installOutlineRail()
         self._displayControl = DisplayControl(self._ui)
         self._renderingTool = RenderingTool(self._ui)
         self._outputTabs = OutputTabRegistry(self._ui.regionCTabHost)
@@ -207,10 +285,38 @@ class MainWindow(QMainWindow):
         self._meshQualityTab = MeshQualityTab()
         self._outputTabs.register_permanent(
             'quality', self._meshQualityTab, self.tr('Mesh quality'))
+        # Plan 40 UXD1: the live run panel, fed by the same job events.
+        self._runPanel = install_run_panel(self._outputTabs)
         self._verdictStrip = self._ui.meshVerdictStrip
         self._verdictStrip.activated.connect(self.showQualityReport)
+        # Plan 43 LY9. A failed check names the step to look at, and the strip
+        # opens it.
+        from foammesh.view.engine_context import read_engine
+        self._verdictStrip.engineProvider = lambda: read_engine(
+            app.facadeClient.checkout())
+        self._verdictStrip.stepRequested.connect(self.openLikelyStep)
+        self._installOutputBandControls()
+        # Plan 40 UXC4: taskbar progress, flash, opt-in notification.
+        from foammesh.view.main_window.job_attention import (
+            install_job_attention)
+        self._jobAttention = install_job_attention(
+            self, app.events, self._ui.menuView, settings=app.settings)
         self._meshQualityTab.acceptRequested.connect(self._acceptMeshQuality)
+        self._meshQualityTab.runCheckRequested.connect(
+            self._runMeshCheckDashboard)
         self._meshQualityTab.elementSelected.connect(self._focusQualityElement)
+        # Plan 39 VI8: the ranked worst-cell list is asked for from the tab.
+        self._meshQualityTab.rankRequested.connect(
+            lambda metric: self._displayControl.meshQualityInfo()
+            .requestRanking(self._meshQualityTab, metric,
+                            self._meshQualityTab.rank_count()))
+        self._wireQualityInspector()
+        self._meshQualityTab.saveSelectionRequested.connect(
+            self._saveElementSelection)
+        self._meshQualityTab.showSelectionRequested.connect(
+            self._showElementSelection)
+        self._meshQualityTab.deleteSelectionRequested.connect(
+            self._deleteElementSelection)
         #: WP3.3. Auto-raise Quality when a run finishes -- console is what a
         #: user wants *during* a run, quality *after* -- but never once the user
         #: has chosen a tab themselves, or it steals focus mid-read.
@@ -233,6 +339,11 @@ class MainWindow(QMainWindow):
         self._failedCellSetIndex: int = -1
         self._meshManager = None
         self._stepManager = StepManager(self._navigationView, self._ui)
+        # Plan 40 UXC5 (F6d). The status bar keeps what it is told, behind a
+        # bell with a *Go to* for each entry.
+        install_notification_centre(
+            self, self._notificationTarget, self._goToNotification)
+        self._installTopBand()
         self.setTabOrder(
             self._ui.workflowStepTree, self._ui.wizardBackButton)
         self.setTabOrder(
@@ -285,16 +396,33 @@ class MainWindow(QMainWindow):
         self._captureManager = CaptureManager(
             self._ui.renderingView, self._displayControl)
         self._viewportOverlay = ViewportOverlay(self._ui.renderingView)
-        self._viewportOverlay.move(12, 12)
+        # FX1 (DP-2620). Placed by the clear area (`_placeViewportOverlay`),
+        # not once in view coordinates: at (12, 12) it sat under the sheet.
         self._viewportOverlay.show()
         # DP-713. The deviation colouring's histogram, figures and legend.
         self._deviationPanel = DeviationPanel(self._ui.renderingView)
         self._deviationPanel.toleranceChanged.connect(
             self._deviationToleranceEdited)
+        self._deviationPanel.scaleChanged.connect(
+            self._deviationScaleEdited)
+        self._deviationPanel.surfaceToggled.connect(
+            self._deviationSurfaceToggled)
         self._deviationLegend = None
         self._deviationToleranceMm = None
+        # Plan 43 LY11. One legend: Patches / Quality / Deviation.
+        self._legendController = LegendController(
+            self, self._ui.renderingView)
+        qualityInfo = self._displayControl.meshQualityInfo()
+        qualityInfo.highlightingChanged.connect(
+            lambda _on: self._legendController.refresh())
+        qualityInfo.scaleChanged.connect(self._legendController.refresh)
         self._displayControl.cutTool().addMirror(
             self._viewportOverlay.sectionPanel())
+        self._installViewportRail()
+        self._installClearAreaFloats()
+        self._displayControl.cutTool().hidePageCopy()
+        self._adoptPreviewNotice()
+        self._installResourceUsageAction()
         self._connectViewportControls()
 
         self._dialog = None
@@ -312,14 +440,29 @@ class MainWindow(QMainWindow):
 
         self._installStepHelpActions()
         self._installDiagnosticsActions()
+        self._installShortcutsHelp()
         #: Plan 35 CR0 step 6: the banner about a session that died, if any.
         self._crashNotice = None
 
         self._setupShortcuts()
 
         self._connectSignalsSlots()
-
-        self._ui.regionValidationMessage.hide()
+        self._installConsoleMenu()
+        self._installMeshQualityViews()
+        self._wireClearAreaConsumers()
+        # Plan 43 LY8. The View actions made above, laid out in the groups of
+        # the plan's section 6.
+        from foammesh.view.main_window.view_menu import install_view_menu
+        install_view_menu(self)
+        # Plan 43 LY3 / LY8. The settings column is a sheet; View > Settings
+        # sheet (LY8's entries) is read by it.
+        self._settingsSheet.bind_view_state(
+            self._viewState, self._viewMenu)
+        # The tool edges read the View menu's choices (pins, bottom bar,
+        # Parts panel and chip, how the edges are revealed).
+        self._viewportToolEdges.bindViewState(self._viewState)
+        self._qualityViews.bind(self._viewState,
+                                show_report=self.showQualityReport)
 
         # Plan 30 WP-08 (F-09). What a run did is said in one line, without
         # taking the window away, instead of in a modal raised over the
@@ -339,6 +482,11 @@ class MainWindow(QMainWindow):
         self._runStatusStrip.cancelRequested.connect(self._cancelRunningJobs)
         self._runStatusStrip.offerAccepted.connect(self._drawOfferedResult)
         self._runStatusStrip.logRequested.connect(self._openRunLog)
+        # VI12 (F6c). The strip's Cancel used to be reachable only through
+        # Help > Run details. While a run is going, a copy of the strip is
+        # docked under the page footer, where the Cancel of the run is looked
+        # for; the Run details view keeps the strip itself.
+        self._runDockStrip = self._dockRunStrip()
         #: CP-02. The earlier accepted result the strip is currently offering,
         #: set when a run ends with no mesh of its own. Never drawn until the
         #: user takes the offer.
@@ -358,10 +506,29 @@ class MainWindow(QMainWindow):
         runDetailsOuter.addWidget(self._runDetailsTabs)
         runDetailsPage = QWidget(self._runDetailsTabs)
         self._runDetailsTabs.addTab(runDetailsPage, self.tr('Last run'))
-        self._runHistoryText = QPlainTextEdit(self._runDetailsTabs)
+        # UXD7. The tab is the History panel: every step Undo and Redo walk
+        # (settings changes and mesh stage runs), with a jump to any of them;
+        # the case's recorded transactions stay readable beneath it.
+        historyPage = QWidget(self._runDetailsTabs)
+        historyLayout = QVBoxLayout(historyPage)
+        self._historyPanel = HistoryPanel(historyPage)
+        self._historyPanel.jumpRequested.connect(self._jumpHistory)
+        historyLayout.addWidget(self._historyPanel, 2)
+        self._runHistoryText = QPlainTextEdit(historyPage)
         self._runHistoryText.setObjectName('runHistoryText')
         self._runHistoryText.setReadOnly(True)
-        self._runDetailsTabs.addTab(self._runHistoryText, self.tr('History'))
+        historyLayout.addWidget(self._runHistoryText, 1)
+        self._runDetailsTabs.addTab(historyPage, self.tr('History'))
+        self._historyTab = historyPage
+        self._historyAction = QAction(self.tr('&History…'), self)
+        self._historyAction.setObjectName('actionHistory')
+        self._historyAction.setToolTip(self.tr(
+            'List the steps undo and redo walk, and go to any of them'))
+        self._historyAction.triggered.connect(lambda *_: self.showHistory())
+        self._ui.menuEdit.addAction(self._historyAction)
+        # Undo and Redo name the newest step as the menu opens, whatever
+        # recorded it (a mesh stage run records one without an event).
+        self._ui.menuEdit.aboutToShow.connect(self._updateMenuStates)
         runDetailsLayout = QVBoxLayout(runDetailsPage)
         # The strip hides itself when there is nothing to say, so the view
         # says that in words rather than opening on an empty rectangle.
@@ -386,6 +553,20 @@ class MainWindow(QMainWindow):
         fit = getFit(geometry, screen.availableGeometry())
         self.setGeometry(fit)
 
+    def _dockRunStrip(self):
+        """Mount the run strip's docked copy under the footer, or None."""
+        bar = getattr(self._ui, 'wizardActionBar', None)
+        host = bar.parentWidget() if bar is not None else None
+        layout = host.layout() if host is not None else None
+        if layout is None:
+            return None
+        dock = RunStatusStrip(host, docked=True)
+        layout.insertWidget(layout.indexOf(bar) + 1, dock, 0)
+        dock.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._runStatusStrip.addMirror(dock)
+        return dock
+
     @property
     def renderingView(self):
         return self._ui.renderingView
@@ -396,7 +577,638 @@ class MainWindow(QMainWindow):
 
     def showOutputTab(self, key: str):
         """Select one existing Region C output without changing Regions A/B."""
+        self.openOutputBand()
         return self._outputTabs.show(key)
+
+    # -- Plan 40 UXC2: the output band on demand, and focus mode -------------- #
+
+    # -- Plan 43 LY5: the clear area and the centring ---------------------- #
+
+    @property
+    def clearArea(self):
+        """The controller that centres the model between the sheet and the
+        console. The settings sheet registers itself with
+        ``clearArea.add_occluder(sheet, 'left' | 'right')``."""
+        return self._clearArea
+
+    # -- Plan 44 MF3: the top band, the status strip, the clear area ---------- #
+
+    #: The top band is 60 px: the menu bar and the step ribbon.
+    MENU_HEIGHT = 24
+
+    def _installTopBand(self) -> None:
+        """One 60 px band over the viewport: a 24 px menu above a 36 px
+        ribbon, with no margin, gap or gutter between it and the view."""
+        self.menuBar().setFixedHeight(self.MENU_HEIGHT)
+        central = self.centralWidget()
+        layout = central.layout() if central is not None else None
+        if layout is not None:
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+        # The viewport's frame: no gutter at its right or bottom either.
+        box = getattr(self._ui, 'groupBox_24', None)
+        if box is not None and box.layout() is not None:
+            box.layout().setContentsMargins(0, 0, 0, 0)
+        # The run and progress strip lives in the status strip (U7): the
+        # viewport's own copy of it stays off the picture. Its Cancel is the
+        # status strip's, and reaches every wait the same way.
+        self._runHostInStatusBar = True
+        self._syncStripToStatusBar()
+
+    def _syncStripToStatusBar(self) -> None:
+        view = getattr(getattr(self, '_ui', None), 'renderingView', None)
+        strip = getattr(view, '_strip', None)
+        setter = getattr(strip, 'setSuppressed', None)
+        if callable(setter):
+            setter(bool(getattr(self, '_runHostInStatusBar', False)))
+
+    def _syncSizeGrip(self) -> None:
+        """No size grip when maximised; a grip when the window is a window."""
+        bar = self.statusBar()
+        if hasattr(bar, 'setSizeGripEnabled'):
+            bar.setSizeGripEnabled(
+                not (self.isMaximized() or self.isFullScreen()))
+
+    def _applyCaption(self) -> None:
+        """Q5: the caption in the chrome colour (a no-op off Windows)."""
+        try:
+            from foammesh.view.theming import window_frame
+            manager = getattr(app, 'themeManager', None)
+            tokens = getattr(manager, 'tokens', None)
+            if tokens is None:
+                return
+            window_frame.apply_caption(
+                self, dark=(manager.resolved_name == 'dark'),
+                caption=tokens.value('background.chrome'),
+                border=tokens.value('border.default'))
+        except Exception:                                    # noqa: BLE001
+            logger.debug('the caption colour was not applied', exc_info=True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._applyCaption()
+        self._syncSizeGrip()
+
+    def clearRectOfView(self):
+        """The clear area in the viewport's pixels: the view's own
+        ``clearRect()`` (Plan 44 MF7), else the controller's."""
+        view = self._ui.renderingView
+        accessor = getattr(view, 'clearRect', None)
+        rect = accessor() if callable(accessor) else None
+        if isinstance(rect, QRect):
+            return rect
+        controller = getattr(self, '_clearArea', None)
+        return controller.clearRect() if controller is not None else None
+
+    def _wireClearAreaConsumers(self) -> None:
+        """What lays itself out against the clear area is told when it moves.
+
+        * MF23: the layout-C inspector card is hosted on the view and placed
+          in the clear area; it shows while the model is coloured by quality.
+        * MF16: the worst-value labels keep inside the clear rectangle.
+        """
+        self._meshQualityTab.attach_inspector_card(
+            self._ui.renderingView, self.clearRectOfView)
+        self._syncInspectorOnModel()
+        card = self._meshQualityTab.inspector_card()
+        if card is not None:
+            # DP-2685: the layout-C inspector card is a floating item too, so
+            # the viewport overlay (placed last) stands off it.
+            from foammesh.view.main_window import clear_area as ca
+            self._clearArea.add_float(card, ca.FLOAT_RANK_PANEL, card.place)
+            self._placeViewportOverlay()
+        self._clearArea.changed.connect(self._clearRectChanged)
+        info = self._displayControl.meshQualityInfo()
+        info.highlightingChanged.connect(
+            lambda _on: self._syncInspectorOnModel())
+
+    def _clearRectChanged(self, _rect=None) -> None:
+        layer = getattr(getattr(self, '_qualityViews', None), '_layer', None)
+        if layer is not None:
+            self.feedClearRect(layer)
+
+    def feedClearRect(self, layer) -> None:
+        """Give a ``WorstLabelLayer`` the clear rectangle: render pixels,
+        y down, as ``clear_area.clear_rect`` returns it."""
+        from foammesh.view.main_window.clear_area import clear_rect
+        controller = self._clearArea
+        view = self._ui.renderingView
+        layer.set_clear_rect(clear_rect(
+            int(view.width()), int(view.height()), controller.insets()))
+
+    def _syncInspectorOnModel(self) -> None:
+        """The inspector card follows the colouring: on while the model is
+        coloured by quality (the Quality view mode, or the poor cells
+        highlighted)."""
+        control = getattr(self, '_displayControl', None)
+        getter = getattr(control, 'meshQualityInfo', None)
+        info = getter() if callable(getter) else None
+        highlighting = bool(info is not None and info.isHighlighting())
+        colour_mode = (view_modes.QUALITY
+                       if self._viewMode == view_modes.QUALITY
+                       or highlighting else '')
+        tab = getattr(self, '_meshQualityTab', None)
+        if tab is None:
+            return
+        tab.set_inspector_on_model(
+            colour_mode == view_modes.QUALITY)
+
+    def _installClearArea(self, band) -> None:
+        from foammesh.view.main_window.clear_area import ClearAreaController
+        self._clearArea = ClearAreaController(self._ui.renderingView)
+        self._clearArea.add_occluder(band.band_widget, 'bottom')
+        band.subscribe_geometry(self._clearArea.update)
+        # The settings sheet (Plan 43 LY3) is an occluder while it floats or
+        # is minimised to its tab; pinned, it sits in the dock beside the
+        # viewport and takes nothing from it (its frame is hidden then).
+        sheet = getattr(self, '_settingsSheet', None)
+        if sheet is not None:
+            self.registerSheet(sheet.frame, lambda: sheet.side, tab=sheet.tab)
+            sheet.changed.connect(self._clearArea.update)
+        # Plan 43 section 1: re-centre on every sheet, console and tab change.
+        # A tab or page change can resize either without a Resize reaching the
+        # watcher first (the tab's content sets the band's wanted height).
+        for source, signal in (
+                (getattr(self._ui, 'regionCTabHost', None), 'currentChanged'),
+                (getattr(self._ui, 'content', None), 'currentChanged')):
+            if source is not None and hasattr(source, signal):
+                getattr(source, signal).connect(
+                    lambda *_a: self._clearArea.update())
+
+    def _installClearAreaFloats(self) -> None:
+        """FX1 (DP-2620, DP-2621). The floating items of the clear area keep
+        off one another by one rule (`ClearAreaController.add_float`): the
+        rail's popovers and the notice strip first, then the Parts chip, the
+        legend (bound by its controller) and last the viewport overlay, which
+        stands at the clear area's top left and follows it."""
+        from foammesh.view.main_window import clear_area as ca
+        controller = self._clearArea
+        rail = getattr(self, '_viewportRail', None)
+        if rail is not None:
+            for key in rail.tools():
+                popover = rail.popover(key)
+                if popover is not None:
+                    controller.add_float(popover, ca.FLOAT_RANK_POPOVER)
+        getter = getattr(self._ui.renderingView, 'noticeStrip', None)
+        strip = getter() if callable(getter) else None
+        if isinstance(strip, QWidget):
+            controller.add_float(strip, ca.FLOAT_RANK_NOTICE)
+        edges = getattr(self, '_viewportToolEdges', None)
+        chip = edges.chip() if edges is not None else None
+        if chip is not None:
+            controller.add_float(chip, ca.FLOAT_RANK_CHIP)
+        panel = getattr(self, '_deviationPanel', None)
+        if panel is not None:
+            # V16 (DP-2650): the deviation panel stands in the clear area.
+            controller.add_float(panel, ca.FLOAT_RANK_PANEL, panel.place)
+            panel.setClearArea(controller)
+        controller.add_float(self._viewportOverlay, ca.FLOAT_RANK_OVERLAY,
+                             self._placeViewportOverlay)
+        self._placeViewportOverlay()
+
+    def viewportOverlayRect(self) -> QRect:
+        """Where the viewport overlay should stand, in the view's pixels: the
+        clear area's top left, 6 px in, below the top pill when the two
+        share columns (the Parts chip's rule), and off every floating item
+        placed before it."""
+        from foammesh.view.main_window.clear_area import OVERLAY_INSET
+        overlay = self._viewportOverlay
+        controller = self._clearArea
+        clear = controller.clearRect()
+        wanted = overlay.rect().translated(clear.x() + OVERLAY_INSET,
+                                           clear.y() + OVERLAY_INSET)
+        edges = getattr(self, '_viewportToolEdges', None)
+        top_rect = getattr(edges, '_topRect', None)
+        if callable(top_rect):
+            try:
+                pill = top_rect().adjusted(-OVERLAY_INSET, -OVERLAY_INSET,
+                                           OVERLAY_INSET, OVERLAY_INSET)
+            except (RuntimeError, AttributeError, TypeError):
+                pill = None
+            if pill is not None and wanted.intersects(pill):
+                wanted.moveTop(pill.bottom() + 1)
+        return controller.place_clear_of(overlay, wanted)
+
+    def _placeViewportOverlay(self) -> None:
+        overlay = getattr(self, '_viewportOverlay', None)
+        if overlay is None or getattr(self, '_clearArea', None) is None:
+            return
+        rect = self.viewportOverlayRect()
+        if overlay.pos() != rect.topLeft():
+            overlay.move(rect.topLeft())
+
+    def registerSheet(self, sheet, side='left', *, tab=None) -> None:
+        """Make the settings sheet (floating or pinned, left or right) and
+        its minimised tab occluders of the viewport (Plan 43 LY5)."""
+        self._clearArea.register_sheet(sheet, side, tab=tab)
+
+    def openOutputBand(self) -> None:
+        """Open the band under the viewport (a run, a failure, a click)."""
+        band = getattr(self._ui, 'regionCBandController', None)
+        if band is not None:
+            band.open()
+
+    def _installOutputBandControls(self) -> None:
+        """Wire Ctrl+J, F11 / Esc, the chip click and the run triggers."""
+        from foammesh.view.main_window.console_band import ConsoleLayout
+        band = self._ui.regionCBandController.configure(
+            layout=ConsoleLayout.from_dict(
+                getattr(app.settings, 'getConsoleLayout', lambda: {})()),
+            window_height=self.height,
+            current_tab_key=lambda: self._outputTabs.key_for_current(),
+            save=lambda value: getattr(
+                app.settings, 'updateConsoleLayout',
+                lambda _v: None)(value.to_dict()))
+        self._ui.regionCBandController = band
+        # Plan 43 LY4 (DP-1660): the console is docked at the sheet's edge.
+        band.follow_sheet(self._settingsSheet)
+        band.subscribe_geometry(self._applyRegionSizes)
+        self._installClearArea(band)
+        self._bandAction = self._ui.menuView.addAction(
+            self.tr('Output pa&nel'))
+        self._bandAction.setObjectName('actionOutputBand')
+        self._bandAction.setShortcut('Ctrl+J')
+        adoptShortcut('view.outputBand', self._bandAction)
+        self._bandAction.setCheckable(True)
+        self._bandAction.setToolTip(self.tr(
+            'Show or hide the console and the Mesh quality report under '
+            'the viewport'))
+        self._bandAction.triggered.connect(lambda _checked=False: self._toggleBand())
+        self._arrangeAction = self._ui.menuView.addAction(
+            self.tr('Arran&ge panels'))
+        self._arrangeAction.setObjectName('actionArrangePanels')
+        self._arrangeAction.setCheckable(True)
+        self._arrangeAction.setToolTip(self.tr(
+            'Show the title bars of the outline and the settings column so '
+            'they can be dragged, tabbed together or floated'))
+        self._arrangeAction.toggled.connect(
+            lambda on: self._dockLayout.set_title_bars(on))
+        self._resetLayoutAction = self._ui.menuView.addAction(
+            self.tr('Standard la&yout'))
+        self._resetLayoutAction.setObjectName('actionResetLayout')
+        self._resetLayoutAction.setToolTip(self.tr(
+            'Put the outline, the settings column, the console and the '
+            'viewport back where they start, and forget the saved '
+            'arrangement'))
+        self._resetLayoutAction.setShortcut('Ctrl+0')
+        adoptShortcut('view.standardLayout', self._resetLayoutAction)
+        self._resetLayoutAction.triggered.connect(
+            lambda _checked=False: self.resetLayout())
+        self._focusAction = self._ui.menuView.addAction(
+            self.tr('Focu&s mode'))
+        self._focusAction.setObjectName('actionFocusMode')
+        self._focusAction.setShortcut('F11')
+        adoptShortcut('view.focusMode', self._focusAction)
+        self._focusAction.setCheckable(True)
+        self._focusAction.setToolTip(self.tr(
+            'Hide the outline, the page and the output panel so the model '
+            'fills the window. Esc brings them back.'))
+        self._focusAction.triggered.connect(
+            lambda _checked=False: self._toggleFocusMode())
+        # Esc only means something while focus mode is on; off, it is left to
+        # dialogs, popups and the console's search bar.
+        self._focusEscape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._focusEscape.setContext(Qt.ShortcutContext.WindowShortcut)
+        adoptShortcut('view.focusExit', self._focusEscape)
+        self._focusEscape.setEnabled(False)
+        self._focusEscape.activated.connect(self._toggleFocusMode)
+        band.subscribe(self._bandStateChanged)
+        # The chip is a button as a whole: a click anywhere on it opens the band.
+        self._bandChipFilter = _ChipClick(self)
+        self._verdictStrip.installEventFilter(self._bandChipFilter)
+        self._bandChipFilter.clicked.connect(self._toggleBand)
+        # A run starting and a run failing both bring the console up.
+        self._bandUnsubscribes = [
+            app.events.subscribe(Event.JOB_STARTED, self._onJobOpensBand),
+            app.events.subscribe(Event.JOB_FAILED, self._onJobFailsBand),
+            app.events.subscribe(Event.JOB_FINISHED, self._onJobEndsBand),
+            app.events.subscribe(Event.JOB_CANCELLED, self._onJobEndsBand),
+        ]
+        self._bandStateChanged(band.is_open, band.in_focus_mode)
+
+    def _installConsoleMenu(self) -> None:
+        """Plan 43 LY4: View > Console, the console's choices in one place.
+
+        The existing View actions (Output panel, Ctrl+J; Console, Ctrl+Shift+C;
+        Notify when a run ends) stay where they are; the submenu holds them
+        too, with the new ones beside them."""
+        from foammesh.view.main_window.console_band import (
+            HEIGHT_PRESETS, WIDTH_PRESETS, exclusive_group)
+        from foammesh.view.main_window.shortcut_registry import (
+            REGISTRY as _SHORTCUTS)
+        band = self._ui.regionCBandController
+        menu = self._ui.menuView.addMenu(self.tr('Conso&le'))
+        menu.setObjectName('menuConsole')
+        self._consoleMenu = menu
+        menu.addAction(self._bandAction)
+        self._minimiseAction = menu.addAction(self.tr('&Minimised'))
+        self._minimiseAction.setObjectName('actionConsoleMinimised')
+        self._minimiseAction.setCheckable(True)
+        self._minimiseAction.setShortcut('Ctrl+`')
+        adoptShortcut('view.consoleMinimise', self._minimiseAction)
+        self._minimiseAction.setToolTip(self.tr(
+            'Fold the console to a 28 px header, or open it again'))
+        self._minimiseAction.triggered.connect(
+            lambda _checked=False: band.toggle_minimised())
+        # Ctrl+Shift+C stays on the View > Console action it always was on;
+        # this entry reaches the same tab from the submenu. The key is shown
+        # as a hint after the tab (DP-1659); it is not bound a second time.
+        openTab = menu.addAction(
+            self.tr('Open at the &console tab') + '\t'
+            + ', '.join(_SHORTCUTS.keys('view.console')))
+        openTab.setObjectName('actionConsoleOpenAtTab')
+        openTab.triggered.connect(lambda _c=False: self.showOutputTab('console'))
+        self._openOnRunAction = menu.addAction(
+            self.tr('Open when a run &starts'))
+        self._openOnRunAction.setObjectName('actionConsoleOpenOnRun')
+        self._openOnRunAction.setCheckable(True)
+        self._openOnRunAction.setChecked(band.layout.open_on_run)
+        self._openOnRunAction.toggled.connect(band.set_open_on_run)
+        notify = getattr(self._jobAttention, 'action', None)
+        if notify is not None:
+            menu.addAction(notify)
+        menu.addSeparator()
+        heightGroup = exclusive_group(self)
+        height_menu = menu.addMenu(self.tr('&Height'))
+        height_menu.setObjectName('menuConsoleHeight')
+        self._consoleHeightActions = {}
+        for value in (None,) + HEIGHT_PRESETS:
+            text = (self.tr('Standard') if value is None
+                    else self.tr('%1 px').replace('%1', str(value)))
+            action = height_menu.addAction(text)
+            action.setObjectName(
+                'actionConsoleHeight' + ('Standard' if value is None
+                                         else str(value)))
+            action.setCheckable(True)
+            heightGroup.addAction(action)
+            action.triggered.connect(
+                lambda _c=False, v=value: band.set_height(v))
+            self._consoleHeightActions[value] = action
+        widthGroup = exclusive_group(self)
+        width_menu = menu.addMenu(self.tr('&Width'))
+        width_menu.setObjectName('menuConsoleWidth')
+        self._consoleWidthActions = {}
+        for value in (None,) + WIDTH_PRESETS:
+            text = (self.tr('To the right edge') if value is None
+                    else self.tr('%1 px').replace('%1', str(value)))
+            action = width_menu.addAction(text)
+            action.setObjectName(
+                'actionConsoleWidth' + ('Edge' if value is None
+                                        else str(value)))
+            action.setCheckable(True)
+            widthGroup.addAction(action)
+            action.triggered.connect(
+                lambda _c=False, v=value: band.set_width(v))
+            self._consoleWidthActions[value] = action
+        band.subscribe_geometry(self._consoleMenuState)
+        band.subscribe(lambda _open, _focus: self._consoleMenuState())
+        self._consoleMenuState()
+
+    def _installMeshQualityViews(self) -> None:
+        """Plan 43 LY10: the Mesh quality tab's layout, the worst values on
+        the model and the statistics caption, and their View menus."""
+        from foammesh.view.main_window.quality_views import (
+            install_quality_views)
+
+        views = install_quality_views(self, self._meshQualityTab, app.settings)
+        self._qualityViews = views
+        info = self._displayControl.meshQualityInfo()
+        for signal in (info.scaleChanged, info.highlightingChanged):
+            signal.connect(lambda *_a: views.refresh())
+        info.availabilityChanged.connect(
+            lambda available: None if available else views.clear())
+
+    def _consoleMenuState(self) -> None:
+        """Keep the Console submenu's checks true to the band."""
+        band = self._ui.regionCBandController
+        if not hasattr(self, '_consoleHeightActions'):
+            return
+        self._minimiseAction.blockSignals(True)
+        self._minimiseAction.setChecked(band.is_minimised)
+        self._minimiseAction.blockSignals(False)
+        for table, current in ((self._consoleHeightActions,
+                                band.layout.height),
+                               (self._consoleWidthActions,
+                                band.layout.width)):
+            match = current if current in table else 'custom'
+            for key, action in table.items():
+                action.setChecked(key == match)
+
+    def _installOutlineRail(self) -> None:
+        """Plan 43 LY2. The step ribbon replaces the Outline dock.
+
+        The outline tree stays as the model the ribbon reads; the ribbon is
+        one line under the menu bar. Ctrl+B keeps its key and means the
+        ribbon's compact form (numbers only); Ctrl+PageUp and Ctrl+PageDown
+        step between the usable steps.
+        """
+        ribbon = StepRibbon(self._navigationView, self)
+        self._stepRibbon = ribbon
+        self._dockLayout.host_box.insertWidget(0, ribbon)
+        # The ribbon is one 36 px line; a gap under it would be a second line.
+        self._dockLayout.host_box.setSpacing(0)
+        self._dockLayout.host_box.setContentsMargins(0, 0, 0, 0)
+        ribbon.setOptions(getattr(
+            app.settings, 'getStepRibbon', lambda: {})())
+        ribbon.optionsChanged.connect(self._onRibbonOptionsChanged)
+        # Plan 44 F4. A tab that cannot be used yet says why on the status
+        # bar when it is clicked (the mockup's flash); the step stays shut.
+        ribbon.unavailableClicked.connect(
+            lambda text: self.statusBar().showMessage(text, 8000))
+
+        view = self._ui.menuView
+        self._railAction = view.addAction(self.tr('Step ribbon: &numbers only'))
+        self._railAction.setObjectName('actionOutlineRail')
+        self._railAction.setShortcut('Ctrl+B')
+        adoptShortcut('view.outlineRail', self._railAction)
+        self._railAction.setCheckable(True)
+        self._railAction.setToolTip(self.tr(
+            'Show the step ribbon as step numbers only, or with full labels '
+            'again'))
+        self._railAction.triggered.connect(
+            lambda _checked=False: self.toggleOutlineRail())
+        self._navigationView.railToggleRequested.connect(
+            self.toggleOutlineRail)
+
+        self._ribbonColourAction = view.addAction(
+            self.tr('Step ribbon: colour by &state'))
+        self._ribbonColourAction.setObjectName('actionStepRibbonColour')
+        self._ribbonColourAction.setCheckable(True)
+        self._ribbonColourAction.toggled.connect(ribbon.setColourByState)
+        self._ribbonLocksAction = view.addAction(
+            self.tr('Step ribbon: show &locks'))
+        self._ribbonLocksAction.setObjectName('actionStepRibbonLocks')
+        self._ribbonLocksAction.setCheckable(True)
+        self._ribbonLocksAction.toggled.connect(ribbon.setShowLocks)
+        self._stepPreviousAction = view.addAction(self.tr('Previous step'))
+        self._stepPreviousAction.setObjectName('actionStepPrevious')
+        self._stepPreviousAction.setShortcut('Ctrl+PgUp')
+        adoptShortcut('view.stepPrevious', self._stepPreviousAction)
+        self._stepPreviousAction.triggered.connect(
+            lambda _checked=False: ribbon.step(-1))
+        self._stepNextAction = view.addAction(self.tr('Next step'))
+        self._stepNextAction.setObjectName('actionStepNext')
+        self._stepNextAction.setShortcut('Ctrl+PgDown')
+        adoptShortcut('view.stepNext', self._stepNextAction)
+        self._stepNextAction.triggered.connect(
+            lambda _checked=False: ribbon.step(1))
+        self._syncRibbonActions()
+        # The page column tells the window how wide the page on screen needs
+        # to be, so a wide table page gets its room in a large window.
+        self._ui.regionBPageColumn.wantedWidthChanged.connect(
+            lambda _width: self._applyRegionSizes())
+
+    def _syncRibbonActions(self) -> None:
+        ribbon = self._stepRibbon
+        for action, checked in ((self._railAction, ribbon.numbersOnly()),
+                                (self._ribbonColourAction, ribbon.colourByState()),
+                                (self._ribbonLocksAction, ribbon.showLocks())):
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+
+    def _onRibbonOptionsChanged(self, record: dict) -> None:
+        self._syncRibbonActions()
+        getattr(app.settings, 'setStepRibbon', lambda _r: None)(record)
+    def _currentStepName(self) -> str:
+        """The step on screen, for the minimised settings sheet's tab."""
+        try:
+            tree = self._navigationView._tree
+            return str(tree.currentIndex().data(Qt.ItemDataRole.DisplayRole)
+                       or '').strip()
+        except (AttributeError, RuntimeError):
+            return ''
+
+    def _showLayoutNote(self) -> None:
+        """Plan 43 LY3. The one-time note after the saved layout was retired."""
+        try:
+            self.statusBar().showMessage(SETTINGS_SHEET_NOTE, 30000)
+        except RuntimeError:                # the window is already gone
+            pass
+
+    def resetLayout(self) -> None:
+        """View > Reset layout: the default arrangement and default sizes."""
+        band = getattr(self._ui, 'regionCBandController', None)
+        if band is not None and band.in_focus_mode:
+            band.leave_focus()
+        if band is not None and hasattr(band, 'standard'):
+            band.standard()
+        self._restoreColourStandard()
+        self._threeRegionShell.set_rail(False)
+        self._stepRibbon.setOptions({})
+        getattr(app.settings, 'setStepRibbon', lambda _r: None)(
+            self._stepRibbon.options())
+        self._syncRibbonActions()
+        self._arrangeAction.setChecked(False)
+        self._dockLayout.reset()
+        # Plan 43 LY8. Ctrl+0: the View menu's own choices go back too.
+        viewState = getattr(self, '_viewState', None)
+        if viewState is not None:
+            viewState.reset_layout()
+        self._settingsSheet.reset()
+        self._regionSplitterUserMoved = False
+        self._savedRegionSizes = None
+        getattr(app.settings, 'updateThreeRegionLayout', lambda **_kw: None)(
+            sizes=None, active_output=self._outputTabs.key_for_current())
+        getattr(app.settings, 'updateDockLayout', lambda _r: None)(None)
+        self._applyRegionSizes()
+        clear_area = getattr(self, '_clearArea', None)
+        if clear_area is not None:
+            clear_area.reset()
+
+    def _restoreColourStandard(self) -> None:
+        """Ctrl+0 puts the colour back to the user's standard (Plan 43 section
+        4). The standard itself arrives with LY11/LY12; until it is saved
+        there is nothing to restore and the colour is left as it is."""
+        standard = getattr(app.settings, 'getColourStandard', lambda: None)()
+        apply = getattr(self._ui.renderingView, 'applyColourStandard', None)
+        if standard and apply is not None:
+            apply(standard)
+
+    def toggleOutlineRail(self) -> bool:
+        """Ctrl+B. Returns whether the step ribbon shows numbers only after."""
+        band = getattr(self._ui, 'regionCBandController', None)
+        if band is not None and band.in_focus_mode:
+            # The ribbon is hidden in focus mode; Ctrl+B waits for Esc.
+            return self._stepRibbon.numbersOnly()
+        self._stepRibbon.setNumbersOnly(not self._stepRibbon.numbersOnly())
+        self._syncRibbonActions()
+        return self._stepRibbon.numbersOnly()
+
+    def _onJobOpensBand(self, **_kwargs) -> None:
+        try:
+            self._ui.regionCBandController.run_started()
+        except RuntimeError:        # the window is being torn down
+            pass
+
+    def _onJobFailsBand(self, **_kwargs) -> None:
+        try:
+            self._ui.regionCBandController.run_failed()
+        except RuntimeError:
+            pass
+
+    def _onJobEndsBand(self, **_kwargs) -> None:
+        """UXR: a band a run opened folds once the last run has ended well.
+
+        The wait lets a pipeline's next job start before the band flickers
+        shut and open again."""
+        try:
+            band = self._ui.regionCBandController
+            band.run_ended()
+            QTimer.singleShot(1500, self._settleBand)
+            # A stage run is a step in the undo history; the Edit menu's Undo
+            # (label, and whether it is enabled at all) must say so.
+            QTimer.singleShot(1500, self._refreshMenusAfterRun)
+        except RuntimeError:
+            pass
+
+    def _refreshMenusAfterRun(self) -> None:
+        try:
+            self._updateMenuStates()
+        except RuntimeError:        # the window is being torn down
+            pass
+
+    def _settleBand(self) -> None:
+        try:
+            self._ui.regionCBandController.settle_after_runs()
+        except RuntimeError:
+            pass
+
+    def _toggleBand(self) -> None:
+        self._ui.regionCBandController.toggle()
+
+    def _toggleFocusMode(self) -> None:
+        self._ui.regionCBandController.toggle_focus()
+
+    def inFocusMode(self) -> bool:
+        return self._ui.regionCBandController.in_focus_mode
+
+    def _bandStateChanged(self, is_open: bool, in_focus: bool) -> None:
+        for action, checked in ((self._bandAction, is_open),
+                                (self._focusAction, in_focus)):
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+        self._focusEscape.setEnabled(in_focus)
+        ribbon = getattr(self, '_stepRibbon', None)
+        if ribbon is not None:
+            ribbon.setVisible(not in_focus)
+        sheet = getattr(self, '_settingsSheet', None)
+        if sheet is not None:
+            sheet.set_focus_mode(in_focus)
+        # The 8 px frame round the regions is the page's breathing room; with
+        # the page gone it is only wasted model.
+        layout = self.centralWidget().layout()
+        if layout is not None:
+            if in_focus:
+                if not hasattr(self, '_marginsBeforeFocus'):
+                    self._marginsBeforeFocus = layout.contentsMargins()
+                layout.setContentsMargins(0, 0, 0, 0)
+            elif hasattr(self, '_marginsBeforeFocus'):
+                layout.setContentsMargins(self._marginsBeforeFocus)
+                del self._marginsBeforeFocus
+        if not in_focus:
+            self._applyRegionSizes()
 
     # -- WP7/WP8: the viewport's own controls ------------------------------ #
 
@@ -417,7 +1229,7 @@ class MainWindow(QMainWindow):
         from foammesh.support import resource_budget
 
         total, _available = resource_budget.physical_memory()
-        confirmed = QMessageBox.warning(
+        confirmed = messages.warning(
             self, self.tr('Build the preview anyway?'),
             self.tr('The preview worker will be allowed up to {0} (90% of '
                     'this computer\'s memory). Other programs may slow down '
@@ -429,10 +1241,165 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No)
         return confirmed == QMessageBox.StandardButton.Yes
 
+    def _adoptPreviewNotice(self):
+        """Plan 43 LY7. The preview notice (Try again, Build anyway, Load
+        full volume) stands in the Viewport notice strip at the top centre of
+        the view, with the progress strip, not in the Parts card."""
+        getter = getattr(self._ui.renderingView, 'noticeStrip', None)
+        strip = getter() if callable(getter) else None
+        if strip is not None:
+            strip.adoptNotice(self._viewportOverlay.previewNoticeWidget())
+
+    def _installViewportRail(self):
+        """Plan 40 UXE2. The tool rail and its popovers (section 4.4 item 6).
+
+        The lists that used to open on top of the model -- the parts, the cut
+        plane, the section, the display switches -- are popovers hung from a
+        narrow rail at the viewport's right edge. The widgets are the ones
+        they always were, moved, so each control still has one copy.
+        """
+        overlay = self._viewportOverlay
+        tool = self._renderingTool
+        rail = ViewportRail(self._ui.renderingView)
+        self._viewportRail = rail
+        overlay.setRailMode(True)
+        section = overlay.sectionPanel()
+        rail.addTool('parts', self.tr('Parts'), 'volume.svg',
+                     overlay.takePartsPanel(),
+                     tip=self.tr('Parts: show, hide, isolate and explode'))
+        rail.addTool('cut', self.tr('Cut plane'), 'planeHandle.svg', section,
+                     tip=self.tr('Cut plane: aim, move and combine the planes'))
+        rail.addTool('section', self.tr('Section'), 'section.svg',
+                     section.sectionHalf(),
+                     tip=self.tr('Section: mode, colour, saved sections'))
+        rail.addTool('display', self.tr('Display'), 'cubeAxes.svg',
+                     tool.displayPanel(), group=1,
+                     tip=self.tr('Display: mesh lines, axes, ruler, features, '
+                                 'background'))
+        rail.addTool('inspector', self.tr('Inspector'), 'poorCells.svg', None,
+                     group=2,
+                     tip=self.tr('Inspector: the mesh quality report'))
+        tool.sendOverflowToRail(rail)
+        overlay.partsRequested.connect(lambda: rail.open('parts'))
+        rail.actionRequested.connect(self._railToolPressed)
+        overlay.sceneEmptyChanged.connect(
+            lambda empty: rail.setSceneEmpty(empty, ('parts', 'cut', 'section')))
+        rail.setSceneEmpty(overlay.isSceneEmpty(), ('parts', 'cut', 'section'))
+        section.sectionChanged.connect(
+            lambda: rail.setToolActive('cut', bool(section.enabledPlanes())))
+        settings = app.settings
+        if hasattr(settings, 'getViewportRail'):
+            rail.setPreferences(settings.getViewportRail())
+            rail.preferencesChanged.connect(settings.updateViewportRail)
+        # Customise: right-click the horizontal toolbar as well as the rail.
+        toolbar = self._ui.toolbar
+        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        toolbar.customContextMenuRequested.connect(
+            lambda point: rail.showCustomiseMenu(toolbar.mapToGlobal(point)))
+        action = self._ui.menuView.addAction(self.tr('&Viewport tool rail'))
+        action.setObjectName('actionViewportRail')
+        action.setCheckable(True)
+        action.setChecked(rail.preferences()['rail'])
+        action.setToolTip(self.tr(
+            'Show or hide the tool rail at the right edge of the viewport'))
+        action.toggled.connect(
+            lambda on: rail.setPreferences(
+                {**rail.preferences(), 'rail': on}, emit=True))
+        rail.preferencesChanged.connect(
+            lambda prefs: action.setChecked(prefs['rail']))
+        # Its own name: `_railAction` is UXC1's outline rail (Ctrl+B), whose
+        # check mark `toggleOutlineRail` keeps. Sharing the name left Ctrl+B
+        # without its action and ticked this one when the outline folded.
+        self._viewportRailAction = action
+        # Plan 43 LY6, LY7. The top bar, the bottom bar and the rail fold to
+        # nubs; the Parts chip opens the Parts panel.
+        self._viewportToolEdges = ViewportToolEdges(self, rail)
+        # Plan 44 MF3: the pills stand on the clear area's centre line and
+        # follow it (a sheet or the console moved, a resize).
+        self._viewportToolEdges.attachClearArea(self._clearArea)
+        self._installViewActions(rail)
+
+    def _installViewActions(self, rail) -> None:
+        """Plan 39 VI15. View > Copy view, Save view as..., Hover readout; the
+        tool rail's width is the overlay layout's right inset."""
+        view = self._ui.renderingView
+        menu = self._ui.menuView
+
+        def applyInset(pixels=None):
+            layout = view.overlayLayout()
+            if layout is None:      # a view without the overlay layout
+                return
+            layout.setRightInset(int(rail.extent() if pixels is None
+                                     else pixels))
+            view.arrangeOverlays()
+        rail.extentChanged.connect(applyInset)
+        applyInset()
+
+        copy = menu.addAction(self.tr('&Copy view'))
+        copy.setObjectName('actionCopyView')
+        copy.setToolTip(self.tr(
+            'Copy the viewport to the clipboard as an image at twice the '
+            'window size'))
+        copy.triggered.connect(lambda _c=False: view._copyView())
+        save = menu.addAction(self.tr('Save &view as…'))
+        save.setObjectName('actionSaveViewAs')
+        save.setToolTip(self.tr(
+            'Save the viewport as an image, optionally with a transparent '
+            'background'))
+        save.triggered.connect(lambda _c=False: view._saveViewAs())
+        hover = menu.addAction(self.tr('&Hover readout'))
+        hover.setObjectName('actionHoverReadout')
+        hover.setCheckable(True)
+        hover.setChecked(bool(view.hoverReadoutEnabled()))
+        hover.setToolTip(self.tr(
+            'Show the cell or face under the cursor with its field values'))
+        hover.toggled.connect(view.setHoverReadoutEnabled)
+        # VI14. A cell picked on a cut says what the volume cell it stands
+        # for is, not what the cut surface kept.
+        view.setHoverVolumeProvider(self._hoverVolume)
+        self._copyViewAction = copy
+        self._saveViewAction = save
+        self._hoverReadoutAction = hover
+
+    def _hoverVolume(self, name: str):
+        """The whole volume the viewport actor *name* was cut from."""
+        from foammesh.rendering.actor_info import MeshActor
+        info = self._meshManager.actorInfo(name)
+        return info.dataSet() if isinstance(info, MeshActor) else None
+
+    def _installResourceUsageAction(self) -> None:
+        """Plan 39 VI13. View > Show resource usage, remembered."""
+        settings = app.settings
+        view = self._ui.renderingView
+        action = self._ui.menuView.addAction(self.tr('Show resource &usage'))
+        action.setObjectName('actionShowResourceUsage')
+        action.setCheckable(True)
+        action.setToolTip(self.tr(
+            'Show CPU load and memory over the viewport, updated each '
+            'second'))
+        on = bool(settings.getResourceUsage()) if hasattr(
+            settings, 'getResourceUsage') else False
+        action.setChecked(on)
+        view.setResourceOverlayVisible(on)
+
+        def toggled(checked):
+            view.setResourceOverlayVisible(checked)
+            if hasattr(settings, 'updateResourceUsage'):
+                settings.updateResourceUsage(checked)
+        action.toggled.connect(toggled)
+        self._resourceAction = action
+
+    def _railToolPressed(self, key: str) -> None:
+        if key == 'inspector':
+            self.showQualityReport()
+
     def _connectViewportControls(self):
         tool = self._renderingTool
         tool.sectionRequested.connect(self._quickSection)
-        tool.captureRequested.connect(self.captureViewport)
+        # Plan 43 LY15. The camera button, Ctrl+Shift+P and View > Camera >
+        # Save view as... are one popover; `captureViewport` stays as the
+        # no-dialog writer the tests and sequences call.
+        tool.captureRequested.connect(self.showSnapshot)
         tool.galleryRequested.connect(self._showCaptureGallery)
         tool.isolateRequested.connect(self._isolateSelection)
         tool.zoomSelectionRequested.connect(self._zoomToSelection)
@@ -444,6 +1411,7 @@ class MainWindow(QMainWindow):
         tool.featuresRequested.connect(self.toggleFeatureCapture)
         tool.viewModeRequested.connect(self.applyViewMode)
         tool.layerCoverageRequested.connect(self.showLayerCoverage)
+        tool.colourMeshRequested.connect(self.colourMeshBy)
 
         self._displayControl.meshQualityInfo().statusMessage.connect(
             lambda text: self.statusBar().showMessage(text, 8000))
@@ -461,8 +1429,11 @@ class MainWindow(QMainWindow):
             self._setPartVisible)
         self._viewportOverlay.soloRequested.connect(
             lambda key: self._displayControl.isolate([key]))
-        # DP-705. The overlay's Show all is the toolbar's, scoped to the mode.
-        self._viewportOverlay.showAllRequested.connect(self._showEveryPart)
+        # UXB5. The toolbar's model tools follow whether the viewport holds
+        # anything: the overlay says so, the tool gates its controls.
+        self._viewportOverlay.sceneEmptyChanged.connect(
+            self._renderingTool.setSceneEmpty)
+        self._renderingTool.setSceneEmpty(self._viewportOverlay.isSceneEmpty())
         self._viewportOverlay.regionFilterChanged.connect(
             self._applyRegionFilter)
         # DP-712. A row click selects the part; Fit and Isolate follow.
@@ -516,6 +1487,8 @@ class MainWindow(QMainWindow):
         view = self._ui.renderingView
         self._effectActions = {}
         menu = self._ui.menuView.addMenu(self.tr('Render &quality'))
+        menu.setObjectName('menuRenderQuality')
+        self._renderQualityMenu = menu
         group = QActionGroup(menu)
         group.setExclusive(True)
         self._renderQualityActions = {}
@@ -562,6 +1535,30 @@ class MainWindow(QMainWindow):
                 lambda checked, apply=setter, item=action:
                 self._applyViewportEffect(apply, item, checked))
             self._effectActions[label] = action
+
+    def _buildColourScaleMenu(self, app):
+        """Plan 43 LY12. The colour standard redraws the picture.
+
+        The controls are View > Colour scale (the View menu's group, bound to
+        the standard in ``view_menu.bind_colour``) and Preferences >
+        Appearance > Colour scale. A change lasts for the session until
+        *Make this my standard*.
+        """
+        from foammesh.support import colour_standard
+
+        settings = getattr(app, '_settings', None)
+        if settings is not None and not hasattr(settings, 'getColourStandard'):
+            settings = None
+        self._colourStandardFollower = self._colourStandardChanged
+        colour_standard.subscribe(self._colourStandardFollower)
+        self._colourStandardChanged(colour_standard.current(settings))
+
+    def _colourStandardChanged(self, _standard=None):
+        """The legends show or hide, and the picture redraws, at once."""
+        view = self._ui.renderingView
+        apply = getattr(view, 'applyColourStandard', None)
+        if callable(apply):
+            apply()
 
     def _renderQualityChosen(self, action):
         name = action.data()
@@ -818,6 +1815,7 @@ class MainWindow(QMainWindow):
         if plan.quality:
             self._highlightPoorCells()
         self._viewMode = plan.mode
+        self._syncInspectorOnModel()
         self._renderingTool.showViewMode(plan.mode)
         self.statusBar().showMessage(
             self.tr('{0}: showing {1}.').format(
@@ -879,12 +1877,11 @@ class MainWindow(QMainWindow):
         panel = tool.panel()
         index = panel.activeIndex()
         tool._useViewNormal()
-        # DP-695. A cut along the view is placed, not dragged: lock it so a
-        # rotation drag that starts on a handle still turns the camera. The
-        # section controls carry the Lock box for whoever wants to drag it.
-        panel.setLocked(True)
+        # VI10 (F2a, F3a). The plane comes up the way the user left it: not
+        # locked (a locked plane takes no drag, which read as a plane that
+        # will not move; Lock stays a choice the user makes and keeps), and
+        # with its handle shown unless they hid it.
         panel._planeToggled(index, True)
-        panel._gizmoButtons[index].setChecked(True)
         self._renderingTool.setInspectionActive(
             'section', tool.isSectionActive())
         self._renderingTool.updateHistoryButtons()
@@ -908,6 +1905,7 @@ class MainWindow(QMainWindow):
     def rebuildOverlayParts(self):
         parts = []
         groups = {}
+        roles = {}
         groupPath = getattr(self._displayControl, '_groupPath', None)
         for key, item in self._displayControl._items.items():
             info = item.actorInfo()
@@ -915,7 +1913,9 @@ class MainWindow(QMainWindow):
             # DP-712. The rows file under the tree's own headings.
             if groupPath is not None:
                 groups[key] = ' / '.join(groupPath(info))
-        self._viewportOverlay.setParts(parts, groups)
+            # Plan 44 F1 (MF21). The row's small role text.
+            roles[key] = part_role(info)
+        self._viewportOverlay.setParts(parts, groups, roles)
         # DP-713. A reload drops the colouring with the actors it was on;
         # the legend and the button have to drop it too.
         if (getattr(self, '_fidelityPainted', False)
@@ -925,6 +1925,18 @@ class MainWindow(QMainWindow):
                 self._hideDeviationReadout()
                 self._fidelityPainted = False
                 self._renderingTool.setInspectionActive('fidelity', False)
+        # Plan 39 VI16. Nor does a reload keep the Layers grown colouring.
+        if (getattr(self, '_layersGrownLegend', None) is not None
+                and (self._meshManager is None
+                     or self._meshManager.layersGrownReadout() is None)):
+            self._hideLayersGrownLegend()
+            self._renderingTool.setColourMeshChoice(layers_grown.SOLID)
+        # Plan 39 VI16. Nor does a reload keep the volume's exterior colour.
+        if (getattr(self, '_volumeLegend', None) is not None
+                and (self._meshManager is None
+                     or not self._meshManager.volumeColoured())):
+            self._hideVolumeLegend()
+            self._renderingTool.setColourMeshChoice(layers_grown.SOLID)
         # DP-711. A new scene gets a fresh Region picker.
         refreshPicker = getattr(self, '_refreshRegionPicker', None)
         if refreshPicker is not None:
@@ -1088,6 +2100,52 @@ class MainWindow(QMainWindow):
             label = f'{label} · {self.tr("revision {0}").format(int(revision))}'
         self._viewportOverlay.setResult(label)
 
+    def openLikelyStep(self, task_id: str) -> None:
+        """Plan 43 LY9. Open the step a failed quality check pointed at."""
+        from foammesh.view.main_window.meshing_method_branch import (
+            TASK_TOKEN_PREFIX)
+        setup = {'setup.geometry': Step.GEOMETRY,
+                 'setup.preparation': Step.GEOMETRY_REPAIR}
+        if task_id in setup:
+            self._navigationView.openStep(setup[task_id])
+        else:
+            self._navigationView.requestBranch(TASK_TOKEN_PREFIX + task_id)
+
+    def discardResultsOnScreen(self) -> None:
+        """Plan 43 LY9. An unlock deleted the mesh and the quality results.
+
+        The viewport, the cell count, the verdict strip and the Mesh quality
+        tab show a mesh that is no longer in the case, so they are emptied
+        with it (the same as a Base Grid reset, R87). Nothing is labelled
+        "previous mesh": there is none.
+        """
+        self._historicalResult = None
+        manager = getattr(self, '_meshManager', None)
+        unload = getattr(manager, 'unload', None)
+        if callable(unload):
+            unload()
+        self._viewportOverlay.setResult('')
+        self.clearMeshVerdict()
+
+    def restoreResultsOnScreen(self) -> None:
+        """Plan 43 LY9. Undo put the mesh and the quality results back: draw
+        them again, and show the stored verdict."""
+        manager = getattr(self, '_meshManager', None)
+        load = getattr(manager, 'load', None)
+        if callable(load):
+            try:
+                asyncio.ensure_future(load(0))
+            except Exception:                                # noqa: BLE001
+                logger.debug('the restored mesh could not be drawn',
+                             exc_info=True)
+        refresh = getattr(self, 'refreshMeshVerdictSoon', None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:                                # noqa: BLE001
+                logger.debug('the restored verdict could not be shown',
+                             exc_info=True)
+
     def clearHistoricalResult(self, restore: bool = False) -> None:
         """Take the historical label down (I2).
 
@@ -1227,6 +2285,32 @@ class MainWindow(QMainWindow):
         strip = getattr(self, '_runStatusStrip', None)
         if strip is not None:
             strip.showResult(message, failed=failed, log=log)
+        # A run that ended has just recorded its step in the undo history.
+        QTimer.singleShot(0, self._refreshMenusAfterRun)
+
+    def showHistory(self) -> None:
+        """Open the History panel (Edit > History)."""
+        self.showRunDetails()
+        self._runDetailsTabs.setCurrentWidget(self._historyTab)
+
+    def _refreshHistoryPanel(self) -> None:
+        panel = getattr(self, '_historyPanel', None)
+        if panel is None or app.project is None:
+            return
+        result = query(app.facadeClient, 'history.query', {'limit': 1})
+        panel.setEntries(result.payload.get('undo_history') or {})
+
+    def _jumpHistory(self, direction: str, steps: int) -> None:
+        """Go to a step the History panel chose: as many Undos or Redos."""
+        def done(result):
+            if (getattr(result, 'payload', None) or {}).get('steps'):
+                self.statusBar().showMessage(
+                    self.tr('Went to the chosen step.'), 3000)
+            self._updateMenuStates()
+            self._refreshHistoryPanel()
+
+        submit(app.facadeClient, f'history.{direction}', {'steps': steps},
+               then=done)
 
     def showRunDetails(self) -> None:
         """Open the run details view (QA-04).
@@ -1250,6 +2334,7 @@ class MainWindow(QMainWindow):
         history = getattr(self, '_runHistoryText', None)
         if history is not None:
             history.setPlainText(self._historyText())
+        self._refreshHistoryPanel()
         view.show()
         view.raise_()
         view.activateWindow()
@@ -1326,12 +2411,12 @@ class MainWindow(QMainWindow):
         """
         manager = self._meshManager
         hasMesh = manager is not None and not manager.isEmpty()
-        failed = bool(getattr(self, '_lastFailedCellSets', None))
+        failed = bool(MainWindow._failedSets(self))
         self._renderingTool.setQualityActionsEnabled(
             hasMesh,
             self.tr('No mesh is loaded'),
             failed,
-            self.tr('No mesh check has written a failed-cell set yet'))
+            MainWindow._noFailedSetsReason(self))
         # Recording an orbit or a section sweep needs something in the scene
         # to orbit around. The gate was written and never called, so the menu
         # offered both on an empty viewport and the recording came out blank.
@@ -1382,12 +2467,17 @@ class MainWindow(QMainWindow):
                 except Exception:                             # noqa: BLE001
                     logger.debug('no readable feature measurements',
                                  exc_info=True)
+            if sections and self.nativeMeasurementRefusal(report):
+                sections = {}
             features = bool(sections) or bool(self._featureActors)
             if not features:
                 featuresReason = self.tr(
                     'The fidelity run recorded no feature measurements, so '
                     'there are no declared feature lines to draw. Declare '
                     'features on the geometry and run it again.')
+        if not features and hasMesh and MainWindow._nativeCurveFeatures(self):
+            # Plan 41 GN23. A Gmsh mesh always has its curve entities to show.
+            features = True
         # A painted viewport keeps its own way back: the button that put the
         # colouring on is the button that takes it off, so disabling it while
         # the colour is still there would strand the reader.
@@ -1448,6 +2538,179 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.tr(coverage.describe()), 15000)
         return True
 
+    def colourMeshBy(self, key: str) -> bool:
+        """Plan 39 VI16 (I6). *Colour mesh by*: Solid, or the layers grown.
+
+        Layers grown paints each patch with the count the stored layer report
+        says the run achieved on it; patches that asked for none are grey. The
+        legend sits in the viewport's stack with the others, and Solid (or a
+        new mesh) takes both away.
+        """
+        tool = self._renderingTool
+        manager = self._meshManager
+        if manager is None:
+            tool.setColourMeshChoice(layers_grown.SOLID)
+            return False
+        if layers_grown.is_volume_choice(key):
+            return self._colourVolume(key)
+        self._dropVolumeColour()
+        if key != layers_grown.LAYERS_GROWN:
+            self._dropLayersGrown()
+            return True
+        coverage = self.layerCoverage()
+        if not coverage.measured or not coverage.rows:
+            tool.setColourMeshChoice(layers_grown.SOLID)
+            self.statusBar().showMessage(self.tr(coverage.describe()), 10000)
+            return False
+        if self._fidelityPainted:
+            # One colouring on the patches at a time.
+            self.toggleGeometryFidelity()
+            tool.setInspectionActive('fidelity', False)
+        painted = manager.showLayersGrown(coverage.rows)
+        self._showLayersGrownLegend()
+        self.statusBar().showMessage(self.tr(
+            'Layers grown on {0}; patches that asked for none are grey.'
+        ).format(count_text(painted, 'patch', 'patches')), 12000)
+        return True
+
+    def _colourVolume(self, key: str) -> bool:
+        """Plan 39 VI16 (I6). Colour the volume's exterior by *key*.
+
+        The same choices and mapping as *Colour cut by* in the section: cell
+        type, refinement level, region / zone and quality. A level or a zone
+        is read from the case off the GUI thread, so with an event loop the
+        paint lands when the read does.
+        """
+        tool = self._renderingTool
+        self._dropLayersGrown()
+        tool.setColourMeshChoice(key)
+        work = self._paintVolume(key)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return bool(asyncio.run(work))
+        asyncio.ensure_future(work)
+        return True
+
+    async def _paintVolume(self, key: str) -> bool:
+        tool = self._renderingTool
+        manager = self._meshManager
+        try:
+            mapped, reason = await manager.colourVolumeBy(key)
+        except Exception as error:  # noqa: BLE001 - the viewport must not take the window down
+            logger.warning('could not colour the volume by %s: %s', key, error)
+            mapped, reason = {'kind': 'none'}, str(error)
+        if tool.colourMeshChoice() != key:
+            # Another choice was made while this one was being worked out.
+            return False
+        if mapped.get('kind') == 'none':
+            self._hideVolumeLegend()
+            manager.clearVolumeColour()
+            tool.setColourMeshChoice(layers_grown.SOLID)
+            self.statusBar().showMessage(self.tr(reason), 12000)
+            return False
+        self._showVolumeLegend(mapped)
+        self.statusBar().showMessage(self.tr(
+            'The volume is coloured by {0}. Solid takes the colour off.'
+        ).format(mapped.get('label', '')), 10000)
+        return True
+
+    def _showVolumeLegend(self, mapped):
+        from vtkmodules.vtkRenderingAnnotation import vtkScalarBarActor
+
+        from foammesh.rendering.section_colour_map import lookupTable
+
+        display = getattr(self, '_displayControl', None)
+        self._hideVolumeLegend()
+        if display is None:
+            return
+        bar = vtkScalarBarActor()
+        bar.SetObjectName('volumeColourLegend')
+        bar.SetLookupTable(lookupTable(mapped))
+        bar.SetTitle(str(mapped.get('label', '')))
+        if mapped.get('kind') == 'categorical':
+            bar.SetNumberOfLabels(0)
+        else:
+            bar.SetNumberOfLabels(5)
+            bar.SetLabelFormat('%.3g')
+        bar.UnconstrainedFontSizeOn()
+        bar.SetTitleRatio(0.5)
+        bar.SetBarRatio(0.25)
+        bar.SetWidth(0.2)
+        bar.SetHeight(0.45)
+        if app.themeManager is not None and app.themeManager.tokens is not None:
+            from foammesh.view.theming.vtk_theme import apply_scalar_bar_theme
+            apply_scalar_bar_theme(bar, app.themeManager.tokens)
+        self._volumeLegend = bar
+        display.addLegend(VOLUME_LEGEND_KEY, bar)
+
+    def _hideVolumeLegend(self):
+        if getattr(self, '_volumeLegend', None) is None:
+            return
+        display = getattr(self, '_displayControl', None)
+        if display is not None:
+            display.removeLegend(VOLUME_LEGEND_KEY)
+        self._volumeLegend = None
+
+    def _dropVolumeColour(self):
+        """Take the volume's exterior colour and its legend off."""
+        manager = self._meshManager
+        clear = getattr(manager, 'clearVolumeColour', None)
+        if clear is not None:
+            clear()
+        self._hideVolumeLegend()
+
+    def _volumeColourDropped(self):
+        """The volume's colour went (a cut began): the menu and legend follow."""
+        self._hideVolumeLegend()
+        tool = self._renderingTool
+        if layers_grown.is_volume_choice(tool.colourMeshChoice()):
+            tool.setColourMeshChoice(layers_grown.SOLID)
+
+    def _showLayersGrownLegend(self):
+        from vtkmodules.vtkRenderingAnnotation import vtkScalarBarActor
+
+        readout = self._meshManager.layersGrownReadout()
+        display = getattr(self, '_displayControl', None)
+        self._hideLayersGrownLegend()
+        if readout is None or display is None:
+            return
+        bar = vtkScalarBarActor()
+        bar.SetObjectName('layersGrownLegend')
+        bar.SetLookupTable(readout['table'])
+        bar.SetTitle(layers_grown.legend_title())
+        bar.SetNumberOfLabels(int(readout['range'][1]) + 1
+                              if readout['range'][1] <= 8 else 5)
+        bar.SetLabelFormat('%.3g')
+        bar.UnconstrainedFontSizeOn()
+        bar.SetTitleRatio(0.5)
+        bar.SetBarRatio(0.25)
+        bar.DrawNanAnnotationOn()
+        bar.SetNanAnnotation('asked for none')
+        bar.SetWidth(0.2)
+        bar.SetHeight(0.45)
+        if app.themeManager is not None and app.themeManager.tokens is not None:
+            from foammesh.view.theming.vtk_theme import apply_scalar_bar_theme
+            apply_scalar_bar_theme(bar, app.themeManager.tokens)
+        self._layersGrownLegend = bar
+        display.addLegend(layers_grown.LEGEND_KEY, bar)
+
+    def _hideLayersGrownLegend(self):
+        if getattr(self, '_layersGrownLegend', None) is None:
+            return
+        display = getattr(self, '_displayControl', None)
+        if display is not None:
+            display.removeLegend(layers_grown.LEGEND_KEY)
+        self._layersGrownLegend = None
+
+    def _dropLayersGrown(self):
+        """Take the Layers grown colouring and its legend off."""
+        manager = self._meshManager
+        if manager is not None and manager.layersGrownReadout() is not None:
+            manager.clearLayersGrown()
+        self._hideLayersGrownLegend()
+        self._renderingTool.setColourMeshChoice(layers_grown.SOLID)
+
     def toggleGeometryFidelity(self):
         """WP3.3. Colour the surface by how far it left the reference geometry.
 
@@ -1462,6 +2725,9 @@ class MainWindow(QMainWindow):
         only way out of the deviation colours used to be reloading the mesh.
         """
         try:
+            if not self._fidelityPainted and getattr(
+                    self, '_layersGrownLegend', None) is not None:
+                self._dropLayersGrown()
             if self._fidelityPainted:
                 if self._meshManager is not None:
                     self._meshManager.clearFidelityColouring()
@@ -1472,6 +2738,10 @@ class MainWindow(QMainWindow):
                 return
 
             root = self._captureManager.caseRoot()
+            if root is None and self._meshManager is not None:
+                # Plan 42 SG2. A mesh on screen that no case holds (a native
+                # Gmsh mesh from the session) keeps its results beside itself.
+                root = self._meshManager.nativeStoreRoot()
             if root is None or self._meshManager is None:
                 self.statusBar().showMessage(
                     self.tr('Open a case with a mesh first.'), 5000)
@@ -1487,15 +2757,21 @@ class MainWindow(QMainWindow):
                     'geometry. Run the geometry fidelity task first.'), 9000)
                 return
 
-            refusal = self.caseOverlayRefusal()
+            refusal = self.nativeMeasurementRefusal(report)
             if refusal:
+                # Plan 42 SG2. A stored result that is not of this mesh is no
+                # reason not to measure it now.
+                if self._paintLiveDeviation() is not None:
+                    return
                 self.statusBar().showMessage(refusal, 12000)
                 return
 
             task_id = str(report.get('task_id') or '')
             fields = hotspot.read(root, task_id) if task_id else {}
             if fields:
-                painted = self._meshManager.showFidelityHotspots(fields)
+                painted = self._meshManager.showFidelityHotspots(
+                    fields, unit=self._caseLengthUnit(),
+                    tolerance=self._deviationTolerance(report))
                 self._fidelityPainted = painted > 0
                 self._showDeviationReadout()
                 self.statusBar().showMessage(self.tr(
@@ -1532,24 +2808,95 @@ class MainWindow(QMainWindow):
         """
         geometry = getattr(self, '_geometryManager', None)
         manager = self._meshManager
-        if geometry is None or manager is None:
+        if manager is None:
             return None
-        reference = geometry.referenceSurface()
+        reference = (geometry.referenceSurface()
+                     if geometry is not None else None)
+        source = self.tr('the loaded geometry')
+        if reference is not None:
+            reference = self._referenceInMeshUnit(reference)
+        else:
+            # Plan 42 SG2 (D13). A model opened only in the Gmsh session has
+            # no geometry in the shared step: its own surface is the
+            # reference.
+            reference = self.gmshSessionReference()
+            source = self.tr('the open Gmsh model')
         if reference is None:
             return None
-        painted = manager.showLiveDeviation(reference)
+        painted = manager.showLiveDeviation(
+            reference, unit=self._caseLengthUnit(),
+            tolerance=self._deviationTolerance(),
+            identity=self._patchIdentity())
         self._fidelityPainted = painted > 0
         if painted:
+            panel = getattr(self, '_deviationPanel', None)
+            if panel is not None:
+                # The panel says what the measurement is against, as the
+                # status line does (Plan 42 SG2).
+                panel.setReferenceName(source)
             self._showDeviationReadout()
             self.statusBar().showMessage(self.tr(
-                'Deviation from the loaded geometry, measured now per face, '
-                'on {0}.').format(count_text(painted, 'patch', 'patches')),
-                12000)
+                'Deviation from {0}, measured now per face, on {1}.'
+            ).format(source, count_text(painted, 'patch', 'patches')), 12000)
         else:
             self.statusBar().showMessage(self.tr(
-                'No patch of this mesh could be measured against the loaded '
-                'geometry.'), 9000)
+                'No patch of this mesh could be measured against {0}.'
+            ).format(source), 9000)
         return painted
+
+    def _referenceInMeshUnit(self, reference):
+        """Plan 42 SG2. The imported geometry is in metres; a native mesh in
+        another unit is measured in its own, so the reference is scaled to it."""
+        manager = self._meshManager
+        scale = getattr(manager, 'nativeScaleToMetres', None)
+        scale = scale() if callable(scale) else 1.0
+        native = getattr(manager, 'nativePath', None)
+        if native is None or native() is None or abs(scale - 1.0) < 1e-12:
+            return reference
+        from vtkmodules.vtkCommonTransforms import vtkTransform
+        from vtkmodules.vtkFiltersGeneral import vtkTransformPolyDataFilter
+
+        transform = vtkTransform()
+        transform.Scale(1.0 / scale, 1.0 / scale, 1.0 / scale)
+        moved = vtkTransformPolyDataFilter()
+        moved.SetTransform(transform)
+        moved.SetInputData(reference)
+        moved.Update()
+        return moved.GetOutput()
+
+    def gmshSessionReference(self):
+        """Plan 42 SG2 (D13). The open Gmsh model's own surface as polydata,
+        or ``None`` when no session holds a model.
+
+        The session tessellates its CAD finely without touching its mesh
+        (``reference_surface``); the surface is in the model's own unit,
+        which is the unit of the mesh it made.
+        """
+        import tempfile
+
+        from foammesh.view.gmsh_workflow.compute_page import (
+            residentGenerateController)
+        client = getattr(app, 'facadeClient', None)
+        controller = (residentGenerateController(client)
+                      if client is not None else None)
+        if controller is None:
+            return None
+        try:
+            with tempfile.TemporaryDirectory(
+                    prefix='foammesh-reference-') as directory:
+                written = controller.reference_surface(directory)
+                path = written.get('host_path')
+                if not path or not written.get('cells'):
+                    return None
+                from vtkmodules.vtkIOXML import vtkXMLPolyDataReader
+                reader = vtkXMLPolyDataReader()
+                reader.SetFileName(str(path))
+                reader.Update()
+                surface = reader.GetOutput()
+                return surface if surface.GetNumberOfCells() else None
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no Gmsh session reference', exc_info=True)
+            return None
 
     def _showDeviationReadout(self):
         """DP-713. The legend, histogram and figures for the colouring."""
@@ -1564,11 +2911,20 @@ class MainWindow(QMainWindow):
         display = getattr(self, '_displayControl', None)
         if display is not None:
             self._deviationLegend = deviationScalarBar(
-                readout.lookup_table, tokens)
+                readout.lookup_table, tokens,
+                signed=bool(getattr(readout, 'signed', True)))
+            # Plan 43 LY11. The one Qt legend draws the bar; this actor stays
+            # for the picture-taking path and is not shown on screen.
+            self._deviationLegend.SetVisibility(False)
             display.addOverlay(self._deviationLegend)
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
-            panel.setReadout(readout, self._deviationTolerance())
+            panel.setReadout(
+                readout, getattr(readout, 'tolerance', None)
+                if getattr(readout, 'tolerance', None) is not None
+                else self._deviationTolerance())
+        self._refreshWorstValues()
+        self._legendController.refresh()
 
     def _hideDeviationReadout(self):
         legend = getattr(self, '_deviationLegend', None)
@@ -1579,16 +2935,31 @@ class MainWindow(QMainWindow):
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
             panel.clearReadout()
+        self._refreshWorstValues()
+        controller = getattr(self, '_legendController', None)
+        if controller is not None:
+            controller.refresh()
 
-    def _deviationTolerance(self) -> float:
+    def _refreshWorstValues(self) -> None:
+        views = getattr(self, '_qualityViews', None)
+        if views is not None:
+            views.refresh()
+
+    def _deviationTolerance(self, report=None) -> float:
         """The tolerance the figures count against, in mm.
 
-        The user's own once they have set one; until then a tenth of the
-        base cell, or a thousandth of the model when there is no cell size.
+        The user's own once they have set one -- zero included, a value like
+        any other (Plan 39 VI6, F4g). Until then a stored run's own tolerance
+        (``report``, F4e), else a tenth of the base cell, or a thousandth of
+        the model when there is no cell size. A proposed value never replaces
+        one the user typed.
         """
         chosen = getattr(self, '_deviationToleranceMm', None)
-        if chosen:
+        if chosen is not None:
             return chosen
+        run = self._runToleranceMm(report)
+        if run is not None:
+            return run
         cellSize = extent = None
         geometry = getattr(self, '_geometryManager', None)
         try:
@@ -1601,10 +2972,117 @@ class MainWindow(QMainWindow):
                          bounds[5] - bounds[4])
         except Exception:                                     # noqa: BLE001
             logger.debug('no mesh extent', exc_info=True)
-        return live_distance.default_tolerance(cellSize, extent)
+        return live_distance.default_tolerance(
+            cellSize, extent, self._caseLengthUnit())
+
+    def _caseLengthUnit(self) -> float:
+        """Metres in one unit of the mesh on screen (Plan 39 VI5, F4c).
+
+        The geometry and a generated mesh are in metres; Mesh > Scale makes
+        one unit ``1 / factor`` metres, and the case records that scale.
+        """
+        from foammesh.core.mesh import transform_record
+        # Plan 42 SG2. A native mesh is in the unit its session recorded, not
+        # the case's.
+        manager = getattr(self, '_meshManager', None)
+        native = getattr(manager, 'nativePath', None)
+        if native is not None and native() is not None:
+            return float(manager.nativeScaleToMetres())
+        try:
+            return transform_record.metres_per_unit(
+                transform_record.load(app.project.path))
+        except Exception:                                     # noqa: BLE001
+            return 1.0
+
+    def _runToleranceMm(self, report):
+        """The smallest tolerance a stored run rated its sections by, in mm."""
+        if not report:
+            return None
+        found = []
+        for section in report.get('sections') or ():
+            try:
+                tolerance = float(section.get('tolerance'))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if tolerance > 0.0:
+                found.append(tolerance)
+        if not found:
+            return None
+        return min(found) * live_distance.unit_to_mm(self._caseLengthUnit())
+
+    def _patchIdentity(self):
+        """The patch-identity map written beside this mesh, or None."""
+        from foammesh.core.quality import patch_identity
+        try:
+            # Plan 42 SG2. The sidecar sits beside the mesh on screen: a
+            # native mesh's own store, else the case.
+            manager = getattr(self, '_meshManager', None)
+            native = getattr(manager, 'nativePath', None)
+            root = (manager.nativeStoreRoot()
+                    if native is not None and native() is not None
+                    else self._captureManager.caseRoot())
+        except Exception:                                     # noqa: BLE001
+            return None
+        if root is None:
+            return None
+        quality = Path(root) / 'foammesh' / 'quality'
+        for sidecar in (quality / 'geometry' / patch_identity.IDENTITY_FILENAME,
+                        quality / patch_identity.IDENTITY_FILENAME):
+            try:
+                return patch_identity.read(sidecar)
+            except (OSError, ValueError):
+                continue
+        return None
 
     def _deviationToleranceEdited(self, value):
-        self._deviationToleranceMm = float(value) or None
+        """Plan 39 VI6 (F4a, F4g). The tolerance moves the neutral band.
+
+        The value is kept whatever it is (zero too); the model's table is
+        refilled without measuring again, and the panel's histogram, drawn in
+        that table's colours, follows.
+        """
+        self._deviationToleranceMm = float(value)
+        manager = getattr(self, '_meshManager', None)
+        change = getattr(manager, 'setDeviationTolerance', None)
+        if change is not None:
+            change(float(value))
+        panel = getattr(self, '_deviationPanel', None)
+        if panel is not None:
+            panel.refresh()
+        controller = getattr(self, '_legendController', None)
+        if controller is not None:
+            controller.syncTolerance(float(value))
+            controller.refresh()
+
+    def _deviationScaleEdited(self, value):
+        """The scale the ramp reaches changed (0 = automatic): repaint."""
+        manager = getattr(self, '_meshManager', None)
+        change = getattr(manager, 'setDeviationScale', None)
+        if change is not None and change(float(value) or None):
+            self._refreshDeviationReadout()
+
+    def _deviationSurfaceToggled(self, name, ticked):
+        """A patch ticked or unticked in the Surfaces list: re-measure it only."""
+        manager = getattr(self, '_meshManager', None)
+        change = getattr(manager, 'setDeviationSurface', None)
+        if change is not None and change(str(name), bool(ticked)):
+            self._refreshDeviationReadout()
+
+    def _refreshDeviationReadout(self):
+        """Follow a repaint with the same legend and panel, not new ones."""
+        readout = getattr(self._meshManager, 'deviationReadout', None)
+        readout = readout() if readout is not None else None
+        if readout is None:
+            self._hideDeviationReadout()
+            return
+        legend = getattr(self, '_deviationLegend', None)
+        if legend is not None:
+            legend.SetLookupTable(readout.lookup_table)
+        panel = getattr(self, '_deviationPanel', None)
+        if panel is not None:
+            panel.setReadout(readout, readout.tolerance)
+        self._refreshWorstValues()
+        self._legendController.refresh()
 
     def toggleFeatureCapture(self):
         """WP3.1. Draw the declared features, coloured by whether they survived.
@@ -1623,7 +3101,14 @@ class MainWindow(QMainWindow):
         root = self._captureManager.caseRoot()
         report = self._latestFidelityReport() if root is not None else None
         task_id = str((report or {}).get('task_id') or '')
-        sections = hotspot.read_features(root, task_id) if task_id else {}
+        sections = {}
+        if task_id and not self.nativeMeasurementRefusal(report):
+            sections = hotspot.read_features(root, task_id)
+        curves = MainWindow._nativeCurveFeatures(self) if not sections else {}
+        if curves:
+            # Plan 41 GN23. A native mesh with no measured features shows the
+            # model's own curves; they are drawn as what they are, unmeasured.
+            sections = curves
         if not sections:
             self.statusBar().showMessage(self.tr(
                 'No feature measurements for this mesh. Run the geometry '
@@ -1642,6 +3127,21 @@ class MainWindow(QMainWindow):
             'Declared features: {0}.').format(', '.join(
                 f'{count} {verdict}' for verdict, count
                 in sorted(counts.items()))), 12000)
+
+    def _nativeCurveFeatures(self) -> dict:
+        """Plan 41 GN23. The curve entities of the native mesh on screen as
+        feature records (``unrated``: nothing measured them), or ``{}``."""
+        mesh = getattr(self, '_meshManager', None)
+        curves = getattr(mesh, 'nativeCurves', None)
+        found = curves() if callable(curves) else {}
+        return {
+            name: [{'feature_uuid': f'{name}#{index}', 'verdict': 'unrated',
+                    'critical': False, 'max_distance': 0.0,
+                    'length_coverage': 0.0,
+                    'points': [[float(v) for v in point]
+                               for point in chain]}
+                   for index, chain in enumerate(chains)]
+            for name, chains in found.items() if chains}
 
     def _latestFidelityReport(self):
         """The most recent stored fidelity report for this case, or None."""
@@ -1695,6 +3195,11 @@ class MainWindow(QMainWindow):
         if self._meshManager is not None:
             self._meshManager.clearFailedCells()
             self._meshManager.clearFidelityColouring()
+        self._hideLayersGrownLegend()
+        self._dropVolumeColour()
+        pick = getattr(tool, 'setColourMeshChoice', None)
+        if pick is not None:
+            pick(layers_grown.SOLID)
         self._failedCellSetIndex = -1
         self._fidelityPainted = False
         for name in ('poorCells', 'section', 'failedCells', 'fidelity'):
@@ -1702,6 +3207,31 @@ class MainWindow(QMainWindow):
         tool.updateHistoryButtons()
         self.statusBar().showMessage(
             self.tr('Inspection overlays cleared.'), 4000)
+
+    def nativeMeasurementRefusal(self, report) -> str:
+        """Plan 41 GN23. ``''`` when a stored measurement is of the native
+        Gmsh file on screen, else why it is not drawn over it.
+
+        A stored deviation field or feature record is keyed by the labels of
+        one mesh; the native task records the digest of the file it measured,
+        and only that file is painted.
+        """
+        mesh = getattr(self, '_meshManager', None)
+        getter = getattr(mesh, 'nativePath', None)
+        if getter is None or getter() is None:
+            return ''
+        recorded = str((report or {}).get('native_mesh_digest') or '')
+        if recorded and recorded == mesh.nativeDigest():
+            return ''
+        if recorded:
+            return self.tr(
+                'This measurement is of another Gmsh mesh than the one on '
+                'screen (the mesh was meshed again, or another file is '
+                'open). Run the native mesh fidelity task again.')
+        return self.tr(
+            'This stored measurement does not say which Gmsh mesh it is of, '
+            'so it is not drawn over the one on screen. Run the native mesh '
+            'fidelity task again.')
 
     def caseOverlayRefusal(self) -> str:
         """Why a case-root overlay must not be drawn over what is on screen.
@@ -1728,8 +3258,139 @@ class MainWindow(QMainWindow):
             'cell numbers do not mean the same thing in both, so they are '
             'not drawn here. Accept this result to inspect its failed cells.')
 
+    def _caseMeshOnScreen(self) -> bool:
+        """The viewport shows, or will show, the case's own polyMesh, not a
+        native mesh file whose cell numbers the sets do not address."""
+        manager = getattr(self, '_meshManager', None)
+        getter = getattr(manager, 'nativePath', None)
+        return getter is None or getter() is None
+
+    def _noFailedSetsReason(self) -> str:
+        manager = getattr(self, '_meshManager', None)
+        getter = getattr(manager, 'nativePath', None)
+        if getter is not None and getter() is not None:
+            return self.tr('The quality gate has named no offending elements '
+                           'of this Gmsh mesh')
+        return self.tr('No mesh check has written a failed-cell set yet')
+
+    # -- Plan 41 GN23 (FM-04): named selections of elements ---------------- #
+
+    SELECTION_PREFIX = 'selection: '
+
+    def _selectionStore(self):
+        """Plan 42 SG14 (D8). Where saved selections are kept: beside the
+        native mesh on screen, else in the case of the mesh read from it."""
+        manager = getattr(self, '_meshManager', None)
+        getter = getattr(manager, 'nativeStoreRoot', None)
+        root = getter() if callable(getter) else None
+        if root is None:
+            case = getattr(manager, 'caseRoot', None)
+            root = case() if callable(case) else None
+        return root
+
+    def _meshIdentity(self) -> dict:
+        getter = getattr(getattr(self, '_meshManager', None),
+                         'meshIdentity', None)
+        return getter() if callable(getter) else {}
+
+    def refreshElementSelections(self) -> None:
+        from foammesh.core.gmsh import named_selections
+        store = self._selectionStore()
+        here = MainWindow._meshIdentity(self)
+        marked = {}
+        for name, record in (named_selections.load(store).items()
+                             if store else ()):
+            if record.get('kind') == named_selections.ELEMENT:
+                marked[name] = named_selections.origin_notice(record, here)
+        self._meshQualityTab.set_selections(sorted(marked), marked)
+
+    def _saveElementSelection(self, name, tags) -> None:
+        from foammesh.core.gmsh import named_selections
+        store = self._selectionStore()
+        if store is None:
+            self.statusBar().showMessage(self.tr(
+                'Selections are kept with the project; load a mesh '
+                'first.'), 6000)
+            return
+        try:
+            named_selections.save(store, name, elements=tags,
+                                  mesh=MainWindow._meshIdentity(self))
+        except named_selections.SelectionError as error:
+            self.statusBar().showMessage(
+                self.tr('Not saved: {0}.').format(error), 6000)
+            return
+        self.refreshElementSelections()
+        self.statusBar().showMessage(self.tr(
+            'Saved "{0}": {1:,} cells.').format(str(name).strip(), len(tags)),
+            6000)
+
+    def _showElementSelection(self, name) -> None:
+        sets = MainWindow._failedSets(self)
+        key = self.SELECTION_PREFIX + str(name)
+        cells = sets.get(key)
+        tool = self._renderingTool
+        from foammesh.core.gmsh import named_selections
+        store = self._selectionStore()
+        record = (named_selections.load(store).get(str(name), {})
+                  if store else {})
+        notice = named_selections.origin_notice(
+            record, MainWindow._meshIdentity(self))
+        if not cells:
+            # WALK-2 (SG14). A selection made on the other engine's mesh can
+            # number past every cell here; the note is why it found none.
+            self.statusBar().showMessage(self.tr(
+                '"{0}" has no cells in the mesh on screen.').format(name)
+                + (' ' + self.tr(notice) if notice else ''), 10000)
+            return
+        self._meshManager.showFailedCells(list(cells), key)
+        tool.setInspectionActive('failedCells', True)
+        tool.setFailedCellSetShown(key)
+        self.statusBar().showMessage(
+            self.tr('{0}: {1:,} cells.').format(key, len(cells))
+            + (' ' + self.tr(notice) if notice else ''), 10000)
+
+    def _deleteElementSelection(self, name) -> None:
+        from foammesh.core.gmsh import named_selections
+        store = self._selectionStore()
+        if store is not None:
+            named_selections.delete(store, name)
+        self.refreshElementSelections()
+
     def failedCellSetNames(self) -> list:
-        return list(getattr(self, '_lastFailedCellSets', None) or {})
+        return list(MainWindow._failedSets(self))
+
+    def _failedSets(self) -> dict:
+        """``{set name: cell positions}`` the failed-cells button steps
+        through: checkMesh's written sets, or for a native Gmsh mesh the
+        elements the quality gate named as offending, one set per measure."""
+        manager = getattr(self, '_meshManager', None)
+        getter = getattr(manager, 'nativePath', None)
+        native = getter is not None and getter() is not None
+        strip = getattr(self, '_verdictStrip', None)
+        rows = ((getattr(strip, 'verdict', None) or {}).get('offending') or ()
+                if native else ())
+        by_measure: dict = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get('tag') is not None:
+                by_measure.setdefault(
+                    str(row.get('measure') or 'quality'), []).append(
+                        int(row['tag']))
+        found = (dict(getattr(self, '_lastFailedCellSets', None) or {})
+                 if not native else {})
+        for measure, tags in by_measure.items():
+            cells = manager.nativeCellsForTags(tags)
+            if cells:
+                found[self.tr('{0} below the limit').format(measure)] = cells
+        store = MainWindow._selectionStore(self)
+        if store is not None:
+            from foammesh.core.gmsh import named_selections
+            for name, record in sorted(named_selections.load(store).items()):
+                if record.get('kind') != named_selections.ELEMENT:
+                    continue
+                cells = manager.cellsForElements(record.get('elements', ()))
+                if cells:
+                    found[MainWindow.SELECTION_PREFIX + name] = cells
+        return found
 
     def _showFailedCellsFromViewport(self):
         """Step to the next failed-cell set, rather than only ever the first.
@@ -1747,7 +3408,7 @@ class MainWindow(QMainWindow):
         """
         tool = self._renderingTool
         requested = tool.requestedFailedCellSet()
-        sets = getattr(self, '_lastFailedCellSets', None)
+        sets = MainWindow._failedSets(self)
         names = list(sets or ())
         stepped = getattr(self, '_failedCellSetIndex', -1) + 1
         # Off: asked for by name from the menu, or reached by stepping past
@@ -1763,10 +3424,16 @@ class MainWindow(QMainWindow):
             return
         if not sets:
             tool.setInspectionActive('failedCells', False)
-            self.statusBar().showMessage(
-                self.tr('No mesh check has written a failed-cell set yet.'), 6000)
+            # checkMesh's sets index the polyMesh; with a native mesh on
+            # screen they are refused in words, not silently dropped.
+            case_sets = getattr(self, '_lastFailedCellSets', None)
+            text = (self.caseOverlayRefusal() if case_sets
+                    else MainWindow._noFailedSetsReason(self) + '.')
+            self.statusBar().showMessage(text, 6000)
             return
-        refusal = self.caseOverlayRefusal()
+        refusal = ('' if getattr(self._meshManager, 'nativePath', None)
+                   and self._meshManager.nativePath() is not None
+                   else self.caseOverlayRefusal())
         if refusal:
             tool.setInspectionActive('failedCells', False)
             self.statusBar().showMessage(refusal, 12000)
@@ -1791,6 +3458,89 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             self.tr('{0}: {1:,} cells.').format(name, len(ids)) + position,
             10000)
+
+    # -- the snapshot popover (Plan 43 LY15) -------------------------------- #
+
+    def showSnapshot(self, *_args):
+        """Open the Snapshot popover under the camera button."""
+        from .snapshot_popover import SnapshotPopover
+
+        view = self._ui.renderingView
+        popover = getattr(self, '_snapshotPopover', None)
+        if popover is None:
+            popover = make(SnapshotPopover, self)
+            popover.saveRequested.connect(self._snapshotSave)
+            popover.copyRequested.connect(self._snapshotCopy)
+            self._snapshotPopover = popover
+        popover.attach(view)
+        popover.setSuggestedName(self._captureManager.suggestedName(
+            popover.options().format))
+        popover.setNote('')
+        clear = self.clearRectOfView()
+        if clear is not None and view.isVisible():
+            popover.showInClearArea(view, clear)
+            return popover
+        button = getattr(self._renderingTool, '_captureButton', None)
+        anchor = button if button is not None and button.isVisible() else view
+        popover.showBelow(anchor)
+        return popover
+
+    def _snapshotSave(self):
+        popover = self._snapshotPopover
+        options = popover.options()
+        self.snapshotFlash().clear()
+        path = self._captureManager.snapshot(options)
+        message = self._captureManager.snapshotMessage
+        if path is None:
+            popover.setNote(message)
+            self.statusBar().showMessage(message, 8000)
+            return None
+        popover.hide()
+        self._flashViewport()
+        self.statusBar().showMessage(message, 10000)
+        if options.directory is None:
+            self.showCaptures()
+        return path
+
+    def _snapshotCopy(self):
+        from .view_capture import COPY_SCALE, copyView
+        from foammesh.core import snapshot as snapshot_core
+
+        popover = self._snapshotPopover
+        options = popover.options().normalised()
+        self.snapshotFlash().clear()
+        scale = options.scale if snapshot_core.is_raster(options.format) \
+            else COPY_SCALE
+        image = compose(
+            copyView, self._ui.renderingView, scale=scale,
+            transparent=bool(options.includes.get('transparent')),
+            overlay=options.overlay, includes=dict(options.includes))
+        if image is None:
+            self.statusBar().showMessage(self.tr(
+                'The viewport is not drawing, so there is nothing to copy.'), 6000)
+            return None
+        popover.hide()
+        self._flashViewport()
+        self.statusBar().showMessage(self.tr(
+            'Copied the view to the clipboard ({0} × {1}).').format(
+                image.width(), image.height()), 6000)
+        return image
+
+    def snapshotFlash(self):
+        """The VTK-drawn flash over the view (Plan 44 MF22), made on first use."""
+        from .snapshot_flash import SnapshotFlash
+
+        flash = getattr(self, '_snapshotFlash', None)
+        if flash is None:
+            flash = SnapshotFlash(self._ui.renderingView, self)
+            self._snapshotFlash = flash
+        return flash
+
+    def _flashViewport(self) -> bool:
+        """A white veil over the view fading .75 -> 0 in 450 ms: the picture
+        was taken. Drawn by VTK, because the native viewport paints over a
+        plain widget. Skipped under reduced motion or a render hold."""
+        return self.snapshotFlash().fire()
 
     def captureViewport(self, *, scale: int = 2):
         """Write a PNG plus its view record into the case, with no dialog."""
@@ -1841,11 +3591,15 @@ class MainWindow(QMainWindow):
             'captures', self.tr('Captures'), CapturesPage)
         if page is None:
             return None
-        try:
-            page.restoreRequested.disconnect()
-            page.deleteRequested.disconnect()
-        except (RuntimeError, TypeError):
-            pass
+        # A page that was never connected has nothing to disconnect, and
+        # PySide6 says so with a RuntimeWarning rather than an error.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            try:
+                page.restoreRequested.disconnect()
+                page.deleteRequested.disconnect()
+            except (RuntimeError, TypeError):
+                pass
         page.restoreRequested.connect(self._restoreCapture)
         page.deleteRequested.connect(self._deleteCapture)
         root = self._captureManager.caseRoot()
@@ -1913,7 +3667,7 @@ class MainWindow(QMainWindow):
     def _dropScaleNoteOffItsPage(self, step):
         """The base-cell clause belongs to the page that computes it.
 
-        DP-106. `BaseGridPage.hide` clears the note, and the note was still
+        DP-106. the legacy base-grid page's `hide` cleared the note, and the note was still
         seen on frames of a Gmsh run -- a route that has no base grid and
         never will -- which means at least one way of leaving that page does
         not go through `hide`. Rather than hunt for it, the note is dropped
@@ -1928,6 +3682,11 @@ class MainWindow(QMainWindow):
         return self._displayControl
 
     @property
+    def viewportOverlay(self):
+        """Plan 42 SG9. The card and Parts list over the viewport."""
+        return self._viewportOverlay
+
+    @property
     def geometryManager(self) -> GeometryManager:
         return self._geometryManager
 
@@ -1935,13 +3694,74 @@ class MainWindow(QMainWindow):
     def meshManager(self):
         return self._meshManager
 
+    _DROP_SUFFIXES = ('.stl', '.obj', '.step', '.stp', '.iges', '.igs', '.brep')
+
+    @staticmethod
+    def droppedGeometryFiles(mime):
+        """The geometry files a drag carries, in the order dragged."""
+        if mime is None or not mime.hasUrls():
+            return []
+        found = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in MainWindow._DROP_SUFFIXES:
+                found.append(path)
+        return found
+
+    def dragEnterEvent(self, event):
+        if MainWindow.droppedGeometryFiles(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    dragMoveEvent = dragEnterEvent
+
+    def dropEvent(self, event):
+        files = MainWindow.droppedGeometryFiles(event.mimeData())
+        if not files:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        # Out of the event handler: the import runs, and may ask, on the loop.
+        QTimer.singleShot(0, lambda: self._importDropped(files))
+
+    @qasync.asyncSlot()
+    async def _importDropped(self, files):
+        """Import dropped model files as the Import dialog's OK would."""
+        if app.project is None and not await self._startScratchCase(
+                files[0].stem):
+            return
+        try:
+            await self._stepManager.importGeometryFiles(files)
+        except (OSError, RuntimeError, ValueError) as error:
+            await AsyncMessageBox().warning(
+                self, self.tr('Geometry import error'), str(error))
+
     def closeEvent(self, event):
         if not self._readyToQuit:
             self._closeTriggered.emit(True)
             event.ignore()
             return
 
+        # DP-2100.  A second close of a window that has already been taken down
+        # (a test, or a shutdown path that closes twice) must not walk the
+        # dock layout again: its floating containers are queued for deletion
+        # and reading their screen is an access violation.
+        if getattr(self, '_teardownDone', False):
+            super().closeEvent(event)
+            return
+        self._teardownDone = True
+
         app.settings.updateLastMainWindowGeometry(self.geometry())
+        # Hidden panes report no width; put them back before the split is read.
+        self._ui.regionCBandController.leave_focus()
+        for unsubscribe in getattr(self, '_bandUnsubscribes', ()):
+            unsubscribe()
+        self._bandUnsubscribes = []
+        if getattr(self, '_jobAttention', None) is not None:
+            self._jobAttention.unsubscribe()
         sizes = (
             self._ui.regionSplitter.sizes()
             if layout_worth_recording(
@@ -1949,6 +3769,9 @@ class MainWindow(QMainWindow):
             else None)
         getattr(app.settings, 'updateThreeRegionLayout', lambda **_kw: None)(
             sizes=sizes, active_output=self._outputTabs.key_for_current())
+        getattr(app.settings, 'updateDockLayout', lambda _r: None)(
+            self._dockLayout.snapshot())
+        self._dockLayout.dispose()
         if self._jobStateUnsubscribe is not None:
             self._jobStateUnsubscribe()
             self._jobStateUnsubscribe = None
@@ -1965,6 +3788,9 @@ class MainWindow(QMainWindow):
         client = getattr(app, 'facadeClient', None)
         if isinstance(getattr(client, 'retry_prompt', None), RetryPrompt):
             client.retry_prompt = None
+        # A finished export window nobody dismissed stayed on screen after
+        # this window had closed (the guided walks, 2026-10-11).
+        closeProgressWindowsOf(self)
 
         super().closeEvent(event)
 
@@ -1977,15 +3803,33 @@ class MainWindow(QMainWindow):
         """
         if not hasattr(self, '_threeRegionShell'):
             return
+        band = getattr(self._ui, 'regionCBandController', None)
+        if band is not None and band.in_focus_mode:
+            return
         if total_width is None:
             total_width = max(self.width(), 1280)
         sizes = self._ui.regionSplitter.sizes()
         saved = (sizes if self._regionSplitterUserMoved and len(sizes) == 3
                  else self._savedRegionSizes)
         navigation = getattr(self, '_navigationView', None)
-        self._threeRegionShell.apply_sizes(
-            total_width, saved,
-            navigation.wantedPaneWidth() if navigation is not None else None)
+        # Plan 43 LY2. The outline dock is retired, so no pane waits for room.
+        wanted = (navigation.wantedPaneWidth() if navigation is not None
+                  and not self._dockLayout.isRetired(OUTLINE_DOCK) else None)
+        if (saved is not None and wanted and not self._regionSplitterUserMoved
+                and len(saved) == 3 and saved[0] < wanted):
+            # Plan 40 UXB4 (#8). A width restored from an earlier session is
+            # not one dragged in this one: MEASURED, a saved 190 px kept
+            # "4. Domai... region" clipped at 1280 px for ever. The outline's
+            # own width is the floor; the settings column gives it up.
+            give = wanted - saved[0]
+            saved = [wanted, max(saved[1] - give, 0), saved[2]]
+        page_column = getattr(self._ui, 'regionBPageColumn', None)
+        b_wanted = page_column.wantedWidth() if page_column is not None else None
+        sizes = self._threeRegionShell.apply_sizes(
+            total_width, saved, wanted, b_wanted)
+        sheet = getattr(self, '_settingsSheet', None)
+        if sheet is not None:
+            sheet.apply_to_sizes(sizes)
 
     def resizeEvent(self, event):
         """Clamp the permanent regions while leaving user-adjusted A/B intact."""
@@ -2002,6 +3846,8 @@ class MainWindow(QMainWindow):
             self._ui.retranslateUi(self)
             self._stepManager.retranslatePages()
             self._updateMenuStates()
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self._syncSizeGrip()
 
         super().changeEvent(event)
 
@@ -2038,6 +3884,20 @@ class MainWindow(QMainWindow):
         self._ui.actionViewZoomSelection.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         # DP-759. The key every desktop platform uses for its preferences.
         self._ui.actionPreferences.setShortcut(QKeySequence('Ctrl+,'))
+        # Plan 40 UXE1. Every key above belongs to the shortcut registry, which
+        # applies the user's own keys over these defaults.
+        for command_id, action in (
+                ('file.new', self._ui.actionNew),
+                ('file.open', self._ui.actionOpen),
+                ('file.save', self._ui.actionSave),
+                ('file.saveAs', self._ui.actionSaveProjectAs),
+                ('file.close', self._ui.actionClose),
+                ('file.exit', self._ui.actionExit),
+                ('edit.undo', self._ui.actionUndo),
+                ('edit.redo', self._ui.actionRedo),
+                ('viewport.zoomSelection', self._ui.actionViewZoomSelection),
+                ('file.preferences', self._ui.actionPreferences)):
+            adoptShortcut(command_id, action)
 
     def _applyVtkTheme(self, _name):
         self._applyThemedIcons()
@@ -2070,13 +3930,6 @@ class MainWindow(QMainWindow):
             self._ui.alignAxis: ':/graphicsIcons/alignAxis.svg',
             self._ui.rotate: ':/graphicsIcons/roll.svg',
             self._ui.rotationCenter: ':/graphicsIcons/rotationCenter.svg',
-            self._ui.regionAdd: ':/icons/add-circle-outline.svg',
-            self._ui.surfaceRefinementAdd: ':/icons/add-circle-outline.svg',
-            self._ui.volumeRefinementAdd: ':/icons/add-circle-outline.svg',
-            self._ui.boundaryLayerConfigurationsAdd: ':/icons/add-circle-outline.svg',
-            self._ui.loadCastellationDefaults: ':/icons/arrow-undo-outline.svg',
-            self._ui.loadSnapDefaults: ':/icons/arrow-undo-outline.svg',
-            self._ui.loadBoundaryLayerDefaults: ':/icons/arrow-undo-outline.svg',
         }
         for widget, path in icons.items():
             widget.setIcon(load_themed_icon(path))
@@ -2099,13 +3952,6 @@ class MainWindow(QMainWindow):
             self._ui.alignAxis: self.tr('Align view to nearest axis'),
             self._ui.rotate: self.tr('Roll view 90 degrees'),
             self._ui.rotationCenter: self.tr('Set rotation centre'),
-            self._ui.loadBoundaryLayerDefaults: self.tr('Load boundary-layer defaults'),
-            self._ui.boundaryLayerConfigurationsAdd: self.tr('Add boundary-layer configuration'),
-            self._ui.loadCastellationDefaults: self.tr('Load castellation defaults'),
-            self._ui.surfaceRefinementAdd: self.tr('Add surface refinement group'),
-            self._ui.volumeRefinementAdd: self.tr('Add volume refinement group'),
-            self._ui.regionAdd: self.tr('Add region'),
-            self._ui.loadSnapDefaults: self.tr('Load snap defaults'),
         }
         for widget, name in names.items():
             widget.setAccessibleName(name)
@@ -2115,14 +3961,29 @@ class MainWindow(QMainWindow):
     def _connectSignalsSlots(self):
         app.renderingToggled.connect(self._setRenderingEnabled)
 
+        # Plan 40 UXD2 (F7a). Ctrl+K finds any action, step or setting by name.
+        from foammesh.view.main_window.command_palette import (
+            install as installCommandPalette)
+        self._commandPalette = installCommandPalette(self)
+        # Plan 40 UXE1. The palette's key and the Gmsh route's keys are made
+        # elsewhere; they are listed and rebindable all the same.
+        palette_key = getattr(self._commandPalette, '_shortcut', None)
+        if palette_key is not None:
+            adoptShortcut('view.palette', palette_key)
+        SHORTCUTS.sweep(self)
+        QApplication.instance().focusChanged.connect(self._sweepShortcuts)
+
         self._consoleAction = self._ui.menuView.addAction(self.tr('&Console'))
         self._consoleAction.setShortcut('Ctrl+Shift+C')
+        adoptShortcut('view.console', self._consoleAction)
         self._consoleAction.triggered.connect(
             lambda: self.showOutputTab('console'))
         self._installViewportEffectActions()
+        self._buildColourScaleMenu(app)
 
         self._recentFilesMenu.projectSelected.connect(self._openRecent)
         self._recentFilesMenu.clearRequested.connect(self._clearRecents)
+        self._installWelcomePanel()
 
         self._stepManager.workingStepChanged.connect(self._displayControl.openedStepChanged)
         self._stepManager.displayStepChanged.connect(self._displayControl.currentStepChanged)
@@ -2187,6 +4048,8 @@ class MainWindow(QMainWindow):
             ActionId.VIEW_ROLL: lambda: self._ui.rotate.click(),
             ActionId.VIEW_ROTATION_CENTER: lambda: self._ui.rotationCenter.click(),
             ActionId.PREFERENCES: self._openPreferences,
+            ActionId.SETTINGS_MESH_QUALITY: self._actionParameters,
+            ActionId.START_WINDOW: self._openStartWindow,
             ActionId.TERMINAL_HERE: self._openTerminalHere,
             ActionId.TUTORIALS: self._openTutorials,
             ActionId.LICENSE: self._openLicense,
@@ -2265,10 +4128,9 @@ class MainWindow(QMainWindow):
             # been produced in this case yet` on the quality page, because
             # this answer was `False` and `refreshMeshVerdict` clears both
             # quality surfaces unless it is `True`.
-            from foammesh.core.engine.registry import configured_engine_id
             from foammesh.core.facade.mesh_presence import has_engine_mesh
             has_mesh = (has_engine_mesh(app.project.path,
-                                        configured_engine_id(app.db))
+                                        configured_engine(app))
                         or self._hasMeshOnDisk())
             geometry_root = app.project.path / 'constant' / 'triSurface'
             has_geometry = (app.db.elementCount('geometry') > 0 or
@@ -2287,19 +4149,23 @@ class MainWindow(QMainWindow):
             ActionId.CLOSE_PROJECT.value,
             ActionId.MESH_INFO.value,
             ActionId.PREFERENCES.value,
+            ActionId.START_WINDOW.value,
             ActionId.LOAD_MESH.value,
             ActionId.SAVE_PROJECT_AS.value,
             ActionId.LOAD_GEOMETRY.value,
         })
         capability_reasons = {}
         # DP-752. The thresholds are snappy's; a Gmsh case is told why not.
-        from foammesh.core.engine.registry import configured_engine_id
         quality_available, quality_reason = mesh_quality_capability(
-            configured_engine_id(app.db))
+            configured_engine(app))
         if quality_available:
-            capabilities = capabilities | frozenset({ActionId.MESH_QUALITY.value})
+            capabilities = capabilities | frozenset({
+                ActionId.MESH_QUALITY.value,
+                ActionId.SETTINGS_MESH_QUALITY.value})
         else:
             capability_reasons[ActionId.MESH_QUALITY.value] = quality_reason
+            capability_reasons[
+                ActionId.SETTINGS_MESH_QUALITY.value] = quality_reason
         terminal_available, terminal_reason = terminal_capability()
         if terminal_available:
             capabilities = capabilities | frozenset({ActionId.TERMINAL_HERE.value})
@@ -2567,24 +4433,131 @@ class MainWindow(QMainWindow):
         """The configuration changed after this mesh was produced."""
         self._verdictStrip.mark_stale()
 
+    def _wireQualityInspector(self) -> None:
+        """Plan 39 VI9. The Quality inspector and the colouring it drives.
+
+        One metric, one limit, one picture: the tab's controls and the
+        controller that paints share them, and a section coloured by the same
+        metric is repainted on the same band.
+        """
+        tab = self._meshQualityTab
+        info = self._displayControl.meshQualityInfo()
+        info.bindInspector(tab)
+        # The histogram redraws once a drag has settled; the line itself and
+        # the field follow the hand at once.
+        self._inspectorTimer = QTimer(self)
+        self._inspectorTimer.setSingleShot(True)
+        self._inspectorTimer.setInterval(120)
+        self._inspectorTimer.timeout.connect(self._inspectorRefresh)
+
+        info.availabilityChanged.connect(self._inspectorAvailable)
+        info.limitChanged.connect(self._inspectorLimitHeld)
+        info.elementInspected.connect(tab.show_inspection)
+        tab.pickElementToggled.connect(info.setPickingElements)
+        info.highlightingChanged.connect(
+            lambda _on: tab.set_show_beyond(info.isShowingBeyondLimit()))
+        info.scaleChanged.connect(self._recolourSectionForInspector)
+        tab.metricChanged.connect(self._inspectorMetricChanged)
+        tab.limitChanged.connect(self._inspectorLimitEdited)
+        tab.limitSourceRequested.connect(self._inspectorLimitSource)
+        tab.showBeyondToggled.connect(self._inspectorShowBeyond)
+        tab.measureRequested.connect(
+            lambda _metric: info.refreshDistribution(tab))
+        self._inspectorAvailable(info.isVisible())
+        self._inspectorShowLimit()
+
+    def _inspectorShowLimit(self) -> None:
+        """Put the active metric's limit and its sources in the tab."""
+        info = self._displayControl.meshQualityInfo()
+        index = info.activeIndex()
+        self._meshQualityTab.set_limit(info.limitFor(index))
+        self._meshQualityTab.set_limit_sources(
+            info.mesherLimitFor(index), info.checkLimitFor(index))
+
+    def _inspectorAvailable(self, available: bool) -> None:
+        self._meshQualityTab.set_inspector_available(bool(available))
+        MainWindow.refreshElementSelections(self)
+        if available:
+            self._inspectorShowLimit()
+
+    def _inspectorMetricChanged(self, name: str) -> None:
+        from foammesh.rendering.actor_info import MeshQualityIndex
+
+        info = self._displayControl.meshQualityInfo()
+        info.setWorstChoice(MeshQualityIndex(name))
+        self._inspectorShowLimit()
+        # Only what is already measured: a metric change never starts a pass.
+        info.refreshDistribution(self._meshQualityTab, mayCompute=False)
+        self._meshQualityTab.set_beyond_count(
+            info.beyondCount(), info.limitFor(info.activeIndex()))
+
+    def _inspectorLimitHeld(self, metric: str, value) -> None:
+        info = self._displayControl.meshQualityInfo()
+        if metric == info.activeIndex().value:
+            self._meshQualityTab.set_limit(value)
+
+    def _inspectorLimitEdited(self, value) -> None:
+        info = self._displayControl.meshQualityInfo()
+        info.setLimit(info.activeIndex(), value)
+        self._inspectorTimer.start()
+
+    def _inspectorRefresh(self) -> None:
+        """Redraw the counts and, if the cells beyond are shown, repaint."""
+        info = self._displayControl.meshQualityInfo()
+        if not info.isVisible():
+            return
+        info.refreshDistribution(self._meshQualityTab, mayCompute=False)
+        self._meshQualityTab.set_beyond_count(
+            info.beyondCount(), info.limitFor(info.activeIndex()))
+        if info.isShowingBeyondLimit():
+            info.highlightWorst(mode='limit')
+
+    def _inspectorLimitSource(self, source: str) -> None:
+        info = self._displayControl.meshQualityInfo()
+        if info.useLimit(info.activeIndex(), source) is None:
+            self.statusBar().showMessage(
+                self.tr('There is no {0} limit for this metric.').format(
+                    self.tr('mesher') if source == 'mesher'
+                    else self.tr('check')), 6000)
+            return
+        self._inspectorRefresh()
+
+    def _inspectorShowBeyond(self, on: bool) -> None:
+        info = self._displayControl.meshQualityInfo()
+        if not info.showBeyondLimit(bool(on)) and on:
+            self._meshQualityTab.set_show_beyond(False)
+
+    def _recolourSectionForInspector(self) -> None:
+        """A section coloured by the metric the inspector paints follows it."""
+        cut = self._displayControl.cutTool()
+        key = cut.sectionColour()
+        if str(key).startswith('quality.'):
+            cut.setSectionColour(key)
+
     def _focusQualityElement(self, element: dict) -> None:
         """Answer a click on an offending element in the Quality tab.
 
-        The tab has emitted this since it was written and nothing listened,
-        so the worst-cell table was a list one could read but not act on.
-        The viewport colours the worst decile of the active metric, and the
-        status bar names the element and where it is.
+        Plan 39 VI8 (F5b). The camera goes to the element: it dollies to the
+        centroid at twenty cell diameters and outlines the cell, and Back
+        returns to where the user was. The status bar names the element and
+        where it is.
         """
         centroid = element.get('centroid') or ()
+        views = getattr(self, '_qualityViews', None)
+        if views is not None:
+            views.select(element)
         # DP-165. The same point the quality table shows, to the same
         # precision, and to one precision across its three axes.
         where = ', '.join(aligned(centroid))
+        went = False
         try:
-            self._displayControl.meshQualityInfo().highlightWorst()
+            went = self._displayControl.meshQualityInfo().flyToElement(element)
         except Exception as error:  # noqa: BLE001 - the viewport must not take the tab down
-            logger.warning('could not highlight the selected element: %s', error)
+            logger.warning('could not go to the selected element: %s', error)
         self.statusBar().showMessage(
-            self.tr('Element {0} at ({1}).').format(element.get('tag', ''), where),
+            self.tr('Element {0} at ({1}).').format(element.get('tag', ''), where)
+            + ('' if went else self.tr(
+                '  The viewport could not be moved there.')),
             8000)
 
     def showMeshVerdict(self, verdict: dict) -> None:
@@ -2598,6 +4571,7 @@ class MainWindow(QMainWindow):
         verdict = with_layer_coverage(verdict)
         self._verdictStrip.show_verdict(verdict)
         self._meshQualityTab.show_verdict(verdict)
+        self._refreshQualityActions()
         if verdict.get('stale'):
             # A stored check whose fingerprint no longer matches the loaded
             # polyMesh. It describes a different mesh, so it must not read as
@@ -2619,6 +4593,7 @@ class MainWindow(QMainWindow):
         the user should not have to find its handle to see the report the app
         is asking them to accept.
         """
+        self.openOutputBand()
         self._outputTabs.show('quality')
         splitter = getattr(self._ui, 'regionCSplitter', None)
         if splitter is not None:
@@ -2664,6 +4639,7 @@ class MainWindow(QMainWindow):
         # the `unrated` verdict, which names the command that would produce a
         # real one, rather than on a bare `return`.
         report = None
+        gate = None
         waivers: list = []
         try:
             # `quality.report` is a READ of a persisted file. Routed through
@@ -2681,6 +4657,9 @@ class MainWindow(QMainWindow):
             # repainting `Quality limits: pass · quality: good` over a recorded
             # override of a sicn failure.
             waivers = list((result.payload or {}).get('waivers') or ())
+            # Plan 41 GN14 (F5d). The Gmsh element gate's own stored report,
+            # whose offending rows a checkMesh verdict cannot carry.
+            gate = (result.payload or {}).get('gate') or None
         except Exception:
             # A case with no stored report is the common case, not an error,
             # and the operation signals it differently depending on how the
@@ -2690,18 +4669,34 @@ class MainWindow(QMainWindow):
                          exc_info=True)
 
         published = self._verdictStrip.verdict or {}
-        if report is None and published.get('verdict') not in (None, 'unrated'):
+        if (report is None and not gate
+                and published.get('verdict') not in (None, 'unrated')):
             # A real verdict is already on screen for this mesh; a failed
             # re-read must not downgrade it to "not checked".
             return
 
         verdict = with_layer_coverage(
-            apply_waivers(verdict_from_report(report), waivers))
+            apply_waivers(verdict_with_gate(report, gate), waivers))
         self._verdictStrip.show_verdict(verdict)
         self._meshQualityTab.show_verdict(verdict)
         if verdict.get('stale'):
             self._verdictStrip.mark_stale(self.tr(
                 'This check was run against a different mesh'))
+        # DP-2722. A case opened with its check's sets on disk: the button
+        # acts on them, as it does on the sets a check run here wrote.
+        if (report is not None and not verdict.get('stale')
+                and not getattr(self, '_lastFailedCellSets', None)
+                and MainWindow._caseMeshOnScreen(self)):
+            path = app.project.path
+            sets = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: sets_of_this_mesh(path))
+            if (sets and app.project is not None and app.project.path == path
+                    and not getattr(self, '_lastFailedCellSets', None)):
+                self._lastFailedCellSets = sets
+                self._failedCellSetIndex = -1
+        # Plan 41 GN23. The failed-cells button follows the gate's offending
+        # elements on a native mesh, so it follows the verdict.
+        self._refreshQualityActions()
 
     def clearMeshVerdict(self) -> None:
         self._verdictStrip.clear()
@@ -2717,7 +4712,7 @@ class MainWindow(QMainWindow):
         """
         if not verdict:
             return
-        confirmed = QMessageBox.question(
+        confirmed = messages.question(
             self, self.tr('Accept this mesh?'),
             self.tr('This mesh did not meet its quality limits:\n\n%s\n\n'
                     'Accepting it records the decision against this mesh. The '
@@ -2767,7 +4762,7 @@ class MainWindow(QMainWindow):
             logger.debug('the engine listing could not be read', exc_info=True)
             engines = {}
         operation = accept_quality_route(
-            engines.get('current_engine'),
+            engine_from_listing(engines),
             target_solver=engines.get('target_solver'))
         # Plan 31 CP-05 item 4. The Gmsh route accepts a *candidate*, so it
         # has to be told which one. The verdict on screen names it; a verdict
@@ -2782,7 +4777,7 @@ class MainWindow(QMainWindow):
                 # nested loop does not refuse -- and drop -- the tasks it
                 # steps.
                 await modal(
-                    QMessageBox.warning,
+                    messages.warning,
                     self, self.tr('Not accepted'),
                     self.tr('This case holds no meshing run to accept. Run '
                             'the mesh again and accept the result of that '
@@ -2805,7 +4800,7 @@ class MainWindow(QMainWindow):
                 lambda **event: console.append(event.get('line', '')))
             result = await app.facadeClient.run(operation, parameters)
         except Exception as error:                           # noqa: BLE001
-            await modal(QMessageBox.warning,
+            await modal(messages.warning,
                         self, self.tr('Not accepted'), str(error))
             return
         finally:
@@ -2814,7 +4809,7 @@ class MainWindow(QMainWindow):
         payload = getattr(result, 'payload', {}) or {}
         if getattr(result, 'status', '') != 'accepted':
             await modal(
-                QMessageBox.warning,
+                messages.warning,
                 self, self.tr('Not accepted'),
                 str(payload.get('reason') or self.tr('The mesh was refused.')))
             return
@@ -2892,6 +4887,9 @@ class MainWindow(QMainWindow):
             if snapshot.redo_label else self.tr('&Redo'))
         holdBatchLock(self._ui, getattr(self, '_batchLocked', False))
         self._updateWindowTitle()
+        view = getattr(self, '_runDetailsView', None)
+        if view is not None and view.isVisible():
+            self._refreshHistoryPanel()
 
     def _pruneStaleScratchCases(self):
         """Sweep abandoned untitled cases at launch.
@@ -2931,20 +4929,26 @@ class MainWindow(QMainWindow):
         # write was in flight nor gave the window back. It is a scheduled
         # write like every other one now, and the status line is written when
         # the facade says what it undid.
+        label = app.facadeClient.history_status()['undo_label']
+
         def undone(result):
             if (getattr(result, 'payload', None) or {}).get('undone'):
                 self.statusBar().showMessage(
-                    self.tr('Undid the last state edit.'), 3000)
+                    self.tr('Undid {0}.').format(label) if label
+                    else self.tr('Undid the last step.'), 3000)
             self._updateMenuStates()
 
         submit(app.facadeClient, 'history.undo', {}, then=undone)
 
     def _redo(self):
         # C31-12. See `_undo`.
+        label = app.facadeClient.history_status()['redo_label']
+
         def redone(result):
             if (getattr(result, 'payload', None) or {}).get('redone'):
                 self.statusBar().showMessage(
-                    self.tr('Redid the last state edit.'), 3000)
+                    self.tr('Redid {0}.').format(label) if label
+                    else self.tr('Redid the last step.'), 3000)
             self._updateMenuStates()
 
         submit(app.facadeClient, 'history.redo', {}, then=redone)
@@ -3009,18 +5013,26 @@ class MainWindow(QMainWindow):
         the facade's own answer is preferred when it can be asked.
         """
         from foammesh.core.engine.base import qa_operation
+        from foammesh.view.mesh_check_action import operation_from_listing
 
         try:
             listing = await app.facadeClient.run('mesh.engine.list')
             payload = dict(getattr(listing, 'payload', None) or {})
         except (FacadeError, OSError, ValueError, TypeError):
             return qa_operation(None)
-        return str(payload.get('qa_operation')
-                   or qa_operation(payload.get('target_solver')))
+        return operation_from_listing(payload)
 
     @qasync.asyncSlot()
     async def _runMeshCheckDashboard(self):
         if app.project is None:
+            return
+        # Plan 42 SG7. One "Run mesh check" for every mesh. A Gmsh session
+        # mesh has no polyMesh behind it, so its check is the judgement of
+        # every element against the mesher's limits; any other mesh is
+        # checked by the engine's own check below.
+        tab = getattr(self, '_meshQualityTab', None)
+        if tab is not None and tab.on_session_mesh():
+            tab.judge_session_mesh()
             return
         # Plan 28 WP4. Which check depends on the solver the mesh is for: an
         # SU2 project is usually meshed on a machine with no OpenFOAM, and
@@ -3036,13 +5048,25 @@ class MainWindow(QMainWindow):
             Event.JOB_OUTPUT,
             lambda **payload: MainWindow._appendConsole(
                 self, payload.get('line', '')))
+        # Plan 42 SG18. The same submit the Quality page and the footer use;
+        # this door only waits for the result so it can draw the console
+        # table and the report dialog below.
+        from foammesh.view.mesh_check_action import run_mesh_check
+
+        finished = asyncio.get_running_loop().create_future()
         try:
-            execution = await app.facadeClient.run(operation)
-        except (FacadeError, OSError, ValueError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh check error'), str(error))
-            return
+            run_mesh_check(app.facadeClient,
+                           lambda result: finished.done()
+                           or finished.set_result(result),
+                           operation=operation)
+            execution = await finished
         finally:
             unsubscribe()
+        refusal = getattr(execution, 'error', None)
+        if refusal is not None:
+            await AsyncMessageBox().warning(
+                self, self.tr('Mesh check error'), str(refusal))
+            return
         report_result = await app.facadeClient.run('quality.report')
         report_data = report_result.payload.get('report')
         from foammesh.core.quality import QualityReport
@@ -3155,7 +5179,7 @@ class MainWindow(QMainWindow):
             field_support = '-rotateFields' in help_result.output
             if fields_present and operation != 'rotate':
                 proceed = await modal(
-                    QMessageBox.warning,
+                    messages.warning,
                     self, self.tr('Existing result fields'),
                     self.tr('This case contains result fields. The selected transform changes mesh points '
                             'but does not transform those fields. Continue?'),
@@ -3175,7 +5199,8 @@ class MainWindow(QMainWindow):
             request.argv(utility, app.project.path)
         except (OSError, ValueError, CaseConflictError) as error:
             self.statusBar().clearMessage()
-            await AsyncMessageBox().warning(self, self.tr('Invalid transform'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The transform could not be applied.'))
+            await AsyncMessageBox().warning(self, self.tr('Invalid transform'), text, detailedText=details)
             return
         self.statusBar().showMessage(self.tr('Running mesh {0}…').format(operation))
         MainWindow._selectConsole(self)
@@ -3193,7 +5218,8 @@ class MainWindow(QMainWindow):
             completed = await app.facadeClient.run(
                 f'mesh.transform.{operation}', parameters)
         except FacadeError as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh transform error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The mesh could not be transformed.'))
+            await AsyncMessageBox().warning(self, self.tr('Mesh transform error'), text, detailedText=details)
             return
         finally:
             unsubscribe()
@@ -3338,7 +5364,7 @@ class MainWindow(QMainWindow):
         if operation is RepairOperation.SUBSET_CELLS:
             warning = self.tr('This destructive operation runs only in a new copied case.')
         confirmation = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Run mesh repair'), warning,
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -3363,7 +5389,8 @@ class MainWindow(QMainWindow):
                                        if subset_destination else None),
             })
         except (FacadeError, OSError, ValueError, RuntimeError, CaseConflictError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh repair error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The mesh could not be repaired.'))
+            await AsyncMessageBox().warning(self, self.tr('Mesh repair error'), text, detailedText=details)
             return
         finally:
             unsubscribe()
@@ -3409,7 +5436,7 @@ class MainWindow(QMainWindow):
                     pass
         if completed.payload.get('copied_from') is not None:
             await modal(
-                QMessageBox.information,
+                messages.information,
                 self, self.tr('Subset case created'),
                 summary + '\n' + self.tr('New case: {0}').format(
                     completed.payload['case_path']))
@@ -3434,7 +5461,7 @@ class MainWindow(QMainWindow):
             return
         payload = points[-1]
         confirmation = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Restore previous mesh'),
             self.tr('Replace the current mesh with the recovery copy saved before '
                     '"{0}" ({1})?\nThis is an artifact restore, not Undo; the '
@@ -3508,7 +5535,8 @@ class MainWindow(QMainWindow):
                 self._geometryManager.polyData(g_id), operation,
                 hole_size=hole_size)
         except (OSError, ValueError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Geometry repair error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The geometry could not be repaired.'))
+            await AsyncMessageBox().warning(self, self.tr('Geometry repair error'), text, detailedText=details)
             return
         before_counts = {item.kind: item.count for item in result.before.findings}
         after_counts = {item.kind: item.count for item in result.after.findings}
@@ -3524,7 +5552,7 @@ class MainWindow(QMainWindow):
                 before_counts.get('duplicate_points', 0),
                 after_counts.get('duplicate_points', 0))
         choice = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Geometry repair preview'), summary,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
             QMessageBox.StandardButton.Cancel,
@@ -3582,7 +5610,7 @@ class MainWindow(QMainWindow):
         if not source:
             return
         confirmation = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Convert and replace mesh'),
             self.tr('Convert this file into the current case? The current mesh will be retained as a recovery copy.'),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
@@ -3595,7 +5623,8 @@ class MainWindow(QMainWindow):
             completed = await app.facadeClient.run(
                 'mesh.import.converter', {'format': fmt.value, 'source': source})
         except (FacadeError, OSError, RuntimeError, ValueError, CaseConflictError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh conversion error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The mesh could not be converted.'))
+            await AsyncMessageBox().warning(self, self.tr('Mesh conversion error'), text, detailedText=details)
             return
         if completed.status != 'accepted':
             detail = (completed.payload.get('validation_error') or
@@ -3652,7 +5681,7 @@ class MainWindow(QMainWindow):
         if not source:
             return
         # §13.1 native import contract: ask copy versus replace explicitly.
-        box = QMessageBox(self)
+        box = messages.box(self)
         box.setWindowTitle(self.tr('Import native mesh'))
         box.setText(self.tr('How should the selected polyMesh be imported?'))
         replace = box.addButton(self.tr('Replace current mesh'), QMessageBox.ButtonRole.AcceptRole)
@@ -3673,7 +5702,8 @@ class MainWindow(QMainWindow):
             app.project.assertUnchanged()
             await app.facadeClient.run('mesh.import.native', {'source': source})
         except (FacadeError, OSError, ValueError, CaseConflictError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The mesh could not be imported.'))
+            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), text, detailedText=details)
             return
         app.refreshWorkflowResolution()
         self._stepManager.load()
@@ -3700,10 +5730,11 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run('mesh.import.native', {
                 'source': source, 'copy_destination': str(destination)})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The mesh could not be imported.'))
+            await AsyncMessageBox().warning(self, self.tr('Mesh import error'), text, detailedText=details)
             return
         open_copy = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Import complete'),
             self.tr('Imported the mesh into {0}. Open that case now?').format(
                 result.payload['target_case']),
@@ -3740,10 +5771,11 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run(
                 'case.copy', {'destination': str(Path(parent) / name.strip())})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Copy error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The case could not be copied.'))
+            await AsyncMessageBox().warning(self, self.tr('Copy error'), text, detailedText=details)
             return
         open_copy = await modal(
-            QMessageBox.question,
+            messages.question,
             self, self.tr('Copy complete'), self.tr('Open the copied case now?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -3856,7 +5888,8 @@ class MainWindow(QMainWindow):
             result = await app.facadeClient.run(
                 'case.copy', {'destination': str(Path(parent) / name.strip())})
         except (FacadeError, OSError, ValueError, FileExistsError) as error:
-            await AsyncMessageBox().warning(self, self.tr('Save copy error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The copy could not be saved.'))
+            await AsyncMessageBox().warning(self, self.tr('Save copy error'), text, detailedText=details)
             return False
         self.statusBar().showMessage(
             self.tr('Saved a conflict-safe copy to {0}.').format(
@@ -3875,6 +5908,75 @@ class MainWindow(QMainWindow):
 
     def _openRecent(self, path):
         self._openProject(path)
+
+    def _installWelcomePanel(self):
+        """Wire the welcome panel and File > Open example (Plan 40 UXA8, #27).
+
+        The panel's buttons and the menu run the same handlers as File > New,
+        Open and Open recent: this only gives them a second place to be asked
+        from, so there is still one backend for each.
+        """
+        from foammesh.core.examples import list_examples
+
+        welcome = self._stepManager.welcomePage
+        welcome.setRecentsProvider(app.settings.getRecentCases)
+        welcome.newRequested.connect(self._actionNew)
+        welcome.openRequested.connect(self._actionOpen)
+        welcome.recentSelected.connect(self._openRecent)
+        welcome.exampleSelected.connect(self._openExample)
+
+        menu = QMenu(self.tr('Open &example'), self._ui.menuFile)
+        menu.setObjectName('menuOpenExample')
+        menu.setToolTipsVisible(True)
+        for example in list_examples():
+            action = menu.addAction(example.title)
+            action.setObjectName('actionOpenExample_' + example.name)
+            action.setToolTip(example.summary)
+            action.setStatusTip(example.summary)
+            action.triggered.connect(
+                lambda _checked=False, n=example.name: self._openExample(n))
+        actions = self._ui.menuFile.actions()
+        recent = self._ui.menuOpen_Recent.menuAction()
+        after = actions.index(recent) + 1 if recent in actions else 0
+        before = actions[after] if after < len(actions) else None
+        if before is None:
+            self._ui.menuFile.addMenu(menu)
+        else:
+            self._ui.menuFile.insertMenu(before, menu)
+        self._exampleMenu = menu
+
+    @qasync.asyncSlot()
+    async def _openExample(self, name):
+        """Make a new case from an example and stand on Mesh setup.
+
+        The geometry is copied into a new case in the temporary folder (the
+        same door File > New Untitled uses) and imported as the Import dialog
+        would, then Geometry is settled the way Proceed settles it.
+        """
+        from foammesh.core.examples import find_example, stage_example
+        try:
+            example = find_example(name)
+        except ValueError as error:
+            await AsyncMessageBox().warning(
+                self, self.tr('Open example'), str(error))
+            return
+        if not await self._startScratchCase(example.name):
+            return
+        try:
+            staged = stage_example(example, app.project.path)
+            await self._stepManager.importGeometryFiles([staged])
+            atMeshSetup = await self._stepManager.openMeshSetup()
+        except (OSError, RuntimeError, ValueError) as error:
+            await AsyncMessageBox().warning(
+                self, self.tr('Open example'), str(error))
+            return
+        if not atMeshSetup:
+            # Plan 42 SG8: Preparation refused it and said why; saying it
+            # opened at Mesh setup would write over that.
+            return
+        self.statusBar().showMessage(self.tr(
+            '{0} is open at Mesh setup. Save the case somewhere before you '
+            'close FoamMesh.').format(example.title), 12000)
 
     def _clearRecents(self):
         app.settings.clearRecents()
@@ -3931,7 +6033,8 @@ class MainWindow(QMainWindow):
             app.openCase(path)
             self._projectOpened()
         except (OSError, ValueError, Timeout) as error:
-            await AsyncMessageBox().warning(self, self.tr('Reload error'), str(error))
+            text, details = messages.reasonOf(error, self.tr('The case could not be reloaded.'))
+            await AsyncMessageBox().warning(self, self.tr('Reload error'), text, detailedText=details)
 
     def _actionSaveAs(self):
         self._dialog = NewProjectDialog(self, self.tr('Save as new project'),
@@ -3940,8 +6043,48 @@ class MainWindow(QMainWindow):
         self._dialog.open()
 
     def _actionParameters(self):
-        self._dialog = MeshQualityParametersDialog(self)
-        self._dialog.open()
+        """Mesh > Quality thresholds and Settings > Mesh quality (DP-1470)."""
+        self._openQualityThresholds()
+
+    def _openQualityThresholds(self):
+        """Plan 43 LY13 (D7, D8). Settings > Mesh quality and Mesh > Quality
+        thresholds open the one MeshQualityParametersDialog (DP-1470: the item
+        used to stand on a Snap row the outline does not have and did nothing).
+        Applying it hands the limits to the Quality inspector, so the legend's
+        limit line and the cells beyond the limit follow what was typed."""
+        from foammesh.view.menu.mesh_quality.mesh_quality_parameters_dialog import (
+            MeshQualityParametersDialog)
+        # Plan 44 HNG (DP-2689): every open built a child dialog that was never
+        # destroyed (a long pass piled them up on the main window); the one
+        # that was closed is released before the next is built.
+        from shiboken6 import isValid
+        old = getattr(self, '_qualityDialog', None)
+        if old is not None and isValid(old) and not old.isVisible():
+            old.deleteLater()
+        self._qualityDialog = MeshQualityParametersDialog(self)
+        self._qualityDialog.accepted.connect(self._qualityThresholdsApplied)
+        self._qualityDialog.open()
+
+    def _qualityThresholdsApplied(self):
+        info = self._displayControl.meshQualityInfo()
+        info.applyThresholds()
+        self._legendController.refresh()
+        if hasattr(self, '_inspectorTimer'):
+            self._inspectorShowLimit()
+            self._inspectorRefresh()
+
+    def _openStartWindow(self):
+        """Plan 43 LY13 (D7). File > Start window: the launcher, reachable
+        again once a project is open (it was shown only at start-up)."""
+        from foammesh.view.widgets.project_dialog import ProjectDialog
+        dialog = ProjectDialog(self)
+        dialog.setRecents(app.settings.getRecentProjects())
+        dialog.actionNewSelected.connect(lambda: (dialog.accept(), self._actionNew()))
+        dialog.actionOpenSelected.connect(lambda: (dialog.accept(), self._actionOpen()))
+        dialog.actionProjectSelected.connect(
+            lambda path: (dialog.accept(), self._openRecent(path)))
+        self._startDialog = dialog
+        dialog.open()
 
     #: Object names for the two Plan 33 FORM-03/FORM-02 Help entries, so a
     #: gate can find them without matching on the words.
@@ -3978,6 +6121,23 @@ class MainWindow(QMainWindow):
             menu.insertAction(first, action)
         menu.aboutToShow.connect(self._updateStepHelpActions)
         self._updateStepHelpActions()
+
+    def _notificationTarget(self):
+        """Where the user stands now: (step, branch route token or None)."""
+        manager = getattr(self, '_stepManager', None)
+        if manager is None or manager._externalMeshMode:
+            return None
+        return (manager._navigation.currentStep(), manager.routeMemo())
+
+    def _goToNotification(self, entry):
+        """Stand back where a notification was raised."""
+        if entry.target is None:
+            return
+        step, token = entry.target
+        manager = self._stepManager
+        if token and manager.restoreRouteMemo(token):
+            return
+        manager._open(step)
 
     def _currentStepPage(self):
         """The task page the middle region is showing, if it is showing one."""
@@ -4020,6 +6180,33 @@ class MainWindow(QMainWindow):
     def _actionAbout(self):
         self._dialog = AboutDialog(self)
         self._dialog.open()
+
+    SHORTCUTS_ACTION = 'actionKeyboardShortcuts'
+
+    def _sweepShortcuts(self, *_args):
+        """Pick up the Gmsh pages' keys once they exist (Plan 40 UXE1)."""
+        SHORTCUTS.sweep(self)
+
+    def _installShortcutsHelp(self):
+        """Help > Keyboard shortcuts... (Plan 40 UXE1). F1 opens it as well."""
+        menu = getattr(self._ui, 'menuHelp', None)
+        if menu is None:
+            return
+        self._shortcutsAction = QAction(
+            self.tr('Keyboard shortcuts…'), self)
+        self._shortcutsAction.setObjectName(self.SHORTCUTS_ACTION)
+        self._shortcutsAction.setToolTip(self.tr(
+            'Every key of the window in one list. Search it, give a command '
+            'other keys, or print the sheet.'))
+        self._shortcutsAction.triggered.connect(
+            lambda _checked=False: self.showShortcuts())
+        first = menu.actions()[0] if menu.actions() else None
+        menu.insertAction(first, self._shortcutsAction)
+
+    def showShortcuts(self):
+        from foammesh.view.main_window import shortcuts_dialog
+        SHORTCUTS.sweep(self)
+        return shortcuts_dialog.show(self)
 
     #: Object names for the Plan 35 CR0 Help entries.
     CRASH_REPORT_ACTION = 'actionCreateCrashReport'
@@ -4267,20 +6454,32 @@ class MainWindow(QMainWindow):
     @qasync.asyncSlot()
     async def _saveAs(self, path):
         if await self._stepManager.saveCurrentPage():
-            progressDialog = ProgressDialog(self, self.tr('Save FoamMesh state as'))
+            # Plan 39 VI1 (F6b). Cancel is polled between the copy's writes, so a
+            # cancelled Save as leaves no destination at all.
+            progressDialog = ProgressDialog(
+                self, self.tr('Save FoamMesh state as'), cancelable=True,
+                autoCloseOnCancel=False)
             progressDialog.open()
 
             progressDialog.setLabelText(self.tr(
                 'Saving FoamMesh state only; native geometry and mesh files are not copied'))
             try:
-                await asyncio.to_thread(app.project.saveStateAsCase, path)
+                await asyncio.to_thread(
+                    app.project.saveStateAsCase, path,
+                    cancelled=progressDialog.isCanceled)
+            except StateSaveCancelled:
+                progressDialog.close()
+                self.statusBar().showMessage(
+                    self.tr('Save as cancelled; nothing was written.'), 8000)
+                return
             except (OSError, ValueError, FileExistsError) as error:
                 progressDialog.close()
-                await AsyncMessageBox().warning(self, self.tr('Save state error'), str(error))
+                text, details = messages.reasonOf(error, self.tr('The state could not be saved.'))
+                await AsyncMessageBox().warning(self, self.tr('Save state error'), text, detailedText=details)
                 return
             progressDialog.close()
             open_copy = await modal(
-                QMessageBox.question,
+                messages.question,
                 self, self.tr('State copy complete'),
                 self.tr('FoamMesh state was saved without native artifacts. Open it now?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -4426,7 +6625,11 @@ class MainWindow(QMainWindow):
         self.statusBar().clearMessage()
 
         # 10MB(=10,485,760=1024*1024*10)
-        self._handler = RotatingFileHandler(app.project.storagePath / 'log.txt', maxBytes=10485760, backupCount=5)
+        # Plan 39 VI14d. Written by a thread of its own: a record logged on this
+        # thread waited a second for the file system (virus scanner) once.
+        self._handler = DeferredHandler(RotatingFileHandler(
+            app.project.storagePath / 'log.txt', maxBytes=10485760,
+            backupCount=5))
         self._handler.setFormatter(logging.Formatter("[%(asctime)s][%(name)s] ==> %(message)s"))
         logging.getLogger().addHandler(self._handler)
         scene_events = (
@@ -4496,6 +6699,10 @@ class MainWindow(QMainWindow):
         self._geometryManager = GeometryManager()
         self._meshManager = MeshManager()
         self._meshManager.cellCountChanged.connect(self._cellCountChanged)
+        self._meshManager.volumeColourDropped.connect(
+            self._volumeColourDropped)
+        # Plan 42 SG1. The mesh on screen is the context's provenance source.
+        wire_mesh_provenance(app, self._meshManager)
         # DP-485. A job that rewrites the mesh waits for the viewport to
         # finish reading it.
         try:
@@ -4663,6 +6870,8 @@ class MainWindow(QMainWindow):
         whole-mesh one.
         """
         text, tip = cell_count_text(visible, total)
+        # Plan 42 SG1. A new mesh on screen is a new provenance.
+        refresh_mesh_provenance(app)
         self._ui.cellCount.setText(text)
         self._ui.cellCount.setToolTip(tip)
         # DP-811. The whole-mesh count is on the overlay card; the toolbar

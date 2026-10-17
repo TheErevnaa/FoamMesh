@@ -20,17 +20,22 @@ class PFloat():
 
         self._text = text.strip()
 
-        # Parameter-expression support is intentionally absent. PFloat
-        # validates plain numeric values only.
         if not self._text:
             raise ValueError(field_complaint.sentence(
                 name, field_complaint.required_clause()))
 
+        # DP-1373 (Plan 40 UXD6). A plain number is read as it always was; any
+        # other text goes to the safe quantity evaluator, so `10 mm`, `0.5*12`
+        # and `=diag/40` can be typed. The text is kept as typed.
         try:
             value = float(self._text)
         except ValueError as error:
-            raise ValueError(field_complaint.sentence(
-                name, field_complaint.number_clause())) from error
+            try:
+                from foammesh.core import quantity_expr
+                value = quantity_expr.evaluate(self._text, per=1.0)
+            except ValueError:
+                raise ValueError(field_complaint.sentence(
+                    name, field_complaint.number_clause())) from error
 
         self._isParam = False
 

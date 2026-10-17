@@ -53,8 +53,22 @@ def overlay(db, pending) -> None:
             continue
 
 
-def current(client=None, pending=None, db=None):
-    """The estimate for the open case with ``pending`` edits laid over it."""
+MAX_GLOBAL_PATH = 'castellation/maxGlobalCells'
+
+
+def max_global_cells(db) -> int | None:
+    """The case's ``maxGlobalCells`` (DP-2401), or ``None``."""
+    try:
+        return int(float(db.getValue(MAX_GLOBAL_PATH)))
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def current(client=None, pending=None, db=None, want_budget=False):
+    """The estimate for the open case with ``pending`` edits laid over it.
+
+    With *want_budget* the answer is ``(estimate, maxGlobalCells)``.
+    """
     if db is None:
         try:
             if client is None:
@@ -65,7 +79,10 @@ def current(client=None, pending=None, db=None):
         except Exception:                                   # noqa: BLE001
             return None
         overlay(db, pending)
-    return background_estimate.estimate(db, geometry_bounds())
+    found = background_estimate.estimate(db, geometry_bounds())
+    if found is not None and want_budget:
+        found = (found, max_global_cells(db))
+    return found
 
 
 def prepare(label: QLabel, object_name: str) -> QLabel:
@@ -78,15 +95,30 @@ def prepare(label: QLabel, object_name: str) -> QLabel:
     return label
 
 
-def show(label, client=None, pending=None, db=None):
-    """Fill ``label`` and return the estimate it shows."""
+def show(label, client=None, pending=None, db=None, *, budget=False):
+    """Fill ``label`` and return the estimate it shows.
+
+    *budget* is the castellation page's: it adds the advisory about how much
+    of ``maxGlobalCells`` the starting cells take (DP-2401).
+    """
     if label is None:
         return None
-    found = current(client, pending, db)
+    found = current(client, pending, db, want_budget=budget)
+    maximum = None
+    if budget and found is not None:
+        found, maximum = found
     # Plan 33 check 1: the settings column holds no standing prose. With no
     # case or no geometry there is nothing to count, so nothing is said;
     # once there is, the count is what the sizing above it costs.
-    label.setText(background_estimate.describe(found) if found else '')
+    text = background_estimate.describe(
+        found, max_global_cells=maximum) if found else ''
+    label.setText(text)
+    summary = getattr(label, 'setSummary', None)
+    if callable(summary):
+        # Plan 44 FX2. A folded estimate (Castellation) keeps any warning on
+        # its one line; with none it is the estimate itself on one line.
+        warnings = [line for line in text.splitlines() if 'Warning' in line]
+        summary(' '.join(warnings))
     label.setVisible(found is not None)
     label.setProperty('warning', bool(found is not None and found.over_ram))
     return found

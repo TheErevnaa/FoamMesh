@@ -316,6 +316,24 @@ def summary_readout(document: Mapping | None) -> Readout:
                    ' '.join(caveats), len(rows), len(rows))
 
 
+def plain_engine_message(text: str) -> str:
+    """An OpenFOAM message in the user's words, with the one thing to do.
+
+    Plan 40 UXB7. "--> FOAM Warning : From function ... in file ..." is the
+    solver talking to itself; the user needs what it means and the action.
+    """
+    import re
+
+    body = re.sub(r'^-->\s*FOAM Warning\s*:?\s*', '', text.strip()).strip()
+    lowered = body.lower()
+    if 'no time specified' in lowered:
+        return 'checkMesh read the case at its only time. Nothing to do.'
+    if 'cannot find file' in lowered or 'cannot open file' in lowered:
+        return (f'OpenFOAM could not find a file it expected ({body}). '
+                'Re-run the mesh step that writes it.')
+    return body or text.strip()
+
+
 def checkmesh_readout(document: Mapping | None) -> Readout:
     """Project a stored ``checkMesh`` report for the QA page.
 
@@ -335,8 +353,13 @@ def checkmesh_readout(document: Mapping | None) -> Readout:
         # Older reports carry the raw warning lines and no classified
         # findings; dropping those would show an empty panel beside a
         # `warning` row, which is the defect this fixes.
-        for finding in result.get('warnings') or ():
-            rows.append(ReadoutRow('warning', 'warning', str(finding)))
+        # Plan 40 UXB7 (DP-1352). The banners checkMesh prints as a matter
+        # of course ("No time specified or available") are folded away, and
+        # the rest are put into words and say what to do.
+        from foammesh.core.quality.checkmesh_parser import substantive_warnings
+        for finding in substantive_warnings(result.get('warnings') or ()):
+            rows.append(ReadoutRow(
+                'warning', 'warning', plain_engine_message(str(finding))))
     for label, key, spec in (('max non-orthogonality', 'max_non_ortho', '.4g'),
                              ('max skewness', 'max_skewness', '.4g'),
                              ('max aspect ratio', 'max_aspect_ratio', '.4g'),

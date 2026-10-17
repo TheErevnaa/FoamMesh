@@ -48,3 +48,17 @@ for i, source in enumerate(paths):
     else:
         print(f'  [{i+1}/{totalNum}] Converting... {source.name} -> {source.stem}_ui.py')
         subprocess.run(['pyside6-uic', source, '-o', target])
+
+
+# Remove generated forms whose Designer file is gone (SG44). `*_ui.py` is
+# build output (.gitignore), so a form deleted from the tree -- Plan 43 LY13
+# D1 retired the legacy Region, Castellation and boundary-layer dialogs --
+# left its generated module behind in every existing checkout, where the
+# generated-form smoke test and anything importing it still found it.
+print('\n>> Remove Orphaned Generated Forms')
+for folder in FOLDERS:
+    for generated in Path(folder).glob('**/*_ui.py'):
+        source = generated.parent / (generated.name[:-len('_ui.py')] + '.ui')
+        if not source.is_file():
+            print(f'  Removing...   {generated} (no {source.name})')
+            generated.unlink()
