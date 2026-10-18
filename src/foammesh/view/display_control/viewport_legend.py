@@ -9,6 +9,13 @@ The mockup's geometry (``M:284-317``): 178 px wide, an 18 x 190 bar with mono
 11 px ticks on its right, placed 64 px left of the clear area's right edge and
 centred on the clear area's vertical centre.
 
+Plan 45 D (P1, P1b): the head is a drag handle. The card can be dropped
+anywhere in the clear area; the spot is kept for the session as a fraction of
+the clear area's free room, so it holds across a resize and a mode change.
+Double-clicking the head puts it back. The left edge widens it (178-360 px).
+The metric picker has its own row, its text elided, the whole name in its tip;
+a tick label that would sit under the limit tag is not drawn (the tag wins).
+
 Deviation is coloured by ``|d|``. Its tolerance and scale-to controls live in
 the scale popover's Range section (the legend is too narrow for them); the
 Mesh quality tab's surface rows carry the same tolerance, and both write to
@@ -20,11 +27,12 @@ colouring changes.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
+    QPushButton, QSizePolicy, QStyle, QStyleOptionComboBox, QStylePainter,
+    QToolButton, QVBoxLayout, QWidget)
 
 from foammesh.core.quality import legend_model as lm
 from foammesh.support.colormap import NAN_GREY
@@ -38,6 +46,17 @@ from foammesh.view.theming.status_colors import style_overlay_panel
 #: Space kept between the legend and the viewport's edges.
 LEGEND_MARGIN = 8
 LEGEND_WIDTH = 178
+#: Plan 45 D: the widest the left edge can pull the legend.
+LEGEND_MAX_WIDTH = 360
+#: The width of the left edge's widening grip.
+EDGE_GRIP = 5
+#: The head row's height (the fold control's).
+HEAD_HEIGHT = 20
+#: The head row while the metric picker stands under it (Quality): a grip
+#: strip with the fold, so the picker's own row costs little height.
+HEAD_COMPACT = 14
+#: The gap between the compact head and the metric picker.
+METRIC_GAP = 2
 #: The legend sits this far left of the clear area's right edge (the rail).
 RAIL_CLEARANCE = 64
 #: How far above the clear area's centre the legend's top is (mockup).
@@ -48,6 +67,9 @@ BAR_HEIGHT = 190
 BAR_PAD = 7
 #: Where the tick text starts: the bar and the mockup's 8 px gap.
 TICK_X = BAR_WIDTH + 8
+#: Plan 45 V4. The shortest the limit (tolerance) line gets when its tag
+#: needs the room to read whole.
+TAG_MIN_LINE = 10
 CHIP_HEIGHT = 24
 #: The scale row: the mockup's ``.lscale`` (11 px text, 2 px padding, 1 px border).
 SCALE_HEIGHT = 20
@@ -59,6 +81,16 @@ def _qcolour(rgb) -> QColor:
 
 def _format(value: float) -> str:
     return f'{value:.3g}'
+
+
+def drop_ticks_under_tag(labels, tag):
+    """Plan 45 P1b. ``labels`` is ``[(QRectF, text)]``, the tick labels'
+    text rectangles; ``tag`` is the rectangle the limit (or tolerance) line
+    and its tag cover, or None. A label whose rectangle meets the tag is left
+    out: the tag wins."""
+    if tag is None or tag.isEmpty():
+        return list(labels)
+    return [(rect, text) for rect, text in labels if not rect.intersects(tag)]
 
 
 class LegendBar(QWidget):
@@ -103,6 +135,90 @@ class LegendBar(QWidget):
         area = self.barRect()
         return area.bottom() - float(fraction) * area.height()
 
+    # -- P1b: the tick labels and the limit tag, as rectangles ------------- #
+
+    @staticmethod
+    def _tagFont():
+        # The tag reads in the ticks' mono 11 px.
+        return mono_font(11)
+
+    def tickLabels(self) -> list:
+        """Every tick's ``(QRectF, text)``: the text's own rectangle."""
+        spec = self._spec
+        if spec is None or not spec.has_bar:
+            return []
+        metrics = QFontMetrics(mono_font(11))
+        span = (spec.high - spec.low) or 1.0
+        room = max(0, self.width() - TICK_X)
+        labels = []
+        for value in spec.ticks:
+            y = self.yOf((value - spec.low) / span)
+            words = _format(value)
+            width = min(room, metrics.horizontalAdvance(words) + 1)
+            labels.append((QRectF(TICK_X, y - 8, width, 16), words))
+        return labels
+
+    def _tagLayout(self):
+        """``(y, label, tag box)`` of the limit line, or None."""
+        spec = self._spec
+        if spec is None or not spec.has_bar:
+            return None
+        fraction = spec.limit_fraction()
+        if fraction is None:
+            return None
+        y = round(self.yOf(fraction))
+        label = self.limitText()
+        box = QRectF()
+        if label:
+            # Plan 45 V4. The tag reads whole: "tolerance ±1.12 mm" was cut
+            # to "tolerance ±1.12…". Beside the line when it fits; else it
+            # starts nearer the line (the line shortened to TAG_MIN_LINE);
+            # else it breaks onto two lines at its last space.
+            metrics = QFontMetrics(self._tagFont())
+            right = self.width() - 2
+            width = metrics.horizontalAdvance(label) + 8
+            nearest = TICK_X - 3 + TAG_MIN_LINE + 2
+            left = TICK_X + 30
+            if left + width > right:
+                left = max(nearest, right - width)
+            if left + width > right and ' ' in label:
+                # "tolerance" over "±1.12 mm": the word, then the value.
+                label = '\n'.join(label.split(' ', 1))
+                width = max(metrics.horizontalAdvance(line)
+                            for line in label.split('\n')) + 8
+                left = max(nearest, min(TICK_X + 30, right - width))
+            height = 16 if '\n' not in label else 2 * metrics.height() + 4
+            box = QRectF(left, y - height / 2.0, width, height)
+            box.moveTop(max(0.0, min(box.top(), self.height() - height)))
+        return y, label, box
+
+    def limitRect(self):
+        """The rectangle the limit line and its tag cover, or None: from
+        the line's start to the tag's right end, the tag's 16 px high."""
+        tag = self._tagLayout()
+        if tag is None:
+            return None
+        y, _label, box = tag
+        if box.isEmpty():
+            return QRectF(TICK_X - 3, y - 8, 26, 16)
+        top = min(y - 8, box.top())
+        bottom = max(y + 8, box.bottom())
+        return QRectF(TICK_X - 3, top, box.right() - (TICK_X - 3),
+                      bottom - top)
+
+    def lineEnd(self) -> float:
+        """Where the dashed limit line ends: 26 px long, shorter when its
+        tag was moved nearer to read whole (V4)."""
+        tag = self._tagLayout()
+        end = TICK_X - 3 + 26
+        if tag is not None and not tag[2].isEmpty():
+            end = min(end, tag[2].left() - 2)
+        return end
+
+    def visibleTickLabels(self) -> list:
+        """The tick labels drawn: those the limit tag does not cover."""
+        return drop_ticks_under_tag(self.tickLabels(), self.limitRect())
+
     def paintEvent(self, event):                  # noqa: N802 - Qt naming
         spec = self._spec
         if spec is None or not spec.has_bar:
@@ -122,33 +238,24 @@ class LegendBar(QWidget):
         painter.drawRoundedRect(area.adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         # Ticks: mono 11 px, to the right of the bar, centred on their value.
+        # P1b: a tick the limit line or its tag would cover is not drawn.
         painter.setFont(mono_font(11))
         painter.setPen(text)
-        span = (spec.high - spec.low) or 1.0
-        for value in spec.ticks:
-            y = self.yOf((value - spec.low) / span)
+        for rect, words in self.visibleTickLabels():
             painter.drawText(
-                QRectF(TICK_X, y - 8, max(0, self.width() - TICK_X), 16),
-                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                _format(value))
-        fraction = spec.limit_fraction()
-        if fraction is not None:
-            y = round(self.yOf(fraction))
+                rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                words)
+        tag = self._tagLayout()
+        if tag is not None:
+            y, label, box = tag
             pen = QPen(QColor('#ffffff'))
             pen.setWidth(2)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
-            painter.drawLine(TICK_X - 3, y, TICK_X - 3 + 26, y)
-            label = self.limitText()
+            painter.drawLine(TICK_X - 3, y, int(self.lineEnd()), y)
             if label:
-                font = painter.font()
-                font.setPixelSize(11)
-                painter.setFont(font)
-                metrics = QFontMetrics(font)
-                room = max(20, self.width() - (TICK_X + 30) - 8)
-                label = metrics.elidedText(label, Qt.TextElideMode.ElideRight, room)
-                width = metrics.horizontalAdvance(label) + 8
-                tag = QRectF(TICK_X + 30, y - 8, width, 16)
+                painter.setFont(self._tagFont())
+                tag = box
                 ground = ink('overlay.legend', '#15181d')
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(blend(QColor('#000000'), 0.6, ground))
@@ -320,6 +427,139 @@ class ScaleButton(QPushButton):
         super().leaveEvent(event)
 
 
+class _MetricCombo(QComboBox):
+    """P1b: the metric picker; its text elided to the field, the whole
+    name in its tool tip."""
+
+    def _fieldRect(self, option) -> QRect:
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, option,
+            QStyle.SubControl.SC_ComboBoxEditField, self)
+
+    def elidedText(self) -> str:
+        """The text the closed picker shows."""
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        room = max(0, self._fieldRect(option).width() - 2)
+        return self.fontMetrics().elidedText(
+            self.currentText(), Qt.TextElideMode.ElideRight, room)
+
+    def paintEvent(self, _event):                 # noqa: N802 - Qt naming
+        painter = QStylePainter(self)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+        option.currentText = self.elidedText()
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
+
+
+class _LegendHead(QWidget):
+    """P1: the legend's head row, its drag handle. A drag moves the legend
+    within the clear area; a double-click puts it back where it starts."""
+
+    def __init__(self, legend: 'ViewportLegend', parent=None):
+        super().__init__(parent)
+        self._legend = legend
+        self.setObjectName('legendHead')
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip(self.tr(
+            'Drag to move the legend; double-click to put it back'))
+        self.setMinimumHeight(HEAD_HEIGHT)
+        self._compact = False
+
+    def setCompact(self, compact: bool) -> None:
+        """The grip strip (no title shown) or the full title row."""
+        self._compact = bool(compact)
+        if self._compact:
+            self.setFixedHeight(HEAD_COMPACT)
+        else:
+            self.setMinimumHeight(HEAD_HEIGHT)
+            self.setMaximumHeight(16777215)
+        self.update()
+
+    def isCompact(self) -> bool:
+        return self._compact
+
+    def paintEvent(self, _event):                 # noqa: N802 - Qt naming
+        if not self._compact:
+            return
+        # The grip: two rows of dots, centred, that say "drag me".
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(ink('foreground.sub', '#8a919b'))
+        centre_x = self.width() / 2.0
+        centre_y = self.height() / 2.0
+        for row in (-2.0, 2.0):
+            for column in (-6.0, -2.0, 2.0, 6.0):
+                painter.drawEllipse(QRectF(centre_x + column - 0.75,
+                                           centre_y + row - 0.75, 1.5, 1.5))
+
+    def mousePressEvent(self, event):             # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._legend._beginDrag(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):              # noqa: N802 - Qt naming
+        if self._legend._dragging():
+            self._legend._dragTo(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):           # noqa: N802 - Qt naming
+        if self._legend._dragging():
+            self._legend._dragTo(event.globalPosition().toPoint())
+            self._legend._endDrag()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):       # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._legend._endDrag()
+            self._legend.restoreDefaultPlace()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class _EdgeGrip(QWidget):
+    """P1: the legend's left edge; a drag widens or narrows the legend
+    (``LEGEND_WIDTH`` to ``LEGEND_MAX_WIDTH``), its right edge kept."""
+
+    def __init__(self, legend: 'ViewportLegend'):
+        super().__init__(legend)
+        self._legend = legend
+        self.setObjectName('legendEdgeGrip')
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip(self.tr('Drag to widen the legend'))
+
+    def mousePressEvent(self, event):             # noqa: N802 - Qt naming
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._legend._beginWiden(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):              # noqa: N802 - Qt naming
+        if self._legend._widening():
+            self._legend._widenTo(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):           # noqa: N802 - Qt naming
+        if self._legend._widening():
+            self._legend._widenTo(event.globalPosition().toPoint())
+            self._legend._endWiden()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class ViewportLegend(QFrame):
     """The legend over the viewport (Plan 43 section 3, Plan 44 MF12)."""
 
@@ -349,6 +589,13 @@ class ViewportLegend(QFrame):
         self._placing = False
         self._modes: dict[str, QPushButton] = {}
         self._patchNames = ''
+        #: P1. The user's spot: (x, y) fractions of the clear area's free
+        #: room (0 = left/top, 1 = right/bottom); None for the default place.
+        self._spot: tuple[float, float] | None = None
+        #: P1. The width the left edge was pulled to; None for 178.
+        self._userWidth: int | None = None
+        self._drag = None        # (global press point, top-left at press)
+        self._widen = None       # (global press x, width at press, right edge)
 
         outer = QVBoxLayout(self)
         self._outer = outer
@@ -380,17 +627,28 @@ class ViewportLegend(QFrame):
         self._segment.setFixedHeight(20)
         body.addWidget(self._segment)
 
-        head = QHBoxLayout()
+        # P1: the head row is the drag handle (the title and the fold).
+        self._head = _LegendHead(self, self._body)
+        head = QHBoxLayout(self._head)
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(GAP)
-        self._title = QLabel(self._body)
+        self._title = QLabel(self._head)
         self._title.setObjectName('legendCaption')
         self._title.setWordWrap(True)
         font = self._title.font()
         font.setBold(True)
         self._title.setFont(font)
         head.addWidget(self._title, 1)
-        self._metric = QComboBox(self._body)
+        head.addStretch(0)      # holds the fold right while the title hides
+        # P1b: the metric picker has its own, full-width row.
+        self._metricRow = QWidget(self._body)
+        self._metricRow.setObjectName('legendMetricRow')
+        self._metricRow.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                      QSizePolicy.Policy.Fixed)
+        metric_row = QVBoxLayout(self._metricRow)
+        metric_row.setContentsMargins(0, METRIC_GAP, 0, 0)
+        metric_row.setSpacing(0)
+        self._metric = _MetricCombo(self._metricRow)
         self._metric.setObjectName('legendMetric')
         self._metric.setAccessibleName(self.tr('Quality metric'))
         self._metric.setSizeAdjustPolicy(
@@ -402,8 +660,9 @@ class ViewportLegend(QFrame):
         # control beside it is 20.
         self._metric.setFixedHeight(20)
         self._metric.activated.connect(self._metricChosen)
-        head.addWidget(self._metric, 1)
-        self._fold = _GlyphButton('—', self._body)
+        self._metric.currentIndexChanged.connect(self._metricTip)
+        metric_row.addWidget(self._metric)
+        self._fold = _GlyphButton('—', self._head)
         self._fold.setObjectName('legendFold')
         self._fold.setToolTip(self.tr('Fold the legend to a chip'))
         self._fold.setAccessibleName(self._fold.toolTip())
@@ -418,7 +677,8 @@ class ViewportLegend(QFrame):
         block = body.itemAt(body.count() - 1).layout()
         block.setContentsMargins(0, 0, 0, 0)
         block.setSpacing(max(0, GAP - BAR_PAD))
-        block.addLayout(head)
+        block.addWidget(self._head)
+        block.addWidget(self._metricRow)
 
         self._bar = LegendBar(self._body)
         block.addWidget(self._bar)
@@ -495,6 +755,7 @@ class ViewportLegend(QFrame):
         body.addWidget(self._scale)
 
         outer.addWidget(self._body)
+        self._edge = _EdgeGrip(self)
         self._applyFold()
         self.hide()
         if parent is not None:
@@ -527,17 +788,28 @@ class ViewportLegend(QFrame):
         self._segment.setChecked(spec.mode)
         self._title.setText(spec.title)
         quality = spec.mode == lm.QUALITY
-        self._metric.setVisible(quality and bool(spec.metrics))
-        self._title.setVisible(not (quality and bool(spec.metrics)))
+        self._metricRow.setVisible(quality and bool(spec.metrics))
+        picker = quality and bool(spec.metrics)
+        self._title.setVisible(not picker)
+        self._head.setCompact(picker)
+        self._fold.setFixedSize(20, HEAD_COMPACT if picker else HEAD_HEIGHT)
         if quality:
             self._metric.blockSignals(True)
             self._metric.clear()
+            metrics = QFontMetrics(self._metric.font())
+            widest = 0
             for name in spec.metrics:
                 self._metric.addItem(name)
+                self._metric.setItemData(
+                    self._metric.count() - 1, name, Qt.ItemDataRole.ToolTipRole)
+                widest = max(widest, metrics.horizontalAdvance(name))
             at = self._metric.findText(spec.metric)
             if at >= 0:
                 self._metric.setCurrentIndex(at)
             self._metric.blockSignals(False)
+            # The open list shows every name whole.
+            self._metric.view().setMinimumWidth(widest + 32)
+            self._metricTip()
         self._bar.setVisible(spec.has_bar)
         self._bar.setSpec(spec, lut)
         self._missing.setText(spec.not_measured)
@@ -677,23 +949,6 @@ class ViewportLegend(QFrame):
         """Set the tolerance as if typed."""
         self._tolerance.setValue(abs(float(value)))
 
-    def _partsChipBox(self, x, width):
-        """The geometry of a visible Parts chip that shares the legend's
-        columns, or None."""
-        parent = self.parentWidget()
-        if parent is None:
-            return None
-        chip = parent.findChild(QWidget, 'partsChip')
-        if chip is not None and getattr(self, '_watchedChip', None) is not chip:
-            self._watchedChip = chip          # re-place when the chip moves
-            chip.installEventFilter(self)
-        if chip is None or not chip.isVisible():
-            return None
-        geometry = chip.geometry()
-        if geometry.x() >= x + width or geometry.x() + geometry.width() <= x:
-            return None
-        return geometry
-
     def _chipOnly(self) -> bool:
         return self._folded or (
             self._spec is not None and self._spec.mode == lm.PATCHES)
@@ -717,7 +972,8 @@ class ViewportLegend(QFrame):
                 FORM_MARGIN, FORM_MARGIN - 1, FORM_MARGIN, FORM_MARGIN)
             self.setMinimumSize(0, 0)
             self.setMaximumHeight(16777215)
-            self.setFixedWidth(LEGEND_WIDTH)
+            self.setFixedWidth(self._legendWidth())
+        self._edge.setVisible(not chip)
         self._remask()
 
     def _chipClicked(self):
@@ -728,6 +984,13 @@ class ViewportLegend(QFrame):
 
     def _metricChosen(self, _index):
         self.metricRequested.emit(self._metric.currentText())
+
+    def _metricTip(self, _index=None):
+        """P1b: the picker's tip is the whole name of what it shows."""
+        self._metric.setToolTip(self._metric.currentText())
+
+    def metricCombo(self) -> QComboBox:
+        return self._metric
 
     def _scaleToEdited(self):
         self._scaleAuto.setEnabled(True)
@@ -748,6 +1011,10 @@ class ViewportLegend(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        edge = getattr(self, '_edge', None)
+        if edge is not None:
+            edge.setGeometry(0, 0, EDGE_GRIP, self.height())
+            edge.raise_()
         self._remask()
 
     # -- placement ---------------------------------------------------------- #
@@ -783,12 +1050,107 @@ class ViewportLegend(QFrame):
     def eventFilter(self, watched, event):
         if watched is self.parent() and event.type() == QEvent.Type.Resize:
             self._place()
-        elif (watched is getattr(self, '_watchedChip', None)
-              and event.type() in (QEvent.Type.Move, QEvent.Type.Show,
-                                   QEvent.Type.Hide)
-              and self._spec is not None and self.isVisible()):
-            self._place()
         return super().eventFilter(watched, event)
+
+    # -- P1: moved and widened by the user -------------------------------- #
+
+    def isUserPlaced(self) -> bool:
+        """True while the legend stands where it was dropped."""
+        return self._spot is not None
+
+    def spot(self):
+        """The dropped spot as (x, y) fractions of the clear area's free
+        room, or None."""
+        return self._spot
+
+    def restoreDefaultPlace(self) -> None:
+        """Back to the mockup's place and width (a double-click on the head)."""
+        before = self.geometry()
+        self._spot = None
+        self._userWidth = None
+        if not self._chipOnly():
+            self.setFixedWidth(self._legendWidth())
+        self._place()
+        self._repaintMoved(before)
+
+    def _legendWidth(self) -> int:
+        width = LEGEND_WIDTH if self._userWidth is None else self._userWidth
+        clear = self.clearRect()
+        if clear.isValid() and not clear.isEmpty():
+            width = min(width, clear.width())
+        return int(max(LEGEND_WIDTH, min(LEGEND_MAX_WIDTH, width)))
+
+    @staticmethod
+    def _clamped(x, y, width, height, clear: QRect) -> QPoint:
+        x = max(clear.x(), min(int(round(x)), clear.x() + clear.width() - width))
+        y = max(clear.y(), min(int(round(y)), clear.y() + clear.height() - height))
+        return QPoint(x, y)
+
+    def _storeSpot(self) -> None:
+        clear = self.clearRect()
+        room_x = clear.width() - self.width()
+        room_y = clear.height() - self.height()
+        fx = (self.x() - clear.x()) / room_x if room_x > 0 else 0.0
+        fy = (self.y() - clear.y()) / room_y if room_y > 0 else 0.0
+        self._spot = (min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy)))
+
+    def _repaintMoved(self, before: QRect) -> None:
+        """The legend is a native window over the GL view (DP-2707): have
+        the view redraw what the move uncovered, and the legend itself."""
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.update(before.united(self.geometry()))
+        self.update()
+
+    def _dragging(self) -> bool:
+        return self._drag is not None
+
+    def _beginDrag(self, global_point: QPoint) -> None:
+        self._drag = (QPoint(global_point), self.pos())
+        self._head.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _dragTo(self, global_point: QPoint) -> None:
+        if self._drag is None:
+            return
+        start, origin = self._drag
+        target = origin + (global_point - start)
+        before = self.geometry()
+        point = self._clamped(target.x(), target.y(), self.width(),
+                              self.height(), self.clearRect())
+        if point != self.pos():
+            self.move(point)
+            self._repaintMoved(before)
+        self._storeSpot()
+
+    def _endDrag(self) -> None:
+        self._drag = None
+        self._head.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _widening(self) -> bool:
+        return self._widen is not None
+
+    def _beginWiden(self, global_point: QPoint) -> None:
+        self._widen = (global_point.x(), self.width(), self.x() + self.width())
+
+    def _widenTo(self, global_point: QPoint) -> None:
+        if self._widen is None or self._chipOnly():
+            return
+        start_x, start_width, right = self._widen
+        clear = self.clearRect()
+        widest = min(LEGEND_MAX_WIDTH, right - clear.x())
+        width = int(max(LEGEND_WIDTH, min(widest, start_width + start_x
+                                          - global_point.x())))
+        before = self.geometry()
+        self._userWidth = width
+        self.setFixedWidth(width)
+        self.adjustSize()
+        point = self._clamped(right - width, self.y(), width, self.height(), clear)
+        self.move(point)
+        self._storeSpot()
+        self._repaintMoved(before)
+
+    def _endWiden(self) -> None:
+        self._widen = None
 
     def _place(self):
         """Mockup ``renderLegend``: 64 px left of the clear area's right edge,
@@ -799,9 +1161,24 @@ class ViewportLegend(QFrame):
             return
         self._placing = True
         try:
+            if not self._chipOnly() and self.width() != self._legendWidth():
+                self.setFixedWidth(self._legendWidth())
+            # The head and the picker row change their height with the mode;
+            # settle the inner layouts first so the size below is current.
+            for part in (self._head, self._metricRow, self._body):
+                if part.layout() is not None:
+                    part.layout().activate()
             self.adjustSize()
             clear = self.clearRect()
             width, height = self.width(), self.height()
+            if self._spot is not None:
+                # P1: where the user dropped it, as a share of the free room.
+                fx, fy = self._spot
+                self.move(self._clamped(
+                    clear.x() + fx * max(0, clear.width() - width),
+                    clear.y() + fy * max(0, clear.height() - height),
+                    width, height, clear))
+                return
             right = clear.x() + clear.width() - RAIL_CLEARANCE
             centre = clear.y() + clear.height() / 2.0
             x = max(clear.x(), right - width)
@@ -810,18 +1187,8 @@ class ViewportLegend(QFrame):
             else:
                 y = max(clear.y() + LEGEND_MARGIN, centre - CENTRE_RISE)
             bottom = clear.y() + clear.height() - LEGEND_MARGIN
-            # MF27: in a short clear area (1280x800, console at 280) the
-            # legend rose to the clear top and sat on the Parts chip, which
-            # the overlay layout keeps at the clear area's top right. Start
-            # below the chip when the two share columns.
-            chip = self._partsChipBox(x, width)
-            if chip is not None:
-                floor = chip.y() + chip.height() + LEGEND_MARGIN
-                if floor + height <= bottom:
-                    y = max(y, floor)
-                else:
-                    # no room under it: stand left of the chip's column
-                    x = max(clear.x(), min(x, chip.x() - LEGEND_MARGIN - width))
+            # Plan 45 (user 2026-10-17): the Parts chip it once stood clear
+            # of is retired; the rail's Parts button is the one way in.
             y = max(clear.y(), min(y, bottom - height))
             rect = self.rect().translated(int(round(x)), int(round(y)))
             if self._avoider is not None:

@@ -152,6 +152,33 @@ def set_last_op(text: str) -> None:
         pass
 
 
+def last_op() -> str:
+    """This process's last operation as written now ('' without a block)."""
+    shared = _state['block']
+    if shared is None:
+        return ''
+    try:
+        return read(shared)['last_op']
+    except (ValueError, TypeError, struct.error):
+        return ''
+
+
+def restore_last_op(written: str, previous: str) -> None:
+    """Plan 45 W1/V12. An operation that has finished hands the label back.
+
+    Put *previous* back, but only while the label still reads *written*: a
+    later writer (a nested or another thread's operation) keeps its own. A
+    finished operation that stayed in the block was named, minutes later, as
+    the cause of an unrelated stall (``facade:mesh.engine.probe`` for a
+    theme switch).
+    """
+    if _state['block'] is None:
+        return
+    if last_op() == str(written).encode('utf-8', 'replace')[:OP_CAPACITY].decode(
+            'utf-8', 'replace'):
+        set_last_op(previous)
+
+
 def read(shared) -> dict:
     """Decode a block (the helper's side)."""
     for _attempt in range(3):

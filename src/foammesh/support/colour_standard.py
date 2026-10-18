@@ -19,8 +19,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
-from matplotlib import colormaps
-from matplotlib.colors import LinearSegmentedColormap
 from vtkmodules.vtkCommonCore import vtkLookupTable
 
 #: Not measured is always this grey, never a colour of the scale.
@@ -228,10 +226,23 @@ def reset_session() -> None:
 
 # --- the table ---------------------------------------------------------------
 
-_BLACKBODY = LinearSegmentedColormap.from_list(
-    'foammesh_blackbody',
-    [(0.0, 0.0, 0.0), (0.55, 0.0, 0.0), (0.95, 0.35, 0.0),
-     (1.0, 0.8, 0.1), (1.0, 1.0, 0.85)])
+_BLACKBODY = None
+
+
+def _blackbody():
+    """The blackbody map, made on first use.
+
+    Plan 45 start-up: matplotlib is imported when a table is first coloured,
+    not by importing the application (~0.15 s of every launch).
+    """
+    global _BLACKBODY
+    if _BLACKBODY is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        _BLACKBODY = LinearSegmentedColormap.from_list(
+            'foammesh_blackbody',
+            [(0.0, 0.0, 0.0), (0.55, 0.0, 0.0), (0.95, 0.35, 0.0),
+             (1.0, 0.8, 0.1), (1.0, 1.0, 0.85)])
+    return _BLACKBODY
 
 
 def _white_to_red(x: float):
@@ -241,9 +252,10 @@ def _white_to_red(x: float):
 
 def _colour_map(key: str):
     if key == 'blackbody':
-        return _BLACKBODY
+        return _blackbody()
     if key == 'white_to_red':
         return _white_to_red
+    from matplotlib import colormaps
     return colormaps[key]
 
 

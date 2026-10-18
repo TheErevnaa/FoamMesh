@@ -16,8 +16,8 @@ label for one changes nothing else.
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
-                               QSizePolicy, QVBoxLayout)
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
+                               QPushButton, QSizePolicy, QVBoxLayout)
 
 from foammesh.view.theming.metrics import FORM_MARGIN, GAP, MARGIN_TIGHT
 
@@ -48,6 +48,8 @@ _GLYPHS = {
 _TOKENS = {INFO: ('status.info', '#6da0ff'),
            WARNING: ('status.warning', '#d2a106'),
            ERROR: ('status.error', '#ec837d')}
+#: (kind, colour, device pixel ratio) -> the glyph drawn in that colour
+_PIXMAPS: dict = {}
 
 
 class NoticeCard(QFrame):
@@ -191,8 +193,23 @@ class NoticeCard(QFrame):
     def _paint_icon(self) -> None:
         from foammesh.view.workflow_controls.lock_chip import _token, svg_icon
         name, fallback = _TOKENS[self._kind]
-        icon = svg_icon(_GLYPHS[self._kind], _token(name, fallback), ICON_SIZE)
-        self.icon.setPixmap(icon.pixmap(ICON_SIZE, ICON_SIZE))
+        colour = _token(name, fallback)
+        screen = QApplication.primaryScreen() if QApplication.instance() else None
+        ratio = screen.devicePixelRatio() if screen is not None else 1.0
+        key = (self._kind, colour, ratio)
+        # Plan 45 W1. A theme switch re-polishes the tree once per ancestor,
+        # so a card hears StyleChange a dozen times or more in one switch;
+        # each used to draw its SVG again. The glyph is the same for every
+        # card of a kind in a colour, so it is drawn once and kept.
+        if getattr(self, '_painted', None) == key:
+            return
+        pixmap = _PIXMAPS.get(key)
+        if pixmap is None:
+            pixmap = svg_icon(_GLYPHS[self._kind], colour, ICON_SIZE).pixmap(
+                ICON_SIZE, ICON_SIZE)
+            _PIXMAPS[key] = pixmap
+        self._painted = key
+        self.icon.setPixmap(pixmap)
 
 
 __all__ = ['ERROR', 'INFO', 'NOTICE_PROPERTY', 'NoticeCard', 'WARNING']

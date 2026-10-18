@@ -116,6 +116,14 @@ class ElementDisplayPanel(QWidget):
         self._show.toggled.connect(self.setShown)
         layout.addWidget(self._show)
 
+        # Plan 45 P12. The answer to a refused request lives OUTSIDE the
+        # body, which is hidden on a refusal; it stays until the next action.
+        self._notice = QLabel('')
+        self._notice.setObjectName('elementNotice')
+        self._notice.setWordWrap(True)
+        self._notice.setVisible(False)
+        layout.addWidget(self._notice)
+
         self._body = QWidget()
         self._body.setObjectName('elementBody')
         body = QVBoxLayout(self._body)
@@ -250,6 +258,7 @@ class ElementDisplayPanel(QWidget):
 
     def _say(self, text: str) -> None:
         self._status.setText(str(text))
+        self.updateGeometry()
 
     def status(self) -> str:
         return self._status.text()
@@ -328,13 +337,25 @@ class ElementDisplayPanel(QWidget):
     def isShown(self) -> bool:
         return self._show.isChecked()
 
+    def notice(self) -> str:
+        """Why the last request was refused ('' when it was not)."""
+        return self._notice.text()
+
+    def _setNotice(self, text: str) -> None:
+        self._notice.setText(str(text))
+        self._notice.setVisible(bool(text))
+        self.updateGeometry()
+
     def setShown(self, on: bool) -> None:
+        self._setNotice('')
         self._body.setVisible(bool(on))
+        self.updateGeometry()
         if not on:
             self.clear()
             self.changed.emit()
             return
         self.request()
+        self.updateGeometry()
 
     def request(self) -> None:
         """Read the mesh on screen and draw it."""
@@ -362,8 +383,10 @@ class ElementDisplayPanel(QWidget):
             if self._provider is None:
                 raise ValueError('There is no mesh in the viewport yet.')
             source = self._provider()
-        except (ValueError, OSError) as error:
-            self._refused(str(error))
+        except Exception as error:                        # noqa: BLE001
+            # Any failure of the producer is an answer, not a silent no-op
+            # (a raise in a toggled slot only reaches the console).
+            self._refused(str(error) or type(error).__name__)
             return
         self.showSource(source)
 
@@ -379,11 +402,16 @@ class ElementDisplayPanel(QWidget):
             return False
 
     def _refused(self, reason: str) -> None:
-        self._say(reason)
+        # The box is unticked: nothing is drawn, so a tick would lie; the
+        # reason stays under it until the user's next action.
+        self._busy = False
+        self._status.setText('')
+        self._setNotice(reason)
         self._show.blockSignals(True)
         self._show.setChecked(False)
         self._show.blockSignals(False)
         self._body.setVisible(False)
+        self.updateGeometry()
 
     def _onSource(self, source) -> None:
         self._busy = False
@@ -406,6 +434,8 @@ class ElementDisplayPanel(QWidget):
             self._show.setChecked(True)
             self._show.blockSignals(False)
             self._body.setVisible(True)
+        self._setNotice('')
+        self.updateGeometry()
         return self._draw()
 
     def clear(self) -> None:

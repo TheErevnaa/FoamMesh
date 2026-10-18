@@ -101,13 +101,36 @@ class LegendController:
         add_float = getattr(clear, 'add_float', None)
         if callable(add_float):
             legend = self.legend
-            legend.setAvoider(
-                lambda rect: clear.place_clear_of(legend, rect))
+            legend.setAvoider(lambda rect: self._placeOff(clear, rect))
             add_float(legend, FLOAT_RANK_LEGEND, legend.place)
         try:
             clear.changed.connect(lambda _rect: self.legend.place())
         except (AttributeError, TypeError):
             logger.debug('clear area has no changed signal', exc_info=True)
+
+    def _placeOff(self, clear, rect):
+        """Plan 45 V6. *rect* (the legend's own place) moved off the items
+        placed before it (an open popover), and off the model too when there
+        is such a place: the section panel opening under its button pushed
+        the legend left onto the model. With no place off both, the place
+        off the items alone is kept, as before."""
+        moved = clear.place_clear_of(self.legend, rect)
+        if moved == rect:
+            return moved
+        modelRect = getattr(self._window, 'modelScreenRect', None)
+        try:
+            model = modelRect() if callable(modelRect) else None
+        except Exception:                                 # noqa: BLE001
+            logger.debug('model rectangle unavailable', exc_info=True)
+            model = None
+        if model is None or model.isEmpty() or not moved.intersects(model):
+            return moved
+        from foammesh.view.main_window.clear_area import avoid_rect
+        blockers = list(clear.float_blockers(self.legend)) + [model]
+        free = avoid_rect(rect, clear.clearRect(), blockers)
+        if any(free.intersects(block) for block in blockers):
+            return moved
+        return free
 
     def refresh(self):
         """Redraw the legend from the colouring on screen."""

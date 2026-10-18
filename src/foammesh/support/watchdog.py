@@ -150,6 +150,10 @@ class Watchdog(QObject):
         self._gui_ident: int | None = None
         self._beat_at: float | None = None     # real monotonic, for the monitor
         self._dumped_for: float | None = None  # the beat whose stall has stacks
+        #: Plan 45 W1/V12: (beat, operation) read by the monitor while the
+        #: GUI thread was stuck, so the report names what was running then
+        #: rather than whatever the label reads once the stall is over.
+        self._stall_op: tuple[float, str] | None = None
         self._monitor_stop = threading.Event()
         self._monitor: threading.Thread | None = None
         #: stall dumps the monitor wrote from ``sys._current_frames``
@@ -231,6 +235,11 @@ class Watchdog(QObject):
                 self._dumped_for = beat
             self._arm()
             armed_at = now
+            if (beat is not None and now - beat >= self._stall_seconds
+                    and (self._stall_op is None or self._stall_op[0] != beat)):
+                # Read while the GUI thread is still stuck: what it is
+                # running now, not what the label says after it returns.
+                self._stall_op = (beat, self._last_op())
             if (beat is None or self._dumped_for == beat
                     or now - beat < self._stall_seconds):
                 continue
@@ -258,16 +267,22 @@ class Watchdog(QObject):
         now = self._clock()
         gap = now - self._last if self._last is not None else 0.0
         self._last = now
+        stuck_beat = self._beat_at
         self._beat_at = time.monotonic()
         heartbeat.beat()
         self._ticks += 1
         if self._ticks % HELPER_CHECK_TICKS == 0:
             crash_helper.check_helper(logger)
         if gap >= self._stall_seconds:
-            self._report(gap)
+            self._report(gap, stuck_beat)
 
-    def _report(self, seconds: float) -> None:
-        operation = self._last_op()
+    def _report(self, seconds: float, stuck_beat: float | None = None) -> None:
+        seen = self._stall_op
+        self._stall_op = None
+        if seen is not None and stuck_beat is not None and seen[0] == stuck_beat:
+            operation = seen[1]
+        else:
+            operation = self._last_op()
         self.stalls.append((seconds, operation))
         self._write(f'[{_now()}] the GUI thread was unresponsive for '
                     f'{seconds:.1f} s; last operation: {operation or "none"}')
@@ -277,15 +292,27 @@ class Watchdog(QObject):
         self.stalled.emit(seconds, operation)
 
 
-class StallIndicator(QLabel):
-    """Status-bar item: "UI was unresponsive for X s (details)"."""
+#: Plan 45 V12. How long the status-bar note stays once the GUI answers
+#: again. The note reports a stall that is over; left up for good it read as
+#: a standing fault ("UI was unresponsive for 15 s" minutes after a theme
+#: switch). Every stall stays in ``watchdog.log``.
+NOTE_SECONDS = 10.0
 
-    def __init__(self, log_path, parent=None):
+
+class StallIndicator(QLabel):
+    """Status-bar item: "UI was unresponsive for X s (details)".
+
+    Shown when a stall ends and cleared :data:`NOTE_SECONDS` later.
+    """
+
+    def __init__(self, log_path, parent=None, *, note_seconds: float = NOTE_SECONDS):
         super().__init__(parent)
         self._log_path = Path(log_path)
         self.setObjectName('uiStallIndicator')
         self.setTextFormat(Qt.TextFormat.RichText)
         self.linkActivated.connect(self._open)
+        self._note_ms = int(note_seconds * 1000)
+        self._shown = 0
         self.hide()
 
     def show_stall(self, seconds: float, operation: str = '') -> None:
@@ -294,6 +321,12 @@ class StallIndicator(QLabel):
         self.setToolTip(self.tr('Last operation: {0}\nStacks: {1}').format(
             operation or self.tr('none'), self._log_path))
         self.show()
+        self._shown += 1
+        shown = self._shown
+        # Only the latest stall's note clears it: an earlier one's timer
+        # finds a newer note up and leaves it.
+        QTimer.singleShot(self._note_ms, self,
+                          lambda: shown == self._shown and self.hide())
 
     def _open(self, _link: str = '') -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._log_path)))

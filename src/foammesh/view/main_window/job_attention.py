@@ -31,14 +31,30 @@ class JobAttention:
         self._notify_enabled = notify_enabled
         self._running: dict[str, str] = {}
         self.flashes = 0
+        #: Plan 45 W2. What the taskbar button was last told. A window that
+        #: has never run anything shows no progress, so that is the start.
+        self._shown = NO_PROGRESS
 
     @property
     def running(self) -> int:
         return len(self._running)
 
+    def _show(self, state):
+        """Tell the taskbar ``state``, unless that is what it shows (W2).
+
+        A focus change asked for "no progress" every time, and asking went
+        through ``winId()`` and a call into the shell's taskbar on the GUI
+        thread -- 2.1 s in one live pass. Nothing is asked when nothing
+        would change.
+        """
+        if state == self._shown:
+            return
+        self._shown = state
+        self._backend.set_progress(state)
+
     def on_started(self, *, job_id, name='', **_kwargs):
         self._running[str(job_id)] = str(name or '')
-        self._backend.set_progress(INDETERMINATE)
+        self._show(INDETERMINATE)
 
     def on_finished(self, *, job_id, **_kwargs):
         self._end(job_id, 'finished', failed=False)
@@ -52,9 +68,9 @@ class JobAttention:
     def _end(self, job_id, verb, *, failed, attention=True):
         name = self._running.pop(str(job_id), '')
         if self._running:
-            self._backend.set_progress(INDETERMINATE)
+            self._show(INDETERMINATE)
         else:
-            self._backend.set_progress(ERROR if failed else NO_PROGRESS)
+            self._show(ERROR if failed else NO_PROGRESS)
         if not attention or self._is_active():
             return
         self.flashes += 1
@@ -66,7 +82,7 @@ class JobAttention:
     def on_activated(self):
         """The window came to the front: clear a failure mark on the button."""
         if not self._running:
-            self._backend.set_progress(NO_PROGRESS)
+            self._show(NO_PROGRESS)
 
 
 class QtBackend:
@@ -108,6 +124,7 @@ class QtBackend:
         if sys.platform != 'win32':
             return None
         if self._taskbar is None:
+            # Made once, on the first state change, never at start-up.
             try:
                 self._taskbar = _WindowsTaskbar()
             except Exception:
@@ -115,8 +132,20 @@ class QtBackend:
                 self._taskbar = False
         if not self._taskbar:
             return None
-        self._hwnd = int(self._window.winId())
+        # Plan 45 W2. The handle is kept: ``winId()`` dispatched events (and
+        # every Python event filter with them) inside the call. It is asked
+        # again only when Windows says the kept one is no window any more.
+        if not self._hwnd or not _is_window(self._hwnd):
+            self._hwnd = int(self._window.winId())
         return self._taskbar
+
+
+def _is_window(hwnd):
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.IsWindow(ctypes.c_void_p(hwnd)))
+    except Exception:
+        return False
 
 
 class _WindowsTaskbar:

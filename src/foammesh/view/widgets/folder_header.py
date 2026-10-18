@@ -48,6 +48,7 @@ class FolderHeader(QCheckBox):
         self.toggled.connect(self._refreshChevron)
 
     def _refreshChevron(self, *_):
+        self._staleChevron = False
         self.setIcon(load_themed_icon(
             _CHEVRON_OPEN if self.isChecked() else _CHEVRON_CLOSED,
             QSize(64, 64)))
@@ -57,7 +58,19 @@ class FolderHeader(QCheckBox):
         # A theme swap replaces the palette and empties the icon cache; the
         # chevron has to be asked for again or it keeps the old theme ink.
         if event.type() == QEvent.Type.PaletteChange:
+            if self.isVisible():
+                self._refreshChevron()
+            else:
+                # Plan 45 W1. A theme switch sends this to every fold in the
+                # application, most of them on pages nobody is looking at;
+                # each one read and recoloured its SVG inside the switch.
+                # A hidden fold is drawn again when it is shown.
+                self._staleChevron = True
+
+    def showEvent(self, event):
+        if getattr(self, '_staleChevron', False):
             self._refreshChevron()
+        super().showEvent(event)
 
     def setContents(self, widget):
         self._contents = widget

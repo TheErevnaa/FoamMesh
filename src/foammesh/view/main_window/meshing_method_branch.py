@@ -579,7 +579,9 @@ class MeshingMethodBranch(QObject):
             # consult a hand-written table in StepManager as well, which meant
             # the tree could disagree with the workflow descriptor in two
             # directions at once; that table is gone.
-            if self._branch.page(task_id) is None:
+            has_page = getattr(self._branch, 'hasPage', None)
+            if (not has_page(task_id) if has_page is not None
+                    else self._branch.page(task_id) is None):
                 continue
             # Plan 32 section 4.4. A hosted task keeps its page, its
             # prerequisites and its place in the workflow graph; what it loses

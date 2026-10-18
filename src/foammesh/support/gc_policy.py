@@ -49,6 +49,7 @@ _state = {
     'frozen_at_startup': None,
     'threshold_raised': False,
     'timer': None,
+    'after_paint': None,
 }
 
 
@@ -81,11 +82,78 @@ def freeze_startup():
     return _state['frozen_at_startup']
 
 
-def startup_complete():
-    """Apply the whole policy. Called once, after the main window exists."""
+#: Milliseconds after start-up by which the heap is frozen even if the window
+#: was never painted (started minimised, say).
+FREEZE_FALLBACK_MS = 1500
+
+
+def startup_complete(after_paint=None):
+    """Apply the whole policy. Called once, after the main window exists.
+
+    ``after_paint`` -- the main window's ``QWindow``, when no project can be
+    opened before the window is painted: the start-up heap is then frozen
+    once that first paint is done instead of before the window is shown.
+    The freeze's collection is ~0.05 s (MEASURED live 18 October 2026) that
+    the window used to wait for.
+    """
     raise_threshold()
-    freeze_startup()
+    if after_paint is None or not freeze_after_first_paint(after_paint):
+        freeze_startup()
     start_idle_collector()
+
+
+class _FreezeAfterPaint:
+    """Freeze the start-up heap once the window's first expose is painted.
+
+    A widget window paints its first frame while it handles the expose, so a
+    zero-delay call queued from the expose runs once that frame is drawn.
+    """
+
+    def __init__(self, window, fallback_ms):
+        from PySide6.QtCore import QEvent, QObject, QTimer
+
+        class Filter(QObject):
+            def eventFilter(filter_self, watched, event):     # noqa: N805
+                if event.type() == QEvent.Type.Expose and watched.isExposed():
+                    watched.removeEventFilter(filter_self)
+                    QTimer.singleShot(0, self.freeze)
+                return False
+
+        self._filter = Filter(window)
+        window.installEventFilter(self._filter)
+        QTimer.singleShot(fallback_ms, self.freeze)
+
+    def freeze(self):
+        if _state['after_paint'] is not self:
+            return
+        _state['after_paint'] = None
+        freeze_startup()
+
+
+def freeze_after_first_paint(window, fallback_ms=FREEZE_FALLBACK_MS):
+    """Freeze the start-up heap after *window*'s first paint; True if armed.
+
+    Falls back to a timer so the heap is frozen even with no paint. A
+    project opened meanwhile calls :func:`freeze_pending` first.
+    """
+    if _state['frozen'] or _state['after_paint'] is not None:
+        return _state['after_paint'] is not None
+    if window is None or not _on_main_thread():
+        return False
+    try:
+        _state['after_paint'] = _FreezeAfterPaint(window, fallback_ms)
+    except Exception:                                       # noqa: BLE001
+        logger.debug('freeze after paint not armed', exc_info=True)
+        _state['after_paint'] = None
+        return False
+    return True
+
+
+def freeze_pending():
+    """Freeze now if a freeze is waiting for the first paint (a project opens)."""
+    pending = _state['after_paint']
+    if pending is not None:
+        pending.freeze()
 
 
 def start_idle_collector():
@@ -130,6 +198,11 @@ def collect_full(reason=''):
     """Full collection on the GUI thread, after a scene swap or close."""
     if not _on_main_thread():
         logger.debug('gc_policy: full collect for %r skipped off the GUI thread', reason)
+        return 0
+    if _state['after_paint'] is not None:
+        # Plan 45 start-up. The start-up freeze, waiting for the first paint,
+        # is a full collection of its own; the window's start clears an empty
+        # case (MEASURED live 18 October 2026: 0.05 s inside show()).
         return 0
     return gc.collect()
 

@@ -22,8 +22,9 @@ the same widgets, only their parents are dock widgets now.
 from __future__ import annotations
 
 import base64
+from xml.etree import ElementTree
 
-from PySide6.QtCore import QByteArray, QObject, QRect, Qt, Signal
+from PySide6.QtCore import QByteArray, QObject, QRect, Qt, Signal, qUncompress
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QWidget
 import PySide6QtAds as QtAds
@@ -62,6 +63,37 @@ def screen_for(name: str | None, screens) -> tuple[object | None, bool]:
     if primary is None and screens:
         primary = screens[0]
     return primary, False
+
+
+def _state_tree(raw: bytes):
+    """The XML of a Qt-ADS state (``qCompress``-ed or plain), or None."""
+    if not raw.lstrip().startswith(b'<'):
+        raw = bytes(qUncompress(QByteArray(raw)).data())
+    try:
+        return ElementTree.fromstring(raw)
+    except ElementTree.ParseError:
+        return None
+
+
+def _shape(element) -> tuple:
+    """An arrangement without its sizes and without which docks are closed."""
+    attributes = tuple(sorted((key, value) for key, value in element.attrib.items()
+                              if key != 'Closed'))
+    return (element.tag, attributes,
+            tuple(_shape(child) for child in element if child.tag != 'Sizes'))
+
+
+def _apply_sizes(element, splitter) -> None:
+    """Give ``splitter`` (and the splitters in it) the saved sizes."""
+    sizes = element.find('Sizes')
+    if sizes is not None and sizes.text and sizes.text.split():
+        splitter.setSizes([int(value) for value in sizes.text.split()])
+    children = [child for child in element if child.tag != 'Sizes']
+    for index, child in enumerate(children):
+        if child.tag == 'Splitter':
+            inner = splitter.widget(index)
+            if inner is not None:
+                _apply_sizes(child, inner)
 
 
 class RegionSizes(QObject):
@@ -125,6 +157,12 @@ class RegionSizes(QObject):
         splitter = self.main()
         if splitter is None:
             return
+        # Plan 45 PINQ. A dock just opened or closed shows or hides its
+        # splitter handle only on the splitter's next layout pass, after
+        # these sizes: MEASURED live, every pin and unpin then resized the
+        # viewport a second time by the handle's 5 px, ~80 ms later, and the
+        # viewport rendered at full cost twice. The handles settle first.
+        splitter.refresh()
         current = list(splitter.sizes())
         sizes = list(sizes)
         names = (OUTLINE_DOCK, SETTINGS_DOCK, VIEWPORT_DOCK)
@@ -137,7 +175,10 @@ class RegionSizes(QObject):
             index = self._index(splitter, name)
             if 0 <= index < len(current):
                 current[index] = int(size)
-        splitter.setSizes(current)
+        # Plan 45 I. The same sizes again still laid the whole window out
+        # (MEASURED at 90 ms with the settings column in it).
+        if current != list(splitter.sizes()):
+            splitter.setSizes(current)
 
     def count(self) -> int:
         return sum(1 for name in (OUTLINE_DOCK, SETTINGS_DOCK, VIEWPORT_DOCK)
@@ -322,11 +363,47 @@ class DockLayout(QObject):
             raw = base64.b64decode(record['state'].encode('ascii'))
         except (ValueError, UnicodeEncodeError):
             return False
+        if self._restore_in_place(raw):
+            self._retire()
+            self._arranged()
+            return True
         if not self._manager.restoreState(QByteArray(raw)):
             return False
         self._put_floating_on_its_screen(dict(record.get('screens') or {}))
         self._retire()
         self._arranged()
+        return True
+
+    def _restore_in_place(self, raw: bytes) -> bool:
+        """Apply a saved arrangement of the docks as they are now; False if not.
+
+        Plan 45 start-up. Qt-ADS's ``restoreState`` takes every dock area
+        down and builds it again -- MEASURED live 18 October 2026, ~0.12 s
+        of the window's construction -- even when the saved arrangement has
+        the same docks in the same areas and splitters as the one just built
+        (the usual case: only the widths and which docks are closed differ).
+        Then only those are applied, which is all ``restoreState`` would
+        change; anything else (a floated dock, docks tabbed together, another
+        order) goes through ``restoreState`` as before.
+        """
+        saved = _state_tree(raw)
+        current = _state_tree(bytes(self._manager.saveState().data()))
+        if saved is None or current is None or _shape(saved) != _shape(current):
+            return False
+        containers = saved.findall('Container')
+        root = self._manager.rootSplitter()
+        if len(containers) != 1 or root is None:
+            return False
+        top = containers[0].find('Splitter')
+        closed = {widget.get('Name'): widget.get('Closed') == '1'
+                  for widget in saved.iter('Widget')}
+        if top is None or any(name not in self._docks for name in closed):
+            return False
+        for name, is_closed in closed.items():
+            dock = self._docks[name]
+            if dock.isClosed() != is_closed:
+                dock.toggleView(not is_closed)
+        _apply_sizes(top, root)
         return True
 
     def dispose(self) -> None:

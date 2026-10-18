@@ -10,6 +10,14 @@ QFrame#settingsSheet {
     border-radius: {{radius.sheet}}px;
 }
 
+/* Plan 45 PINQ: pinned, the sheet lies flat over the settings dock's slot
+   in the dock's own background (ads--CDockWidget, palette(window)). */
+QFrame#settingsSheet[foammeshPinned="true"] {
+    background: palette(window);
+    border: none;
+    border-radius: 0px;
+}
+
 QWidget#settingsSheetHolder {
     background: transparent;
 }

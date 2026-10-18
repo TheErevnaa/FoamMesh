@@ -13,6 +13,7 @@ them. ``ClearAreaController`` reads the occluding widgets and tells the view.
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QRect, Signal
@@ -236,6 +237,9 @@ class ClearAreaController:
         self._changes = _changes()
         self._last: Insets | None = None
         self._updating = False
+        #: Plan 45 PINQ. Held while the sheet re-arranges (``held``).
+        self._held = 0
+        self._held_due = False
         #: FX1. The floating items of the clear area: [rank, widget, place].
         self._floats: list = []
         self._floatWatcher = _float_watch(self)
@@ -343,6 +347,16 @@ class ClearAreaController:
                 out.append(rect)
         return out
 
+    def float_rects(self) -> list:
+        """The rectangles (view pixels) of every visible floating item
+        (Plan 45 V3: what the worst-value tags keep off)."""
+        out = []
+        for _rank, other, _place in self._floats:
+            rect = self._rect_in_view(other)
+            if rect is not None and not rect.isEmpty():
+                out.append(rect)
+        return out
+
     def float_rects_of_rank(self, rank: int) -> list:
         """The rectangles (view pixels) of the visible floating items of one
         *rank* (V16: the rail's popovers hang under the Parts chip)."""
@@ -421,8 +435,29 @@ class ClearAreaController:
         width, height = self._view_size()
         return insets_from_rects(width, height, self._occluder_rects())
 
+    @contextlib.contextmanager
+    def held(self):
+        """Re-centre once, at the end, however often the occluders move.
+
+        Plan 45 PINQ. A pin or an unpin moves the sheet, the console and the
+        viewport many times in one arrangement, and every move asked for a
+        re-centre (MEASURED live: a sixth of a press). Within one event and
+        before any paint, so only the last one was ever seen.
+        """
+        self._held += 1
+        try:
+            yield self
+        finally:
+            self._held -= 1
+            if not self._held and self._held_due:
+                self._held_due = False
+                self.update()
+
     def update(self) -> Insets:
         """Re-centre. Cheap when nothing moved."""
+        if self._held:
+            self._held_due = True
+            return self._last or Insets()
         if self._updating:
             return self._last or Insets()
         self._updating = True

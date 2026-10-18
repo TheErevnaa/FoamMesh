@@ -83,7 +83,7 @@ QFrame#consoleHeaderChip {
     border-top-left-radius: 5px;
     border-top-right-radius: 5px;
 }
-QFrame#consoleHeaderRule { background: {{border.default}}; border: none; }
+QFrame#consoleHeaderRule { background: {{border.rule}}; border: none; }
 
 /* Filter chips: 20 px line, 1 px border, radius 3, 12 px. */
 QWidget#consoleFilterChips QToolButton,
@@ -166,18 +166,18 @@ QFrame#consoleCard QPlainTextEdit[foammeshConsole="true"] {
 
 QSplitter#regionCSplitter { background: transparent; }
 QSplitter#regionCSplitter::handle:vertical {
-    /* DP-2707: over the native GL view "transparent" is black, so the grip
-       wears the card's own field colour and reads as its top edge. */
-    background: {{background.field}};
+    /* DP-2707 / Plan 45 P13: over the native GL view "transparent" is black,
+       so the handle must be opaque -- but only its bottom 3 px (the grip,
+       next to the card) survive the splitter's mask. The rest of the 8 px
+       handle is cut away, so no white bar crosses the window in the light
+       theme. The grip wears the quiet rule colour, not the field colour. */
+    background: {{border.rule}};
     border: none;
     margin: 0;
 }
 QSplitter#regionCSplitter::handle:vertical:hover,
 QSplitter#regionCSplitter::handle:vertical:pressed {
     background: {{accent.default}};
-    border-top: 3px solid {{background.field}};
-    border-bottom: 3px solid {{background.field}};
-    background-clip: padding;
 }
 QWidget#consoleSideGrip { background: transparent; }
 QWidget#consoleSideGrip:hover { background: {{accent.default}}; }

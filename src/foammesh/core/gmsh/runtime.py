@@ -118,8 +118,12 @@ class GmshRuntimeProbe:
 
     @staticmethod
     def _run(argv, timeout):
+        # Plan 45 BOOT2. No console window for the wsl.exe child (it took the
+        # focus from a console-less app), and no inherited stdin.
         return subprocess.run(
-            list(argv), capture_output=True, timeout=timeout, check=False)
+            list(argv), capture_output=True, timeout=timeout, check=False,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
     def probe(self, profile: GmshLaunchProfile, *,
               refresh: bool = False) -> GmshRuntimeReport:

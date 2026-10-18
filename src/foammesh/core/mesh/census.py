@@ -30,7 +30,8 @@ what a 2:1 refinement transition leaves behind.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -174,6 +175,35 @@ def classify_cells(mesh: PolyMesh) -> dict:
     return counts
 
 
+#: Plan 45 boot. ``(path, layout, per-file name/size/mtime) -> MeshCensus``.
+_CENSUS_CACHE: dict = {}
+
+
+def _census_key(case_path: Path, layout_expectation: str):
+    """What the census depends on, as the files' own sizes and times.
+
+    The export page and the size-field card each census the same untouched
+    mesh while a case opens (a full parse of points, faces and owners, about
+    0.2 s apiece on the pipe, minutes on a large mesh). None when the files
+    cannot be listed: then nothing is remembered.
+    """
+    roots = [case_path, case_path / 'constant' / 'polyMesh']
+    try:
+        roots += sorted(case_path.glob('processor*/constant/polyMesh'))
+        parts = [os.path.normcase(os.path.abspath(case_path)), layout_expectation]
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for entry in sorted(root.iterdir(), key=lambda p: p.name):
+                if entry.is_file():
+                    st = entry.stat()
+                    parts.append((str(entry.relative_to(case_path)),
+                                  st.st_size, st.st_mtime_ns))
+        return tuple(parts)
+    except (OSError, ValueError):
+        return None
+
+
 def cell_census(case_path, *, layout_expectation: str = 'reconstructed'
                 ) -> MeshCensus:
     """Census the mesh at ``case_path``, reporting rather than raising.
@@ -181,6 +211,21 @@ def cell_census(case_path, *, layout_expectation: str = 'reconstructed'
     ``case_path`` may be the case directory or the ``polyMesh`` directory.
     """
     case_path = Path(case_path)
+    key = _census_key(case_path, layout_expectation)
+    if key is not None and key in _CENSUS_CACHE:
+        cached = _CENSUS_CACHE[key]
+        return replace(cached, cells_by_family=dict(cached.cells_by_family))
+    census = _cell_census_uncached(case_path, layout_expectation)
+    if key is not None:
+        if len(_CENSUS_CACHE) >= 8:
+            _CENSUS_CACHE.pop(next(iter(_CENSUS_CACHE)))
+        _CENSUS_CACHE[key] = census
+        census = replace(census, cells_by_family=dict(census.cells_by_family))
+    return census
+
+
+def _cell_census_uncached(case_path: Path, layout_expectation: str
+                          ) -> MeshCensus:
     try:
         mesh = read_poly_mesh(case_path, layout_expectation=layout_expectation)
     except PolyMeshReadError as error:

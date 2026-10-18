@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QDialog, QLabel, QMainWindow, QMenu
                                QMessageBox, QInputDialog, QVBoxLayout,
                                QTabWidget, QPlainTextEdit, QSizePolicy,
                                QWidget, QPushButton)
-from PySide6.QtCore import QObject, QRect, Signal, QEvent, Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QPoint, QRect, Signal, QEvent, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAction, QDesktopServices, QGuiApplication, QKeySequence, QShortcut)
 
@@ -30,6 +30,7 @@ from foammesh.support.utils import getFit
 from foammesh.support import gc_policy
 from foammesh.db.configurations_schema import Shape, Step
 from widgets.async_dialog import asyncExec
+from widgets.rendering import rendering_widget as rendering_widget_module
 from widgets.async_message_box import AsyncMessageBox
 from widgets.new_project_dialog import NewProjectDialog
 from widgets.progress_dialog import ProgressDialog, closeProgressWindowsOf
@@ -81,6 +82,7 @@ from foammesh.view.menu.mesh import MeshInfoDialog, QualityDashboardDialog, Tran
 from foammesh.view.geometry.geometry_manager import GeometryManager
 from widgets.themed_icon import load_themed_icon
 from foammesh.view.widget_factory import compose, make
+from foammesh.view.theming.fonts import warm_application_font
 from .recent_files_menu import RecentFilesMenu
 from .navigation_view import NavigationView
 from .step_ribbon import StepRibbon
@@ -108,7 +110,7 @@ from .capture_manager import CaptureManager
 from .captures_page import CapturesPage
 from foammesh.core.capture import captures_dir, delete_capture
 from foammesh.core.quality.geometry_fidelity import hotspot
-from foammesh.rendering import feature_overlay
+from foammesh.rendering import boundary_feature_edges, feature_overlay
 from foammesh.core.quality.geometry_fidelity import report as fidelity_report
 from foammesh.core.viewport_state import (
     ViewStateError, delete_view, load_views, save_view)
@@ -193,15 +195,40 @@ class MainWindow(QMainWindow):
     _vtkReaderProgress = Signal(str)
     _closeTriggered = Signal(bool)
 
-    def __init__(self):
+    def __init__(self, *, staged: bool = False):
         super().__init__()
+        #: Plan 45 start-up. Building the window held the GUI thread ~2.5 s in
+        #: one piece before the event loop ran (measured live, 17 October
+        #: 2026). With ``staged`` -- the application's own start -- the event
+        #: queue is served between the stages below, so no single stretch
+        #: holds the thread long; ``MainWindow()`` builds it all in one go, as
+        #: it always did. The window stays hidden until it is shown by
+        #: :meth:`start`.
+        self._stagedConstruction = staged
+        #: Zero-delay calls the stages ask for, held until the last stage has
+        #: run so none of them meets a half-built window.
+        self._afterConstruction = [] if staged else None
+        if staged:
+            # The first text in the application font costs ~0.3 s once; it
+            # is paid in a turn of its own instead of inside setupUi's.
+            warm_application_font()
+            self._constructionTurn()
         self._ui = Ui_MainWindow()
-        self._ui.setupUi(self)
+        if staged:
+            # Plan 45 BOOT2. The viewport is ~0.45 s of setupUi's ~0.5 s
+            # (MEASURED live, 17 October 2026); it serves the queue between
+            # its own stages while the window is built in stages.
+            rendering_widget_module.constructionTurn = self._constructionTurn
+        try:
+            self._ui.setupUi(self)
+        finally:
+            rendering_widget_module.constructionTurn = None
         # Plan 40 UXE1 (F7b). The keys the user rebound apply to every
         # shortcut made from here on.
         SHORTCUTS.attach(app.settings)
         # Plan 40 UXE4 (F7e): a model dragged from the file manager imports.
         self.setAcceptDrops(True)
+        self._constructionTurn()
         self._threeRegionShell = install_three_region_shell(self._ui)
         # Non-visual compatibility alias for controller/tests that inspect the
         # former member. It is permanent and has no hide/toggle action.
@@ -214,6 +241,9 @@ class MainWindow(QMainWindow):
         # saved arrangement (which dock floated, where, on which screen) is
         # restored before the sizes are applied.
         self._dockLayout = dock_the_regions(self._ui, self._threeRegionShell)
+        # Plan 45 BOOT2. Docking (~0.2 s), restoring the saved arrangement
+        # (~0.3 s) and the settings sheet were one ~0.55 s stage.
+        self._constructionTurn()
         # Plan 43 LY3. A layout saved before the settings sheet is not
         # applied (it is kept under a backup key for a release); whoever had
         # one is told once.
@@ -222,6 +252,7 @@ class MainWindow(QMainWindow):
         saved_docks = getattr(app.settings, 'getDockLayout', lambda: None)()
         if saved_docks is not None:
             self._dockLayout.restore(saved_docks)
+            self._constructionTurn()
         self._settingsSheet = SettingsSheet(
             layout=self._dockLayout, region_b=self._ui.regionBHost,
             host=self._ui.regionCHost, stack=self._ui.content,
@@ -229,14 +260,14 @@ class MainWindow(QMainWindow):
             parent=self)
         self._ui.settingsSheet = self._settingsSheet
         if self._layoutNoteDue:
-            QTimer.singleShot(0, self._showLayoutNote)
+            self._soon(self._showLayoutNote)
         self._dockLayout.regions.moved.connect(
             lambda: setattr(self, '_regionSplitterUserMoved', True))
         self._dockLayout.arrangementChanged.connect(
             lambda: self._applyRegionSizes())
         self._threeRegionShell.apply_sizes(
             max(self.width(), 1280), self._savedRegionSizes)
-        QTimer.singleShot(0, self._applyRegionSizes)
+        self._soon(self._applyRegionSizes)
         # Plan 43 LY2. The outline dock is retired, so its minimum width is
         # not a width the window has to keep.
         self.setMinimumWidth(
@@ -244,6 +275,7 @@ class MainWindow(QMainWindow):
             - self._dockLayout.regions.handleWidth()
             if self._dockLayout.isRetired(OUTLINE_DOCK)
             else self._threeRegionShell.minimum_window_width)
+        self._constructionTurn()
 
         self._applyThemedIcons()
         if app.themeManager is not None:
@@ -272,6 +304,7 @@ class MainWindow(QMainWindow):
         self._installOutlineRail()
         self._displayControl = DisplayControl(self._ui)
         self._renderingTool = RenderingTool(self._ui)
+        self._constructionTurn()
         self._outputTabs = OutputTabRegistry(self._ui.regionCTabHost)
         # Plan 26 WP3: the mesh viewport is no longer one of these tabs. It is
         # a permanent sibling above them, so watching the console during a run
@@ -388,6 +421,7 @@ class MainWindow(QMainWindow):
         client = getattr(app, 'facadeClient', None)
         if client is not None and hasattr(client, 'retry_prompt'):
             client.retry_prompt = RetryPrompt(self)
+        self._constructionTurn()
 
         #: Feature-line actors while the overlay is shown.
         self._featureActors = []
@@ -416,14 +450,15 @@ class MainWindow(QMainWindow):
         qualityInfo.highlightingChanged.connect(
             lambda _on: self._legendController.refresh())
         qualityInfo.scaleChanged.connect(self._legendController.refresh)
-        self._displayControl.cutTool().addMirror(
-            self._viewportOverlay.sectionPanel())
+        # Plan 45 BOOT2. The rail (~0.25-0.35 s) is a stage of its own.
+        self._constructionTurn()
         self._installViewportRail()
+        self._prepareSectionPopover()
         self._installClearAreaFloats()
-        self._displayControl.cutTool().hidePageCopy()
         self._adoptPreviewNotice()
         self._installResourceUsageAction()
         self._connectViewportControls()
+        self._constructionTurn()
 
         self._dialog = None
 
@@ -552,6 +587,30 @@ class MainWindow(QMainWindow):
                   or app.qApplication.primaryScreen())
         fit = getFit(geometry, screen.availableGeometry())
         self.setGeometry(fit)
+        self._finishConstruction()
+
+    def _constructionTurn(self) -> None:
+        """Plan 45 start-up: serve the event queue between two stages.
+
+        Only for the application's staged start, which builds the window
+        before its event loop runs; nothing is shown yet, so no input reaches
+        the half-built window, and calls it queues are held by :meth:`_soon`.
+        """
+        if self._stagedConstruction:
+            QApplication.processEvents()
+
+    def _finishConstruction(self) -> None:
+        self._stagedConstruction = False
+        held, self._afterConstruction = self._afterConstruction, None
+        for call in held or ():
+            QTimer.singleShot(0, call)
+
+    def _soon(self, call) -> None:
+        """``QTimer.singleShot(0, call)``, held while the window is built."""
+        if self._afterConstruction is not None:
+            self._afterConstruction.append(call)
+        else:
+            QTimer.singleShot(0, call)
 
     def _dockRunStrip(self):
         """Mount the run strip's docked copy under the footer, or None."""
@@ -693,8 +752,70 @@ class MainWindow(QMainWindow):
         from foammesh.view.main_window.clear_area import clear_rect
         controller = self._clearArea
         view = self._ui.renderingView
+        setKeepOut = getattr(layer, 'set_keep_out', None)
+        if callable(setKeepOut):
+            setKeepOut(self.overlayKeepOut)
         layer.set_clear_rect(clear_rect(
             int(view.width()), int(view.height()), controller.insets()))
+
+    def modelScreenRect(self):
+        """Plan 45 V6. The model on screen as a QRect in the view's pixels
+        (y down): the projected box of the parts drawn, or None."""
+        boxes = []
+        for name in ('_meshManager', '_geometryManager'):
+            manager = getattr(self, name, None)
+            getter = getattr(manager, 'getDisplayedBounds', None)
+            try:
+                bounds = getter() if callable(getter) else None
+            except Exception:                                # noqa: BLE001
+                bounds = None
+            if bounds is not None:
+                boxes.append(tuple(bounds.toTuple()))
+        view = self._ui.renderingView
+        getRenderer = getattr(view, 'renderer', None)
+        renderer = getRenderer() if callable(getRenderer) else None
+        if not boxes or renderer is None:
+            return None
+        width, height = renderer.GetSize()
+        if width <= 0 or height <= 0 or view.width() <= 0:
+            return None
+        scale = view.width() / float(width)
+        xs, ys = [], []
+        for box in boxes:
+            for x in box[0:2]:
+                for y in box[2:4]:
+                    for z in box[4:6]:
+                        renderer.SetWorldPoint(x, y, z, 1.0)
+                        renderer.WorldToDisplay()
+                        dx, dy, _dz = renderer.GetDisplayPoint()
+                        xs.append(dx * scale)
+                        ys.append((height - dy) * scale)
+        left, top = int(min(xs)), int(min(ys))
+        return QRect(left, top, max(1, int(max(xs)) - left),
+                     max(1, int(max(ys)) - top))
+
+    def overlayKeepOut(self) -> list:
+        """Plan 45 V3/V10. ``[(x0, y0, x1, y1)]`` in the view's pixels (y
+        down): the widgets standing over the picture -- the clear area's
+        floating items (the overlay card, the legend, the deviation panel,
+        an open popover) and the bottom bar. The worst-value tags and the
+        statistics caption are placed off them."""
+        rects = []
+        controller = getattr(self, '_clearArea', None)
+        floats = getattr(controller, 'float_rects', None)
+        if callable(floats):
+            rects.extend(floats())
+        edges = getattr(self, '_viewportToolEdges', None)
+        frame = getattr(edges, '_bottomFrame', None)
+        view = self._ui.renderingView
+        try:
+            if frame is not None and frame.isVisible():
+                corner = view.mapFromGlobal(frame.mapToGlobal(QPoint(0, 0)))
+                rects.append(QRect(corner, frame.size()))
+        except RuntimeError:
+            pass
+        return [(r.x(), r.y(), r.x() + r.width(), r.y() + r.height())
+                for r in rects if r is not None and not r.isEmpty()]
 
     def _syncInspectorOnModel(self) -> None:
         """The inspector card follows the colouring: on while the model is
@@ -725,6 +846,10 @@ class MainWindow(QMainWindow):
         if sheet is not None:
             self.registerSheet(sheet.frame, lambda: sheet.side, tab=sheet.tab)
             sheet.changed.connect(self._clearArea.update)
+            # Plan 45 PINQ: one re-centre per pin or unpin, at its end.
+            hold = getattr(sheet, 'add_arrangement_hold', None)
+            if hold is not None:
+                hold(self._clearArea.held)
         # Plan 43 section 1: re-centre on every sheet, console and tab change.
         # A tab or page change can resize either without a Resize reaching the
         # watcher first (the tab's content sets the band's wanted height).
@@ -1263,30 +1388,34 @@ class MainWindow(QMainWindow):
         rail = ViewportRail(self._ui.renderingView)
         self._viewportRail = rail
         overlay.setRailMode(True)
-        section = overlay.sectionPanel()
+        # A short rail folds the highest ``fold`` first (Plan 45 N): the
+        # background and the axes go first, Parts and the Inspector last.
         rail.addTool('parts', self.tr('Parts'), 'volume.svg',
                      overlay.takePartsPanel(),
                      tip=self.tr('Parts: show, hide, isolate and explode'))
-        rail.addTool('cut', self.tr('Cut plane'), 'planeHandle.svg', section,
-                     tip=self.tr('Cut plane: aim, move and combine the planes'))
-        rail.addTool('section', self.tr('Section'), 'section.svg',
-                     section.sectionHalf(),
-                     tip=self.tr('Section: mode, colour, saved sections'))
-        rail.addTool('display', self.tr('Display'), 'cubeAxes.svg',
-                     tool.displayPanel(), group=1,
-                     tip=self.tr('Display: mesh lines, axes, ruler, features, '
-                                 'background'))
+        # Plan 45 N (P9, Q3 b). The display switches are rail tools of their
+        # own, one button each, in a group under a rule after Parts; Show
+        # elements stays a panel, opened by its own button. The Display
+        # popover that held them all is gone.
+        for key, title, widget, button, tip, fold in tool.railDisplayTools():
+            rail.adoptTool(key, title, widget, button=button, tip=tip,
+                           group=1, fold=fold)
+        rail.addTool('elements', self.tr('Show elements'), 'face.svg',
+                     tool.displayPanel(), group=1, fold=4,
+                     tip=self.tr('Show elements: colour by, cell types, '
+                                 'nodes, shrink, labels'))
+        # Plan 45 N (Q1 a). No Cut plane or Section tool on the rail: the top
+        # bar's Section button opens the one section panel, with its Cut
+        # plane and Section tabs (Plan 45 L, ``openSectionPanel``).
         rail.addTool('inspector', self.tr('Inspector'), 'poorCells.svg', None,
-                     group=2,
+                     group=2, fold=1,
                      tip=self.tr('Inspector: the mesh quality report'))
         tool.sendOverflowToRail(rail)
         overlay.partsRequested.connect(lambda: rail.open('parts'))
         rail.actionRequested.connect(self._railToolPressed)
         overlay.sceneEmptyChanged.connect(
-            lambda empty: rail.setSceneEmpty(empty, ('parts', 'cut', 'section')))
-        rail.setSceneEmpty(overlay.isSceneEmpty(), ('parts', 'cut', 'section'))
-        section.sectionChanged.connect(
-            lambda: rail.setToolActive('cut', bool(section.enabledPlanes())))
+            lambda empty: rail.setSceneEmpty(empty, ('parts',)))
+        rail.setSceneEmpty(overlay.isSceneEmpty(), ('parts',))
         settings = app.settings
         if hasattr(settings, 'getViewportRail'):
             rail.setPreferences(settings.getViewportRail())
@@ -1392,6 +1521,91 @@ class MainWindow(QMainWindow):
     def _railToolPressed(self, key: str) -> None:
         if key == 'inspector':
             self.showQualityReport()
+
+    def _prepareSectionPopover(self):
+        """Plan 45 L (P4, P5, Q1 a). The top bar's Section button is the one
+        home of slicing: the cut tool's own `SectionPanel` (one instance,
+        taken off the Display Control page) in a popover docked under the
+        button, with its *Cut plane* and *Section* tabs.
+
+        The overlay's copy is mirrored onto the same section only while the
+        rail still carries a *Cut plane* or *Section* tool (package N retires
+        them); with neither left there is one panel and no mirror.
+
+        Plan 45 start-up: the popover itself is made the first time it is
+        asked for (:meth:`sectionPopover`). It is hidden until the Section
+        button opens it, and moving the whole panel into it held the start
+        ~0.14 s. :meth:`_installSectionPopover` makes it."""
+        cut = self._displayControl.cutTool()
+        rail = getattr(self, '_viewportRail', None)
+        if rail is not None and any(
+                key in rail.tools() for key in ('cut', 'section')):
+            cut.addMirror(self._viewportOverlay.sectionPanel())
+        cut.hidePageCopy()
+        self._sectionPopover = None
+        cut.panel().sectionChanged.connect(self._syncSectionButton)
+
+    def _installSectionPopover(self):
+        """Make the popover and hang it in the clear area (on first use)."""
+        from .section_popover import SectionPopover
+        cut = self._displayControl.cutTool()
+        rail = getattr(self, '_viewportRail', None)
+        view = self._ui.renderingView
+        clearArea = getattr(self, '_clearArea', None)
+
+        def clearRect():
+            # The clear area, less the rail at its right edge.
+            if clearArea is None:
+                return None
+            rect = clearArea.clearRect()
+            if rail is not None:
+                rect.setRight(rect.right() - rail.extent())
+            return rect
+
+        popover = SectionPopover(
+            cut.panel(), view,
+            anchor=getattr(self._renderingTool, '_sectionButton', None),
+            clearRect=clearRect)
+        self._sectionPopover = popover
+        if clearArea is not None:
+            changed = getattr(clearArea, 'changed', None)
+            if changed is not None:
+                changed.connect(lambda *_a: popover.place())
+            from foammesh.view.main_window import clear_area as ca
+            clearArea.add_float(popover, ca.FLOAT_RANK_POPOVER)
+        return popover
+
+    def _syncSectionButton(self):
+        """The top bar's Section reads on while a plane cuts the model."""
+        tool = self._displayControl.cutTool()
+        self._renderingTool.setInspectionActive(
+            'section', tool.isSectionActive())
+
+    def sectionPopover(self):
+        """Plan 45 L. The popover under the top bar's Section button, made
+        on the first call (Plan 45 start-up)."""
+        popover = getattr(self, '_sectionPopover', None)
+        if popover is None and hasattr(self, '_displayControl'):
+            popover = self._installSectionPopover()
+        return popover
+
+    def openSectionPanel(self, tab: str = 'cut') -> bool:
+        """Plan 45 L. Open the section panel under the top bar's Section
+        button on its *Cut plane* (``'cut'``) or *Section* (``'section'``)
+        tab. The entry point every other way into slicing uses (the rail's
+        former Cut plane and Section tools, View mode > Slice). False when
+        there is no popover to open."""
+        popover = self.sectionPopover()
+        if popover is None:
+            return False
+        popover.open('section' if tab == 'section' else 'cut')
+        return True
+
+    def closeSectionPanel(self) -> None:
+        """Fold the section panel away; the planes stay."""
+        popover = getattr(self, '_sectionPopover', None)
+        if popover is not None:
+            popover.dismiss()
 
     def _connectViewportControls(self):
         tool = self._renderingTool
@@ -1812,9 +2026,30 @@ class MainWindow(QMainWindow):
             return False
         self._displayControl.applyViewPlan(plan)
         self._setSectionEnabled(plan.section)
+        getter = getattr(self._displayControl, 'meshQualityInfo', None)
+        info = getter() if callable(getter) else None
         if plan.quality:
-            self._highlightPoorCells()
+            # Poor cells is a toggle: entering Quality while its colouring is
+            # already on must not take it off.
+            if info is None or not info.isHighlighting():
+                self._highlightPoorCells()
+                self._qualityByMode = True
+        elif getattr(self, '_qualityByMode', False):
+            # Plan 45 V6. Leaving Quality takes its colouring off: the cell
+            # filter, the legend's Quality page and the worst-cell tags
+            # stayed on screen over the Boundary mesh.
+            # Unconditionally: a measurement still running for it is
+            # abandoned too, so it cannot paint after the mode is left.
+            self._qualityByMode = False
+            if info is not None:
+                info.clearHighlight()
+            self._renderingTool.setInspectionActive('poorCells', False)
         self._viewMode = plan.mode
+        # Plan 45 V5. The Parts count follows the mode: what the mode hides
+        # is not a part the user hid.
+        if (getattr(self, '_viewportOverlay', None) is not None
+                and hasattr(self._displayControl, '_items')):
+            self._refreshOverlayChip()
         self._syncInspectorOnModel()
         self._renderingTool.showViewMode(plan.mode)
         self.statusBar().showMessage(
@@ -1823,12 +2058,14 @@ class MainWindow(QMainWindow):
         return True
 
     def _setSectionEnabled(self, enabled: bool):
-        """Raise or drop the section plane the Slice mode is made of."""
+        """Raise or drop the section plane the Slice mode is made of.
+
+        Plan 45 L (P5): Slice opens the same panel the top bar's Section
+        does, on its Cut plane tab."""
         tool = self._displayControl.cutTool()
         panel = tool.panel()
         if enabled:
-            if not panel.enabledPlanes():
-                self._quickSection()
+            self._quickSection(toggle=False)
             return
         for index, plane in enumerate(panel.planes()):
             if plane.enabled:
@@ -1855,36 +2092,46 @@ class MainWindow(QMainWindow):
                 10000)
         return match
 
-    def _quickSection(self):
-        """One click: a plane along the current view normal, already cutting.
+    def _quickSection(self, toggle: bool = True):
+        """The top bar's Section button: a plane along the view, and the
+        section panel under the button.
 
-        VIEW-02. The second click takes the plane back down, because a cut
-        model with a live gizmo on it and no control anywhere reading active
-        is a state a user can only leave by finding the Display Control panel
-        the button exists to save them from opening.
+        VIEW-02 raised a plane along the current view normal in one click.
+        Plan 45 L (P5, Q1 a): the click also opens the section panel docked
+        under the button, so the controls of the plane just raised are where
+        the hand already is. A second click (*toggle*) folds the panel away
+        and leaves the planes cutting: the panel's *Clear* takes them down.
+        A plane already cutting is not raised again.
         """
         tool = self._displayControl.cutTool()
-        if tool.isSectionActive():
-            tool.clearSection()
-            self._renderingTool.setInspectionActive('section', False)
-            self._renderingTool.updateHistoryButtons()
+        popover = getattr(self, '_sectionPopover', None)
+        if toggle and popover is not None and popover.isOpen():
+            popover.dismiss()
+            self._renderingTool.setInspectionActive(
+                'section', tool.isSectionActive())
             return
-        if not tool.updateBounds():
-            self._renderingTool.setInspectionActive('section', False)
-            self.statusBar().showMessage(
-                self.tr('Nothing is loaded to cut yet.'), 5000)
-            return
-        panel = tool.panel()
-        index = panel.activeIndex()
-        tool._useViewNormal()
-        # VI10 (F2a, F3a). The plane comes up the way the user left it: not
-        # locked (a locked plane takes no drag, which read as a plane that
-        # will not move; Lock stays a choice the user makes and keeps), and
-        # with its handle shown unless they hid it.
-        panel._planeToggled(index, True)
+        if not tool.isSectionActive():
+            if not tool.updateBounds():
+                self._renderingTool.setInspectionActive('section', False)
+                self.statusBar().showMessage(
+                    self.tr('Nothing is loaded to cut yet.'), 5000)
+                return
+            panel = tool.panel()
+            index = panel.activeIndex()
+            tool._useViewNormal()
+            # VI10 (F2a, F3a). The plane comes up the way the user left it:
+            # not locked (a locked plane takes no drag, which read as a plane
+            # that will not move; Lock stays a choice the user makes and
+            # keeps), and with its handle shown unless they hid it.
+            panel._planeToggled(index, True)
         self._renderingTool.setInspectionActive(
             'section', tool.isSectionActive())
         self._renderingTool.updateHistoryButtons()
+        # The popover is made the first time it is wanted (Plan 45 start-up).
+        make = getattr(self, 'sectionPopover', None)
+        popover = make() if callable(make) else popover
+        if popover is not None:
+            popover.open('cut')
 
     def _setPartVisible(self, key: str, visible: bool):
         item = self._displayControl._items.get(key)
@@ -1937,6 +2184,8 @@ class MainWindow(QMainWindow):
                      or not self._meshManager.volumeColoured())):
             self._hideVolumeLegend()
             self._renderingTool.setColourMeshChoice(layers_grown.SOLID)
+        # Plan 45 P11. Nor do feature lines drawn on a mesh no longer there.
+        MainWindow._dropStaleFeatureActors(self)
         # DP-711. A new scene gets a fresh Region picker.
         refreshPicker = getattr(self, '_refreshRegionPicker', None)
         if refreshPicker is not None:
@@ -2003,12 +2252,31 @@ class MainWindow(QMainWindow):
         # DP-679. Not every row: a region seed marker is not a part.
         return countedPartIds(self._displayControl._items), self.tr('parts')
 
+    def _modeHiddenParts(self) -> set:
+        """Plan 45 V5. The parts the view mode on screen hides by itself.
+
+        Quality draws the volume and hides the boundary patches; that is the
+        mode drawing differently, not the user hiding parts, so those parts
+        are not counted as hidden ("2 of 2 hidden" with nothing hidden)."""
+        mode = getattr(self, '_viewMode', '')
+        if mode not in view_modes.MODE_IDS:
+            return set()
+        try:
+            plan = view_modes.plan(mode, self.viewScene())
+        except Exception:                                    # noqa: BLE001
+            logger.debug('view mode plan unavailable', exc_info=True)
+            return set()
+        return set(plan.hidden) if plan.is_available() else set()
+
     def _refreshOverlayChip(self):
         keys, noun = self._countedParts()
         items = self._displayControl._items
-        shown = sum(1 for key in keys
-                    if key in items and items[key].actorInfo().isVisible())
-        self._viewportOverlay.setChip(shown, len(keys), noun,
+        modeHidden = getattr(self, '_modeHiddenParts', None)
+        byMode = modeHidden() if callable(modeHidden) else set()
+        hidden = sum(1 for key in keys
+                     if key not in byMode and not (
+                         key in items and items[key].actorInfo().isVisible()))
+        self._viewportOverlay.setChip(len(keys) - hidden, len(keys), noun,
                                       self._compositionText())
 
     def _compositionText(self) -> str:
@@ -2477,6 +2745,12 @@ class MainWindow(QMainWindow):
                     'features on the geometry and run it again.')
         if not features and hasMesh and MainWindow._nativeCurveFeatures(self):
             # Plan 41 GN23. A Gmsh mesh always has its curve entities to show.
+            features = True
+        if not features and hasMesh and (
+                MainWindow._boundaryFeatureDataSets(self)
+                or getattr(self, '_featureActors', None)):
+            # Plan 45 P11 (Q5 a). Any boundary on screen has edges of its own
+            # to draw, and drawn edges keep their way off.
             features = True
         # A painted viewport keeps its own way back: the button that put the
         # colouring on is the button that takes it off, so disabling it while
@@ -3091,10 +3365,13 @@ class MainWindow(QMainWindow):
         exporting and eyeballing, and before that not at all -- the feature
         measurement existed and nothing ever called it.
         """
-        if self._featureActors:
+        if self._featureActors or getattr(self, '_featureJob', None):
             for actor in self._featureActors:
                 self._displayControl.removeOverlay(actor)
             self._featureActors = []
+            self._featureJob = None
+            self._featureKey = None
+            self._renderingTool.setInspectionActive('features', False)
             self.statusBar().showMessage(self.tr('Feature lines hidden.'), 4000)
             return
 
@@ -3110,10 +3387,9 @@ class MainWindow(QMainWindow):
             # model's own curves; they are drawn as what they are, unmeasured.
             sections = curves
         if not sections:
-            self.statusBar().showMessage(self.tr(
-                'No feature measurements for this mesh. Run the geometry '
-                'fidelity task on a case whose geometry declares features.'),
-                9000)
+            # Plan 45 P11 (Q5 a). Nothing declared and no Gmsh curves: the
+            # boundary's own creases, rims and non-manifold edges.
+            MainWindow._drawBoundaryFeatures(self)
             return
 
         tokens = (app.themeManager.tokens
@@ -3121,12 +3397,133 @@ class MainWindow(QMainWindow):
         self._featureActors = feature_overlay.build_actors(sections, tokens)
         for actor in self._featureActors:
             self._displayControl.addOverlay(actor)
+        self._featureKey = MainWindow._boundaryFeatureKey(self)
+        self._renderingTool.setInspectionActive(
+            'features', bool(self._featureActors))
 
         counts = feature_overlay.summarise(sections)
         self.statusBar().showMessage(self.tr(
             'Declared features: {0}.').format(', '.join(
                 f'{count} {verdict}' for verdict, count
                 in sorted(counts.items()))), 12000)
+
+    def _boundaryFeatureDataSets(self) -> list:
+        """Plan 45 P11. The boundary patches' datasets on screen, or ``[]``."""
+        mesh = getattr(self, '_meshManager', None)
+        patchIds = getattr(mesh, 'patchIds', None)
+        actorInfo = getattr(mesh, 'actorInfo', None)
+        if not callable(patchIds) or not callable(actorInfo):
+            return []
+        try:
+            if mesh.isEmpty():
+                return []
+            found = []
+            for key in patchIds():
+                info = actorInfo(key)
+                data = info.dataSet() if info is not None else None
+                if data is not None and data.GetNumberOfCells() > 0:
+                    found.append(data)
+            return found
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no readable boundary datasets', exc_info=True)
+            return []
+
+    def _boundaryFeatureKey(self) -> tuple:
+        """Which boundary the drawn feature lines belong to."""
+        return tuple(id(data) for data in
+                     MainWindow._boundaryFeatureDataSets(self))
+
+    def _dropFeatureActors(self):
+        """Take the feature lines down: unload, or a different mesh."""
+        control = getattr(self, '_displayControl', None)
+        for actor in getattr(self, '_featureActors', None) or ():
+            if control is not None:
+                control.removeOverlay(actor)
+        self._featureActors = []
+        self._featureJob = None
+        self._featureKey = None
+        tool = getattr(self, '_renderingTool', None)
+        if tool is not None:
+            tool.setInspectionActive('features', False)
+
+    def _dropStaleFeatureActors(self):
+        """Drop feature lines drawn over a boundary no longer on screen."""
+        if ((getattr(self, '_featureActors', None)
+             or getattr(self, '_featureJob', None))
+                and getattr(self, '_featureKey', None)
+                != MainWindow._boundaryFeatureKey(self)):
+            MainWindow._dropFeatureActors(self)
+
+    def _drawBoundaryFeatures(self):
+        """Plan 45 P11 (Q5 a). Draw the boundary's own feature edges.
+
+        The angle is the project feature angle (the one Surface features'
+        includedAngle is derived from), 30 degrees by default. A large
+        boundary is read on a worker thread; a press while it runs, or a
+        new mesh, abandons it.
+        """
+        data = MainWindow._boundaryFeatureDataSets(self)
+        if not data:
+            self._renderingTool.setInspectionActive('features', False)
+            self.statusBar().showMessage(self.tr(
+                'No boundary is on screen to draw feature edges from.'), 9000)
+            return
+        from foammesh.view.geometry.feature_angle_panel import (
+            project_feature_angle)
+        angle = project_feature_angle()
+        key = tuple(id(item) for item in data)
+        if (boundary_feature_edges.face_count(data)
+                > boundary_feature_edges.SYNC_FACE_LIMIT):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                job = object()
+                self._featureJob = job
+                self._renderingTool.setInspectionActive('features', True)
+                self.statusBar().showMessage(self.tr(
+                    "Finding the boundary's feature edges…"), 9000)
+                asyncio.create_task(MainWindow._drawBoundaryFeaturesLater(
+                    self, job, key, data, angle))
+                return
+        MainWindow._showBoundaryFeatures(
+            self, boundary_feature_edges.extract_edges(data, angle), key,
+            angle)
+
+    async def _drawBoundaryFeaturesLater(self, job, key, data, angle):
+        try:
+            edges = await asyncio.to_thread(
+                boundary_feature_edges.extract_edges, data, angle)
+        except Exception:                                     # noqa: BLE001
+            logger.exception('could not extract the boundary feature edges')
+            edges = None
+        if getattr(self, '_featureJob', None) is not job:
+            return
+        self._featureJob = None
+        if MainWindow._boundaryFeatureKey(self) != key:
+            self._renderingTool.setInspectionActive('features', False)
+            return
+        MainWindow._showBoundaryFeatures(self, edges, key, angle)
+
+    def _showBoundaryFeatures(self, edges, key, angle):
+        tokens = (app.themeManager.tokens
+                  if app.themeManager is not None else None)
+        actor = boundary_feature_edges.build_actor(edges, tokens)
+        if actor is None:
+            self._renderingTool.setInspectionActive('features', False)
+            self.statusBar().showMessage(self.tr(
+                'The boundary has no edge sharper than {0:g} degrees.'
+            ).format(angle), 9000)
+            return
+        self._featureActors = [actor]
+        self._featureKey = key
+        self._displayControl.addOverlay(actor)
+        self._renderingTool.setInspectionActive('features', True)
+        self.statusBar().showMessage(self.tr(
+            'Boundary feature edges at {0:g} degrees: {1}.').format(
+                angle, count_text(edges.GetNumberOfLines(), 'edge', 'edges')),
+            12000)
 
     def _nativeCurveFeatures(self) -> dict:
         """Plan 41 GN23. The curve entities of the native mesh on screen as
@@ -3825,9 +4222,11 @@ class MainWindow(QMainWindow):
             saved = [wanted, max(saved[1] - give, 0), saved[2]]
         page_column = getattr(self._ui, 'regionBPageColumn', None)
         b_wanted = page_column.wantedWidth() if page_column is not None else None
-        sizes = self._threeRegionShell.apply_sizes(
-            total_width, saved, wanted, b_wanted)
         sheet = getattr(self, '_settingsSheet', None)
+        # Plan 45 I. The sheet sets the three widths itself (it owns the
+        # middle one), so the shell only measures when there is a sheet.
+        sizes = self._threeRegionShell.apply_sizes(
+            total_width, saved, wanted, b_wanted, commit=sheet is None)
         if sheet is not None:
             sheet.apply_to_sizes(sizes)
 
@@ -6824,6 +7223,8 @@ class MainWindow(QMainWindow):
             dispose = getattr(manager, 'dispose', None)
             if callable(dispose):
                 dispose()
+        # Plan 45 P11. The feature lines belong to the closing mesh.
+        MainWindow._dropFeatureActors(self)
         # The actors go first: the toolbar readout is derived from what the
         # view is holding, so clearing it before the view leaves the closing
         # case's model extent on screen (R49).
@@ -6869,7 +7270,12 @@ class MainWindow(QMainWindow):
         The readout is labelled, so a slice-only number is never read as a
         whole-mesh one.
         """
-        text, tip = cell_count_text(visible, total)
+        # Plan 45 V5. Say what took the cells away: a section, or the quality
+        # filter that shows only the worst cells (no section is cut then).
+        causeOf = getattr(getattr(self, '_meshManager', None),
+                          'cellCountCause', None)
+        cause = (causeOf() if callable(causeOf) else '') or 'section'
+        text, tip = cell_count_text(visible, total, cause)
         # Plan 42 SG1. A new mesh on screen is a new provenance.
         refresh_mesh_provenance(app)
         self._ui.cellCount.setText(text)

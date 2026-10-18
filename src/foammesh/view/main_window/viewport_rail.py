@@ -31,21 +31,22 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from shiboken6 import isValid
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QCursor
+from PySide6.QtCore import (
+    QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal)
+from PySide6.QtGui import QCursor, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QScrollArea, QSizePolicy,
+    QAbstractButton, QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QScrollArea, QSizePolicy,
     QToolButton, QVBoxLayout, QWidget)
 
 from foammesh.view.main_window.tool_edges import (
-    RIGHT, ToolEdge, centred_span, make_pin_button, set_pin_look,
-    style_tool_tile)
+    RIGHT, ToolEdge, centred_span, make_pin_button, round_native_corners,
+    set_pin_look, style_tool_tile)
 from foammesh.view.theming.fonts import caps_font
 from foammesh.view.theming.icons import apply_tinted_icon, tinted_icon
 from foammesh.view.theming.metrics import (
     FORM_MARGIN, GAP, GAP_TIGHT, MARGIN_TIGHT)
 from foammesh.view.theming.status_colors import (
-    style_floating_panel, style_overlay_panel)
+    OVERLAY_KINDS, style_floating_panel, style_overlay_panel)
 
 #: Plan 44 MF13 (mockup M:139-165): a 34 px rail of 26 px tiles with 16 px
 #: glyphs, padding 10 0, radius 6, 18 x 1 separators.
@@ -84,6 +85,64 @@ class RailTool:
     active: bool = False
     enabled: bool = True
     reason: str = ''
+    #: Plan 45 N (P9). A control the rail took over rather than made: the
+    #: row's own switch, same object and wiring, standing on the rail as a
+    #: tool of its own. ``widget`` is what stands in the column (the button,
+    #: or the frame that holds it).
+    adopted: bool = False
+    widget: Optional[QWidget] = None
+    #: Which tools a short rail folds first: the highest rank goes first, a
+    #: tie folds the lowest tool first.
+    fold: int = 0
+
+
+class _PopoverGrip(QWidget):
+    """Plan 45 M. The handle at a popover's bottom-left corner. The popover
+    hangs from the rail's edge, so pulling the corner out to the left widens
+    it and pulling down makes it taller. (Not a QSizeGrip: that resizes the
+    top-level window.)"""
+
+    EDGE = 14
+
+    def __init__(self, popover: 'Popover'):
+        super().__init__(popover)
+        self.setObjectName('popoverGrip')
+        self.setFixedSize(self.EDGE, self.EDGE)
+        self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        self.setToolTip(self.tr('Drag to resize'))
+        self.setAccessibleName(self.tr('Resize {0}').format(popover.windowTitle()
+                                                            or popover.key))
+        self._press: Optional[tuple] = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            popover = self.parentWidget()
+            self._press = (event.globalPosition().toPoint(),
+                           QSize(popover.size()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press is None:
+            return
+        start, size = self._press
+        delta = event.globalPosition().toPoint() - start
+        self.parentWidget().setUserSize(
+            QSize(max(160, size.width() - delta.x()),
+                  max(120, size.height() + delta.y())))
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._press = None
+        event.accept()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        pen = QPen(self.palette().color(QPalette.ColorRole.Mid))
+        painter.setPen(pen)
+        for step in (4, 8, 12):
+            painter.drawLine(0, self.height() - step - 1, step, self.height() - 1)
 
 
 class Popover(QFrame):
@@ -91,6 +150,9 @@ class Popover(QFrame):
 
     closed = Signal()
     pinnedChanged = Signal(bool)
+    #: Plan 45 P12: the content asked for a new size while the popover is
+    #: open (a section of it opened or closed); the rail arranges again.
+    contentResized = Signal()
 
     def __init__(self, key: str, title: str, content: QWidget, parent: QWidget):
         super().__init__(parent)
@@ -103,6 +165,9 @@ class Popover(QFrame):
         self.setAutoFillBackground(True)
         self.setAccessibleName(title)
         style_overlay_panel(self, 'popover')
+        # Plan 45 P16: a native window over the GL view; cut to the sheet's
+        # radius or the square outside it paints black.
+        round_native_corners(self, OVERLAY_KINDS['popover'][2])
 
         column = QVBoxLayout(self)
         column.setContentsMargins(FORM_MARGIN, MARGIN_TIGHT, FORM_MARGIN, FORM_MARGIN)
@@ -134,17 +199,61 @@ class Popover(QFrame):
         head.addWidget(self._close)
         column.addLayout(head)
 
-        self._scroll = QScrollArea()
-        self._scroll.setObjectName('popoverScroll')
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._scroll.setWidget(content)
-        content.setVisible(True)
-        column.addWidget(self._scroll, 1)
+        if content.property('popoverOwnsScroll'):
+            # Plan 45 M: the content scrolls its own list; a second scroll
+            # area around it would put a bar inside a bar.
+            self._scroll = None
+            # Into the popover first: shown while it had no parent, the
+            # content was a window of its own on screen for a moment (the
+            # Parts panel, 200 x 100, at every start; seen live 18 October
+            # 2026).
+            column.addWidget(content, 1)
+            content.setVisible(True)
+        else:
+            self._scroll = QScrollArea()
+            self._scroll.setObjectName('popoverScroll')
+            self._scroll.setWidgetResizable(True)
+            self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self._scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self._scroll.setWidget(content)
+            content.setVisible(True)
+            column.addWidget(self._scroll, 1)
         self._content = content
+        # Plan 45 P12: one arrange per burst of layout requests, a turn of
+        # the event loop later, when the content's size hint is settled.
+        self._resizeTimer = QTimer(self)
+        self._resizeTimer.setSingleShot(True)
+        self._resizeTimer.setInterval(0)
+        self._resizeTimer.timeout.connect(self._contentSettled)
+        content.installEventFilter(self)
+        # Plan 45 M: the user's size, kept for the session.
+        self._userSize: Optional[QSize] = None
+        self._grip = _PopoverGrip(self)
         self.setVisible(False)
+
+    def userSize(self) -> Optional[QSize]:
+        return self._userSize
+
+    def setUserSize(self, size: Optional[QSize]) -> None:
+        self._userSize = QSize(size) if size is not None else None
+        self.contentResized.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._grip.move(2, self.height() - self._grip.height() - 2)
+        self._grip.raise_()
+
+    def eventFilter(self, watched, event):
+        if (watched is self._content
+                and event.type() == QEvent.Type.LayoutRequest
+                and self.isVisible()):
+            self._resizeTimer.start()
+        return super().eventFilter(watched, event)
+
+    def _contentSettled(self) -> None:
+        if self.isVisible():
+            self.contentResized.emit()
 
     def isPinned(self) -> bool:
         return self._pin.isChecked()
@@ -160,8 +269,25 @@ class Popover(QFrame):
         hint = self._content.sizeHint()
         want_w = max(POPOVER_WIDTH, hint.width() + 28)
         want_h = hint.height() + self._title.sizeHint().height() + 36
-        width = min(want_w, max(160, room.width() - 2 * POPOVER_MARGIN))
-        height = min(want_h, max(120, room.height() - 2 * POPOVER_MARGIN))
+        if self._scroll is None:
+            # Plan 45 M: the list inside must get exactly its ten rows, so
+            # no slack: header, the column's margins and gap, the frame.
+            head = max(self._title.sizeHint().height(),
+                       self._pin.sizeHint().height(),
+                       self._close.sizeHint().height())
+            column = self.layout()
+            margins = column.contentsMargins()
+            want_h = (hint.height() + head + column.spacing()
+                      + margins.top() + margins.bottom()
+                      + 2 * self.frameWidth())
+        if self._userSize is not None:
+            want_w = self._userSize.width()
+            want_h = self._userSize.height()
+        width = min(max(want_w, 160) if self._userSize is not None else want_w,
+                    max(160, room.width() - 2 * POPOVER_MARGIN))
+        height = min(max(want_h, 120) if self._userSize is not None
+                     else want_h,
+                     max(120, room.height() - 2 * POPOVER_MARGIN))
         return QSize(width, height)
 
     def dismiss(self):
@@ -197,8 +323,8 @@ class ViewportRail(QObject):
         self._appFilter = False
         self._railOn = True
         self._clickWatched: list[QWidget] = []
-        # DP-2718: widgets outside the rail that open a popover (the Parts
-        # chip); a press on one is that popover's own business.
+        # DP-2718: widgets outside the rail that open a popover (the bottom
+        # bar's Parts button); a press on one is that popover's own business.
         self._openers: dict[str, list[QWidget]] = {}
         self._pinned: list[str] = []
         self._extraOverflow: Optional[Callable[[QMenu], None]] = None
@@ -220,14 +346,19 @@ class ViewportRail(QObject):
         self._bar.setFrameShape(QFrame.Shape.NoFrame)
         self._bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._column = QVBoxLayout(self._bar)
-        self._column.setContentsMargins(
-            RAIL_SIDE, RAIL_PADDING, RAIL_SIDE, RAIL_PADDING)
+        # Plan 45 N: no side margins. The bar's 1 px border already takes a
+        # pixel off each side, so 4 + 26 + 4 overflowed the 32 px inside and
+        # every button stood 1 px right of the bar's centre (measured live:
+        # 5 px left, 3 px right). Each item is centred in what is left.
+        self._column.setContentsMargins(0, RAIL_PADDING, 0, RAIL_PADDING)
         self._column.setSpacing(GAP_TIGHT)
         self._bar.setAccessibleName(self.tr('Viewport tools'))
         self._bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._bar.customContextMenuRequested.connect(self._customiseAt)
         self._bar.setFixedWidth(RAIL_WIDTH)
         style_floating_panel(self._bar, radius=6)
+        # Plan 45 P16: the bar is a native window over the GL view.
+        round_native_corners(self._bar, 6)
         self._bar.installEventFilter(self)
 
         self._more = QToolButton()
@@ -451,8 +582,14 @@ class ViewportRail(QObject):
             self.arrange()
 
     def _popoverHeld(self) -> bool:
-        """A popover hangs from the rail: it stays out while one is open."""
-        return bool(self.openKeys())
+        """A popover hangs from the rail: it stays out while one is open,
+        and while a rail tool's menu is (Plan 45 N)."""
+        if self.openKeys():
+            return True
+        for menu, _anchor in getattr(self, '_sideMenus', {}).values():
+            if isValid(menu) and menu.isVisible():
+                return True
+        return False
 
     def edge(self) -> ToolEdge:
         return self._edge
@@ -487,9 +624,9 @@ class ViewportRail(QObject):
 
     def addTool(self, key: str, title: str, icon: str,
                 content: Optional[QWidget] = None, *, tip: str = '',
-                group: int = 0) -> RailTool:
+                group: int = 0, fold: int = 0) -> RailTool:
         tool = RailTool(key=key, title=title, icon=icon, content=content,
-                        tip=tip or title, group=group)
+                        tip=tip or title, group=group, fold=fold)
         button = QToolButton()
         button.setObjectName('railTool_' + key)
         apply_tinted_icon(button, ':/graphicsIcons/' + icon,
@@ -509,6 +646,60 @@ class ViewportRail(QObject):
             tool.popover.closed.connect(lambda k=key: self._popoverClosed(k))
             tool.popover.pinnedChanged.connect(
                 lambda on, k=key: self._pinnedToggled(k, on))
+            tool.popover.contentResized.connect(self._popoverResized)
+        return self._addToColumn(tool, button)
+
+    def adoptTool(self, key: str, title: str, widget: QWidget, *,
+                  button=None, tip: str = '', group: int = 0,
+                  fold: int = 0) -> RailTool:
+        """Plan 45 N (P9, Q3 b). Stand an existing control on the rail.
+
+        The display switches were rows of one Display popover; each is now a
+        rail tool of its own. The control is the one the row had -- the same
+        object, name, signals and gating -- moved into the column, so there
+        is still one copy of it. *button* is what a press works (the
+        Background frame's swatch button); a switch keeps its own checked
+        state, and a button with a menu opens it beside the rail.
+        """
+        button = widget if button is None else button
+        tool = RailTool(key=key, title=title, icon='', tip=tip or title,
+                        group=group, fold=fold, button=button, widget=widget,
+                        adopted=True)
+        widget.setParent(self._bar)
+        if widget is not button and widget.layout() is not None:
+            widget.layout().setContentsMargins(0, 0, 0, 0)
+        if isinstance(button, QToolButton):
+            # A push button (the axes, the ruler) would print the words.
+            if not button.text():
+                button.setText(title)
+            button.setAutoRaise(True)
+        if isinstance(button, QAbstractButton):
+            button.setIconSize(QSize(GLYPH, GLYPH))
+            # DP-2720: a switch that is on looks on (the accent ring).
+            if button.objectName():
+                button.setProperty('foammeshTile', True)
+                style_tool_tile(button)
+        menu = self._menuOf(button)
+        if menu is not None:
+            self._besideTheRail(menu, button)
+        key_text = ''
+        shortcut = getattr(button, 'shortcut', None)
+        if callable(shortcut):
+            key_text = shortcut().toString()
+        tip = tool.tip + (' ({0})'.format(key_text) if key_text else '')
+        tool.tip = tip
+        # The row's gate keeps the default tip and shows a reason instead
+        # while the switch is off; the default is now the rail's.
+        button.setProperty('foammeshDefaultTip', tip)
+        if button.isEnabled():
+            button.setToolTip(tip)
+        if not button.accessibleName():
+            button.setAccessibleName(title)
+        widget.setVisible(True)
+        return self._addToColumn(tool, widget)
+
+    def _addToColumn(self, tool: RailTool, item: QWidget) -> RailTool:
+        key, group = tool.key, tool.group
         # Above the stretch, so the menu button stays at the foot.
         at = self._column.count() - 2
         if self._order and self._tools[self._order[-1]].group != group:
@@ -522,7 +713,7 @@ class ViewportRail(QObject):
             self._separators.append(rule)
             at += 1
         self._column.insertWidget(
-            at, button, 0, Qt.AlignmentFlag.AlignHCenter)
+            at, item, 0, Qt.AlignmentFlag.AlignHCenter)
         self._tools[key] = tool
         self._order.append(key)
         self._applyStyle(tool)
@@ -537,10 +728,19 @@ class ViewportRail(QObject):
     def _applyStyle(self, tool: RailTool):
         button = tool.button
         labels = bool(self._preferences.get('labels'))
-        button.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextUnderIcon if labels
-            else Qt.ToolButtonStyle.ToolButtonIconOnly)
+        if isinstance(button, QToolButton):
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextUnderIcon if labels
+                else Qt.ToolButtonStyle.ToolButtonIconOnly)
         button.setFixedSize(self._buttonSize())
+        item = self._item(tool)
+        if item is not button:
+            item.setFixedSize(self._buttonSize())
+
+    @staticmethod
+    def _item(tool: RailTool) -> QWidget:
+        """What stands in the column for *tool*."""
+        return tool.widget if tool.widget is not None else tool.button
 
     # -- state -------------------------------------------------------------- #
 
@@ -570,13 +770,16 @@ class ViewportRail(QObject):
     def reachable(self) -> list[str]:
         """Every tool a user can press: on the rail or in the menu."""
         return [k for k in self._order
-                if not self._tools[k].button.isHidden() or k in self._hidden]
+                if not self._item(self._tools[k]).isHidden()
+                or k in self._hidden]
 
     def setToolEnabled(self, key: str, enabled: bool, reason: str = ''):
         tool = self._tools[key]
         tool.enabled = bool(enabled)
         tool.reason = reason
         tool.button.setEnabled(bool(enabled))
+        if tool.adopted:
+            return
         tool.button.setToolTip(
             tool.tip if enabled or not reason
             else '{0}\n{1}'.format(tool.tip, reason))
@@ -603,6 +806,8 @@ class ViewportRail(QObject):
         return self._tools[key].active
 
     def _refreshChecked(self, tool: RailTool):
+        if tool.adopted:
+            return              # a switch says what it is itself (Plan 45 N)
         tool.button.blockSignals(True)
         tool.button.setChecked(tool.active or self.isOpen(tool.key))
         tool.button.blockSignals(False)
@@ -611,6 +816,15 @@ class ViewportRail(QObject):
 
     def toggle(self, key: str):
         tool = self._tools[key]
+        if tool.adopted:
+            # One press: a switch flips, a button with a menu opens it.
+            if not tool.button.isEnabled():
+                return
+            if self._menuOf(tool.button) is not None:
+                self.popMenu(key)
+            else:
+                tool.button.click()
+            return
         if tool.popover is None:
             self._refreshChecked(tool)
             self.actionRequested.emit(key)
@@ -679,32 +893,11 @@ class ViewportRail(QObject):
 
     # -- placement ---------------------------------------------------------- #
 
-    def _chipRect(self) -> Optional[QRect]:
-        """The Parts chip's rectangle in the view's pixels (V16 / DP-2649):
-        the popovers hang under it and never over it."""
-        area = self._clearAreaController()
-        finder = getattr(area, 'float_rects_of_rank', None)
-        if not callable(finder):
-            return None
-        try:
-            from foammesh.view.main_window.clear_area import FLOAT_RANK_CHIP
-            rects = finder(FLOAT_RANK_CHIP)
-        except (RuntimeError, AttributeError, TypeError):
-            return None
-        return rects[0] if rects else None
-
-    def _lowestTop(self, left: int, right: int, top: int) -> int:
-        """*top*, moved below the Parts chip when the column ``left..right``
-        stands under it."""
-        chip = self._chipRect()
-        if chip is not None and chip.left() <= right and chip.right() >= left:
-            return max(top, chip.bottom() + 1 + POPOVER_MARGIN)
-        return top
-
     def arrange(self):
         """Pinned popovers stack down the right edge; the transient one sits
         beside them, level with its button. Every popover stays inside the
-        clear rectangle and under the Parts chip (V16 / DP-2649)."""
+        clear rectangle (V16 / DP-2649; the Parts chip it once hung under is
+        retired, Plan 45)."""
         view = self._view
         room = view.size()
         clear = self.clearRect()
@@ -715,10 +908,6 @@ class ViewportRail(QObject):
             popover = self._tools[key].popover
             if popover is None or not popover.isVisible():
                 continue
-            size = popover.wantedSize(
-                QSize(room.width(), floor - top + POPOVER_MARGIN))
-            left = right - size.width()
-            top = self._lowestTop(left, right, top)
             size = popover.wantedSize(
                 QSize(room.width(), floor - top + POPOVER_MARGIN))
             popover.setGeometry(right - size.width(), top,
@@ -738,10 +927,6 @@ class ViewportRail(QObject):
                 low = max(POPOVER_MARGIN, clear.top() + POPOVER_MARGIN)
                 size = popover.wantedSize(
                     QSize(room.width() - shift, floor - low + POPOVER_MARGIN))
-                left = right - shift - size.width()
-                low = self._lowestTop(left, right - shift, low)
-                size = popover.wantedSize(
-                    QSize(room.width() - shift, floor - low + POPOVER_MARGIN))
                 anchor = self._anchorOf(tool)
                 # Level with its button, clamped inside the clear rectangle.
                 high = floor - size.height() - POPOVER_MARGIN
@@ -750,8 +935,14 @@ class ViewportRail(QObject):
                                     size.width(), size.height())
                 popover.raise_()
 
+    def _popoverResized(self) -> None:
+        """Plan 45 P12: an open popover's content changed its size hint."""
+        if isValid(self._view) and self.openKeys():
+            self.arrange()
+
     def _anchorOf(self, tool: RailTool) -> QPoint:
-        button = tool.button if not tool.button.isHidden() else self._more
+        item = self._item(tool)
+        button = item if not item.isHidden() else self._more
         centre = button.mapToGlobal(QPoint(0, button.height() // 2))
         return self._view.mapFromGlobal(centre)
 
@@ -777,7 +968,7 @@ class ViewportRail(QObject):
         try:
             keys = list(self._order)
             for k in keys:
-                self._tools[k].button.setVisible(True)
+                self._item(self._tools[k]).setVisible(True)
             if room is None:
                 # The rail is as tall as its tools, so what it has to fit in
                 # is the view, not its own (shrunk) height.
@@ -795,9 +986,14 @@ class ViewportRail(QObject):
                           - pin)
                 if len(keys) * step > usable or extra:
                     keep = max(0, int((usable - step) // step))
-                    hidden = keys[keep:] if len(keys) > keep else []
+                    # Plan 45 N: the highest fold rank goes first; among
+                    # equals, the lowest tool (the old rule).
+                    ranked = sorted(range(len(keys)), key=lambda i: (
+                        self._tools[keys[i]].fold, i))
+                    kept = {keys[i] for i in ranked[:keep]}
+                    hidden = [k for k in keys if k not in kept]
                 for k in hidden:
-                    self._tools[k].button.setVisible(False)
+                    self._item(self._tools[k]).setVisible(False)
             self._hidden = hidden
             self._more.setFixedSize(self._buttonSize())
             self._more.setVisible(bool(hidden) or extra)
@@ -811,6 +1007,18 @@ class ViewportRail(QObject):
         menu.clear()
         for key in self._hidden:
             tool = self._tools[key]
+            if tool.adopted:
+                # The switch itself is hidden; its entry says its state.
+                button = tool.button
+                action = menu.addAction(button.icon(), tool.title)
+                action.setToolTip(tool.tip)
+                action.setEnabled(button.isEnabled())
+                if button.isCheckable():
+                    action.setCheckable(True)
+                    action.setChecked(button.isChecked())
+                action.triggered.connect(
+                    lambda _c=False, k=key: self.toggle(k))
+                continue
             action = menu.addAction(
                 tinted_icon(':/graphicsIcons/' + tool.icon,
                             QSize(GLYPH, GLYPH), GLYPH_STROKE_PX), tool.title)
@@ -825,6 +1033,55 @@ class ViewportRail(QObject):
         if menu.isEmpty():
             menu.addAction(self.tr('Everything fits at this size')).setEnabled(
                 False)
+
+    # -- a rail tool's own menu (Plan 45 N) -------------------------------- #
+
+    def _besideTheRail(self, menu: QMenu, anchor: QWidget) -> None:
+        """*menu* opens to the left of the rail, level with *anchor*, not
+        under a 26 px button at the window's right edge."""
+        if not hasattr(self, '_sideMenus'):
+            self._sideMenus = {}
+        self._sideMenus[id(menu)] = (menu, anchor)
+        menu.installEventFilter(self)
+
+    @staticmethod
+    def _menuOf(button) -> Optional[QMenu]:
+        menu = getattr(button, 'menu', None)
+        return menu() if callable(menu) else None
+
+    def popMenu(self, key: str) -> Optional[QMenu]:
+        """Open *key*'s menu beside the rail (from its button, or from the
+        ``...`` menu when the button is folded away)."""
+        tool = self._tools[key]
+        menu = self._menuOf(tool.button) if tool.adopted else None
+        if menu is None:
+            return None
+        menu.popup(self._besidePoint(menu, tool))
+        return menu
+
+    def _besidePoint(self, menu: QMenu, tool: Optional[RailTool]) -> QPoint:
+        anchor = self._more
+        if tool is not None and not self._item(tool).isHidden():
+            anchor = tool.button
+        width = max(menu.width(), menu.sizeHint().width())
+        left = self._bar.mapToGlobal(QPoint(0, 0)).x()
+        top = anchor.mapToGlobal(QPoint(0, 0)).y()
+        point = QPoint(left - width - POPOVER_MARGIN, top)
+        screen = anchor.screen()
+        if screen is not None:
+            room = screen.availableGeometry()
+            height = max(menu.height(), menu.sizeHint().height())
+            point.setY(max(room.top(), min(point.y(),
+                                           room.bottom() - height)))
+            point.setX(max(room.left(), point.x()))
+        return point
+
+    def _placeSideMenu(self, menu: QMenu) -> None:
+        tool = next((t for t in self._tools.values() if t.adopted
+                     and self._menuOf(t.button) is menu), None)
+        point = self._besidePoint(menu, tool)
+        if menu.pos() != point:
+            menu.move(point)
 
     # -- Customise ---------------------------------------------------------- #
 
@@ -886,6 +1143,11 @@ class ViewportRail(QObject):
 
     def eventFilter(self, watched, event):
         kind = event.type()
+        side = getattr(self, '_sideMenus', {}).get(id(watched))
+        if (kind == QEvent.Type.Show and side is not None
+                and side[0] is watched and isValid(self._bar)):
+            self._placeSideMenu(watched)
+            return super().eventFilter(watched, event)
         if watched is self._view and kind == QEvent.Type.Resize:
             self._place()
             self.reflow()

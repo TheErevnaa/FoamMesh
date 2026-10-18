@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 from foammesh.core.gmsh.launch_profiles import GmshLaunchProfile
+from foammesh.support.loop_executor import waits_on_child_process
 
 SESSION_LOG_NAME = 'session.log.jsonl'
 EXIT_ABORTED = 75
@@ -204,6 +205,9 @@ class GmshSession:
     def pid(self) -> int | None:
         return self.hello.get('pid')
 
+    # Plan 45 shut-down: a start-up probe waiting here for the first answer
+    # waits on the session process, so the exit does not wait for it.
+    @waits_on_child_process
     def start(self) -> dict:
         """Start the process and wait for its identity answer."""
         with self._call_lock:
@@ -479,7 +483,10 @@ class GmshSession:
             try:
                 subprocess.run(
                     [*self.profile._wsl_prefix(), 'kill', '-KILL', str(pid)],
-                    capture_output=True, timeout=15, check=False)
+                    capture_output=True, timeout=15, check=False,
+                    stdin=subprocess.DEVNULL,
+                    # Plan 45: no console window from a console-less build.
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             except (OSError, subprocess.SubprocessError):
                 pass
         self._hard_kill()
@@ -523,6 +530,49 @@ class GmshSession:
                 except subprocess.TimeoutExpired:
                     self.kill()
             _forget_hello(self.profile)
+
+    def close_at_exit(self, settle: float = 0.5) -> None:
+        """End the session as the application exits, without holding the exit.
+
+        :meth:`close` waits up to 10 s for ``wsl.exe`` itself to end after the
+        session has answered ``session.quit``. MEASURED (Plan 45, 2026-10-17):
+        with a case open that wait held the exiting process 5 s. The session
+        keeps nothing to save -- its op log is written as each operation runs,
+        and the server only finalizes Gmsh after answering quit -- so the exit
+        asks it to quit without waiting for the answer, closes its input (the
+        server ends on end-of-input, as it would when this process is gone),
+        gives it ``settle`` seconds, and leaves the runtime to end it.
+        """
+        if not self._call_lock.acquire(timeout=settle):
+            # An operation holds the session; the end of its input ends it,
+            # exactly as this process ending would.
+            self._close_input()
+            return
+        try:
+            process = self._process
+            if self.alive and process.stdin is not None:
+                try:
+                    process.stdin.write(b'{"id":null,"op":"session.quit"}\n')
+                    process.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+            self._close_input()
+            if process is not None:
+                try:
+                    process.wait(timeout=settle)
+                except subprocess.TimeoutExpired:
+                    pass
+            _forget_hello(self.profile)
+        finally:
+            self._call_lock.release()
+
+    def _close_input(self) -> None:
+        process = self._process
+        if process is not None and process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
 
     def __enter__(self):
         self.start()
@@ -615,7 +665,8 @@ def start_idle_session(profile: GmshLaunchProfile, *,
     session.start()
     with _hello_lock:
         _idle[profile.fingerprint] = session
-    atexit.register(session.close)
+    # Plan 45 shut-down: the exit does not wait for wsl.exe to end.
+    atexit.register(session.close_at_exit)
     return session
 
 

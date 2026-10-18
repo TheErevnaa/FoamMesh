@@ -353,9 +353,49 @@ class _RingBehind(QWidget):
         painter.end()
 
 
+#: Win32 WM_NCHITTEST and its "ask the window underneath" answer.
+_WM_NCHITTEST = 0x0084
+_HTTRANSPARENT = -1
+
+
+def pass_hit_test(event_type, message):
+    """Plan 45 H/I. ``(True, HTTRANSPARENT)`` for a WM_NCHITTEST on Windows,
+    else ``None``.
+
+    ``WA_TransparentForMouseEvents`` only steers Qt's own hit test inside one
+    native window. A decoration that has become a native window of its own
+    (over the GL viewport everything near it is native) is a Win32 window
+    that Windows hands the press to; Qt then delivers it to the decoration,
+    which passes it up to its parent and never to the control drawn under it.
+    MEASURED (plans/evidence/plan45/live0): the console card's ring and the
+    floating sheet's edge lines took every press meant for the console's
+    "--", its folded chip, Details and the sheet's "--". Answering
+    HTTRANSPARENT makes Windows offer the press to the window underneath.
+    """
+    if sys.platform != 'win32':
+        return None
+    name = bytes(event_type) if not isinstance(event_type, str) else event_type.encode()
+    if name != b'windows_generic_MSG':
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes
+        msg = ctypes.wintypes.MSG.from_address(int(message))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if msg.message == _WM_NCHITTEST:
+        return True, _HTTRANSPARENT
+    return None
+
+
 class _EdgeLines(QWidget):
     """The fallback: a 1 px ``border.default`` outer line and a 1 px light inner highlight,
     drawn at the target's own edge by a click-through child."""
+
+    def nativeEvent(self, event_type, message):
+        # Plan 45 I: click-through for Windows too, not only for Qt.
+        # (QWidget's own nativeEvent answers "not handled" to everything.)
+        return pass_hit_test(event_type, message) or (False, 0)
 
     def __init__(self, target: QWidget, level: str):
         super().__init__(target)

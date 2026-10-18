@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 from resources import resource
 
 
-APP_VERSION = '1.1.1'
+APP_VERSION = '1.1.2'
 
 
 @dataclass

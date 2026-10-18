@@ -143,13 +143,24 @@ class FoldedNote(QLabel):
     def _summary_width(self) -> float:
         return self._document(self.summary()).idealWidth()
 
+    _measured_line = None
+
     def _line_height(self) -> int:
         text = self.summary()
+        # Plan 45 PINQ. Every layout pass asks the folded height, and a rich
+        # summary built a text document each time; the answer only changes
+        # with the summary and the font.
+        key = (text, self.font().key())
+        cached = self._measured_line
+        if cached is not None and cached[0] == key:
+            return cached[1]
         if self._rich(text):
             height = self._document(text).size().height()
         else:
             height = QFontMetrics(self.font()).height()
-        return int(round(height))
+        height = int(round(height))
+        self._measured_line = (key, height)
+        return height
 
     def _frame(self) -> int:
         margins = self.contentsMargins()

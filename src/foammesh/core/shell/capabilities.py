@@ -16,6 +16,18 @@ from foammesh.core.openfoam_runtime import (
 )
 
 
+def _quiet() -> dict:
+    """Plan 45 BOOT2. Keyword arguments every probe child is started with.
+
+    The probes start ``wsl.exe``. Without ``CREATE_NO_WINDOW`` a console-less
+    app (the packaged build, ``pythonw``) gets a console window for each one,
+    and that window takes the focus from the main window while the distro
+    boots. ``stdin`` is closed so a child can never wait on the app's input.
+    """
+    return {'stdin': subprocess.DEVNULL,
+            'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)}
+
+
 OPENFOAM_UTILITIES = frozenset({
     'blockMesh', 'surfaceFeatures', 'snappyHexMesh', 'checkMesh',
     'decomposePar', 'reconstructPar', 'redistributePar',
@@ -132,7 +144,8 @@ def _run_cleanup(command) -> None:
     if not cleanup:
         return
     try:
-        subprocess.run(cleanup, capture_output=True, timeout=15, check=False)
+        subprocess.run(cleanup, capture_output=True, timeout=15, check=False,
+                       **_quiet())
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -236,7 +249,8 @@ class CapabilityRegistry:
                 try:
                     completed = subprocess.run(
                         command.argv, capture_output=True,
-                        text=True, errors='replace', timeout=timeout, check=False)
+                        text=True, errors='replace', timeout=timeout, check=False,
+                        **_quiet())
                 except subprocess.TimeoutExpired:
                     _run_cleanup(command)
                     raise
@@ -345,7 +359,7 @@ class CapabilityRegistry:
         try:
             completed = subprocess.run(
                 probe(), capture_output=True, text=True, errors='replace',
-                timeout=timeout, check=False)
+                timeout=timeout, check=False, **_quiet())
         except (OSError, subprocess.SubprocessError):
             return None
         found = parse_decomposition_probe(completed.stdout)
@@ -418,6 +432,7 @@ class CapabilityRegistry:
                 errors='replace',
                 timeout=RUNTIME_PROBE_TIMEOUT_SECONDS,
                 check=False,
+                **_quiet(),
             )
         except subprocess.TimeoutExpired:
             # R194. Not an answer: the runtime was never asked to its face.
@@ -490,6 +505,7 @@ class CapabilityRegistry:
                     errors='replace',
                     timeout=60,
                     check=False,
+                    **_quiet(),
                 )
             except (OSError, subprocess.SubprocessError) as error:
                 failures.append(str(error))

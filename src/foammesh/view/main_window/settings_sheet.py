@@ -18,11 +18,23 @@ by dragging its grip; the width is remembered per page, and a table page
 (Sizing, Periodic) opens at 440 px by itself. *Minimised* (Ctrl+\\) leaves a
 32 px tab with the step's name at the edge.
 
-Nothing inside the page changes: the widget that moves is the same
-``regionBHost`` that was in the dock.
+Nothing inside the page changes: the column is the same ``regionBHost``
+that was in the dock.
+
+Plan 45 PINQ. The column never changes parent on a pin or an unpin. It lives
+in the sheet's frame, a native child of the dock manager (the one widget
+above both the viewport and the settings dock); the dock holds an empty slot
+that takes the sheet's width beside the viewport. Floating, the frame floats
+over the viewport with its rounded corners, edge lines and grip; pinned, it
+lies flat over the slot, square, without the lines or the grip, in the dock's
+own background. A change of parent re-polishes every widget under the one that
+moved (Qt's ``inheritStyle`` runs whenever an application style sheet is set;
+it has no "same style" shortcut): MEASURED 150-170 ms of the 0.40-0.46 s a pin
+took live, with the 4,372 widgets of the column.
 """
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from functools import reduce
 
@@ -63,6 +75,11 @@ SIDES = ('left', 'right')
 #: A page whose class (or any base class) or object name contains one of these
 #: is a table page.
 TABLE_MARKERS = ('sizing', 'periodic', 'sizefield')
+
+#: The events of the slot, the viewport host and the widgets between them
+#: and the dock manager that move the frame (Plan 45 PINQ).
+_FOLLOW = (QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.Show,
+           QEvent.Type.Hide, QEvent.Type.ParentChange)
 
 NOTE = ('The layout has changed. View → Standard layout puts it back; '
         'Pin docks the settings.')
@@ -417,9 +434,16 @@ class SheetTab(QWidget):
         painter.setPen(QColor(_token('accent.text', '#ffffff')))
         painter.setFont(self._font())
         painter.save()
-        painter.translate(w / 2 + 4, 14)
-        painter.rotate(90)
         metrics = QFontMetrics(painter.font())
+        # Plan 45 (user screenshot 2026-10-17: "not readable"). Turned a
+        # quarter clockwise, the glyphs stand on the baseline towards +x, so
+        # a baseline at w/2 + 4 put the letters from 17 to 29 px in a 26 px
+        # tab and cut them off. The baseline sits so the drawn letters (not
+        # the font's taller ascent) are centred across the tab.
+        ink = metrics.tightBoundingRect(self.label())
+        baseline = w / 2 + (ink.top() + ink.bottom()) / 2
+        painter.translate(baseline, 14)
+        painter.rotate(90)
         text = metrics.elidedText(self.label(), Qt.TextElideMode.ElideRight,
                                   max(h - TAB_PADDING, 20))
         painter.drawText(0, 0, text)
@@ -437,10 +461,22 @@ class SheetTab(QWidget):
             super().keyPressEvent(event)
 
 
+def _ancestors(start, stop):
+    """``start`` and each parent above it, up to (not including) ``stop``."""
+    if start is None or start is stop:
+        return
+    yield start
+    yield from _ancestors(start.parentWidget(), stop)
+
+
 class SettingsSheet(QObject):
-    """Moves region B between the floating sheet and the Qt-ADS settings dock."""
+    """Shows region B as the floating sheet or in the Qt-ADS settings dock."""
 
     changed = Signal()
+
+    #: Plan 45 PINQ: a pin or an unpin leaves the column where it is (in the
+    #: frame); only a dock the user floated out of the window takes it.
+    COLUMN_STAYS = True
 
     def __init__(self, *, layout, region_b: QWidget, host: QWidget,
                  stack: QStackedWidget, store=None, step_name=None,
@@ -454,6 +490,8 @@ class SettingsSheet(QObject):
         self._step_name = step_name
         self._focus = False
         self._busy = False
+        #: Plan 45 PINQ. Context factories held for the length of `_apply`.
+        self._arrangement_holds: list = []
         #: What the last `_position` decided; ``None`` before the first.
         self._was_shown = None
         self._render_pending = False
@@ -467,7 +505,10 @@ class SettingsSheet(QObject):
 
         # Plan 44 MF5. A native window: the viewport is one, and a plain child
         # of the same host is drawn under it (the sheet that could not be seen).
-        self._frame = SheetFrame(host)
+        # Plan 45 PINQ. A child of the dock manager, not of the viewport's
+        # host: from there it can lie over the viewport (floating) and over
+        # the settings dock's slot (pinned) without the column ever moving.
+        self._frame = SheetFrame(layout.manager)
         self._frame.setObjectName('settingsSheet')
         self._frame.setAccessibleName('Settings sheet')
         self._frame.setProperty('floating', True)
@@ -480,6 +521,18 @@ class SettingsSheet(QObject):
         self._holder_box = QVBoxLayout(self._holder)
         # 7 px under the footer, so no child reaches a rounded corner.
         self._holder_box.setContentsMargins(0, 0, 0, RADIUS_SHEET)
+        # Plan 45 I. The dock holds a plain slot for the whole life of the
+        # sheet, and the page column moves between the slot and the floating
+        # holder. Taking the column out of the dock and into it again went
+        # through a parentless step each way (Qt-ADS ``takeWidget`` and
+        # ``setWidget``), and every parentless step re-polished all of the
+        # column's widgets: MEASURED at 2.3 s to pin and 1.9 s to unpin.
+        self._slot = QWidget()
+        self._slot.setObjectName('settingsSheetSlot')
+        self._slot_box = QVBoxLayout(self._slot)
+        self._slot_box.setContentsMargins(0, 0, 0, 0)
+        self._slot_box.setSpacing(0)
+        self._slot.setMinimumWidth(SHEET_MINIMUM)
         self._grip = SheetGrip(self._frame)
         self._grip.dragged.connect(self._grip_dragged)
         self._grip.menuRequested.connect(self._popup_menu)
@@ -487,6 +540,12 @@ class SettingsSheet(QObject):
         self._tab.clicked.connect(lambda: self.set_minimised(False))
         self._frame.hide()
         self._tab.hide()
+        #: True while the frame wears the pinned look (flat over the slot).
+        self._flat = False
+        #: The widgets whose moves move the frame (see ``_watch``).
+        self._chain: list = []
+        self._follow_due = False
+        self._slide_in = False
 
         # Plan 44 MF5. One header for every step. It sits at the head of
         # region B's own column, so it moves with the page between the frame
@@ -505,7 +564,21 @@ class SettingsSheet(QObject):
             _app.themeManager.themeChanged.connect(
                 lambda _name: self._header.refresh_icons())
 
-        host.installEventFilter(self)
+        # The one time the column leaves the dock the layout built for it.
+        import PySide6QtAds as QtAds
+        dock = self._layout.dock(SETTINGS_DOCK)
+        if dock.widget() is self._b:
+            dock.takeWidget()
+        dock.setWidget(self._slot, QtAds.CDockWidget.ForceNoScrollArea)
+        self._layout.pin_area_minimums()
+        # Plan 45 PINQ. The column's one home from here on.
+        self._holder_box.addWidget(self._b)
+        top_level = getattr(dock, 'topLevelChanged', None)
+        if top_level is not None:
+            # a dock floated out of the window, or docked again
+            top_level.connect(lambda *_a: self._apply())
+
+        self._watch()
         stack.currentChanged.connect(self._page_changed)
         regions = getattr(layout, 'regions', None)
         if regions is not None:
@@ -579,9 +652,13 @@ class SettingsSheet(QObject):
                 self.state.to_record())
 
     def _commit(self) -> None:
-        self._save()
-        self._apply()
-        self.changed.emit()
+        # Plan 45 PINQ. The sheet's record and the View menu's (written from
+        # ``changed``) go to the settings file in one write.
+        batched = getattr(self._store, 'batched', None)
+        with batched() if callable(batched) else contextlib.nullcontext():
+            self._save()
+            self._apply()
+            self.changed.emit()
 
     def set_mode(self, mode: str) -> None:
         if mode in MODES and mode != self.state.mode:
@@ -633,55 +710,180 @@ class SettingsSheet(QObject):
     # -- the widgets -------------------------------------------------------- #
 
     def _in_dock(self) -> bool:
-        return self._layout.dock(SETTINGS_DOCK).widget() is self._b
+        """The column stands in the dock's place: pinned (the frame flat over
+        the slot), or inside a dock the user floated out of the window."""
+        return self._flat or self._b.parent() is self._slot
+
+    def _over_slot(self) -> bool:
+        """The frame lies over the dock's slot now (pinned, open, docked)."""
+        return (self._flat and not self.state.minimised and not self._focus
+                and self._b.parent() is self._holder
+                and self._slot.isVisible()
+                and self._layout.manager.isAncestorOf(self._slot))
+
+    def _slot_rect(self) -> QRect:
+        manager = self._layout.manager
+        return QRect(self._slot.mapTo(manager, QPoint(0, 0)), self._slot.size())
+
+    def _host_offset(self) -> QPoint:
+        return self._host.mapTo(self._layout.manager, QPoint(0, 0))
+
+    def _set_flat(self, flat: bool) -> None:
+        """Plan 45 PINQ. The pinned look (square, no edge lines, no grip, the
+        dock's background) or the floating one. Only the frame itself is
+        re-polished; nothing under it changes parent."""
+        flat = bool(flat)
+        if flat == self._flat:
+            return
+        self._flat = flat
+        frame = self._frame
+        # Unpinned, the sheet slides in from its edge as it always has: from
+        # beyond the edge, without a hide and a show of all of its widgets.
+        self._slide_in = (not flat and frame.isVisible()
+                          and motion.motion_enabled())
+        self._restyle_frame(flat)
+        frame.set_radius(0 if flat else RADIUS_SHEET)
+        self._grip.setVisible(not flat)
+        self._holder_box.setContentsMargins(0, 0, 0, 0 if flat else RADIUS_SHEET)
+        for lines in frame.findChildren(QWidget, 'foammeshElevationLines'):
+            lines.setVisible(not flat)
+
+    def _restyle_frame(self, flat: bool) -> None:
+        """The frame's own rule (``foammeshPinned`` in sheet.qss.tmpl); the
+        frame alone is re-polished, not the column in it."""
+        frame = self._frame
+        frame.setProperty('foammeshPinned', flat)
+        style = frame.style()
+        style.unpolish(frame)
+        style.polish(frame)
+        frame.update()
+
+    def _watch(self) -> None:
+        """Follow every widget from the slot and from the viewport host up to
+        the dock manager: a splitter drag, a re-dock or a closed dock moves
+        or hides the place the frame has to cover."""
+        manager = self._layout.manager
+        chain = []
+        for start in (self._slot, self._host):
+            for widget in _ancestors(start, manager):
+                if widget not in chain:
+                    chain.append(widget)
+        for widget in chain:
+            if widget not in self._chain:
+                widget.installEventFilter(self)
+        for widget in self._chain:
+            if widget not in chain:
+                try:
+                    widget.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+        self._chain = chain
 
     def _take_from_dock(self) -> None:
-        dock = self._layout.dock(SETTINGS_DOCK)
-        if dock.widget() is self._b:
-            dock.takeWidget()
+        if self._b.parent() is self._slot:
+            self._slot_box.removeWidget(self._b)
+
+    def _adopt_into_dock(self) -> None:
+        if self._b.parent() is not self._slot:
+            self._release_from_frame()
+            self._slot_box.addWidget(self._b)
+            self._b.show()
 
     def _adopt_into_frame(self) -> None:
         if self._b.parent() is not self._holder:
+            self._take_from_dock()
             self._holder_box.addWidget(self._b)
             self._b.show()
 
     def _release_from_frame(self) -> None:
+        # No ``setParent(None)``: a column with no parent is re-polished on
+        # the way out and again on the way in.
         if self._b.parent() is self._holder:
             self._holder_box.removeWidget(self._b)
-            self._b.setParent(None)
+
+    def add_arrangement_hold(self, factory) -> None:
+        """``factory()`` -- a context manager -- is entered for the whole of
+        each arrangement: what it holds catches up once, at the end."""
+        self._arrangement_holds.append(factory)
 
     def _apply(self) -> None:
         """Reconcile the widgets with ``self.state`` (idempotent)."""
         if self._busy:
             return
+        with contextlib.ExitStack() as holds:
+            for factory in tuple(self._arrangement_holds):
+                holds.enter_context(factory())
+            self._apply_held()
+
+    def _apply_held(self) -> None:
         self._busy = True
+        self._follow_due = False
+        # Plan 45 PINQ. The frame's layout waits until the frame has its new
+        # look and place: showing the grip, the holder's new margin and the
+        # new geometry would each lay the whole column out again (a shown
+        # child activates its parent's layout at once). MEASURED live: the
+        # grip's show alone, 22-27 ms of an unpin.
+        box = self._box
+        box.setEnabled(False)
         try:
-            self._reconcile()
+            try:
+                self._reconcile()
+            finally:
+                self._busy = False
+            if self._follow_due:
+                # the slot or the host moved under the arrangement just made
+                self._follow_due = False
+                self._position()
         finally:
-            self._busy = False
+            box.setEnabled(True)
+            box.invalidate()
+            box.activate()
 
     def _reconcile(self) -> None:
-        import PySide6QtAds as QtAds
-
-        state = self.state
-        dock = self._layout.dock(SETTINGS_DOCK)
         if self._focus:
             return
-        want_dock = state.mode == 'pinned' and not state.minimised
+        # Plan 45 I. Opening or closing the dock announced a new arrangement
+        # on its own, and the end of this method announced it again: every
+        # region size, and the whole column under it, was laid out twice.
+        # One announcement, once the widgets are where they belong.
+        held = self._layout.blockSignals(True)
+        try:
+            self._reconcile_widgets()
+        finally:
+            self._layout.blockSignals(held)
+        self._layout.arrangementChanged.emit()
+
+    def _reconcile_widgets(self) -> None:
+        state = self.state
+        dock = self._layout.dock(SETTINGS_DOCK)
+        pinned = state.mode == 'pinned'
+        want_dock = pinned and not state.minimised
+        # Plan 45 PINQ. Pinned or floating, the column stays in the frame;
+        # pinned, the frame lies flat over the dock's empty slot. Only a dock
+        # the user floated out of the window (a window of its own) takes the
+        # column, the one move that still re-polishes it.
         if want_dock:
-            if not self._in_dock():
-                self._release_from_frame()
-                dock.setWidget(self._b, QtAds.CDockWidget.ForceNoScrollArea)
             if dock.isClosed():
                 dock.toggleView(True)
-            self._frame.hide()
+            if dock.isFloating():
+                self._adopt_into_dock()
+            else:
+                self._adopt_into_frame()
             self._place_dock()
+            # the title bar off first, so the slot has its final height
+            # when the frame is laid over it
+            self._hide_dock_title_bar()
+            self._slot.setMinimumHeight(self._b.minimumSizeHint().height())
+        elif pinned:
+            # Plan 45 I. Pinned and minimised: only the dock closes.
+            if not dock.isClosed():
+                dock.toggleView(False)
         else:
-            if self._in_dock():
-                self._take_from_dock()
             if not dock.isClosed():
                 dock.toggleView(False)
             self._adopt_into_frame()
+        self._set_flat(pinned)
+        self._watch()
         self._grip.set_side(state.side)
         self._tab.set_side(state.side)
         self._header.set_pinned(state.mode == 'pinned')
@@ -690,7 +892,6 @@ class SettingsSheet(QObject):
         self._position()
         self._set_tab_text()
         self._hide_dock_title_bar()
-        self._layout.arrangementChanged.emit()
 
     def _hide_dock_title_bar(self) -> None:
         """Plan 44 Q12: the pinned sheet has the sheet header and no ADS title
@@ -760,12 +961,26 @@ class SettingsSheet(QObject):
         shown = self.shows_floating_sheet()
         was = self._was_shown
         self._was_shown = shown
-        if shown:
+        if self._over_slot():
+            # Plan 45 PINQ. Pinned: flat over the dock's slot, laid over it
+            # once the arrangement is made (``_apply``), not at the slot's
+            # place before the splitter has sized it: one layout of the
+            # column, not two.
+            motion._stop(self._frame)
+            if self._busy:
+                self._follow_due = True
+            else:
+                self._frame.setGeometry(self._slot_rect())
+                self._frame.show()
+                self._frame.raise_()
+        elif shown:
             width = self.frame_width()
             x = INSET if self.state.side == 'left' else host.width() - width - INSET
-            rect = QRect(x, INSET, width, max(height - 2 * INSET, 0))
+            rect = QRect(x, INSET, width, max(height - 2 * INSET, 0)).translated(
+                self._host_offset())
             motion._stop(self._frame)             # a hide still running
-            if was is False and not self._frame.isVisible():
+            slide_in, self._slide_in = self._slide_in, False
+            if slide_in or (was is False and not self._frame.isVisible()):
                 # Plan 44 MF5: it slides in from beyond its edge (200 ms,
                 # OutCubic; instant with motion off or Reduce motion on).
                 self._frame.setGeometry(self._off_rect(rect))
@@ -806,11 +1021,17 @@ class SettingsSheet(QObject):
         if self._render_pending:
             return
         self._render_pending = True
-        QTimer.singleShot(0, self._render_viewport)
+        # The sheet as the timer's context: a window closed with a render
+        # still queued drops it, rather than the render reading a host that
+        # is gone.
+        QTimer.singleShot(0, self, self._render_viewport)
 
     def _render_viewport(self) -> None:
         self._render_pending = False
-        window = self._host.window() if self._host is not None else None
+        try:
+            window = self._host.window() if self._host is not None else None
+        except RuntimeError:                     # the host was deleted first
+            return
         view = getattr(window, 'renderingView', None)
         refresh = getattr(view, 'refresh', None)
         if callable(refresh):
@@ -860,11 +1081,22 @@ class SettingsSheet(QObject):
     # -- events -------------------------------------------------------------- #
 
     def eventFilter(self, watched, event) -> bool:
-        if watched is self._host and event.type() == QEvent.Type.Resize:
-            self._position()
+        kind = event.type()
+        if kind in _FOLLOW and watched in self._chain:
+            if kind == QEvent.Type.ParentChange:
+                self._watch()            # a re-docked dock: a new chain
+            if self._busy:
+                self._follow_due = True
+            else:
+                self._position()
         elif (watched is getattr(self, '_barWatched', None)
               and event.type() == QEvent.Type.Show and self._in_dock()):
-            self._hide_dock_title_bar()
+            # Plan 45 final pass (LIVEZ). Qt sends Show *before* it shows the
+            # native window (show_helper: the event, then show_sys()). A hide
+            # from in here left Qt saying "hidden" over a shown native bar
+            # that took the header's presses (pin, minimise -> detach). Hide
+            # it once the show has finished.
+            QTimer.singleShot(0, self._hide_dock_title_bar)
         return False
 
     def _page_changed(self, *_args) -> None:
@@ -873,6 +1105,8 @@ class SettingsSheet(QObject):
         if self.shows_floating_sheet():
             self._position()
         elif self._in_dock():
+            if self._over_slot():
+                self._slot.setMinimumHeight(self._b.minimumSizeHint().height())
             self._layout.arrangementChanged.emit()
 
     def _set_tab_text(self) -> None:

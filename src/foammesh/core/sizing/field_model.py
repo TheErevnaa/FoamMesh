@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,10 @@ def _encode(ijk: np.ndarray) -> np.ndarray:
     ijk = ijk.astype(np.uint64)
     return (ijk[:, 0] << np.uint64(2 * _BITS)) | (
         ijk[:, 1] << np.uint64(_BITS)) | ijk[:, 2]
+
+
+#: Plan 45 boot: (directory, per-file name/size/mtime) -> the loaded field.
+_LOADED_FIELDS: dict = {}
 
 
 @dataclass
@@ -51,6 +56,29 @@ class SizeField:
     @classmethod
     def load(cls, directory) -> 'SizeField':
         directory = Path(directory)
+        # Plan 45 boot. The size-field card asks three times while a case
+        # opens and each load sorted every leaf again (0.1 s apiece on a small
+        # field). The loaded field is kept against its four files' sizes and
+        # times, so a recompute (which rewrites them) loads afresh.
+        key = None
+        try:
+            key = (os.path.normcase(os.path.abspath(directory)),) + tuple(
+                (name, st.st_size, st.st_mtime_ns)
+                for name in ('field.json', 'leaves_ijk.npy',
+                             'leaves_level.npy', 'leaves_size.npy')
+                for st in ((directory / name).stat(),))
+        except OSError:
+            pass
+        if key is not None and key in _LOADED_FIELDS:
+            return _LOADED_FIELDS[key]
+        field = cls._read(directory)
+        if key is not None:
+            _LOADED_FIELDS.clear()
+            _LOADED_FIELDS[key] = field
+        return field
+
+    @classmethod
+    def _read(cls, directory: Path) -> 'SizeField':
         try:
             meta = json.loads((directory / 'field.json').read_text('utf-8'))
             arrays = {name: np.load(directory / f'{name}.npy')

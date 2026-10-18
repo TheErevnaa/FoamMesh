@@ -9,8 +9,9 @@ tests read the same numbers the viewport writes on the model.
   bad spot do not take two labels.
 * :func:`layout_labels` places the label boxes on the screen so that none
   overlaps another and each keeps a leader to its anchor.
-* :func:`quality_caption` and :func:`deviation_caption` word the two-line
-  statistics card.
+* :func:`quality_caption` and :func:`verdict_caption` word the two-line
+  statistics card. Deviation has none (Plan 45 P2): its figures are the
+  legend's, and a centred copy repeated them a third time.
 """
 from __future__ import annotations
 
@@ -247,29 +248,6 @@ def verdict_caption(*, case: str, metric: dict, source: str = 'checkMesh',
         first.append('not reported')
     return (' · '.join(first), _second_line(source, scale_name, version,
                                                   stamp))
-
-
-def deviation_caption(*, case: str, fields, tolerance: float = 0.0,
-                      signed: bool = True, source: str = 'live distance',
-                      scale_name: str = '', version: str = '',
-                      stamp: str = '') -> tuple:
-    """Two lines for a deviation colouring: max, mean, RMS, share in tolerance
-    (all of |d|, in millimetres)."""
-    chunks = [np.asarray(f, dtype=np.float64).ravel() for f in fields]
-    joined = np.concatenate(chunks) if chunks else np.zeros(0)
-    finite = np.abs(joined[np.isfinite(joined)])
-    first = [case or 'mesh', 'Surface deviation']
-    if finite.size:
-        rms = math.sqrt(float((finite ** 2).mean()))
-        within = 100.0 * float((finite <= abs(tolerance)).sum()) / finite.size
-        first += [f'max |d| {finite.max():.3f} mm',
-                  f'mean |d| {finite.mean():.3f} mm',
-                  f'RMS {rms:.3f} mm',
-                  f'{within:.0f}% within {abs(tolerance):.3f} mm']
-    else:
-        first.append('not measured')
-    return (' · '.join(first), _second_line(source, scale_name, version,
-                                                 stamp))
 
 
 def _second_line(source, scale_name, version, stamp) -> str:

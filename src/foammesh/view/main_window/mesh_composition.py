@@ -71,10 +71,22 @@ def composition_text(regions=(), patches=(), zones=()) -> str:
     return text + '.'
 
 
-def cell_count_text(visible: int, total: int = 0) -> tuple[str, str]:
+#: What makes the cells on screen fewer than the mesh (Plan 45 V5).
+CUT_SECTION = 'section'
+CUT_FILTER = 'filter'
+CUT_BOTH = 'both'
+
+
+def cell_count_text(visible: int, total: int = 0,
+                    cause: str = CUT_SECTION) -> tuple[str, str]:
     """``(label, tooltip)`` for the cell counter.
 
     ``total`` is the whole mesh; ``visible`` is what survives the section.
+
+    Plan 45 V5. ``cause`` says what took the other cells away: a section
+    (``'section'``), the quality filter that shows only the worst cells
+    (``'filter'``), or both. The Quality view read "Section: 100 of 153,999
+    cells" with no section made: the readout named a cut that was not there.
     When they differ the label says which number is which and the tooltip
     says what that means for anything measured on screen -- CP-09 item 6's
     "label slice-only versus whole-mesh statistics", which is the difference
@@ -92,6 +104,18 @@ def cell_count_text(visible: int, total: int = 0) -> tuple[str, str]:
         # cells`. The static label is gone; with nothing beside it, the
         # honest thing for an empty viewport to show is nothing.
         return '', ''
+    if visible < total and cause == CUT_FILTER:
+        return (
+            f'Quality filter: {visible:,} of {total:,} cells',
+            f'The quality colouring shows only the {visible:,} cells in its '
+            f'band; the other {total - visible:,} of the {total:,} cells are '
+            f'filtered out. No section is cut.')
+    if visible < total and cause == CUT_BOTH:
+        return (
+            f'Section and quality filter: {visible:,} of {total:,} cells',
+            f'A section and the quality filter together leave {visible:,} '
+            f'of the {total:,} cells on screen.\nAnything measured on screen '
+            f'now describes those {visible:,} cells, not the whole mesh.')
     if visible < total:
         return (
             f'Section: {visible:,} of {total:,} cells',

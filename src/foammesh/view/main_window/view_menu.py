@@ -87,7 +87,9 @@ STATE_SPEC: dict = {
     'tools.reveal': ('hover', REVEALS),
     'tools.show_bottom': (True, BOOL),
     'parts.show': (False, BOOL),
-    'parts.chip': (True, BOOL),
+    # Plan 45 (user 2026-10-17): the Parts chip is retired -- the rail's
+    # Parts button is the one way in. The key stays so a saved True loads.
+    'parts.chip': (False, BOOL),
     'parts.autohide': (True, BOOL),
     'ribbon.labels': ('full', RIBBON_LABELS),
     'ribbon.colour': (True, BOOL),
@@ -633,10 +635,6 @@ def install_view_menu(window) -> ViewMenu:
     parts = view.submenu(menu, 'menuViewParts', tr('&Parts panel'))
     view.toggle(parts, 'actionShowPartsPanel', tr('&Show parts panel'),
                 'parts.show', tr('Open the Parts panel'))
-    view.toggle(parts, 'actionPartsChip', tr('Show the Parts &chip'),
-                'parts.chip',
-                tr('Show the "3 of 3" chip at the top right that opens the '
-                   'Parts panel'))
     view.toggle(parts, 'actionPartsAutoHide', tr('&Auto-hide'),
                 'parts.autohide',
                 tr('Fold the Parts panel away when the pointer leaves it'))

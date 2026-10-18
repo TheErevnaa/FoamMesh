@@ -52,6 +52,25 @@ from foammesh.view.display_control.overlay_layout import OverlayLayout, Slot, ap
 
 logger = logging.getLogger(__name__)
 
+#: Plan 45 shut-down. Set by the application once its event loop has
+#: returned for good; render windows finalized after it leave their GL
+#: context to the process exit (they are kept here, referenced).
+_processExiting = False
+_contextsLeftToTheProcessExit = []
+
+
+def leaveContextsToProcessExit() -> None:
+    """The process is ending: do not delete GL contexts one by one.
+
+    MEASURED (Plan 45, 2026-10-17): after ``main()`` returned, the viewport's
+    ``Finalize`` -- run when the QApplication's widgets are taken down --
+    sat 1-2 s in the GPU driver's ``wglDeleteContext`` (atio6axx) on about
+    one exit in four; a standalone VTK window shows the same. Left to the
+    process exit, 35 of 35 standalone exits ended in 0.19-0.41 s.
+    """
+    global _processExiting
+    _processExiting = True
+
 RENDER_DELAY_TIME = 200
 REPAINT_SUPPRESS_TIME = 100
 #: UXB5 (N4). A paint that arrives while a hold is on is dropped, and the
@@ -110,8 +129,27 @@ CORNER_AXES_LENGTH = (0.5, 0.5, 0.5)
 #: 16 px arms on top of its hexagon). The faces are translucent so the axes
 #: show through, as the mockup's lines do.
 TRIAD_FACE_OPACITY = 0.3
-#: The world-origin triad's arms are this share of the visible bounds' span.
-ORIGIN_ARM_SHARE = 0.25
+#: Plan 45 B (P10). The world-origin triad's arms are this share of the
+#: model's SMALLEST non-zero bounding-box side.
+ORIGIN_ARM_SHARE = 0.4
+ORIGIN_ARM_FALLBACK = 1.0
+
+
+def origin_arm_length(bounds) -> float:
+    """Arm of the world-origin triad: 0.4 x the smallest non-zero box side.
+
+    ``bounds`` is (xmin, xmax, ymin, ymax, zmin, zmax) of the model, or None /
+    inverted for an empty scene (then the fixed fallback).
+    """
+    if bounds is None or len(bounds) < 6:
+        return ORIGIN_ARM_FALLBACK
+    sides = [float(bounds[i + 1]) - float(bounds[i]) for i in (0, 2, 4)]
+    sides = [side for side in sides if side > 0.0]
+    if not sides:
+        return ORIGIN_ARM_FALLBACK
+    return ORIGIN_ARM_SHARE * min(sides)
+
+
 #: DP-2721. The origin triad's X, Y, Z: a fixed 14 px in the axis colours.
 #: VTK's default caption is white and scales with the window (60 px letters
 #: at 1920 x 960, unreadable on the light ground).
@@ -501,9 +539,18 @@ class RenderWindowInteractor(QVTKRenderWindowInteractor):
         super().__init__(parent=parent, **kw)
 
     def Finalize(self):
-        if self._RenderWindow is not None:
-            self._RenderWindow.Finalize()
-            self._RenderWindow = None
+        window = self._RenderWindow
+        if window is None:
+            return
+        self._RenderWindow = None
+        if _processExiting:
+            # Plan 45 shut-down (see leaveContextsToProcessExit): the context
+            # goes with the process. The extra reference keeps a late
+            # destructor from deleting it either.
+            window.Register(None)
+            _contextsLeftToTheProcessExit.append(window)
+            return
+        window.Finalize()
 
     def paintEvent(self, ev):
         if isRenderingHold():
@@ -788,6 +835,18 @@ def _applyQuality(view, name: str) -> bool:
     return applied or not chosen.ssao
 
 
+#: Plan 45 BOOT2. While the main window is built in stages, a call that serves
+#: the event queue; the viewport calls it between its own stages (it was
+#: ~0.45 s in one piece, MEASURED live 17 October 2026). None otherwise.
+constructionTurn = None
+
+
+def _constructionTurn() -> None:
+    turn = constructionTurn
+    if turn is not None:
+        turn()
+
+
 class RenderingWidget(QWidget):
     actorPicked = Signal(vtkActor, bool, bool)
     #: Plan 43 LY8. The labels font/size or the legends switch changed, from
@@ -920,6 +979,7 @@ class RenderingWidget(QWidget):
         self._presentSettleTimer.timeout.connect(self._presentFrame)
         self._widget.onHeldPaint = self._heldPaint
         self._widget.onDrawn = self._frameDrawn
+        _constructionTurn()
 
         self._depthPeeling = False
         #: Plan 35 CR8 step 2. Translucency wanted, peeling dropped (budget).
@@ -1013,6 +1073,7 @@ class RenderingWidget(QWidget):
         # Plan 39 VI14d. Its window handle is made now, hidden; made at the
         # first show it held the GUI thread for about 30 ms in a section raise.
         self._holdCover.winId()
+        _constructionTurn()
 
         self._originalMouseObserver = MouseHandler(self._style)
         self._mouseObserver = self._originalMouseObserver
@@ -1054,6 +1115,7 @@ class RenderingWidget(QWidget):
                             self._decision.reason),
                 self.tr('Show viewport'))
         else:
+            _constructionTurn()
             self._startInteractor()
 
         # To adjust origin axes size on zoom
@@ -3321,11 +3383,10 @@ class RenderingWidget(QWidget):
                          bounds[5] - bounds[4]))
 
     def _resizeOriginTriad(self) -> None:
-        """Arms of 25 % of the visible bounds' longest span, on every fit."""
+        """Arms of 40 % of the model's smallest non-zero side, on every fit."""
         if self._originTriad is None:
             return
-        span = self._sceneSpan()
-        arm = ORIGIN_ARM_SHARE * span if span > 0 else 1.0
+        arm = origin_arm_length(self._renderer.ComputeVisiblePropBounds())
         self._originTriad.SetTotalLength(arm, arm, arm)
 
     # -- one layout for the overlays (VI15, I4) ------------------------------ #

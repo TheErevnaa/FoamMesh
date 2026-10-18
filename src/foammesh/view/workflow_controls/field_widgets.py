@@ -11,12 +11,16 @@ from __future__ import annotations
 import math
 import re
 
-from PySide6.QtCore import QCoreApplication, QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QValidator
-from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QLineEdit, QMenu, QSpinBox,
-    QWidget,
+from PySide6.QtCore import (
+    QCoreApplication, QEvent, QObject, QPoint, Qt, Signal,
 )
+from PySide6.QtGui import QColor, QPainter, QPalette, QValidator
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QLabel, QLineEdit, QMenu,
+    QSpinBox, QWidget,
+)
+
+from shiboken6 import isValid
 
 from foammesh.core import display_unit, quantity_expr
 from foammesh.core.facade.field_tiers import tier_of
@@ -80,13 +84,123 @@ def unset_phrase(field_id: str) -> str:
     return 'OpenFOAM default'
 
 
-def fit_special_text(widget) -> None:
-    """Keep a spin box wide enough to read its special-value text whole.
+#: The narrowest a spin box with a special-value text may become: the sheet
+#: grid's floor for every spin box (``sheet_form.elide_combos``).
+SPECIAL_TEXT_FLOOR = 72
+_ELIDER_PROPERTY = 'foammeshSpecialTextElider'
 
-    DP-2701. ``Auto (7.71 mm)`` and ``Auto (Gmsh default)`` are longer than
-    the 72 px floor the sheet gives a spin box, so the box clipped them on
-    both sides ("uto (7.71 mm)"). The floor is the text and the box's own
-    padding; a box that has no special text keeps what it had.
+
+class _SpecialTextElider(QObject):
+    """Paint a spin box's special-value text with an ellipsis when it is cut.
+
+    Plan 45 V11. DP-2701 kept ``Auto (OpenFOAM default)`` whole by making it
+    the box's minimum width (193 px), and a sheet column of 257 px cannot
+    hold that beside its label: the whole page grew sideways inside a
+    scroller with no sideways bar, so the layers table and the orange notes
+    under it were cut on the right. The box now shrinks with the column as
+    every other field does, and when the column is too narrow for the words
+    it shows them elided -- ``Auto (OpenFOAM de...`` -- the same rule the
+    sheet's combo boxes follow, with the whole text in the tooltip. A box
+    with room shows the text whole, as DP-2701 asked; it is never clipped
+    on either side.
+    """
+
+    def __init__(self, box) -> None:
+        # A child of the editor it watches, so it goes with the editor and
+        # is never asked about a box half way through its destructor.
+        super().__init__(box.lineEdit())
+        self._box = box
+        self._edit = self.parent()
+        self._tip = None
+        self._edit.installEventFilter(self)
+
+    def _room(self):
+        edit = self._edit
+        rect = edit.contentsRect()
+        margins = edit.textMargins()
+        # QLineEdit's own horizontal text margin (``horizontalMargin`` = 2).
+        return rect.adjusted(margins.left() + 2, margins.top(),
+                             -(margins.right() + 2), -margins.bottom())
+
+    def _showing_special(self) -> str:
+        box = self._box
+        text = box.specialValueText()
+        edit = self._edit
+        if not text or edit.text() != text or edit.hasFocus():
+            return ''
+        return text
+
+    def isElided(self) -> bool:
+        text = self._showing_special()
+        if not text:
+            return False
+        edit = self._edit
+        return (edit.width() > 0 and edit.fontMetrics().horizontalAdvance(text)
+                > self._room().width())
+
+    def _tooltip(self) -> None:
+        edit = self._edit
+        if self.isElided():
+            text = self._box.specialValueText()
+            base = self._box.toolTip()
+            wanted = text if not base else text + chr(10) * 2 + base
+            if edit.toolTip() != wanted:
+                edit.setToolTip(wanted)
+                self._tip = wanted
+        elif self._tip is not None and edit.toolTip() == self._tip:
+            edit.setToolTip('')
+            self._tip = None
+
+    def eventFilter(self, watched, event):
+        kind = event.type()
+        if (kind not in (QEvent.Type.Resize, QEvent.Type.Paint)
+                or watched is not self._edit):
+            return False
+        if not (isValid(self._box) and isValid(self._edit)):
+            return False
+        if kind == QEvent.Type.Resize:
+            self._tooltip()
+            return False
+        if not self.isElided():
+            return False
+        box, edit = self._box, self._edit
+        room = self._room()
+        metrics = edit.fontMetrics()
+        shown = metrics.elidedText(box.specialValueText(),
+                                   Qt.TextElideMode.ElideRight, room.width())
+        group = (QPalette.ColorGroup.Active if edit.isEnabled()
+                 else QPalette.ColorGroup.Disabled)
+        painter = _open_painter(edit)
+        painter.setFont(edit.font())
+        painter.setPen(edit.palette().color(group, QPalette.ColorRole.Text))
+        horizontal = edit.alignment() & Qt.AlignmentFlag.AlignHorizontal_Mask
+        painter.drawText(room, int(horizontal | Qt.AlignmentFlag.AlignVCenter),
+                         shown)
+        painter.end()
+        return True
+
+
+def _open_painter(widget) -> QPainter:
+    """A painter on ``widget``, for a paint event an event filter takes."""
+    return QPainter(widget)
+
+
+def special_text_is_elided(widget) -> bool:
+    """True while ``widget`` shows its special-value text with an ellipsis."""
+    elider = getattr(widget, '_foammeshSpecialElider', None)
+    return bool(elider is not None and elider.isElided())
+
+
+def fit_special_text(widget) -> None:
+    """Let a spin box with a special-value text fit its column, never clip it.
+
+    DP-2701. ``Auto (7.71 mm)`` and ``Auto (Gmsh default)`` were clipped on
+    both sides ("uto (7.71 mm)"). Plan 45 V11: raising the box's minimum to
+    the text's width fixed that by pushing the whole sheet page wider than
+    its column. The box keeps the sheet's floor instead, asks for the text's
+    width as its preferred size (``_value_sized_hint``), and a
+    :class:`_SpecialTextElider` draws the text whole when it has the room and
+    elided, with the whole text in the tooltip, when it does not.
     """
     text = widget.specialValueText() if hasattr(widget, 'specialValueText')         else ''
     base = widget.property('foammeshBaseMinWidth')
@@ -96,8 +210,14 @@ def fit_special_text(widget) -> None:
     if not text:
         widget.setMinimumWidth(base)
         return
-    need = widget.fontMetrics().horizontalAdvance(text) + 40
-    widget.setMinimumWidth(max(base, need))
+    # The minimum width is set, never left at 0: a 0 lets the layout fall
+    # back on the minimum size hint, which counts the special text whole.
+    widget.setMinimumWidth(max(int(base or 0), SPECIAL_TEXT_FLOOR))
+    if (getattr(widget, '_foammeshSpecialElider', None) is None
+            and hasattr(widget, 'lineEdit')):
+        setattr(widget, '_foammeshSpecialElider', _SpecialTextElider(widget))
+        widget.setProperty(_ELIDER_PROPERTY, True)
+    widget.updateGeometry()
 
 
 def auto_text(field_id: str, effective: str | None = None) -> str:
@@ -523,6 +643,84 @@ def same_as_default(value, default) -> bool:
         return str(value) == str(default)
 
 
+class _BadgeElider(QObject):
+    """Let the size field's "field: 20 mm" badge shrink before its row widens.
+
+    Plan 45 V11. The badge sits on the editor's row, after the unit; a
+    label asks for its whole text as its minimum, so on 9. Boundary layers
+    ``field: 100 deg`` made the Feature angle row 184 px and the Guided card
+    295 px in a 233 px column, and the whole page -- the layers table and
+    the orange notes under it -- was cut on the right. The badge now asks
+    for an ellipsis at least and, when its row gives it less than its words,
+    draws them elided; the whole text stays its ``text()`` and its tooltip.
+    """
+
+    #: What the badge keeps at its narrowest: an ellipsis, so a 1280 x 800
+    #: column (257 px) still holds label, editor, unit and badge.
+    FLOOR_TEXT = '…'
+    _REFIT = (QEvent.Type.Polish, QEvent.Type.StyleChange,
+              QEvent.Type.FontChange, QEvent.Type.Show)
+
+    def __init__(self, label) -> None:
+        super().__init__(label)
+        self._label = self.parent()
+        self._label.installEventFilter(self)
+        self.refit()
+
+    def refit(self) -> None:
+        label = self._label
+        margins = label.contentsMargins()
+        floor = (label.fontMetrics().horizontalAdvance(self.FLOOR_TEXT)
+                 + margins.left() + margins.right() + 2 * label.margin()
+                 + 2 * label.frameWidth())
+        if label.minimumWidth() != floor:
+            # Set, never left at 0: a 0 lets the layout fall back on the
+            # minimum size hint, which counts the text whole.
+            label.setMinimumWidth(floor)
+
+    def isElided(self) -> bool:
+        label = self._label
+        text = label.text()
+        return bool(text) and label.fontMetrics().horizontalAdvance(text) > (
+            label.contentsRect().width() - 2 * label.margin())
+
+    def eventFilter(self, watched, event):
+        if watched is not self._label or not isValid(watched):
+            return False
+        kind = event.type()
+        if kind in self._REFIT:
+            self.refit()
+            return False
+        if kind != QEvent.Type.Paint or not self.isElided():
+            return False
+        label = self._label
+        # The frame, as QLabel would draw it; the background was drawn
+        # before this event. Then the words, elided.
+        QFrame.paintEvent(label, event)
+        painter = _open_painter(label)
+        margin = label.margin()
+        rect = label.contentsRect().adjusted(margin, margin, -margin, -margin)
+        shown = label.fontMetrics().elidedText(
+            label.text(), Qt.TextElideMode.ElideRight, rect.width())
+        label.style().drawItemText(
+            painter, rect, int(label.alignment()), label.palette(),
+            label.isEnabled(), shown, QPalette.ColorRole.WindowText)
+        painter.end()
+        return True
+
+
+def fit_badge(label) -> None:
+    """Give a badge label :class:`_BadgeElider` (once)."""
+    if getattr(label, '_foammeshBadgeElider', None) is None:
+        setattr(label, '_foammeshBadgeElider', _BadgeElider(label))
+
+
+def badge_is_elided(label) -> bool:
+    """True while the badge ``label`` shows its text with an ellipsis."""
+    elider = getattr(label, '_foammeshBadgeElider', None)
+    return bool(elider is not None and elider.isElided())
+
+
 class FieldEditor(QWidget):
     """One registry-backed field: label, editor, unit suffix, documentation."""
 
@@ -554,6 +752,8 @@ class FieldEditor(QWidget):
         # proposals; hidden until the size field has proposed this control.
         self.badge_label = QLabel(self)
         self.badge_label.setObjectName('fieldSizingBadge')
+        # Plan 45 V11: shrinks to an ellipsis before it widens the row.
+        fit_badge(self.badge_label)
         self.badge_label.setProperty('foammeshStatus', 'info')
         self.badge_label.setVisible(False)
         _connect(self._editor, self._emit)

@@ -6,18 +6,25 @@ way. This is what a painted deviation now carries with it --
 
 * a scalar bar titled with the quantity and its unit, on the one range every
   patch shares, with unmeasured faces called out in grey;
-* a histogram of the signed deviation, its bars in the colours of the scale so
-  it reads as the legend's distribution, with the tolerance band marked;
+* a histogram of the deviation, its bars in the colours of the scale so it
+  reads as the legend's distribution, with the tolerance band marked;
 * the figures a user decides with: max |d|, mean, RMS and the share of faces
-  within a tolerance the user sets.
+  within a tolerance the user sets (shown once, in the legend's figures).
 
 Plan 39 VI6: the tolerance is part of the picture (the neutral band on the
 model widens and narrows as it is edited), the scale is editable, a closed
 reference is signed and an open one or a stored run is not, and a Surfaces
 list decides which patches are measured and painted at all.
+
+Plan 45 P2 (Q2 a). One scale: the histogram bins |d| over the same 0..scale
+the model and the legend are coloured on, each bar in the shared table's
+colour at its bin centre, faces past the scale in the last bar, and the
+tolerance band from 0 to the tolerance. The figures are the legend's alone;
+the card no longer repeats them, and no centred caption does either.
 """
 from __future__ import annotations
 
+import numpy as np
 from PySide6.QtCore import QEvent, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -71,7 +78,7 @@ def deviationScalarBar(lookupTable, tokens=None, signed=True):
 
 
 class DeviationHistogram(QWidget):
-    """The signed deviation's distribution, in the colours of its scale."""
+    """The distribution of |d| over 0..scale, in the colours of its scale."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,11 +90,11 @@ class DeviationHistogram(QWidget):
         self._counts: list[int] = []
         self._tolerance = 0.0
         self._lut = None
-        self._signed = True
 
     def setDistribution(self, histogram: dict, tolerance: float,
-                        lookupTable=None, signed: bool = True):
-        self._signed = bool(signed)
+                        lookupTable=None, signed: bool = False):
+        """``signed`` is accepted for old callers and ignored: the bars are
+        always |d| from 0 to the scale (Plan 45 P2)."""
         self._edges = [float(edge) for edge in histogram.get('edges') or ()]
         self._counts = [int(count) for count in histogram.get('counts') or ()]
         self._tolerance = abs(float(tolerance))
@@ -100,11 +107,39 @@ class DeviationHistogram(QWidget):
     def counts(self) -> list[int]:
         return list(self._counts)
 
+    def valueRange(self) -> tuple:
+        """The axis, ``(0, scale)``; ``()`` when nothing is measured."""
+        if len(self._edges) < 2:
+            return ()
+        return (self._edges[0], self._edges[-1])
+
+    def toleranceBand(self) -> tuple:
+        """The shaded band, ``(0, tolerance)`` clipped to the axis."""
+        if self._tolerance <= 0.0 or len(self._edges) < 2:
+            return ()
+        return (self._edges[0], min(self._edges[-1], self._tolerance))
+
+    def axisLabels(self) -> tuple:
+        """The labels under the axis: ``('0', '<scale> mm')``."""
+        if len(self._edges) < 2:
+            return ()
+        return ('0', f'{self._edges[-1]:.3g} mm')
+
+    def barColours(self) -> list:
+        """``[(bin centre, (r, g, b))]``, one per bar, as painted."""
+        out = []
+        for index in range(len(self._counts)):
+            centre = 0.5 * (self._edges[index] + self._edges[index + 1])
+            colour = self._barColour(centre)
+            out.append((centre, (colour.redF(), colour.greenF(),
+                                 colour.blueF())))
+        return out
+
     def _barColour(self, value: float) -> QColor:
         if self._lut is None:
             return QColor(self.palette().windowText().color())
         rgb = [0.0, 0.0, 0.0]
-        # Coloured by size (Plan 43 LY12): a bar left of zero is |value|.
+        # The model's own table, at the bar's |d| (Plan 45 P2).
         self._lut.GetColor(abs(value), rgb)
         return QColor.fromRgbF(*rgb)
 
@@ -126,20 +161,18 @@ class DeviationHistogram(QWidget):
             return area.left() + (value - low) / span * area.width()
 
         # The tolerance band first, so the bars stand in front of it.
-        if self._tolerance > 0.0:
-            left = x(max(low, -self._tolerance if self._signed else 0.0))
-            right = x(min(high, self._tolerance))
+        band_range = self.toleranceBand()
+        if band_range:
+            left, right = x(band_range[0]), x(band_range[1])
             band = QColor(text)
             band.setAlpha(28)
             painter.fillRect(QRectF(left, area.top(), right - left,
                                     area.height()), band)
-            dashed = QPen(text, 1, Qt.PenStyle.DashLine)
-            painter.setPen(dashed)
-            for edge in ((-self._tolerance, self._tolerance) if self._signed
-                         else (self._tolerance,)):
-                if low <= edge <= high:
-                    painter.drawLine(int(x(edge)), int(area.top()),
-                                     int(x(edge)), int(area.bottom()))
+            if self._tolerance <= high:
+                painter.setPen(QPen(text, 1, Qt.PenStyle.DashLine))
+                edge = x(self._tolerance)
+                painter.drawLine(int(edge), int(area.top()),
+                                 int(edge), int(area.bottom()))
         tallest = max(self._counts) or 1
         for index, count in enumerate(self._counts):
             if count <= 0:
@@ -156,17 +189,17 @@ class DeviationHistogram(QWidget):
                          int(area.right()), int(area.bottom()))
         labels = QRectF(area.left(), area.bottom() + 2, area.width(),
                         labelHeight)
-        painter.drawText(labels, Qt.AlignmentFlag.AlignLeft,
-                         f'{low:+.3g}' if self._signed else f'{low:.3g}')
-        if self._signed:
-            painter.drawText(labels, Qt.AlignmentFlag.AlignHCenter, '0')
-        painter.drawText(labels, Qt.AlignmentFlag.AlignRight,
-                         f'{high:+.3g} mm' if self._signed
-                         else f'{high:.3g} mm')
+        first, last = self.axisLabels()
+        painter.drawText(labels, Qt.AlignmentFlag.AlignLeft, first)
+        painter.drawText(labels, Qt.AlignmentFlag.AlignRight, last)
 
 
 class DeviationPanel(QFrame):
-    """Histogram and figures for the deviation on screen, over the viewport."""
+    """The histogram and the Surfaces list for the deviation on screen.
+
+    The figures (max, mean, RMS, share within tolerance) are the legend's;
+    the panel keeps them in :meth:`summary` but does not repeat them.
+    """
 
     toleranceChanged = Signal(float)
     #: The scale the ramp reaches, in mm; 0 asks for the automatic one.
@@ -199,11 +232,6 @@ class DeviationPanel(QFrame):
         self._source.setObjectName('deviationSource')
         self._source.setWordWrap(True)
         self._histogram = DeviationHistogram(self)
-        self._stats = QLabel()
-        self._stats.setObjectName('deviationStats')
-        self._stats.setWordWrap(True)
-        self._stats.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
 
         toleranceRow = QHBoxLayout()
         toleranceRow.setContentsMargins(0, 0, 0, 0)
@@ -263,7 +291,6 @@ class DeviationPanel(QFrame):
         layout.addWidget(self._title)
         layout.addWidget(self._source)
         layout.addWidget(self._histogram)
-        layout.addWidget(self._stats)
         layout.addLayout(toleranceRow)
         layout.addLayout(scaleRow)
         layout.addWidget(self._surfacesCaption)
@@ -334,7 +361,7 @@ class DeviationPanel(QFrame):
         self.hide()
 
     def refresh(self):
-        """Redraw the histogram and figures, e.g. after the scale changed."""
+        """Redraw the histogram, e.g. after the scale changed."""
         self._refresh()
 
     # -- the Surfaces list ------------------------------------------------- #
@@ -413,9 +440,6 @@ class DeviationPanel(QFrame):
     def summary(self):
         return self._summary
 
-    def statsText(self) -> str:
-        return self._stats.text()
-
     def histogram(self) -> DeviationHistogram:
         return self._histogram
 
@@ -429,26 +453,23 @@ class DeviationPanel(QFrame):
         values = self._readout.values()
         summary = live_distance.summarize(values, self.tolerance())
         self._summary = summary
+        # Plan 45 P2: |d| over the model's own 0..scale; past the scale is
+        # counted in the last bar (live_distance.histogram clips).
+        magnitudes = [np.abs(np.asarray(v, dtype=np.float64)) for v in values]
         self._histogram.setDistribution(
-            live_distance.histogram(
-                values, HISTOGRAM_BINS,
-                (-self._readout.value_range[1], self._readout.value_range[1])
-                if getattr(self._readout, 'signed', True)
-                else self._readout.value_range),
-            summary.tolerance, self._readout.lookup_table,
-            signed=False)
-        lines = [
-            # A figure never wraps away from its name or its unit.
-            self.tr('max |d| {0:.3g} mm   mean\u00a0|d| {1:.3g}\u00a0mm   '
-                    'RMS\u00a0{2:.3g}\u00a0mm').format(
-                        summary.max_abs, summary.mean, summary.rms),
-            self.tr('{0:.1f}% of {1:,} faces within ±{2:.3g} mm').format(
-                100.0 * summary.within_fraction, summary.count,
-                summary.tolerance)]
-        if summary.unmeasured:
-            lines.append(self.tr('{0:,} faces not measured (grey)').format(
-                summary.unmeasured))
-        self._stats.setText('\n'.join(lines))
+            live_distance.histogram(magnitudes, HISTOGRAM_BINS,
+                                    self.colourRange()),
+            summary.tolerance, self._readout.lookup_table)
+
+    def colourRange(self) -> tuple:
+        """``(0, scale)``: the range the model and the legend are coloured on."""
+        high = 0.0
+        value_range = getattr(self._readout, 'value_range', None) or ()
+        if len(value_range) == 2:
+            high = abs(float(value_range[1]))
+        if high <= 0.0:
+            high = abs(float(getattr(self._readout, 'scale', 0.0) or 0.0))
+        return (0.0, high or 1e-6)
 
     # -- placement --------------------------------------------------------- #
 
@@ -474,6 +495,19 @@ class DeviationPanel(QFrame):
         if parent is None:
             return
         self.adjustSize()
+        # Plan 45 V2. The source sentence wraps: its height depends on the
+        # width, and ``adjustSize`` asked the label at another width than the
+        # panel's fixed 300 px, so the panel came out a line short and the
+        # layout squeezed the histogram -- its axis labels ran under the
+        # Surfaces caption. The height is the one the fixed width needs.
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+            need = layout.minimumSize().height()
+            if layout.hasHeightForWidth():
+                need = max(need, layout.totalHeightForWidth(self.width()))
+            if need > self.height():
+                self.resize(self.width(), need)
         controller = getattr(self, '_clearArea', None)
         if controller is not None:
             clear = controller.clearRect()
@@ -483,7 +517,24 @@ class DeviationPanel(QFrame):
             rect = controller.place_clear_of(self, wanted)
             if self.pos() != rect.topLeft():
                 self.move(rect.topLeft())
+        else:
+            self.move(PANEL_MARGIN,
+                      max(PANEL_MARGIN,
+                          parent.height() - self.height() - PANEL_MARGIN))
+        self._fitLayout()
+
+    def _fitLayout(self):
+        """Plan 45 V2. Lay the children out on the panel's final size.
+
+        The clear area places the panel again from inside the panel's own
+        Resize event (its float watcher), so the nested ``adjustSize``
+        laid the children out at the short height and the outer resize
+        never reached the layout: live, a 265 px panel kept a 232 px
+        layout, the histogram overran its slot and the Surfaces caption
+        sat on its "0" axis label."""
+        layout = self.layout()
+        if layout is None:
             return
-        self.move(PANEL_MARGIN,
-                  max(PANEL_MARGIN,
-                      parent.height() - self.height() - PANEL_MARGIN))
+        inner = self.contentsRect()
+        if layout.geometry() != inner:
+            layout.setGeometry(inner)

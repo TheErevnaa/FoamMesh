@@ -1291,7 +1291,10 @@ def _intersect_pair(left, right, budget):
                  str(root / 'left.vtp'), str(root / 'right.vtp'),
                  str(result_path)],
                 timeout=max(remaining, 1.0), check=True,
-                capture_output=True, env=environment)
+                capture_output=True, env=environment,
+                stdin=subprocess.DEVNULL,
+                # Plan 45: no console window from a console-less build.
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except subprocess.TimeoutExpired:
             budget.add_external_seconds(_time.monotonic() - child_started)
             budget.report(

@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, Signal
 from foammesh.view.theming.metrics import UnitLabel
 from foammesh.view.workflow_controls.length_box import ModelLengthBox
 from foammesh.core import display_unit
 from foammesh.rendering import layers_grown
 from PySide6.QtGui import (
-    QAction, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPixmap)
+    QAction, QColor, QGuiApplication, QIcon, QKeySequence, QLinearGradient,
+    QPainter, QPen, QPixmap)
 from PySide6.QtGui import QActionGroup, QFont
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QFileDialog, QFrame, QGridLayout, QLabel,
@@ -21,7 +22,7 @@ from widgets.rendering.ruler_widget import RulerWidget
 from foammesh.app import app
 from foammesh.view.main_window.main_window_ui import Ui_MainWindow
 from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
-from foammesh.view.theming.icons import load_themed_icon
+from foammesh.view.theming.icons import load_themed_icon, theme_colour
 from foammesh.view.theming.status_colors import (
     apply_color_swatch, hide_menu_indicator, style_tool_tile)
 from foammesh.view.display_control import view_modes
@@ -40,32 +41,6 @@ BUTTON_SIZE = QSize(28, 28)
 #: DP-106. Kept as a module name because the tests and the callers below
 #: already say it; the ladder itself is shared with the base-grid readout.
 _formatExtent = format_extent
-
-
-class _RowCaption(QLabel):
-    """DP-2720. A Display row's words: pressing them presses the row's
-    control, so the row is the target, not only its 28 px glyph."""
-
-    def __init__(self, text: str, buddy):
-        super().__init__(text)
-        self.setBuddy(buddy)
-        self._buddy = buddy
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        buddy = self._buddy
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self.rect().contains(event.position().toPoint())
-                and buddy.isEnabled() and buddy.isVisible()):
-            if isinstance(buddy, QFrame):
-                buddy = next((child for child in buddy.findChildren(QToolButton)
-                              if child.isVisible()), None)
-            if buddy is not None:
-                if isinstance(buddy, QToolButton) and buddy.menu() is not None:
-                    buddy.showMenu()
-                else:
-                    buddy.click()
 
 
 class ElidingLabel(QLabel):
@@ -314,6 +289,7 @@ class RenderingTool(QObject):
         'poorCells': '_poorCellsButton',
         'failedCells': '_failedCellsButton',
         'fidelity': '_fidelityButton',
+        'features': '_featuresButton',
     }
 
     def _installViewActions(self):
@@ -462,11 +438,15 @@ class RenderingTool(QObject):
                     'geometry'),
             self.fidelityRequested.emit, objectName='viewportFidelity',
             checkable=True)
+        # Plan 45 P11 (Q5 a). A toggle like the other overlays: with no
+        # declared features it draws the boundary's own feature edges.
         self._featuresButton = self._toolButton(
             'features.svg',
-            self.tr('Show the declared feature edges, coloured by whether the '
-                    'mesh kept them'),
-            self.featuresRequested.emit, objectName='viewportFeatures')
+            self.tr('Show the feature edges: the declared features coloured '
+                    'by whether the mesh kept them, or else the creases and '
+                    'rims of the boundary itself'),
+            self.featuresRequested.emit, objectName='viewportFeatures',
+            checkable=True)
         self._failedCellsButton = self._toolButton(
             'failedCells.svg',
             self.tr('Show the cell sets the last mesh check wrote'),
@@ -1186,53 +1166,69 @@ class RenderingTool(QObject):
             action = menu.addAction(self.tr('Everything fits at this width'))
             action.setEnabled(False)
 
-    # -- Plan 40 UXE2: the rail takes the display switches ------------------- #
+    # -- Plan 45 N (P9): the display switches are rail tools of their own --- #
+
+    def railDisplayTools(self) -> list:
+        """The display switches, for the rail to stand one button each.
+
+        Plan 45 P9 (Q3 b): they were rows of one Display popover; a user
+        wanted them as tools. Each entry is ``(key, title, widget, button,
+        tip, fold)``: *widget* is the row's own control -- same object, name
+        and wiring, so there is still one copy of each switch -- *button* what
+        a press works when that is not the widget itself (the Background
+        frame's swatch button), and *fold* how early a short rail folds it
+        into its ``...`` menu (higher goes first). The row lets go of them.
+        """
+        ui = self._ui
+        tools = [
+            ('meshLines', self.tr('Mesh lines'), self._meshLinesButton, None,
+             self.tr('Mesh lines: opacity, colour and width of the grid'), 2),
+            ('originAxes', self.tr('Origin axes'), ui.axis, None,
+             self.tr('Origin axes: show the axes at the origin'), 5),
+            ('cubeAxes', self.tr('Cube axes'), ui.cubeAxis, None,
+             self.tr('Cube axes: the labelled box of axes round the model'),
+             7),
+            ('ruler', self.tr('Ruler'), ui.ruler, None,
+             self.tr('Ruler: measure a distance in the view'), 6),
+            ('features', self.tr('Feature edges'), self._featuresButton, None,
+             self.tr('Feature edges: the declared features coloured by '
+                     'whether the mesh kept them, or else the creases and '
+                     'rims of the boundary itself'), 3),
+        ]
+        frame = getattr(ui, 'frame_2', None)
+        if frame is not None:
+            tools.append(
+                ('background', self.tr('Background'), frame,
+                 getattr(self, '_backgroundButton', None),
+                 self.tr('Background: the top and bottom colours of the '
+                         'view'), 8))
+        self._railOwned = [entry[2] for entry in tools]
+        self._regroupAfterRail()
+        return tools
 
     def displayPanel(self):
-        """The Display popover's body, built from the row's own controls.
+        """The Show elements popover's body (Plan 45 N; the name is kept).
 
-        The buttons are the ones the row had -- same objects, same wiring --
-        moved into labelled rows, so there is still one copy of each switch.
+        The switches that were rows here are rail tools of their own
+        (``railDisplayTools``). What stays a panel is the Elements group and
+        the Gmsh display options: they are panels, not toggles.
         """
         from PySide6.QtWidgets import QGridLayout, QVBoxLayout, QWidget
         ui = self._ui
         panel = QWidget()
-        panel.setObjectName('displayPopoverBody')
+        panel.setObjectName('elementsPopoverBody')
         grid = QGridLayout(panel)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(6)
-        rows = (
-            (self.tr('Mesh lines'), self._meshLinesButton),
-            (self.tr('Origin axes'), ui.axis),
-            (self.tr('Cube axes'), ui.cubeAxis),
-            (self.tr('Ruler'), ui.ruler),
-            (self.tr('Feature edges'), self._featuresButton),
-            (self.tr('Background'), ui.frame_2),
-        )
-        owned = []
-        for row, (label, widget) in enumerate(rows):
-            widget.setParent(panel)
-            grid.addWidget(widget, row, 0)
-            caption = _RowCaption(label, widget)
-            grid.addWidget(caption, row, 1)
-            owned.append(widget)
-            # DP-2720: a switch that is on looks on, as every other viewport
-            # tool does (the accent ring); the row showed nothing.
-            if (getattr(widget, 'isCheckable', bool)() and widget.objectName()):
-                widget.setProperty('foammeshTile', True)
-                style_tool_tile(widget)
-        grid.setColumnStretch(1, 1)
+        row = 0
         # Plan 42 SG9. The Elements group, one for both engines: the display
         # control made it, and an engine item inside it shows only while the
         # mesh on screen has it.
         elements = getattr(ui, 'elementDisplayPanel', None)
         if elements is not None:
             elements.setParent(panel)
-            grid.addWidget(elements, len(rows), 0, 1, 2)
-            grid.setRowStretch(len(rows) + 1, 1)
-        else:
-            grid.setRowStretch(len(rows), 1)
+            grid.addWidget(elements, row, 0)
+            row += 1
         # Plan 43 LY13 D11. Gmsh's visibility and display options hang in
         # this popover too, in a section the Gmsh pages fill and empty: it is
         # hidden whenever no Gmsh page has mounted a panel into it.
@@ -1240,16 +1236,16 @@ class RenderingTool(QObject):
         host.setObjectName('gmshDisplayHost')
         QVBoxLayout(host).setContentsMargins(0, 0, 0, 0)
         host.setVisible(False)
-        grid.addWidget(host, len(rows) + 1, 0, 1, 2)
+        grid.addWidget(host, row, 0)
+        grid.setRowStretch(row + 1, 1)
         self._gmshDisplayHost = host
         self._gmshDisplayPanel = None
-        self._railOwned = owned
         self._displayPanel = panel
-        self._regroupAfterRail()
         return panel
 
     def mountGmshDisplay(self, widget) -> bool:
-        """Plan 43 LY13 D11. Put Gmsh's display panel in the Display popover.
+        """Plan 43 LY13 D11. Put Gmsh's display panel in the Show elements
+        popover (Plan 45 N; it was the Display popover).
 
         The panel is the Gmsh page's own object, every control in it kept; a
         panel mounted earlier (a page rebuilt by an engine switch) is
@@ -2041,18 +2037,35 @@ class RenderingTool(QObject):
         top = colours.get('bg2') or QColor.fromRgbF(*self._view.background2())
         bottom = colours.get('bg1') or QColor.fromRgbF(
             *self._view.background1())
+        # Plan 45 V9. The swatch is the view's own gradient, so on the rail it
+        # stood in the colour of the ground round it with a 35% black edge
+        # (1.3:1 on dark) -- an empty slot. Its edge and a small picture mark
+        # are drawn in the theme's ink, at least 3:1 on either ground.
         size = ICON_SIZE
-        pixmap = QPixmap(size)
+        screen = QGuiApplication.primaryScreen()
+        dpr = screen.devicePixelRatio() if screen is not None else 1.0
+        pixmap = QPixmap(round(size.width() * dpr), round(size.height() * dpr))
+        pixmap.setDevicePixelRatio(dpr)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        gradient = QLinearGradient(0, 0, 0, size.height())
+        w, h = float(size.width()), float(size.height())
+        gradient = QLinearGradient(0, 0, 0, h)
         gradient.setColorAt(0, top)
         gradient.setColorAt(1, bottom)
         painter.setBrush(gradient)
-        painter.setPen(QColor(0, 0, 0, 90))
-        painter.drawRoundedRect(1, 1, size.width() - 2, size.height() - 2,
-                                3, 3)
+        painter.setPen(QPen(QColor(theme_colour('foreground.strong')), 1.5,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin))
+        painter.drawRoundedRect(QRectF(1.75, 1.75, w - 3.5, h - 3.5), 3, 3)
+        # A hill and a sun: "the picture behind the model".
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline([QPointF(w * 0.25, h * 0.72),
+                              QPointF(w * 0.45, h * 0.48),
+                              QPointF(w * 0.58, h * 0.62),
+                              QPointF(w * 0.66, h * 0.54),
+                              QPointF(w * 0.78, h * 0.72)])
+        painter.drawEllipse(QPointF(w * 0.68, h * 0.32), w * 0.07, w * 0.07)
         painter.end()
         button.setIcon(QIcon(pixmap))
         action = getattr(self, '_backgroundResetAction', None)

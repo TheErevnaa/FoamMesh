@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import os
+import threading
 from pathlib import Path
 
 import weakref
@@ -35,9 +36,73 @@ class _ActivationWatch(QObject):
             return
         try:
             if focused is widget.window().windowHandle():
-                widget.revalidate()
+                # Plan 45 W3. Not `revalidate()`: that asks the disk on the
+                # GUI thread, and a location on a share or in a stopped WSL
+                # distro held the window for seconds on a focus change.
+                widget.revalidateLater()
         except RuntimeError:
             pass
+
+
+def _diskFacts(location, written):
+    """What the disk says about a destination, as `_applyValidation` reads it.
+
+    Plan 45 W3. May block -- a share that does not answer, a WSL distro that
+    has to start -- so a focus change runs it on a worker thread. The checks
+    are made in the order the messages need them and no further: nothing past
+    "the location is not a folder" is asked.
+    """
+    def ask(check):
+        try:
+            return bool(check())
+        except (OSError, ValueError):
+            return False
+
+    isFolder = ask(Path(location).is_dir)
+    exists = isFolder and ask(written.exists)
+    return {
+        'locationIsFolder': isFolder,
+        'exists': exists,
+        'isFile': exists and ask(written.is_file),
+        'isFolder': exists and ask(written.is_dir),
+    }
+
+
+class _DiskCheckRelay(QObject):
+    """Carries a worker thread's disk answer back to the GUI thread (W3).
+
+    One for the application and never destroyed: a worker stuck on a slow
+    path may answer long after the widget that asked is gone, so the answer
+    goes to an object that is certainly alive and is matched to its widget
+    there, through a weak reference.
+    """
+    answered = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.answered.connect(self._deliver)
+
+    def _deliver(self, answer):
+        ref, token, inputs, facts = answer
+        widget = ref()
+        if widget is None:
+            return
+        try:
+            from shiboken6 import isValid
+            if isValid(widget):
+                widget._diskCheckAnswered(token, inputs, facts)
+        except RuntimeError:
+            pass
+
+
+#: The one relay, made on first use -- which is on the GUI thread.
+_relays = []
+
+
+def _diskCheckRelay():
+    if not _relays:
+        _relays.append(_DiskCheckRelay())
+    return _relays[0]
 
 
 class NewProjectWidget(QWidget):
@@ -59,6 +124,14 @@ class NewProjectWidget(QWidget):
         self._suffix = ''
 
         self._validatedPath = None
+
+        # Plan 45 W3. The disk check a focus change asked for off the GUI
+        # thread: its number, whether one is out, whether another was asked
+        # for meanwhile, and whether one was skipped while hidden.
+        self._diskCheckToken = 0
+        self._diskCheckPending = False
+        self._diskCheckAgain = False
+        self._diskCheckedWhileHidden = False
 
         self._dialog = None
 
@@ -233,6 +306,74 @@ class NewProjectWidget(QWidget):
         """
         self._updateProjectPath()
 
+    def revalidateLater(self):
+        """Re-check the typed location against the disk without waiting (W3).
+
+        What a focus change asks for. `revalidate()` asks the disk on the GUI
+        thread, and a location on a share that does not answer, or in a WSL
+        distro that has to start, held the whole window for seconds every
+        time FoamMesh came back to the front -- even with this widget on a
+        page nobody was looking at. A hidden widget is only marked, and
+        checked when it is shown; a shown one is checked on a worker thread
+        and the answer is applied when it comes back, if the fields still say
+        what was checked. Typing still validates at once, as before.
+        """
+        try:
+            visible = self.isVisible()
+        except RuntimeError:
+            return
+        if not visible:
+            self._diskCheckedWhileHidden = True
+            return
+        inputs = self._validationInputs()
+        if not inputs['name']:
+            # Nothing on disk decides an empty name; typing already said so.
+            return
+        self._diskCheckToken += 1
+        if self._diskCheckPending:
+            # One check at a time per widget: a share that hangs must not
+            # collect a thread for every focus change while it does.
+            self._diskCheckAgain = True
+            return
+        self._startDiskCheck(self._diskCheckToken, inputs)
+
+    def _startDiskCheck(self, token, inputs):
+        relay = _diskCheckRelay()
+        ref = weakref.ref(self)
+        self._diskCheckPending = True
+        self._diskCheckAgain = False
+
+        def work():
+            facts = _diskFacts(inputs['location'], inputs['written'])
+            try:
+                relay.answered.emit((ref, token, inputs, facts))
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=work, name='NewProjectWidget disk check',
+                         daemon=True).start()
+
+    def _diskCheckAnswered(self, token, inputs, facts):
+        self._diskCheckPending = False
+        if self._diskCheckAgain:
+            self.revalidateLater()
+            return
+        if (token != self._diskCheckToken
+                or inputs != self._validationInputs()):
+            # The fields changed while the disk was asked; typing validated
+            # them already, and this answer is about something else.
+            return
+        before = (self._validatedPath, self._ui.validationMessage.text())
+        self._applyValidation(inputs, facts)
+        if before != (self._validatedPath, self._ui.validationMessage.text()):
+            self.pathChanged.emit(self._validatedPath)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._diskCheckedWhileHidden:
+            self._diskCheckedWhileHidden = False
+            self.revalidateLater()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # R43/R105. The elision has to follow the width the layout hands out.
@@ -280,7 +421,8 @@ class NewProjectWidget(QWidget):
         self._validate()
         self.pathChanged.emit(self._validatedPath)
 
-    def _validate(self):
+    def _validationInputs(self):
+        """Everything validation reads off the fields, as one value (W3)."""
         location = self._typedLocation()
         folderName = f'{self._ui.projectName.text()}{self._suffix}' if self._ui.projectName.text() else ''
         path = Path(location) / folderName
@@ -292,23 +434,37 @@ class NewProjectWidget(QWidget):
         if (self._destinationIsFile and self._destinationSuffix
                 and not folderName.endswith(self._destinationSuffix)):
             written = path.with_name(path.name + self._destinationSuffix)
+        return {'name': bool(self._ui.projectName.text()),
+                'location': location, 'path': path, 'written': written,
+                'overwriteAllowed': self._overwriteAllowed,
+                'isFile': self._destinationIsFile}
+
+    def _validate(self):
+        inputs = self._validationInputs()
+        facts = (_diskFacts(inputs['location'], inputs['written'])
+                 if inputs['name'] else None)
+        self._applyValidation(inputs, facts)
+
+    def _applyValidation(self, inputs, facts):
+        location, path, written = (
+            inputs['location'], inputs['path'], inputs['written'])
 
         self._validatedPath = None
 
-        if not self._ui.projectName.text():
+        if not inputs['name']:
             self._ui.validationMessage.clear()
-        elif not Path(location).is_dir():
+        elif not facts['locationIsFolder']:
             self._ui.validationMessage.setText(
                 self.tr('{0} is not a folder.').format(location))
-        elif (written.exists() and self._overwriteAllowed
-              and (written.is_file() if self._destinationIsFile
-                   else written.is_dir())):
+        elif (facts['exists'] and inputs['overwriteAllowed']
+              and (facts['isFile'] if inputs['isFile']
+                   else facts['isFolder'])):
             # DP-680. The host's "Overwrite existing" is on: the destination
             # is accepted and the row says what will happen to it.
             self._ui.validationMessage.setText(
                 self.tr('{0} exists and will be replaced.').format(written))
             self._validatedPath = path
-        elif written.exists():
+        elif facts['exists']:
             # Without the overwrite control an existing destination is
             # refused here, and the export form offers the next free name
             # (DP-562).

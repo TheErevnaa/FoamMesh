@@ -312,8 +312,10 @@ def read_back(path, read_options=None, profile=None) -> dict:
             profile.translate_host_path(path),
             json.dumps(dict(read_options or {})))
     try:
+        # Plan 45: no console window from a console-less build.
         done = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=600)
+                              timeout=600, stdin=subprocess.DEVNULL,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {'error': f'the read-back could not run: {error}'}
     for line in reversed((done.stdout or '').splitlines()):
@@ -394,8 +396,10 @@ def run_foam_utility(case: Path, utility: str, profile=None, *,
               f'cd {shlex.quote(runtime_case)} && {utility} {arguments}')
     argv = (*profile._wsl_prefix(), 'bash', '-c', script)
     try:
+        # Plan 45: no console window from a console-less build.
         done = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, stdin=subprocess.DEVNULL,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {'ok': False, 'tail': str(error), 'returncode': None}
     output = (done.stdout or '') + (done.stderr or '')

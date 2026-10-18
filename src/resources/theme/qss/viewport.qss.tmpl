@@ -125,6 +125,8 @@ QLabel#overlayChip { color: {{foreground.muted}}; }
 /* Plan 44 F1 (MF21, mockup .prow small): a part row's role text. */
 QLabel#overlayPartRole { color: {{foreground.muted}}; padding-left: 2px; }
 QLabel#overlayChip[partial="true"] { color: {{status.warning}}; font-weight: 600; }
+/* Plan 45: the bottom bar says the count only when parts are hidden, as a warning. */
+QToolButton#bottomParts[partial="true"] { color: {{status.warning}}; font-weight: 600; }
 QLabel#viewportScale { color: {{foreground.muted}}; padding: 0 8px; }
 QLabel#captureStale { color: {{status.warning}}; }
 

@@ -80,7 +80,6 @@ from PySide6.QtWidgets import QApplication
 # To render SVG files.
 # noinspection PyUnresolvedReferences
 import PySide6.QtSvg
-from vtkmodules.vtkCommonCore import vtkSMPTools
 
 # To use ".qrc" QT Resource files
 # noinspection PyUnresolvedReferences
@@ -90,15 +89,76 @@ from app_properties import meshAppProperties
 from analytics import Analytics
 from analytics.events import EVENT_LOOP_ERROR
 
-from foammesh.app import app
-from foammesh.core.case import startup_case_path
+from foammesh.support.deferred_log import DeferredHandler
 from foammesh.support import (
-    crash_helper, lifecycle, qt_messages, safe_mode, watchdog)
-from foammesh.view.main_window.main_window import MainWindow
+    crash_helper, lifecycle, loop_executor, qt_messages, safe_mode, watchdog)
+from foammesh.view import startup_splash
+
+#: Plan 45 splash. The application's heavy modules -- ~1.2 s of imports,
+#: measured live -- are imported by main() once the QApplication and the
+#: splash exist, so something of FoamMesh is on screen within about a second.
+#: The module-level names they provide: {name: (module, attribute)}, an
+#: attribute of None naming the module itself.
+DEFERRED_NAMES = {
+    'vtkSMPTools': ('vtkmodules.vtkCommonCore', 'vtkSMPTools'),
+    'app': ('foammesh.app', 'app'),
+    'startup_case_path': ('foammesh.core.case', 'startup_case_path'),
+    'MainWindow': ('foammesh.view.main_window.main_window', 'MainWindow'),
+    'rendering_widget': ('widgets.rendering.rendering_widget', None),
+}
+
+
+def import_application(serve=None):
+    """Import the heavy modules and bind the names main() uses from them.
+
+    ``serve`` is called between two imports (at start: the event queue, so
+    the splash stays drawn and no one import holds the GUI thread long). The
+    imports are written out, not looked up by name, so the package build
+    still finds them. A name already bound -- a test's stand-in -- is left.
+    """
+    serve = serve or (lambda: None)
+    # Plan 45 BOOT2. Seven groups of ~0.1-0.25 s, not three of up to ~0.45 s
+    # (MEASURED live, 17 October 2026): the largest dependency of each of the
+    # old groups is imported first, on its own.
+    import vtkmodules.vtkCommonCore  # noqa: F401
+    import foammesh.openfoam.file_system  # noqa: F401
+    serve()
+    import foammesh.app  # noqa: F401
+    serve()
+    import foammesh.core.case  # noqa: F401
+    import widgets.rendering.rendering_widget  # noqa: F401
+    serve()
+    import superqt  # noqa: F401
+    import foammesh.view.display_control.mesh_quality_info  # noqa: F401
+    serve()
+    import foammesh.view.display_control.display_control  # noqa: F401
+    import foammesh.view.main_window.rendering_tool  # noqa: F401
+    serve()
+    import foammesh.view.main_window.step_manager  # noqa: F401
+    serve()
+    import foammesh.view.main_window.main_window  # noqa: F401
+    serve()
+    namespace = globals()
+    for name, (module_name, attribute) in DEFERRED_NAMES.items():
+        if name not in namespace:
+            module = sys.modules[module_name]
+            namespace[name] = module if attribute is None else getattr(module, attribute)
+
+
+def __getattr__(name):
+    """Any other reader of ``foammesh.main.app`` (and the rest) gets them too."""
+    if name in DEFERRED_NAMES:
+        import_application()
+        return globals()[name]
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
 
 logger = logging.getLogger()
 formatter = logging.Formatter("[%(asctime)s][%(name)s] ==> %(message)s")
-handler = logging.StreamHandler()
+# Plan 45 start-up. The console is written by a thread of its own: MEASURED
+# live, one start-up warning (the viewport GPU note) held the GUI thread
+# ~0.4 s in the console write while the window was being built.
+handler = DeferredHandler(logging.StreamHandler())
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
@@ -119,6 +179,35 @@ def run_package_self_test(report_path):
     """Lazy import keeps package qualification out of normal GUI startup."""
     from foammesh.core.release.package_self_test import run
     return run(report_path)
+
+
+def _describe_platform_aside():
+    """Ask what Windows this is on a worker thread, before anything else does.
+
+    The first ``platform.system()`` of the process runs ``cmd /c ver`` (Python
+    3.11) and waits for it; the answer is cached. PyFoam and the MPI support
+    ask while the window's modules are imported -- MEASURED live 18 October
+    2026, a ~0.02 s wait on the GUI thread. The child process is waited for
+    with the GIL released.
+    """
+    import platform
+    import threading
+    threading.Thread(target=platform.uname, name='foammesh-platform',
+                     daemon=True).start()
+
+
+def _early_settings(properties):
+    """The application settings, read before the heavy modules are imported."""
+    from foammesh.settings.app_settings import appSettings
+    appSettings.load(properties.name)
+    return appSettings
+
+
+def _serve_events(application):
+    """Serve the event queue between two start-up imports (the splash)."""
+    process = getattr(application, 'processEvents', None)
+    if process is not None:
+        process()
 
 
 def handle_exception(eType, eValue, eTraceback):
@@ -149,6 +238,14 @@ def loop_exception(loop, context):
 #: Windows taskbar identity. Any stable, unique string works; changing it makes
 #: Windows treat the app as a different program (new taskbar slot, lost pin).
 APP_USER_MODEL_ID = 'FoamMesh.FoamMesh.Desktop.1'
+
+
+def disable_combo_animation():
+    """Plan 45 K. Qt rolls a combo's list open with an animation, and a
+    tooltip appearing over it cancels the roll, so the list never opens (seen
+    live in unpinned runs). The effect is off for the whole application."""
+    from PySide6.QtCore import Qt
+    QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
 
 
 def _claim_windows_taskbar_identity():
@@ -195,13 +292,21 @@ def main():
     if self_test_path is not None:
         report = run_package_self_test(self_test_path)
         return 0 if report['summary']['all_passed'] else 2
+    # Plan 45 start-up: the cyclic collector's start-up threshold, before the
+    # heavy imports rather than after the window (MEASURED live 18 October
+    # 2026: 407 automatic collections, ~0.06 s, while the window was built).
+    from foammesh.support import gc_policy
+    gc_policy.raise_threshold()
+    _describe_platform_aside()
 
-    initial_case = startup_case_path(sys.argv[1:])
-    app.setupApplication(meshAppProperties)
+    # Plan 45 splash: the settings are read here without the application's
+    # heavy modules (``app.setupApplication`` below reads the same file into
+    # the same object once they are imported).
+    settings = _early_settings(meshAppProperties)
     # DP-550/551. Before anything native can fail: a fatal fault, a VTK
     # warning and the way this process ends are all written under the
     # application's log directory, and a session that died last time is named.
-    dead_sessions = lifecycle.install(app.settings.settingsPath(),
+    dead_sessions = lifecycle.install(settings.settingsPath(),
                                       version=meshAppProperties.version)
     # Plan 35 CR0: the root log, thread and unraisable exceptions, native
     # dumps from outside the process, and Qt's own messages -- all before the
@@ -228,9 +333,13 @@ def main():
     # reads OpenGL; a failed or software start falls back by itself.
     try:
         from foammesh.rendering import gpu_preference
-        gpu_preference.startup(app.settings, lifecycle.log_directory())
+        gpu_preference.startup(settings, lifecycle.log_directory())
     except Exception:                                       # noqa: BLE001
         logger.warning('GPU preference could not be applied', exc_info=True)
+    # Plan 45 start-up: the OpenGL driver wakes beside the imports (~0.14 s
+    # of the first render window's construction, paid on the GUI thread).
+    from foammesh.rendering import gl_driver_warm
+    gl_driver_warm.start(safe_mode=graphics.active)
     if crash_helper.start(lifecycle.log_directory()) is None:
         logger.info('No crash helper this session; a native crash leaves '
                     'faulthandler.log only.')
@@ -240,50 +349,93 @@ def main():
     # Plan 40 UXE3: UI scale and the HiDPI rounding policy can only be set
     # before the QApplication exists.
     from foammesh.view.theming import appearance
-    appearance.prepare_application(appearance.Appearance.from_settings(app.settings))
+    appearance.prepare_application(appearance.Appearance.from_settings(settings))
     application = QApplication(sys.argv)
+    disable_combo_animation()
     application.setWindowIcon(meshAppProperties.icon())
     application.lastWindowClosed.connect(
         lambda: lifecycle.record('Qt lastWindowClosed'))
     application.aboutToQuit.connect(
         lambda: lifecycle.record('Qt aboutToQuit'))
+    # Plan 45 splash: on screen and painted before the heavy imports. It is
+    # closed once the window is shown, before the crash note, and on any
+    # failure from here on.
+    splash = [startup_splash.show(
+        application, meshAppProperties,
+        getattr(settings, 'getTheme', lambda: None)())]
+    # Plan 45 start-up: Qt's full scan of the installed fonts (~0.27 s, paid
+    # inside the window's construction) runs beside the imports instead.
+    from foammesh.view.theming import font_population
+    font_population.start()
 
-    Analytics().configure(
-        app_name=meshAppProperties.name,
-        app_version=meshAppProperties.version,
-        config_dir=app.settings.settingsPath())
+    def close_splash():
+        startup_splash.close(splash[0])
+        splash[0] = None
 
-    # Leave 1 core for users
-    numCores = max(1, (os.cpu_count() or 2) - 1)
+    try:
+        import_application(lambda: _serve_events(application))
+        initial_case = startup_case_path(sys.argv[1:])
+        app.setupApplication(meshAppProperties)
 
-    smp = vtkSMPTools()
-    smp.Initialize(numCores)
-    smp.SetBackend('STDThread')
+        Analytics().configure(
+            app_name=meshAppProperties.name,
+            app_version=meshAppProperties.version,
+            config_dir=app.settings.settingsPath())
 
-    app.qApplication = application
+        # Leave 1 core for users
+        numCores = max(1, (os.cpu_count() or 2) - 1)
 
-    loop = qasync.QEventLoop(application)
-    asyncio.set_event_loop(loop)
+        smp = vtkSMPTools()
+        smp.Initialize(numCores)
+        smp.SetBackend('STDThread')
 
-    loop.set_exception_handler(loop_exception)
+        app.qApplication = application
 
-    app.applyLanguage()
+        loop = qasync.QEventLoop(application)
+        # Plan 45 shut-down: qasync's own executor made close() wait for every
+        # queued and running background job (WSL probes held the exit 4-65 s).
+        loop_executor.install(loop)
+        asyncio.set_event_loop(loop)
 
-    app.window = MainWindow()
-    # CR1: the GUI thread's heartbeat, and a status-bar note after a stall.
-    watchdog.start(lifecycle.watchdog_log_path(), app.window)
-    if dead_sessions:
-        # CR0 step 6: a non-modal banner naming the session that died.
-        app.window.showPreviousCrash(dead_sessions)
-    # Plan 35 CR3: freeze the start-up heap and steer the cyclic collector
-    # onto the GUI thread before any project object exists.
-    from foammesh.support import gc_policy
-    gc_policy.startup_complete()
+        loop.set_exception_handler(loop_exception)
+
+        app.applyLanguage()
+
+        # Plan 45 start-up: the window is built in stages with the event queue
+        # served between them (one piece held the GUI thread ~2.5 s).
+        # Plan 45 start-up: the native-sibling rule waits until the window is
+        # built (natives moved by the docking were made twice).
+        from foammesh.view.main_window import native_siblings
+        gl_driver_warm.wait()
+        with native_siblings.held_off() as built:
+            app.window = MainWindow(staged=True)
+            built(app.window)
+        # CR1: the GUI thread's heartbeat, and a status-bar note after a stall.
+        watchdog.start(lifecycle.watchdog_log_path(), app.window)
+        if dead_sessions:
+            # CR0 step 6: a non-modal banner naming the session that died.
+            # Plan 45 splash: the splash is gone before the note is shown.
+            close_splash()
+            app.window.showPreviousCrash(dead_sessions)
+        # Plan 35 CR3: freeze the start-up heap and steer the cyclic collector
+        # onto the GUI thread before any project object exists. Plan 45: with
+        # no case to open, the freeze waits for the window's first paint.
+        gc_policy.startup_complete(
+            after_paint=app.window.windowHandle() if initial_case is None
+            else None)
+    except BaseException:
+        close_splash()
+        raise
 
     async def bootstrap():
         # First paint and event processing happen before environment probes,
         # consent, or optional case inspection can delay the shell.
-        await app.window.start(initial_case)
+        try:
+            await app.window.start(initial_case)
+        finally:
+            # Plan 45 splash: the window is shown; the splash goes before
+            # anything the start may ask of the user.
+            close_splash()
         await asyncio.sleep(0)
         # A first start looks for OpenFOAM 13 and Gmsh in WSL rather than
         # assuming the distribution is called OpenFOAM13Runtime.
@@ -322,6 +474,9 @@ def main():
         loop.run_forever()
 
     lifecycle.record('event loop returned; exiting with code 0')
+    # Plan 45 shut-down: the viewport GL contexts go with the process; the
+    # driver's context delete held the exit 1-2 s on about one exit in four.
+    rendering_widget.leaveContextsToProcessExit()
     watchdog.stop()
     crash_helper.stop()
     loop.close()

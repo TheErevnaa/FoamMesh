@@ -40,6 +40,8 @@ unbound with the reason where it does not or where the window owns the key.
 """
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QAbstractButton
@@ -233,12 +235,23 @@ def install_shortcuts(page, run_action) -> list:
 # the window's side
 # --------------------------------------------------------------------------- #
 
+def _engine_branches(window) -> list:
+    """The engine branches of *window*; none before their module is imported.
+
+    Plan 45 start-up. No branch can exist before ``engine_branch`` is
+    imported, and importing it to look held the GUI thread ~0.04 s while the
+    window was built (MEASURED live 18 October 2026).
+    """
+    module = sys.modules.get('foammesh.view.main_window.engine_branch')
+    if module is None or not hasattr(window, 'findChildren'):
+        return []
+    return window.findChildren(module.EngineBranchView)
+
+
 def gmsh_pages(window) -> dict:
     """``{task_id: page}`` for the Gmsh pages of the open engine branch."""
-    from foammesh.view.main_window.engine_branch import EngineBranchView
-
     found = {}
-    for branch in window.findChildren(EngineBranchView):
+    for branch in _engine_branches(window):
         for task_id, page in (getattr(branch, '_pages', None) or {}).items():
             if task_id.startswith('gmsh.') or task_id == 'common.export':
                 found[task_id] = page
@@ -327,11 +340,12 @@ def activate_key(window, binding) -> bool:
         return True
     if kind == keys.TIER and binding[2] == keys.DISPLAY:
         # Plan 43 LY13 D11: the Visibility and display options are in the
-        # side rail's Display popover, not on a page.
+        # side rail, not on a page -- since Plan 45 N in its Show elements
+        # popover (the Display popover is gone).
         rail = getattr(window, '_viewportRail', None)
         if rail is None or not gmsh_route_active(window):
             return False
-        rail.open('display')
+        rail.open('elements')
         return True
     page = _show_row(window, binding[1])
     if page is None:
@@ -346,8 +360,16 @@ def activate_key(window, binding) -> bool:
 
 
 def gmsh_route_active(window) -> bool:
-    """True while the open case is on the Gmsh route (its pages exist)."""
-    return bool(gmsh_pages(window))
+    """True while the open case is on the Gmsh route (its pages exist).
+
+    Plan 45. Asked on every palette refresh and shortcut sync, so it reads the
+    branch's task ids and builds no page (``gmsh_pages`` builds them all).
+    """
+    branches = _engine_branches(window)
+    if not branches:
+        return bool(gmsh_pages(window))
+    return any(task_id.startswith('gmsh.') or task_id == 'common.export'
+               for branch in branches for task_id in branch.task_ids)
 
 
 def sync_window_shortcuts(window, shortcuts) -> bool:

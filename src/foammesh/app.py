@@ -29,6 +29,7 @@ from foammesh.core.facade import CaseSession, FoamMeshFacade
 from foammesh.view.facade_client import DesktopFacadeClient
 from foammesh.core.shell import CapabilityRegistry
 from foammesh.core.selection import SelectionService
+from foammesh.support import gc_policy
 from resources import resource
 
 if TYPE_CHECKING:
@@ -276,6 +277,9 @@ class App(QObject):
 
     def createProject(self, path):
         assert(self._project is None)
+        # Plan 45 start-up: the start-up heap is frozen before any project
+        # object exists, even when its freeze was waiting for the first paint.
+        gc_policy.freeze_pending()
         resolved = Path(path).resolve()
         self._events.publish(Event.PROJECT_OPENING, case_id=str(resolved), path=str(resolved))
         try:
@@ -343,6 +347,9 @@ class App(QObject):
 
     def openProject(self, path):
         assert(self._project is None)
+        # Plan 45 start-up: the start-up heap is frozen before any project
+        # object exists, even when its freeze was waiting for the first paint.
+        gc_policy.freeze_pending()
         resolved = Path(path).resolve()
         self._events.publish(Event.PROJECT_OPENING, case_id=str(resolved), path=str(resolved))
         try:

@@ -323,13 +323,10 @@ class MeshQualityViews(QObject):
         self._set_beyond(None, None)
         layer = self.layer()
         layer.set_targets(targets)
-        layer.set_caption(wv.deviation_caption(
-            case=self._case_name(), fields=arrays,
-            tolerance=float(getattr(readout, 'tolerance', 0.0) or 0.0),
-            signed=bool(getattr(readout, 'signed', True)),
-            source=('stored run' if readout.source == 'run'
-                    else 'live distance'),
-            scale_name=self.scale_name(), version=_version(), stamp=stamp))
+        # Plan 45 P2: no centred statistics caption in Deviation mode. The
+        # legend's figures already say max, mean, RMS and the share within
+        # tolerance; a second copy in the middle of the view was the third.
+        layer.set_caption(())
 
     # -- the View menu's state --------------------------------------------- #
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Plan 43 LY6 and LY7: tool edges that fold away, and the Parts chip.
+"""Plan 43 LY6 and LY7: tool edges that fold away, and the Parts panel.
 
 The top bar (the viewport toolbar), the bottom bar and the side rail are
 *edges* of the viewport. Each one folds to a nub at its edge and comes back
@@ -31,10 +31,11 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from shiboken6 import isValid
+import numpy as np
 from PySide6.QtCore import (
     QEvent, QObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import (
-    QBitmap, QColor, QCursor, QFont, QPainter, QPainterPath, QPalette, QPen, QRegion,
+    QBitmap, QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPalette, QPen, QRegion,
     QResizeEvent)
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QSlider, QToolButton, QWidget)
@@ -75,8 +76,9 @@ def edge_title(key: str) -> str:
 
 
 def pin_button_icon(pinned: bool):
-    """The push-pin glyph (MF5's pin.svg / pin-on.svg), tilted when the edge
-    floats and upright with a red head when it is pinned."""
+    """The push-pin glyph (MF5's pin.svg / pin-on.svg), red in every theme:
+    tilted with an outlined head when the edge floats, upright and filled when
+    it is pinned."""
     from foammesh.view.main_window.sheet_header import pin_icon
     return pin_icon(pinned)
 
@@ -87,7 +89,8 @@ def set_pin_look(pin: QToolButton, title: str) -> None:
     pinned = pin.isChecked()
     pin.setText('')
     pin.setIcon(pin_button_icon(pinned))
-    pin.setIconSize(QSize(16, 16))
+    from foammesh.view.main_window.sheet_header import PIN_SIZE
+    pin.setIconSize(QSize(PIN_SIZE, PIN_SIZE))
     pin.setToolTip((QApplication.translate('ToolEdge', 'Unpin the {0}')
                     if pinned else QApplication.translate(
                         'ToolEdge', 'Pin the {0}')).format(title))
@@ -107,6 +110,7 @@ def make_pin_button(key: str, title: str) -> QToolButton:
     pin.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
     pin.setAccessibleName(QApplication.translate(
         'ToolEdge', 'Pin the {0}').format(title))
+    pin.setProperty('pinTitle', title)
     set_pin_look(pin, title)
     pin.toggled.connect(lambda _on, b=pin, t=title: set_pin_look(b, t))
     try:
@@ -143,6 +147,113 @@ def centred_span(length: int, centre: float, low: int, high: int) -> int:
     and stays inside ``[low, high]`` (Plan 44 U3). Used by every edge."""
     start = int(round(centre - length / 2.0))
     return max(low, min(start, high - length))
+
+
+#: The object name of the watcher ``round_native_corners`` leaves on a widget.
+ROUNDED_MASK_NAME = 'roundedNativeMask'
+
+
+#: A pixel is kept by a rounded cut only when it is painted at least this much.
+_FULL = 252
+
+
+def rounded_region(width: int, height: int, radius: int) -> Optional[QRegion]:
+    """The rounded rectangle ``0, 0, width, height`` with corner *radius*, as
+    a region; None when there is no corner to cut (no size, radius 0). A
+    radius over half the short side is clamped to it, as the style sheet
+    does: a pill (radius = height / 2) has round ends."""
+    radius = min(float(radius), width / 2.0, height / 2.0)
+    if radius <= 0:
+        return None
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
+    # Plan 45 A (reopened). The polygon's pixel cut keeps every pixel the
+    # outline touches, and the style sheet paints those only partly; a native
+    # window has no see-through, so they showed the black behind the paint.
+    # Keep only the pixels the outline covers in full: the straight sides stay
+    # whole and the curve steps in by under a pixel.
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(0)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(255, 255, 255))
+    painter.drawPath(path)
+    painter.end()
+    stride = image.bytesPerLine()
+    alpha = np.frombuffer(image.constBits(), np.uint8).reshape(
+        height, stride)[:, :width * 4].reshape(height, width, 4)[..., 3]
+    # The style sheet strokes its own outline, a little off this one, so a
+    # pixel is kept only when its neighbours (those inside the widget) are
+    # covered in full too.
+    padded = np.pad(alpha >= _FULL, 1, constant_values=True)
+    keep = np.ones((height, width), bool)
+    for dy in range(3):
+        for dx in range(3):
+            keep &= padded[dy:dy + height, dx:dx + width]
+    bits = QBitmap(width, height)
+    bits.fill(Qt.GlobalColor.color0)
+    cut = QPainter(bits)
+    cut.setPen(Qt.GlobalColor.color1)
+    edges = np.diff(np.pad(keep, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+    for y, x in zip(*np.nonzero(edges == 1)):
+        end = np.nonzero(edges[y, x + 1:] == -1)[0][0] + x
+        cut.drawLine(int(x), int(y), int(end), int(y))
+    cut.end()
+    return QRegion(bits)
+
+
+def apply_rounded_mask(widget: QWidget, radius: int) -> None:
+    """Cut *widget* to its rounded outline now (or clear the mask when there
+    is nothing to cut). DP-2707 / Plan 45 P16: a sibling of the GL view is a
+    native window and cannot be see-through, so the square outside a style
+    sheet's ``border-radius`` paints black unless the window is cut."""
+    region = rounded_region(widget.width(), widget.height(), radius)
+    if region is None:
+        widget.clearMask()
+    else:
+        widget.setMask(region)
+
+
+class _RoundedMask(QObject):
+    """Re-cuts its widget to the rounded outline on every resize."""
+
+    def __init__(self, widget: QWidget, radius: int):
+        super().__init__(widget)
+        self.setObjectName(ROUNDED_MASK_NAME)
+        self._widget = widget
+        self._radius = int(radius)
+        widget.installEventFilter(self)
+
+    def radius(self) -> int:
+        return self._radius
+
+    def setRadius(self, radius: int) -> None:
+        self._radius = int(radius)
+        self.apply()
+
+    def apply(self) -> None:
+        if isValid(self._widget):
+            apply_rounded_mask(self._widget, self._radius)
+
+    def eventFilter(self, watched, event):
+        if watched is self._widget and event.type() == QEvent.Type.Resize:
+            self.apply()
+        return False
+
+
+def round_native_corners(widget: QWidget, radius: int) -> QObject:
+    """Keep *widget* cut to a rounded rectangle of *radius* (the radius of its
+    style sheet), now and after every resize. Called again on the same
+    widget, it only changes the radius."""
+    watcher = widget.findChild(QObject, ROUNDED_MASK_NAME,
+                               Qt.FindChildOption.FindDirectChildrenOnly)
+    if isinstance(watcher, _RoundedMask):
+        watcher.setRadius(radius)
+        return watcher
+    watcher = _RoundedMask(widget, radius)
+    watcher.apply()
+    return watcher
 
 
 class NubButton(QToolButton):
@@ -202,6 +313,7 @@ def make_edge_frame(view: QWidget, key: str, content: QWidget,
     row.addWidget(content, 1)
     row.addWidget(pin, 0, Qt.AlignmentFlag.AlignTop)
     style_floating_panel(frame, radius=6)
+    round_native_corners(frame, 6)
     return frame
 
 
@@ -325,6 +437,10 @@ class ToolEdge(QObject):
             blocked = self._pin.blockSignals(True)
             self._pin.setChecked(pinned)
             self._pin.blockSignals(blocked)
+            # toggled was blocked, so redraw the glyph here: a restored or
+            # Ctrl+H pin otherwise kept the floating glyph on a pressed tile.
+            set_pin_look(self._pin, self._pin.property('pinTitle')
+                         or edge_title(self._key))
         if pinned:
             self._timer.stop()
         else:
@@ -639,169 +755,29 @@ def centre_rect(clear: QRect, size: QSize, axis: str, cross: int, *,
     return QRect(cross, begin, across, extent)
 
 
-PARTS_CHIP_HEIGHT = 26
-PARTS_CHIP_RADIUS = 6
-PARTS_CHIP_FONT_PX = 12
-PARTS_CHIP_TEXT_ALPHA = 0.7
 PARTS_PANEL_WIDTH = 260
 PARTS_PANEL_RADIUS = 6
 
 
-class PartsChip(QToolButton):
-    """The Parts chip: "‹ Parts · 3 of 3", at the clear area's top right.
-
-    Plan 44 MF21 (F9). A faint outline chip, not a pill: the ``overlay.chip.
-    border`` outline, 26 px tall, radius 6, 12 px ``foreground.legend`` text
-    at 70 %. The native GL viewport draws over a plain sibling and a native
-    window cannot be translucent (section 3), so the chip is a *native* window
-    whose mask is only its outline and its glyphs: the interior is the view,
-    pixel for pixel. Resting on it peeks the Parts panel.
-    """
-
-    def __init__(self, parent: QWidget):
-        super().__init__(parent)
-        self.setObjectName('partsChip')
-        self.setAutoRaise(True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
-        font = QFont(self.font())
-        font.setPixelSize(PARTS_CHIP_FONT_PX)
-        self.setFont(font)
-        self.setToolTip(self.tr(
-            'Parts: show, hide, isolate and explode. Rest the pointer here, '
-            'or press, to open the panel; pin it to keep it open.'))
-        self.setProperty('foammeshFlat', False)
-        self._placer: Optional[Callable[[QRect], QRect]] = None
-        self.setCounts(0, 0)
-        self.winId()                    # native now, so the mask is honoured
-
-    # -- the words ---------------------------------------------------------- #
-
-    def setCounts(self, shown: int, total: int) -> None:
-        if total:
-            self.setText(self.tr('‹ Parts · {0} of {1}').format(
-                shown, total))
-            # DP-186 (WCAG 2.1 SC 2.5.3): the name carries the words the
-            # chip paints, the count with them; only the chevron is dropped.
-            self.setAccessibleName(self.tr('Parts · {0} of {1}').format(
-                shown, total))
-        else:
-            self.setText(self.tr('‹ Parts · 0'))
-            self.setAccessibleName(self.tr('Parts · 0'))
-        self.setFixedHeight(PARTS_CHIP_HEIGHT)
-        self.adjustSize()
-        self._remask()
-        self.update()
-
-    def sizeHint(self) -> QSize:
-        width = self.fontMetrics().horizontalAdvance(self.text()) + 20
-        return QSize(max(width, 56), PARTS_CHIP_HEIGHT)
-
-    def wantedSize(self) -> tuple:
-        hint = self.sizeHint()
-        return (hint.width(), hint.height())
-
-    # -- where it stands ---------------------------------------------------- #
-
-    def setPlacer(self, placer: Optional[Callable[[QRect], QRect]]) -> None:
-        """*placer* turns the rectangle the overlay layout gives into the one
-        that keeps the chip off the sheet header and the top pill."""
-        self._placer = placer
-
-    def setGeometry(self, *args) -> None:       # noqa: N802 (Qt name)
-        rect = args[0] if len(args) == 1 else QRect(*args)
-        if self._placer is not None:
-            rect = self._placer(QRect(rect))
-        super().setGeometry(rect)
-
-    # -- the look ------------------------------------------------------------ #
-
-    def _textRect(self) -> QRect:
-        return QRect(10, 0, max(0, self.width() - 20), self.height())
-
-    def _outline(self) -> QPainterPath:
-        path = QPainterPath()
-        r = float(PARTS_CHIP_RADIUS)
-        path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0,
-                                   self.height() - 1.0), r, r)
-        return path
-
-    def _remask(self) -> None:
-        """The mask: the 1 px outline plus a 1 px halo round each glyph."""
-        w, h = self.width(), self.height()
-        if w <= 2 or h <= 2:
-            return
-        bits = QBitmap(w, h)
-        bits.fill(Qt.GlobalColor.color0)
-        painter = QPainter(bits)
-        painter.setPen(QPen(Qt.GlobalColor.color1, 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        painter.drawPath(self._outline())
-        painter.setFont(self.font())
-        rect = self._textRect()
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                painter.drawText(rect.translated(dx, dy),
-                                 int(Qt.AlignmentFlag.AlignVCenter
-                                     | Qt.AlignmentFlag.AlignLeft),
-                                 self.text())
-        painter.end()
-        self.setMask(bits)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._remask()
-
-    def textColour(self) -> QColor:
-        colour = QColor(theme_colour('foreground.legend'))
-        colour.setAlphaF(PARTS_CHIP_TEXT_ALPHA if self.isEnabled() else 0.4)
-        return colour
-
-    def borderColour(self) -> QColor:
-        raw = _token('overlay.chip.border') or '#ffffff1f'
-        colour = QColor(raw if len(raw) < 9 else '#' + raw[7:9] + raw[1:7])
-        if self.underMouse():
-            colour.setAlpha(min(255, colour.alpha() * 2))
-        return colour
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # What the mask lets through (the glyph halos) is the view's own
-        # ground, so a glyph's soft edge blends with it, not with a plate.
-        ground = QColor(theme_colour('viewport.mid'))
-        painter.fillRect(self.rect(), ground)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        # The outline is composited over the ground (a native window has no
-        # alpha), the same as ``#ffffff1f`` over the view.
-        painter.setPen(QPen(self.borderColour(), 1))
-        painter.drawPath(self._outline())
-        painter.setFont(self.font())
-        painter.setPen(self.textColour())
-        painter.drawText(self._textRect(),
-                         int(Qt.AlignmentFlag.AlignVCenter
-                             | Qt.AlignmentFlag.AlignLeft), self.text())
-        painter.end()
-
-
-def _token(name: str) -> Optional[str]:
-    from foammesh.view.theming.elevation import token
-    return token(name, None)
-
-
 class PartsPanelEdge(QObject):
-    """The Parts panel's auto-hide: hover on the chip opens it, leaving folds
-    it, a pin keeps it. The panel is the rail's Parts popover, unchanged."""
+    """The Parts panel's auto-hide: hover on the rail's Parts button opens it
+    beside that button, leaving folds it, a pin keeps it. The panel is the
+    rail's Parts popover, unchanged.
+
+    Plan 45 (user 2026-10-17): the Parts chip is retired; the rail's Parts
+    button is the one way in."""
 
     pinnedChanged = Signal(bool)
-    #: The panel was shown or hidden (by the chip, the rail, a pin or Esc).
+    #: The panel was shown or hidden (by the rail, a pin or Esc).
     openChanged = Signal(bool)
 
-    def __init__(self, rail, chip: PartsChip):
-        super().__init__(chip)
+    def __init__(self, rail):
+        super().__init__(rail)
         self._rail = rail
-        self._chip = chip
+        tool = rail.tool('parts') if hasattr(rail, 'tool') else None
+        #: The rail's own Parts button: where the panel opens from.
+        self._anchor = getattr(tool, 'button', None)
+        self._keepOnPress = False
         self._revealOnHover = True
         self._open = False
         self._byHover = False
@@ -811,12 +787,11 @@ class PartsPanelEdge(QObject):
         self._timer.setInterval(HIDE_DELAY_MS)
         self._timer.timeout.connect(self._maybeFold)
         self._closedSeen = False
-        chip.installEventFilter(self)
-        chip.clicked.connect(self._pressed)
-        # DP-2718: a press on the chip is the panel's toggle, not a click
-        # away that closes it before the press opens it again.
-        if hasattr(rail, 'addOpener'):
-            rail.addOpener('parts', chip)
+        if self._anchor is not None:
+            self._anchor.installEventFilter(self)
+            # Connected after the rail's own toggle, so it runs after it.
+            self._anchor.pressed.connect(self._anchorPressed)
+            self._anchor.clicked.connect(self._pressed)
         popover = rail.popover('parts')
         if popover is not None:
             popover.installEventFilter(self)
@@ -846,20 +821,16 @@ class PartsPanelEdge(QObject):
             return QSize(min(PARTS_PANEL_WIDTH, size.width()), size.height())
 
         popover.wantedSize = panelSize
+        # The popover already keeps itself cut to its own radius (P16); the
+        # Parts panel's sheet radius is this one.
+        round_native_corners(popover, PARTS_PANEL_RADIUS)
         self._remask()
 
     def _remask(self) -> None:
         popover = self._popover()
         if popover is None:
             return
-        w, h = popover.width(), popover.height()
-        r = PARTS_PANEL_RADIUS
-        if w <= 2 * r or h <= 2 * r:
-            popover.clearMask()
-            return
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, w, h), r, r)
-        popover.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        apply_rounded_mask(popover, PARTS_PANEL_RADIUS)
 
     def accentExplode(self) -> int:
         """Colour the Explode slider with ``explode.accent``; how many."""
@@ -959,13 +930,18 @@ class PartsPanelEdge(QObject):
                 self._byHover = True
         self._timer.start()
 
-    def _pressed(self) -> None:
-        if self._byHover and self.isOpen():
-            # It was opened by resting on the chip; a press keeps it open.
-            self._byHover = False
-            return
+    def _anchorPressed(self) -> None:
+        """A press on a panel that a hover opened keeps it open."""
+        self._keepOnPress = bool(self._byHover and self.isOpen())
         self._byHover = False
-        self._rail.toggle('parts')
+        self._timer.stop()
+
+    def _pressed(self) -> None:
+        """Runs after the rail's own toggle. A panel a hover had opened stays
+        open under the press that follows (the toggle closed it; put it back)."""
+        keep, self._keepOnPress = self._keepOnPress, False
+        if keep and not self.isOpen():
+            self._rail.open('parts')
 
     def _popoverPinned(self, on: bool) -> None:
         self._wantPinned = bool(on)
@@ -996,7 +972,7 @@ class PartsPanelEdge(QObject):
     def _cursorOver(self) -> bool:
         point = QCursor.pos()
         popover = self._popover()
-        for widget in (self._chip, popover):
+        for widget in (self._anchor, popover):
             if widget is not None and widget.isVisible() and QRect(
                     widget.mapToGlobal(QPoint(0, 0)),
                     widget.size()).contains(point):
@@ -1012,68 +988,10 @@ class PartsPanelEdge(QObject):
         self._byHover = False
         self._rail.close('parts')
 
-    # -- the view under the chip (DP-2718) ----------------------------------- #
-
-    def passThrough(self, widget: Optional[QWidget]) -> None:
-        """The chip's mask is its outline and glyphs, so a press or a rest
-        between the letters reaches the view under it, not the chip. Watch
-        *widget* (the view's interactor) and hand the chip what lands inside
-        its rectangle."""
-        if not isinstance(widget, QWidget):
-            widget = None
-        self._under = widget
-        self._underPressed = False
-        self._underInside = False
-        if widget is not None:
-            widget.installEventFilter(self)
-
-    def _overChip(self, watched, event) -> bool:
-        chip = self._chip
-        if not (chip.isVisible() and chip.isEnabled()):
-            return False
-        pos = event.position().toPoint()
-        return chip.rect().contains(
-            chip.mapFromGlobal(watched.mapToGlobal(pos)))
-
-    def _underEvent(self, watched, event) -> bool:
-        kind = event.type()
-        if kind == QEvent.Type.MouseButtonPress:
-            if (event.button() == Qt.MouseButton.LeftButton
-                    and self._overChip(watched, event)):
-                self._underPressed = True
-                return True
-        elif kind == QEvent.Type.MouseButtonRelease and self._underPressed:
-            self._underPressed = False
-            if self._overChip(watched, event):
-                self._chip.click()
-            return True
-        elif kind == QEvent.Type.MouseButtonDblClick:
-            return self._overChip(watched, event)
-        elif kind == QEvent.Type.MouseMove:
-            inside = self._overChip(watched, event)
-            if inside and not self._underInside:
-                if self._revealOnHover:
-                    self.reveal()
-                else:
-                    self._timer.stop()
-            elif not inside and self._underInside and self._byHover:
-                self._timer.start()
-            self._underInside = inside
-            return self._underPressed
-        elif kind == QEvent.Type.Leave and self._underInside:
-            self._underInside = False
-            if self._byHover:
-                self._timer.start()
-        return False
-
     def eventFilter(self, watched, event):
-        if watched is getattr(self, '_under', None) and watched is not None:
-            if self._underEvent(watched, event):
-                return True
-            return super().eventFilter(watched, event)
         kind = event.type()
-        if watched is self._chip and kind == QEvent.Type.Enter:
-            if self._chip.isEnabled() and self._revealOnHover:
+        if watched is self._anchor and kind == QEvent.Type.Enter:
+            if self._anchor.isEnabled() and self._revealOnHover:
                 self.reveal()
         elif kind == QEvent.Type.Resize and watched is self._popover():
             self._remask()

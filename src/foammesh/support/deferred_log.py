@@ -42,6 +42,11 @@ class DeferredHandler(logging.Handler):
             if isinstance(item, threading.Event):
                 try:
                     self.inner.flush()
+                except Exception:                          # noqa: BLE001
+                    # A stream already closed (a console gone, a test's
+                    # captured stderr): logging.shutdown swallows the same
+                    # error when the handler flushes on its own thread.
+                    pass
                 finally:
                     item.set()
                 continue

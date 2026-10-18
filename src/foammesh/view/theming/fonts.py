@@ -43,6 +43,21 @@ def install_application_fonts(application) -> tuple[str, ...]:
     return families
 
 
+def warm_application_font() -> None:
+    """Plan 45 start-up: pay the first use of the application font now.
+
+    The first text measured after ``install_application_fonts`` costs ~0.3 s
+    (measured live, 17 October 2026: Qt resolves the font's fallback faces
+    once). Asked for before the window is built, it is a turn of its own
+    instead of part of the window's longest one. Later uses are cached.
+    """
+    from PySide6.QtGui import QFontMetrics, QGuiApplication
+
+    if QGuiApplication.instance() is None:
+        return
+    QFontMetrics(QGuiApplication.font()).horizontalAdvance('FoamMesh 0.5 mm')
+
+
 # -- Plan 44 MF1: mono, caps and heading faces -----------------------------
 # The fixed-pitch face is Cascadia Mono, which ships with Windows 11 (user
 # decision 2026-10-14: no font files are bundled). Consolas, then the generic

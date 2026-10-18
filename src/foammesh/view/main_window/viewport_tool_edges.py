@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Plan 43 LY6 and LY7: the viewport's three tool edges and the Parts chip.
+"""Plan 43 LY6 and LY7: the viewport's three tool edges and the Parts panel.
 
 ``ViewportToolEdges`` is the one place that knows all of them:
 
@@ -15,8 +15,9 @@
   resource usage, the cell count and the scale note. A result that appears
   while the bar is folded brings it out;
 * the **side rail** is ``ViewportRail`` with its own ``ToolEdge``;
-* the **Parts chip** ("3 of 3") sits at the top right and opens the Parts
-  panel; the panel is the rail's Parts popover, auto-hide or pinned.
+* the **Parts panel** is the rail's Parts popover, auto-hide or pinned; it
+  opens beside the rail's Parts button (Plan 45, user 2026-10-17: the Parts
+  chip is retired, the rail button is the one way in).
 
 Every control of every edge is the widget it always was, moved. Nothing is
 removed and no control has a second copy. See ``tool_edges`` for the rule
@@ -30,10 +31,10 @@ from PySide6.QtWidgets import (
 
 from foammesh.core import display_unit
 
-from foammesh.view.display_control.overlay_layout import Slot
 from foammesh.view.main_window.tool_edges import (
-    BOTTOM, EDGE_KEYS, EDGE_MARGIN, TOP, PartsChip, PartsPanelEdge, ToolEdge,
-    centre_rect, centring_insets, make_edge_frame, make_pin_button)
+    BOTTOM, EDGE_KEYS, EDGE_MARGIN, TOP, PartsPanelEdge, ToolEdge,
+    centre_rect, centring_insets, make_edge_frame, make_pin_button,
+    round_native_corners)
 from foammesh.view.theming.metrics import GAP
 from foammesh.view.theming.status_colors import style_floating_panel
 
@@ -57,7 +58,7 @@ STATE_KEYS = (tuple(STATE_PIN.values())
 
 
 class ViewportToolEdges(QObject):
-    """The three edges and the Parts chip. What the user chose lives in the
+    """The three edges and the Parts panel. What the user chose lives in the
     View menu's state (``bindViewState``), which is also what is saved."""
 
     def __init__(self, window, rail):
@@ -77,7 +78,7 @@ class ViewportToolEdges(QObject):
         self._buildBottomBar()
         self._edges = {'top': self._top, 'bottom': self._bottom,
                        'rail': rail.edge()}
-        self._buildPartsChip()
+        self._buildPartsPanel()
 
     # -- the top bar -------------------------------------------------------- #
 
@@ -95,7 +96,15 @@ class ViewportToolEdges(QObject):
         bar = presetBar() if callable(presetBar) else None
         self._topTools = ()
         if bar is not None:
-            content = QWidget()
+            # Plan 45 J (P14). Born a child of the view, never a window of its
+            # own: the toolbar beside the GL view is a native window, so the
+            # row that takes it becomes one too. A parentless row became a
+            # native *top-level* window, and once moved into the frame Qt
+            # kept that window's screen position as its position in the frame
+            # (measured: (2573, 151) for a row at (13, 1)). Every
+            # mapToGlobal below it, and so where the View-mode list and the
+            # Fit menu opened, was off by the view's screen position.
+            content = QWidget(view)
             content.setObjectName('viewportTopBar')
             row = QHBoxLayout(content)
             row.setContentsMargins(0, 0, 0, 0)
@@ -128,6 +137,9 @@ class ViewportToolEdges(QObject):
         row = frame.layout()
         row.setContentsMargins(PILL_PADDING, 0, PILL_PADDING, 0)
         frame.setFixedHeight(height)
+        # Plan 45 P16: the pill is a native window over the GL view; cut it
+        # to the sheet's radius or the square ends paint black.
+        round_native_corners(frame, height // 2)
 
     def _sizeGlyphs(self, content: QWidget) -> None:
         """U2. The icon-only tools of the top pill draw a 16 px glyph on a
@@ -166,13 +178,18 @@ class ViewportToolEdges(QObject):
         console moved, the window was resized). Tools shown or hidden are
         followed by the frames' own layout requests."""
         controller.changed.connect(lambda _rect: self.reflow())
+        # Plan 45 W1. The viewport overlay stands below the top pill when
+        # the two share columns (``MainWindow.viewportOverlayRect``), but the
+        # pill is not one of the clear area's floating items: when it grows
+        # (a theme switch re-measures its tools), nothing told the overlay,
+        # which stayed over the pill's end. A re-polish of the whole window
+        # used to move the overlay by chance; now the pill says so itself.
+        self._pillWatcher = _pill_watch(self, controller)
+        self._topFrame.installEventFilter(self._pillWatcher)
 
     def reflow(self) -> None:
         for edge in (self._top, self._bottom):
             edge.apply()
-        # The chip keeps clear of the top pill and the sheet: follow them.
-        if getattr(self, '_chipRegistered', False):
-            self._view.arrangeOverlays()
 
     def topWantedWidth(self) -> int:
         """What the top pill asks for: its content with every tool in the
@@ -198,9 +215,20 @@ class ViewportToolEdges(QObject):
 
     # -- the bottom bar ----------------------------------------------------- #
 
+    def _openSection(self) -> None:
+        window = self._window
+        popover = getattr(window, 'sectionPopover', lambda: None)()
+        if popover is not None and popover.isOpen():
+            window.closeSectionPanel()
+            return
+        opener = getattr(window, 'openSectionPanel', None)
+        if callable(opener):
+            opener('cut')
+
     def _buildBottomBar(self) -> None:
         ui, view = self._ui, self._view
-        content = QWidget()
+        # Plan 45 J: a child of the view from birth (see _buildTopBar).
+        content = QWidget(view)
         content.setObjectName('viewportBottomBar')
         row = QHBoxLayout(content)
         row.setContentsMargins(0, 0, 0, 0)
@@ -237,8 +265,10 @@ class ViewportToolEdges(QObject):
         section.setToolTip(self.tr(
             'Section: aim the cut plane (opens the cut plane panel)'))
         section.setAccessibleName(self.tr('Section'))
-        section.clicked.connect(lambda _c=False: self._rail.toggle('cut'))
-        self._rail.addOpener('cut', section)
+        # Plan 45 N (Q1 a): the rail's Cut plane tool is gone; this opens the
+        # one section panel (Plan 45 L) on its Cut plane tab, and a second
+        # press folds it away again (DP-2719).
+        section.clicked.connect(lambda _c=False: self._openSection())
 
         units = QLabel()
         units.setObjectName('bottomUnits')
@@ -361,76 +391,40 @@ class ViewportToolEdges(QObject):
         for widget in (self._partsButton, self._sectionButton, self._explode):
             widget.setEnabled(not empty)
 
-    # -- the Parts chip ----------------------------------------------------- #
+    # -- the Parts panel ---------------------------------------------------- #
 
-    def _buildPartsChip(self) -> None:
-        chip = PartsChip(self._view)
-        chip.setPlacer(self.chipRect)
-        self._chip = chip
-        self._partsPanel = PartsPanelEdge(self._rail, chip)
-        # DP-2718: a press between the chip's glyphs reaches the chip.
-        self._partsPanel.passThrough(getattr(self._view, '_widget', None))
+    def _buildPartsPanel(self) -> None:
+        # Plan 45 (user 2026-10-17): the Parts chip is retired; the rail's
+        # Parts button is the one way in, and its list opens beside it.
+        self._partsPanel = PartsPanelEdge(self._rail)
         self._overlay.chipCountsChanged.connect(self._countsChanged)
-        self._overlay.sceneEmptyChanged.connect(self._chipSceneEmpty)
+        self._overlay.sceneEmptyChanged.connect(self._panelSceneEmpty)
         self._partsPanel.pinnedChanged.connect(self._partsPinned)
-        self._chipRegistered = False
         self._counts = (0, 0)
-        chip.setEnabled(not self._overlay.isSceneEmpty())
 
-    def chip(self) -> PartsChip:
-        return self._chip
-
-    def chipRect(self, rect: QRect) -> QRect:
-        """Plan 44 MF21 (b). Where the chip really stands, given the corner
-        the overlay layout offers: inside the clear area, off the settings
-        sheet (its header and pin) and its tab, and below the top pill when
-        the two would meet."""
-        clear = self.clearRect()
-        out = QRect(rect)
-        margin = EDGE_MARGIN
-        right = clear.x() + clear.width() - margin
-        if out.right() + 1 > right:
-            out.moveRight(right - 1)
-        for blocked in self._sheetRects():
-            keep = blocked.adjusted(-margin, -margin, margin, margin)
-            if out.intersects(keep):
-                out.moveRight(min(out.right(), keep.left() - 1))
-        out.moveLeft(max(out.left(), clear.x() + margin))
-        out.moveTop(max(out.top(), clear.y() + margin))
-        pill = self._topRect().adjusted(-margin, -margin, margin, margin)
-        if out.intersects(pill):
-            out.moveTop(pill.bottom() + 1)
-        return out
-
-    def _sheetRects(self) -> list:
-        """The settings sheet's frame and tab, in the view's pixels."""
-        sheet = getattr(self._window, '_settingsSheet', None)
-        rects = []
-        for name in ('frame', 'tab'):
-            widget = getattr(sheet, name, None)
-            try:
-                if widget is None or not widget.isVisibleTo(widget.window()):
-                    continue
-                corner = self._view.mapFromGlobal(
-                    widget.mapToGlobal(widget.rect().topLeft()))
-                rects.append(QRect(corner, widget.size()))
-            except (RuntimeError, AttributeError, TypeError):
-                continue
-        return rects
+    def chip(self):
+        """The Parts chip is retired (Plan 45); kept only so the window's
+        float registration, which asks for it, finds none."""
+        return None
 
     def partsPanel(self) -> PartsPanelEdge:
         return self._partsPanel
 
     def _countsChanged(self, shown: int, total: int) -> None:
         self._counts = (shown, total)
-        self._chip.setCounts(shown, total)
+        # Plan 45 (user 2026-10-17): "2 of 2 parts" was said in three places.
+        # The count is said here alone, and only when something is hidden --
+        # then it is a warning, highlighted; with every part shown it is noise.
+        hidden = max(0, total - shown) if total else 0
         self._partsButton.setText(
-            self.tr('{0:,} of {1:,} parts').format(shown, total) if total
+            self.tr('{0:,} of {1:,} hidden').format(hidden, total) if hidden
             else self.tr('Parts'))
+        self._partsButton.setProperty('partial', bool(hidden))
+        self._partsButton.style().unpolish(self._partsButton)
+        self._partsButton.style().polish(self._partsButton)
         self._view.arrangeOverlays()
 
-    def _chipSceneEmpty(self, empty: bool) -> None:
-        self._chip.setEnabled(not empty)
+    def _panelSceneEmpty(self, empty: bool) -> None:
         if not empty and self._partsPinWanted and not self._partsPanel.isOpen():
             self._partsPanel.setPinned(True)
 
@@ -441,25 +435,11 @@ class ViewportToolEdges(QObject):
         self._partsPinWanted = bool(on)
         self._tell('parts.autohide', not on)
 
-    def _setChipShown(self, shown: bool) -> None:
-        shown = bool(shown)
-        self._chip.setVisible(shown)
-        if shown and not self._chipRegistered:
-            self._view.registerOverlay(
-                'parts-chip', Slot.TOP_RIGHT, self._chip,
-                size=self._chip.wantedSize)
-            self._chipRegistered = True
-        elif not shown and self._chipRegistered:
-            self._view.unregisterOverlay('parts-chip')
-            self._chipRegistered = False
-            if self._partsPanel.isOpen() and not self._partsPanel.isPinned():
-                self._rail.close('parts')
-
     # -- the View menu state (LY8) ------------------------------------------ #
 
     def bindViewState(self, state) -> None:
         """Read the View menu's choices (LY8's ``ViewMenuState``) and keep
-        them: the pins, the bottom bar, the Parts panel, the Parts chip and
+        them: the pins, the bottom bar, the Parts panel and
         how the edges are revealed. The state is the one place they live (and
         the one that is saved); the menu entries, Ctrl+H and Ctrl+0 only write
         to it, and this object applies what it holds."""
@@ -496,8 +476,7 @@ class ViewportToolEdges(QObject):
                 for edge in self._edges.values():
                     edge.setRevealOnHover(value == 'hover')
                 self._partsPanel.setRevealOnHover(value == 'hover')
-            elif key == 'parts.chip':
-                self._setChipShown(bool(value))
+            # 'parts.chip' (retired, Plan 45) is read and ignored.
             elif key == 'parts.autohide':
                 self._partsPinWanted = not value
                 self._partsPanel.setPinned(not value)
@@ -529,16 +508,10 @@ class ViewportToolEdges(QObject):
         """Ctrl+H: pin all three, or fold all three when all are pinned."""
         self.setAllPinned(not self.allPinned())
 
-    def chipShown(self) -> bool:
-        return self._chipRegistered
-
     # The three Show / Auto-hide choices are the View menu's: these only write
     # them to its state, which applies them back here (``_apply``).
     def setBottomBarShown(self, shown: bool) -> None:
         self._write('tools.show_bottom', bool(shown))
-
-    def setPartsChipShown(self, shown: bool) -> None:
-        self._write('parts.chip', bool(shown))
 
     def setPartsAutoHide(self, autoHide: bool) -> None:
         self._write('parts.autohide', bool(autoHide))
@@ -559,6 +532,29 @@ class ViewportToolEdges(QObject):
                       'revealed': edge.isRevealed(),
                       'nub': edge.nub().isVisibleTo(self._view)}
                 for key, edge in self._edges.items()}
+
+
+class _PillWatcher(QObject):
+    """The top pill moved or was resized: place the viewport overlay again
+    (and the floating items ranked after it)."""
+
+    def __init__(self, owner: QObject, controller):
+        super().__init__(owner)
+        self._controller = controller
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+            from foammesh.view.main_window.clear_area import FLOAT_RANK_OVERLAY
+            try:
+                self._controller.place_floats(after=FLOAT_RANK_OVERLAY - 1)
+            except RuntimeError:                    # closing down
+                pass
+        return False
+
+
+def _pill_watch(owner: QObject, controller) -> _PillWatcher:
+    # A factory, so the facade inventory does not list the filter as a control.
+    return _PillWatcher(owner, controller)
 
 
 class _ResultWatcher(QObject):

@@ -8,7 +8,7 @@ scalar configuration patch.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QGroupBox, QHBoxLayout, QHeaderView,
@@ -66,9 +66,12 @@ class _NumericFloorHeader(QHeaderView):
         self.setSectionsClickable(True)
         self.setHighlightSections(True)
         self._numeric: frozenset = frozenset()
+        self._measured: dict = {}
+        self._bold = None
 
     def set_numeric_columns(self, columns) -> None:
         self._numeric = frozenset(columns)
+        self._measured.clear()
 
     def numeric_floor(self) -> int:
         margin = self.style().pixelMetric(
@@ -84,7 +87,31 @@ class _NumericFloorHeader(QHeaderView):
         return self.measure(logical_index, self._wrap)
 
     def measure(self, logical_index, wrap: bool):
-        """The size one heading asks for, on one line or on two."""
+        """The size one heading asks for, on one line or on two.
+
+        Plan 45 PINQ. Kept per heading, face and wrapping: a pin or an unpin
+        re-fits the headings at a width they had a press before, and every
+        fit asked the style for each heading up to five times over. A style
+        or font change (a theme, the tight padding) drops what is kept.
+        """
+        key = (logical_index, bool(wrap), self._text(logical_index),
+               self.font().key(), self.styleSheet(), self._maxLines,
+               logical_index in self._numeric, self.isSortIndicatorShown(),
+               self.sortIndicatorSection(), self.sortIndicatorOrder())
+        held = self._measured.get(key)
+        if held is None:
+            held = self._measure(logical_index, wrap)
+            self._measured[key] = held
+        return QSize(held)
+
+    def event(self, event):                                  # noqa: D102
+        if event.type() in (QEvent.Type.StyleChange, QEvent.Type.FontChange,
+                            QEvent.Type.Polish):
+            self._measured.clear()
+            self._bold = None
+        return super().event(event)
+
+    def _measure(self, logical_index, wrap: bool):
         size = super().sectionSizeFromContents(logical_index)
         lines = self.wrapped_lines(logical_index, wrap)
         if len(lines) > 1:
@@ -151,9 +178,12 @@ class _NumericFloorHeader(QHeaderView):
     def _bold_metrics(self) -> QFontMetrics:
         # A selected row draws every heading bold, and the column is not
         # re-measured when the selection changes, so it is measured bold.
-        font = QFont(self.font())
-        font.setBold(True)
-        return QFontMetrics(font)
+        key = self.font().key()
+        if self._bold is None or self._bold[0] != key:
+            font = QFont(self.font())
+            font.setBold(True)
+            self._bold = (key, QFontMetrics(font))
+        return self._bold[1]
 
     def wrapped_lines(self, logical_index, wrap=None) -> list:
         """The lines one heading is drawn on: two at most, balanced."""
@@ -937,7 +967,10 @@ class ChildControlPanel(QGroupBox):
 
     def eventFilter(self, watched, event):                   # noqa: N802
         if (event.type() == QEvent.Type.Resize
-                and watched is self.table.viewport()):
+                and watched is self.table.viewport()
+                and self._headings_fitted != self._heading_inputs()):
+            # Plan 45 PINQ: a height-only resize (a pin or an unpin) leaves
+            # the headings as they were fitted.
             self._fit_headings()
         # DP-1193. Delete / Backspace on a selected row did nothing: the
         # only way to drop a row was the Remove button. The key now takes
@@ -1021,6 +1054,7 @@ class ChildControlPanel(QGroupBox):
         """
         if not self._columns:
             return
+        self._headings_fitted = self._heading_inputs()
         header = self.table.horizontalHeader()
         available = self.table.viewport().width()
         one_line = sum(self._column_need(column, False)
@@ -1071,6 +1105,15 @@ class ChildControlPanel(QGroupBox):
         if changed:
             header.resizeSections()
             self._fit_table_height()
+
+    _headings_fitted = None
+
+    def _heading_inputs(self):
+        """What the heading fit reads, bar the rows (a row change refits
+        through ``_fit_headings`` itself): the table's width and fonts."""
+        return (self.table.viewport().width(), len(self._columns),
+                self.table.font().key(),
+                self.table.horizontalHeader().font().key())
 
     def _base_minimum_section(self) -> int:
         """The header's own minimum section size, as the table was built."""

@@ -70,10 +70,18 @@ class FlowLayout(QLayout):
     def __init__(self, parent=None, spacing: int = 6):
         super().__init__(parent)
         self._items = []
+        #: width -> height, until the next invalidate (Plan 45 PINQ: a pin
+        #: asked each row the same question for every layout pass).
+        self._heights: dict = {}
         self.setSpacing(spacing)
+
+    def invalidate(self):                                    # noqa: D102
+        self._heights = {}
+        super().invalidate()
 
     def addItem(self, item):                                 # noqa: N802
         self._items.append(item)
+        self._heights = {}
 
     def count(self):
         return len(self._items)
@@ -83,6 +91,7 @@ class FlowLayout(QLayout):
 
     def takeAt(self, index):                                 # noqa: N802
         if 0 <= index < len(self._items):
+            self._heights = {}
             return self._items.pop(index)
         return None
 
@@ -93,7 +102,11 @@ class FlowLayout(QLayout):
         return True
 
     def heightForWidth(self, width):                         # noqa: N802
-        return self._layout(QRect(0, 0, width, 0), apply=False)
+        height = self._heights.get(width)
+        if height is None:
+            height = self._layout(QRect(0, 0, width, 0), apply=False)
+            self._heights[width] = height
+        return height
 
     def setGeometry(self, rect):                             # noqa: N802
         super().setGeometry(rect)

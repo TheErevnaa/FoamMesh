@@ -30,8 +30,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSizePolicy, QSlider, QVBoxLayout,
-    QWidget)
+    QLabel, QLineEdit, QPushButton, QSizePolicy, QSlider, QTabWidget,
+    QVBoxLayout, QWidget)
 
 from foammesh.view.combo_items import item_enabled, set_item_enabled
 from foammesh.core.section.plane_equation import from_equation, to_equation
@@ -42,7 +42,7 @@ from foammesh.core.section.pieces import (
     SCALE_LABELS, CellRule, Combine, Prefer, ScalePolicy)
 from foammesh.core.section.plane_state import (
     FINE_FRACTION, PlaneState, display_unit, domain_step, from_display,
-    rotated_normal, to_display, unit)
+    clean, display_noise, rotated_normal, to_display, unit)
 from foammesh.rendering.plane_widget import AXIS_NORMAL
 from foammesh.core.quantities import aligned
 from foammesh.view.theming.metrics import GAP, GAP_TIGHT, UnitLabel
@@ -246,10 +246,42 @@ def _field(width=72):
     return edit
 
 
-def _compactButton(text, tooltip, width=34):
+#: Plan 45 L (P4). The width of a row's caption ("Offset", "Drag").
+CAPTION_WIDTH = 58
+
+#: Plan 45 L (P4). A combo box asks for this many characters at least and
+#: grows with the row; its list still shows every item whole.
+COMBO_CHARS = 12
+
+#: Plan 45 L. A plane's origin-and-normal line starts under its name.
+CHECK_INDENT = 22
+
+#: Plan 45 V7. An axis preset reads on one line, the plane it sets and its
+#: normal: "YZ (X)". Two lines ("YZ" over "X") did not fit the one control
+#: height (24 px compact) and were cut at 1280 x 800.
+PRESET_TEXT = '{0} ({1})'
+
+#: Plan 45 V7. A unit-vector component this close to zero reads 0.
+NORMAL_NOISE = 1.0e-9
+
+
+def _fitCombo(box):
+    """Plan 45 L. A combo box sized by the row, not by its longest item."""
+    box.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    box.setMinimumContentsLength(COMBO_CHARS)
+    box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    return box
+
+
+def _compactButton(text, tooltip):
+    """A small button, as wide as its text and the theme's padding ask.
+
+    Plan 45 V7. It used to be capped at 34 px (46 for an axis preset), under
+    the 39 px the theme's padding asks for a one-glyph button, so the glyph
+    sat in a squeezed button and a preset's text was cut."""
     button = QPushButton(text)
     button.setToolTip(tooltip)
-    button.setMaximumWidth(width)
     button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     return button
 
@@ -326,6 +358,10 @@ class SectionPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(GAP)
+        #: Plan 45 L (P4). Every row of the panel, in build order: a strip of
+        #: three controls or fewer, so it reads whole in the popover under
+        #: the top bar's Section button at 1280 px.
+        self._rows = []
 
         #: Plan 40 UXE2. The groups that are about the section as a whole
         #: (mode, saved sections, status and cancel, colour, compare, freeze),
@@ -334,22 +370,90 @@ class SectionPanel(QWidget):
             self._buildModeRow(), self._buildSaved(), self._buildStatus(),
             self._buildColour(), self._buildCompare(), self._buildFreeze()]
         self._sectionHost = None
-        mode, saved, status, colour, compare, freeze = self._sectionSide
-        layout.addWidget(mode)
-        layout.addWidget(self._buildPieces())
-        layout.addWidget(saved)
-        layout.addWidget(self._buildPlaneRows())
-        layout.addWidget(self._separator())
-        layout.addWidget(self._buildPlacement())
-        layout.addWidget(self._buildAdvanced())
-        layout.addWidget(status)
-        layout.addWidget(colour)
-        layout.addWidget(compare)
-        layout.addWidget(freeze)
+
+        # Plan 45 L (P5). One panel, two tabs: the planes (*Cut plane*) and
+        # the section as a whole (*Section*).
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName('sectionTabs')
+        self._tabs.setDocumentMode(True)
+        self._tabs.setUsesScrollButtons(False)
+        cutTab = QWidget()
+        cutTab.setObjectName('sectionCutTab')
+        cutColumn = QVBoxLayout(cutTab)
+        cutColumn.setContentsMargins(0, GAP_TIGHT, 0, 0)
+        cutColumn.setSpacing(GAP)
+        cutColumn.addWidget(self._buildPlaneRows())
+        cutColumn.addWidget(self._separator())
+        cutColumn.addWidget(self._buildPlacement())
+        cutColumn.addWidget(self._buildMore())
+        cutColumn.addStretch(1)
+        sectionTab = QWidget()
+        sectionTab.setObjectName('sectionSectionTab')
+        sectionColumn = QVBoxLayout(sectionTab)
+        sectionColumn.setContentsMargins(0, GAP_TIGHT, 0, 0)
+        sectionColumn.setSpacing(GAP)
+        for widget in self._sectionSide:
+            sectionColumn.addWidget(widget)
+        sectionColumn.addStretch(1)
+        self._cutTab = cutTab
+        self._sectionTab = sectionTab
+        self._tabs.addTab(cutTab, self.tr('Cut plane'))
+        self._tabs.addTab(sectionTab, self.tr('Section'))
+        layout.addWidget(self._tabs, 1)
         layout.addWidget(self._buildFooter())
 
         self._connectSignalsSlots()
         self._syncFromState()
+
+    #: Plan 45 L. The tab keys `showTab` takes.
+    TAB_CUT = 'cut'
+    TAB_SECTION = 'section'
+
+    def tabs(self) -> QTabWidget:
+        return self._tabs
+
+    def showTab(self, key: str) -> None:
+        """Bring the *Cut plane* (``'cut'``) or *Section* tab forward."""
+        page = self._sectionTab if key == self.TAB_SECTION else self._cutTab
+        index = self._tabs.indexOf(page)
+        if index >= 0:
+            self._tabs.setCurrentIndex(index)
+
+    def currentTab(self) -> str:
+        if self._tabs.currentWidget() is self._sectionTab:
+            return self.TAB_SECTION
+        return self.TAB_CUT
+
+    def rows(self) -> list:
+        """Plan 45 L (P4). The panel's rows (each three controls or fewer)."""
+        return list(self._rows)
+
+    def _row(self, caption, *widgets, stretch=True, name=''):
+        """A row of the panel: an optional caption, then *widgets* (three
+        at most), left to right."""
+        assert len(widgets) <= 3, 'a section row holds three controls or fewer'
+        row = QWidget()
+        row.setProperty('sectionRow', True)
+        if name:
+            row.setObjectName(name)
+        strip = QHBoxLayout(row)
+        strip.setContentsMargins(0, 0, 0, 0)
+        strip.setSpacing(GAP_TIGHT)
+        if caption is not None:
+            label = caption if isinstance(caption, QLabel) else QLabel(caption)
+            label.setMinimumWidth(CAPTION_WIDTH)
+            strip.addWidget(label)
+            if widgets and isinstance(widgets[0], QWidget):
+                label.setBuddy(widgets[0])
+        for widget in widgets:
+            if isinstance(widget, QWidget):
+                strip.addWidget(widget)
+            else:
+                strip.addLayout(widget)
+        if stretch:
+            strip.addStretch(1)
+        self._rows.append(row)
+        return row
 
     def sectionHalf(self) -> QWidget:
         """Plan 40 UXE2. The section-wide groups on a host of their own.
@@ -357,7 +461,8 @@ class SectionPanel(QWidget):
         The viewport rail shows the planes (*Cut plane*) and the section as a
         whole (*Section*) in two popovers; both are this one panel, so every
         signal and every piece of state stays where it was. Calling it again
-        returns the same host.
+        returns the same host. Plan 45 L: the groups leave the panel's own
+        *Section* tab, which goes with them.
         """
         if self._sectionHost is None:
             host = QWidget()
@@ -369,6 +474,10 @@ class SectionPanel(QWidget):
                 column.addWidget(widget)
             column.addStretch(1)
             self._sectionHost = host
+            index = self._tabs.indexOf(self._sectionTab)
+            if index >= 0:
+                self._tabs.removeTab(index)
+            self._tabs.tabBar().setVisible(False)
         return self._sectionHost
 
     # -- construction ------------------------------------------------------ #
@@ -380,10 +489,6 @@ class SectionPanel(QWidget):
         return line
 
     def _buildModeRow(self):
-        widget = QWidget()
-        row = QHBoxLayout(widget)
-        row.setContentsMargins(0, 0, 0, 0)
-
         self._modeBox = QComboBox()
         self._modeBox.setObjectName('sectionMode')
         self._modeBox.setAccessibleName(self.tr('Section mode'))
@@ -393,10 +498,9 @@ class SectionPanel(QWidget):
                 self._modeBox.count() - 1, self.tr(MODE_TOOLTIPS[mode]),
                 Qt.ItemDataRole.ToolTipRole)
         self._modeBox.setCurrentIndex(self._modeBox.findData(SectionMode.CLIP))
-
-        row.addWidget(QLabel(self.tr('Show')))
-        row.addWidget(self._modeBox, 1)
-        return widget
+        _fitCombo(self._modeBox)
+        return self._row(self.tr('Show'), self._modeBox, stretch=False,
+                         name='sectionModeRow')
 
     def _buildPieces(self):
         """Plan 39 VI10b (F2f, F2g). How several planes combine and which
@@ -406,8 +510,6 @@ class SectionPanel(QWidget):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
 
-        row = QHBoxLayout()
-        label = QLabel(self.tr('Planes combine'))
         self._combineBox = QComboBox()
         self._combineBox.setObjectName('sectionCombine')
         self._combineBox.setAccessibleName(self.tr('Planes combine'))
@@ -417,23 +519,17 @@ class SectionPanel(QWidget):
                 self._combineBox.count() - 1,
                 self.tr(COMBINE_TOOLTIPS[member]),
                 Qt.ItemDataRole.ToolTipRole)
-        label.setBuddy(self._combineBox)
-        row.addWidget(label)
-        row.addWidget(self._combineBox, 1)
-        column.addLayout(row)
+        _fitCombo(self._combineBox)
+        column.addWidget(self._row(self.tr('Combine'), self._combineBox,
+                                   stretch=False))
 
-        row = QHBoxLayout()
         self._largerButton = QPushButton(self.tr('Keep larger'))
         self._largerButton.setObjectName('sectionKeepLarger')
         self._smallerButton = QPushButton(self.tr('Keep smaller'))
         self._smallerButton.setObjectName('sectionKeepSmaller')
-        row.addWidget(self._largerButton)
-        row.addWidget(self._smallerButton)
-        row.addStretch(1)
-        column.addLayout(row)
+        column.addWidget(self._row(
+            QLabel(''), self._largerButton, self._smallerButton))
 
-        row = QHBoxLayout()
-        label = QLabel(self.tr('Whole cells'))
         self._ruleBox = QComboBox()
         self._ruleBox.setObjectName('sectionCellRule')
         self._ruleBox.setAccessibleName(self.tr('Whole-cell rule'))
@@ -442,10 +538,9 @@ class SectionPanel(QWidget):
             self._ruleBox.setItemData(
                 self._ruleBox.count() - 1, self.tr(RULE_TOOLTIPS[member]),
                 Qt.ItemDataRole.ToolTipRole)
-        label.setBuddy(self._ruleBox)
-        row.addWidget(label)
-        row.addWidget(self._ruleBox, 1)
-        column.addLayout(row)
+        _fitCombo(self._ruleBox)
+        column.addWidget(self._row(self.tr('Whole cells'), self._ruleBox,
+                                   stretch=False))
 
         # Plan 42 SG12. Gmsh meshes can hold line and point elements; the
         # box is there only while one is on screen.
@@ -474,16 +569,13 @@ class SectionPanel(QWidget):
         column = QVBoxLayout(widget)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(self.tr('Saved'))
         self._savedBox = QComboBox()
         self._savedBox.setObjectName('sectionSaved')
         self._savedBox.setAccessibleName(self.tr('Saved sections'))
         self._savedBox.setToolTip(self.tr(
             'Sections saved with this case. Choosing one puts its planes, '
             'mode and colour back.'))
-        label.setBuddy(self._savedBox)
+        _fitCombo(self._savedBox)
         self._savedName = QLineEdit()
         self._savedName.setObjectName('sectionSavedName')
         self._savedName.setAccessibleName(self.tr('Section name'))
@@ -498,16 +590,15 @@ class SectionPanel(QWidget):
         self._deleteSavedButton.setObjectName('sectionDeleteSaved')
         self._deleteSavedButton.setToolTip(
             self.tr('Delete the chosen saved section'))
-        row.addWidget(label)
-        row.addWidget(self._savedBox, 1)
-        row.addWidget(self._savedName, 1)
-        row.addWidget(self._saveButton)
-        row.addWidget(self._deleteSavedButton)
         self._savedNote = QLabel()
         self._savedNote.setObjectName('sectionSavedNote')
         self._savedNote.setWordWrap(True)
         self._savedNote.setVisible(False)
-        column.addLayout(row)
+        column.addWidget(self._row(self.tr('Saved'), self._savedBox,
+                                   stretch=False))
+        column.addWidget(self._row(QLabel(''), self._savedName,
+                                   self._saveButton, self._deleteSavedButton,
+                                   stretch=False))
         column.addWidget(self._savedNote)
         self._savedReadOnly = ''
         self.setSavedSections([])
@@ -574,10 +665,14 @@ class SectionPanel(QWidget):
             self.deleteSectionRequested.emit(str(sectionId))
 
     def _buildPlaneRows(self):
+        """The planes list. Plan 45 L (P4): a plane is one row -- its tick,
+        its name and its three switches (handle, sheet, solo) as one cluster
+        -- with the origin and normal read beneath it."""
         widget = QWidget()
-        grid = QGridLayout(widget)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setVerticalSpacing(2)
+        widget.setObjectName('sectionPlaneList')
+        column = QVBoxLayout(widget)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(GAP_TIGHT)
 
         self._enableBoxes = []
         self._gizmoButtons = []
@@ -585,6 +680,8 @@ class SectionPanel(QWidget):
         self._selectButtons = []
         self._summaries = []
         self._rowWidgets = []
+        #: Plan 45 L. Each plane's row and the line beneath it.
+        self._planeRowHosts = []
         self._gizmoGroup = QButtonGroup(self)
         self._gizmoGroup.setExclusive(False)
         self._sheetGroup = QButtonGroup(self)
@@ -603,10 +700,14 @@ class SectionPanel(QWidget):
             select.setCheckable(True)
             select.setChecked(index == 0)
             select.setToolTip(self.tr('Edit this plane below'))
+            select.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Fixed)
             self._selectGroup.addButton(select, index)
 
             summary = QLabel()
             summary.setToolTip(self.tr('Origin and normal of this plane'))
+            summary.setWordWrap(True)
+            summary.setIndent(CHECK_INDENT)
 
             gizmo = _compactButton(
                 self.tr('◈'), self.tr('Show the draggable handle for this plane'))
@@ -630,12 +731,14 @@ class SectionPanel(QWidget):
                 self.tr('Show only the cut of plane {0}').format(index + 1))
             self._soloGroup.addButton(solo, index)
 
-            grid.addWidget(enable, index, 0)
-            grid.addWidget(select, index, 1)
-            grid.addWidget(summary, index, 2)
-            grid.addWidget(gizmo, index, 3)
-            grid.addWidget(sheet, index, 4)
-            grid.addWidget(solo, index, 5)
+            switches = QHBoxLayout()
+            switches.setContentsMargins(0, 0, 0, 0)
+            switches.setSpacing(0)
+            for button in (gizmo, sheet, solo):
+                switches.addWidget(button)
+            row = self._row(None, enable, select, switches, stretch=False)
+            column.addWidget(row)
+            column.addWidget(summary)
 
             self._enableBoxes.append(enable)
             self._selectButtons.append(select)
@@ -645,10 +748,10 @@ class SectionPanel(QWidget):
             self._soloButtons.append(solo)
             self._rowWidgets.append(
                 (enable, select, summary, gizmo, sheet, solo))
+            self._planeRowHosts.append(row)
 
-        grid.addWidget(self._buildPlaneHint(), MAX_PLANES, 0, 1, 6)
-        grid.addWidget(self._buildPlaneActions(), MAX_PLANES + 1, 0, 1, 6)
-        grid.setColumnStretch(2, 1)
+        column.addWidget(self._buildPlaneHint())
+        column.addWidget(self._buildPlaneActions())
         return widget
 
     def _buildPlaneHint(self):
@@ -667,17 +770,13 @@ class SectionPanel(QWidget):
 
     def _buildPlaneActions(self):
         """Plan 37 UF11. Name the plane being edited; add or delete one."""
-        widget = QWidget()
-        row = QHBoxLayout(widget)
-        row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(self.tr('Name'))
         self._nameEdit = QLineEdit()
         self._nameEdit.setObjectName('sectionPlaneName')
         self._nameEdit.setAccessibleName(self.tr('Plane name'))
+        self._nameEdit.setPlaceholderText(self.tr('Plane name'))
         self._nameEdit.setToolTip(self.tr(
             'The name of the plane being edited. Press Enter to rename it.'))
         self._nameEdit.setMaxLength(40)
-        label.setBuddy(self._nameEdit)
         self._addPlaneButton = QPushButton(self.tr('Add plane'))
         self._addPlaneButton.setObjectName('sectionAddPlane')
         self._deletePlaneButton = QPushButton(self.tr('Delete plane'))
@@ -687,15 +786,13 @@ class SectionPanel(QWidget):
         self._planeNote.setWordWrap(True)
         self._planeNote.setAccessibleName(self.tr('Plane note'))
         self._planeNote.setVisible(False)
-        row.addWidget(label)
-        row.addWidget(self._nameEdit, 1)
-        row.addWidget(self._addPlaneButton)
-        row.addWidget(self._deletePlaneButton)
         outer = QWidget()
         column = QVBoxLayout(outer)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
-        column.addWidget(widget)
+        column.addWidget(self._row(
+            None, self._nameEdit, self._addPlaneButton,
+            self._deletePlaneButton, stretch=False))
         column.addWidget(self._planeNote)
         return outer
 
@@ -821,23 +918,25 @@ class SectionPanel(QWidget):
         self.renamePlane(self._active, self._nameEdit.text())
 
     def _buildPlacement(self):
+        """Plan 45 L (P4). The plane being edited, in rows of three controls
+        or fewer: the normal, the offset and its step, the position, how a
+        handle drags and where the plane snaps to."""
         widget = QWidget()
-        grid = QGridLayout(widget)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setVerticalSpacing(3)
+        column = QVBoxLayout(widget)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(GAP_TIGHT)
 
-        grid.addWidget(QLabel(self.tr('Normal')), 0, 0)
         presets = QHBoxLayout()
         presets.setContentsMargins(0, 0, 0, 0)
+        presets.setSpacing(0)
         self._axisButtons = []
         # VI10 (F2c). A plane is named by the axes it spans; the letter
         # beneath is the normal the button sets.
         for axis, (label, spans) in enumerate(
                 (('X', 'YZ'), ('Y', 'XZ'), ('Z', 'XY'))):
             button = _compactButton(
-                '{0}\n{1}'.format(spans, label),
-                self.tr('{0} plane (normal {1})').format(spans, label),
-                width=40)
+                PRESET_TEXT.format(spans, label),
+                self.tr('{0} plane (normal {1})').format(spans, label))
             button.setAccessibleName(
                 self.tr('{0} plane, normal {1}').format(spans, label))
             presets.addWidget(button)
@@ -857,23 +956,23 @@ class SectionPanel(QWidget):
         self._lookButton.setToolTip(self.tr(
             'Look straight at the cut, square on, without perspective. Press '
             'again to put the camera back.'))
-        presets.addWidget(self._viewNormalButton)
-        presets.addWidget(self._flipButton)
-        presets.addWidget(self._lookButton)
-        presets.addStretch(1)
-        grid.addLayout(presets, 0, 1)
+        column.addWidget(self._row(
+            self.tr('Normal'), presets, self._viewNormalButton,
+            self._flipButton, name='sectionNormalRow'))
 
-        grid.addWidget(QLabel(self.tr('Offset')), 1, 0)
-        offsetRow = QHBoxLayout()
-        offsetRow.setContentsMargins(0, 0, 0, 0)
         self._offsetEdit = _field(96)
         self._offsetEdit.setObjectName('sectionOffset')
         self._offsetEdit.setAccessibleName(self.tr('Plane offset'))
         self._offsetUnit = QLabel()
         self._offsetUnit.setObjectName('sectionOffsetUnit')
+        offsetField = QHBoxLayout()
+        offsetField.setContentsMargins(0, 0, 0, 0)
+        offsetField.setSpacing(GAP_TIGHT)
+        offsetField.addWidget(self._offsetEdit)
+        offsetField.addWidget(self._offsetUnit)
         self._stepDown = _compactButton(
             '−', self.tr('Move the plane back one step. Keyboard: PgDn, '
-                         'or Shift+PgDn for a fine step.'))
+                              'or Shift+PgDn for a fine step.'))
         self._stepDown.setObjectName('sectionStepBack')
         self._stepDown.setAccessibleName(self.tr('Step plane back'))
         self._stepUp = _compactButton(
@@ -881,6 +980,10 @@ class SectionPanel(QWidget):
                          'or Shift+PgUp for a fine step.'))
         self._stepUp.setObjectName('sectionStepForward')
         self._stepUp.setAccessibleName(self.tr('Step plane forward'))
+        column.addWidget(self._row(
+            self.tr('Offset'), offsetField, self._stepDown, self._stepUp,
+            name='sectionOffsetRow'))
+
         self._stepChoice = QComboBox()
         self._stepChoice.setObjectName('sectionStepChoice')
         self._stepChoice.setAccessibleName(self.tr('Step size'))
@@ -896,16 +999,13 @@ class SectionPanel(QWidget):
         self._stepEdit.setPlaceholderText(self.tr('step'))
         self._stepNote = QLabel()
         self._stepNote.setObjectName('sectionStepNote')
-        offsetRow.addWidget(self._offsetEdit)
-        offsetRow.addWidget(self._offsetUnit)
-        offsetRow.addWidget(self._stepDown)
-        offsetRow.addWidget(self._stepUp)
-        offsetRow.addWidget(self._stepChoice)
-        offsetRow.addWidget(self._stepEdit)
-        offsetRow.addWidget(self._stepNote, 1)
-        grid.addLayout(offsetRow, 1, 1)
+        self._stepNote.setWordWrap(True)
+        self._stepNote.setIndent(CAPTION_WIDTH)
+        column.addWidget(self._row(
+            self.tr('Step'), self._stepChoice, self._stepEdit,
+            name='sectionStepRow'))
+        column.addWidget(self._stepNote)
 
-        grid.addWidget(QLabel(self.tr('Position')), 2, 0)
         self._positionSlider = QSlider(Qt.Orientation.Horizontal)
         self._positionSlider.setObjectName('sectionPosition')
         self._positionSlider.setRange(0, SLIDER_STEPS)
@@ -913,11 +1013,10 @@ class SectionPanel(QWidget):
         self._positionSlider.setToolTip(
             self.tr('Sweep the plane across the model along its normal'))
         self._positionSlider.setAccessibleName(self.tr('Plane position'))
-        grid.addWidget(self._positionSlider, 2, 1)
+        column.addWidget(self._row(
+            self.tr('Position'), self._positionSlider, stretch=False,
+            name='sectionPositionRow'))
 
-        grid.addWidget(QLabel(self.tr('Drag')), 3, 0)
-        dragRow = QHBoxLayout()
-        dragRow.setContentsMargins(0, 0, 0, 0)
         self._dragAxis = QComboBox()
         self._dragAxis.setObjectName('sectionDragAxis')
         self._dragAxis.addItem(self.tr('Free'), None)
@@ -928,12 +1027,6 @@ class SectionPanel(QWidget):
         self._dragAxis.setCurrentIndex(4)
         self._dragAxis.setToolTip(
             self.tr('Which direction the handle is allowed to move in'))
-        self._snapCentre = QPushButton(self.tr('Centre'))
-        self._snapCentre.setObjectName('sectionSnapCentre')
-        self._snapCentre.setToolTip(self.tr('Put the plane through the middle of the model'))
-        self._snapOrigin = QPushButton(self.tr('Origin'))
-        self._snapOrigin.setObjectName('sectionSnapOrigin')
-        self._snapOrigin.setToolTip(self.tr('Put the plane through (0, 0, 0)'))
         # DP-695. A placed plane that any handle press can move is a plane
         # that moves while the user only meant to turn the model.
         self._lock = QCheckBox(self.tr('Lock'))
@@ -943,30 +1036,67 @@ class SectionPanel(QWidget):
             'drag in the viewport turns the camera. Ctrl+drag a handle to '
             'move the plane anyway; untick to drag handles without Ctrl.'))
         self._lock.setAccessibleName(self.tr('Lock section plane'))
-        self._advancedButton = QPushButton(self.tr('Advanced'))
+        column.addWidget(self._row(
+            self.tr('Drag'), self._dragAxis, self._lock,
+            name='sectionDragRow'))
+
+        self._snapCentre = QPushButton(self.tr('Centre'))
+        self._snapCentre.setObjectName('sectionSnapCentre')
+        self._snapCentre.setToolTip(self.tr('Put the plane through the middle of the model'))
+        self._snapOrigin = QPushButton(self.tr('Origin'))
+        self._snapOrigin.setObjectName('sectionSnapOrigin')
+        self._snapOrigin.setToolTip(self.tr('Put the plane through (0, 0, 0)'))
+        column.addWidget(self._row(
+            self.tr('Place'), self._snapCentre, self._snapOrigin,
+            self._lookButton, name='sectionPlaceRow'))
+        return widget
+
+    def _buildMore(self):
+        """Plan 45 L (P4). *More…*: how the planes combine, which whole
+        cells stay, and the typed entry (point, normal, turns, equation). The
+        button keeps the Advanced button's name and signal."""
+        self._advancedButton = QPushButton(self.tr('More…'))
         self._advancedButton.setObjectName('sectionAdvanced')
         self._advancedButton.setCheckable(True)
         self._advancedButton.setToolTip(self.tr(
-            'Type the normal and a point on the plane, or turn the normal by '
-            'angles'))
-        dragRow.addWidget(self._dragAxis)
-        dragRow.addWidget(self._lock)
-        dragRow.addWidget(self._snapCentre)
-        dragRow.addWidget(self._snapOrigin)
-        dragRow.addStretch(1)
-        dragRow.addWidget(self._advancedButton)
-        grid.addLayout(dragRow, 3, 1)
+            'How the planes combine and which whole cells stay; type the '
+            'normal and a point on the plane, or turn the normal by angles'))
+        self._advancedButton.setAccessibleName(
+            self.tr('More section settings'))
+        outer = QWidget()
+        column = QVBoxLayout(outer)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(GAP_TIGHT)
+        column.addWidget(self._row(None, self._advancedButton,
+                                   name='sectionMoreRow'))
+        pane = QWidget()
+        pane.setObjectName('sectionMorePane')
+        paneColumn = QVBoxLayout(pane)
+        paneColumn.setContentsMargins(0, 0, 0, 0)
+        paneColumn.setSpacing(GAP)
+        paneColumn.addWidget(self._buildPieces())
+        paneColumn.addWidget(self._buildAdvanced())
+        pane.setVisible(False)
+        self._morePane = pane
+        column.addWidget(pane)
+        return outer
 
-        grid.setColumnStretch(1, 1)
-        return widget
+    def _moreToggled(self, shown: bool) -> None:
+        self._morePane.setVisible(bool(shown))
+        self._advanced.setVisible(bool(shown))
+
+    def isMoreShown(self) -> bool:
+        return not self._morePane.isHidden()
 
     def _buildAdvanced(self):
         """Absolute entry: a point on the plane, the normal, relative turns."""
         widget = QWidget()
         widget.setObjectName('sectionAdvancedPane')
-        grid = QGridLayout(widget)
+        # Plan 45 L (P4): one row per quantity; a triple of coordinates is
+        # one control.
+        grid = QVBoxLayout(widget)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setVerticalSpacing(3)
+        grid.setSpacing(GAP_TIGHT)
 
         self._originFields = [_field() for _ in range(3)]
         self._normalFields = [_field() for _ in range(3)]
@@ -975,19 +1105,16 @@ class SectionPanel(QWidget):
         for axis, edit in zip('XYZ', self._normalFields):
             edit.setAccessibleName(self.tr('Normal {0}').format(axis))
 
-        grid.addWidget(QLabel(self.tr('Point')), 0, 0)
         originRow = QHBoxLayout()
         originRow.setContentsMargins(0, 0, 0, 0)
         for edit in self._originFields:
             originRow.addWidget(edit)
         self._pointUnit = QLabel()
         originRow.addWidget(self._pointUnit)
-        originRow.addStretch(1)
-        grid.addLayout(originRow, 0, 1)
+        grid.addWidget(self._row(self.tr('Point'), originRow))
 
         # VI10 (F2d). A relative move: type how far, press Enter, the plane
         # goes there and the box clears.
-        grid.addWidget(QLabel(self.tr('Move by')), 1, 0)
         deltaRow = QHBoxLayout()
         deltaRow.setContentsMargins(0, 0, 0, 0)
         self._deltaFields = [_field(56) for _ in range(3)]
@@ -1002,20 +1129,14 @@ class SectionPanel(QWidget):
             deltaRow.addWidget(edit)
         self._deltaUnit = QLabel()
         deltaRow.addWidget(self._deltaUnit)
-        deltaRow.addStretch(1)
-        grid.addLayout(deltaRow, 1, 1)
+        grid.addWidget(self._row(self.tr('Move by'), deltaRow))
 
-        grid.addWidget(QLabel(self.tr('Normal')), 2, 0)
         normalRow = QHBoxLayout()
         normalRow.setContentsMargins(0, 0, 0, 0)
         for edit in self._normalFields:
             normalRow.addWidget(edit)
-        normalRow.addStretch(1)
-        grid.addLayout(normalRow, 2, 1)
+        grid.addWidget(self._row(self.tr('Normal'), normalRow))
 
-        grid.addWidget(QLabel(self.tr('Turn')), 3, 0)
-        turnRow = QHBoxLayout()
-        turnRow.setContentsMargins(0, 0, 0, 0)
         self._tiltField = _field(56)
         self._tiltField.setText(_NO_TURN)
         self._tiltField.setAccessibleName(self.tr('Tilt angle'))
@@ -1033,18 +1154,20 @@ class SectionPanel(QWidget):
         self._rotateButton.setToolTip(self.tr(
             'Turn the normal by these angles about the point on the plane'))
         # DP-1103: the unit follows its box as everywhere else (DP-164).
-        turnRow.addWidget(QLabel(self.tr('tilt')))
-        turnRow.addWidget(self._tiltField)
-        turnRow.addWidget(UnitLabel('deg'))
-        turnRow.addWidget(QLabel(self.tr('then')))
-        turnRow.addWidget(self._turnField)
-        turnRow.addWidget(UnitLabel('deg'))
-        turnRow.addWidget(self._rotateButton)
-        turnRow.addStretch(1)
-        grid.addLayout(turnRow, 3, 1)
+        tilt = QHBoxLayout()
+        tilt.setContentsMargins(0, 0, 0, 0)
+        tilt.addWidget(QLabel(self.tr('tilt')))
+        tilt.addWidget(self._tiltField)
+        tilt.addWidget(UnitLabel('deg'))
+        turn = QHBoxLayout()
+        turn.setContentsMargins(0, 0, 0, 0)
+        turn.addWidget(QLabel(self.tr('then')))
+        turn.addWidget(self._turnField)
+        turn.addWidget(UnitLabel('deg'))
+        grid.addWidget(self._row(self.tr('Turn'), tilt, turn))
+        grid.addWidget(self._row(QLabel(''), self._rotateButton))
 
         # VI10 (F3b). How see-through the sheet is.
-        grid.addWidget(QLabel(self.tr('Sheet opacity')), 4, 0)
         opacityRow = QHBoxLayout()
         opacityRow.setContentsMargins(0, 0, 0, 0)
         self._sheetOpacity = QSlider(Qt.Orientation.Horizontal)
@@ -1060,11 +1183,10 @@ class SectionPanel(QWidget):
             '{0} %'.format(DEFAULT_SHEET_PERCENT))
         opacityRow.addWidget(self._sheetOpacity, 1)
         opacityRow.addWidget(self._sheetOpacityValue)
-        grid.addLayout(opacityRow, 4, 1)
+        grid.addWidget(self._row(self.tr('Sheet'), opacityRow, stretch=False))
 
         # Plan 42 SG12 (was the Gmsh Clip tab). The same plane as an equation
         # a x + b y + c z + d = 0; the side a x + b y + c z + d >= 0 stays.
-        grid.addWidget(QLabel(self.tr('Equation')), 5, 0)
         equationRow = QHBoxLayout()
         equationRow.setContentsMargins(0, 0, 0, 0)
         self._equationFields = [_field(64) for _ in range(4)]
@@ -1077,16 +1199,15 @@ class SectionPanel(QWidget):
                 'a x + b y + c z + d is not negative stays. d is in the '
                 'unit beside the point.'))
             equationRow.addWidget(edit)
-        equationRow.addStretch(1)
-        grid.addLayout(equationRow, 5, 1)
+        grid.addWidget(self._row(self.tr('Equation'), equationRow))
 
         self._referenceLabel = QLabel()
         self._referenceLabel.setObjectName('sectionReference')
         self._referenceLabel.setToolTip(self.tr(
             'The offset is measured from this point, fixed when the section '
             'was made'))
-        grid.addWidget(self._referenceLabel, 6, 0, 1, 2)
-        grid.setColumnStretch(1, 1)
+        self._referenceLabel.setWordWrap(True)
+        grid.addWidget(self._referenceLabel)
 
         widget.setVisible(False)
         self._advanced = widget
@@ -1103,8 +1224,9 @@ class SectionPanel(QWidget):
         cut exactly in the mesh worker, without loading the whole volume.
         """
         widget = QWidget()
-        row = QHBoxLayout(widget)
-        row.setContentsMargins(0, 0, 0, 0)
+        column = QVBoxLayout(widget)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(GAP_TIGHT)
         self._statusLabel = QLabel()
         self._statusLabel.setObjectName('sectionStatus')
         self._statusLabel.setWordWrap(True)
@@ -1126,40 +1248,32 @@ class SectionPanel(QWidget):
             'Stop working out this section; the previous one stays'))
         self._cancelButton.setVisible(False)
         self._cancelButton.clicked.connect(self.cancelSectionRequested)
-        row.addWidget(self._statusLabel, 1)
-        row.addWidget(self._cancelButton)
-        row.addWidget(self._loadCellsButton)
-        row.addWidget(self._loadVolumeButton)
+        column.addWidget(self._statusLabel)
+        column.addWidget(self._row(
+            None, self._cancelButton, self._loadCellsButton,
+            self._loadVolumeButton, name='sectionStatusActions'))
         return widget
 
     def _buildColour(self):
         """Plan 37 UF9. *Colour cut by*: quality, cell type, refinement
         level or region, read per cell -- a choice with no values here is
         disabled and says why, never drawn as zeros."""
-        widget = QWidget()
-        row = QHBoxLayout(widget)
-        row.setContentsMargins(0, 0, 0, 0)
-        label = QLabel(self.tr('Colour cut by'))
         self._colourBox = QComboBox()
         self._colourBox.setObjectName('sectionColourBy')
         self._colourBox.setAccessibleName(self.tr('Colour cut by'))
         for item in section_colour.CHOICES:
             self._colourBox.addItem(self.tr(item.label), item.key)
-        label.setBuddy(self._colourBox)
+        _fitCombo(self._colourBox)
         self._colourBox.currentIndexChanged.connect(self._colourPicked)
         self._colourLegend = QLabel()
         self._colourLegend.setObjectName('sectionColourLegend')
         self._colourLegend.setWordWrap(True)
         self._colourLegend.setAccessibleName(self.tr('Colour legend'))
-        row.addWidget(label)
-        row.addWidget(self._colourBox)
-        row.addWidget(self._colourLegend, 1)
         # VI10b (F2h). Rescale to this cut, and which range the scale holds.
         self._rescaleButton = QPushButton(self.tr('Rescale to cut'))
         self._rescaleButton.setObjectName('sectionRescale')
         self._rescaleButton.setToolTip(self.tr(
             'Fit the colour scale to the cells on screen now'))
-        scaleLabel = QLabel(self.tr('Scale'))
         self._scaleBox = QComboBox()
         self._scaleBox.setObjectName('sectionColourScale')
         self._scaleBox.setAccessibleName(self.tr('Colour scale'))
@@ -1177,19 +1291,16 @@ class SectionPanel(QWidget):
                 Qt.ItemDataRole.ToolTipRole)
         self._scaleBox.setCurrentIndex(
             self._scaleBox.findData(ScalePolicy.CUT))
-        scaleLabel.setBuddy(self._scaleBox)
-        second = QHBoxLayout()
-        second.setContentsMargins(0, 0, 0, 0)
-        second.addWidget(scaleLabel)
-        second.addWidget(self._scaleBox)
-        second.addWidget(self._rescaleButton)
-        second.addStretch(1)
         outer = QWidget()
         column = QVBoxLayout(outer)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
-        column.addWidget(widget)
-        column.addLayout(second)
+        column.addWidget(self._row(self.tr('Colour by'), self._colourBox,
+                                   stretch=False, name='sectionColourRow'))
+        column.addWidget(self._colourLegend)
+        column.addWidget(self._row(self.tr('Scale'), self._scaleBox,
+                                   self._rescaleButton,
+                                   name='sectionScaleRow'))
         return outer
 
     def _colourPicked(self, index):
@@ -1249,10 +1360,11 @@ class SectionPanel(QWidget):
         if gmsh == getattr(self, '_compareGmsh', None):
             return
         for box in self._compareBoxes.values():
-            self._compareRow.removeWidget(box)
+            self._compareGrid.removeWidget(box)
             box.deleteLater()
         self._compareBoxes = {}
-        position = 1
+        # Plan 45 L (P4): three stages to a row.
+        position = 0
         for stage, label, ticked in stage_compare.stage_list(gmsh):
             box = QCheckBox(self.tr(label))
             box.setObjectName(('sectionCompareGmsh' + label) if gmsh else
@@ -1264,7 +1376,7 @@ class SectionPanel(QWidget):
                     self.tr('pass of the Gmsh session') if gmsh
                     else self.tr('snapshot')))
             self._compareBoxes[stage] = box
-            self._compareRow.insertWidget(position, box)
+            self._compareGrid.addWidget(box, position // 3, position % 3)
             position += 1
         self._compareGmsh = gmsh
 
@@ -1273,11 +1385,13 @@ class SectionPanel(QWidget):
         column = QVBoxLayout(widget)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(QLabel(self.tr('Compare')))
-        row.addStretch(1)
-        self._compareRow = row
+        caption = QLabel(self.tr('Compare stages'))
+        stages = QWidget()
+        stages.setObjectName('sectionCompareStages')
+        self._compareGrid = QGridLayout(stages)
+        self._compareGrid.setContentsMargins(0, 0, 0, 0)
+        self._compareGrid.setHorizontalSpacing(GAP)
+        self._compareGrid.setVerticalSpacing(GAP_TIGHT)
         self._compareBoxes = {}
         self._compareGmsh = None
         self.setCompareGmsh(False)
@@ -1292,8 +1406,6 @@ class SectionPanel(QWidget):
         self._compareClearButton.setToolTip(
             self.tr('Take the stage comparison down'))
         self._compareClearButton.setEnabled(False)
-        row.addWidget(self._compareButton)
-        row.addWidget(self._compareClearButton)
         self._compareResults = QLabel()
         self._compareResults.setObjectName('sectionCompareResults')
         self._compareResults.setWordWrap(True)
@@ -1317,7 +1429,11 @@ class SectionPanel(QWidget):
             self.tr('Stage comparison is out of date'))
         self._compareStale.setVisible(False)
         self._compareStaleState = False
-        column.addLayout(row)
+        column.addWidget(caption)
+        column.addWidget(stages)
+        column.addWidget(self._row(
+            None, self._compareButton, self._compareClearButton,
+            name='sectionCompareActions'))
         column.addWidget(self._compareStale)
         column.addWidget(self._compareResults)
         column.addWidget(self._compareLegend)
@@ -1387,8 +1503,6 @@ class SectionPanel(QWidget):
         column = QVBoxLayout(widget)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(GAP_TIGHT)
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
         self._freezeButton = QPushButton(self.tr('Freeze cells'))
         self._freezeButton.setObjectName('sectionFreeze')
         self._freezeButton.setToolTip(self.tr(
@@ -1399,15 +1513,14 @@ class SectionPanel(QWidget):
         self._unfreezeButton.setObjectName('sectionUnfreeze')
         self._unfreezeButton.setToolTip(self.tr('Let the frozen cells go'))
         self._unfreezeButton.setEnabled(False)
-        row.addWidget(self._freezeButton)
-        row.addWidget(self._unfreezeButton)
-        row.addStretch(1)
         self._frozenNote = QLabel()
         self._frozenNote.setObjectName('sectionFrozenNote')
         self._frozenNote.setWordWrap(True)
         self._frozenNote.setAccessibleName(self.tr('Frozen cells'))
         self._frozenNote.setVisible(False)
-        column.addLayout(row)
+        column.addWidget(self._row(
+            None, self._freezeButton, self._unfreezeButton,
+            name='sectionFreezeRow'))
         column.addWidget(self._frozenNote)
         self._freezeButton.clicked.connect(self.freezeRequested.emit)
         self._unfreezeButton.clicked.connect(self.unfreezeRequested.emit)
@@ -1424,9 +1537,12 @@ class SectionPanel(QWidget):
         return self._frozenNote.text()
 
     def _buildFooter(self):
+        """Live, Clear, Apply: under both tabs (Plan 45 L)."""
         widget = QWidget()
-        row = QHBoxLayout(widget)
-        row.setContentsMargins(0, 0, 0, 0)
+        widget.setObjectName('sectionFooter')
+        column = QVBoxLayout(widget)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(GAP_TIGHT)
 
         self._live = QCheckBox(self.tr('Live'))
         self._live.setObjectName('sectionLive')
@@ -1435,6 +1551,8 @@ class SectionPanel(QWidget):
             'Re-cut while the handle is dragged. Large meshes fall back to '
             'updating when the drag ends, and say so here.'))
         self._liveNote = QLabel()
+        self._liveNote.setObjectName('sectionLiveNote')
+        self._liveNote.setWordWrap(True)
         self._liveNote.setVisible(False)
         self._clearButton = QPushButton(self.tr('Clear'))
         self._clearButton.setObjectName('sectionClear')
@@ -1444,11 +1562,14 @@ class SectionPanel(QWidget):
         self._applyButton.setToolTip(
             self.tr('Re-cut now. Only needed when Live is off.'))
 
-        row.addWidget(self._live)
-        row.addWidget(self._liveNote, 1)
-        row.addStretch(1)
-        row.addWidget(self._clearButton)
-        row.addWidget(self._applyButton)
+        row = self._row(None, self._live, stretch=False,
+                        name='sectionFooterRow')
+        strip = row.layout()
+        strip.addStretch(1)
+        strip.addWidget(self._clearButton)
+        strip.addWidget(self._applyButton)
+        column.addWidget(row)
+        column.addWidget(self._liveNote)
         return widget
 
     # -- public state ------------------------------------------------------ #
@@ -1844,7 +1965,7 @@ class SectionPanel(QWidget):
         self._viewNormalButton.clicked.connect(self.viewNormalRequested)
         self._flipButton.clicked.connect(self._flip)
         self._lookButton.toggled.connect(self.lookAlongRequested)
-        self._advancedButton.toggled.connect(self._advanced.setVisible)
+        self._advancedButton.toggled.connect(self._moreToggled)
         self._snapCentre.clicked.connect(self._snapToCentre)
         self._snapOrigin.clicked.connect(self._snapToOrigin)
         self._positionSlider.valueChanged.connect(self._positionChanged)
@@ -2043,7 +2164,8 @@ class SectionPanel(QWidget):
         scale, _suffix = self._unit()
         edit = self._originFields[axis]
         plane = self._activePlane()
-        if edit.text() == to_display(plane.origin[axis], scale):
+        if edit.text() == to_display(plane.origin[axis], scale,
+                                     self._noise()):
             return
         try:
             value = from_display(edit.text(), scale)
@@ -2111,7 +2233,7 @@ class SectionPanel(QWidget):
         scale, _suffix = self._unit()
         plane = self._activePlane()
         text = self._offsetEdit.text()
-        if text == to_display(plane.distance, scale):
+        if text == to_display(plane.distance, scale, self._noise()):
             return
         try:
             metres = from_display(text, scale)
@@ -2203,6 +2325,13 @@ class SectionPanel(QWidget):
             return 1.0, 'm'
         return display_unit(max(self._bounds.size()))
 
+    def _noise(self):
+        """Plan 45 V7. Metres below which a length on this model reads 0
+        (arithmetic noise, not a place); 0 with no model."""
+        if self._bounds is None:
+            return 0.0
+        return display_noise(max(self._bounds.size()))
+
     def _span(self, unitNormal):
         """Extent of the model measured along ``unitNormal``."""
         if self._bounds is None:
@@ -2225,7 +2354,8 @@ class SectionPanel(QWidget):
         if not source:
             return ''
         scale, suffix = self._unit()
-        amount = '{0} {1}'.format(to_display(step, scale), suffix)
+        amount = '{0} {1}'.format(
+            to_display(step, scale, self._noise()), suffix)
         if source == 'cell':
             return self.tr('≈ {0} (cell scale)').format(amount)
         if source == 'kept':
@@ -2260,18 +2390,19 @@ class SectionPanel(QWidget):
                 self._solo = None
             scale, suffix = self._unit()
             plane = self._activePlane()
+            noise = self._noise()
             for axis in range(3):
                 self._originFields[axis].setText(
-                    to_display(plane.origin[axis], scale))
+                    to_display(plane.origin[axis], scale, noise))
                 self._normalFields[axis].setText(
-                    '{:.6g}'.format(plane.normal[axis]))
+                    '{:.6g}'.format(clean(plane.normal[axis], NORMAL_NOISE)))
             a, b, c, d = to_equation(plane.origin, plane.normalised())
             for edit, value in zip(self._equationFields, (a, b, c)):
-                edit.setText('{:.6g}'.format(value))
-            self._equationFields[3].setText(to_display(d, scale))
+                edit.setText('{:.6g}'.format(clean(value, NORMAL_NOISE)))
+            self._equationFields[3].setText(to_display(d, scale, noise))
             self._pointUnit.setText(suffix)
             self._deltaUnit.setText(suffix)
-            reference = ', '.join(to_display(value, scale)
+            reference = ', '.join(to_display(value, scale, noise)
                                   for value in plane.reference)
             self._referenceLabel.setText(
                 self.tr('Offset measured from ({0}) {1}').format(
@@ -2280,6 +2411,7 @@ class SectionPanel(QWidget):
             for index, widgets in enumerate(self._rowWidgets):
                 for item in widgets:
                     item.setVisible(index < count)
+                self._planeRowHosts[index].setVisible(index < count)
                 if index >= count:
                     self._soloButtons[index].setChecked(False)
                     self._enableBoxes[index].setChecked(False)
@@ -2294,10 +2426,11 @@ class SectionPanel(QWidget):
                 self._enableBoxes[index].setAccessibleName(
                     self.tr('Enable {0}').format(name))
                 self._enableBoxes[index].setChecked(state.enabled)
-                unitNormal = state.normalised()
+                unitNormal = [clean(value, NORMAL_NOISE)
+                              for value in state.normalised()]
                 self._summaries[index].setText(
                     '{0} {1}  ⟂ {2:.2g}, {3:.2g}, {4:.2g}'.format(
-                        ', '.join(aligned(value * scale
+                        ', '.join(aligned(clean(value, noise) * scale
                                           for value in state.origin)),
                         suffix, *unitNormal))
                 # VI10 (F3a). The button shows the plane's own preference.
@@ -2324,7 +2457,7 @@ class SectionPanel(QWidget):
                     else self.tr('Turn {0} on first').format(name))
 
             offset = plane.distance
-            self._offsetEdit.setText(to_display(offset, scale))
+            self._offsetEdit.setText(to_display(offset, scale, noise))
             self._offsetUnit.setText(suffix)
             self._offsetEdit.setToolTip(self.tr(
                 'Signed distance of the plane from its reference point, '

@@ -211,7 +211,9 @@ class ConsoleBandController(OutputBandController):
             # Ctrl+J make).
             self._header.minimiseRequested.connect(
                 lambda: self.minimise())
-            self._header.restoreRequested.connect(lambda: self.open())
+            # Plan 45 H: in focus mode too (it ends focus mode first).
+            self._header.restoreRequested.connect(
+                lambda: self.restore_from_chip())
         self._tabs.currentChanged.connect(lambda _index: self.tab_changed())
 
     def configure(self, *, layout: ConsoleLayout, window_height=lambda: None,
@@ -310,6 +312,17 @@ class ConsoleBandController(OutputBandController):
         finally:
             self._programmatic -= 1
         self._geometry_changed()
+
+    def _set_band_height(self, height: int) -> None:
+        """``reveal`` (Details) grows the band through the console's own
+        height rule. On the Mesh quality tab the raise is for this visit:
+        leaving the tab folds back to the console's own height."""
+        if self._on_quality_tab():
+            own = clamp_height(
+                self._console.resolved_height(self._window_height()))
+            if own < height:
+                self._quality_raised = True
+        self._apply_height(height)
 
     def set_height(self, height: int | None) -> None:
         """A preset or a number (``None`` is the standard) -- and keep it."""

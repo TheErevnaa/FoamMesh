@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
     QScrollArea, QSizePolicy, QSlider, QToolButton, QVBoxLayout, QWidget)
 
-from foammesh.view.theming.icons import load_themed_icon
+from foammesh.view.theming.icons import apply_tinted_icon
 from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT, apply_bar_metrics
 
 from .region_picker import ALL
@@ -35,11 +35,19 @@ SWATCH = 10
 #: share of the row's font.
 ROLE_FONT_SHARE = 0.85
 ROW_ICON = QSize(14, 14)
+#: Plan 45 V8. The eye and the isolate glyphs of a part row are drawn with
+#: strokes at least this wide on screen. Their SVGs stroke 20 to 32 units of a
+#: 512 viewBox -- 0.55 to 0.9 px at 14 px, the isolate's satellites dashed at
+#: 60% opacity on top of that -- and drew as a grey smudge.
+ROW_GLYPH_STROKE_PX = 1.25
 #: DP-712. The parts list may take this share of the viewport's height, and
 #: scrolls past it. A fixed 180 px showed six rows of a 40-part mesh on a
 #: tall window and still covered half of a short one.
 PARTS_HEIGHT_SHARE = 0.4
 PARTS_MIN_HEIGHT = 96
+#: Plan 45 M. In the Parts popover the list shows this many rows without a
+#: scrollbar and scrolls from the next one on.
+PARTS_VISIBLE_ROWS = 10
 #: Plan 35 CR3. Patches listed by name under an outline; the rest are counted.
 NOTICE_PATCHES = 12
 #: UXB5. The card never grows past this share of the viewport's width, nor
@@ -190,6 +198,32 @@ def _swatch(color: QColor) -> QPixmap:
     return pixmap
 
 
+class _PartsScroll(QScrollArea):
+    """The parts list. In the Parts popover its preferred height is exactly
+    that of the first ``PARTS_VISIBLE_ROWS`` rows (headings between them
+    included), and it takes whatever more the popover is given."""
+
+    def __init__(self):
+        super().__init__()
+        self.rowsHeight = None   # callable -> int, set by the overlay
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        if self.rowsHeight is not None:
+            height = self.rowsHeight()
+            if height is not None:
+                hint.setHeight(height)
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        if self.rowsHeight is not None:
+            height = self.rowsHeight()
+            if height is not None:
+                hint.setHeight(min(height, PARTS_MIN_HEIGHT))
+        return hint
+
+
 class PartRow(QWidget):
     """One part: its colour, its name, an eye, and a solo button."""
 
@@ -235,11 +269,16 @@ class PartRow(QWidget):
         self._eye.setToolTip(self.tr('Show or hide {0}').format(name))
         self._eye.setAccessibleName(self._eye.toolTip())
         self._eye.setAutoRaise(True)
+        self._setEyeIcon(True)
 
+        # Plan 45 V8. The glyphs are token icons, drawn again on every theme
+        # change: tinted once, from the palette of the moment, the isolate
+        # glyph kept the dark theme's pale ink on the light popover (and the
+        # eye kept it until it was next pressed).
         self._solo = QToolButton()
         self._solo.setObjectName('overlayPartSolo')
-        self._solo.setIcon(load_themed_icon(':/graphicsIcons/isolate.svg'))
-        self._solo.setIconSize(ROW_ICON)
+        apply_tinted_icon(self._solo, ':/graphicsIcons/isolate.svg',
+                          ROW_ICON, ROW_GLYPH_STROKE_PX)
         self._solo.setAutoRaise(True)
         self._solo.setToolTip(self.tr('Show only {0}').format(name))
         self._solo.setAccessibleName(self._solo.toolTip())
@@ -305,10 +344,13 @@ class PartRow(QWidget):
     def setVisibleState(self, visible: bool):
         was = self._eye.blockSignals(True)
         self._eye.setChecked(visible)
-        self._eye.setIcon(load_themed_icon(
-            ':/graphicsIcons/bulb-on.svg' if visible
-            else ':/graphicsIcons/bulb-off.svg'))
+        self._setEyeIcon(visible)
         self._eye.blockSignals(was)
+
+    def _setEyeIcon(self, visible: bool) -> None:
+        apply_tinted_icon(self._eye, ':/graphicsIcons/bulb-on.svg' if visible
+                          else ':/graphicsIcons/bulb-off.svg',
+                          ROW_ICON, ROW_GLYPH_STROKE_PX)
 
 
 class GmshEntityGroup(QFrame):
@@ -668,7 +710,8 @@ class ViewportOverlay(QFrame):
         self._partsLayout.setContentsMargins(0, 0, 0, 0)
         self._partsLayout.setSpacing(0)
 
-        scroll = QScrollArea()
+        scroll = _PartsScroll()
+        scroll.rowsHeight = self._railRowsHeight
         scroll.setObjectName('overlayPartsScroll')
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -709,9 +752,8 @@ class ViewportOverlay(QFrame):
         self._sectionPanel = SectionPanel()
         self._sectionToggle = QToolButton()
         self._sectionToggle.setObjectName('overlaySectionToggle')
-        self._sectionToggle.setIcon(
-            load_themed_icon(':/graphicsIcons/section.svg'))
-        self._sectionToggle.setIconSize(ROW_ICON)
+        apply_tinted_icon(self._sectionToggle, ':/graphicsIcons/section.svg',
+                          ROW_ICON, ROW_GLYPH_STROKE_PX)
         self._sectionToggle.setText(self.tr('Cut plane'))
         self._sectionToggle.setToolButtonStyle(
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -748,6 +790,9 @@ class ViewportOverlay(QFrame):
     def setRailMode(self, on: bool):
         """The card is the one-line readout; the lists live in popovers."""
         self._railMode = bool(on)
+        # Plan 45 (user 2026-10-17): the rail's Parts button is the one way
+        # into the Parts list, so the card's arrow is not shown beside it.
+        self._toggle.setVisible(not self._railMode)
         if self._railMode:
             self._body.setVisible(False)
             self._expanded = False
@@ -755,6 +800,8 @@ class ViewportOverlay(QFrame):
             self._toggle.setToolTip(self.tr('Open the parts list'))
             self._toggle.setAccessibleName(self._toggle.toolTip())
             self._chip.setMinimumWidth(0)
+        self._capPartsHeight()
+        self._partsScroll.updateGeometry()
         self._refreshChip()
         self.adjustSize()
 
@@ -768,6 +815,9 @@ class ViewportOverlay(QFrame):
         if panel is None:
             panel = QWidget()
             panel.setObjectName('overlayPartsPanel')
+            # Plan 45 M: the list is the one scroll area; the popover must
+            # not wrap this panel in a second one.
+            panel.setProperty('popoverOwnsScroll', True)
             column = QVBoxLayout(panel)
             column.setContentsMargins(0, 0, 0, 0)
             column.setSpacing(GAP_TIGHT)
@@ -782,8 +832,12 @@ class ViewportOverlay(QFrame):
 
     def _refreshChip(self):
         base = getattr(self, '_chipBase', '')
-        if self._railMode and base and self._partsTotal and self._cellsText:
-            base = '{0} · {1}'.format(base, self._cellsText)
+        if self._railMode and self._partsTotal:
+            # Plan 45: "2 of 2 parts" was said three times -- here, on the
+            # Parts tab and on the bottom bar. The bottom bar's Parts button
+            # is its one home (always on screen, so isolation is never
+            # invisible); this line keeps what only it says, the cell count.
+            base = self._cellsText
         self._chip.setText(base)
 
     def event(self, event):
@@ -824,8 +878,35 @@ class ViewportOverlay(QFrame):
     def partsHeightCap(self) -> int:
         return self._partsScroll.maximumHeight()
 
+    def _railRowsHeight(self):
+        """The height of the first ten rows (and the headings and gaps among
+        them), measured from the layout; None outside the rail."""
+        if not self._railMode:
+            return None
+        layout = self._partsLayout
+        total = 0
+        rows = 0
+        through = 0
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            if isinstance(item.widget(), PartRow):
+                if rows == PARTS_VISIBLE_ROWS:
+                    break
+                rows += 1
+                total += item.sizeHint().height()
+                through = total
+            else:
+                total += item.sizeHint().height()
+        return through if rows == PARTS_VISIBLE_ROWS else total
+
     def _capPartsHeight(self):
         """DP-712. At most 40% of the viewport, and scroll past it."""
+        if self._railMode:
+            # The popover sizes the list: ten rows, then the wheel.
+            cap = 16777215
+            if cap != self._partsScroll.maximumHeight():
+                self._partsScroll.setMaximumHeight(cap)
+            return
         parent = self.parentWidget()
         height = parent.height() if parent is not None else 450
         cap = max(PARTS_MIN_HEIGHT, int(height * PARTS_HEIGHT_SHARE))
@@ -1062,6 +1143,7 @@ class ViewportOverlay(QFrame):
                 self._partsLayout.addWidget(row)
                 self._rows[key] = row
 
+        self._partsScroll.updateGeometry()
         shown = sum(1 for _key, _name, _color, visible in parts if visible)
         # The caller that knows the mesh re-sets the chip with the mesh's own
         # nouns and detail straight after (`MainWindow.rebuildOverlayParts`);

@@ -35,7 +35,8 @@ from dataclasses import dataclass
 from foammesh.core.quantities import unit_for
 
 __all__ = ['PlaneState', 'local_basis', 'rotated_normal', 'display_unit',
-           'to_display', 'from_display', 'domain_step', 'unit']
+           'to_display', 'from_display', 'domain_step', 'unit', 'clean',
+           'display_noise', 'NOISE_FRACTION']
 
 #: The labelled fallback step: this fraction of the model's extent along n.
 DOMAIN_STEP_FRACTION = 0.01
@@ -238,8 +239,34 @@ def display_unit(extent):
     return unit_for(extent if extent else 1.0)
 
 
-def to_display(metres, scale):
-    return '{:.6g}'.format(float(metres) * scale)
+#: Plan 45 V7. A length this small against the model's extent is arithmetic
+#: noise (a plane centred on a float32 box reads 8.009e-05 mm on a 300 mm
+#: model), not a place anyone put the plane: it shows as 0. It sits far below
+#: the six figures a field shows (1e-6 of the extent is the last of them).
+NOISE_FRACTION = 1.0e-6
+
+
+def display_noise(extent):
+    """The length (metres) below which a value on a model *extent* metres
+    long is shown as 0."""
+    extent = abs(float(extent or 0.0))
+    return extent * NOISE_FRACTION if math.isfinite(extent) else 0.0
+
+
+def clean(value, noise=0.0):
+    """*value* as it should read: 0 when it is within *noise* of zero, and
+    never a negative zero (Plan 45 V7: the Offset field read "-0"). The model
+    keeps the full value; this is the number shown."""
+    number = float(value)
+    if abs(number) <= noise:
+        return 0.0
+    return number + 0.0         # -0.0 + 0.0 is +0.0
+
+
+def to_display(metres, scale, noise=0.0):
+    """*metres* in the unit *scale* converts to, at six figures; within
+    *noise* (metres) of zero it reads 0, and never "-0"."""
+    return '{:.6g}'.format(clean(float(metres) * scale, noise * scale))
 
 
 def from_display(text, scale):

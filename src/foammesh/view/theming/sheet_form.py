@@ -588,6 +588,47 @@ def _natural_width(label: QWidget) -> int:
     return label.sizeHint().width()
 
 
+_NATURAL = '_foammeshNaturalWidth'
+
+
+def _natural_key(label: QWidget):
+    """What a label's one-line width is measured from."""
+    cm = label.contentsMargins()
+    text = label.text() if hasattr(label, 'text') else None
+    rich = (isinstance(label, QLabel)
+            and label.textFormat() == Qt.TextFormat.RichText)
+    return (type(label).__name__, text, label.font().key(), rich,
+            label.margin() if isinstance(label, QLabel) else 0,
+            label.frameWidth() if isinstance(label, QLabel) else 0,
+            cm.left(), cm.right())
+
+
+def _cached_natural_width(label: QWidget) -> int:
+    """``_natural_width`` once per text, font and margins.
+
+    A rich-text label (or any non-label) is measured from its size hint,
+    which a wrap or a cap changes, so it is measured free of both -- the
+    first time only.
+    """
+    key = _natural_key(label)
+    held = getattr(label, _NATURAL, None)
+    if held is not None and held[0] == key:
+        return held[1]
+    plain = (isinstance(label, QLabel) and label.text()
+             and label.textFormat() != Qt.TextFormat.RichText)
+    if not plain:
+        if isinstance(label, QLabel):
+            label.setWordWrap(False)
+        label.setMinimumWidth(0)
+        label.setMaximumWidth(16777215)
+    width = _natural_width(label)
+    try:
+        setattr(label, _NATURAL, (key, width))
+    except (AttributeError, TypeError):
+        pass
+    return width
+
+
 def _labels_of(form) -> list:
     """The label widgets of a ``SheetForm`` or a legacy ``QFormLayout``."""
     if isinstance(form, SheetForm):
@@ -623,25 +664,33 @@ def share_label_width(forms, available: int = 0) -> int:
             if isinstance(form, SheetForm):
                 form.setLabelWidth(0)
         return 0
-    for label in labels:
-        if isinstance(label, QLabel):
-            label.setWordWrap(False)
-        label.setMinimumWidth(0)
-        label.setMaximumWidth(16777215)
-    natural = max(_natural_width(label) for label in labels)
+    # Plan 45 PINQ. Each label is measured once per text and font, and a
+    # label is only touched when what it ends with differs from what it has.
+    # MEASURED live: un-wrapping, un-capping and re-capping every label on
+    # every run laid each one out six times over, a pin's column relayout.
+    naturals = [_cached_natural_width(label) for label in labels]
+    natural = max(naturals)
     width = natural
     if available > 0:
         width = min(natural, int(available * LABEL_SHARE))
-    for label in labels:
+    in_sheet_form = set()
+    for form, group in per_form:
+        if isinstance(form, SheetForm):
+            in_sheet_form.update(id(label) for label in group)
+    for label, own in zip(labels, naturals):
         if isinstance(label, QLabel):
-            label.setWordWrap(_natural_width(label) > width)
-    for label in labels:
+            wrap = own > width
+            if label.wordWrap() != wrap:
+                label.setWordWrap(wrap)
         # A wrapped label's size hint is not its column; the column is
         # `width`, so the label may not ask for more.
         label.setMaximumWidth(max(width, 1))
+        if id(label) in in_sheet_form:
+            label.setMinimumWidth(0)
     for form, group in per_form:
         if isinstance(form, SheetForm):
-            form.setLabelWidth(width)
+            if getattr(form, '_labelWidth', None) != width:
+                form.setLabelWidth(width)
         else:
             form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft
                                    | Qt.AlignmentFlag.AlignVCenter)
@@ -726,12 +775,24 @@ class LabelWidthWatcher(QObject):
         host.installEventFilter(self)
         self._busy = False
         self._viewport = None
+        self._measured = None
+
+    def _inputs(self):
+        """Everything the shared column is measured from: the width offered,
+        and each label's text and font (a theme or density change alters the
+        font while the width stays put)."""
+        labels = tuple((label.text() if hasattr(label, 'text') else '',
+                        label.font().key())
+                       for form in self._forms() if form is not None
+                       for label in _labels_of(form))
+        return (self._offered() if self._host.isVisible() else 0, labels)
 
     def run(self) -> int:
         if self._busy or not _alive(self._host):
             return 0
         self._busy = True
         try:
+            self._measured = self._inputs()
             # A host that has not been shown has no real width yet; the
             # first Resize after it is shown measures again.
             from PySide6.QtWidgets import QCheckBox
@@ -768,5 +829,12 @@ class LabelWidthWatcher(QObject):
     def eventFilter(self, watched, event):
         if event.type() in (QEvent.Type.Resize, QEvent.Type.Show) and (
                 watched is self._host or watched is self._viewport):
+            # Plan 45 PINQ. A pin or unpin changes the column's height only;
+            # the column measured from the same width and fonts is the same
+            # column. MEASURED live: re-measuring it was a sixth of a press.
+            if (event.type() == QEvent.Type.Resize and not self._busy
+                    and _alive(self._host)
+                    and self._measured == self._inputs()):
+                return False
             self.run()
         return False

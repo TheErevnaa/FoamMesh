@@ -7,7 +7,12 @@ from PySide6.QtCore import QFile, QIODevice, QSize, Qt
 from PySide6.QtGui import QGuiApplication, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
-_PIXMAP_CACHE: dict[tuple[str, int, int, float, int, int, str], QPixmap] = {}
+#: Keyed by what the picture is drawn from. The mode and the state an icon
+#: puts a pixmap under do not change the picture: Plan 45 start-up, MEASURED
+#: live 18 October 2026, the window drew 274 SVG pictures at start where
+#: 108 differ (each themed icon's Normal and Active cells, and its Off and
+#: On cells, were drawn twice).
+_PIXMAP_CACHE: dict[tuple[str, int, int, float, str], QPixmap] = {}
 _ICON_CACHE: dict[tuple[str, int, int, float, tuple[str, ...]], QIcon] = {}
 
 
@@ -34,9 +39,15 @@ def load_themed_icon(path: str, size: QSize = QSize(256, 256)) -> QIcon:
         return _ICON_CACHE[key]
 
     icon = QIcon()
+    # Plan 45 V1. Active is the mode a raised tool button draws under the
+    # pointer, and it used to take the Highlight colour -- the theme's
+    # selection.background, the very ground a checked or pressed button is
+    # filled with. A button just clicked (the pointer still on it) showed an
+    # empty highlighted square, and an unchecked one under the pointer drew
+    # its glyph at 1.1:1 on light, 2:1 on dark. Hover keeps the ink.
     for mode, color in ((QIcon.Mode.Normal, colors[0]),
                         (QIcon.Mode.Disabled, colors[1]),
-                        (QIcon.Mode.Active, colors[2]),
+                        (QIcon.Mode.Active, colors[0]),
                         (QIcon.Mode.Selected, colors[3])):
         for state in (QIcon.State.Off, QIcon.State.On):
             icon.addPixmap(_render(data, path, size, dpr, mode, state, color), mode, state)
@@ -46,7 +57,7 @@ def load_themed_icon(path: str, size: QSize = QSize(256, 256)) -> QIcon:
 
 def _render(data: bytes, path: str, size: QSize, dpr: float,
             mode: QIcon.Mode, state: QIcon.State, color: str) -> QPixmap:
-    key = (path, size.width(), size.height(), dpr, int(mode.value), int(state.value), color)
+    key = (path, size.width(), size.height(), dpr, color)
     if key in _PIXMAP_CACHE:
         return _PIXMAP_CACHE[key]
     text = data.decode('utf-8').replace('#000000', color).replace('#000', color)

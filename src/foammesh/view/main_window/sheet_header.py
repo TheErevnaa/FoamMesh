@@ -35,7 +35,8 @@ from foammesh.view.theming.metrics import FORM_MARGIN, GAP, MARGIN_TIGHT
 SETUP_FIRST = 4
 SETUP_LAST = 8
 SETUP_COUNT = SETUP_LAST - SETUP_FIRST + 1
-PIN_SIZE = 16
+#: Plan 45 (user, 2026-10-17): a little smaller than the 16 px tool glyphs.
+PIN_SIZE = 14
 
 _ICONS = Path(__file__).parents[3] / 'resources' / 'icons'
 #: ``"4. Sizing"``, optionally behind a status glyph such as ``"○ "``.
@@ -68,8 +69,10 @@ def _tokens():
 
 
 def pin_icon(pinned: bool, size: int = PIN_SIZE) -> QIcon:
-    """The push-pin glyph: tilted and grey when floating, upright with a red
-    head when pinned. Every colour is a token of the theme in use.
+    """The push-pin glyph: tilted with a red outlined head when floating,
+    upright with a red filled head when pinned. Every colour is a token of the
+    theme in use; ``pin.head`` is red in the light and the dark theme alike
+    (Plan 45, user 2026-10-17: the pin options read red in both themes).
 
     CHL (DP-2687, V3): the glyph is also drawn for the checked state of a tool
     button (the rail's pin sits on the ``selection.background`` tile when it
@@ -85,11 +88,10 @@ def pin_icon(pinned: bool, size: int = PIN_SIZE) -> QIcon:
     ratio = screen.devicePixelRatio() if screen is not None else 1.0
     text = (_ICONS / ('pin-on.svg' if pinned else 'pin.svg')).read_text(encoding='utf-8')
     strong = token('foreground.strong', '#e6e8eb')
-    head = token('pin.head' if pinned else 'foreground.sub',
-                 '#c9534e' if pinned else '#8b919a')
-    # The resting glyph, then the checked one (strong needle and outline).
+    head = token('pin.head', '#c9534e')
+    # The resting glyph, then the checked one (strong needle, the head stays red).
     variants = [(token('foreground.secondary', '#9aa2ae'), head),
-                (strong, token('pin.head', '#c9534e') if pinned else strong)]
+                (strong, head)]
     drawn = []
     for needle, outline in variants:
         colours = {

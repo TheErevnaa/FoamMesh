@@ -1,4 +1,6 @@
 """Semantic status and colour-swatch helpers."""
+import re
+
 from PySide6.QtGui import QColor
 
 
@@ -259,9 +261,25 @@ def style_tightest_headings(header) -> None:
     header.setStyleSheet('QHeaderView::section { padding: 2px 2px; }')
 
 
-def _dock_rules(base: str) -> str:
+#: Qt-ADS's own rule for the splitter handle between dock areas.
+_ADS_HANDLE = re.compile(
+    r'ads--CDockContainerWidget\s+ads--CDockSplitter::handle\s*\{[^}]*\}')
+
+#: The dock manager's object name, which scopes its rules in the
+#: application sheet (``dock_layout`` names it).
+DOCK_MANAGER = 'dockManager'
+
+
+def _chrome(tokens=None) -> str:
     from .elevation import token
-    chrome = (token('background.chrome', None) or '')[:7] or 'palette(window)'
+    if tokens is not None:
+        value = tokens.values.get('background.chrome') or ''
+    else:
+        value = token('background.chrome', None) or ''
+    return value[:7] or 'palette(window)'
+
+
+def _dock_rules(base: str, tokens=None) -> str:
     return (
         base
         + ' ads--CDockWidget { border: none; background: palette(window); }'
@@ -271,22 +289,67 @@ def _dock_rules(base: str) -> str:
         # names the container too, so this one must, to outrank it. The
         # handle at rest is the chrome ground (Plan 44 sec. 2.2).
         ' ads--CDockContainerWidget ads--CDockSplitter::handle'
-        ' { background: %s; }' % chrome
+        ' { background: %s; }' % _chrome(tokens)
         + ' ads--CDockWidgetTab { background: palette(window); }'
         ' ads--CDockWidgetTab[activeTab="true"] { background: palette(window); }')
+
+
+def _static_dock_rules(base: str) -> str | None:
+    """The dock manager's own sheet with nothing in it that a theme changes:
+    Qt-ADS's sheet without its handle rule, and the rules above without
+    theirs. ``None`` when Qt-ADS's handle rule is not where it is expected."""
+    stripped, count = _ADS_HANDLE.subn('', base)
+    if count != 1:
+        return None
+    return (
+        stripped
+        + ' ads--CDockWidget { border: none; background: palette(window); }'
+        ' ads--CDockAreaWidget { border: none; }'
+        ' ads--CDockWidgetTab { background: palette(window); }'
+        ' ads--CDockWidgetTab[activeTab="true"] { background: palette(window); }')
+
+
+def dock_application_rules(tokens) -> str:
+    """Plan 45 W1. The dock handle's theme colour, as an application rule.
+
+    It used to sit in the dock manager's own sheet, so every theme switch had
+    to set that sheet again -- a re-polish of the 5,500 widgets under the
+    manager. Scoped by the manager's name it outranks every application rule
+    that reaches a splitter handle, as the manager's own sheet did. The
+    manager is itself the container of the root splitter, so the rule names
+    it both as that container and as the ancestor of any container inside.
+    """
+    return ('\nads--CDockContainerWidget#{0} ads--CDockSplitter::handle,'
+            ' #{0} ads--CDockContainerWidget ads--CDockSplitter::handle'
+            ' {{ background: {1}; }}\n'.format(DOCK_MANAGER, _chrome(tokens)))
 
 
 def strip_dock_rules(manager) -> None:
     """UXC3: no 1 px rule above a dock's content, on top of Qt-ADS's own QSS.
 
     That pixel is the difference between the Mesh setup page fitting the
-    settings column of a 700 px window and scrolling by one row. The rules
-    carry a token colour, so they are re-read when the theme changes.
+    settings column of a 700 px window and scrolling by one row.
+
+    Plan 45 W1. The one rule that carries a theme colour (the handle) lives
+    in the application sheet (:func:`dock_application_rules`), so the
+    manager's own sheet never changes on a theme switch. A manager not named
+    ``dockManager`` keeps the colour in its own sheet, re-read on a switch.
     """
     import weakref
     base = manager.styleSheet()
+    static = _static_dock_rules(base)
+    if static is not None and manager.objectName() == DOCK_MANAGER:
+        manager.setStyleSheet(static)
+        return
     manager.setStyleSheet(_dock_rules(base))
     ref = weakref.ref(manager)
+    try:
+        from foammesh.app import app
+        themes = getattr(app, 'themeManager', None)
+    except Exception:  # noqa: BLE001 - tools and tests without the app
+        themes = None
+    if themes is None:
+        return
 
     def restyle(*_args) -> None:
         live = ref()
@@ -296,13 +359,7 @@ def strip_dock_rules(manager) -> None:
             live.setStyleSheet(_dock_rules(base))
         except RuntimeError:                    # C++ side already gone
             pass
-    try:
-        from foammesh.app import app
-        themes = getattr(app, 'themeManager', None)
-        if themes is not None:
-            themes.themeChanged.connect(restyle)
-    except Exception:  # noqa: BLE001 - tools and tests without the app
-        pass
+    themes.themeChanged.connect(restyle)
 
 
 # -- the viewport tool edges (Plan 43 LY6/LY7, Plan 44 U2) ------------------

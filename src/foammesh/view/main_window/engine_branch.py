@@ -105,9 +105,24 @@ def _stage_writer(view):
     return writers.get(getattr(view, '_engine_id', ''))
 
 
+def _built_pages(view) -> list:
+    """The ``(task_id, page)`` pairs that exist, building none.
+
+    Plain-dict stand-ins (the Region B harnesses call these routes unbound)
+    have only built pages.
+    """
+    pages = getattr(view, '_pages', None) or {}
+    built = getattr(pages, 'built_items', None)
+    return built() if built is not None else list(pages.items())
+
+
 def _page_of(view, task_id: str):
     """The page ``task_id`` is edited on, or None (stand-ins have none)."""
-    return (getattr(view, '_pages', None) or {}).get(task_id)
+    pages = getattr(view, '_pages', None) or {}
+    # A page not built yet has no edits to save and nothing to re-read, so
+    # asking must not build it.
+    peek = getattr(pages, 'peek', None)
+    return peek(task_id) if peek is not None else pages.get(task_id)
 
 
 def _page_needs_save(view, task_id: str) -> bool:
@@ -166,6 +181,83 @@ def _reload_page_keeping_edits(page) -> None:
     if not callable(reload):
         reload = page.refresh
     reload()
+
+
+class _LazyPages(dict):
+    """The task pages of one branch, built when first asked for.
+
+    Plan 45. Building all thirteen pages at case open held the GUI thread for
+    ~2.7 s. The page on screen is built at once and the rest one per event-loop
+    turn; any access by task id (``[]``, ``get``, ``in``, ``values``, ``items``)
+    builds what it names first, so a caller always gets a real page. ``peek``
+    and ``built_items`` look only at pages that exist, for the branch's own
+    loops that have nothing to say to a page not yet built.
+    """
+
+    def __init__(self, build) -> None:
+        super().__init__()
+        self._build = build
+        self._pending: set = set()
+
+    def _need(self, key) -> None:
+        if key in self._pending:
+            self._build(key)
+
+    def mark_pending(self, key) -> None:
+        self._pending.add(key)
+
+    def pending(self) -> tuple:
+        return tuple(self._pending)
+
+    def forget(self) -> None:
+        self._pending.clear()
+        super().clear()
+
+    def clear(self) -> None:
+        self.forget()
+
+    def peek(self, key):
+        return dict.get(self, key)
+
+    def built_items(self) -> list:
+        return list(dict.items(self))
+
+    def build_all(self) -> None:
+        for key in list(self._pending):
+            self._need(key)
+
+    def __getitem__(self, key):
+        self._need(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._need(key)
+        return super().get(key, default)
+
+    def __contains__(self, key) -> bool:
+        return key in self._pending or super().__contains__(key)
+
+    def __len__(self) -> int:
+        return super().__len__() + len(self._pending)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __iter__(self):
+        self.build_all()
+        return super().__iter__()
+
+    def keys(self):
+        self.build_all()
+        return super().keys()
+
+    def values(self):
+        self.build_all()
+        return super().values()
+
+    def items(self):
+        self.build_all()
+        return super().items()
 
 
 class _ShownPageStack(QStackedWidget):
@@ -238,7 +330,13 @@ class EngineBranchView(QWidget):
     def __init__(self, facade_client, parent=None):
         super().__init__(parent)
         self._client = facade_client
-        self._pages: dict[str, QWidget] = {}
+        self._pages = _LazyPages(self._buildPage)
+        self._pageSpecs: dict[str, tuple] = {}
+        self._pageGeneration = 0
+        self._warmTimer = QTimer(self)
+        self._warmTimer.setSingleShot(True)
+        self._warmTimer.setInterval(0)
+        self._warmTimer.timeout.connect(self._buildNextPage)
         self._order: list[str] = []
         self._graph: EngineWorkflowGraph | None = None
         self._engine_id = ''
@@ -399,6 +497,14 @@ class EngineBranchView(QWidget):
     def page(self, task_id: str):
         return self._pages.get(task_id)
 
+    def hasPage(self, task_id: str) -> bool:
+        """Whether ``task_id`` has a page, built or not (builds nothing)."""
+        return task_id in self._pages
+
+    def pagesBuilt(self) -> tuple:
+        """The task ids whose page has been constructed so far."""
+        return tuple(t for t, _p in _built_pages(self))
+
     # -- construction ------------------------------------------------------ #
 
     def refresh(self) -> None:
@@ -433,6 +539,8 @@ class EngineBranchView(QWidget):
             self.stack.removeWidget(widget)
             widget.deleteLater()
         self.tasks.clear()
+        self._warmTimer.stop()
+        self._pageSpecs.clear()
         self._pages.clear()
         self._staleBodies = frozenset()
         self._order.clear()
@@ -449,52 +557,11 @@ class EngineBranchView(QWidget):
                 # without a page, which would otherwise raise while the tree
                 # is being rebuilt.
                 continue
-            # Plan 23 WP7B: the `common.*` qualification pages serve both
-            # engines, so the branch supplies the engine rather than the page
-            # assuming one. Without this they inherit the base default and a
-            # Gmsh case would send its transitions to the snappy workflow --
-            # which fails as a *missing* task rather than a wrong one, so it
-            # would have been read as an unregistered page.
-            try:
-                page = page_class(self._client, self, engine_id=engine_id)
-            except TypeError:
-                page = page_class(self._client, self)
-            # R155. `updateRequested` no longer maps straight to `accept`:
-            # see _on_task_updated. A run-gated task refuses `accept`, and the
-            # refusal used to vanish into the bare except below.
-            update_signal = getattr(page, 'updateRequested', None)
-            if update_signal is not None:
-                update_signal.connect(self._on_task_updated)
-            # R134. A page that records a setting no run has to judge asks
-            # for CONFIGURED rather than the tick, so the outline can show
-            # the half-filled glyph R94 added for exactly that case.
-            configure_signal = getattr(page, 'configureRequested', None)
-            if configure_signal is not None:
-                configure_signal.connect(
-                    lambda tid: self._on_task_transition(tid, 'configure'))
-            revert_signal = getattr(page, 'revertRequested', None)
-            if revert_signal is not None:
-                revert_signal.connect(
-                    lambda tid: self._on_task_transition(tid, 'revert'))
-            unlock_signal = getattr(page, 'unlockRequested', None)
-            if unlock_signal is not None:
-                # Plan 44 MF18 K2: the page's lock chip asked inline (first
-                # press) and was confirmed (second press), so no modal follows.
-                unlock_signal.connect(
-                    lambda tid: self.requestUnlock(tid, confirmed=True))
-            run_signal = getattr(page, 'runRequested', None)
-            if run_signal is not None:
-                run_signal.connect(self._on_run_requested)
-            stage_signal = getattr(page, 'stageRunRequested', None)
-            if stage_signal is not None:
-                stage_signal.connect(self._on_stage_run_requested)
-            # DP-123. A page that can refuse the whole-pipeline run says so
-            # here, because the button that starts it belongs to this row.
-            refusal_signal = getattr(page, 'runAllRefusalChanged', None)
-            if refusal_signal is not None:
-                refusal_signal.connect(lambda _text='': self._gradeRunAll())
-            self.stack.addWidget(page)
-            self._pages[task_id] = page
+            self._pageSpecs[task_id] = (page_class, engine_id)
+            # Plan 45. A placeholder holds the page's place in the stack; the
+            # page itself is built when first needed (see _LazyPages).
+            self.stack.addWidget(QWidget())
+            self._pages.mark_pending(task_id)
             self._order.append(task_id)
             item = QListWidgetItem(self._label(task, task_id), self.tasks)
             item.setData(Qt.ItemDataRole.UserRole, task_id)
@@ -514,12 +581,118 @@ class EngineBranchView(QWidget):
         self._update_run_all(engine_id)
         if self._order:
             self.tasks.setCurrentRow(0)
+            # The page on screen exists before this returns; the rest follow
+            # one per event-loop turn.
+            self._pages._need(self._order[0])
+            if self._pages.pending():
+                self._warmTimer.start()
+
+    def _buildPage(self, task_id: str) -> QWidget:
+        """Build the page for ``task_id`` now and put it in its place."""
+        page_class, engine_id = self._pageSpecs[task_id]
+        self._pages._pending.discard(task_id)
+        try:
+            page = self._makePage(page_class, engine_id)
+        except BaseException:
+            self._pages._pending.add(task_id)
+            raise
+        dict.__setitem__(self._pages, task_id, page)
+        row = self._order.index(task_id)
+        current = self.stack.currentIndex()
+        old = self.stack.widget(row)
+        if old is not None:
+            self.stack.removeWidget(old)
+            old.deleteLater()
+        self.stack.insertWidget(row, page)
+        if current >= 0:
+            self.stack.setCurrentIndex(current)
+        # The pages built earlier were told about the locks as they stood;
+        # this one is told now, as the eager build did.
+        setter = getattr(page, 'setResultLocked', None)
+        if callable(setter):
+            try:
+                setter(task_id in self._resultLocked)
+            except Exception:                                # noqa: BLE001
+                logger.exception('the %s page could not show its lock', task_id)
+        self._staleBodies = self._staleBodies - {task_id}
+        if task_id == self._run_all_task_id():
+            self._gradeRunAll()
+        return page
+
+    def _buildNextPage(self) -> None:
+        """Plan 45. One more page per event-loop turn until all exist."""
+        pending = self._pages.pending()
+        if not pending:
+            return
+        first = self._run_all_task_id()
+        for task_id in ([first] if first in pending else []) + list(
+                self._order):
+            if task_id in pending:
+                self._pages._need(task_id)
+                break
+        if self._pages.pending():
+            self._warmTimer.start()
+
+    def _makePage(self, page_class, engine_id: str) -> QWidget:
+        # Plan 23 WP7B: the `common.*` qualification pages serve both
+        # engines, so the branch supplies the engine rather than the page
+        # assuming one. Without this they inherit the base default and a
+        # Gmsh case would send its transitions to the snappy workflow --
+        # which fails as a *missing* task rather than a wrong one, so it
+        # would have been read as an unregistered page.
+        try:
+            page = page_class(self._client, self, engine_id=engine_id)
+        except TypeError:
+            page = page_class(self._client, self)
+        # R155. `updateRequested` no longer maps straight to `accept`:
+        # see _on_task_updated. A run-gated task refuses `accept`, and the
+        # refusal used to vanish into the bare except below.
+        update_signal = getattr(page, 'updateRequested', None)
+        if update_signal is not None:
+            update_signal.connect(self._on_task_updated)
+        # R134. A page that records a setting no run has to judge asks
+        # for CONFIGURED rather than the tick, so the outline can show
+        # the half-filled glyph R94 added for exactly that case.
+        configure_signal = getattr(page, 'configureRequested', None)
+        if configure_signal is not None:
+            configure_signal.connect(
+                lambda tid: self._on_task_transition(tid, 'configure'))
+        revert_signal = getattr(page, 'revertRequested', None)
+        if revert_signal is not None:
+            revert_signal.connect(
+                lambda tid: self._on_task_transition(tid, 'revert'))
+        unlock_signal = getattr(page, 'unlockRequested', None)
+        if unlock_signal is not None:
+            # Plan 44 MF18 K2: the page's lock chip asked inline (first
+            # press) and was confirmed (second press), so no modal follows.
+            unlock_signal.connect(
+                lambda tid: self.requestUnlock(tid, confirmed=True))
+        run_signal = getattr(page, 'runRequested', None)
+        if run_signal is not None:
+            run_signal.connect(self._on_run_requested)
+        stage_signal = getattr(page, 'stageRunRequested', None)
+        if stage_signal is not None:
+            stage_signal.connect(self._on_stage_run_requested)
+        # DP-123. A page that can refuse the whole-pipeline run says so
+        # here, because the button that starts it belongs to this row.
+        refusal_signal = getattr(page, 'runAllRefusalChanged', None)
+        if refusal_signal is not None:
+            refusal_signal.connect(lambda _text='': self._gradeRunAll())
+        return page
 
     def _run_all_task_id(self) -> str:
         """The task the whole-pipeline run is recorded against."""
-        for task_id, page in self._pages.items():
-            if getattr(page, 'run_all_task_id', None) == task_id:
-                return task_id
+        specs = getattr(self, '_pageSpecs', None)
+        if specs is None:                       # a stand-in with built pages
+            for task_id, page in self._pages.items():
+                if getattr(page, 'run_all_task_id', None) == task_id:
+                    return task_id
+        else:
+            for task_id in self._order:
+                spec = specs.get(task_id)
+                if (spec and getattr(spec[0], 'run_all_task_id', None)
+                        == task_id):
+                    return task_id
         return self._order[0] if self._order else ''
 
     def _update_run_all(self, engine_id: str) -> None:
@@ -655,6 +828,12 @@ class EngineBranchView(QWidget):
 
     def _gradeRunAll(self) -> None:
         """Shut "Run to end" when the run would refuse, and say why."""
+        # Plan 45. The refusal is the run-all page's to give; a page not built
+        # yet grades the button itself the moment it is (``_buildPage``), and
+        # is built first in the background chain.
+        pending = getattr(self._pages, 'pending', None)
+        if pending is not None and self._run_all_task_id() in pending():
+            return
         refusal = self.runAllRefusal()
         self._runAll.setEnabled(not refusal)
         self._runAll.setToolTip(refusal)
@@ -987,7 +1166,7 @@ class EngineBranchView(QWidget):
         """
         current = self.stack.currentWidget() if self._pages else None
         stale = set(self._staleBodies)
-        for task_id, page in self._pages.items():
+        for task_id, page in _built_pages(self):
             if page is current:
                 self._reread_body(task_id, page)
                 stale.discard(task_id)
@@ -1082,7 +1261,7 @@ class EngineBranchView(QWidget):
         except RuntimeError:
             return                              # the branch was deleted
         self._staleBodies = frozenset(
-            task_id for task_id, page in self._pages.items()
+            task_id for task_id, page in _built_pages(self)
             if page is not current) | self._staleBodies
         if current is not None:
             self._refresh_derived(current)
@@ -1104,7 +1283,7 @@ class EngineBranchView(QWidget):
         anywhere said so. The page is still skipped -- it is still not worth
         a broken branch -- but now it says which page and why.
         """
-        for task_id, page in self._pages.items():
+        for task_id, page in _built_pages(self):
             refresh = getattr(page, 'refresh_status', None)
             if callable(refresh):
                 try:
@@ -1555,7 +1734,7 @@ class EngineBranchView(QWidget):
             if getattr(result, 'status', '') == 'accepted' and not is_check:
                 self._reload_mesh()
             # DP-1220: the re-read keeps what was typed while it ran.
-            _reload_page_keeping_edits(self._pages.get(task_id))
+            _reload_page_keeping_edits(_page_of(self, task_id))
             self._graph = self._build_graph(self._engine_id)
             self._apply_states()
             self._noticeSkippedSnapshots(baseline, payload)
@@ -2238,7 +2417,7 @@ class EngineBranchView(QWidget):
         if held != self._appliedResultLocks:
             self._appliedResultLocks = held
             self.resultLocksChanged.emit()
-        for task_id, page in self._pages.items():
+        for task_id, page in _built_pages(self):
             setter = getattr(page, 'setResultLocked', None)
             if not callable(setter):
                 continue
@@ -2672,7 +2851,7 @@ class EngineBranchView(QWidget):
                     copy=self.tr('the restored mesh'))
                     or str(getattr(result, 'message', '') or ''))
             self.refresh_states()
-            for page in list(self._pages.values()):
+            for _task, page in _built_pages(self):
                 reload_page = getattr(page, 'refresh', None)
                 if callable(reload_page):
                     try:
@@ -2758,9 +2937,9 @@ class EngineBranchView(QWidget):
     def _on_row_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._order):
             return
-        self.stack.setCurrentIndex(row)
         task_id = self._order[row]
-        page = self._pages.get(task_id)
+        page = self._pages.get(task_id)      # built now if it is not yet
+        self.stack.setCurrentIndex(row)
         if page is not None:
             self._open_page(task_id, page)
         self._updateHeading()

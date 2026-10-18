@@ -27,12 +27,17 @@ from foammesh.view.theming.metrics import (
 )
 
 #: A 3x3 grid on a square: what the control changes, drawn as that.
+#: Plan 45 V9. 2.25 units of the 24 box is 1.5 px at the rail's 16 px, the
+#: stroke the other rail glyphs are widened to (DP-2723); at 1.5 units and
+#: 75% opacity the inner lines were 1 px of grey, read as a disabled tool.
 _ICON_SVG = (
     '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" '
-    'stroke="{c}" stroke-width="1.5" stroke-linecap="round">'
+    'stroke="{c}" stroke-width="2.25" stroke-linecap="round">'
     '<rect x="3.5" y="3.5" width="17" height="17" rx="1.5"/>'
-    '<path d="M9.2 3.5v17M14.8 3.5v17M3.5 9.2h17M3.5 14.8h17" '
-    'stroke-opacity="0.75"/></svg>')
+    '<path d="M9.2 3.5v17M14.8 3.5v17M3.5 9.2h17M3.5 14.8h17"/></svg>')
+
+#: The sizes the icon is drawn at, so no size is a scaled-down 64 px image.
+_ICON_SIZES = (16, 20, 24, 32, 64)
 
 COLOR_CHOICES = (
     ('auto', 'Auto (theme: light on dark, dark on light)'),
@@ -43,19 +48,46 @@ COLOR_CHOICES = (
 
 
 def meshLinesIcon(size: int = 64) -> QIcon:
-    palette = QGuiApplication.palette()
+    """The grid glyph in the running theme's ink, for every mode and state.
+
+    Plan 45 V9. It was drawn once, from the palette of the moment, in Normal
+    and Disabled only: after a theme switch the rail's mesh-lines tool kept
+    the other theme's ink (the dark theme's pale grey on the light rail, read
+    as a disabled tool). The button draws it again on every theme change
+    (``MeshLinesButton.retint``); hover and checked keep the ink.
+    """
+    ink = _ink('foreground.strong', QPalette.ColorGroup.Active)
+    faint = _ink('disabled.foreground', QPalette.ColorGroup.Disabled)
+    screen = QGuiApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    sizes = sorted(set(_ICON_SIZES + (int(size),)))
     icon = QIcon()
-    for mode, group in ((QIcon.Mode.Normal, QPalette.ColorGroup.Active),
-                        (QIcon.Mode.Disabled, QPalette.ColorGroup.Disabled)):
-        color = palette.color(group, QPalette.ColorRole.ButtonText).name()
+    for mode, color in ((QIcon.Mode.Normal, ink), (QIcon.Mode.Active, ink),
+                        (QIcon.Mode.Selected, ink),
+                        (QIcon.Mode.Disabled, faint)):
         renderer = QSvgRenderer(QByteArray(_ICON_SVG.format(c=color).encode()))
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        renderer.render(painter)
-        painter.end()
-        icon.addPixmap(pixmap, mode)
+        for side in sizes:
+            pixels = max(1, round(side * dpr))
+            pixmap = QPixmap(pixels, pixels)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            renderer.render(painter)
+            painter.end()
+            pixmap.setDevicePixelRatio(dpr)
+            for state in (QIcon.State.Off, QIcon.State.On):
+                icon.addPixmap(pixmap, mode, state)
     return icon
+
+
+def _ink(token: str, group) -> str:
+    """The theme token *token*, or the palette's button text without one."""
+    from foammesh.view.theming.elevation import token as live_token
+    value = live_token(token, None)
+    if value:
+        return value[:7]
+    return QGuiApplication.palette().color(
+        group, QPalette.ColorRole.ButtonText).name()
 
 
 def _settings():
@@ -165,6 +197,7 @@ class MeshLinesButton(QToolButton):
         super().__init__(parent)
         self.setObjectName('viewportMeshLines')
         self.setIcon(meshLinesIcon())
+        self._hookTheme()
         if iconSize is not None:
             self.setIconSize(iconSize)
         if size is not None:
@@ -188,6 +221,20 @@ class MeshLinesButton(QToolButton):
 
     def panel(self) -> MeshLinesPanel:
         return self._panel
+
+    def retint(self, *_args) -> None:
+        """Draw the glyph again in the theme now running (Plan 45 V9)."""
+        self.setIcon(meshLinesIcon())
+
+    def _hookTheme(self) -> None:
+        try:
+            from foammesh.app import app
+            manager = getattr(app, 'themeManager', None)
+        except Exception:  # noqa: BLE001 - tools and tests without the app
+            manager = None
+        if manager is not None:
+            # A bound slot of this QObject: Qt drops it with the button.
+            manager.themeChanged.connect(self.retint)
 
 
 def loadSavedStyle():

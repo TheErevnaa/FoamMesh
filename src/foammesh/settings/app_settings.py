@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import contextlib
 from enum import Enum
 import os
 import re
@@ -10,6 +11,8 @@ from datetime import datetime, timezone
 import yaml
 from PySide6.QtCore import QLocale, QRect
 
+#: libyaml's emitter when PyYAML was built with it (same output, faster).
+_DUMPER = getattr(yaml, 'CDumper', yaml.Dumper)
 
 
 FORMAT_VERSION = 1
@@ -95,6 +98,32 @@ COLOUR_STANDARD_KEY = SimpleNamespace(value='colour_standard')
 DEFAULT_APP_NAME = 'FoamMesh'
 
 
+#: Plan 45 boot. Several callers build a fresh ``AppSettings()`` for one read
+#: (the runtime target, the qualification mode, the diagnostic budget), and a
+#: case open makes dozens of those reads, each parsing the same 11 KB YAML file
+#: (35 ms apiece, about 0.9 s of the GUI thread). The parse is kept against the
+#: file's size and modification time and every caller still gets a copy of its
+#: own, so one instance changing a value never shows in another.
+_SETTINGS_CACHE: dict = {}
+
+
+def _read_settings_file(path):
+    import copy
+    try:
+        st = os.stat(path)
+        key = (os.path.normcase(os.path.abspath(path)), st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _SETTINGS_CACHE:
+        return copy.deepcopy(_SETTINGS_CACHE[key])
+    with open(path) as file:
+        loaded = yaml.load(file, Loader=yaml.FullLoader)
+    if key is not None:
+        _SETTINGS_CACHE.clear()
+        _SETTINGS_CACHE[key] = copy.deepcopy(loaded)
+    return loaded
+
+
 class AppSettings:
     def __init__(self):
         self._settings = None
@@ -114,8 +143,7 @@ class AppSettings:
         self._settingsFile = self._settingsPath / 'foammesh.settings.yaml'
 
         if self._settingsFile.is_file():
-            with open(self._settingsFile) as file:
-                self._settings = yaml.load(file, Loader=yaml.FullLoader)
+            self._settings = _read_settings_file(self._settingsFile)
         else:
             self._settingsPath.mkdir(exist_ok=True)
             self._settings = {SettingKey.FORMAT_VERSION.value: FORMAT_VERSION}
@@ -764,8 +792,12 @@ class AppSettings:
         return False
 
     def _save(self):
+        # Plan 45 V11. Every remembered choice writes the whole file, on the
+        # GUI thread: a sheet pin wrote it twice, 8.5 ms each live with the
+        # pure-Python emitter. libyaml's emitter writes the same text
+        # (same representer, same layout) in a sixth of the time.
         with open(self._settingsFile, 'w') as file:
-            yaml.dump(self._settings, file)
+            yaml.dump(self._settings, file, Dumper=_DUMPER)
 
     def _get(self, key, default=None):
         self._ensureLoaded()
@@ -777,9 +809,26 @@ class AppSettings:
             return False
 
         self._settings[key.value] = value
-        self._save()
+        if getattr(self, '_batchDepth', 0):
+            self._batchDue = True
+        else:
+            self._save()
 
         return True
+
+    @contextlib.contextmanager
+    def batched(self):
+        """Plan 45 PINQ. The choices set inside are written once, at the end:
+        a sheet pin remembered the sheet and the View menu, two whole-file
+        writes on the GUI thread. Nothing is held past the block."""
+        self._batchDepth = getattr(self, '_batchDepth', 0) + 1
+        try:
+            yield
+        finally:
+            self._batchDepth -= 1
+            if not self._batchDepth and getattr(self, '_batchDue', False):
+                self._batchDue = False
+                self._save()
 
     def removeProject(self, num):
         project = self.getRecentProjects()

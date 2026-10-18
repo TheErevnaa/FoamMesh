@@ -243,6 +243,10 @@ class WorstLabelLayer:
         self._boxes: list = []
         self._caption_box = None
         self._clear = None             # (x0, y0, x1, y1), y down, or None
+        #: Plan 45 V3/V10. ``keep_out()`` -> [(x0, y0, x1, y1)], y down: the
+        #: widgets standing over the picture (the overlay card, the bottom
+        #: bar, the legend...), which the tags and the caption keep off.
+        self._keep_out = None
         self._outline = None           # the beyond-limit edge actor
 
     # -- state ---------------------------------------------------------- #
@@ -284,6 +288,32 @@ class WorstLabelLayer:
         if self._shapes:
             self.relayout()
             self._refresh()
+
+    def set_keep_out(self, provider) -> None:
+        """Plan 45 V3/V10. ``provider()`` returns the rectangles, in render
+        pixels with y down, that the widgets over the view cover; the tags
+        and the caption are placed off them. None for no rule. Read at every
+        layout, so a widget that moves is followed at the next frame."""
+        self._keep_out = provider
+
+    def keep_out_boxes(self, height) -> list:
+        """The keep-out rectangles in display coordinates (y up)."""
+        provider = self._keep_out
+        if provider is None:
+            return []
+        try:
+            rects = list(provider() or ())
+        except Exception:                                     # noqa: BLE001
+            return []
+        out = []
+        for rect in rects:
+            try:
+                x0, y0, x1, y1 = (float(v) for v in rect)
+            except (TypeError, ValueError):
+                continue
+            if x1 > x0 and y1 > y0:
+                out.append((x0, float(height) - y1, x1, float(height) - y0))
+        return out
 
     def set_beyond_cells(self, dataset, cell_ids) -> None:
         """Outline the cells *cell_ids* of *dataset* (their edges, 1.6 px) in
@@ -490,12 +520,16 @@ class WorstLabelLayer:
     # -- layout --------------------------------------------------------- #
 
     @staticmethod
-    def _place(anchors, sizes, bounds, selected_index) -> list:
+    def _place(anchors, sizes, bounds, selected_index, blocked=()) -> list:
         """One box per label inside *bounds*. The preferred spot is ``_GAP``
         right of the anchor, or left of it in the left half of the bounds (the
         mockup's side flip); then the nearest free spot up and down on either
         side; then a stack from the corner. Rows are bucketed so any number of
-        labels stays cheap."""
+        labels stays cheap.
+
+        Plan 45 V3. *blocked* (display boxes, y up) are taken before the
+        first label: a tag never runs under the overlay card, the bottom bar
+        or the legend."""
         x0, y0, x1, y1 = bounds
         pad = 4.0
         bucket = 32.0
@@ -515,6 +549,10 @@ class WorstLabelLayer:
             placed.append(box)
             for r in range(int(box[1] // bucket), int(box[3] // bucket) + 1):
                 rows.setdefault(r, []).append(box)
+
+        for box in blocked:
+            for r in range(int(box[1] // bucket), int(box[3] // bucket) + 1):
+                rows.setdefault(r, []).append(tuple(box))
 
         mid = (x0 + x1) / 2.0
         stacked = y0
@@ -583,7 +621,9 @@ class WorstLabelLayer:
             inner = vw + ((6.0 + tw) if tail is not None else 0.0)
             sizes.append((inner + 2 * _PAD_X, hh + 2 * _PAD_Y + 2.0))
             self._metrics.append((vw, tw, hh))
-        self._boxes = self._place(anchors, sizes, bounds, selected_index)
+        blocked = self.keep_out_boxes(height)
+        self._boxes = self._place(anchors, sizes, bounds, selected_index,
+                                  blocked)
         if shown:
             for key in _SHAPE_KEYS:
                 self._shapes[key].reset()
@@ -609,7 +649,7 @@ class WorstLabelLayer:
                                      box[1] + _PAD_Y + 2.0)
             for key in _SHAPE_KEYS:
                 self._shapes[key].done()
-        self._layout_caption(renderer, bounds)
+        self._layout_caption(renderer, bounds, blocked)
 
     def _wrapped(self, renderer, room) -> list:
         """The caption lines, each source line broken at ' · ' so none is
@@ -666,7 +706,7 @@ class WorstLabelLayer:
             self._texts.append(actor)
             self._caption_actors.append(actor)
 
-    def _layout_caption(self, renderer, bounds) -> None:
+    def _layout_caption(self, renderer, bounds, blocked=()) -> None:
         self._caption_box = None
         self._sync_caption(renderer, bounds)
         if not self._caption_actors:
@@ -688,6 +728,15 @@ class WorstLabelLayer:
         if left + box_w > x1 - 2.0:
             left = max(x1 - 2.0 - box_w, x0 + 2.0)
         bottom = y0 + _CAPTION_ABOVE
+        # Plan 45 V10. The caption stands above whatever covers its place
+        # (the bottom bar at 1280x800 hid its second line).
+        for _turn in range(len(blocked) + 1):
+            hits = [b for b in blocked
+                    if b[0] < left + box_w and left < b[2]
+                    and b[1] < bottom + box_h and bottom < b[3]]
+            if not hits:
+                break
+            bottom = max(b[3] for b in hits) + 4.0
         if bottom + box_h > y1:
             bottom = max(y1 - box_h, y0)
         box = (left, bottom, left + box_w, bottom + box_h)

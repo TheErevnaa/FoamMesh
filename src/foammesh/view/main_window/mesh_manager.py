@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 #: enough to keep the model's shape, little enough to see the cells inside.
 QUALITY_SEE_THROUGH_OPACITY = 0.3
 
+#: DP-2725. How opaque the volume is while failed cells are shown. The
+#: failed cells sit inside it, so at full strength it buried all but the ones
+#: touching the boundary; the faded patches keep the model's shape instead.
+FAILED_CELLS_VOLUME_OPACITY = 0.0
+
 
 def _closeProgress(dialog):
     """Close a load's progress dialog and let Qt delete it (Plan 35 F16).
@@ -1524,6 +1529,10 @@ class MeshManager(ActorManager):
         # A failed-cell overlay belongs to a specific mesh/result pair; never
         # let it survive a case/mesh unload and reappear over different data.
         self.remove('failedCells')
+        # DP-2725. What it faded goes with the mesh it faded.
+        self._failedFaded = {}
+        self._qualityFaded = {}
+        self._qualityFilterOn = False
         self.hide()
         self._load_generation += 1
         self._time = None
@@ -1633,7 +1642,13 @@ class MeshManager(ActorManager):
     def clearCellFilter(self):
         for actorInfo in self._actorInfos.values():
             actorInfo.clearCellFilter()
-        self._restoreSurfaces()
+        self._qualityFilterOn = False
+        # DP-2725. Failed cells still on screen keep the model see-through,
+        # and the whole volume is back, so it is faded round them again.
+        if 'failedCells' in self._actorInfos:
+            self._fadeAroundFailedCells()
+        else:
+            self._restoreSurfaces()
 
         self._notifyCellCountChange()
 
@@ -1682,12 +1697,14 @@ class MeshManager(ActorManager):
         """
         self.remove('failedCells')
         if not self.ownsArtifact(artifact_id):
+            self._restoreAfterFailedCells()
             logger.info('failed-cell overlay refused: it belongs to %s, '
                         'the viewport is showing %s',
                         artifact_id, self._artifactId or '(nothing)')
             self.applyToDisplay()
             return False
         if not ids:
+            self._restoreAfterFailedCells()
             self.applyToDisplay()
             return False
 
@@ -1706,8 +1723,50 @@ class MeshManager(ActorManager):
         overlay.setOpacity(0.85)
         overlay.setDisplayMode(DisplayMode.SURFACE_EDGE)
         self.add(overlay)
+        self._fadeAroundFailedCells()
         self.applyToDisplay()
         return True
+
+    def _fadeAroundFailedCells(self):
+        """DP-2725. Let the failed cells be seen inside the model.
+
+        The cells are volume cells, most of them inside, and the volume was
+        left drawn at full strength over them: on the snappy pipe only the
+        cells touching the outlet showed. The volume is faded out and the
+        patches see-through, as for the poor cells (DP-714), so the model's
+        shape stays on screen around the cells. Each keeps its own opacity to
+        come back to.
+        """
+        self._seeThroughSurfaces()
+        if getattr(self, '_qualityFilterOn', False):
+            # The volume shows only the poor cells now; it stays as it is.
+            return
+        faded = getattr(self, '_failedFaded', None) or {}
+        for id_, actorInfo in self._actorInfos.items():
+            if (id_ == 'failedCells' or id_ in faded
+                    or not isinstance(actorInfo, MeshActor)):
+                continue
+            opacity = actorInfo.properties().opacity
+            faded[id_] = 1.0 if opacity is None else float(opacity)
+            actorInfo.setOpacity(FAILED_CELLS_VOLUME_OPACITY)
+        self._failedFaded = faded
+
+    def _restoreAfterFailedCells(self):
+        """Give the volume and, unless the poor cells are still coloured,
+        the surfaces their opacity back. An opacity the user set meanwhile
+        stands."""
+        self._restoreFadedVolume()
+        if not getattr(self, '_qualityFilterOn', False):
+            self._restoreSurfaces()
+
+    def _restoreFadedVolume(self):
+        faded = getattr(self, '_failedFaded', None) or {}
+        self._failedFaded = {}
+        for id_, opacity in faded.items():
+            actorInfo = self._actorInfos.get(id_)
+            if (actorInfo is not None and actorInfo.properties().opacity
+                    == FAILED_CELLS_VOLUME_OPACITY):
+                actorInfo.setOpacity(opacity)
 
     #: Fidelity verdict -> the status token its colour comes from. Roles, not
     #: hex, so the colouring follows the theme like everything else.
@@ -2248,6 +2307,7 @@ class MeshManager(ActorManager):
 
     def clearFailedCells(self):
         self.remove('failedCells')
+        self._restoreAfterFailedCells()
         self.applyToDisplay()
 
     def rethemeFailedCells(self):
@@ -2263,6 +2323,10 @@ class MeshManager(ActorManager):
     def applyCellFilter(self):
         for actorInfo in self._actorInfos.values():
             actorInfo.applyCellFilter()
+        self._qualityFilterOn = True
+        # DP-2725. The volume now shows only the poor cells, so a fade put
+        # on it for the failed cells would hide them.
+        self._restoreFadedVolume()
         self._seeThroughSurfaces()
 
         self._notifyCellCountChange()
@@ -2296,13 +2360,25 @@ class MeshManager(ActorManager):
 
     def clip(self, planes):
         self.clearVolumeColour()
+        self._sectioned = bool(planes)
         super().clip(planes)
         self._notifyCellCountChange()
 
     def slice(self, plane):
         self.clearVolumeColour()
+        self._sectioned = bool(plane)
         super().slice(plane)
         self._notifyCellCountChange()
+
+    def cellCountCause(self) -> str:
+        """Plan 45 V5. What takes cells off the screen: ``'section'`` (a cut
+        plane), ``'filter'`` (the quality filter showing only its band),
+        ``'both'``, or ``''`` for neither."""
+        sectioned = bool(getattr(self, '_sectioned', False))
+        filtered = bool(getattr(self, '_qualityFilterOn', False))
+        if sectioned and filtered:
+            return 'both'
+        return 'section' if sectioned else ('filter' if filtered else '')
 
     def _notifyCellCountChange(self):
         shown = self.getNumberOfDisplayedCells()

@@ -336,6 +336,10 @@ def _poly_mesh_path(case_path: Path) -> Path:
     return case_path / 'constant' / 'polyMesh'
 
 
+#: Plan 45 boot: (mesh path, per-file name/size/mtime) -> fingerprint.
+_FINGERPRINT_CACHE: dict = {}
+
+
 def fingerprint_poly_mesh(poly_mesh_path: Path) -> MeshFingerprint:
     """Return a deterministic SHA-256 fingerprint of a complete polyMesh.
 
@@ -348,12 +352,32 @@ def fingerprint_poly_mesh(poly_mesh_path: Path) -> MeshFingerprint:
         raise ValueError(f'not a complete polyMesh: missing {", ".join(missing)}')
     validate_poly_mesh_headers(poly_mesh_path)
 
-    digest = hashlib.sha256()
-    selected: list[str] = []
+    # Plan 45 boot. The quality, export and sizing reads each ask for this
+    # fingerprint, and a case open asks about two dozen times: every ask hashed
+    # the whole mesh again (23 x 23 ms on the pipe, minutes on a large mesh)
+    # on the GUI thread. A file that has not changed in size or modification
+    # time has not changed in content, so the answer is kept against exactly
+    # that, and any write to a mesh file makes the key differ.
+    members: list[tuple[str, Path]] = []
     for name in _FINGERPRINT_POLY_MESH_FILES:
         file_path = _mesh_file(poly_mesh_path, name)
-        if file_path is None:
-            continue
+        if file_path is not None:
+            members.append((name, file_path))
+    cache_key = None
+    try:
+        cache_key = (os.path.normcase(os.path.abspath(poly_mesh_path)),) + tuple(
+            (path.name, st.st_size, st.st_mtime_ns)
+            for _name, path in members for st in (path.stat(),))
+    except OSError:
+        pass
+    if cache_key is not None:
+        known = _FINGERPRINT_CACHE.get(cache_key)
+        if known is not None:
+            return known
+
+    digest = hashlib.sha256()
+    selected: list[str] = []
+    for _name, file_path in members:
         relative_name = file_path.name
         selected.append(relative_name)
         digest.update(relative_name.encode('utf-8'))
@@ -363,7 +387,12 @@ def fingerprint_poly_mesh(poly_mesh_path: Path) -> MeshFingerprint:
         with file_path.open('rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
                 digest.update(chunk)
-    return MeshFingerprint(digest=digest.hexdigest(), files=tuple(selected))
+    result = MeshFingerprint(digest=digest.hexdigest(), files=tuple(selected))
+    if cache_key is not None:
+        if len(_FINGERPRINT_CACHE) >= 16:
+            _FINGERPRINT_CACHE.pop(next(iter(_FINGERPRINT_CACHE)))
+        _FINGERPRINT_CACHE[cache_key] = result
+    return result
 
 
 #: Why a case with our own sidecar still opens with no workflow behind it.

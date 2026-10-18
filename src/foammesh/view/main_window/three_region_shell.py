@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
@@ -115,6 +115,15 @@ def preferred_band_sizes(total_height: int) -> tuple[int, int]:
     return total_height - band, band
 
 
+def readable_band_height(band_widget) -> int:
+    """R196: the height at which what the band holds is legible -- the
+    preferred band, or what the widget says it needs, whichever is larger."""
+    minimum = REGION_C_BAND_PREFERRED
+    if band_widget is not None:
+        minimum = max(minimum, band_widget.minimumSizeHint().height())
+    return minimum
+
+
 def reveal_output_band(splitter, *, minimum: int | None = None) -> bool:
     """Grow Region C's output band to fit what it holds. True when it moved.
 
@@ -131,15 +140,20 @@ def reveal_output_band(splitter, *, minimum: int | None = None) -> bool:
     there and none of it was legible. A constant cannot know that; the band
     can. Ask the widget what it needs and use whichever is larger, still
     capped by the viewport's own minimum.
+
+    Plan 45 H. Region C's splitter belongs to its band controller: setting
+    its sizes from here, behind the controller's back, left the controller
+    sure of a height and a state the splitter no longer had. When the
+    splitter has a controller (``_foammeshBandController``), the controller
+    does the revealing; this function only measures for a bare splitter.
     """
     if splitter is None or splitter.count() < 2:
         return False
+    controller = getattr(splitter, '_foammeshBandController', None)
+    if controller is not None:
+        return controller.reveal(minimum)
     if minimum is None:
-        minimum = REGION_C_BAND_PREFERRED
-        band_widget = splitter.widget(1)
-        if band_widget is not None:
-            minimum = max(minimum,
-                          band_widget.minimumSizeHint().height())
+        minimum = readable_band_height(splitter.widget(1))
     sizes = list(splitter.sizes())
     total = sizes[0] + sizes[1]
     if total <= 0 or sizes[1] >= minimum:
@@ -254,6 +268,40 @@ class OutputBandController:
         self._changed()
         return True
 
+    def reveal(self, minimum: int | None = None) -> bool:
+        """Details: open the band and make it tall enough to read (R114/R196).
+
+        The one way to grow the band for a report, so the controller's state
+        and the splitter never disagree (Plan 45 H). True when anything
+        changed. In focus mode the band opens when focus mode ends."""
+        changed = self.open()
+        if not self._open or self._focus:
+            return changed
+        wanted = (readable_band_height(self._band) if minimum is None
+                  else int(minimum))
+        sizes = list(self._splitter.sizes())
+        total = sizes[0] + sizes[1]
+        if total <= 0 or sizes[1] >= wanted:
+            return changed
+        band = min(wanted, total - REGION_C_VIEWPORT_MINIMUM)
+        if band <= sizes[1]:
+            return changed
+        self._set_band_height(band)
+        return True
+
+    def _set_band_height(self, height: int) -> None:
+        sizes = list(self._splitter.sizes())
+        total = sizes[0] + sizes[1]
+        self._splitter.setSizes([total - height, height] + sizes[2:])
+
+    def restore_from_chip(self) -> bool:
+        """The folded chip was pressed: open the console. In focus mode the
+        chip is the one control on screen, so it ends focus mode first."""
+        if self._focus:
+            self.leave_focus()
+        self.open()
+        return self._open
+
     def toggle(self) -> bool:
         """Ctrl+J. Returns whether the band is open afterwards."""
         if self._focus:
@@ -327,7 +375,12 @@ class OutputBandController:
                 if widget is not None and not widget.isHidden():
                     widget.hide()
                     self._hidden_before_focus.append(widget)
-        self._band.hide()
+        # Plan 45 H. Not hidden: folded to its 28 px chip, so a way back to
+        # the console stays on screen (the chip ends focus mode and opens it).
+        self._show_band_widgets(False)
+        chip = self._chip_height()
+        total = self._viewport_total()
+        self._splitter.setSizes([max(total - chip, 0), chip])
         self._focus = True
         self._changed()
         return True
@@ -631,7 +684,15 @@ class ThreeRegionShell:
 
     def apply_sizes(self, total_width: int, saved=None,
                     a_preferred: int | None = None,
-                    b_wanted: int | None = None) -> tuple[int, int, int]:
+                    b_wanted: int | None = None, *,
+                    commit: bool = True) -> tuple[int, int, int]:
+        """Work out the three widths and, with ``commit``, set them.
+
+        Plan 45 I. ``commit=False`` only measures: the settings sheet owns
+        the middle width and sets all three itself, and setting them here
+        first laid the window out at the shell's idea of B, then again at the
+        sheet's (two 45 ms passes, one of them thrown away).
+        """
         rail = self.rail
         sizes = (
             preferred_region_sizes(total_width, a_preferred, b_wanted, rail)
@@ -639,7 +700,8 @@ class ThreeRegionShell:
             else clamp_region_sizes(
                 total_width, saved, a_preferred, b_wanted, rail)
         )
-        self.splitter.setSizes(list(sizes))
+        if commit and list(self.splitter.sizes()) != list(sizes):
+            self.splitter.setSizes(list(sizes))
         return sizes
 
     def assert_invariants(self) -> None:
@@ -743,6 +805,12 @@ class _CollapseWhenEmpty(QObject):
         return False
 
 
+#: Plan 45 P13. How much of the console splitter's handle stays over the view:
+#: a thin grip against the card. The rest of the 8 px handle is masked away,
+#: where a solid colour read as a white bar across the light theme.
+CONSOLE_GRIP_PX = 3
+
+
 class _ClearOverView(QObject):
     """DP-2707. Cut the console splitter's window down to what it draws.
 
@@ -762,8 +830,30 @@ class _ClearOverView(QObject):
         self._splitter, self._spacer, self._card = splitter, spacer, card
         for watched in (splitter, spacer) + ((card,) if card else ()):
             watched.installEventFilter(self)
-        splitter.splitterMoved.connect(lambda *_: self.sync())
+        splitter.splitterMoved.connect(lambda *_: (self.sync(), self.sync_later()))
+        self._pending = False
         self.sync()
+
+    def sync_later(self) -> None:
+        """Resync once the event loop has laid the splitter out.
+
+        The filter below sees a Resize/LayoutRequest *before* the splitter
+        has placed its handle and children, so a sync run from it masks the
+        previous layout: after the console folded, or the window shrank, the
+        mask kept a strip above the chip -- the splitter's unpainted window,
+        black over the GL view. One deferred pass reads the settled layout.
+        """
+        if self._pending:
+            return
+        self._pending = True
+
+        def run() -> None:
+            self._pending = False
+            try:
+                self.sync()
+            except RuntimeError:                  # the splitter was deleted
+                pass
+        QTimer.singleShot(0, self, run)
 
     def sync(self) -> None:
         from PySide6.QtGui import QRegion
@@ -778,6 +868,23 @@ class _ClearOverView(QObject):
             left = card.mapTo(splitter, QPoint(0, 0)).x()
             region = region.intersected(QRegion(QRect(
                 left, 0, card.width(), splitter.height())))
+        # Plan 45 P13. Of the handle keep only a thin grip (its edge against
+        # the card); the rest of its band is cut away, since a solid handle
+        # read as a white bar and a transparent one is black over the GL view.
+        handle = splitter.handle(1) if splitter.count() > 1 else None
+        if handle is not None and handle.isVisibleTo(splitter):
+            band = handle.geometry()
+            grip = QRect(band.left(), band.bottom() + 1 - CONSOLE_GRIP_PX,
+                         band.width(), CONSOLE_GRIP_PX)
+            if card is not None and card.isVisibleTo(splitter):
+                grip = grip.intersected(QRect(left, 0, card.width(),
+                                              splitter.height()))
+            region = region.subtracted(QRegion(band)).united(QRegion(grip))
+        if card is not None and not card.isVisibleTo(splitter):
+            # Plan 45 H. No card, nothing to take a press: the splitter is
+            # no longer transparent for the mouse, so it must not cover the
+            # view with an empty band either.
+            region = region.subtracted(region)
         if region.isEmpty():
             # An empty mask means "no mask" to Qt; keep one pixel instead.
             region = QRegion(QRect(0, 0, 1, 1))
@@ -791,6 +898,7 @@ class _ClearOverView(QObject):
                             QEvent.Type.HideToParent,
                             QEvent.Type.LayoutRequest):
             self.sync()
+            self.sync_later()
         return False
 
 
@@ -821,14 +929,27 @@ class _CardRing(QWidget):
         card = self._card
         left, top, right, bottom = self._margins
         origin = card.mapTo(self._host, QPoint(0, 0))
-        self.setGeometry(QRect(origin, card.size()).adjusted(
-            -left, -top, right, bottom))
+        rect = QRect(origin, card.size()).adjusted(-left, -top, right, bottom)
+        visible = card.isVisible()
+        mask = (left, top, card.width(), card.height())
         self.stackUnder(self._splitter)
-        self.setVisible(card.isVisible())
+        # Plan 45 PINQ. Every move, resize and layout request of the host,
+        # the card and the band came here, and each re-set the ring's native
+        # window -- its mask and place -- whether or not either had changed
+        # (MEASURED: eight window-region calls in one pin).
+        key = (rect, visible, mask)
+        if (key == self._synced and self.geometry() == rect
+                and self.isVisible() == visible):
+            return
+        self._synced = key
+        self.setGeometry(rect)
+        self.setVisible(visible)
         # DP-2707. The ring is a native window over the GL view, where its
         # translucent shadow paints black; only the card's own rect is kept.
         from PySide6.QtGui import QRegion
-        self.setMask(QRegion(QRect(left, top, card.width(), card.height())))
+        self.setMask(QRegion(QRect(*mask)))
+
+    _synced = None
 
     def eventFilter(self, watched, event):
         if event.type() in (QEvent.Type.Move, QEvent.Type.Resize,
@@ -836,6 +957,15 @@ class _CardRing(QWidget):
                             QEvent.Type.LayoutRequest):
             self.sync()
         return False
+
+    def nativeEvent(self, event_type, message):
+        # Plan 45 H. ``stackUnder`` does not restack native windows, so the
+        # ring's window sat over the splitter's and took every press on the
+        # card (MEASURED: Details, "--" and the folded chip all landed on
+        # consoleCardRingWindow). Windows now passes the press underneath.
+        from foammesh.view.theming.elevation import pass_hit_test
+        # (QWidget's own nativeEvent answers "not handled" to everything.)
+        return pass_hit_test(event_type, message) or (False, 0)
 
     def paintEvent(self, _event) -> None:
         left, top, right, bottom = self._margins
@@ -1037,17 +1167,20 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
 
     # Plan 44 MF6. The console is a card that floats over the bottom of the
     # viewport, not a band the viewport gives way to: the viewport fills region
-    # C, and the splitter that sizes the card is laid over it. The splitter is
-    # transparent and lets the mouse through; only its handle (an invisible grip
-    # until hovered) and the card itself take it. Its first child is a spacer
-    # standing for the part of the viewport the card does not cover, so
-    # ``sizes()`` is still ``[clear viewport, console]`` for everything that
-    # read it before.
+    # C, and the splitter that sizes the card is laid over it. Its mask
+    # (``_ClearOverView``) cuts it down to the card and a thin grip, so the
+    # mouse reaches the viewport everywhere else and the card and the grip
+    # take it. Its first child is a spacer standing for the part of the
+    # viewport the card does not cover, so ``sizes()`` is still
+    # ``[clear viewport, console]`` for everything that read it before.
+    #
+    # Plan 45 H. The splitter and the band were also
+    # ``WA_TransparentForMouseEvents``, which Qt applies to a widget *and its
+    # children*: the card inside them could never be pressed (its "--", the
+    # folded chip, Details). The mask is what lets the mouse through now.
     region_c_splitter = QSplitter(Qt.Orientation.Vertical, region_c_host)
     region_c_splitter.setObjectName('regionCSplitter')
     region_c_splitter.setChildrenCollapsible(False)
-    region_c_splitter.setAttribute(
-        Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     viewport.setParent(region_c_host)
     if hasattr(viewport, 'setTitle'):
         viewport.setTitle('')
@@ -1063,12 +1196,12 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
     clear_spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
     # The card and the band that places it travel together. The band is
-    # transparent (the console's width is set by margins on it) and the card is
-    # the visible panel: one 28 px header row over the pages.
+    # unpainted (the console's width is set by margins on it; the splitter's
+    # mask keeps only the card's columns) and the card is the visible panel:
+    # one 28 px header row over the pages.
     output_band = QWidget(region_c_splitter)
     output_band.setObjectName('regionCOutputBand')
     output_band.setAccessibleName('Mesh verdict and output tabs')
-    output_band.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     band_layout = QVBoxLayout(output_band)
     band_layout.setContentsMargins(0, 0, 0, 0)
     band_layout.setSpacing(0)
@@ -1174,6 +1307,8 @@ def install_three_region_shell(ui) -> ThreeRegionShell:
         region_c_splitter, output_band, region_c, verdict_strip,
         region_splitter_h=splitter, header=console_header)
     ui.regionCBandController = band
+    # Plan 45 H: one owner for the band's height (see reveal_output_band).
+    region_c_splitter._foammeshBandController = band
     shell = ThreeRegionShell(
         splitter, region_a, region_b, region_c, viewport,
         region_c_host=region_c_host, region_c_splitter=region_c_splitter,

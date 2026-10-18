@@ -295,8 +295,10 @@ def _run_conversion(profile, argv, timeout, staging: Path):
     logger.info('Gmsh export through %s runs %s (cwd %s)',
                 profile.profile_id, spoken, os.getcwd())
     try:
+        # Plan 45: no console window from a console-less build.
         completed = subprocess.run(argv, capture_output=True, text=True,
-                                   timeout=timeout)
+                                   timeout=timeout, stdin=subprocess.DEVNULL,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except subprocess.TimeoutExpired as error:
         logger.info('Gmsh export through %s was interrupted: no answer within '
                     '%s seconds (cwd %s, stdout and stderr unread)',

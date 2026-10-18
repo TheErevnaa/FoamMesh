@@ -18,7 +18,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from foammesh.support.heartbeat import set_last_op
+from foammesh.support.heartbeat import last_op as heartbeat_last_op, restore_last_op, set_last_op
 
 logger = logging.getLogger(__name__)
 
@@ -186,12 +186,14 @@ class _Measurement:
         self._context = context
         self._started = 0.0
         self._cpu_started = 0.0
+        self._previous_op = None
 
     def __enter__(self):
         if self._context:
             # Plan 35 CR1: the crash helper reads what was running from the
             # heartbeat block, so a hang dump or a death names the facade
             # operation without asking the frozen process.
+            self._previous_op = heartbeat_last_op()
             set_last_op(f'facade:{self._context}')
         self._cpu_started = time.thread_time()
         self._started = self._monitor._clock()
@@ -202,4 +204,9 @@ class _Measurement:
         cpu = (time.thread_time() - self._cpu_started) * 1000.0
         self._monitor.record(self._name, duration, context=self._context,
                              cpu_ms=cpu)
+        if self._context:
+            # Plan 45 W1/V12: a finished operation is not "what is running";
+            # the label goes back to what it was, so a later stall is not
+            # blamed on it.
+            restore_last_op(f'facade:{self._context}', self._previous_op or '')
         return False
