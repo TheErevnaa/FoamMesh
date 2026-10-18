@@ -1,5 +1,33 @@
 # FoamMesh Release Notes
 
+## 1.1.2 — 2026-10-18
+
+- **A faster start.** A FoamMesh splash shows within half a second of launch
+  and the main window opens in about 2.3 s (was 2.7 s). Quitting closes the
+  app in under 2 s.
+- **Pinning is immediate.** Pinning or unpinning the settings column now
+  answers in under 0.3 s, with the view laid out and drawn once.
+- **Viewport tools.**
+  - The colour-scale card can be moved and widened, and its metric name and
+    limit tag no longer collide.
+  - Deviation is shown with one colour map: the legend, the card's histogram
+    and the caption read the same unsigned distance.
+  - Parts shows ten parts before it scrolls, and is opened from its rail
+    button.
+  - The cut plane and section are one tool with a readable panel.
+  - The display tools sit on the rail as tools of their own.
+  - The origin axes are scaled to the model (0.4 of its smallest side).
+  - Feature edges draws the boundary's own edges on any mesh, and Show
+    elements says why when it draws nothing.
+- **Fixes.**
+  - The console and the settings column minimise and come back reliably.
+  - Drop-down menus open beside their buttons.
+  - No dark corners on the floating bars, and no white line above the
+    console in the light theme.
+  - Switching theme holds the window under a second, and opening a case
+    builds only the page it shows.
+  - No console windows flash open when tools run.
+
 ## 1.1.1 — 2026-10-17
 
 - **A viewport-first window.** The 3-D view takes most of the window. Its tools
