@@ -11,7 +11,7 @@ pip install pyinstaller
 python convertUi.py          # generate resource_rc.py + *_ui.py (REQUIRED)
 python scripts/generate_build_metadata.py
 # optional extras to bundle their features:
-pip install "foammesh[cad]" "foammesh[api]" "foammesh[agent]" "foammesh[export]"
+pip install "foammesh[cad]" "foammesh[api]" "foammesh[export]"
 ```
 
 ## Build
