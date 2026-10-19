@@ -387,6 +387,7 @@ class MainWindow(QMainWindow):
         self._policyActions = {}
         self._menuRefreshPending = False
         self._projectRefreshPending = False
+        self._apiGeometryPending = False
         # DP-363. Set when a pending refresh is a history move, which has
         # to repaint the forms; cleared when it is flushed.
         self._projectRefreshRepaintsForms = False
@@ -4723,6 +4724,28 @@ class MainWindow(QMainWindow):
         self._menuRefreshPending = False
         self._updateMenuStates()
 
+    def _geometryFromApi(self, **_payload):
+        """Queue adoption of geometry an API command put in the store."""
+        try:
+            source = app.facadeClient.session().event_source()
+        except (AttributeError, RuntimeError):
+            return
+        if source != 'rest' or self._apiGeometryPending:
+            return
+        self._apiGeometryPending = True
+        QTimer.singleShot(0, self._adoptApiGeometry)
+
+    def _adoptApiGeometry(self):
+        self._apiGeometryPending = False
+
+        async def adopt():
+            try:
+                await self._stepManager.adoptStoreGeometry()
+            except Exception:                            # noqa: BLE001
+                logger.exception('could not show geometry imported over the API')
+
+        asyncio.ensure_future(adopt())
+
     def _scheduleProjectRefresh(self, *_args, **kwargs):
         """Coalesce artifact/history events into one truthful scene refresh."""
         self._scheduleMenuRefresh()
@@ -7064,6 +7087,12 @@ class MainWindow(QMainWindow):
             # not keep reading as current.
             app.events.subscribe(
                 Event.MESH_VERDICT_STALE, self._meshVerdictSuperseded),
+        ] + [
+            # DP-2730. An import over the local API writes the store only;
+            # the Geometry page adds its rows so the tree, the viewport and
+            # the Preparation lock see it.
+            app.events.subscribe(
+                Event.ARTIFACT_GEOMETRY_CHANGED, self._geometryFromApi),
         ] + [
             # R143. MEASURED: the snappy Quality row ran checkMesh -allTopology
             # -allGeometry -writeSets on the 67,662-cell mesh, wrote every

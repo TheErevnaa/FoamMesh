@@ -329,6 +329,14 @@ class CaseSession:
             {'id': command.actor.id, 'kind': command.actor.kind.value},
             command.source.value, command.correlation_id or command.command_id))
 
+    def event_source(self) -> str | None:
+        """The source of the command whose events are being raised now.
+
+        DP-2730. 'rest' while a local API command runs, so a window can tell
+        a change it made itself from one made over the API.
+        """
+        return self._event_context.get()[1]
+
     def clear_event_context(self) -> None:
         self._event_context.set((None, None, None))
 

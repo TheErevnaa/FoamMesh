@@ -61,9 +61,22 @@ hiddenimports = [
     # Engine packages use lazy module exports so PyInstaller cannot discover
     # the registry reached by frozen package qualification and fresh cases.
     'foammesh.core.engine.registry',
+    # DP-2729: the engine switch (mesh.engine.select) reaches this one lazily.
+    'foammesh.core.engine.selection',
     # VTK creates these backends through factories, so static analysis cannot
     # see them even though the application imports their public wrappers.
     'vtkmodules.vtkRenderingOpenGL2', 'vtkmodules.vtkInteractionStyle',
+    # Plan 46: the local API (--api-attach) is imported only when it is
+    # switched on, and uvicorn picks its loop and protocols by name.
+    'foammesh.api', 'foammesh.api.v1', 'foammesh.core.facade.desktop_host',
+    'foammesh.support.local_api', 'foammesh.view.main_window.local_api_indicator',
+    'fastapi', 'starlette', 'anyio', 'h11',
+    'uvicorn', 'uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto',
+    'uvicorn.loops.asyncio', 'uvicorn.protocols', 'uvicorn.protocols.http',
+    'uvicorn.protocols.http.auto', 'uvicorn.protocols.http.h11_impl',
+    'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto',
+    'uvicorn.protocols.websockets.websockets_impl', 'uvicorn.lifespan',
+    'uvicorn.lifespan.on', 'uvicorn.lifespan.off',
 ]
 
 
@@ -159,8 +172,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleDisplayName': 'FoamMesh',
             'CFBundleName': 'FoamMesh',
-            'CFBundleShortVersionString': '1.1.2',
-            'CFBundleVersion': '1.1.2',
+            'CFBundleShortVersionString': '1.1.3',
+            'CFBundleVersion': '1.1.3',
             'NSHighResolutionCapable': True,
         },
     )

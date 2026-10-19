@@ -149,6 +149,27 @@ def _volumeName(surfaces):
     return surfaces[0].fName
 
 
+def _composeEntry(importer, entry, stem):
+    """Read one store entry back as the volumes and surfaces the tree shows.
+
+    Returns ``(volumes, surfaces)`` the way ``StlImporter.identifyVolumes``
+    does. Filter work on plain polydata, safe on a worker thread (DP-2709).
+    """
+    from pathlib import Path
+
+    names, uuids = _patchIdentities(entry)
+    pieces = importer.loadNamedSolids(
+        Path(entry['artifact']), names, fileName=stem,
+        volumeName=entry.get('name') or stem,
+        geometryId=entry.get('geometry_id'), uuids=uuids)
+    # DP-419. The bodies the import recorded, where it recorded more than one;
+    # otherwise the composition that has always run.
+    bodies = _volumesFromBodies(entry, pieces)
+    if bodies is None:
+        return importer.identifyVolumes()
+    return bodies, []
+
+
 def _patchIdentities(entry) -> tuple[dict, dict]:
     """``(solid -> patch name, patch name -> patch uuid)`` for one import.
 
@@ -232,6 +253,9 @@ class GeometryPage(StepPage):
         super().__init__(ui, ui.geometryPage)
 
         self._geometryManager = None
+        #: Geometry ids being adopted from the store (DP-2730), so a second
+        #: event during the compose does not write the same rows twice.
+        self._adopting = set()
         self._list = GeometryList(self._ui.geometryList)
         self._menu = None
 
@@ -1662,12 +1686,6 @@ class GeometryPage(StepPage):
 
     @qasync.asyncSlot()
     async def _importSTL(self):
-        def getUniqueSeq(name, seq):
-            if seq == '' and name in RESERVED_NAMES:
-                seq = 1
-
-            return db.getUniqueSeq('geometry', 'name', name, seq)
-
         from foammesh.core.facade.errors import FacadeError
         from foammesh.core.geometry.cad import CAD_SUFFIXES, is_available, CAD_INSTALL_HINT
         files = self._dialog.files()
@@ -1766,93 +1784,165 @@ class GeometryPage(StepPage):
             surfaces = [*surfaces, *meshSurfaces]
 
         try:
-            addedVolumes = []
-            addedSurfaces = []
-
-            db = app.facadeClient.checkout()
-            seq = ''
-            for volume in volumes:
-                name = _volumeName(volume)
-                seq = getUniqueSeq(name, seq)
-                volumeName = name + seq
-                element = db.newElement('geometry')
-                element.setValue('gType', GeometryType.VOLUME)
-                element.setValue('name', volumeName)
-                element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
-                element.setValue('cfdType', CFDType.NONE.value)
-                if volume:
-                    self._stampIdentity(element, volume[0], patch=False)
-                volumeId = db.addElement('geometry', element)
-                addedVolumes.append(volumeId)
-
-                sName = f'{volumeName}_surface'
-                sseq = ''
-                for surface in volume:
-                    name = surface.sName if surface.sName and surface.sName != volumeName else sName
-                    sseq = db.getUniqueSeq('geometry', 'name', name, sseq)
-                    surfaceName = name + getUniqueSeq(name, sseq)
-                    element = db.newElement('geometry')
-                    element.setValue('gType', GeometryType.SURFACE.value)
-                    element.setValue('volume', volumeId)
-                    element.setValue('name', surfaceName)
-                    element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
-                    element.setValue('cfdType', CFDType.BOUNDARY.value)
-                    # DP-383. The row is about to be given a name the tree can
-                    # show, which is not always the name the manifest holds:
-                    # `getUniqueSeq` suffixes a name another import already
-                    # took, so a second STEP's face0 becomes face01 here and
-                    # stays face0 there. The identity is what survives that.
-                    self._stampIdentity(element, surface)
-                    element.setValue('path', db.addGeometryPolyData(surface.polyData))
-                    db.addElement('geometry', element)
-
-            for surface in surfaces:
-                name = surface.sName if surface.sName else surface.fName
-                seq = getUniqueSeq(name, seq)
-                surfaceName = name + seq
-                element = db.newElement('geometry')
-                element.setValue('gType', GeometryType.SURFACE.value)
-                element.setValue('name', surfaceName)
-                element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
-                element.setValue('cfdType', CFDType.BOUNDARY.value)
-                self._stampIdentity(element, surface)
-                element.setValue('path', db.addGeometryPolyData(surface.polyData))
-                gId = db.addElement('geometry', element)
-                addedSurfaces.append(gId)
-
-            await app.facadeClient.commit_working_copy(db, action='update geometry')
-
-            # The sources are already persisted: every branch above imported
-            # through `geometry.import` and then read the artifact back, so
-            # there is nothing left to write here. This used to be a second
-            # pass over the same files -- a second tessellation of every STEP,
-            # at the importer's fixed deflection rather than the one shown --
-            # which is how the viewport and the mesher came to disagree about
-            # the same part.
-
-            # Rebuild once from what was committed, rather than also adding
-            # each element incrementally.
-            #
-            # Committing yields to the event loop, and the project refresh it
-            # schedules already rebuilds the tree and the scene from the
-            # database. Adding the same elements again afterwards gave the
-            # geometry list a second, childless copy of the volume -- the
-            # duplicate "duct" row -- and asked the actor manager to register
-            # actors it already had, which raises. `_importSTL` catches only
-            # RuntimeError, so that KeyError aborted the rest of the import
-            # with nothing said.
-            #
-            # Both loads clear before they read, so this is idempotent and it
-            # does not matter whether the scheduled refresh runs before or
-            # after it.
-            del addedVolumes, addedSurfaces
-            self._reloadFromDatabase()
+            await self._writeGeometryRows(volumes, surfaces)
         except (RuntimeError, OSError, ValueError, FacadeError) as ex:
             # RuntimeError alone let a rejected artifact import or an
             # unreadable file abort the import with nothing said.
             await modal(
                 messages.warning,
                 self._widget, self.tr('Geometry loading error'), str(ex))
+
+    async def adoptStoreGeometry(self) -> int:
+        """Show geometry that reached the store without this page (DP-2730).
+
+        `geometry.import` over the local API writes the artifact store and
+        nothing else; the tree, the viewport and the Preparation lock read the
+        geometry rows this page writes after its own import. MEASURED on the
+        packaged 1.1.3: an elbow imported over the API meshed and passed
+        checkMesh while the Geometry page still said there was no geometry.
+        Every store entry with no row is composed and written exactly as the
+        import button would have. Returns how many entries were adopted.
+        """
+        project = getattr(app, 'project', None)
+        if project is None or getattr(project, 'path', None) is None:
+            return 0
+        from pathlib import Path
+
+        from foammesh.core.geometry import GeometryArtifactStore
+        try:
+            entries = GeometryArtifactStore(project.path).entries()
+        except (OSError, ValueError):
+            return 0
+
+        def of(element):
+            try:
+                return str(element['geometryId'] or '')
+            except (KeyError, TypeError):
+                return ''
+
+        db = app.facadeClient.checkout()
+        known = {of(e) for e in db.getElements('geometry').values()}
+        missing = [entry for entry in entries
+                   if entry.get('artifact') and entry.get('geometry_id')
+                   and str(entry['geometry_id']) not in known
+                   and str(entry['geometry_id']) not in self._adopting]
+        if not missing:
+            return 0
+        self._adopting.update(str(entry['geometry_id']) for entry in missing)
+        try:
+            importer = StlImporter()
+            volumes, surfaces = [], []
+            for entry in missing:
+                stem = Path(str(entry.get('source') or entry.get('name')
+                                or entry['geometry_id'])).stem
+
+                def compose(entry=entry, stem=stem):
+                    return _composeEntry(importer, entry, stem)
+
+                fileVolumes, fileSurfaces = await asyncio.to_thread(compose)
+                volumes.extend(fileVolumes)
+                surfaces.extend(fileSurfaces)
+            await self._writeGeometryRows(volumes, surfaces)
+        finally:
+            self._adopting.difference_update(
+                str(entry['geometry_id']) for entry in missing)
+        return len(missing)
+
+    async def _writeGeometryRows(self, volumes, surfaces):
+        """Add the composed volumes and surfaces to the geometry tree.
+
+        What the import button does once the store has the artifact. The
+        API import (DP-2730) arrives at the same rows through
+        :meth:`adoptStoreGeometry`, so both write them one way.
+        """
+        addedVolumes = []
+        addedSurfaces = []
+
+        db = app.facadeClient.checkout()
+
+        def getUniqueSeq(name, seq):
+            if seq == '' and name in RESERVED_NAMES:
+                seq = 1
+
+            return db.getUniqueSeq('geometry', 'name', name, seq)
+
+        seq = ''
+        for volume in volumes:
+            name = _volumeName(volume)
+            seq = getUniqueSeq(name, seq)
+            volumeName = name + seq
+            element = db.newElement('geometry')
+            element.setValue('gType', GeometryType.VOLUME)
+            element.setValue('name', volumeName)
+            element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
+            element.setValue('cfdType', CFDType.NONE.value)
+            if volume:
+                self._stampIdentity(element, volume[0], patch=False)
+            volumeId = db.addElement('geometry', element)
+            addedVolumes.append(volumeId)
+
+            sName = f'{volumeName}_surface'
+            sseq = ''
+            for surface in volume:
+                name = surface.sName if surface.sName and surface.sName != volumeName else sName
+                sseq = db.getUniqueSeq('geometry', 'name', name, sseq)
+                surfaceName = name + getUniqueSeq(name, sseq)
+                element = db.newElement('geometry')
+                element.setValue('gType', GeometryType.SURFACE.value)
+                element.setValue('volume', volumeId)
+                element.setValue('name', surfaceName)
+                element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
+                element.setValue('cfdType', CFDType.BOUNDARY.value)
+                # DP-383. The row is about to be given a name the tree can
+                # show, which is not always the name the manifest holds:
+                # `getUniqueSeq` suffixes a name another import already
+                # took, so a second STEP's face0 becomes face01 here and
+                # stays face0 there. The identity is what survives that.
+                self._stampIdentity(element, surface)
+                element.setValue('path', db.addGeometryPolyData(surface.polyData))
+                db.addElement('geometry', element)
+
+        for surface in surfaces:
+            name = surface.sName if surface.sName else surface.fName
+            seq = getUniqueSeq(name, seq)
+            surfaceName = name + seq
+            element = db.newElement('geometry')
+            element.setValue('gType', GeometryType.SURFACE.value)
+            element.setValue('name', surfaceName)
+            element.setValue('shape', Shape.TRI_SURFACE_MESH.value)
+            element.setValue('cfdType', CFDType.BOUNDARY.value)
+            self._stampIdentity(element, surface)
+            element.setValue('path', db.addGeometryPolyData(surface.polyData))
+            gId = db.addElement('geometry', element)
+            addedSurfaces.append(gId)
+
+        await app.facadeClient.commit_working_copy(db, action='update geometry')
+
+        # The sources are already persisted: every branch above imported
+        # through `geometry.import` and then read the artifact back, so
+        # there is nothing left to write here. This used to be a second
+        # pass over the same files -- a second tessellation of every STEP,
+        # at the importer's fixed deflection rather than the one shown --
+        # which is how the viewport and the mesher came to disagree about
+        # the same part.
+
+        # Rebuild once from what was committed, rather than also adding
+        # each element incrementally.
+        #
+        # Committing yields to the event loop, and the project refresh it
+        # schedules already rebuilds the tree and the scene from the
+        # database. Adding the same elements again afterwards gave the
+        # geometry list a second, childless copy of the volume -- the
+        # duplicate "duct" row -- and asked the actor manager to register
+        # actors it already had, which raises. `_importSTL` catches only
+        # RuntimeError, so that KeyError aborted the rest of the import
+        # with nothing said.
+        #
+        # Both loads clear before they read, so this is idempotent and it
+        # does not matter whether the scheduled refresh runs before or
+        # after it.
+        del addedVolumes, addedSurfaces
+        self._reloadFromDatabase()
 
     @staticmethod
     def _stampIdentity(element, surface, patch: bool = True) -> None:
@@ -1905,19 +1995,9 @@ class GeometryPage(StepPage):
                 parameters['tessellation'] = dict(tessellation)
             imported = await app.facadeClient.run('geometry.import', parameters)
             entry = imported.payload
-            names, uuids = _patchIdentities(entry)
-            def compose(entry=entry, names=names, uuids=uuids, source=source):
-                pieces = importer.loadNamedSolids(
-                    Path(entry['artifact']), names, fileName=source.stem,
-                    volumeName=entry.get('name') or source.stem,
-                    geometryId=entry.get('geometry_id'), uuids=uuids)
-                # DP-419. The bodies the import recorded, where it recorded
-                # more than one; otherwise the composition that has always
-                # run.
-                bodies = _volumesFromBodies(entry, pieces)
-                if bodies is None:
-                    return importer.identifyVolumes()
-                return bodies, []
+
+            def compose(entry=entry, source=source):
+                return _composeEntry(importer, entry, source.stem)
 
             # DP-2709. Reading the artifact back and cleaning, sizing and
             # splitting it per surface is filter work on plain polydata -- no

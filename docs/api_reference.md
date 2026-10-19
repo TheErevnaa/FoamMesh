@@ -2,8 +2,20 @@
 
 ## REST API (`foammesh[api]`)
 
-Run `foammesh serve`, then open `/docs` for runtime-generated OpenAPI
-documentation. The only public domain surface is versioned under `/api/v1`.
+Run `foammesh serve --token T --allow-root DIR`. Every request carries
+`Authorization: Bearer T`, and cases are created or opened only inside an
+allowed folder. The OpenAPI document is at `GET /api/v1/openapi.json`; there
+is no `/docs` page. The only public domain surface is versioned under `/api/v1`.
+
+### Local API of the desktop app
+
+Off unless switched on: Settings > Preferences > Connections, or
+`FoamMesh.exe [case] --api-attach [--api-discovery FILE] [--api-allow-root DIR]`
+for one run. The open window then serves the same routes on 127.0.0.1 with a
+new token each start, over the case open in it (no case create, open or close).
+The discovery file (default `~/.foammesh/local-api.json`) holds
+`{endpoint, token, pid}`. The status bar shows while it is on; a click there
+turns it off.
 Clients use semantic field and operation IDs, never database paths or arbitrary
 executable names.
 
@@ -51,7 +63,7 @@ foammesh import-mesh <case> <src> [--format fluent|gmsh|... | --from-case]
 foammesh export <case> <format> [dest]
 foammesh formats
 foammesh history <case>
-foammesh serve [--host H --port P]
+foammesh serve --token T --allow-root DIR [--host H --port P]
 ```
 
 Workflow, mesh, import, export, and history commands execute the same

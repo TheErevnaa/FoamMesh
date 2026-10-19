@@ -124,6 +124,7 @@ class PreferencesDialog(QDialog):
         self.pages.addTab(self._runtimePage(), self.tr('OpenFOAM runtime'))
         self.pages.addTab(self._diagnosticsPage(), self.tr('Diagnostics'))
         self.pages.addTab(self._qualificationPage(), self.tr('Geometry qualification'))
+        self.pages.addTab(self._connectionsPage(), self.tr('Connections'))
         if privacy is not None:
             self.pages.addTab(self._privacyPage(privacy), self.tr('Privacy'))
 
@@ -426,6 +427,38 @@ class PreferencesDialog(QDialog):
         self._showMode()
         return page
 
+    def _connectionsPage(self) -> QWidget:
+        """Plan 46. Whether programs on this PC may work on the open case."""
+        page = QWidget()
+        form = self._form(page)
+        self.localApi = QCheckBox(
+            self.tr('Allow programs on this PC to connect to the open case'), page)
+        self.localApi.setObjectName('preferencesLocalApi')
+        getter = getattr(self._settings, 'getLocalApiEnabled', None)
+        self.localApi.setChecked(bool(getter()) if callable(getter) else False)
+        self.localApi.setToolTip(self.tr(
+            'Serves the FoamMesh API on 127.0.0.1 only, with a new access key '
+            'every start that only your Windows account can read. The status '
+            'bar shows while it is on.'))
+        form.addRow(self.localApi)
+        form.addRow(_note(self.tr(
+            'Off by default. A program that starts FoamMesh with --api-attach '
+            'turns it on for that run only.')))
+        return page
+
+    def _applyLocalApi(self) -> None:
+        setter = getattr(self._settings, 'setLocalApiEnabled', None)
+        if not callable(setter):
+            return
+        wanted = self.localApi.isChecked()
+        if not setter(wanted):
+            return
+        from foammesh.support import local_api
+        api = local_api.current()
+        if api is not None and api.active != wanted:
+            import asyncio
+            asyncio.ensure_future(api.start() if wanted else api.stop())
+
     def _privacyPage(self, privacy) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -524,6 +557,7 @@ class PreferencesDialog(QDialog):
             float(self.budgetSeconds.value()))
         self._settings.setQualificationMode(
             QualificationMode(self.qualificationMode.currentData()))
+        self._applyLocalApi()
         return True
 
     def _applyAppearance(self) -> None:

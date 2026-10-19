@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -243,15 +244,18 @@ def add_facade_commands(sub: argparse._SubParsersAction) -> None:
     ops = sub.add_parser('operations', help='list registered facade operations')
     ops.set_defaults(func=cmd_operations)
 
-    journey = sub.add_parser('journey', help='run a confirmed deterministic PC6 recipe')
-    journey.add_argument('case')
-    journey.add_argument('journey', choices=(
-        'geometry', 'authored-mesh', 'qa-assess', 'qa-adjust', 'transform',
-        'converter-import', 'export-archive'))
-    journey.add_argument('--parameters', default='{}', help='journey-specific JSON object')
-    journey.add_argument('--max-cells', type=int)
-    journey.add_argument('--estimated-cells', type=int)
-    journey.add_argument('--max-attempts', type=int, default=3)
-    journey.add_argument('--max-seconds', type=float)
-    journey.add_argument('--allowed-root')
-    journey.set_defaults(func=cmd_journey)
+    # Plan 46 (Plan 38 D3): the scripted recipes are not in the public
+    # release; the command is offered only where core.automation is.
+    if importlib.util.find_spec('foammesh.core.automation') is not None:
+        journey = sub.add_parser('journey', help='run a confirmed deterministic PC6 recipe')
+        journey.add_argument('case')
+        journey.add_argument('journey', choices=(
+            'geometry', 'authored-mesh', 'qa-assess', 'qa-adjust', 'transform',
+            'converter-import', 'export-archive'))
+        journey.add_argument('--parameters', default='{}', help='journey-specific JSON object')
+        journey.add_argument('--max-cells', type=int)
+        journey.add_argument('--estimated-cells', type=int)
+        journey.add_argument('--max-attempts', type=int, default=3)
+        journey.add_argument('--max-seconds', type=float)
+        journey.add_argument('--allowed-root')
+        journey.set_defaults(func=cmd_journey)

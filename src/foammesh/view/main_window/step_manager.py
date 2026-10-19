@@ -639,6 +639,10 @@ class StepManager(QObject):
         """Bring these files into the open case without asking for them."""
         await self._pages[Step.GEOMETRY].importFiles(files)
 
+    async def adoptStoreGeometry(self):
+        """Show geometry imported over the local API (DP-2730)."""
+        return await self._pages[Step.GEOMETRY].adoptStoreGeometry()
+
     async def openMeshSetup(self):
         """Settle Geometry and Preparation and stand on Mesh setup (UXA8).
 

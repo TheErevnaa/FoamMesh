@@ -75,6 +75,8 @@ class SettingKey(Enum):
     # FoamMesh wrote to Windows' per-app graphics preference.
     USE_DEDICATED_GPU = 'use_dedicated_gpu'
     GPU_PREFERENCE_STATE = 'gpu_preference_state'
+    # Plan 46. Programs on this PC may connect to the open case (default off).
+    LOCAL_API_ENABLED = 'local_api_enabled'
     # Plan 43 LY2. The step ribbon: numbers only, colour by state, show locks.
     STEP_RIBBON = 'step_ribbon'
     # Plan 43 LY12. The colour standard: scale, reverse, bands, range, legend,
@@ -731,6 +733,12 @@ class AppSettings:
 
     def setUseDedicatedGpu(self, enabled) -> bool:
         return self._set(SettingKey.USE_DEDICATED_GPU, bool(enabled))
+
+    def getLocalApiEnabled(self) -> bool:
+        return bool(self._get(SettingKey.LOCAL_API_ENABLED, False))
+
+    def setLocalApiEnabled(self, enabled) -> bool:
+        return self._set(SettingKey.LOCAL_API_ENABLED, bool(enabled))
 
     def getGpuPreferenceState(self) -> dict:
         state = self._get(SettingKey.GPU_PREFERENCE_STATE, {})

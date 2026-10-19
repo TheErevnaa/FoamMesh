@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -406,8 +407,19 @@ def _cmd_serve(args) -> int:
         print('The API requires the [api] extra: pip install "foammesh[api]"',
               file=sys.stderr)
         return 2
+    # Plan 46 (Plan 38 OA3): a token and at least one allowed case folder.
+    token = args.token or os.environ.get('FOAMMESH_API_TOKEN')
+    if not token:
+        print('serve needs --token (or FOAMMESH_API_TOKEN): every request must '
+              'carry "Authorization: Bearer <token>"', file=sys.stderr)
+        return 2
+    if not args.allow_root:
+        print('serve needs at least one --allow-root DIR: cases are created and '
+              'opened only inside those folders', file=sys.stderr)
+        return 2
     from foammesh.api import create_app
-    uvicorn.run(create_app(), host=args.host, port=args.port)
+    uvicorn.run(create_app(token=token, allowed_case_roots=tuple(args.allow_root)),
+                host=args.host, port=args.port)
     return 0
 
 
@@ -646,6 +658,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve = sub.add_parser('serve', help='run the REST/WebSocket API')
     p_serve.add_argument('--host', default='127.0.0.1')
     p_serve.add_argument('--port', type=int, default=8000)
+    p_serve.add_argument('--token', help='bearer token every request must carry '
+                         '(default: FOAMMESH_API_TOKEN)')
+    p_serve.add_argument('--allow-root', action='append', default=[], metavar='DIR',
+                         help='a folder cases may be created or opened in (repeatable)')
     p_serve.set_defaults(func=_cmd_serve)
 
     # AF5: thin facade-client subcommands (field-get/set, op, snapshot, ...).

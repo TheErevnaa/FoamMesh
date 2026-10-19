@@ -372,9 +372,18 @@ def main():
         startup_splash.close(splash[0])
         splash[0] = None
 
+    # Plan 46: the --api-* options are taken out before the case path is read.
+    from foammesh.support import local_api
+    try:
+        api_request, arguments = local_api.parse_arguments(sys.argv[1:])
+    except ValueError as error:
+        logger.warning('Local API not started: %s', error)
+        api_request = local_api.Request()
+        arguments = [item for item in sys.argv[1:] if not item.startswith('--api-')]
+
     try:
         import_application(lambda: _serve_events(application))
-        initial_case = startup_case_path(sys.argv[1:])
+        initial_case = startup_case_path(arguments)
         app.setupApplication(meshAppProperties)
 
         Analytics().configure(
@@ -437,6 +446,18 @@ def main():
             # anything the start may ask of the user.
             close_splash()
         await asyncio.sleep(0)
+        # Plan 46: off unless --api-attach or Preferences > Connections.
+        # A failure here is logged; it never stops the window.
+        try:
+            from foammesh.view.main_window import local_api_indicator
+            api = local_api.install(app.facade, app.settings, api_request)
+            local_api_indicator.install(app.window, api)
+            if local_api.should_start(app.settings, api_request):
+                if not await api.start():
+                    app.window.statusBar().showMessage(QApplication.translate(
+                        'main', f'The local API could not start: {api.problem}'), 10000)
+        except Exception:                                   # noqa: BLE001
+            logger.warning('The local API could not be set up', exc_info=True)
         # A first start looks for OpenFOAM 13 and Gmsh in WSL rather than
         # assuming the distribution is called OpenFOAM13Runtime.
         try:
@@ -474,6 +495,8 @@ def main():
         loop.run_forever()
 
     lifecycle.record('event loop returned; exiting with code 0')
+    if local_api.current() is not None and local_api.current().active:
+        local_api.current().remove_discovery_file()
     # Plan 45 shut-down: the viewport GL contexts go with the process; the
     # driver's context delete held the exit 1-2 s on about one exit in four.
     rendering_widget.leaveContextsToProcessExit()

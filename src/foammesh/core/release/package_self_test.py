@@ -134,6 +134,66 @@ def _openfoam_check() -> dict:
     }
 
 
+def _local_api_check() -> dict:
+    """Plan 46: the --api-attach host starts, answers, refuses no token, and
+    runs an operation (DP-2729: a module the operation reaches lazily was
+    missing from the 1.1.3 candidate, and only a call found it)."""
+    import asyncio
+    import urllib.error
+    import urllib.request
+
+    from foammesh.core.facade import FoamMeshFacade
+    from foammesh.support.local_api import LocalApi
+
+    def status(url: str, token: str | None, body: dict | None = None) -> int:
+        data = None if body is None else json.dumps(body).encode('utf-8')
+        request = urllib.request.Request(url, data=data)
+        if data is not None:
+            request.add_header('Content-Type', 'application/json')
+        if token is not None:
+            request.add_header('Authorization', f'Bearer {token}')
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    async def exercise() -> dict:
+        with tempfile.TemporaryDirectory(prefix='foammesh-local-api-') as root:
+            discovery = Path(root) / 'local-api.json'
+            facade = FoamMeshFacade()
+            case = facade.create_case(Path(root) / 'case')
+            api = LocalApi(facade, discovery_path=discovery,
+                           allowed_roots=(Path(root),))
+            if not await api.start():
+                raise RuntimeError(f'local API did not start: {api.problem}')
+            try:
+                found = json.loads(discovery.read_text(encoding='utf-8'))
+                capabilities = f'{found["endpoint"]}/api/v1/system/capabilities'
+                health = await asyncio.to_thread(status, f'{found["endpoint"]}/health', None)
+                refused = await asyncio.to_thread(status, capabilities, None)
+                allowed = await asyncio.to_thread(status, capabilities, found['token'])
+                select = (f'{found["endpoint"]}/api/v1/cases/{case.case_id}'
+                          '/operations/mesh.engine.select:execute')
+                engine = await asyncio.to_thread(status, select, found['token'], {
+                    'parameters': {'engine_id': 'gmsh', 'confirmed': True,
+                                   'reason': 'package self-test'}})
+            finally:
+                await api.stop()
+                facade.close_case(case.case_id, save=False)
+            if (health, refused, allowed, engine) != (200, 401, 200, 200):
+                raise RuntimeError(
+                    f'health {health}, no token {refused}, token {allowed}, '
+                    f'mesh.engine.select {engine} (wanted 200, 401, 200, 200)')
+            if discovery.exists():
+                raise RuntimeError('the discovery file was left after stop')
+            return {'endpoint_host': found['endpoint'].split('//')[1].split(':')[0],
+                    'health': health, 'without_token': refused, 'with_token': allowed,
+                    'mesh_engine_select': engine}
+
+    return asyncio.run(exercise())
+
+
 def run(report_path: str | Path) -> dict:
     """Execute frozen-package gates and always persist their complete result."""
     destination = Path(report_path).resolve()
@@ -149,6 +209,7 @@ def run(report_path: str | Path) -> dict:
     _check(checks, 'package.no_migrations', _no_migration_check)
     _check(checks, 'package.resources', _resource_check)
     _check(checks, 'runtime.openfoam_foundation_13', _openfoam_check)
+    _check(checks, 'package.local_api', _local_api_check)
 
     failed = [item['check_id'] for item in checks if item['status'] != 'pass']
     document = {
