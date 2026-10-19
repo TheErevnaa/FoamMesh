@@ -12,7 +12,6 @@ Optional features (extras):
 ```bash
 pip install "foammesh[cad]"      # STEP/IGES/BREP import (OpenCASCADE)
 pip install "foammesh[api]"      # REST/WebSocket API (FastAPI)
-pip install "foammesh[agent]"    # agent strategy LLM bridge (Anthropic)
 pip install "foammesh[export]"   # Gmsh export
 ```
 
