@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -30,6 +31,8 @@ from .journal import JOURNAL_FILE_NAME, EventJournal
 from .results import RevisionSnapshot
 from .scheduler import CommandScheduler
 
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_WRITERS: set[Path] = set()
 LOCK_FILE = 'facade.session.lock'
@@ -151,6 +154,11 @@ class CaseSession:
         #: the case: ``renderer(operation, changed, parameters)``; None with
         #: no window.
         self.presentation_renderer = None
+        #: DP-2851. ``observer(command, result)`` after each queued command
+        #: ends with a result: how the window learns that a command it did
+        #: not send (a local API run) has finished, so it can show what the
+        #: command made the way it does for its own.
+        self._command_observers: list = []
         self._configuration_cache: tuple[int, dict] | None = None
         # CR4 (F4). The in-memory event list is a bounded window, not a
         # history: it held every line of solver output for the life of the
@@ -311,6 +319,27 @@ class CaseSession:
         """
         self.presentation = state
         self.presentation_renderer = renderer
+
+    def observe_commands(self, observer):
+        """DP-2851. Call ``observer(command, result)`` after each queued
+        command returns a result; returns the undo."""
+        self._command_observers.append(observer)
+
+        def forget():
+            try:
+                self._command_observers.remove(observer)
+            except ValueError:
+                pass
+        return forget
+
+    def notify_command(self, command, result) -> None:
+        """Tell the observers a command ended; one that fails is logged."""
+        for observer in list(self._command_observers):
+            try:
+                observer(command, result)
+            except Exception:                               # noqa: BLE001
+                logger.exception('command observer failed for %s',
+                                 getattr(command, 'operation', '?'))
 
     def presentation_snapshot(self) -> dict:
         """DP-2745. The presentation as the window shows it now."""

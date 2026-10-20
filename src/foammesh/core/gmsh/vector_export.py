@@ -95,6 +95,14 @@ def scene_of(renderer, width: int, height: int, *, font: str | None = None,
         if mapper.IsA('vtkLabeledDataMapper'):
             _labels(scene, mapper, matrix)
             continue
+        if prop.IsA('vtkActor2D'):
+            # DP-2850. A 2-D overlay (the worst-cell markers, a rubber band)
+            # is drawn in viewport pixels with a vtkProperty2D, which has no
+            # representation or edges: projecting it through the camera
+            # raised AttributeError and the SVG snapshot answered HTTP 500.
+            if mapper.IsA('vtkPolyDataMapper2D'):
+                _overlay(scene, renderer, prop, mapper, vtk_to_numpy)
+            continue
         data = mapper.GetInput() if hasattr(mapper, 'GetInput') else None
         if not isinstance(data, vtkPolyData) or data.GetNumberOfPoints() == 0:
             continue
@@ -154,6 +162,57 @@ def _geometry(scene: Scene, actor, mapper, data, matrix, vtk_to_numpy) -> None:
         for row in block:
             for node in row:
                 scene.points.append((float(depth[node]), xy[node], base,
+                                     float(prop.GetPointSize())))
+
+
+def _overlay(scene: Scene, renderer, actor, mapper, vtk_to_numpy) -> None:
+    """A 2-D polydata overlay, in front of the 3-D scene.
+
+    Its points are viewport pixels (or pass through the mapper's transform
+    coordinate). There is no alpha in the vector writers, so a translucent
+    fill is drawn as its outline rather than hiding the model under it.
+    """
+    from vtkmodules.vtkCommonDataModel import vtkPolyData
+
+    data = mapper.GetInput()
+    if not isinstance(data, vtkPolyData) or data.GetNumberOfPoints() == 0:
+        return
+    points = vtk_to_numpy(data.GetPoints().GetData()).astype(np.float64)
+    transform = mapper.GetTransformCoordinate()
+    if transform is not None:
+        xy = []
+        for x, y, z in points:
+            transform.SetValue(float(x), float(y), float(z))
+            xy.append(transform.GetComputedDoubleViewportValue(renderer)[:2])
+        xy = np.array(xy, dtype=np.float64).reshape(-1, 2)
+    else:
+        offset = actor.GetPositionCoordinate()             .GetComputedDoubleViewportValue(renderer)
+        xy = points[:, :2] + np.array(offset[:2], dtype=np.float64)
+    xy = np.stack([xy[:, 0], scene.height - xy[:, 1]], axis=1)
+    prop = actor.GetProperty()
+    colour = _rgb(prop.GetColor())
+    width = float(prop.GetLineWidth())
+    opaque = float(prop.GetOpacity()) >= 0.99
+    for _size, (_ids, block) in _cell_blocks(data.GetPolys(),
+                                             vtk_to_numpy).items():
+        for row in block:
+            corners = xy[row]
+            if np.all(np.isfinite(corners)):
+                scene.polygons.append((-2.0, corners,
+                                       colour if opaque else None,
+                                       None if opaque else colour, width))
+    for _size, (_ids, block) in _cell_blocks(data.GetLines(),
+                                             vtk_to_numpy).items():
+        for row in block:
+            for a, b in zip(row[:-1], row[1:]):
+                pair = xy[[a, b]]
+                if np.all(np.isfinite(pair)):
+                    scene.lines.append((-2.0, pair, colour, width))
+    for _size, (_ids, block) in _cell_blocks(data.GetVerts(),
+                                             vtk_to_numpy).items():
+        for row in block:
+            for node in row:
+                scene.points.append((-2.0, xy[node], colour,
                                      float(prop.GetPointSize())))
 
 

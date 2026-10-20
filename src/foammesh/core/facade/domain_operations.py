@@ -3468,6 +3468,9 @@ class DomainOperations:
 
         result = _read_runner_result(layout)
         payload = execution.to_payload()
+        # DP-2857. The job that produced the result (the retry's, when there
+        # was one) is the run's job; `record_result` below writes it.
+        RunBuilder.record_job(record, payload)
         # DP-12. `to_payload()` has never carried an `exit_code` key -- the
         # process status lives under `job.returncode` -- so this recorded None
         # on every Gmsh run this repository has ever made, succeeded and
@@ -9816,7 +9819,36 @@ runTimeModifiable true;
         """Execute the serial/MPI DAG and publish a validated mesh-state ref.
 
         The body of :meth:`SnappyMeshingEngine.run`, which is what reaches it.
+
+        DP-2856. The run writes one log of its own (``run.log`` in its run
+        directory) with every stage's output, and answers with a job id --
+        the run's id -- whose log the local API reads, as a Gmsh run does.
         """
+        from foammesh.core.jobs.run_log import RunLog
+        run_log = RunLog()
+        try:
+            return await self._snappy_pipeline(session, command, run_log)
+        finally:
+            run_log.close()
+
+    def _snappy_run_job(self, record, run_log, started_at: str, *,
+                        status: str, returncode=None, error=None) -> dict:
+        """DP-2856. ``{job_id, job}`` of a whole snappy run: the run's id and
+        the one log every stage wrote into, in a job's own shape."""
+        from datetime import datetime, timezone
+        job_id = self._run_manifest_id(record) or None
+        finished = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        run_log.write(f'== run {status}'
+                      + (f': {error}' if error else ''))
+        job = {'job_id': job_id, 'name': 'workflow.run_pipeline',
+               'status': status, 'returncode': returncode, 'error': error,
+               'log_path': str(run_log.path) if run_log.path else None,
+               'started_at': started_at, 'finished_at': finished,
+               'kind': 'pipeline'}
+        return {'job_id': job_id, 'job': job}
+
+    async def _snappy_pipeline(self, session: CaseSession, command: Command,
+                               run_log) -> OperationResult:
         session.require_writable()
         from foammesh.core.engine import resolve_engine
         from foammesh.core.execution import (
@@ -10048,6 +10080,21 @@ runTimeModifiable true;
                      effective=allocation.effective_ranks,
                      unit='ranks'),
                  'revision_seal': revision_seal})
+        # DP-2856. The run's own log, every stage's output in it as it comes.
+        from datetime import datetime, timezone
+        run_started = datetime.now(timezone.utc).isoformat().replace(
+            '+00:00', 'Z')
+        if record is not None:
+            from foammesh.core.jobs.run_log import RUN_LOG_NAME
+            if run_log.open(record.layout.root / RUN_LOG_NAME) is not None:
+                record.document['job_id'] = self._run_manifest_id(record)
+                record.document['log_path'] = str(run_log.path)
+                try:
+                    record.write()
+                except OSError:
+                    logger.warning('the run manifest could not name its log',
+                                   exc_info=True)
+        on_line = run_log.tee(command.parameters.get('on_line'))
         checkpoints = []
         executions = []
         check_execution = None
@@ -10076,6 +10123,8 @@ runTimeModifiable true;
                 # DP-1441. A viewer read of the stage before is waited out.
                 async with self._readers_quiet(session):
                     parked = self._park_root_for_gather(session.case_path)
+            run_log.write('==> {0}: {1}'.format(
+                node.node_id, ' '.join(str(part) for part in node.argv)))
             try:
                 execution = await self._context(session).executor.execute(
                     session, OperationSpec(
@@ -10086,7 +10135,7 @@ runTimeModifiable true;
                         max_output_bytes=10 * 1024 * 1024,
                         recover_mesh=node.mutates_mesh,
                         cleanup_argv=launch.cleanup_argv),
-                    on_line=command.parameters.get('on_line'))
+                    on_line=on_line)
             except BaseException:
                 if gathers:
                     self._settle_gather(session.case_path, parked, False)
@@ -10095,6 +10144,10 @@ runTimeModifiable true;
                 session.case_path, parked, execution.succeeded)
                 if gathers else '')
             executions.append(execution.to_payload())
+            stage_job = executions[-1].get('job') or {}
+            run_log.write('<== {0}: {1} (job {2}, log {3})'.format(
+                node.node_id, stage_job.get('status'),
+                executions[-1].get('job_id'), stage_job.get('log_path')))
             if node.node_id == 'checkMesh':
                 check_execution = execution
             if (execution.succeeded
@@ -10145,6 +10198,11 @@ runTimeModifiable true;
                              'resume': interrupted['resume'],
                              **({'resumed': resumed} if resumed else {}),
                              'run_id': self._run_manifest_id(record),
+                             **self._snappy_run_job(
+                                 record, run_log, run_started,
+                                 status='cancelled' if stopped else 'failed',
+                                 returncode=job.get('returncode'),
+                                 error=reason),
                              **self._region_warnings_payload(seed_warnings),
                              # One failure shape, whichever engine wrote it
                              # (Plan 30 F-03). `RunResultHandle.from_payload`
@@ -10191,7 +10249,7 @@ runTimeModifiable true;
                 f'pipeline output could not be published: {error}') from error
         # DP-2748. The stage route (H9) and the gather (UF20) record that the
         # mesh in constant/polyMesh is the workflow's own; this route -- Run
-        # to end, the one the MCP and the guided walks take -- never did. Its
+        # to end, the one API clients and the guided walks take -- never did. Its
         # sidecar kept `workflow=none`, so the next open read "mesh exists
         # but metadata has no workflow mode" and showed the case as External
         # mesh with Geometry through Export suspended. MEASURED on the
@@ -10292,6 +10350,8 @@ runTimeModifiable true;
                      **({'resumed': resumed} if resumed else {}),
                      'qualification_mode': mode.value,
                      'checkpoints': checkpoints,
+                     **self._snappy_run_job(record, run_log, run_started,
+                                            status='done', returncode=0),
                      'mesh_state': reference.to_dict(),
                      'dictionary_manifest': manifest.to_dict(),
                      'dictionary_snapshot': str(snapshot),

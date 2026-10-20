@@ -945,17 +945,46 @@ class FoamMeshFacade:
         if command.scope == 'application' or command.operation.startswith('application.'):
             return self._execute_application(command)
         if command.scope == 'presentation' or command.operation.startswith('presentation.'):
-            result = self._execute_presentation(command)
-            # DP-2741. The window may still be writing what the op made (a
-            # snapshot's PNG, off the GUI thread); answer once it is down.
-            renderer = getattr(self.case(command.case_id),
-                               'presentation_renderer', None)
-            settle = getattr(renderer, 'settle', None)
-            if callable(settle):
-                waiting = settle()
-                if inspect.isawaitable(waiting):
-                    await waiting
-            return result
+            # DP-2850. A fault in the window's own code while it applies the
+            # op (an SVG snapshot met a 2-D overlay) left the facade as an
+            # AttributeError, which the local API answered as HTTP 500. It
+            # is answered as `presentation_failed`, with what went wrong.
+            try:
+                return await self._execute_presentation_guarded(command)
+            except Exception as error:                     # noqa: BLE001
+                from .errors import FacadeError, PresentationFailedError
+                if isinstance(error, FacadeError):
+                    raise
+                logger.exception('presentation op %s failed', command.operation)
+                raise PresentationFailedError(
+                    f'the window could not apply {command.operation}: '
+                    f'{type(error).__name__}: {error}',
+                    details={'operation': command.operation,
+                             'exception': type(error).__name__}) from error
+        return await self._execute_case(command)
+
+    async def _execute_presentation_guarded(self, command: Command) -> OperationResult:
+        renderer = getattr(self.case(command.case_id),
+                           'presentation_renderer', None)
+        # DP-2851/2852. A mesh the window is still reading (a run that
+        # just ended, a case just opened) is waited for, as a person
+        # waits for "Loading mesh" before choosing Volume mesh.
+        prepare = getattr(renderer, 'prepare', None)
+        if callable(prepare):
+            waiting = prepare(command.operation)
+            if inspect.isawaitable(waiting):
+                await waiting
+        result = self._execute_presentation(command)
+        # DP-2741. The window may still be writing what the op made (a
+        # snapshot's PNG, off the GUI thread); answer once it is down.
+        settle = getattr(renderer, 'settle', None)
+        if callable(settle):
+            waiting = settle()
+            if inspect.isawaitable(waiting):
+                await waiting
+        return result
+
+    async def _execute_case(self, command: Command) -> OperationResult:
         session = self.case(command.case_id)
         # §4.4/§6.5: every agent mutation must carry authorization from a
         # confirmed plan. Reads are unrestricted; any state-changing operation
@@ -1039,6 +1068,9 @@ class FoamMeshFacade:
                 # scheduler still serializes access, so the next command
                 # slice never parses the configuration on the owner loop.
                 await session.refresh_configuration_cache()
+                # DP-2851. A window showing this case hears that a command
+                # it did not send has ended, and shows what it made.
+                session.notify_command(command, value)
                 return value
             finally:
                 session.clear_event_context()

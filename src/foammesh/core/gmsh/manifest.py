@@ -233,6 +233,21 @@ class RunBuilder:
         return manifest
 
     @staticmethod
+    def record_job(manifest: RunManifest, payload: dict) -> RunManifest:
+        """Keep the id of the job that ran this run (not written here).
+
+        DP-2857. ``run_mesh`` answered the job that ran a Gmsh run and the
+        manifest never kept it, so the run row (``GET jobs/{run id}``, the
+        Runs listing) said ``job_id: null``. The caller writes the manifest
+        next, with the result.
+        """
+        payload = payload or {}
+        job_id = payload.get('job_id') or (payload.get('job') or {}).get('job_id')
+        if job_id:
+            manifest.document['job_id'] = str(job_id)
+        return manifest
+
+    @staticmethod
     def record_result(manifest: RunManifest, result: dict, *,
                       exit_code: int | None = None) -> RunManifest:
         """Fold the runner's own result into the manifest, verbatim.

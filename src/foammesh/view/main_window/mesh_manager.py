@@ -46,6 +46,22 @@ QUALITY_SEE_THROUGH_OPACITY = 0.3
 FAILED_CELLS_VOLUME_OPACITY = 0.0
 
 
+def _countsLoad(method):
+    """DP-2852. Count a draw as in flight from its call to its last line.
+
+    The loads have many ways out (cancel, a newer load, a failed read), so
+    the count is kept around the whole call rather than at each exit.
+    """
+    @functools.wraps(method)
+    async def counted(self, *args, **kwargs):
+        self._loadStarted()
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            self._loadEnded()
+    return counted
+
+
 def _closeProgress(dialog):
     """Close a load's progress dialog and let Qt delete it (Plan 35 F16).
 
@@ -380,6 +396,11 @@ class MeshManager(ActorManager):
         self._reads = 0
         self._readsIdle = asyncio.Event()
         self._readsIdle.set()
+        # DP-2852. Draws in flight (load, loadNative), from the call to the
+        # scene on screen; see `loadsSettled`.
+        self._loads = 0
+        self._loadsIdle = asyncio.Event()
+        self._loadsIdle.set()
         self._regionIds: dict[str, list[str]] = {}
         self._patchIds: list[str] = []
         self._zoneIds: list[str] = []
@@ -745,6 +766,7 @@ class MeshManager(ActorManager):
         except Exception:                                      # noqa: BLE001
             logger.warning('could not keep the %s pass', key, exc_info=True)
 
+    @_countsLoad
     async def loadNative(self, path, artifact_id: str = '', stage: str = '',
                          *, surface_only: bool = False) -> str:
         """Draw a native Gmsh ``.msh`` directly, publishing nothing.
@@ -848,6 +870,7 @@ class MeshManager(ActorManager):
 
         return ''
 
+    @_countsLoad
     async def load(self, time: int, root=None, artifact_id: str = '',
                    stage: str = '', *, previewMode: str = 'auto',
                    buildAnyway: bool = False):
@@ -1164,6 +1187,37 @@ class MeshManager(ActorManager):
     async def readsFinished(self):
         """The read barrier a mutating job awaits before it starts."""
         await self._readsIdle.wait()
+
+    def _loadStarted(self):
+        self._loads = getattr(self, '_loads', 0) + 1
+        idle = getattr(self, '_loadsIdle', None)
+        if idle is not None:
+            idle.clear()
+
+    def _loadEnded(self):
+        self._loads = max(0, getattr(self, '_loads', 1) - 1)
+        idle = getattr(self, '_loadsIdle', None)
+        if not self._loads and idle is not None:
+            idle.set()
+
+    def isLoading(self) -> bool:
+        """DP-2852. Whether a mesh is being read into the viewport now."""
+        return bool(getattr(self, '_loads', 0))
+
+    async def loadsSettled(self, timeout: float | None = None) -> bool:
+        """DP-2852. Wait until no mesh is being drawn; False on timeout.
+
+        What a person does when the strip says *Loading mesh*: wait for the
+        picture before asking for its Volume mesh or its worst cells.
+        """
+        idle = getattr(self, '_loadsIdle', None)
+        if idle is None or idle.is_set():
+            return True
+        try:
+            await asyncio.wait_for(idle.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def _buildScene(self, vtkMesh, hidden=frozenset(), precomputed=None,
                     outline=None):

@@ -5,7 +5,8 @@ from .domain_operations import DomainOperations
 from .errors import (AuthorizationRequiredError, CapabilityUnavailableError, CaseLockedError,
                      CaseNotFoundError, EventReplayGapError, FacadeError,
                      IdempotencyConflictError, OperationNotFoundError, InteractionBusyError,
-                     PlanStaleError, PreconditionFailedError, PresentationUnavailableError,
+                     PlanStaleError, PreconditionFailedError, PresentationFailedError,
+                     PresentationUnavailableError,
                      ReadOnlySessionError, RevisionConflictError, SecurityPolicyError,
                      UndoNotAllowedError, ValidationFailedError)
 from .presentation import PresentationOperations, PresentationState
@@ -30,7 +31,7 @@ __all__ = [
     'FieldRegistry', 'FieldType', 'ImpactClass', 'IdempotencyConflictError',
     'InteractionBusyError', 'FoamMeshFacade', 'ExecutionMode', 'OperationDescriptor', 'OperationNotFoundError',
     'OperationRegistry', 'OperationResult', 'OwnerLoopMonitor', 'PlanStaleError', 'PlanState',
-    'PlanStore', 'PreconditionFailedError', 'PresentationOperations', 'PresentationState',
+    'PlanStore', 'PreconditionFailedError', 'PresentationFailedError', 'PresentationOperations', 'PresentationState',
     'PresentationUnavailableError', 'ReadOnlySessionError', 'RevisionConflictError',
     'RevisionSnapshot', 'SecurityPolicyError', 'UndoNotAllowedError', 'ValidationFailedError',
     'build_entity_adapters', 'build_field_registry', 'build_operation_registry', 'probe_locking',

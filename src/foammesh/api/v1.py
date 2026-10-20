@@ -341,8 +341,15 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
 
     @app.get('/api/v1/cases/{case_id}/jobs/{job_id}')
     async def job(case_id: str, job_id: str, _auth=Depends(authenticate)):
-        guard(case_id)
-        return facade.slice_operations.job(job_id)
+        session = guard(case_id)
+        found = facade.slice_operations.job(job_id)
+        if found.get('status') != 'not_found':
+            return found
+        # DP-2855/2856. A job the case's job manager ran, or a mesh run by
+        # its run id (the id a snappy run answers as its job id).
+        from foammesh.core.facade import window_text
+        record = await asyncio.to_thread(window_text.job_record, session, job_id)
+        return record if record is not None else found
 
     @app.post('/api/v1/cases/{case_id}/jobs/{job_id}:cancel')
     async def cancel_job(case_id: str, job_id: str, _auth=Depends(authenticate)):

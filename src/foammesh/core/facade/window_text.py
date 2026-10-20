@@ -10,6 +10,7 @@ Qt-free: the window's renderer does the reading.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .errors import FacadeError, SecurityPolicyError, ValidationFailedError
@@ -80,7 +81,45 @@ def _job_log_path(session, job_id: str):
     for record in reversed(jobs.persisted_results(session.case_path)):
         if record.get('job_id') == job_id:
             return record.get('log_path'), True
+    # DP-2856. A mesh run's id reads the run's own log: a snappy run's
+    # ``run.log`` (every stage in it), a Gmsh run's ``runner.log``.
+    run = run_record(session, job_id)
+    if run is not None:
+        return run.get('log_path'), True
     return None, False
+
+
+#: What a run id may look like; anything else is never a directory name.
+_RUN_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+
+
+def run_record(session, run_id: str) -> dict | None:
+    """DP-2855/2856. A mesh run, by its run id, as the run listing names it.
+
+    ``None`` when the case has no run of that id.
+    """
+    if not isinstance(run_id, str) or not _RUN_ID.match(run_id) or '..' in run_id:
+        return None
+    from foammesh.core.jobs.run_listing import run_row
+    return run_row(session.case_path, run_id)
+
+
+def job_record(session, job_id: str) -> dict | None:
+    """DP-2856. A job the case knows, by job id or by a mesh run's id.
+
+    A job the job manager ran (finished, or on its record), else a mesh run
+    (``kind: run``) with its log. ``None`` when there is no such job.
+    """
+    jobs = session.jobs
+    if job_id in tuple(getattr(jobs, 'active_job_ids', ()) or ()):
+        return {'job_id': job_id, 'status': 'running'}
+    result = jobs.result(job_id)
+    if result is not None:
+        return result.to_dict()
+    for record in reversed(jobs.persisted_results(session.case_path)):
+        if record.get('job_id') == job_id:
+            return dict(record)
+    return run_record(session, job_id)
 
 
 def job_log(session, job_id: str, *, tail_lines=200, offset=None) -> dict:

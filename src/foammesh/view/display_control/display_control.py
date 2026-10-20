@@ -733,6 +733,28 @@ class DisplayControl(QObject):
         self._items[key].setActorColor(colour)
         self._view.refresh()
 
+    def setPartsDisplayMode(self, keys, mode) -> list[str]:
+        """Draw these parts in ``mode`` and leave the selection as it is.
+
+        DP-2854. The local API's display mode selected the parts first, as a
+        right-click on a row does, so each repainted in the selection's
+        accent colour and a colour just set read as lost -- while the chip
+        said "Selection: none", because the API never made a selection a
+        person could see. A part keeps its own colour, and a part the person
+        has selected keeps its selection cue. Ids not held are skipped.
+        """
+        if isinstance(mode, str):
+            mode = self._PLAN_DISPLAY_MODES[mode]
+        done = []
+        for key in keys:
+            item = self._items.get(str(key))
+            if item is None:
+                continue
+            item.actorInfo().setDisplayMode(mode)
+            done.append(str(key))
+        self._view.refresh()
+        return done
+
     def setPartOpacity(self, key, opacity: float) -> None:
         self._items[key].actorInfo().setOpacity(float(opacity))
         self._view.refresh()

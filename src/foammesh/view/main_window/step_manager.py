@@ -2594,6 +2594,63 @@ class StepManager(QObject):
         return (humanise_option(engine_id) if str(engine_id)
                 else self.tr('The meshing engine'))
 
+    async def _showRunOutcome(self, payload: dict, result, engine_id: str):
+        """The verdict and the run's own mesh, for any run that ended.
+
+        DP-2851. Shared by the window's own run and a run sent over the
+        local API, so the two show a finished mesh the same way. Returns the
+        run's handle, whether it built a mesh, and whether it was cancelled.
+        """
+        self._showPipelineVerdict(payload)
+        # R210. A run that built a mesh and then failed it on quality is
+        # the run whose mesh most needs looking at, and it was the one run
+        # that never drew it: the viewport kept the STL while the user was
+        # asked to judge cells they could not see. A quality verdict in
+        # the payload means a mesh exists to draw, whatever the verdict
+        # says about it.
+        #
+        # F-37. *Which* mesh is the run's own question, not the viewport's
+        # guess. snappyHexMesh mutates the case in place, so the handle
+        # names `constant/polyMesh` for that engine whatever the verdict;
+        # the Gmsh gate returns before the publication step, so a refused
+        # run leaves `constant/polyMesh` holding whatever the last
+        # *accepted* run published and the handle names this run's own
+        # artifact instead. Either way the handle names it, rather than
+        # the finisher assuming it.
+        handle = self._runResult(payload, result, engine_id)
+        built = handle.produced_a_mesh
+        # CP-02. A run that *ran* and produced nothing is also this
+        # method's business: leaving the previous mesh on screen under
+        # this run's verdict is F-37 whether the run was refused on
+        # quality or died before it wrote anything. A refusal that
+        # happened before any run started has no run id, and changes
+        # nothing about the mesh on disk, so it leaves the viewport alone.
+        # Plan 37 UF20 follow-up: so does the user's own cancel of a
+        # Gmsh run -- it stops before the publisher, the only writer of
+        # the case mesh -- which used to clear the viewport over an
+        # accepted mesh still on disk.
+        cancelled = self._userCancelled(payload)
+        if cancelled and self._caseMeshUntouched(payload):
+            pass
+        elif built or handle.run_id:
+            await self._drawFinishedMesh(handle)
+        return handle, built, cancelled
+
+    async def showApiRunResult(self, result) -> None:
+        """DP-2851. Show a run the local API sent, as if it was pressed here.
+
+        The verdict strip, the run's own mesh in the viewport and the
+        branch's rows -- what `_finishPipeline` does after its own run,
+        without the modals a person at the window would have to dismiss.
+        """
+        payload = getattr(result, 'payload', {}) or {}
+        engine_id = str(payload.get('engine_id') or payload.get('engine') or
+                        self._engineId() or '')
+        try:
+            await self._showRunOutcome(payload, result, engine_id)
+        finally:
+            self._refreshBranch()
+
     async def _finishPipeline(self, engine_id: str,
                               resume: bool = False) -> None:
         """Run this case's whole mesh and report it, whichever engine it is.
@@ -2649,40 +2706,9 @@ class StepManager(QObject):
             result = await app.facadeClient.run(
                 'workflow.run_pipeline', parameters)
             payload = getattr(result, 'payload', {}) or {}
-            self._showPipelineVerdict(payload)
-            # R210. A run that built a mesh and then failed it on quality is
-            # the run whose mesh most needs looking at, and it was the one run
-            # that never drew it: the viewport kept the STL while the user was
-            # asked to judge cells they could not see. A quality verdict in
-            # the payload means a mesh exists to draw, whatever the verdict
-            # says about it.
-            #
-            # F-37. *Which* mesh is the run's own question, not the viewport's
-            # guess. snappyHexMesh mutates the case in place, so the handle
-            # names `constant/polyMesh` for that engine whatever the verdict;
-            # the Gmsh gate returns before the publication step, so a refused
-            # run leaves `constant/polyMesh` holding whatever the last
-            # *accepted* run published and the handle names this run's own
-            # artifact instead. Either way the handle names it, rather than
-            # the finisher assuming it.
-            handle = self._runResult(payload, result, engine_id)
+            handle, built, cancelled = await self._showRunOutcome(
+                payload, result, engine_id)
             name = self._engineDisplayName(handle.engine or engine_id)
-            built = handle.produced_a_mesh
-            # CP-02. A run that *ran* and produced nothing is also this
-            # method's business: leaving the previous mesh on screen under
-            # this run's verdict is F-37 whether the run was refused on
-            # quality or died before it wrote anything. A refusal that
-            # happened before any run started has no run id, and changes
-            # nothing about the mesh on disk, so it leaves the viewport alone.
-            # Plan 37 UF20 follow-up: so does the user's own cancel of a
-            # Gmsh run -- it stops before the publisher, the only writer of
-            # the case mesh -- which used to clear the viewport over an
-            # accepted mesh still on disk.
-            cancelled = self._userCancelled(payload)
-            if cancelled and self._caseMeshUntouched(payload):
-                pass
-            elif built or handle.run_id:
-                await self._drawFinishedMesh(handle)
             unpublished = unpublished_mesh_reason(payload)
             if result.status == 'accepted' and unpublished:
                 # DP-483. With no target solver chosen, a Gmsh mesh the

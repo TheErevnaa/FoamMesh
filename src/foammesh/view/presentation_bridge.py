@@ -100,6 +100,31 @@ class DesktopPresentationRenderer:
         for thread in writing:
             await asyncio.to_thread(thread.join)
 
+    #: DP-2851/DP-2852. The longest an op waits for a mesh still being drawn.
+    MESH_SETTLE_SECONDS = 180.0
+
+    async def prepare(self, operation: str) -> None:
+        """DP-2851/DP-2852. Before an op, wait for the mesh being drawn.
+
+        A run that ended, or a case just opened, puts its mesh on screen a
+        few seconds later -- the *Loading mesh* strip is up meanwhile. A
+        person waits for the picture before pressing Volume or Worst cells;
+        an op that arrived in those seconds was refused with "No mesh has
+        been produced" over a mesh that was on its way. Bounded, and never
+        held by a job that is still writing the mesh.
+        """
+        import asyncio
+
+        window = self.window()
+        settled = getattr(window, 'meshSettled', None)
+        if not callable(settled):
+            return
+        try:
+            await asyncio.wait_for(settled(), self.MESH_SETTLE_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning('%s: the mesh was still being drawn after %.0f s',
+                           operation, self.MESH_SETTLE_SECONDS)
+
     def window(self):
         """The main window: given, or the app's."""
         if self._window is not None:
@@ -700,12 +725,15 @@ class DesktopPresentationRenderer:
         return shown
 
     def _display_mode(self, changed):
-        """Select the parts, then the right-click menu's Display mode."""
+        """The right-click menu's Display mode, on the parts named.
+
+        DP-2854. It used to select the parts first, so each was repainted in
+        the selection colour and a colour set a moment before read as lost.
+        The mode is applied to the parts named; what is selected stays so.
+        """
         ids = list(changed['entity_ids'])
         self._known(ids)
-        self._display.selectParts(ids)
-        self._display._selectedItemsInfo()
-        getattr(self._display, self.DISPLAY_MODE_SLOTS[changed['mode']])()
+        self._display.setPartsDisplayMode(ids, changed['mode'])
         return self._answer(entity_ids=ids, mode=changed['mode'])
 
     def _isolate(self, changed):
@@ -838,7 +866,8 @@ WINDOW_CONTROLS = {
     'foammesh.view.display_control.display_control:DisplayControl': (
         'cutTool', 'elementDisplay', 'partIds', 'selectParts',
         'selectedActorIds', 'setVisibilities', 'setPartColour',
-        'setPartOpacity', '_selectedItemsInfo', '_displayWireframe',
+        'setPartOpacity', 'setPartsDisplayMode', '_selectedItemsInfo',
+        '_displayWireframe',
         '_displaySurface', '_displayWireSurfaceWithEdges'),
     'foammesh.view.display_control.cut_tool:CutTool': (
         'isSectionActive', 'panel', '_syncGizmos'),
@@ -933,7 +962,16 @@ class ConsoleTap:
                                   'level': CONSOLE_LEVEL_NAMES.get(level, 'info')})
             number += 1
             block = block.next()
+        # DP-2853. An empty panel -- at start, or after Clear -- still holds
+        # one empty block, and the next line printed is written into it.
+        # Counted as a line, it made an empty Console answer next_line 1, so
+        # a client that asked for the lines after 1 never saw the first one
+        # (the import's own line, MEASURED over the local API). A trailing empty
+        # block is where the next line goes, not a line.
         last = first + held
+        tail = document.findBlockByNumber(held - 1)
+        if tail.isValid() and not tail.text():
+            last -= 1
         return {'lines': lines, 'next_line': min(number, last),
                 'first_held_line': first + 1, 'last_line': last,
                 'missed': max(first - int(after_line), 0),

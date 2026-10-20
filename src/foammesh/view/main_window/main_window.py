@@ -396,6 +396,9 @@ class MainWindow(QMainWindow):
         self._menuRefreshPending = False
         self._projectRefreshPending = False
         self._apiGeometryPending = False
+        #: DP-2851/DP-2852. Draws of a mesh still under way: an API run's
+        #: result and the stored result of a case just opened.
+        self._meshDraws = set()
         # DP-363. Set when a pending refresh is a history move, which has
         # to repaint the forms; cleared when it is flushed.
         self._projectRefreshRepaintsForms = False
@@ -4952,6 +4955,122 @@ class MainWindow(QMainWindow):
         self._apiGeometryPending = True
         QTimer.singleShot(0, self._adoptApiGeometry)
 
+    # -- DP-2851..2853: work done over the local API, shown as the window's --
+
+    #: The runs whose mesh the window draws when they end.
+    API_RUN_OPERATIONS = frozenset({'workflow.run_pipeline', 'mesh.gmsh.run'})
+
+    def _apiJobOutput(self, **payload):
+        """DP-2853. A local API job's output, in the Console.
+
+        The window's own runs subscribe the Console to their output while
+        they run; a run started over the API had nobody listening, so the
+        Console stayed empty beside a running mesher. Only output raised by
+        a REST command is taken here, so the window's own runs are not
+        printed twice; the session actions print their own (session_activity).
+        """
+        if payload.get('session_action'):
+            return
+        try:
+            source = app.facadeClient.session().event_source()
+        except (AttributeError, RuntimeError):
+            return
+        if source != 'rest':
+            return
+        line = payload.get('line', '')
+        if line:
+            MainWindow._appendConsole(self, str(line))
+
+    @staticmethod
+    def importSummary(payload: dict) -> str:
+        """DP-2853. The Console line an import leaves, from its own result."""
+        name = Path(str(payload.get('source') or payload.get('name') or
+                        'geometry')).name
+        parts = []
+        cells = payload.get('cells')
+        if isinstance(cells, int):
+            parts.append(f'{cells:,} triangles')
+        patches = payload.get('patches')
+        if isinstance(patches, list) and patches:
+            parts.append(f'{len(patches)} patches')
+        unit = payload.get('source_unit')
+        if unit:
+            parts.append(f'unit {unit}')
+        line = f'Imported {name}'
+        if parts:
+            line += ': ' + ', '.join(parts)
+        warnings = payload.get('diagnostic_warnings') or ()
+        lines = [line + '.']
+        lines.extend(f'    {warning}' for warning in warnings)
+        return '\n'.join(lines)
+
+    def _commandEnded(self, command, result):
+        """DP-2851/DP-2853. A command ended: say and show what it made.
+
+        Called by the session after every command, from the window's own
+        loop. An import is written to the Console whoever sent it. A run
+        sent over the local API is drawn the way the window draws its own:
+        the verdict, then the run's own mesh -- until now the window never
+        heard the run end, and Volume, Worst cells and the rest were refused
+        over a mesh on disk.
+        """
+        operation = getattr(command, 'operation', '')
+        status = getattr(result, 'status', '')
+        payload = getattr(result, 'payload', None)
+        payload = payload if isinstance(payload, dict) else {}
+        if operation == 'geometry.import' and status == 'accepted':
+            MainWindow._appendConsole(self, MainWindow.importSummary(payload))
+        source = getattr(getattr(command, 'source', None), 'value',
+                         getattr(command, 'source', None))
+        if source != 'rest' or operation not in self.API_RUN_OPERATIONS:
+            return
+        stepManager = getattr(self, '_stepManager', None)
+        show = getattr(stepManager, 'showApiRunResult', None)
+        if show is None:
+            return
+
+        async def draw():
+            # The draw is the window's own work, not the API command's: its
+            # task inherited the command's event source, and clears it.
+            try:
+                app.facadeClient.session().clear_event_context()
+            except (AttributeError, RuntimeError):
+                pass
+            await show(result)
+
+        self._trackMeshDraw(draw())
+
+    def _trackMeshDraw(self, coroutine):
+        """Run a mesh draw, kept until it ends so `meshSettled` can wait."""
+        task = asyncio.ensure_future(coroutine)
+        self._meshDraws.add(task)
+
+        def ended(done):
+            self._meshDraws.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logger.error('could not draw the mesh',
+                             exc_info=done.exception())
+        task.add_done_callback(ended)
+        return task
+
+    async def meshSettled(self):
+        """DP-2851/DP-2852. Return once the mesh on its way is on screen.
+
+        The draw of an API run's result or of an opened case's stored mesh,
+        and any read the viewport has under way. A read that waits for a job
+        still writing the mesh is not waited for: that mesh is not done.
+        """
+        while self._meshDraws:
+            await asyncio.wait(set(self._meshDraws))
+        manager = getattr(self, '_meshManager', None)
+        settled = getattr(manager, 'loadsSettled', None)
+        if settled is None:
+            return
+        writing = getattr(manager, '_writerActive', None)
+        if callable(writing) and writing():
+            return
+        await settled()
+
     def _adoptApiGeometry(self):
         self._apiGeometryPending = False
 
@@ -7348,7 +7467,19 @@ class MainWindow(QMainWindow):
                 Event.ARTIFACT_MESH_CHANGED, self._sectionRemeshEvent),
             app.events.subscribe(
                 Event.ARTIFACT_QUALITY_CHANGED, self._sectionUnlockEvent),
+        ] + [
+            # DP-2853. Output of a job a local API command started goes to
+            # the Console, as the window's own runs put theirs there.
+            app.events.subscribe(Event.JOB_OUTPUT, self._apiJobOutput),
         ]
+        # DP-2851. A command this window did not send (a local API run) is
+        # shown when it ends, the way the window shows its own.
+        try:
+            self._projectEventUnsubscribes.append(
+                app.facadeClient.session().observe_commands(
+                    self._commandEnded))
+        except Exception:       # noqa: BLE001 - no session, no commands
+            logger.debug('no session to observe commands of')
 
         self._updateWindowTitle()
 
@@ -7378,7 +7509,7 @@ class MainWindow(QMainWindow):
 
         self._geometryManager.load()
         self._stepManager.load()
-        asyncio.create_task(self.drawStoredResult())
+        self._trackMeshDraw(self.drawStoredResult())
         # An opened case may already carry a checkMesh report. Reading it here
         # is what makes the quality surfaces reflect the mesh a user just
         # loaded rather than only one this session generated.

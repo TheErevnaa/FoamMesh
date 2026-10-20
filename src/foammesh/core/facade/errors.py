@@ -110,6 +110,15 @@ class PresentationUnavailableError(FacadeError):
     code = 'presentation_unavailable'
 
 
+class PresentationFailedError(FacadeError):
+    """DP-2850. The window raised while it applied a presentation op.
+
+    Nothing about the case changed: the presentation state keeps what it had.
+    ``details`` names the operation and the exception's type.
+    """
+    code = 'presentation_failed'
+
+
 class CheckUnavailableError(FacadeError):
     """A check could not produce a result (Plan 35 CR2).
 
