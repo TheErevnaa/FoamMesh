@@ -1,5 +1,47 @@
 # FoamMesh Release Notes
 
+## 1.1.3 — 2026-10-21
+
+- **The local API answers only trusted clients.** The access key in the
+  discovery file (or `serve --token`) now only pairs: a client must answer a
+  signed handshake (`GET`/`POST /api/v1/handshake`, Ed25519) before any other
+  route or the event stream answers. A stock build trusts only the keys it
+  ships with.
+- **Every window control over the local API.** View modes, back and forward,
+  fit to selection and saved views; deviation and its settings; feature
+  edges, worst and failed cells; colour scale and colour-by; section,
+  explode, mesh lines, background, element display, parts display mode,
+  isolate and show all; snapshots (PNG or SVG, written to the case's
+  captures folder). New routes read the Console (`/console`), the status
+  line (`/status`) and a job's log (`/jobs/{id}/log`). A trusted client can
+  close the window's case, saving or not.
+- **Work sent over the API shows in the window.** A mesh run sent by a
+  program is drawn when it finishes, and its lines appear in the Console.
+- **Run records.** A snappy run has its own name, status, job id and one
+  `run.log` holding every stage; a Gmsh run says it published and which job
+  ran it.
+- **Fixes.**
+  - Deviation keeps its colouring across re-renders; one scale, a labelled
+    clipped top and the tolerance shown against it.
+  - Snapshots follow the view on screen, draw the ticked overlays and the
+    worst-value labels, and no longer hold the window.
+  - The Snapshot popup opens under its button; Geometry view draws the
+    imported geometry; isolating the only selected part hides nothing.
+  - The View mode box names the view the legend shows; Measure marks its
+    picks and shows the distance.
+  - Part colours survive a display mode change.
+  - Gmsh element order 1 to 3 can be chosen.
+  - The snappy step that adds boundary layers is named Layers.
+- **Connections (off by default).** Settings > Preferences > Connections lets
+  programs on this PC work on the case open in the window, through the
+  FoamMesh API on 127.0.0.1 only, with a new access key each start. A program
+  that starts FoamMesh can ask for it for one run with `--api-attach`. The
+  status bar shows while it is on, and a click there turns it off.
+- **`foammesh serve` needs a token and an allowed folder** (`--token`,
+  `--allow-root`), and refuses to start without them.
+- The scripted `foammesh journey` recipes are no longer part of the public
+  release.
+
 ## 1.1.2 — 2026-10-18
 
 - **A faster start.** A FoamMesh splash shows within half a second of launch
