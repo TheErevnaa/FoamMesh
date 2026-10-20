@@ -29,13 +29,18 @@ _AUTH_CODES = {'authorization_required'}
 
 def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
                       allowed_case_roots=(), actor_id: str | None = None,
-                      lifecycle: bool = True, title: str = 'FoamMesh API v1'):
+                      lifecycle: bool = True, title: str = 'FoamMesh API v1',
+                      client_trust=None):
     """Build the FastAPI app exposing the full ``/api/v1`` facade surface.
 
     ``lifecycle`` enables case create/open/close (headless serve). The desktop
     loopback disables it so a client cannot displace the foreground case.
+
+    With ``client_trust`` (``foammesh.support.client_trust.ClientTrust``) the
+    bearer ``token`` buys the signed handshake and nothing else; every other
+    route needs the session token a trusted key's signature wins.
     """
-    from fastapi import Depends, FastAPI, Header, HTTPException, Query
+    from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import JSONResponse, Response
     from starlette.websockets import WebSocketDisconnect
 
@@ -49,10 +54,33 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
         return not allowed_roots or any(
             candidate == root or root in candidate.parents for root in allowed_roots)
 
+    def _bearer(authorization):
+        if authorization is None or not authorization.startswith('Bearer '):
+            return None
+        return authorization[len('Bearer '):]
+
+    def _is_token(value):
+        return value is not None and secrets.compare_digest(value, bearer_token)
+
+    def _granted(value) -> bool:
+        if client_trust is not None:
+            return client_trust.session_valid(value)
+        return bearer_token is None or _is_token(value)
+
     async def authenticate(authorization: str | None = Header(default=None)) -> None:
-        if bearer_token is None:
+        value = _bearer(authorization)
+        if _granted(value):
             return
-        if authorization is None or not secrets.compare_digest(authorization, f'Bearer {bearer_token}'):
+        if client_trust is not None and bearer_token is not None and _is_token(value):
+            raise HTTPException(status_code=403, detail={
+                'code': 'client_not_trusted',
+                'message': 'this FoamMesh answers only signed clients: '
+                           'GET /api/v1/handshake, sign the challenge, '
+                           'POST it back and use the session token'})
+        raise HTTPException(status_code=401, detail={'code': 'unauthorized'})
+
+    async def authenticate_pairing(authorization: str | None = Header(default=None)) -> None:
+        if bearer_token is not None and not _is_token(_bearer(authorization)):
             raise HTTPException(status_code=401, detail={'code': 'unauthorized'})
 
     def guard(case_id: str):
@@ -88,10 +116,9 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
             cursor = int(params.get('after_sequence', 0))
         except (TypeError, ValueError):
             cursor = 0
-        if bearer_token is not None:
-            header = websocket.headers.get('authorization')
-            ok = ((header is not None and secrets.compare_digest(header, f'Bearer {bearer_token}'))
-                  or (query_token is not None and secrets.compare_digest(query_token, bearer_token)))
+        if client_trust is not None or bearer_token is not None:
+            ok = (_granted(_bearer(websocket.headers.get('authorization')))
+                  or (query_token is not None and _granted(query_token)))
             if not ok:
                 await websocket.close(code=4401)
                 return
@@ -115,7 +142,28 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
 
     @app.get('/health')
     async def health():
-        return {'status': 'ok'}
+        return {'status': 'ok', 'signed_clients_only': client_trust is not None}
+
+    # ---- the signed handshake ---------------------------------------------- #
+
+    @app.get('/api/v1/handshake')
+    async def handshake_challenge(_auth=Depends(authenticate_pairing)):
+        if client_trust is None:
+            return {'required': False}
+        return {'required': True, **client_trust.challenge()}
+
+    @app.post('/api/v1/handshake')
+    async def handshake_answer(body: dict, _auth=Depends(authenticate_pairing)):
+        if client_trust is None:
+            return {'required': False, 'session_token': bearer_token}
+        session = client_trust.answer(body.get('challenge'), body.get('key_id'),
+                                      body.get('signature'))
+        if session is None:
+            raise HTTPException(status_code=403, detail={
+                'code': 'client_not_trusted',
+                'message': "the signature is not a trusted key's, or the challenge "
+                           'expired or was spent; ask for a new one'})
+        return {'required': True, 'session_token': session}
 
     @app.get('/api/v1/system/capabilities')
     async def capabilities(_auth=Depends(authenticate)):
@@ -183,11 +231,26 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
         return (await facade.execute(rest_command('case.save', case_id, {}))).to_dict()
 
     @app.post('/api/v1/cases/{case_id}:close')
-    async def close_case(case_id: str, _auth=Depends(authenticate)):
-        _require_lifecycle()
-        guard(case_id)
-        facade.close_case(case_id)
-        return {'closed': case_id}
+    async def close_case(case_id: str, body: dict | None = Body(default=None),
+                         _auth=Depends(authenticate)):
+        if lifecycle:
+            guard(case_id)
+            facade.close_case(case_id)
+            return {'closed': case_id}
+        # DP-2764 (user, 2026-10-20). On the window's API a signed client may
+        # close the case the window has open, as the window's own close does:
+        # unsaved changes ask the person (*Save changed*), unless ``save``
+        # answers it as the dialog's Ok (true) or Discard (false). Nothing
+        # here opens a case or reaches any case but the window's.
+        session = guard(case_id)
+        save = (body or {}).get('save')
+        if save is not None and not isinstance(save, bool):
+            raise ValidationFailedError('save is true, false or left out',
+                                        details={'save': save})
+        closer = getattr(session.presentation_renderer, 'close_case', None)
+        if client_trust is None or session.presentation is None or not callable(closer):
+            _require_lifecycle()
+        return await closer(save=save)
 
     # ---- case queries + commands ----------------------------------------- #
 
@@ -287,14 +350,36 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
         return (await facade.execute(rest_command(
             'job.cancel', case_id, {'job_id': job_id}))).to_dict()
 
+    @app.get('/api/v1/cases/{case_id}/jobs/{job_id}/log')
+    async def job_log(case_id: str, job_id: str, tail_lines: int = 200,
+                      offset: int | None = None, _auth=Depends(authenticate)):
+        """DP-2763. A job's log: its last lines, or the bytes after ``offset``."""
+        from foammesh.core.facade import window_text
+        return window_text.job_log(guard(case_id), job_id,
+                                   tail_lines=tail_lines, offset=offset)
+
+    # ---- what the window said -------------------------------------------- #
+
+    @app.get('/api/v1/cases/{case_id}/console')
+    async def console(case_id: str, after_line: int = 0, limit: int = 500,
+                      min_level: str = 'info', _auth=Depends(authenticate)):
+        """DP-2762. The Console panel's lines after ``after_line``."""
+        from foammesh.core.facade import window_text
+        return window_text.console(guard(case_id), after_line=after_line,
+                                   limit=limit, min_level=min_level)
+
+    @app.get('/api/v1/cases/{case_id}/status')
+    async def status_text(case_id: str, after: int = 0, _auth=Depends(authenticate)):
+        """DP-2762. The status line, its recent messages, the viewport's
+        notices and the run status strip."""
+        from foammesh.core.facade import window_text
+        return window_text.status(guard(case_id), after=after)
+
     # ---- presentation ---------------------------------------------------- #
 
     @app.get('/api/v1/cases/{case_id}/presentation/snapshot')
     async def presentation_snapshot(case_id: str, _auth=Depends(authenticate)):
-        session = guard(case_id)
-        if session.presentation is None:
-            return {'attached': False}
-        return session.presentation.to_dict()
+        return guard(case_id).presentation_snapshot()
 
     @app.post('/api/v1/cases/{case_id}/presentation/operations/{operation_id}:execute')
     async def presentation_execute(case_id: str, operation_id: str, body: dict,
@@ -314,7 +399,9 @@ async def serve(facade: FoamMeshFacade, *, host: str = '127.0.0.1', port: int = 
                 token: str | None = None, allowed_case_roots=()):  # pragma: no cover
     """Host the versioned facade app headlessly (``foammesh serve``)."""
     import uvicorn
+    from foammesh.support.client_trust import ClientTrust
     app = create_facade_app(facade, token=token, allowed_case_roots=allowed_case_roots,
-                            lifecycle=True, title='FoamMesh headless API v1')
+                            lifecycle=True, title='FoamMesh headless API v1',
+                            client_trust=ClientTrust.erevnaa())
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level='warning'))
     await server.serve()

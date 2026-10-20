@@ -77,6 +77,70 @@ def deviationScalarBar(lookupTable, tokens=None, signed=True):
     return bar
 
 
+def _magnitudes(readout) -> np.ndarray:
+    fields = getattr(readout, 'signed_fields', None) or getattr(
+        readout, 'fields', None) or {}
+    parts = [np.abs(np.asarray(values, dtype=float)).ravel()
+             for values in fields.values()]
+    magnitude = np.concatenate(parts) if parts else np.zeros(0)
+    return magnitude[np.isfinite(magnitude)]
+
+
+def markDeviationBar(bar, readout, tolerance=None) -> dict:
+    """The picture's bar says what the screen's legend says (DP-2738/2739).
+
+    The bar is the one a snapshot carries (the screen draws the Qt legend).
+    It stopped at the scale with nothing to say faces lay past it -- a
+    snapshot of the elbow read 0 to 0.242 mm with its worst label at
+    1.08 mm -- and had no tolerance on it. It now carries
+
+    * an above-range swatch in the top colour, noted with the count of faces
+      past the scale and their maximum, when there are any;
+    * the tolerance as a tick at its value when it lies on the bar, or in
+      the note when it lies above it.
+
+    The marks are written on the shared table (annotations and the
+    above-range colour do not change how a value maps to a colour) and are
+    rewritten on every refresh. Returns what was marked.
+    """
+    lut = bar.GetLookupTable()
+    if lut is None or readout is None:
+        return {}
+    high = float(lut.GetTableRange()[1])
+    tolerance = abs(float(
+        tolerance if tolerance is not None
+        else getattr(readout, 'tolerance', 0.0) or 0.0))
+    magnitude = _magnitudes(readout)
+    above = int(np.count_nonzero(magnitude > high * (1 + 1e-9)))
+    maximum = float(magnitude.max()) if magnitude.size else 0.0
+    off_scale = tolerance > high * (1 + 1e-9)
+    lut.ResetAnnotations()
+    if 0.0 < tolerance and not off_scale:
+        lut.SetAnnotation(tolerance, f'tolerance ±{tolerance:.3g}')
+    # On always: it also draws the swatches' notes ('not measured').
+    bar.DrawAnnotationsOn()
+    notes = []
+    if above:
+        faces = 'face' if above == 1 else 'faces'
+        notes.append(f'above {high:.3g}: {above:,} {faces}, max {maximum:.3g}')
+    if off_scale and tolerance > 0.0:
+        notes.append(f'tolerance ±{tolerance:.3g} above the scale')
+    if notes:
+        count = lut.GetNumberOfTableValues()
+        lut.SetAboveRangeColor(lut.GetTableValue(count - 1))
+        lut.UseAboveRangeColorOn()
+        bar.DrawAboveRangeSwatchOn()
+        bar.SetAboveRangeAnnotation('\n'.join(notes))
+    else:
+        lut.UseAboveRangeColorOff()
+        bar.DrawAboveRangeSwatchOff()
+        bar.SetAboveRangeAnnotation('')
+    return {'above': above, 'max': maximum, 'tolerance_tick':
+            bool(tolerance > 0.0 and not off_scale),
+            'tolerance_off_scale': bool(off_scale and tolerance > 0.0),
+            'note': '\n'.join(notes)}
+
+
 class DeviationHistogram(QWidget):
     """The distribution of |d| over 0..scale, in the colours of its scale."""
 
@@ -114,16 +178,31 @@ class DeviationHistogram(QWidget):
         return (self._edges[0], self._edges[-1])
 
     def toleranceBand(self) -> tuple:
-        """The shaded band, ``(0, tolerance)`` clipped to the axis."""
+        """The shaded band, ``(0, tolerance)``; ``()`` when there is none.
+
+        DP-2739. A tolerance past the axis's end has no band: clipped to the
+        axis it shaded the whole histogram, as if every bar were the band's.
+        The legend says the tolerance is above the scale.
+        """
         if self._tolerance <= 0.0 or len(self._edges) < 2:
             return ()
-        return (self._edges[0], min(self._edges[-1], self._tolerance))
+        if self._tolerance > self._edges[-1]:
+            return ()
+        return (self._edges[0], self._tolerance)
+
+    def toleranceOffScale(self) -> bool:
+        """DP-2739. The tolerance lies past the axis's end."""
+        return len(self._edges) >= 2 and self._tolerance > self._edges[-1]
 
     def axisLabels(self) -> tuple:
-        """The labels under the axis: ``('0', '<scale> mm')``."""
-        if len(self._edges) < 2:
-            return ()
-        return ('0', f'{self._edges[-1]:.3g} mm')
+        """The numbers under the axis: none.
+
+        DP-2737. The histogram runs on the legend's 0..scale, which the
+        legend's bar already numbers; a second numbered axis made two scales
+        for one quantity. The bars are in the legend's colours, so a bar is
+        read against the bar beside the model.
+        """
+        return ()
 
     def barColours(self) -> list:
         """``[(bin centre, (r, g, b))]``, one per bar, as painted."""
@@ -151,9 +230,7 @@ class DeviationHistogram(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              self.tr('Nothing measured'))
             return
-        labelHeight = float(self.fontMetrics().height() + 2)
-        area = QRectF(4.0, 4.0, self.width() - 8.0,
-                      self.height() - 8.0 - labelHeight)
+        area = QRectF(4.0, 4.0, self.width() - 8.0, self.height() - 8.0)
         low, high = self._edges[0], self._edges[-1]
         span = (high - low) or 1.0
 
@@ -187,11 +264,6 @@ class DeviationHistogram(QWidget):
         painter.setPen(QPen(text))
         painter.drawLine(int(area.left()), int(area.bottom()),
                          int(area.right()), int(area.bottom()))
-        labels = QRectF(area.left(), area.bottom() + 2, area.width(),
-                        labelHeight)
-        first, last = self.axisLabels()
-        painter.drawText(labels, Qt.AlignmentFlag.AlignLeft, first)
-        painter.drawText(labels, Qt.AlignmentFlag.AlignRight, last)
 
 
 class DeviationPanel(QFrame):

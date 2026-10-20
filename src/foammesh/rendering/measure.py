@@ -110,10 +110,15 @@ def cell_lines(info: dict) -> list:
 class MeasureState:
     """The clicks of one measurement and the lines the readout shows."""
 
+    #: DP-2747. What the readout says when a click found nothing to measure.
+    MISSED = 'That click is not on the model. Click on a face or an edge.'
+    FIRST = 'Click a point on the model.'
+
     def __init__(self):
         self.active = False
         self.points: list = []
         self.info: dict = {}
+        self.missed = False
 
     def setActive(self, on: bool) -> None:
         self.active = bool(on)
@@ -123,6 +128,7 @@ class MeasureState:
     def clear(self) -> None:
         self.points = []
         self.info = {}
+        self.missed = False
 
     def click(self, point, info: dict | None = None) -> None:
         """A pick: the third point starts a new pair."""
@@ -130,16 +136,26 @@ class MeasureState:
             self.points = []
         self.points.append(tuple(float(c) for c in point))
         self.info = info or {}
+        self.missed = False
+
+    def miss(self) -> None:
+        """A click that found nothing: the points so far are kept."""
+        self.missed = True
 
     def distance(self) -> float | None:
         return distance(*self.points) if len(self.points) == 2 else None
 
     def lines(self) -> list:
         lines = []
+        if self.missed:
+            lines.append(self.MISSED)
         value = self.distance()
         if value is not None:
             lines.append('Distance: ' + length_text(value))
         elif len(self.points) == 1:
             lines.append('Click a second point.')
+        elif self.active and not self.missed:
+            # DP-2747. Measure on with nothing picked said nothing at all.
+            lines.append(self.FIRST)
         lines += cell_lines(self.info)
         return lines

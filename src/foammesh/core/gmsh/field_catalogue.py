@@ -427,7 +427,7 @@ _TYPES = (
         'and points, used as the boundary layer rather than as a size. A fan '
         'point grows a fan of elements around it (a trailing edge); how '
         'many per half turn is Mesh.BoundaryLayerFanElements on the '
-        'Boundary layers page.',
+        'Layers page.',
         (_ent('CurvesList', 'Curves the layer is grown from.'),
          _ent('PointsList', 'Points the layer is grown from.'),
          _ent('FanPointsList', 'Points a fan of layers is built around.'),

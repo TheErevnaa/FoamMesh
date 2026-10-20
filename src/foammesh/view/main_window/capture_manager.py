@@ -136,6 +136,100 @@ class CaptureManager(QObject):
         return Path(written)
 
     def _writeSnapshot(self, path: Path, opts, includes):
+        with self.labelsFor(includes), self.pictureCaption(includes):
+            return self._writeSnapshotNow(path, opts, includes)
+
+    def _labelLayer(self):
+        views = getattr(getattr(app, 'window', None), '_qualityViews', None)
+        return getattr(views, '_layer', None)
+
+    def labelsFor(self, includes):
+        """The worst values and the statistics caption the Include boxes
+        leave out, held off for one capture (DP-2770).
+
+        Both boxes switched nothing: the view hides the props registered in
+        its 'worst' and 'caption' label groups, and the worst-value layer
+        registered none. The layer now follows the view's switches on
+        screen, and a snapshot whose boxes are unticked (the API's, or the
+        popover's) leaves the groups out of the picture.
+        """
+        import contextlib
+
+        layer = self._labelLayer()
+        off = [group for group in ('worst', 'caption')
+               if (includes or {}).get(group) is False]
+        if layer is None or not off or not hasattr(layer, 'suppressed'):
+            return contextlib.nullcontext()
+        return layer.suppressed(off)
+
+    def captionText(self) -> str:
+        """The statistics the legend shows, one per line, for the picture.
+
+        DP-2740. The snapshot's *Caption* box was ticked and the picture had
+        no statistics: nothing drew a caption (the Qt legend that shows the
+        figures on screen is not in the render window). '' when the model
+        is not coloured by a scalar, so a legend left over from an earlier
+        colouring is never captioned.
+        """
+        # Deviation only: Quality's statistics caption is the worst-value
+        # layer's own, on screen and in the picture alike (Plan 45 P2 took
+        # Deviation's off the screen; the picture has no Qt legend).
+        if self._scalar() != 'deviation':
+            return ''
+        controller = getattr(getattr(app, 'window', None),
+                             '_legendController', None)
+        legend = getattr(controller, 'legend', None)
+        spec = legend.spec() if legend is not None else None
+        lines = [str(line) for line in getattr(spec, 'statistics', ()) or ()]
+        if not lines:
+            return ''
+        title = str(getattr(spec, 'title', '') or '')
+        return '\n'.join([title, *lines] if title else lines)
+
+    def pictureCaption(self, includes):
+        """The caption in the render window for the length of one capture.
+
+        A text actor, top left, white on a dark plate like the worst-value
+        labels; :mod:`foammesh.rendering.label_pass` draws it at the
+        picture's size. Off the screen before and after.
+        """
+        import contextlib
+
+        text = (self.captionText()
+                if (includes or {}).get('caption', True) is not False else '')
+        renderer = getattr(self._view, 'renderer', None)
+        renderer = renderer() if callable(renderer) else None
+        if not text or renderer is None:
+            return contextlib.nullcontext()
+        from vtkmodules.vtkRenderingCore import vtkTextActor
+
+        actor = vtkTextActor()
+        actor.SetObjectName('snapshotCaption')
+        actor.SetInput(text)
+        coordinate = actor.GetPositionCoordinate()
+        coordinate.SetCoordinateSystemToNormalizedViewport()
+        coordinate.SetValue(0.012, 0.975)
+        style = actor.GetTextProperty()
+        style.SetFontSize(13)
+        style.SetJustificationToLeft()
+        style.SetVerticalJustificationToTop()
+        style.SetColor(1.0, 1.0, 1.0)
+        style.SetBackgroundColor(0.12, 0.13, 0.15)
+        style.SetBackgroundOpacity(0.82)
+        style.SetLineSpacing(1.15)
+        style.SetFrame(False)
+
+        @contextlib.contextmanager
+        def shown():
+            renderer.AddViewProp(actor)
+            try:
+                yield actor
+            finally:
+                renderer.RemoveViewProp(actor)
+
+        return shown()
+
+    def _writeSnapshotNow(self, path: Path, opts, includes):
         from .view_capture import composeView
 
         raster = snapshot_core.is_raster(opts.format)
@@ -374,10 +468,30 @@ class CaptureManager(QObject):
         }
 
     def _scalar(self):
+        """What the model on screen is coloured by: ``deviation``, the quality
+        metric being highlighted, or '' for the plain patch colours.
+
+        DP-2740. This read the quality picker's metric whatever was on screen,
+        so a snapshot of the deviation colouring was filed as
+        ``dev_sweep_nonorthoangle_...``; a plain view was named after a metric
+        it did not show either.
+        """
+        manager = getattr(getattr(app, 'window', None), 'meshManager', None)
+        manager = manager() if callable(manager) else manager
+        readout = getattr(manager, 'deviationReadout', None)
+        try:
+            if readout is not None and readout() is not None:
+                return 'deviation'
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no deviation readout for a capture', exc_info=True)
         info = getattr(self._displayControl, 'meshQualityInfo', None)
         if info is None:
             return ''
-        index = info().activeIndex()
+        quality = info()
+        highlighting = getattr(quality, 'isHighlighting', None)
+        if callable(highlighting) and not highlighting():
+            return ''
+        index = quality.activeIndex()
         return index.value if index is not None else ''
 
     def _scalarBand(self):

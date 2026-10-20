@@ -112,8 +112,24 @@ class Scene:
     def mesh_parts(self) -> tuple[str, ...]:
         return tuple(self.patches) + tuple(self.volume) + tuple(self.zones)
 
+    def parts(self) -> tuple[str, ...]:
+        """The geometry's parts: its actors less the region seed markers.
+
+        DP-2743. A seed marker (``region:<id>``) is a landmark the user
+        placed, not a part of what was imported (DP-679), so Geometry mode
+        neither counts it -- "showing 2 geometry parts" for one STL -- nor
+        shows or hides it; the seed tool owns its visibility.
+        """
+        return tuple(key for key in self.geometry if not is_marker(key))
+
     def everything(self) -> tuple[str, ...]:
-        return tuple(self.geometry) + self.mesh_parts()
+        return self.parts() + self.mesh_parts()
+
+
+def is_marker(key) -> bool:
+    """Whether a geometry actor id is a region seed's or exclude point's."""
+    head, sep, tail = str(key).partition(':')
+    return head in ('region', 'exclude') and bool(sep) and ':' not in tail
 
 
 def _split(scene: Scene, wanted) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -145,9 +161,9 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
         raise KeyError(mode_id)
 
     if mode_id == GEOMETRY:
-        if not scene.geometry:
+        if not scene.parts():
             return ViewPlan(mode_id, unavailable=_NO_GEOMETRY)
-        visible, hidden = _split(scene, scene.geometry)
+        visible, hidden = _split(scene, scene.parts())
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
                         summary=count_text(len(visible), 'geometry part'))
 

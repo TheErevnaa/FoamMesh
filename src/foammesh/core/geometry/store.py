@@ -1,6 +1,7 @@
 """Persistent, headless geometry artifacts and diagnostics."""
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -393,6 +394,32 @@ def _excuse_enclosed_seeds(reports, entries, carried, engine) -> list[dict]:
     return result
 
 
+#: DP-2717: manifest path -> ((path, identity, size, mtime), parsed document).
+_DOCUMENT_CACHE: dict = {}
+#: DP-2717: ((path, identity, size, mtime), ...) -> content fingerprint.
+_FINGERPRINT_CACHE: dict = {}
+_FINGERPRINT_CACHE_LIMIT = 256
+
+
+def _content_key(paths) -> tuple | None:
+    """What a file set's content is kept against, or ``None`` if unreadable."""
+    key = []
+    try:
+        for path in paths:
+            stat = os.stat(path)
+            key.append((os.path.normcase(os.path.abspath(path)), stat.st_ino,
+                        stat.st_size, stat.st_mtime_ns))
+    except (OSError, TypeError, ValueError):
+        return None
+    return tuple(key)
+
+
+def _remember_fingerprint(key: tuple, value: str) -> None:
+    if len(_FINGERPRINT_CACHE) >= _FINGERPRINT_CACHE_LIMIT:
+        _FINGERPRINT_CACHE.clear()
+    _FINGERPRINT_CACHE[key] = value
+
+
 class GeometryArtifactStore:
     def __init__(self, case_path: str | Path):
         self.case_path = Path(case_path)
@@ -404,9 +431,24 @@ class GeometryArtifactStore:
         return list(self._document().get('geometries', ()))
 
     def _document(self) -> dict:
-        if not self.manifest_path.is_file():
+        # DP-2717. MEASURED on the two-engine walk: every task page read this
+        # file (through the boundary-coverage warning, the prepared store and
+        # the derivation warnings) on the GUI thread, several times a read.
+        # A file whose identity, size and write time are unchanged has not
+        # changed, so its parse is kept against exactly those -- a replace,
+        # which is how this store writes it, always gives a new identity.
+        try:
+            stat = self.manifest_path.stat()
+        except FileNotFoundError:
             return {}
-        return json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        key = (os.path.normcase(os.path.abspath(self.manifest_path)),
+               stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        cached = _DOCUMENT_CACHE.get(key[0])
+        if cached is not None and cached[0] == key:
+            return copy.deepcopy(cached[1])
+        document = json.loads(self.manifest_path.read_text(encoding='utf-8'))
+        _DOCUMENT_CACHE[key[0]] = (key, copy.deepcopy(document))
+        return document
 
     def removed_entries(self) -> list[dict]:
         """Entries the user removed and an undo may still bring back (DP-1211)."""
@@ -995,13 +1037,20 @@ class GeometryArtifactStore:
 
     @staticmethod
     def _combined_fingerprint(paths) -> str:
+        key = _content_key(paths)
+        cached = _FINGERPRINT_CACHE.get(key) if key is not None else None
+        if cached is not None:
+            return cached
         digest = hashlib.sha256()
         for path in paths:
             with Path(path).open('rb') as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                     digest.update(chunk)
             digest.update(b'\0')
-        return f'sha256:{digest.hexdigest()}'
+        value = f'sha256:{digest.hexdigest()}'
+        if key is not None:
+            _remember_fingerprint(key, value)
+        return value
 
     def diagnose(self, geometry_id: str | None = None, *,
                  target_cell_size: float | None = None,
@@ -1202,11 +1251,20 @@ class GeometryArtifactStore:
         if entry.get('cad_artifact'):
             return GeometryArtifactStore._combined_fingerprint(
                 (entry['cad_artifact'], entry['artifact']))
+        # DP-2717: the whole surface was hashed again on every read of the
+        # prepared revision, on the GUI thread; kept like `_document`.
+        key = _content_key((entry['artifact'],))
+        cached = _FINGERPRINT_CACHE.get(key) if key is not None else None
+        if cached is not None:
+            return cached
         digest = hashlib.sha256()
         with Path(entry['artifact']).open('rb') as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                 digest.update(chunk)
-        return f'sha256:{digest.hexdigest()}'
+        value = f'sha256:{digest.hexdigest()}'
+        if key is not None:
+            _remember_fingerprint(key, value)
+        return value
 
     def readiness_report(self, geometry_id: str | None = None, *,
                          target_cell_size: float | None = None,

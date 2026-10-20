@@ -418,7 +418,10 @@ def _cmd_serve(args) -> int:
               'opened only inside those folders', file=sys.stderr)
         return 2
     from foammesh.api import create_app
-    uvicorn.run(create_app(token=token, allowed_case_roots=tuple(args.allow_root)),
+    from foammesh.support.client_trust import ClientTrust
+    # The token buys only the signed handshake (client_trust).
+    uvicorn.run(create_app(token=token, allowed_case_roots=tuple(args.allow_root),
+                           client_trust=ClientTrust.erevnaa()),
                 host=args.host, port=args.port)
     return 0
 

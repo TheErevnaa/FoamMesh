@@ -35,6 +35,12 @@ def countedPartIds(items) -> list:
             and not isinstance(item.actorInfo(), RegionMarkerActor)]
 
 
+def _rowHidden(item) -> bool:
+    """Whether `DisplayControl.hide` took this row's props out of the scene."""
+    isHidden = getattr(item, 'isHidden', None)
+    return bool(isHidden()) if callable(isHidden) else False
+
+
 class ContextMenu(QMenu):
     showActionTriggered = Signal()
     hideActionTriggered = Signal()
@@ -152,6 +158,8 @@ class DisplayControl(QObject):
         #: Isolation has to be visibly temporary. A user who forgets they
         #: isolated something reads a partial mesh as a broken one.
         self._isolated = False
+        #: DP-2743. Rows a view mode brought back into the scene.
+        self._broughtInByMode = set()
 
         self._list.setColumnWidth(Column.COLOR_COLUMN, 20)
 
@@ -198,6 +206,9 @@ class DisplayControl(QObject):
             # outline come across with its data.
             item.actorInfo().setDataSet(actorInfo.dataSet(), like=actorInfo)
             item.setHidden(False)
+            # DP-2743. Its owner put it back; a mode no longer holds it.
+            self.__dict__.get('_broughtInByMode', set()).discard(
+                actorInfo.id())
 
             actorInfo = item.actorInfo()
         else:
@@ -311,6 +322,7 @@ class DisplayControl(QObject):
         for prop in item.actorInfo().renderProps():
             self._view.removeActor(prop)
         item.setHidden(True)
+        self.__dict__.get('_broughtInByMode', set()).discard(actorInfo.id())
 
     def isShown(self, actorInfo) -> bool:
         """Whether ``actorInfo`` is in the scene: added and not `hide`-den."""
@@ -434,6 +446,7 @@ class DisplayControl(QObject):
         self._groups = {}
         self._selectedItems = []
         self._isolated = False
+        self._broughtInByMode = set()
         self.partsChanged.emit()
 
     def applyTheme(self, tokens):
@@ -594,16 +607,59 @@ class DisplayControl(QObject):
         self._visibilityChanged()
 
     def isolate(self, ids=None):
-        """Show only these parts. Everything else is hidden, not removed."""
+        """Show only these parts. Everything else is hidden, not removed.
+
+        DP-2744. A volume's exterior draws its boundary patches' faces
+        (Plan 39 VI4, `PatchSkin`), so isolating a selected volume used to
+        hide those patches -- "1 of 1 hidden" -- while every one of their
+        faces stayed on screen in the volume's own selection highlight. The
+        patches a kept volume draws are kept with it; a row this control
+        took out of the scene, or a region seed marker, is no part to hide.
+        """
         keep = set(ids) if ids is not None else set(self.selectedActorIds())
         if not keep:
             return False
+        # Left as they are, not shown: Quality hides the patches so the
+        # colouring is not covered, and isolating the volume keeps that.
+        drawn = self._patchesDrawnBy(keep) - keep
 
         for key, item in self._items.items():
-            item.setActorVisible(key in keep)
+            if key in keep:
+                item.setActorVisible(True)
+            elif key in drawn or _rowHidden(item) or isinstance(
+                    item.actorInfo(), RegionMarkerActor):
+                continue
+            else:
+                item.setActorVisible(False)
         self._isolated = True
         self._visibilityChanged()
         return True
+
+    def _patchesDrawnBy(self, volumes) -> set:
+        """The patch ids whose faces the exteriors of ``volumes`` draw.
+
+        A region's volume (``internalMesh``) is drawn as its exterior
+        surface, which is exactly its boundary patches' faces -- skinned
+        (`PatchSkin`) or not -- so those patches go with it.
+        """
+        manager = getattr(app.window, 'meshManager', None)
+        drawn = set()
+        try:
+            skins = getattr(manager, 'skins', None)
+            for skin in (skins() if callable(skins) else ()):
+                if str(skin.volume().id()) in volumes:
+                    drawn.update(str(patch.id()) for patch in skin.patches())
+            regions = getattr(manager, 'regions', None)
+            patchIds = getattr(manager, 'patchIds', None)
+            patches = set(map(str, patchIds())) if callable(patchIds) else set()
+            for ids in (regions().values() if callable(regions) else ()):
+                ids = [str(key) for key in ids]
+                if any(key in volumes and key.endswith('internalMesh')
+                       for key in ids):
+                    drawn.update(key for key in ids if key in patches)
+        except Exception:                                    # noqa: BLE001
+            return set()
+        return drawn
 
     def hiddenActorCount(self) -> int:
         """How many parts are in the scene but not on screen.
@@ -612,9 +668,14 @@ class DisplayControl(QObject):
         the only thing that knew was this dictionary. The count is the
         difference the press makes, and a press that makes none is worth
         saying out loud too.
+
+        DP-2744. Only the parts the chip counts (`countedPartIds`): a row
+        `hide` took out of the scene -- the geometry under a mesh -- and a
+        region seed marker are not brought back by Show all, so "3 were
+        hidden" over a one-patch mesh counted two things it never showed.
         """
-        return sum(1 for item in self._items.values()
-                   if not item.isActorVisible())
+        return sum(1 for key in countedPartIds(self._items)
+                   if not self._items[key].isActorVisible())
 
     def showAll(self):
         for item in self._items.values():
@@ -662,6 +723,20 @@ class DisplayControl(QObject):
         self._visibilityChanged()
         return held
 
+    def partIds(self) -> list[str]:
+        """DP-2745. The id of every part this control holds, as the local
+        API names them."""
+        return [str(key) for key in self._items]
+
+    def setPartColour(self, key, colour) -> None:
+        """Colour one part, swatch included, as its row's colour pick does."""
+        self._items[key].setActorColor(colour)
+        self._view.refresh()
+
+    def setPartOpacity(self, key, opacity: float) -> None:
+        self._items[key].actorInfo().setOpacity(float(opacity))
+        self._view.refresh()
+
     _PLAN_DISPLAY_MODES = {
         'wireframe': DisplayMode.WIREFRAME,
         'surface': DisplayMode.SURFACE,
@@ -684,10 +759,31 @@ class DisplayControl(QObject):
         """
         mode = self._PLAN_DISPLAY_MODES.get(getattr(plan, 'display_mode', ''))
         visible = [key for key in plan.visible if key in self._items]
+        # DP-2743. Showing a mesh takes the geometry's rows out of the scene
+        # (`hide`), and a visibility flag on an actor the renderer no longer
+        # holds draws nothing: Geometry mode said "showing 2 geometry parts"
+        # over an empty viewport. A mode that names such a row brings its
+        # props back, and the next mode that does not name it takes them out
+        # again, so leaving Geometry restores the mesh's own picture.
+        brought = self.__dict__.setdefault('_broughtInByMode', set())
+        for key in tuple(brought):
+            item = self._items.get(key)
+            if item is None:
+                brought.discard(key)
+            elif key not in plan.visible:
+                for prop in item.actorInfo().renderProps():
+                    self._view.removeActor(prop)
+                item.setHidden(True)
+                brought.discard(key)
         for key in plan.visible:
             item = self._items.get(key)
             if item is None:
                 continue
+            if _rowHidden(item):
+                for prop in item.actorInfo().renderProps():
+                    self._view.addActor(prop)
+                item.setHidden(False)
+                brought.add(key)
             item.setActorVisible(True)
             if mode is not None:
                 item.actorInfo().setDisplayMode(mode)

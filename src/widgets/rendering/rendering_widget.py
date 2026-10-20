@@ -598,6 +598,15 @@ class RenderWindowInteractor(QVTKRenderWindowInteractor):
             self._Iren.InvokeEvent(vtkCommand.MiddleButtonDoubleClickEvent, None)
 
 
+def isClick(pressed, released, slop: int = 3) -> bool:
+    """Whether a press and a release ``slop`` pixels apart or closer are a
+    click rather than the end of a drag (DP-2747)."""
+    if pressed is None or released is None:
+        return False
+    return (abs(float(released[0]) - float(pressed[0])) <= slop
+            and abs(float(released[1]) - float(pressed[1])) <= slop)
+
+
 class MouseHandler(QObject):
     mouseClicked = Signal(float, float, bool, bool)
 
@@ -644,8 +653,15 @@ class MouseHandler(QObject):
     def _leftButtonPressed(self, x, y):
         return False
 
+    #: DP-2747. How far, in render-window pixels, the pointer may move
+    #: between press and release for the pair still to be a click. Exact
+    #: equality lost every click whose hand moved one pixel -- on a
+    #: high-resolution mouse or a touchpad, most of them -- and a lost click
+    #: while measuring is a point that silently never arrives.
+    CLICK_SLOP = 3
+
     def _leftButtonReleased(self, x, y):
-        if (x, y) == self._pressPos:
+        if isClick(self._pressPos, (x, y), self.CLICK_SLOP):
             self._leftButtonClicked(x, y)
         return False
 
@@ -1770,6 +1786,7 @@ class RenderingWidget(QWidget):
         if self._originAxes is not None:
             self._installCornerClick()
         self._attachOriginRenderer(window)
+        self._attachMeasureLayer(window)
 
         if self._stack is not None:
             self._stack.insertWidget(0, widget)
@@ -1970,27 +1987,92 @@ class RenderingWidget(QWidget):
     def setPickResolver(self, resolver) -> None:
         self._pickResolver = resolver
 
-    def cellPickedActor(self, x, y):
-        """The actor the cell picker finds at a display point, or ``None``."""
+    #: DP-2713 / DP-2749. A mapper input with at least this many cells gets
+    #: a cell locator, kept until the data changes. MEASURED (dev build,
+    #: 2026-10-20): a linear ray cast costs 6 ms at 79 k faces, 76 ms at
+    #: 977 k and 442 ms at 3.9 M; a vtkStaticCellLocator builds once in
+    #: 83 ms at 1 M (314 ms at 4 M) and then answers in about 0.04 ms.
+    PICK_LOCATOR_MIN_CELLS = 100_000
+
+    def _cellPick(self, x, y):
+        """A CPU cell pick at a display point: the picker, or ``None``.
+
+        DP-2713 / DP-2749. Picking a part used to be a `vtkPropPicker`, which
+        draws the scene once more in hardware-selection mode. In VTK 9.5.2
+        that pass reads a prop id the selector never initialised, so hover
+        picks logged "vtkOpenGLHardwareSelector: Too many props" at random --
+        MEASURED 27 errors in 300 hover picks on a 20 k-cell elbow, every one
+        from the prop pick. A ray cast through the renderer's own props draws
+        nothing, cannot reach that code, and (with the locators above) costs
+        a fraction of a millisecond on any mesh size.
+        """
         picker = vtkCellPicker()
         picker.SetTolerance(0.0005)
+        for locator in self._pickLocators():
+            picker.AddLocator(locator)
         if not picker.Pick(float(x), float(y), 0.0, self._renderer):
             return None
-        actor = picker.GetActor()
+        return picker
+
+    def _pickLocators(self) -> list:
+        renderer = getattr(self, '_renderer', None)
+        if renderer is None:
+            return []
+        from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
+
+        getProps = getattr(renderer, 'GetViewProps', None)
+        if not callable(getProps):
+            return []
+        cache = self.__dict__.get('_pickLocatorCache', {})
+        live = {}
+        props = getProps()
+        if props is None:
+            return []
+        props.InitTraversal()
+        for _ in range(props.GetNumberOfItems()):
+            prop = props.GetNextProp()
+            if (prop is None or not prop.GetVisibility()
+                    or not prop.GetPickable()):
+                continue
+            getMapper = getattr(prop, 'GetMapper', None)
+            mapper = getMapper() if callable(getMapper) else None
+            getInput = getattr(mapper, 'GetInput', None)
+            data = getInput() if callable(getInput) else None
+            if (data is None or not hasattr(data, 'GetNumberOfCells')
+                    or data.GetNumberOfCells() < self.PICK_LOCATOR_MIN_CELLS):
+                continue
+            key = id(data)
+            entry = cache.get(key)
+            if (entry is None or entry[0] is not data
+                    or entry[1] != data.GetMTime()):
+                locator = vtkStaticCellLocator()
+                locator.SetDataSet(data)
+                locator.BuildLocator()
+                entry = (data, data.GetMTime(), locator)
+            live[key] = entry
+        # Only what is in the scene now is held: a replaced mesh lets go.
+        self._pickLocatorCache = live
+        return [entry[2] for entry in live.values()]
+
+    def _resolvedActor(self, picker, x, y):
+        actor = picker.GetActor() if picker is not None else None
         resolver = self._pickResolver
         if actor is not None and resolver is not None:
             actor = resolver(actor, x, y, self._renderer) or actor
         return actor
+
+    def cellPickedActor(self, x, y):
+        """The actor the cell picker finds at a display point, or ``None``."""
+        return self._resolvedActor(self._cellPick(x, y), x, y)
 
     def pickActor(self, x, y):
-        # DP-2713. Only this renderer is drawn in the selection pass.
-        pick_prop(self._actorPicker, x, y, self._renderer)
-        actor = self._actorPicker.GetActor()
-        resolver = self._pickResolver
-        if actor is not None and resolver is not None:
-            actor = resolver(actor, x, y, self._renderer) or actor
+        """The part at a display point, or ``None``.
 
-        return actor
+        DP-2713 / DP-2749: a CPU cell pick (`_cellPick`), not a hardware
+        selection pass; the same pick the hover readout and Measure use, so
+        the part named, the cell read and the point measured always agree.
+        """
+        return self._resolvedActor(self._cellPick(x, y), x, y)
 
     def clear(self):
         # vtkLogoWidget installs its representation as a renderer prop. Turn
@@ -1998,6 +2080,9 @@ class RenderingWidget(QWidget):
         # re-registers the watermark instead of returning as already enabled.
         self._logoWidget.Off()
         self._renderer.RemoveAllViewProps()
+        layer = self.__dict__.get('_measureLayer')
+        if layer is not None:
+            layer.RemoveAllViewProps()
         self._measureActors = []
         self._measureState.clear()
         if getattr(self, '_measureReadout', None) is not None:
@@ -2037,8 +2122,12 @@ class RenderingWidget(QWidget):
         self._widget.Render()
 
     def rollCamera(self):
+        self.rollCameraBy(90.0)
+
+    def rollCameraBy(self, degrees: float):
+        """Turn the view about the line of sight, the toolbar's way round."""
         self.rememberView()
-        self._renderer.GetActiveCamera().Roll(-90)
+        self._renderer.GetActiveCamera().Roll(-float(degrees))
         self._widget.Render()
 
     def setViewPreset(self, preset: str):
@@ -3567,11 +3656,27 @@ class RenderingWidget(QWidget):
         self._measureState.clear()
         self._showMeasure()
 
+    def measureBetween(self, start, end) -> None:
+        """DP-2745. Measure two given points, as two clicks would: Measure
+        turns on, the line and its length are drawn and the readout shows."""
+        self._measureState.setActive(True)
+        self._measureState.clear()
+        self._measureState.click(start)
+        self._measureState.click(end)
+        self.setMeasureActive(True)
+
     def measureAt(self, x, y) -> bool:
-        """Measure what is at a display point; False if nothing is there."""
-        picker = vtkCellPicker()
-        picker.SetTolerance(0.0005)
-        if not picker.Pick(float(x), float(y), 0.0, self._renderer):
+        """Measure what is at a display point; False if nothing is there.
+
+        DP-2747. A click that found nothing used to return False and say
+        nothing, so a measurement that never got its second point looked
+        like a tool that does not work. The readout now says the click
+        missed and what to do instead.
+        """
+        picker = self._cellPick(x, y)
+        if picker is None:
+            self._measureState.miss()
+            self._showMeasure()
             return False
         try:
             info = measure.describe_cell(picker.GetDataSet(),
@@ -3588,10 +3693,15 @@ class RenderingWidget(QWidget):
         from vtkmodules.vtkRenderingCore import (
             vtkBillboardTextActor3D, vtkPolyDataMapper)
 
+        layer = self._measureOverlay()
         for actor in self._measureActors:
-            _quietly(self._renderer.RemoveActor, actor)
+            _quietly(layer.RemoveViewProp, actor)
         self._measureActors = []
         state = self._measureState
+        if state.active and state.points:
+            # DP-2747. Each picked point is marked where it landed, the first
+            # one at once, so the click visibly arrived before the second.
+            self._measureActors.append(self._measurePointsActor(state.points))
         if len(state.points) == 2:
             line = vtkLineSource()
             line.SetPoint1(*state.points[0])
@@ -3603,7 +3713,7 @@ class RenderingWidget(QWidget):
             actor.GetProperty().SetColor(1.0, 0.8, 0.1)
             actor.GetProperty().SetLineWidth(3.0)
             actor.SetPickable(False)
-            self._renderer.AddActor(actor)
+            layer.AddActor(actor)
             label = vtkBillboardTextActor3D()
             label.SetInput(measure.length_text(state.distance()))
             middle = [(a + b) / 2.0 for a, b in zip(*state.points)]
@@ -3612,11 +3722,73 @@ class RenderingWidget(QWidget):
             label.GetTextProperty().SetColor(1.0, 0.8, 0.1)
             label.GetTextProperty().SetBold(True)
             label.SetPickable(False)
-            self._renderer.AddActor(label)
-            self._measureActors = [actor, label]
+            layer.AddActor(label)
+            self._measureActors += [actor, label]
         self._measureReadout.show_lines(state.lines() if state.active else [])
         self.arrangeOverlays()
         self.refresh()
+
+    def _measurePointsActor(self, points):
+        """The measured points, drawn as dots over the model."""
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+        from vtkmodules.vtkRenderingCore import vtkPolyDataMapper
+
+        coordinates = vtkPoints()
+        vertices = vtkCellArray()
+        for point in points:
+            vertices.InsertNextCell(1)
+            vertices.InsertCellPoint(coordinates.InsertNextPoint(*point))
+        data = vtkPolyData()
+        data.SetPoints(coordinates)
+        data.SetVerts(vertices)
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetObjectName('measure:points')
+        prop = actor.GetProperty()
+        prop.SetColor(1.0, 0.8, 0.1)
+        # Square points: MEASURED on this machine's AMD driver, points drawn
+        # as spheres in the overlay layer put no pixel on screen.
+        prop.SetPointSize(9.0)
+        prop.LightingOff()
+        actor.SetPickable(False)
+        self._measureOverlay().AddActor(actor)
+        return actor
+
+    def _measureOverlay(self):
+        """The layer the measurement is drawn in, over the model.
+
+        DP-2747. MEASURED live 2026-10-20: with the marks, line and label in
+        the scene's own renderer, two clicks on the elbow measured 0.3559 m
+        and nothing showed -- the points lie *on* the surface (a depth tie
+        the volume's depth bias loses or wins by chance), and the straight
+        line between two surface points, with its label at the midpoint,
+        runs *inside* the solid. Drawn in a layer of its own over the scene,
+        with the scene's camera (as the origin triad is), the measurement is
+        always in front.
+        """
+        layer = self.__dict__.get('_measureLayer')
+        if layer is None:
+            layer = vtkRenderer()
+            layer.SetLayer(1)
+            layer.InteractiveOff()
+            layer.SetActiveCamera(self._renderer.GetActiveCamera())
+            self._measureLayer = layer
+        self._attachMeasureLayer(self.renderWindow())
+        return layer
+
+    def _attachMeasureLayer(self, window) -> None:
+        layer = self.__dict__.get('_measureLayer')
+        if layer is None or window is None:
+            return
+        _quietly(window.SetNumberOfLayers, max(2, window.GetNumberOfLayers()))
+        if not window.HasRenderer(layer):
+            window.AddRenderer(layer)
+        # A reset view gets a new camera; the layer follows it.
+        if layer.GetActiveCamera() is not self._renderer.GetActiveCamera():
+            layer.SetActiveCamera(self._renderer.GetActiveCamera())
 
     def _copyView(self) -> None:
         from foammesh.view.main_window.view_capture import copyView
@@ -3698,19 +3870,16 @@ class RenderingWidget(QWidget):
             return
         interactor = self._widget._Iren
         x, y = interactor.GetEventPosition()
-        actor = self.pickActor(x, y)
-        if actor is None:
-            # VI14 (LIVEV). The prop pick can come back empty over a part the
-            # cell pick finds (measured on a smooth clip of the elbow: 0 of 3
-            # points by prop pick, 3 of 3 by cell pick), and the readout is
-            # built from the cell pick. The part under the cursor is named by
-            # the same pick that reads its cell.
-            actor = self.cellPickedActor(x, y)
+        # VI14 (LIVEV) named the part by the pick that reads its cell; since
+        # DP-2713 / DP-2749 that one CPU pick is the only pick, and the
+        # readout is built from it rather than casting the ray again.
+        picker = self._cellPick(x, y)
+        actor = self._resolvedActor(picker, x, y)
         name = actor.GetObjectName() if actor is not None else ''
         if name != self._hoveredName:
             self._hoveredName = name
             self.actorHovered.emit(name)
-        self._hoverReadoutAt(x, y, name)
+        self._hoverReadoutAt(x, y, name, picker=picker)
 
     def setHoverReadoutEnabled(self, enabled: bool) -> None:
         self._readoutEnabled = bool(enabled)
@@ -3738,11 +3907,14 @@ class RenderingWidget(QWidget):
             self._readoutText = ''
             self.hoverReadout.emit('', 0, 0)
 
-    def readoutAt(self, x, y, name: str = '') -> list:
-        """The readout's lines for the cell or face at a display point."""
-        picker = vtkCellPicker()
-        picker.SetTolerance(0.0005)
-        if not picker.Pick(float(x), float(y), 0.0, self._renderer):
+    def readoutAt(self, x, y, name: str = '', picker=False) -> list:
+        """The readout's lines for the cell or face at a display point.
+
+        ``picker`` is a pick already made at that point (``None`` when it
+        found nothing); left out, the point is picked here."""
+        if picker is False:
+            picker = self._cellPick(x, y)
+        if picker is None:
             return []
         info = {}
         if self._hoverInfo is not None and name:
@@ -3762,7 +3934,7 @@ class RenderingWidget(QWidget):
             deviation_array=info.get('deviation'),
             deviation_unit=str(info.get('unit', '') or ''))
 
-    def _hoverReadoutAt(self, x, y, name: str) -> None:
+    def _hoverReadoutAt(self, x, y, name: str, picker=False) -> None:
         """Show the cell or face under the cursor; off with the pick itself."""
         if not self._readoutEnabled:
             return
@@ -3771,7 +3943,7 @@ class RenderingWidget(QWidget):
         if self._interactionDetail.wanted():
             self._clearReadout()
             return
-        lines = self.readoutAt(x, y, name)
+        lines = self.readoutAt(x, y, name, picker=picker)
         if not lines:
             self._clearReadout()
             return

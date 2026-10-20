@@ -1146,8 +1146,16 @@ class EngineBranchView(QWidget):
         self._checkSubscription = session
 
     def _checksLanded(self) -> None:
+        # DP-2815. MEASURED live on the casex pipe reopened after a killed
+        # Run to end: the resumed Snap fidelity gate ran and the store moved
+        # Snap and Layers to done, and the outline went on painting `8. Snap`
+        # and `9. Layers` stale. This repainted the branch's own list only;
+        # the outline is rebuilt from `taskChanged`, which nothing sent, so a
+        # check that lands in the background -- after an in-session Run to
+        # end as well as on reopen -- never reached the rows the user reads.
         try:
             self.refresh_states()
+            self.taskChanged.emit(self.currentTask() or '')
         except RuntimeError:
             pass                           # the branch was deleted meanwhile
 

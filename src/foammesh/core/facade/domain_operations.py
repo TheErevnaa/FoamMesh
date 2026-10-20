@@ -30,7 +30,7 @@ from foammesh.core.project import Event
 from foammesh.core.mesh import detection_record  # RP13 #3
 from foammesh.core.quantities import aligned, count_text
 
-from .commands import Command
+from .commands import Actor, ActorKind, Command, CommandSource
 from .errors import (CapabilityUnavailableError, CheckOverBudgetError,
                      CheckUnavailableError, FacadeError,
                      PreconditionFailedError, ValidationFailedError,
@@ -3660,8 +3660,11 @@ class DomainOperations:
         published = False
         if export_settings.get('publishesPolyMesh', True):
             try:
-                payload['publication'] = self._publish_gmsh_result(
+                publication = self._publish_gmsh_result(
                     session, record, prepared)
+                if inspect.isawaitable(publication):
+                    publication = await publication
+                payload['publication'] = publication
             except ValidationFailedError as error:
                 if target != 'unselected':
                     raise
@@ -4820,6 +4823,7 @@ class DomainOperations:
                 blocked = recorded.get('blocked')
                 gates = self._runnable_gates(session, command, recorded)
                 if not blocked or not gates:
+                    await self._settle_pipeline_gates(session, recorded)
                     return recorded
                 results = {}
                 jobs_run = {}
@@ -4896,12 +4900,15 @@ class DomainOperations:
                 progressed['gates_run'] = list(
                     recorded.get('gates_run', ())) + list(gates)
                 progressed['warning'] = recorded.get('warning')
-                for key in ('warning_for', 'warning_reasons'):
+                for key in ('warning_for', 'warning_reasons',
+                            'pipeline_run_id'):
                     if key in recorded:
                         progressed[key] = recorded[key]
                 if progressed.get('blocked') == blocked:
+                    await self._settle_pipeline_gates(session, progressed)
                     return progressed
                 recorded = progressed
+            await self._settle_pipeline_gates(session, recorded)
             return recorded
         except asyncio.CancelledError:
             raise
@@ -4950,6 +4957,99 @@ class DomainOperations:
         """The background gate tasks of ``session`` (tests and shutdown)."""
         return list(self._checks_for(session)['tasks'])
 
+    async def resume_pipeline_gates(self, session: CaseSession) -> dict | None:
+        """Finish the check gates a Run to end left unrun (DP-2815).
+
+        ``_advance_pipeline_gates`` runs the Snap fidelity gate in the
+        background, after ``workflow.run_pipeline`` has already answered, and
+        only its verdict lets the atomic record carry on to Layers, QA and
+        Export. A window closed or killed in those seconds lost the task and
+        nothing ever ran it again. MEASURED on the casex pipe (2026-10-20):
+        a signed run to end, 153,999 cells, published and accepted, then a
+        kill; on reopen Snap, Layers, Quality and Export read not done, the
+        store held ``snappy.fidelity_snap`` stale and its report was the one
+        from twenty minutes before.
+
+        So, on open: when the live mesh is the one the newest snappy pipeline
+        run published (its run manifest says so, and only that route writes
+        one), that run's gates have not been settled, and its record is still
+        waiting on a check gate that may run now, the record is replayed and
+        the gates are started exactly as the run would have started them. A
+        run whose gates were settled is noted, so a later Revert and edit on
+        the gate is never undone by a reopen.
+        """
+        from foammesh.core.engine.registry import ENGINE_REGISTRY
+        from foammesh.core.workflow.task_state_store import TaskStateError
+
+        if getattr(session, 'read_only', False):
+            return None
+        found = await asyncio.to_thread(
+            _unsettled_pipeline_run, session.case_path)
+        if found is None:
+            return None
+        command = Command(
+            'workflow.run_pipeline', session.case_id, {'engine_id': 'snappy'},
+            Actor('foammesh-recovery', ActorKind.SYSTEM), CommandSource.SYSTEM)
+
+        async def start():
+            engine_id, store = self._task_state_store(session, command)
+            covered = getattr(
+                ENGINE_REGISTRY.get(engine_id), 'ATOMIC_RUN_TASKS', ())
+            if not covered or not self._waits_on_a_gate(store, covered):
+                await asyncio.to_thread(
+                    _settle_pipeline_run, session.case_path, found['run_id'])
+                return None
+            recorded = store.record_atomic_run_success(
+                covered, warning=found['warning'],
+                warning_for=('snappy.qa',), reasons=found['reasons'])
+            recorded.update(
+                warning=found['warning'], warning_for=['snappy.qa'],
+                warning_reasons=list(found['reasons']),
+                pipeline_run_id=found['run_id'])
+            return self._advance_pipeline_gates(session, command, recorded)
+
+        try:
+            scheduler = getattr(session, 'scheduler', None)
+            if scheduler is not None:
+                return await scheduler.submit(start)
+            return await start()
+        except asyncio.CancelledError:
+            raise
+        except (FacadeError, TaskStateError, LookupError, OSError,
+                ValueError) as error:
+            logger.warning('the unrun pipeline gates of %s could not be '
+                           'resumed: %s', session.case_path, error)
+            return None
+
+    def _waits_on_a_gate(self, store, covered) -> bool:
+        """Whether ``covered``'s record stops behind a check that can run."""
+        accepted = ('passed', 'warning', 'skipped', 'completed', 'waived')
+        graph = store.load_result().graph
+        wanted: set[str] = set()
+        for task_id in covered:
+            wanted.update(store.stage_chain(task_id))
+        for task in store.descriptor.ordered_tasks():
+            if task.task_id not in wanted:
+                continue
+            if graph.state(task.task_id).value in accepted:
+                continue
+            return any(
+                parent in self.CHECK_TASK_OPERATIONS
+                and graph.state(parent).value not in accepted
+                and graph.is_runnable(parent)
+                for parent in task.depends_on)
+        return False
+
+    @staticmethod
+    async def _settle_pipeline_gates(session: CaseSession,
+                                     recorded: dict | None) -> None:
+        """Note that the run ``recorded`` came from has had its gates run."""
+        run_id = str((recorded or {}).get('pipeline_run_id') or '')
+        if not run_id:
+            return
+        await asyncio.to_thread(_settle_pipeline_run, session.case_path,
+                                run_id)
+
     @staticmethod
     def _gmsh_volume_types(session: CaseSession, prepared) -> dict:
         """Plan 36 RP11: each typed solid's type, by its published name."""
@@ -4974,19 +5074,30 @@ class DomainOperations:
                 return found
         return {}
 
-    def _publish_gmsh_result(self, session: CaseSession, record, prepared) -> dict:
-        """Publish one Gmsh mesh as constant/polyMesh, atomically."""
+    async def _publish_gmsh_result(self, session: CaseSession, record,
+                                   prepared) -> dict:
+        """Publish one Gmsh mesh as constant/polyMesh, atomically.
+
+        DP-2717. MEASURED on the two-engine walk: 2.65 s on the GUI thread in
+        ``_swap_in_published_mesh -> record_generated_mesh ->
+        save_case_metadata``, beside the publish that writes the polyMesh and
+        the recovery copy of the previous one. The file work goes to a
+        worker; what reads the database (the volume types, the evidence
+        policy) and the event stay here.
+        """
         from foammesh.core.gmsh.manifest import RunBuilder
         from foammesh.core.gmsh.publish import PublishError, publish
 
         staged = record.layout.root / 'publication' / 'polyMesh'
+        region_metadata = self._gmsh_volume_types(session, prepared)
         try:
-            report = publish(
+            report = await asyncio.to_thread(
+                publish,
                 record.layout.mesh, staged,
                 categories={**_gmsh_patch_categories(prepared),
                             **_job_edge_categories(record)},
                 identities=_gmsh_patch_identities(prepared),
-                region_metadata=self._gmsh_volume_types(session, prepared),
+                region_metadata=region_metadata,
                 periodic_pairs=_job_periodic_pairs(record),
                 non_conformal_pairs=_kept_apart_pairs(record),
                 extrusion=_job_extrusion(record),
@@ -5017,18 +5128,26 @@ class DomainOperations:
         # at all -- MEASURED, indistinguishable from a run that deliberately
         # published nothing, and the reopened case called it accepted. Saying
         # it first is what makes the interruption legible afterwards.
-        RunBuilder.record_publication_started(
+        await asyncio.to_thread(
+            RunBuilder.record_publication_started,
             record, session.case_path / 'constant' / 'polyMesh')
-        activation = self._swap_in_published_mesh(session, staged, record)
+        activation = await asyncio.to_thread(
+            self._swap_in_published_mesh, session, staged, record,
+            announce=False)
+        session.state.bus.publish(
+            Event.ARTIFACT_MESH_CHANGED, operation='mesh.publish',
+            run_id=record.run_id)
         document = {**report.to_dict(), **activation}
         document['case_scaffolding'] = self._ensure_openfoam_case(session)
-        document['patch_identity'] = self._write_patch_identity(
+        document['patch_identity'] = await asyncio.to_thread(
+            self._write_patch_identity,
             session, 'gmsh', report.patch_records, prepared)
         document['evidence'] = self._bind_evidence(
             session, checkpoint_fingerprint=str(
                 record.document.get('job_digest') or ''),
             prepared=prepared)
-        RunBuilder.record_publication(record, document)
+        await asyncio.to_thread(RunBuilder.record_publication, record,
+                                document)
         return document
 
     def _bind_evidence(self, session: CaseSession, *,
@@ -5262,8 +5381,13 @@ runTimeModifiable true;
             created.append('system/controlDict')
         return {'created': created, 'system': str(system)}
 
-    def _swap_in_published_mesh(self, session: CaseSession, staged, record) -> dict:
-        """Replace the active mesh, keeping the previous one recoverable."""
+    def _swap_in_published_mesh(self, session: CaseSession, staged, record,
+                                *, announce: bool = True) -> dict:
+        """Replace the active mesh, keeping the previous one recoverable.
+
+        ``announce=False`` (DP-2717) leaves the mesh-changed event to the
+        caller, which runs this on a worker and publishes from the loop.
+        """
         import os
 
         from foammesh.core.mesh.recovery import MeshRecoveryService
@@ -5294,9 +5418,10 @@ runTimeModifiable true;
         from foammesh.core.case import record_generated_mesh
         record_generated_mesh(session.case_path, provenance={
             'generated_by': f'gmsh:{record.run_id}'})
-        session.state.bus.publish(
-            Event.ARTIFACT_MESH_CHANGED, operation='mesh.publish',
-            run_id=record.run_id)
+        if announce:
+            session.state.bus.publish(
+                Event.ARTIFACT_MESH_CHANGED, operation='mesh.publish',
+                run_id=record.run_id)
         return {
             'destination': str(active),
             'replaced_active_mesh': recovery is not None,
@@ -8014,7 +8139,7 @@ runTimeModifiable true;
                 # patch identity (so fidelity and resolution had no
                 # sections) and no evidence (so every summary was stale).
                 # A stage left decomposed binds when it is reconstructed.
-                payload.update(self._trace_mesh_state(
+                payload.update(await self._traced(
                     session, definition.stage, execution))
                 if payload.get('stage_snapshot') is None:
                     payload['stage_snapshot'] = await self._capture_stage_snapshot(
@@ -8336,7 +8461,7 @@ runTimeModifiable true;
             if self._gather_pending(session.case_path):
                 kept = (await self._ensure_reconstructed(session, command)
                         or {}).get('stage_snapshot')
-            self._trace_mesh_state(session, step, execution)
+            await self._traced(session, step, execution)
             summary['regenerated'].append({
                 'stage': step,
                 'snapshot': kept if kept is not None else
@@ -8403,26 +8528,42 @@ runTimeModifiable true;
             failure = {**failure, 'retry': offer}
         return failure
 
-    def _trace_mesh_state(self, session: CaseSession, stage: str,
-                          execution=None) -> dict:
-        """Checkpoint, identity sidecar and evidence for the mesh in the root."""
+    async def _traced(self, session: CaseSession, stage: str,
+                      execution=None) -> dict:
+        """Await :meth:`_trace_mesh_state`, or take a stand-in's plain dict."""
+        traced = self._trace_mesh_state(session, stage, execution)
+        if inspect.isawaitable(traced):
+            traced = await traced
+        return traced
+
+    async def _trace_mesh_state(self, session: CaseSession, stage: str,
+                                execution=None) -> dict:
+        """Checkpoint, identity sidecar and evidence for the mesh in the root.
+
+        DP-2717. MEASURED on the two-engine walk: 9.0 s on the GUI thread in
+        ``snap_checkpoint.save`` (it copies and hashes the snapped boundary),
+        and the prepared-geometry read beside it. The checkpoint, the
+        prepared revision and the identity sidecar are file work and go to a
+        worker; the evidence marker reads the tolerance policy from the
+        database, so it stays here.
+        """
         traced: dict = {}
         checkpoint = ''
         if stage == 'snap':
             run_id = ''
             if execution is not None:
                 run_id = str(execution.to_payload().get('job_id') or '')
-            traced['checkpoint'] = self._save_snap_checkpoint(
-                session, run_id=run_id)
+            traced['checkpoint'] = await asyncio.to_thread(
+                self._save_snap_checkpoint, session, run_id=run_id)
             checkpoint = str(traced['checkpoint'].get('fingerprint') or '')
         if stage == 'blockMesh':
             # A base grid has no surface to join to; the sidecar written on
             # it would fabricate every prepared patch. Evidence is enough.
             traced['evidence'] = self._bind_evidence(session)
             return traced
-        prepared = self._current_prepared(session)
-        traced['patch_identity'] = self._write_snappy_patch_identity(
-            session, prepared)
+        prepared = await asyncio.to_thread(self._current_prepared, session)
+        traced['patch_identity'] = await asyncio.to_thread(
+            self._write_snappy_patch_identity, session, prepared)
         traced['evidence'] = self._bind_evidence(
             session, checkpoint_fingerprint=checkpoint, prepared=prepared)
         return traced
@@ -8858,7 +8999,7 @@ runTimeModifiable true;
         record_generated_mesh(case_path, provenance={
             'generated_by': f'reconstructPar:{gathered_stage}'})
         payload = execution.to_payload()
-        payload['trace'] = self._trace_mesh_state(session, 'reconstruct')
+        payload['trace'] = await self._traced(session, 'reconstruct')
         if gathered_stage != 'parallel':
             payload['stage_snapshot'] = await self._keep_gathered_stage(
                 session, gathered_stage)
@@ -9702,8 +9843,23 @@ runTimeModifiable true;
         self._preflight_snappy_inputs(session, 'surfaceFeatures')
         # DP-851. The same seed gate the stage route asks, against the
         # blockMeshDict just rewritten above, before any node launches.
+        had_region = self._has_region(session)
         seed_warnings = await self._snappy_seed_gate(
             session, allow_region_clash=self._allows_region_clash(command))
+        # DP-2734. The gate adds a default fluid region to a case with none,
+        # after the dictionaries above were written from the settings without
+        # it; each stage then rewrote its dictionary from the settings with
+        # it, and the seal refused the run as changed mid-run. Write them
+        # again from the settings the run will read.
+        if not had_region and self._has_region(session):
+            try:
+                manifest = engine.refresh_pipeline_config(
+                    session.state.db, session.case_path)
+            except (FileNotFoundError, KeyError, TypeError,
+                    ValueError) as error:
+                raise ValidationFailedError(
+                    f'current Snappy dictionaries could not be generated: '
+                    f'{error}') from error
         configuration = _resource_policy(session.configuration())
         mode = ResourceMode(str(command.parameters.get(
             'mode') or configuration['mode']))
@@ -10033,6 +10189,19 @@ runTimeModifiable true;
         except MeshStateError as error:
             raise ValidationFailedError(
                 f'pipeline output could not be published: {error}') from error
+        # DP-2748. The stage route (H9) and the gather (UF20) record that the
+        # mesh in constant/polyMesh is the workflow's own; this route -- Run
+        # to end, the one the MCP and the guided walks take -- never did. Its
+        # sidecar kept `workflow=none`, so the next open read "mesh exists
+        # but metadata has no workflow mode" and showed the case as External
+        # mesh with Geometry through Export suspended. MEASURED on the
+        # dev-sweep case (snappy elbow, 20,470 cells): project.json still
+        # held the 08:55 creation record after the 09:00 run and a 10:29
+        # save. File work, so a worker does it, as the stage route's does.
+        from foammesh.core.case import record_generated_mesh
+        await asyncio.to_thread(
+            record_generated_mesh, session.case_path, provenance={
+                'generated_by': 'snappy:pipeline'})
         session.state.bus.publish(
             Event.ARTIFACT_MESH_CHANGED, mesh_state=reference.to_dict())
         prepared = self._current_prepared(session)
@@ -10083,6 +10252,10 @@ runTimeModifiable true;
             recorded['warning'] = not_clean
             recorded['warning_for'] = ['snappy.qa']
             recorded['warning_reasons'] = list(qa_warning)
+            # DP-2815: which run the gates belong to, so a reopen can tell
+            # whether they ran.
+            recorded['pipeline_run_id'] = str(
+                getattr(record, 'run_id', '') or '')
         task_state = self._advance_pipeline_gates(session, command, recorded)
         # Plan 37 UF5. One pipeline run leaves only its finished mesh; that
         # is kept as the all-in-one stage, so it can be compared and a later
@@ -11820,6 +11993,13 @@ runTimeModifiable true;
                 f'({where}) m, {source}. Move it on Domain & regions if the '
                 'fluid is elsewhere.')
 
+    @staticmethod
+    def _has_region(session: CaseSession) -> bool:
+        try:
+            return bool(session.state.db.getElements('region'))
+        except Exception:  # noqa: BLE001 - a project without regions
+            return False
+
     def _region_seed_rows(self, session: CaseSession) -> list:
         """``(label, type, xyz)`` of every region seed with a point."""
         seeds = []
@@ -12876,7 +13056,7 @@ runTimeModifiable true;
         # Plan 37 F-2. Read on this thread; the parser may run on another.
         retained_context = self._retained_region_context(session)
 
-        def parse_and_persist(result):
+        def parse_and_persist_here(result):
             parsed = parse_checkmesh(result.output)
             self._apply_retained_regions(retained_context, parsed)
             _, report = MeshCheckService.persist_result(
@@ -12898,7 +13078,13 @@ runTimeModifiable true;
                 report_path, kind='quality-report',
                 validator=lambda path: path.is_file() and path.stat().st_size > 0,
                 produced_by_parser=True),),
-            parser=parse_and_persist,
+            parser=parse_and_persist_here,
+            # DP-2717. MEASURED on the two-engine walk: 4.95 s on the GUI
+            # thread in `persist_result -> _save_report` and the parse beside
+            # it. Nothing in the parser reads the database (F-2 read it
+            # above), so the parse, the report and the kept sets go to a
+            # worker.
+            parser_off_loop=True,
             artifact_event=Event.ARTIFACT_QUALITY_CHANGED,
             invalidated_outputs=('quality',),
             cleanup_argv=launch.cleanup_argv,
@@ -14969,7 +15155,13 @@ runTimeModifiable true;
         from foammesh.core.import_export.service import ImportExportService
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
-        result = ImportExportService().export_native_case(session.case_path, destination)
+        # DP-2732. A case with no mesh, or a destination already there, is a
+        # refusal with its reason, as the other exports give; it reached the
+        # local API as an unhandled ValueError and an HTTP 500.
+        try:
+            result = ImportExportService().export_native_case(session.case_path, destination)
+        except (OSError, ValueError) as error:
+            raise ValidationFailedError(str(error)) from error
         return self._read_result(session, command, {'export': _to_payload(result),
                                                     'destination': str(destination),
                                                     'qualification': qualification})
@@ -15323,3 +15515,93 @@ def _gmsh_runtime() -> dict:
     from foammesh.core.gmsh import launch_profiles
 
     return dict(launch_profiles._shared_runtime)
+
+
+# DP-2815. Which pipeline run has had its check gates settled.
+PIPELINE_GATES_RECORD = 'foammesh/workflow/pipeline-gates.json'
+
+
+def _unsettled_pipeline_run(case_path) -> dict | None:
+    """The snappy pipeline run behind the live mesh, if its gates never ran.
+
+    File work only, so it runs on a worker. ``None`` when the live mesh was
+    not published by a pipeline run, when that run's gates were settled, or
+    when its checkMesh verdict cannot be read -- the QA task's warning comes
+    from that verdict, and a replay that guessed it would record a pass the
+    run never earned.
+    """
+    from foammesh.core.quality import QualityReport
+    from foammesh.core.quality.verdict import verdict_from_report
+
+    case_path = Path(case_path)
+    try:
+        state = json.loads((case_path / 'foammesh' / 'mesh-state.json')
+                           .read_text(encoding='utf-8'))
+        live = str(((state or {}).get('mesh') or {}).get('fingerprint') or '')
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not live:
+        return None
+    try:
+        items = sorted((case_path / 'foammesh' / 'runs').iterdir())
+    except OSError:
+        return None
+    newest = None
+    for item in items:
+        # Only `run_snappy_pipeline` opens a snappy run manifest.
+        if not item.name.startswith('snappy-'):
+            continue
+        try:
+            document = json.loads((item / 'run-manifest.json')
+                                  .read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        publication = (document.get('publication')
+                       if isinstance(document, dict) else None)
+        if (not isinstance(publication, dict)
+                or publication.get('status') != 'published'):
+            continue
+        if str((publication.get('mesh_state') or {}).get(
+                'fingerprint') or '') != live:
+            continue
+        key = str(document.get('finished_at') or '')
+        if newest is None or key >= newest[0]:
+            newest = (key, str(document.get('run_id') or item.name))
+    if newest is None:
+        return None
+    run_id = newest[1]
+    try:
+        settled = json.loads((case_path / PIPELINE_GATES_RECORD)
+                             .read_text(encoding='utf-8'))
+        if str((settled or {}).get('settled_run_id') or '') == run_id:
+            return None
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        report = QualityReport.from_dict(json.loads(
+            (case_path / 'foammesh' / 'quality' / 'latest.json')
+            .read_text(encoding='utf-8')))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    verdict = verdict_from_report(report)
+    # The run's own rule (run_snappy_pipeline): anything but a pass is the
+    # QA task's warning.
+    warning = verdict.get('verdict') not in ('pass', None)
+    reasons = (('checkMesh verdict: {0}. {1}'.format(
+        verdict.get('verdict'), verdict.get('reason') or '').strip(),)
+        if warning else ())
+    return {'run_id': run_id, 'mesh_fingerprint': live,
+            'warning': warning, 'reasons': reasons}
+
+
+def _settle_pipeline_run(case_path, run_id: str) -> None:
+    """Record that ``run_id``'s check gates have run (worker thread)."""
+    path = Path(case_path) / PIPELINE_GATES_RECORD
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'settled_run_id': str(run_id)},
+                                   indent=2, sort_keys=True),
+                        encoding='utf-8')
+    except OSError:
+        logger.warning('could not note the settled pipeline gates',
+                       exc_info=True)

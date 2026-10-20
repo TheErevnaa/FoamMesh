@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 from PySide6.QtCore import (
-    QModelIndex, QObject, QPersistentModelIndex, QPoint, QRect, QSize, Qt,
-    Signal)
+    QItemSelectionModel, QModelIndex, QObject, QPersistentModelIndex, QPoint,
+    QRect, QSize, Qt, Signal)
 from PySide6.QtGui import (
     QBrush, QFont, QFontMetrics, QFontMetricsF, QPalette, QRegion,
     QStandardItem, QStandardItemModel)
@@ -826,7 +826,7 @@ class NavigationView(QObject):
             (self._ui.geometryStep, '&Geometry'), (button, '&Repair'),
             (self._ui.regionStep, '&Region'), (self._ui.baseGridStep, '&Base grid'),
             (self._ui.castellationStep, '&Castellation'), (self._ui.snapStep, '&Snap'),
-            (self._ui.boundaryLayerStep, '&Boundary layers'),
+            (self._ui.boundaryLayerStep, '&Layers'),
             (self._ui.exportStep, '&Export'))
         for item, text in labels:
             item.setText(self.tr(text))
@@ -1009,9 +1009,30 @@ class NavigationView(QObject):
         if selected:
             restored = self._itemWithBaseLabel(selected)
             if restored is not None:
-                self._tree.setCurrentIndex(restored.index())
+                self._standOn(restored.index())
                 self._boldOnly(restored)
         return tuple(children)
+
+    def _standOn(self, index) -> None:
+        """Make ``index`` the outline's current row, enabled or not.
+
+        DP-1879. `QAbstractItemView.setCurrentIndex` drops a disabled index
+        in silence. When the page on screen is a task whose row the workflow
+        has just locked (its prerequisite was edited while the page was
+        opening), the rebuild above and `setBranchCurrent` both asked for
+        that row, were ignored, and left the highlight on the band header:
+        the Quality page, saying it was locked, under "3. Mesh setup". The
+        highlight names the page that is shown; the row stays disabled, so a
+        click still cannot open it.
+        """
+        if not index.isValid() or index.flags() & Qt.ItemFlag.ItemIsEnabled:
+            self._tree.setCurrentIndex(index)
+            return
+        selection = self._tree.selectionModel()
+        if selection is None:
+            return
+        flags = QItemSelectionModel.SelectionFlag
+        selection.setCurrentIndex(index, flags.ClearAndSelect | flags.Rows)
 
     def branchNode(self, token):
         return getattr(self, '_branchNodes', {}).get(token)
@@ -1080,7 +1101,7 @@ class NavigationView(QObject):
         """Select and mark a token route without changing another shell region."""
         node = self.branchNode(token)
         if node is not None:
-            self._tree.setCurrentIndex(node.index())
+            self._standOn(node.index())
             self._setItemState(node, WorkflowRowState.CURRENT)
             self._boldOnly(node)
             return True
@@ -1088,7 +1109,7 @@ class NavigationView(QObject):
             for row in range(parent.rowCount()):
                 child = parent.child(row)
                 if child.data(TOKEN_ROLE) == token:
-                    self._tree.setCurrentIndex(child.index())
+                    self._standOn(child.index())
                     self._setItemState(child, WorkflowRowState.CURRENT)
                     self._boldOnly(child)
                     return True

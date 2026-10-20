@@ -248,6 +248,8 @@ class WorstLabelLayer:
         #: bar, the legend...), which the tags and the caption keep off.
         self._keep_out = None
         self._outline = None           # the beyond-limit edge actor
+        #: DP-2770. Groups ('worst', 'caption') held off for one capture.
+        self._suppressed: set = set()
 
     # -- state ---------------------------------------------------------- #
 
@@ -275,6 +277,64 @@ class WorstLabelLayer:
         self._enabled = bool(labels)
         self._caption_enabled = bool(caption)
         self._rebuild()
+
+    # -- the snapshot's Include boxes (DP-2770) -------------------------- #
+
+    def group_props(self, group: str) -> list:
+        """The props of one Include group: 'worst' (the value tags, their
+        boxes, leaders and dots) or 'caption' (the statistics caption)."""
+        if group == 'caption':
+            return list(self._caption_actors) + [
+                self._shapes[key].actor for key in ('capfill', 'capframe')
+                if key in self._shapes]
+        if group == 'worst':
+            return [actor for pair in self._labels for actor in pair
+                    if actor is not None] + [
+                self._shapes[key].actor for key in _SHAPE_KEYS
+                if key in self._shapes]
+        return []
+
+    def group_shown(self, group: str) -> bool:
+        """Whether *group* is drawn: the view's Include switch for it
+        (``isLabelGroupShown``), unless a capture holds it off."""
+        if group in self._suppressed:
+            return False
+        shown = getattr(self._view, 'isLabelGroupShown', None)
+        if not callable(shown):
+            return True
+        try:
+            return bool(shown(group))
+        except Exception:                                     # noqa: BLE001
+            return True
+
+    def _apply_groups(self) -> None:
+        for group in ('worst', 'caption'):
+            on = self.group_shown(group)
+            for prop in self.group_props(group):
+                if bool(prop.GetVisibility()) != on:
+                    prop.SetVisibility(on)
+
+    def suppressed(self, groups):
+        """Hold *groups* off for the length of a ``with`` block (a snapshot
+        whose Include boxes are unticked), then put them back."""
+        import contextlib
+
+        groups = {g for g in groups if g in ('worst', 'caption')}
+        if not groups:
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def held():
+            before = set(self._suppressed)
+            self._suppressed |= groups
+            self._apply_groups()
+            try:
+                yield self
+            finally:
+                self._suppressed = before
+                self._apply_groups()
+
+        return held()
 
     def set_size_factor(self, factor: float) -> None:
         self._scale = float(factor)
@@ -597,6 +657,11 @@ class WorstLabelLayer:
 
     def relayout(self) -> None:
         """Place the boxes for the camera as it is now."""
+        from foammesh.rendering import label_pass
+        if label_pass.capturing():
+            # DP-2740: the tiles of a magnified picture move the camera; the
+            # boxes keep the places they had on the screen.
+            return
         renderer = self._renderer()
         if renderer is None:
             return
@@ -650,6 +715,7 @@ class WorstLabelLayer:
             for key in _SHAPE_KEYS:
                 self._shapes[key].done()
         self._layout_caption(renderer, bounds, blocked)
+        self._apply_groups()
 
     def _wrapped(self, renderer, room) -> list:
         """The caption lines, each source line broken at ' · ' so none is

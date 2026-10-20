@@ -575,8 +575,15 @@ class ImportExportService:
             for name in (dict(identity.get('expected') or {}).get('groups')
                          or identity.get('groups') or ())
             if str(name).strip()]
+        # DP-2733. A conversion reads the run's ``.msh``, and the counts it is
+        # held to are the ones that file read back as. ``statistics.mesh`` is
+        # the model in the mesher's memory, which counts nodes no element of
+        # a named group uses (32,240 against the file's 32,238 on the elbow),
+        # so every MED, UNV and CGNS export of it was refused.
+        nodes = identity.get('nodes') or mesh.get('nodes')
+        cells = identity.get('cells') or mesh.get('cells')
         return self._identity_problems(
-            census, nodes=mesh.get('nodes'), cells=mesh.get('cells'),
+            census, nodes=nodes, cells=cells,
             names=expected_names, wrote='the run wrote',
             recorded='the run recorded no group names for its mesh')
 

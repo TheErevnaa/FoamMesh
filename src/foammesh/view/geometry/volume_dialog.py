@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QDialog, QMessageBox
 from PySide6.QtCore import QEvent, QTimer
 
 from foammesh.support.simple_db.simple_schema import ValidationError
+from foammesh.core.facade.errors import FacadeError
 from foammesh.view import inline_error
 from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
@@ -490,6 +491,14 @@ class VolumeDialog(QDialog):
                     self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
                 inline_error.show(self, e.toMessage())
+            except FacadeError as error:
+                # DP-2810. A locked step (TaskLockedError) or any other facade
+                # refusal used to escape to the event loop's error handler:
+                # OK did nothing, the dialog stayed open and nothing said
+                # why. MEASURED live 2026-10-20 on a meshed Gmsh case: "Describe
+                # geometry is locked ..." reached only the log. The dialog
+                # stays open with the entries kept and says the reason.
+                inline_error.show(self, self.tr('Not saved: {0}').format(error))
 
     def _openSurfacePolyData(self):
         """What the preview draws for a plane, a disk or a plate.

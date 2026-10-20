@@ -124,7 +124,7 @@ from foammesh.view.main_window.viewport_rail import ViewportRail
 from foammesh.view.main_window.viewport_tool_edges import ViewportToolEdges
 from foammesh.view.main_window.legend_controller import LegendController
 from foammesh.view.display_control.deviation_panel import (
-    DeviationPanel, deviationScalarBar)
+    DeviationPanel, deviationScalarBar, markDeviationBar)
 from foammesh.core.quality.geometry_fidelity import live_distance
 from .mesh_quality_tab import MeshQualityTab
 from foammesh.core.geometry.diagnostics.repair import (
@@ -304,6 +304,14 @@ class MainWindow(QMainWindow):
         self._installOutlineRail()
         self._displayControl = DisplayControl(self._ui)
         self._renderingTool = RenderingTool(self._ui)
+        # DP-2745. Presentation ops over the local API move this window.
+        setRenderer = getattr(app, 'setPresentationRenderer', None)
+        if callable(setRenderer):
+            from foammesh.view.presentation_bridge import (
+                DesktopPresentationRenderer)
+            setRenderer(DesktopPresentationRenderer(
+                view=self._ui.renderingView, tool=self._renderingTool,
+                display=self._displayControl, ui=self._ui))
         self._constructionTurn()
         self._outputTabs = OutputTabRegistry(self._ui.regionCTabHost)
         # Plan 26 WP3: the mesh viewport is no longer one of these tabs. It is
@@ -1665,6 +1673,7 @@ class MainWindow(QMainWindow):
         tool.orbitRequested.connect(self._recordOrbit)
         tool.sweepRequested.connect(self._recordSectionSweep)
         tool.saveViewRequested.connect(self._saveNamedView)
+        tool.saveNamedViewRequested.connect(self.saveNamedView)
         tool.namedViewRequested.connect(self._recallNamedView)
         tool.deleteViewRequested.connect(self._forgetNamedView)
         self._viewportOverlay.explodeChanged.connect(self._setExplode)
@@ -1847,7 +1856,10 @@ class MainWindow(QMainWindow):
         if plan is None or not plan.is_available() or not plan.hidden:
             hidden = control.hiddenActorCount()
             control.showAll()
+            # DP-2744: one part "was" hidden.
             self.statusBar().showMessage(
+                self.tr('Showing every part again (1 was hidden).')
+                if hidden == 1 else
                 self.tr('Showing every part again ({0} were hidden).').format(
                     hidden) if hidden else
                 self.tr('Every part is already shown.'), 5000)
@@ -1861,6 +1873,8 @@ class MainWindow(QMainWindow):
                                  **{key: True for key in plan.visible}})
         label = self.tr(view_modes.mode(plan.mode).label)
         self.statusBar().showMessage(
+            self.tr('{0}: showing every part again (1 was hidden).').format(
+                label) if hidden == 1 else
             self.tr('{0}: showing every part again ({1} were hidden).').format(
                 label, hidden) if hidden else
             self.tr('{0}: every part is already shown.').format(label), 5000)
@@ -1917,14 +1931,29 @@ class MainWindow(QMainWindow):
             self, self.tr('Save current view'), self.tr('Name this view'))
         if not accepted or not name.strip():
             return
+        self.saveNamedView(name)
+
+    def saveNamedView(self, name: str) -> bool:
+        """DP-2765. Save the view on screen as ``name``: what *Save current
+        view…* does once its dialog is answered."""
+        root = self._captureManager.caseRoot()
+        if root is None:
+            self.statusBar().showMessage(
+                self.tr('Open a case before saving a view.'), 5000)
+            return False
+        if not str(name or '').strip():
+            self.statusBar().showMessage(
+                self.tr('A saved view needs a name.'), 5000)
+            return False
         try:
             save_view(root, name, self._ui.renderingView.cameraState())
         except (OSError, ViewStateError) as error:
             self.statusBar().showMessage(str(error), 8000)
-            return
+            return False
         self.refreshNamedViews()
         self.statusBar().showMessage(
             self.tr('Saved the view "{0}".').format(name.strip()), 5000)
+        return True
 
     def _recallNamedView(self, name: str):
         root = self._captureManager.caseRoot()
@@ -2020,6 +2049,21 @@ class MainWindow(QMainWindow):
         the user then has to work out whether the mesh or the button is
         broken.
         """
+        deviation = getattr(self._renderingTool, 'DEVIATION_MODE', 'deviation')
+        if modeId == deviation:
+            # DP-2746. The box's Deviation entry is the fidelity toggle.
+            if not (getattr(self, '_fidelityPainted', False)
+                    or self.isLiveDeviationPending()):
+                self.toggleGeometryFidelity()
+            self._syncViewModeBox()
+            return bool(getattr(self, '_fidelityPainted', False)
+                        or self.isLiveDeviationPending())
+        if self.isLiveDeviationPending():
+            self._cancelLiveDeviation()
+        if getattr(self, '_fidelityPainted', False):
+            # Modes are exclusive: leaving Deviation takes its colouring off,
+            # so the box and the legend's tab name the same view.
+            self.toggleGeometryFidelity()
         plan = view_modes.plan(modeId, self.viewScene())
         if not plan.is_available():
             self.statusBar().showMessage(self.tr(plan.unavailable), 10000)
@@ -2151,6 +2195,10 @@ class MainWindow(QMainWindow):
             [(key, color, visible) for key, _name, color, visible in parts])
 
     def rebuildOverlayParts(self):
+        if getattr(self, '_overlayRebuildHeld', False):
+            # DP-2717: `_clear` is removing every actor; it rebuilds once.
+            self._overlayRebuildPending = True
+            return
         parts = []
         groups = {}
         roles = {}
@@ -2163,7 +2211,14 @@ class MainWindow(QMainWindow):
                 groups[key] = ' / '.join(groupPath(info))
             # Plan 44 F1 (MF21). The row's small role text.
             roles[key] = part_role(info)
-        self._viewportOverlay.setParts(parts, groups, roles)
+        # DP-2717. `setParts` builds a row of widgets per part (1.1-1.25 s
+        # per call MEASURED on a loaded host), and a load announces the
+        # scene more than once with nothing changed in between.
+        shown = (tuple(parts), tuple(groups.items()),
+                 tuple(roles.items()))
+        if shown != getattr(self, '_overlayPartsShown', None):
+            self._viewportOverlay.setParts(parts, groups, roles)
+            self._overlayPartsShown = shown
         # DP-713. A reload drops the colouring with the actors it was on;
         # the legend and the button have to drop it too.
         if (getattr(self, '_fidelityPainted', False)
@@ -2173,6 +2228,7 @@ class MainWindow(QMainWindow):
                 self._hideDeviationReadout()
                 self._fidelityPainted = False
                 self._renderingTool.setInspectionActive('fidelity', False)
+                self._syncViewModeBox()
         # Plan 39 VI16. Nor does a reload keep the Layers grown colouring.
         if (getattr(self, '_layersGrownLegend', None) is not None
                 and (self._meshManager is None
@@ -2999,6 +3055,15 @@ class MainWindow(QMainWindow):
         door, and a door a user cannot walk back through is a trap -- the
         only way out of the deviation colours used to be reloading the mesh.
         """
+        wasPainted = bool(getattr(self, '_fidelityPainted', False))
+        if getattr(self, '_liveDeviationPending', False):
+            # DP-2741. The same press takes back a measurement in flight.
+            self._cancelLiveDeviation()
+            self.statusBar().showMessage(self.tr(
+                'Deviation measurement cancelled.'), 4000)
+            self._renderingTool.setInspectionActive('fidelity', False)
+            self._syncViewModeBox()
+            return
         try:
             if not self._fidelityPainted and getattr(
                     self, '_layersGrownLegend', None) is not None:
@@ -3072,8 +3137,56 @@ class MainWindow(QMainWindow):
             # VIEW-04. Every exit above either paints, clears or refuses,
             # and the toolbar icon has to end up saying which -- a refusal
             # used to leave it looking exactly like a success.
+            if self._fidelityPainted and not wasPainted:
+                self._enterDeviationView()
             self._renderingTool.setInspectionActive(
                 'fidelity', bool(self._fidelityPainted))
+            self._syncViewModeBox()
+
+    #: DP-2736. The modes that hide the boundary patches the deviation is
+    #: painted on: Quality draws the poor cells of the volume instead and
+    #: Geometry no mesh at all. Any other (Boundary, Volume, Slice, or none
+    #: chosen yet) draws them.
+    _DEVIATION_HIDDEN_IN = (view_modes.QUALITY, view_modes.GEOMETRY)
+
+    def _enterDeviationView(self) -> None:
+        """DP-2736. Show the patches the deviation was painted on.
+
+        Measured on the dev build: Deviation turned on in Quality mode
+        painted the elbow patch while the mode kept it hidden; the model on
+        screen was the volume's poor cells coloured by non-orthogonality
+        (mostly blue), under the deviation legend and the deviation labels.
+        The Poor cells colouring is taken off too: its cells are drawn in
+        front of the patches (DP-737's bias).
+        """
+        getter = getattr(getattr(self, '_displayControl', None),
+                         'meshQualityInfo', None)
+        info = getter() if callable(getter) else None
+        mode = getattr(self, '_viewMode', '') or ''
+        if mode in self._DEVIATION_HIDDEN_IN:
+            # Not painted yet as far as applyViewMode is concerned: it must
+            # not take the colouring straight back off.
+            painted, self._fidelityPainted = self._fidelityPainted, False
+            try:
+                self.applyViewMode(view_modes.BOUNDARY)
+            finally:
+                self._fidelityPainted = painted
+        if info is not None and info.isHighlighting():
+            self._qualityByMode = False
+            info.clearHighlight()
+            self._renderingTool.setInspectionActive('poorCells', False)
+
+    def _syncViewModeBox(self) -> None:
+        """DP-2746. The View mode box names the view on screen: Deviation
+        while the model is graded by deviation, else the mode entered."""
+        tool = getattr(self, '_renderingTool', None)
+        show = getattr(tool, 'showViewMode', None)
+        if show is None:
+            return
+        if getattr(self, '_fidelityPainted', False):
+            show(getattr(tool, 'DEVIATION_MODE', 'deviation'))
+        else:
+            show(getattr(self, '_viewMode', '') or '')
 
     def _paintLiveDeviation(self):
         """DP-713. Colour deviation measured now against the loaded geometry.
@@ -3098,10 +3211,71 @@ class MainWindow(QMainWindow):
             source = self.tr('the open Gmsh model')
         if reference is None:
             return None
+        measure = getattr(manager, 'measureLiveDeviation', None)
+        if callable(measure) and MainWindow._liveDeviationOffThread():
+            # DP-2741: measured in a worker process; painted when it answers.
+            self._liveDeviationPending = True
+            task = asyncio.ensure_future(measure(
+                reference, unit=self._caseLengthUnit(),
+                tolerance=self._deviationTolerance(),
+                identity=self._patchIdentity()))
+            task.add_done_callback(
+                lambda done: self._liveDeviationMeasured(done, source))
+            self.statusBar().showMessage(self.tr(
+                'Measuring the deviation from {0}…').format(source), 60000)
+            return MainWindow.LIVE_DEVIATION_PENDING
         painted = manager.showLiveDeviation(
             reference, unit=self._caseLengthUnit(),
             tolerance=self._deviationTolerance(),
             identity=self._patchIdentity())
+        # Called on stand-ins in the tests: the helper by the class.
+        MainWindow._deviationPainted(self, painted, source)
+        return painted
+
+    #: DP-2741. What `_paintLiveDeviation` answers while the worker measures:
+    #: true (something will be shown) and not ``None`` (there is geometry).
+    LIVE_DEVIATION_PENDING = -1
+
+    @staticmethod
+    def _liveDeviationOffThread() -> bool:
+        """DP-2741. Measure in a worker only with an event loop to paint on."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def isLiveDeviationPending(self) -> bool:
+        return bool(getattr(self, '_liveDeviationPending', False))
+
+    def _cancelLiveDeviation(self) -> None:
+        self._liveDeviationPending = False
+        cancel = getattr(self._meshManager, 'cancelLiveDeviation', None)
+        if callable(cancel):
+            cancel()
+
+    def _liveDeviationMeasured(self, task, source) -> None:
+        """DP-2741. The worker answered: paint, as the press would have."""
+        if not getattr(self, '_liveDeviationPending', False):
+            return
+        self._liveDeviationPending = False
+        try:
+            painted = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:                                   # noqa: BLE001
+            logger.exception('the live deviation measurement failed')
+            painted = 0
+        if painted is None:
+            return
+        self._deviationPainted(painted, source)
+        if self._fidelityPainted:
+            self._enterDeviationView()
+        self._renderingTool.setInspectionActive(
+            'fidelity', bool(self._fidelityPainted))
+        self._syncViewModeBox()
+
+    def _deviationPainted(self, painted, source) -> None:
         self._fidelityPainted = painted > 0
         if painted:
             panel = getattr(self, '_deviationPanel', None)
@@ -3117,7 +3291,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(self.tr(
                 'No patch of this mesh could be measured against {0}.'
             ).format(source), 9000)
-        return painted
 
     def _referenceInMeshUnit(self, reference):
         """Plan 42 SG2. The imported geometry is in metres; a native mesh in
@@ -3190,8 +3363,16 @@ class MainWindow(QMainWindow):
                 signed=bool(getattr(readout, 'signed', True)))
             # Plan 43 LY11. The one Qt legend draws the bar; this actor stays
             # for the picture-taking path and is not shown on screen.
+            # DP-2740. As a bare hidden overlay it was in no picture either:
+            # only the view's picture-only legends are shown for a capture.
             self._deviationLegend.SetVisibility(False)
-            display.addOverlay(self._deviationLegend)
+            # DP-2738/2739: its ends and the tolerance, as on screen.
+            markDeviationBar(self._deviationLegend, readout)
+            display.addLegend('deviation', self._deviationLegend)
+            pictureOnly = getattr(self._ui.renderingView,
+                                  'setLegendOnScreen', None)
+            if pictureOnly is not None:
+                pictureOnly('deviation', False)
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
             panel.setReadout(
@@ -3205,7 +3386,7 @@ class MainWindow(QMainWindow):
         legend = getattr(self, '_deviationLegend', None)
         display = getattr(self, '_displayControl', None)
         if legend is not None and display is not None:
-            display.removeOverlay(legend)
+            display.removeLegend('deviation')
         self._deviationLegend = None
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
@@ -3321,6 +3502,10 @@ class MainWindow(QMainWindow):
         change = getattr(manager, 'setDeviationTolerance', None)
         if change is not None:
             change(float(value))
+        legend = getattr(self, '_deviationLegend', None)
+        readout = getattr(manager, 'deviationReadout', None)
+        if legend is not None and readout is not None:
+            markDeviationBar(legend, readout(), float(value))
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
             panel.refresh()
@@ -3353,6 +3538,7 @@ class MainWindow(QMainWindow):
         legend = getattr(self, '_deviationLegend', None)
         if legend is not None:
             legend.SetLookupTable(readout.lookup_table)
+            markDeviationBar(legend, readout)
         panel = getattr(self, '_deviationPanel', None)
         if panel is not None:
             panel.setReadout(readout, readout.tolerance)
@@ -3874,20 +4060,33 @@ class MainWindow(QMainWindow):
         popover.setSuggestedName(self._captureManager.suggestedName(
             popover.options().format))
         popover.setNote('')
+        # DP-2742. It opens under the camera button that opened it. The
+        # clear-area spot (clear-left + 16, top 56) put it at the far left of
+        # the viewport under the cell-count chip, away from the button, with
+        # its title cut off.
+        button = getattr(self._renderingTool, '_captureButton', None)
+        if button is not None and button.isVisible():
+            popover.showBelow(button, within=self)
+            return popover
         clear = self.clearRectOfView()
         if clear is not None and view.isVisible():
+            # The button is in the overflow menu: the clear area, as before.
             popover.showInClearArea(view, clear)
             return popover
-        button = getattr(self._renderingTool, '_captureButton', None)
-        anchor = button if button is not None and button.isVisible() else view
-        popover.showBelow(anchor)
+        popover.showBelow(view, within=self)
         return popover
 
     def _snapshotSave(self):
         popover = self._snapshotPopover
         options = popover.options()
         self.snapshotFlash().clear()
-        path = self._captureManager.snapshot(options)
+        from foammesh.rendering import label_pass
+
+        # DP-2741: the PNG is encoded and written on a worker thread; the
+        # GUI held 0.22 s of a 0.71 s Save writing a 2x picture.
+        with label_pass.deferred_writes() as pending:
+            path = self._captureManager.snapshot(options)
+        writer = pending.start()
         message = self._captureManager.snapshotMessage
         if path is None:
             popover.setNote(message)
@@ -3897,8 +4096,22 @@ class MainWindow(QMainWindow):
         self._flashViewport()
         self.statusBar().showMessage(message, 10000)
         if options.directory is None:
-            self.showCaptures()
+            self._showCapturesAfter(writer)
         return path
+
+    def _showCapturesAfter(self, writer):
+        """The Captures page once *writer* has put the file down (its
+        thumbnail reads it), on a later turn of the event loop."""
+        if writer is None:
+            self.showCaptures()
+            return
+
+        def check():
+            if writer.is_alive():
+                QTimer.singleShot(30, check)
+            else:
+                self.showCaptures()
+        QTimer.singleShot(0, check)
 
     def _snapshotCopy(self):
         from .view_capture import COPY_SCALE, copyView
@@ -4189,6 +4402,10 @@ class MainWindow(QMainWindow):
         # A finished export window nobody dismissed stayed on screen after
         # this window had closed (the guided walks, 2026-10-11).
         closeProgressWindowsOf(self)
+        # DP-2745. Nothing draws presentation ops once the window is gone.
+        setRenderer = getattr(app, 'setPresentationRenderer', None)
+        if callable(setRenderer):
+            setRenderer(None)
 
         super().closeEvent(event)
 
@@ -6826,7 +7043,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            if app.createInPlaceCase(path):
+            # DP-2714: the case's files are written off the GUI thread.
+            if await app.createInPlaceCaseAsync(path):
                 self._recentFilesMenu.addRecentest(app.project.path)
                 self._projectOpened()
         except (FileExistsError, OSError, ValueError) as error:
@@ -6929,7 +7147,11 @@ class MainWindow(QMainWindow):
         self._updateMenuStates()
 
     @qasync.asyncSlot()
-    async def _closeProject(self, toQuit=False):
+    async def _closeProject(self, toQuit=False, saveChanges=None):
+        # DP-2764. ``saveChanges`` answers the close's questions as their
+        # buttons would -- True is *Save changed*'s Ok, False its Discard
+        # (and the untitled-case question's Discard) -- for a signed client
+        # closing over the local API; None asks the person, as a click does.
         # A queued close signal can outlive the native QMainWindow when a
         # second, already-authorized close arrives before this coroutine is
         # scheduled. Never dereference a deleted Qt wrapper.
@@ -6971,11 +7193,16 @@ class MainWindow(QMainWindow):
         # to save it is the fourth dialog of a four-dialog save, and its only
         # honest answer is the one already given.
         if app.project.isDirty and not self._relocatingScratch:
-            confirm = await AsyncMessageBox().question(self, self.tr('Save changed'),
-                                                       self.tr('Do you want to save your changes?'),
-                                                       QMessageBox.StandardButton.Ok
-                                                       | QMessageBox.StandardButton.Cancel
-                                                       | QMessageBox.StandardButton.Discard)
+            if saveChanges is None:
+                confirm = await AsyncMessageBox().question(
+                    self, self.tr('Save changed'),
+                    self.tr('Do you want to save your changes?'),
+                    QMessageBox.StandardButton.Ok
+                    | QMessageBox.StandardButton.Cancel
+                    | QMessageBox.StandardButton.Discard)
+            else:
+                confirm = (QMessageBox.StandardButton.Ok if saveChanges
+                           else QMessageBox.StandardButton.Discard)
 
             if confirm == QMessageBox.StandardButton.Ok:
                 try:
@@ -6993,7 +7220,8 @@ class MainWindow(QMainWindow):
         # be told, and it must name the folder rather than say "unsaved".
         if app.isScratchCase() and not self._relocatingScratch:
             scratch = Path(app.project.path)
-            confirm = await AsyncMessageBox().question(
+            confirm = QMessageBox.StandardButton.Discard if saveChanges is False else \
+                await AsyncMessageBox().question(
                 self, self.tr('Keep this untitled case?'),
                 self.tr('This case has never been saved anywhere permanent. '
                         'It is in a temporary folder that is cleaned up '
@@ -7011,7 +7239,7 @@ class MainWindow(QMainWindow):
                     return False
                 # Relocation opened the saved case, so the scratch one this
                 # call was asked to close no longer exists. Close that.
-                return await self._closeProject(toQuit)
+                return await self._closeProject(toQuit, saveChanges)
 
         app.closeProject()
         self._projectClosed()
@@ -7247,20 +7475,34 @@ class MainWindow(QMainWindow):
         # GUI thread and against the viewport's own context, rather than
         # left for the cyclic collector to destroy on whatever thread trips
         # it once the managers below are dropped.
-        for manager in (getattr(self, '_geometryManager', None),
-                        getattr(self, '_meshManager', None)):
-            dispose = getattr(manager, 'dispose', None)
-            if callable(dispose):
-                dispose()
-        # Plan 45 P11. The feature lines belong to the closing mesh.
-        MainWindow._dropFeatureActors(self)
-        # The actors go first: the toolbar readout is derived from what the
-        # view is holding, so clearing it before the view leaves the closing
-        # case's model extent on screen (R49).
-        self._displayControl.clear()
+        # DP-2717. MEASURED on the two-engine walk: 1.85 s on the GUI thread
+        # here, because every actor the disposal removed announced
+        # `partsChanged` and each announcement rebuilt the whole overlay
+        # part list from the parts still left -- quadratic in the parts. The
+        # rebuilds are held while the case's actors go and made once after.
+        self._overlayRebuildHeld = True
+        self._overlayRebuildPending = False
+        try:
+            for manager in (getattr(self, '_geometryManager', None),
+                            getattr(self, '_meshManager', None)):
+                dispose = getattr(manager, 'dispose', None)
+                if callable(dispose):
+                    dispose()
+            # Plan 45 P11. The feature lines belong to the closing mesh.
+            MainWindow._dropFeatureActors(self)
+            # The actors go first: the toolbar readout is derived from what
+            # the view is holding, so clearing it before the view leaves the
+            # closing case's model extent on screen (R49).
+            self._displayControl.clear()
+        finally:
+            self._overlayRebuildHeld = False
+        if self._overlayRebuildPending:
+            self._overlayRebuildPending = False
+            self.rebuildOverlayParts()
         self._renderingTool.clear()
         self._consoleView.clear()
         self._viewportOverlay.setParts([])
+        self._overlayPartsShown = None
         # The run line named a mesh from the case that is closing.
         self._historicalResult = None
         self._viewportOverlay.setResult('')

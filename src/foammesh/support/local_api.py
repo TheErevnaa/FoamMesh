@@ -94,8 +94,10 @@ class LocalApi:
     """Starts and stops the loopback host over the window's facade."""
 
     def __init__(self, facade, *, discovery_path: Path,
-                 allowed_roots: Sequence[Path] = ()):
+                 allowed_roots: Sequence[Path] = (), client_trust=None):
         self._facade = facade
+        #: Who may drive the API; None means the Erevnaa key a stock build trusts.
+        self._client_trust = client_trust
         self.discovery_path = Path(discovery_path)
         self.allowed_roots = tuple(Path(root) for root in allowed_roots)
         self._host = None
@@ -127,9 +129,12 @@ class LocalApi:
         if self._host is not None:
             return True
         from foammesh.core.facade.desktop_host import DesktopHost
+        from foammesh.support.client_trust import ClientTrust
+        # The discovery token only buys the signed handshake (client_trust).
         host = DesktopHost(self._facade, enabled=True,
                            allowed_case_roots=self.allowed_roots,
-                           discovery_path=self.discovery_path)
+                           discovery_path=self.discovery_path,
+                           client_trust=self._client_trust or ClientTrust.erevnaa())
         try:
             await host.start()
         except Exception as error:                          # noqa: BLE001

@@ -1815,7 +1815,9 @@ schema = {
         # See MESHER_ELEMENT_ORDERS / EXPORTER_ELEMENT_ORDERS in
         # core/gmsh/plan_derivation.py.
         'output': {
-            'elementOrder': IntType().setRange(1, 2).setDefault(1),
+            # DP-2699: 1-3, the orders Set order reaches on the Generate page
+            # (MESHER_ELEMENT_ORDERS).
+            'elementOrder': IntType().setRange(1, 3).setDefault(1),
             # Serendipity elements: eight nodes on a hex face rather than
             # nine. Read only when the order is 2.
             'secondOrderIncomplete': BoolType(False),

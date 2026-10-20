@@ -77,6 +77,10 @@ hiddenimports = [
     'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto',
     'uvicorn.protocols.websockets.websockets_impl', 'uvicorn.lifespan',
     'uvicorn.lifespan.on', 'uvicorn.lifespan.off',
+    # The signed handshake: only clients holding a trusted key drive the API.
+    'foammesh.support.client_trust',
+    'cryptography.hazmat.primitives.asymmetric.ed25519',
+    'cryptography.hazmat.bindings._rust',
 ]
 
 

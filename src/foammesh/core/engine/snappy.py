@@ -220,7 +220,9 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
                          'common.export'),
             description='Geometry fidelity of the snapped boundary.'),
         WorkflowTask(
-            'snappy.layers', 'Boundary layers', 60,
+            # DP-1311 (user, 2026-10-20, option A): one step name on both
+            # engines; Gmsh's is `Layers` (GN18). The task id is unchanged.
+            'snappy.layers', 'Layers', 60,
             cardinality=TaskCardinality.OPTIONAL,
             depends_on=('snappy.fidelity_snap',), engine_stage='layers',
             capabilities=(CapabilityRequirement('snappyHexMesh'),),

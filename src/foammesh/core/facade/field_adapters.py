@@ -39,6 +39,31 @@ def read_value(configuration: dict, storage_path: str):
     return node
 
 
+def typed_value(descriptor: FieldDescriptor, value):
+    """*value* as the type the descriptor publishes, for a reader outside.
+
+    DP-2735. SimpleDB keeps every scalar as a string, and GET .../fields/{id}
+    handed that string on: a number field set to 33.0 read back as '33.0'
+    beside a ``default`` of 30, so an API client comparing what it set with
+    what it read saw a change that had not happened. A stored string that is
+    not a valid value of the type is handed on as it is.
+    """
+    if not isinstance(value, str):
+        return value
+    kind = descriptor.value_type
+    try:
+        if kind is FieldType.NUMBER:
+            number = float(value)
+            return int(number) if number.is_integer() and '.' not in value                 and 'e' not in value.lower() else number
+        if kind is FieldType.INTEGER:
+            return int(float(value)) if float(value).is_integer() else value
+    except ValueError:
+        return value
+    if kind is FieldType.BOOLEAN and value.lower() in ('true', 'false'):
+        return value.lower() == 'true'
+    return value
+
+
 def values_equal(current, new) -> bool:
     """SimpleDB stores every scalar as a trimmed string; compare accordingly."""
     if isinstance(new, bool) or isinstance(current, bool):

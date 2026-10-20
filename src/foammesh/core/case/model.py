@@ -608,6 +608,81 @@ def record_generated_mesh(case_path: str | Path, *,
     return updated
 
 
+def adopt_unrecorded_workflow_mesh(case_path: str | Path
+                                   ) -> CaseMetadata | None:
+    """Adopt a mesh one of our own runs published but never recorded (DP-2811).
+
+    Before DP-2748, Run to end (``run_snappy_pipeline``) wrote and published
+    ``constant/polyMesh`` without :func:`record_generated_mesh`, so the
+    sidecar kept ``workflow=none`` and every later open showed the case as
+    External mesh with Geometry through Export suspended. The run left proof
+    of what it did: its run manifest under ``foammesh/runs`` says
+    ``published`` and names the mesh-state fingerprint it published, and
+    ``foammesh/mesh-state.json`` still names that fingerprint.
+
+    The mesh is adopted only when all of that holds *and* none of the five
+    polyMesh files was written after the run closed its manifest -- a mesh
+    imported or edited since is somebody's mesh, not the run's. A sidecar
+    that says ``mesh_external`` (the user's stance) or already says
+    ``authored`` is left alone. Stats only: the mesh is not hashed, so this
+    is cheap enough for the open path.
+
+    Returns the metadata written, or ``None`` when there is nothing to adopt.
+    """
+    case_path = Path(case_path)
+    sidecar = case_path / SIDECAR_DIRECTORY
+    if not (sidecar / CASE_METADATA_FILE).is_file():
+        return None
+    try:
+        metadata = load_case_metadata(case_path)
+    except (OSError, ValueError):
+        return None
+    if metadata.workflow is not WorkflowMode.NONE:
+        return None
+    try:
+        state = json.loads((sidecar / 'mesh-state.json').read_text(
+            encoding='utf-8'))
+        live = str(((state or {}).get('mesh') or {}).get('fingerprint') or '')
+        runs = sorted((sidecar / 'runs').iterdir())
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not live:
+        return None
+    poly_mesh = _poly_mesh_path(case_path)
+    try:
+        written = max(path.stat().st_mtime for name in _FINGERPRINT_POLY_MESH_FILES
+                      for path in (_mesh_file(poly_mesh, name),)
+                      if path is not None)
+    except (OSError, ValueError):
+        return None
+    adopted = None
+    for run in runs:
+        manifest = run / 'run-manifest.json'
+        try:
+            document = json.loads(manifest.read_text(encoding='utf-8'))
+            closed = manifest.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        publication = (document.get('publication')
+                       if isinstance(document, dict) else None)
+        if (not isinstance(publication, dict)
+                or publication.get('status') != 'published'
+                or str((publication.get('mesh_state') or {}).get(
+                    'fingerprint') or '') != live):
+            continue
+        # One second of slack for file systems that store coarse times.
+        if written > closed + 1.0:
+            continue
+        engine_id = str(document.get('engine_id') or run.name.split('-')[0])
+        adopted = engine_id
+    if adopted is None:
+        return None
+    # Only the snappy pipeline opens a snappy run manifest.
+    route = 'pipeline' if adopted == 'snappy' else 'run'
+    return record_generated_mesh(case_path, provenance={
+        'generated_by': f'{adopted}:{route}', 'adopted_by': 'DP-2811'})
+
+
 def workflow_after_mesh_mutation(
         metadata: CaseMetadata | None) -> tuple[WorkflowMode, bool]:
     """The workflow an in-place mesh mutation records, and its suspension flag.

@@ -116,6 +116,112 @@ def is_wrapped(argv) -> bool:
     return any(RUN_ID_VARIABLE in str(item) for item in argv)
 
 
+def _bounded_queue(size: int):
+    import queue
+    return queue.Queue(maxsize=size)
+
+
+class _LogSink:
+    """A job's log file, written by a thread of its own (DP-2717).
+
+    MEASURED on the two-engine walk (2026-10-20, a loaded host): the GUI
+    thread was held 7.25 s inside ``read_lines`` on ``log_file.write`` and
+    21.1 s on the ``os.fsync`` after a checkMesh, because the job's output
+    loop runs on the window's event loop and every write went to disk from
+    there. Lines are queued here and a writer thread puts them on disk;
+    :meth:`sync` waits for that thread (off the loop) to have flushed and
+    fsynced everything queued so far, which is what the old fsync promised.
+
+    Bounded (Plan 35 CR4): lines are handed over in batches of
+    :attr:`BATCH_CHARS`, at most :attr:`QUEUED_BATCHES` of them in flight. A
+    flood the disk cannot keep up with waits for the writer, as the direct
+    write did, instead of piling up in memory.
+    """
+
+    _SYNC = object()
+    BATCH_CHARS = 256 * 1024
+    QUEUED_BATCHES = 16
+
+    def __init__(self, handle):
+        import threading
+
+        self._handle = handle
+        # A factory call, not a constructor: the AF0 widget scan reads
+        # `self._x = Capitalised(...)` as a widget.
+        self._queue = _bounded_queue(self.QUEUED_BATCHES)
+        self._pending = []
+        self._pending_chars = 0
+        self.error = None
+        self._thread = threading.Thread(
+            target=self._drain, name='foammesh-job-log', daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def open(cls, path: Path) -> '_LogSink':
+        # Opened here, not on a worker: the process is already running, and
+        # an await at this point let a flood pile up unread in the stream
+        # buffer (Plan 35 CR4 measured a 106 MB peak). The open was never
+        # one of the measured holds.
+        return cls(Path(path).open('w', encoding='utf-8', newline='\n'))
+
+    def write(self, text: str) -> None:
+        self._pending.append(text)
+        self._pending_chars += len(text)
+        if self._pending_chars >= self.BATCH_CHARS:
+            self._hand_over()
+
+    def _hand_over(self) -> None:
+        if self._pending:
+            batch = ''.join(self._pending)
+            self._pending = []
+            self._pending_chars = 0
+            self._queue.put(batch)
+
+    async def sync(self) -> None:
+        import threading
+
+        self._hand_over()
+        done = threading.Event()
+        await asyncio.to_thread(self._queue.put, (self._SYNC, done))
+        await asyncio.to_thread(done.wait)
+
+    def close(self) -> None:
+        """Close once everything queued is written.
+
+        After :meth:`sync` only the close itself is left, so the short wait
+        is what keeps a caller that removes the log right after the run from
+        meeting a handle still open on Windows; it is bounded either way.
+        """
+        self._hand_over()
+        self._queue.put(None)
+        self._thread.join(0.25)
+
+    def _drain(self) -> None:
+        handle = self._handle
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                if isinstance(item, tuple) and item and item[0] is self._SYNC:
+                    try:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    except (OSError, ValueError) as error:
+                        self.error = error
+                    item[1].set()
+                    continue
+                try:
+                    handle.write(item)
+                except (OSError, ValueError) as error:
+                    self.error = error
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
 class _LineReader:
     """``readline`` with a hard per-line cap that truncates instead of raising."""
 
@@ -399,6 +505,20 @@ class JobManager:
         if result.cwd:
             self._persist_result(Path(result.cwd), result, revision=True)
 
+    async def record_result_async(self, result: JobResult) -> None:
+        """:meth:`record_result`, with the fsynced line written by a worker.
+
+        DP-2717: the operation executor refines every job's result from the
+        window's event loop, and the ``jobs.jsonl`` append it made there is
+        an fsync on the case's disk.
+        """
+        if result.job_id not in self._results:
+            raise KeyError(f'job result is not managed here: {result.job_id}')
+        self._retain(result)
+        if result.cwd:
+            await asyncio.to_thread(
+                self._persist_result, Path(result.cwd), result, revision=True)
+
     def session_event(self, event: str, **payload) -> None:
         """Publish a resident-session event (Plan 41 GN1) on the event bus."""
         self._publish(event, **payload)
@@ -625,7 +745,7 @@ class JobManager:
                         'run_state': run_state}
                        if (wrapped or records is not None) else {}))
                 self._retain(result)
-                self._persist_result(request.cwd, result)
+                await asyncio.to_thread(self._persist_result, request.cwd, result)
                 self._publish(Event.JOB_FAILED, job_id=job_id, result=result.to_dict())
                 return result
 
@@ -656,7 +776,7 @@ class JobManager:
         output_truncated = False
         transport = _Transport(asyncio.get_running_loop(), request.argv, request.idle_timeout)
         self._transports[job_id] = transport
-        log_file = request.log_path.open('w', encoding='utf-8', newline='\n') if request.log_path else None
+        log_file = _LogSink.open(request.log_path) if request.log_path else None
         watchdog = None
         transport_watch = None
         if monitor is not None:
@@ -768,8 +888,7 @@ class JobManager:
                 await self._kill_tree(process)
                 await self._run_cleanup(request)
             if log_file:
-                log_file.flush()
-                os.fsync(log_file.fileno())
+                await log_file.sync()
             wait_timed_out = False
             try:
                 returncode = await asyncio.wait_for(process.wait(), WAIT_TIMEOUT_SECONDS)
@@ -880,7 +999,8 @@ class JobManager:
                 run_id=job_id if identified else None,
                 run_state=run_state, linux_rc=transport.exit_rc)
             self._retain(result)
-            self._persist_result(request.cwd, result)
+            # DP-2717: the durable line is fsynced, so off the event loop.
+            await asyncio.to_thread(self._persist_result, request.cwd, result)
             event = {
                 JobStatus.DONE: Event.JOB_FINISHED,
                 JobStatus.CANCELLED: Event.JOB_CANCELLED,

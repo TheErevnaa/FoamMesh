@@ -446,6 +446,14 @@ def main():
             # anything the start may ask of the user.
             close_splash()
         await asyncio.sleep(0)
+        # DP-2817: the modules pages import on first use are imported now, on
+        # a worker, so a cold .pyc read never holds the GUI thread (measured
+        # 11.15 s and 3.7 s holds in importlib's get_data).
+        try:
+            from foammesh.support import import_warmup
+            import_warmup.start()
+        except Exception:                                   # noqa: BLE001
+            logger.debug('the import warm-up did not start', exc_info=True)
         # Plan 46: off unless --api-attach or Preferences > Connections.
         # A failure here is logged; it never stops the window.
         try:

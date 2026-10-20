@@ -168,7 +168,12 @@ AUTO_FORMAT_CODE = 10
 #: types 11/12/13/14/17/18/19, so a second-order MSH is a mesh this application
 #: counts, summarises and keeps; exporting it is a separate question from
 #: meshing it.
-MESHER_ELEMENT_ORDERS: tuple[int, ...] = (1, 2)
+#: DP-2699. Order 3 is here because the Generate page's Set order reaches 3
+#: (``generate_actions._set_order`` bounds it 1-3) and the census reads the
+#: cubic MSH codes (``MSH_HIGHER_ORDER_VOLUME_TYPES``: 29, 92, ...). With the
+#: table at (1, 2) the stored batch field could not hold the order the page
+#: had just meshed at, so a saved project lost it.
+MESHER_ELEMENT_ORDERS: tuple[int, ...] = (1, 2, 3)
 
 #: What each *export adapter* can represent. A target token absent from this
 #: table names no exporter, so the mesher's own capability applies and the run
@@ -195,6 +200,19 @@ ELEMENT_ORDER_REFUSALS: dict[tuple[str, int], str] = {
         'carry code 24, is one this application would write and then be unable '
         'either to open or to count. So no SU2 file was written: the mesh was '
         'made at order 2 as asked and the native MSH is kept and counted.'),
+    # DP-2699. Order 3 is a mesher order now, so each export says why it
+    # declines it too (``export_refusals`` indexes this table by the order).
+    ('openfoam', 3): (
+        'OpenFOAM 13 reads first-order MSH 2.2 and nothing else — gmshToFoam '
+        'and the direct polyMesh publisher both do — so no polyMesh was '
+        'published from this cubic mesh. The mesh was made at order 3 as '
+        'asked and the native MSH is kept and counted.'),
+    ('su2', 3): (
+        "FoamMesh's own SU2 reader and census hold the linear VTK type codes "
+        'only — 10, 12, 13 and 14 — so a cubic SU2 file is one this '
+        'application would write and then be unable either to open or to '
+        'count. So no SU2 file was written: the mesh was made at order 3 as '
+        'asked and the native MSH is kept and counted.'),
 }
 #: The order every route accepts, and therefore what an unknown target clamps
 #: to.
@@ -1442,8 +1460,8 @@ def derive_export(values: dict, target_solver: str = 'unselected',
             f'element order {values.get("elementOrder")!r} is not a number')
     if order not in MESHER_ELEMENT_ORDERS:
         raise PlanDerivationError(
-            f'element order {order} is outside 1-2; Gmsh writes linear or '
-            'quadratic elements only')
+            f'element order {order} is outside 1-3; Gmsh writes linear, '
+            'quadratic or cubic elements here')
     incomplete = bool(values.get('secondOrderIncomplete', False))
     straight_midsides = bool(values.get('secondOrderLinear', False))
     renumber = bool(values.get('renumber', False))

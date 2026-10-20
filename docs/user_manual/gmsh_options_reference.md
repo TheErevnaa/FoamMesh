@@ -7,7 +7,7 @@ Generated from the option catalogue by `scripts/generate_gmsh_help_docs.py`; do 
 | Geometry | 67 |
 | Global sizing | 39 |
 | Structure and volume controls | 18 |
-| Boundary layers | 2 |
+| Layers | 2 |
 | Periodic | 3 |
 | Generate mesh | 50 |
 | Mesh quality | 9 |
@@ -160,9 +160,9 @@ Advanced section of the Structure row.
 | `Mesh.SubdivisionAlgorithm` | 0.0 |  | (0, 'none'), (1, 'all quadrangles'), (2, 'all hexahedra'), (3, 'barycentric') | Mesh subdivision algorithm (0: none, 1: all quadrangles, 2: all hexahedra, 3: barycentric) |
 | `Mesh.TransfiniteTri` | off |  |  | Use alternative transfinite arrangement when meshing 3-sided surfaces |
 
-## Boundary layers
+## Layers
 
-Advanced section of the Boundary layers row.
+Advanced section of the Layers row.
 
 | Option | Default | Unit | Choices | Help |
 |---|---|---|---|---|

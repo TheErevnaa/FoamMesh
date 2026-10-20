@@ -1321,7 +1321,7 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # stales that stage anyway.
     'meshing.layers.defaulted': {
         'title': 'Default layer group made',
-        'documentation': 'Set once the Boundary layers step has given the '
+        'documentation': 'Set once the Layers step has given the '
                          'case its default wall group, or a group has been '
                          'removed, so a group the user deletes is not made '
                          'again. The mesher never reads it.',
@@ -2366,7 +2366,8 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # element order's own clause and asks for order 2 on top of it.
     'gmsh.compute.high_order_optimize': {
         'applies_when': ('mesh.engine == gmsh',
-                         'gmsh.compute.element_order == 2'),
+                         # DP-2699: order 3 curves elements too.
+                         'gmsh.compute.element_order != 1'),
     },
     # DP-625 (field audit 0924 gmsh-generate-export D6). Which recombiner,
     # and whether to split the quads again, mean something only when the

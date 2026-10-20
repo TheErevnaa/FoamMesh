@@ -190,9 +190,15 @@ class RenderingTool(QObject):
     orbitRequested = Signal()
     sweepRequested = Signal()
     saveViewRequested = Signal()
+    #: DP-2765. Save the view on screen under this name, with no dialog.
+    saveNamedViewRequested = Signal(str)
     namedViewRequested = Signal(str)
     deleteViewRequested = Signal(str)
     viewModeRequested = Signal(str)
+    #: The View mode box's id for the deviation colouring (DP-2746). Not a
+    #: `view_modes` mode: it is a colouring of the boundary, entered and left
+    #: through the window's fidelity toggle.
+    DEVIATION_MODE = 'deviation'
     layerCoverageRequested = Signal()
     #: Plan 39 VI16 (I6). *Colour mesh by* changed; the key is one of
     #: `rendering.layers_grown.CHOICES`.
@@ -722,6 +728,14 @@ class RenderingTool(QObject):
             combo.addItem(self.tr(mode.label), mode.id)
             combo.setItemData(combo.count() - 1, self.tr(mode.question),
                               Qt.ItemDataRole.ToolTipRole)
+        # DP-2746. The deviation colouring is a view of its own: the legend
+        # names it (its Deviation tab), so the box does too. It read Quality
+        # while the model was graded by deviation.
+        combo.addItem(self.tr('Deviation'), self.DEVIATION_MODE)
+        combo.setItemData(
+            combo.count() - 1,
+            self.tr('How far is the mesh from the geometry?'),
+            Qt.ItemDataRole.ToolTipRole)
         combo.setToolTip(
             self.tr('What the viewport shows. Modes are exclusive: the one '
                     'named here is the one you are looking at.'))
@@ -1364,6 +1378,40 @@ class RenderingTool(QObject):
             forget.addAction(
                 name, lambda _c=False, value=name:
                 self.deleteViewRequested.emit(value))
+
+    # -- DP-2765: the Saved views menu, without the menu ------------------- #
+
+    def namedViews(self) -> list:
+        """The names the Saved views menu offers, in its order."""
+        menu = getattr(self, '_namedViewMenu', None)
+        if menu is None or not menu.isEnabled():
+            return []
+        names = []
+        for action in menu.actions():
+            if action.isSeparator() or action.menu() is not None:
+                continue
+            names.append(action.text())
+        return names
+
+    def saveNamedView(self, name: str) -> None:
+        """*Save current view…* with ``name`` already typed: no dialog."""
+        self.saveNamedViewRequested.emit(str(name))
+
+    def applyNamedView(self, name: str) -> bool:
+        """Choose ``name`` in Saved views; False when the menu has no such
+        entry."""
+        if name not in self.namedViews():
+            return False
+        self.namedViewRequested.emit(name)
+        return True
+
+    def deleteNamedView(self, name: str) -> bool:
+        """Choose ``name`` in Saved views > Forget; False when there is no
+        such entry."""
+        if name not in self.namedViews():
+            return False
+        self.deleteViewRequested.emit(name)
+        return True
 
     def setSequencesEnabled(self, enabled: bool, reason: str = ''):
         # DP-700 (viewport audit 0925 F16). A late overlay rebuild during

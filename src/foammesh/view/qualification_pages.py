@@ -886,7 +886,7 @@ class QualificationSummaryPage(QualificationTaskPage):
                 'table': table}
 
     def _buildLayerBox(self) -> QGroupBox:
-        box = QGroupBox(self.tr('Boundary layers'), self)
+        box = QGroupBox(self.tr('Layers'), self)
         inner = QVBoxLayout(box)
         self._layerNote = QLabel(self)
         self._layerNote.setObjectName('qualificationLayerNote')
@@ -1021,7 +1021,7 @@ class QualificationSummaryPage(QualificationTaskPage):
                 'wrote no layer coverage.'))
             # W-O1. Off the form. There is no measurement to annotate, so
             # this is the state of the case; it goes on the box, which still
-            # names itself Boundary layers, and the empty grid beside it.
+            # names itself Layers (DP-2812), and the empty grid beside it.
             note.setVisible(False)
             box = getattr(self, '_layerBox', None)
             if box is not None:

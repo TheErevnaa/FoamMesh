@@ -612,7 +612,47 @@ class FoamMeshFacade:
         self._publish_prepared_catalogue(session)
         self._recover_interrupted_unlock(session)
         self._recover_interrupted_redistribute(session)
+        self._resume_pipeline_gates(session)
         return session
+
+    def _resume_pipeline_gates(self, session: CaseSession) -> None:
+        """DP-2815. Run the check gates a closed or killed Run to end left.
+
+        Only the snappy pipeline writes a run manifest, so a case without a
+        runs folder has nothing to resume and costs one ``is_dir``. The rest
+        is the domain's, on the owner loop; with no loop running (a plain
+        script attaching a case) nothing is started.
+        """
+        if getattr(session, 'read_only', False):
+            return
+        try:
+            if not (Path(session.case_path) / 'foammesh' / 'runs').is_dir():
+                return
+        except (OSError, TypeError):
+            return
+        # DP-2811: the same proof adopts a mesh Run to end published before
+        # DP-2748 and left at `workflow=none`, for every way a case opens.
+        try:
+            from foammesh.core.case import adopt_unrecorded_workflow_mesh
+            adopt_unrecorded_workflow_mesh(session.case_path)
+        except Exception:  # noqa: BLE001 - an unadopted mesh still opens
+            logger.warning('could not adopt the mesh of %s', session.case_path,
+                           exc_info=True)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        resume = getattr(self.domain, 'resume_pipeline_gates', None)
+        if resume is None:
+            return
+
+        async def run():
+            try:
+                await resume(session)
+            except Exception:  # noqa: BLE001 - a background task has nobody to raise to
+                logger.exception('could not resume the pipeline gates of %s',
+                                 session.case_path)
+        loop.create_task(run(), name='foammesh-pipeline-gates')
 
     def _recover_interrupted_redistribute(self, session: CaseSession) -> dict | None:
         """Plan 37 UF17. Settle a core-count change a crash interrupted.
@@ -877,10 +917,10 @@ class FoamMeshFacade:
 
     def field(self, case_id: str, field_id: str) -> dict:
         """A field descriptor plus the case's current value (GET .../fields/{id})."""
-        from .field_adapters import read_value
+        from .field_adapters import read_value, typed_value
         descriptor = self.fields.get(field_id)
         value = read_value(self.case(case_id).configuration(), descriptor.storage_path)
-        return {**descriptor.to_dict(), 'value': value}
+        return {**descriptor.to_dict(), 'value': typed_value(descriptor, value)}
 
     async def history(self, case_id: str, *, limit: int = 200) -> dict:
         command = Command('history.query', case_id, {'limit': limit},
@@ -905,7 +945,17 @@ class FoamMeshFacade:
         if command.scope == 'application' or command.operation.startswith('application.'):
             return self._execute_application(command)
         if command.scope == 'presentation' or command.operation.startswith('presentation.'):
-            return self._execute_presentation(command)
+            result = self._execute_presentation(command)
+            # DP-2741. The window may still be writing what the op made (a
+            # snapshot's PNG, off the GUI thread); answer once it is down.
+            renderer = getattr(self.case(command.case_id),
+                               'presentation_renderer', None)
+            settle = getattr(renderer, 'settle', None)
+            if callable(settle):
+                waiting = settle()
+                if inspect.isawaitable(waiting):
+                    await waiting
+            return result
         session = self.case(command.case_id)
         # §4.4/§6.5: every agent mutation must carry authorization from a
         # confirmed plan. Reads are unrestricted; any state-changing operation
@@ -1687,15 +1737,44 @@ class FoamMeshFacade:
         They advance ``presentation_sequence`` and emit memory-only events, so
         they never stale an engineering plan. With no rendering surface
         attached, they return ``presentation_unavailable``.
+
+        DP-2745. The parameters are checked first, so bad input is
+        ``validation_failed`` whether or not a window is attached. The op is
+        applied to a copy of the state and handed to the window's renderer;
+        the state takes it only once the window has, so it never says the
+        view shows what the window refused.
         """
+        import copy
         from .errors import PresentationUnavailableError
         session = self.case(command.case_id)
         if session.presentation is None:
+            self.presentation_ops.apply(
+                PresentationState(), command.operation, command.parameters)
             raise PresentationUnavailableError('no desktop rendering session is attached')
         session.set_event_context(command)
         try:
+            state = copy.deepcopy(session.presentation)
+            renderer = session.presentation_renderer
+            # A toggle sent without a value flips what the window shows, which
+            # a click on the toolbar may have changed since the last op.
+            refresh = getattr(renderer, 'refresh', None)
+            if callable(refresh):
+                refresh(state)
             changed = self.presentation_ops.apply(
-                session.presentation, command.operation, command.parameters)
+                state, command.operation, command.parameters)
+            if renderer is not None:
+                # DP-2750. The window may answer with what it did -- the
+                # file a snapshot wrote, the mode it entered, the line it
+                # put on the status bar -- and the state then reads back
+                # what the window shows, so the result never claims an
+                # overlay the window has not painted.
+                answer = renderer(command.operation, changed,
+                                  command.parameters or {})
+                if isinstance(answer, dict):
+                    changed.update(answer)
+                if callable(refresh):
+                    refresh(state)
+            session.presentation = state
             session.bump_presentation(command.operation, **changed)
         finally:
             session.clear_event_context()

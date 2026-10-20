@@ -13,6 +13,7 @@ from foammesh.settings.project_manager import ProjectManager
 from foammesh.openfoam.file_system import FileSystem
 from foammesh.core.case import (
     ArtifactState,
+    adopt_unrecorded_workflow_mesh,
     CaseKind,
     MeshOrigin,
     WorkflowMode,
@@ -65,6 +66,9 @@ class App(QObject):
         self._capabilities = CapabilityRegistry()
         self._facade = FoamMeshFacade(capabilities=self._capabilities)
         self._caseSession = None
+        #: DP-2745. The window's renderer for presentation ops (set by the
+        #: main window); None in a process with no window.
+        self._presentationRenderer = None
         self._facadeClient = DesktopFacadeClient(self._facade, lambda: self._caseSession)
         self._facadeClient.on_action = self._wslHealth.note_user_action
 
@@ -156,6 +160,27 @@ class App(QObject):
     @property
     def caseSession(self):
         return self._caseSession
+
+    def setPresentationRenderer(self, renderer) -> None:
+        """DP-2745. The window that shows the case takes presentation ops.
+
+        Without this the local API's presentation operations had no window
+        to reach: every one answered ``presentation_unavailable`` while the
+        window was open. The open case, and every case opened later, gets a
+        presentation state driven through ``renderer``.
+        """
+        self._presentationRenderer = renderer
+        if self._caseSession is not None:
+            self._attachPresentation(self._caseSession)
+
+    def _attachPresentation(self, session) -> None:
+        if self._presentationRenderer is None:
+            # The window is gone: nothing draws the ops, so none is taken.
+            session.attach_presentation(None)
+            return
+        from foammesh.core.facade.presentation import PresentationState
+        session.attach_presentation(PresentationState(),
+                                    renderer=self._presentationRenderer)
 
     @property
     def events(self):
@@ -302,24 +327,74 @@ class App(QObject):
 
         self._events.publish(Event.PROJECT_OPENING, case_id=str(Path(path).resolve()), path=str(Path(path).resolve()))
         try:
-            self._project = self._projectManager.createInPlaceCase(path)
-            # A scratch case is deleted when it goes stale, so recording it
-            # would leave the user a Recents entry that opens nothing.
-            from foammesh.core.case import is_scratch_case
-            if not is_scratch_case(self._project.path):
-                self._settings.updateRecents(self._project.path, True)
-            self._fileSystem = FileSystem(self._project.path, case_root=self._project.path)
-            self._fileSystem.createNativeCase(resource.file('openfoam/case'))
-            self._fileSystem.ensureFoamFile()
-            self._refreshWorkflowResolution()
-            self._project.acceptExternalChanges()
-            self._attachFacadeSession()
-            self._events.publish(Event.PROJECT_OPENED, case_id=str(self._project.path), path=str(self._project.path))
-            return self._project
+            return self._adoptInPlaceCase(*self._buildInPlaceCase(path))
         except Exception as error:
             self._events.publish(Event.PROJECT_ERROR, case_id=str(Path(path).resolve()), error=str(error))
             self.closeProject()
             raise
+
+    async def createInPlaceCaseAsync(self, path):
+        """:meth:`createInPlaceCase` with its disk work off the GUI thread.
+
+        DP-2714. MEASURED (2026-10-20, dev build, loaded D: drive): creating a
+        case held the GUI thread 8.55 s -- the sidecar, configuration, case
+        metadata and case lock 3.07 s, the native skeleton 0.47 s and the
+        event journal's SQLite set-up 3.84 s of the facade attach -- and the
+        window froze for all of it. That work touches only files, so it runs
+        in a worker thread; the GUI thread keeps what it owns: the events, the
+        workflow resolution, the facade attach and the recents.
+        """
+        import asyncio
+
+        assert self._project is None
+        resolved = Path(path).resolve()
+        self._events.publish(Event.PROJECT_OPENING, case_id=str(resolved), path=str(resolved))
+        try:
+            built = await asyncio.to_thread(self._buildInPlaceCase, path)
+            return self._adoptInPlaceCase(*built)
+        except Exception as error:
+            self._events.publish(Event.PROJECT_ERROR, case_id=str(resolved), error=str(error))
+            self.closeProject()
+            raise
+
+    def _buildInPlaceCase(self, path):
+        """The disk half of creating a case: no events, no widgets (DP-2714).
+
+        Safe on a worker thread. The project is handed back to the GUI
+        thread before it is returned, so it lives where it is used.
+        """
+        from PySide6.QtCore import QCoreApplication, QThread
+
+        project = self._projectManager.createInPlaceCase(path)
+        try:
+            instance = QCoreApplication.instance()
+            move = getattr(project, 'moveToThread', None)
+            if (move is not None and instance is not None
+                    and QThread.currentThread() is not instance.thread()):
+                move(instance.thread())
+            fileSystem = FileSystem(project.path, case_root=project.path)
+            fileSystem.createNativeCase(resource.file('openfoam/case'))
+            fileSystem.ensureFoamFile()
+            journal = CaseSession.prepare_journal(project.storagePath)
+        except Exception:
+            project.close()
+            raise
+        return project, fileSystem, journal
+
+    def _adoptInPlaceCase(self, project, fileSystem, journal=None):
+        """The GUI half: make the built case the open one."""
+        self._project = project
+        # A scratch case is deleted when it goes stale, so recording it
+        # would leave the user a Recents entry that opens nothing.
+        from foammesh.core.case import is_scratch_case
+        if not is_scratch_case(self._project.path):
+            self._settings.updateRecents(self._project.path, True)
+        self._fileSystem = fileSystem
+        self._refreshWorkflowResolution()
+        self._project.acceptExternalChanges()
+        self._attachFacadeSession(journal=journal)
+        self._events.publish(Event.PROJECT_OPENED, case_id=str(self._project.path), path=str(self._project.path))
+        return self._project
 
     def createScratchCase(self, name='untitled'):
         """A real case in a temporary directory, for work that has no home yet.
@@ -393,7 +468,7 @@ class App(QObject):
         self._events.publish(Event.PROJECT_ERROR, case_id=str(path), error=details)
         raise ValueError(f'cannot open case: {details}')
 
-    def _attachFacadeSession(self):
+    def _attachFacadeSession(self, journal=None):
         """Attach the facade to the exact ProjectState already open in desktop.
 
         The existing ``Project`` remains responsible for its established case
@@ -403,9 +478,12 @@ class App(QObject):
         assert self._project is not None
         if self._caseSession is not None:
             self._facade.detach(self._caseSession.case_id, save=False)
+        # DP-2714: a journal set up off the GUI thread is handed over.
+        prepared = {} if journal is None else {'journal': journal}
         self._caseSession = CaseSession.from_state(
             self._project.path, self._project.state(), storage_path=self._project.storagePath,
-            jobs=self._jobManager)
+            jobs=self._jobManager, **prepared)
+        self._attachPresentation(self._caseSession)
         self._facade.attach(self._caseSession)
         self._sweepRunRecords(self._project.path)
 
@@ -479,6 +557,11 @@ class App(QObject):
             fingerprint_poly_mesh(classification.poly_mesh_path)
             if classification.poly_mesh_path is not None else None)
         metadata = load_case_metadata(self._project.path) if self._project.isInPlace else None
+        if (metadata is not None and fingerprint is not None
+                and metadata.workflow is WorkflowMode.NONE):
+            # DP-2811: a mesh Run to end published before DP-2748 recorded
+            # nothing; its run manifest is the proof it is the workflow's own.
+            metadata = adopt_unrecorded_workflow_mesh(self._project.path) or metadata
         self._workflowResolution = resolve_workflow(metadata, fingerprint)
         if self._workflowResolution.workflow is not previous_mode:
             self._events.publish(

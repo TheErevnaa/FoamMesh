@@ -75,6 +75,9 @@ class OperationSpec:
     #: -- ``staging`` names a run that writes into a staging copy, whose
     #: failure must not discard the case's live processor cases.
     record_extra: tuple = ()
+    #: DP-2717. Run ``parser`` on a worker thread: for a parser that does
+    #: file work only and reads no database (checkMesh's parse and report).
+    parser_off_loop: bool = False
 
 
 @dataclass(frozen=True)
@@ -245,7 +248,10 @@ class OperationExecutor:
 
         if job.status is JobStatus.DONE and spec.parser is not None:
             try:
-                parsed = spec.parser(job)
+                if spec.parser_off_loop:
+                    parsed = await self._to_thread(spec.parser, job)
+                else:
+                    parsed = spec.parser(job)
                 if inspect.isawaitable(parsed):
                     parsed = await parsed
             except Exception as error:
@@ -318,11 +324,17 @@ class OperationExecutor:
             if record is not None and record.get('state') != job.run_state:
                 job = replace(job, run_state=record.get('state'))
 
-        self.jobs.record_result(job)
+        # DP-2717: the refined result's durable line is written off the loop.
+        recorder = getattr(self.jobs, 'record_result_async', None)
+        if recorder is not None and inspect.iscoroutinefunction(recorder):
+            await recorder(job)
+        else:
+            self.jobs.record_result(job)
         # Plan 42 SG16 (D9). A snappy stage ends in the shared run listing,
         # cancelled or not, as a Gmsh run already does.
         from . import run_listing
-        run_listing.record_stage_job(session.case_path, spec, job)
+        await self._to_thread(run_listing.record_stage_job, session.case_path,
+                              spec, job)
 
         after = await self._mesh_fingerprint(session.case_path) if spec.mutation else None
         changed_before, changed_after = before, after

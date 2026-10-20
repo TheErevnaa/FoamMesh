@@ -132,9 +132,11 @@ SERVICE_TO_OPERATIONS: dict[str, tuple[str, ...]] = {
 SUPPLEMENTAL_TO_OPERATION: dict[str, str] = {
     '_removeAction': 'geometry.items.remove',   # geometry page: remove entity
     'editAction': 'geometry.items.patch',       # geometry page: edit entity
-    'capture': CLIENT_SHELL,                    # viewport-only image capture
+    # DP-2756. The viewport's Snapshot writes into the case's captures folder.
+    'capture': 'presentation.snapshot',
     'cheatSheet': CLIENT_SHELL,                 # viewport shortcut overlay
-    'zoomSelection': CLIENT_SHELL,              # viewport-only camera fit
+    # DP-2751. The Fit menu's Fit the selection.
+    'zoomSelection': 'presentation.view.fit_selection',
     'fitSelectionOrAll': CLIENT_SHELL,          # DP-697: the viewport's F key
     'action': CLIENT_SHELL,                     # recent-files / menu container control
     # DP-292 (W-B): the boundary actions on the geometry page are the four

@@ -125,6 +125,18 @@ class LegendSpec:
     unit: str = ''
     #: The figures behind the statistics, for tests and the caption.
     figures: dict = field(default_factory=dict)
+    #: DP-2738. Values run past the bar's high end (the scale is a percentile
+    #: or the user's): the top end reads "≥ high" and carries a cap.
+    over_range: bool = False
+
+    def tolerance_off_scale(self) -> bool:
+        """DP-2739. The deviation tolerance lies past the bar's high end.
+
+        The bar has no line for it then -- clamped to the top it read as if
+        the tolerance were the scale's end -- and the statistics say so.
+        """
+        return (self.mode == DEVIATION and self.tolerance is not None
+                and self.high > self.low and self.tolerance > self.high)
 
     @property
     def has_bar(self) -> bool:
@@ -134,6 +146,8 @@ class LegendSpec:
         """Where the limit (or tolerance) line sits on the bar, 0 to 1."""
         value = self.limit if self.mode == QUALITY else self.tolerance
         if value is None or self.high == self.low:
+            return None
+        if self.tolerance_off_scale():
             return None
         return min(1.0, max(0.0, (value - self.low) / (self.high - self.low)))
 
@@ -225,6 +239,14 @@ def deviation_spec(fields, scale: float, tolerance: float, *,
                      f'{_format(mean)} mm · RMS {_format(rms)} mm')
         stats.append(f'{100.0 * share:.1f}% of {magnitude.size:,} faces '
                      f'within ±{_format(tolerance)} mm')
+        above = int(np.count_nonzero(magnitude > scale))
+        figures.update(above_scale=above)
+        if above:
+            stats.append(f'{above:,} faces above the scale of '
+                         f'{_format(scale)} mm (max {_format(maximum)} mm)')
+    if tolerance > scale:
+        stats.append(f'tolerance ±{_format(tolerance)} mm is above the '
+                     f'scale (0 to {_format(scale)} mm)')
     title = ('Deviation |d| (mm)' if source != 'run'
              else 'Distance from reference |d| (mm)')
     return LegendSpec(
@@ -234,7 +256,8 @@ def deviation_spec(fields, scale: float, tolerance: float, *,
         not_measured=(f'{NOT_MEASURED} ({missing:,} faces)' if missing else ''),
         unmeasured_count=missing, statistics=tuple(stats),
         metric='Deviation', unit='mm',
-        scale_label=scale_label(choice, standard), figures=figures)
+        scale_label=scale_label(choice, standard), figures=figures,
+        over_range=bool(figures.get('above_scale')))
 
 
 def with_scale(spec: LegendSpec, choice: ScaleChoice,

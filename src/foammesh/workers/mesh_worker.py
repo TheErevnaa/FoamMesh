@@ -57,6 +57,9 @@ SECTION_OPERATIONS = ('mesh.section', 'mesh.section_batch')
 #: Plan 37 UF18: checkMesh's written sets, parsed for the viewport
 #: (``core.quality.check_artifacts``) -- never in the window's process.
 CHECK_HIGHLIGHT_OPERATIONS = ('quality.check_highlights',)
+#: DP-2741: the live deviation measurement
+#: (``core.quality.geometry_fidelity.live_worker``), off the window's GIL.
+DEVIATION_OPERATIONS = ('quality.live_deviation',)
 #: Test and support operations: they exercise the transport, never a case.
 DIAGNOSTIC_OPERATIONS = ('diag.allocate', 'diag.crash', 'diag.sleep',
                          'diag.echo')
@@ -228,6 +231,10 @@ def run_operation(operation: str, args: dict) -> dict:
         from foammesh.core.quality import check_artifacts
 
         return check_artifacts.run(args)
+    if operation in DEVIATION_OPERATIONS:
+        from foammesh.core.quality.geometry_fidelity import live_worker
+
+        return live_worker.run(args)
     method = OPERATIONS.get(operation)
     if method is None:
         raise KeyError(f'the mesh worker does not run {operation!r}')

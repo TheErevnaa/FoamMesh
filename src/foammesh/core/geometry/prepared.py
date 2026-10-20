@@ -372,7 +372,7 @@ class PreparedGeometryResult:
 
 class PreparedGeometryStore:
     def __init__(self, case_path: str | Path):
-        self.case_path = Path(case_path).resolve()
+        self.case_path = _resolved(case_path)
         self.root = self.case_path / 'foammesh' / 'geometry' / 'prepared'
         self.current_path = self.root / 'current.json'
         self.source = GeometryArtifactStore(self.case_path)
@@ -474,17 +474,39 @@ class PreparedGeometryStore:
         A stale publication is never silently reused after geometry import,
         transform, healing, or revision changes.
         """
-        if not self.current_path.is_file():
+        # DP-2717. MEASURED on the two-engine walk: 40.9 s of one GUI-thread
+        # hold in here -- this ran from every task page read, and each call
+        # re-read four JSON files, hashed the imported surface again and
+        # resolved every path on a loaded disk. The answer is kept against
+        # the identity, size and write time of the files it was read from
+        # (a revision is immutable once published), so an unchanged case
+        # costs a few stats.
+        head = _stat_key(self.current_path)
+        if head is None:
             return None
+        source = (self.source.geometry_fingerprint() if require_source_match
+                  else None)
+        cache_key = (str(self.current_path), bool(require_source_match))
+        hit = _CURRENT_CACHE.get(cache_key)
+        if (hit is not None and hit['head'] == head and hit['source'] == source
+                and all(_stat_key(path) == key for path, key in hit['files'])):
+            return _copied(hit['result'])
         document = _read_json(self.current_path)
         if document.get('schema_version') != CURRENT_SCHEMA_VERSION:
             raise PreparedGeometryError('unsupported current prepared geometry schema')
         if require_source_match and document.get(
-                'source_geometry_fingerprint') != self.source.geometry_fingerprint():
+                'source_geometry_fingerprint') != source:
+            _CURRENT_CACHE[cache_key] = {'head': head, 'source': source,
+                                         'files': (), 'result': None}
             return None
         result = self.load(str(document.get('revision_id') or ''))
         if result.reference.fingerprint != document.get('prepared_fingerprint'):
             raise PreparedGeometryError('current prepared geometry fingerprint mismatch')
+        files = tuple((path, _stat_key(path)) for path in (
+            result.reference.manifest_path, result.reference.group_manifest_path,
+            result.reference.geometry_path))
+        _CURRENT_CACHE[cache_key] = {'head': head, 'source': source,
+                                     'files': files, 'result': _copied(result)}
         return result
 
     def select(self, revision_id: str, *, require_source_match: bool = True
@@ -962,6 +984,46 @@ def _write_json_atomic(path: Path, document: dict) -> None:
     temporary.write_text(
         json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     os.replace(temporary, path)
+
+
+#: DP-2717: case path as given -> resolved. A store is built per read, and
+#: each build resolved the case path again (a realpath walk on a loaded disk).
+_RESOLVED: dict = {}
+
+
+def _resolved(case_path) -> Path:
+    key = os.fspath(case_path)
+    if not os.path.isabs(key):
+        # A relative path means a different place after a chdir.
+        return Path(case_path).resolve()
+    found = _RESOLVED.get(key)
+    if found is None:
+        found = Path(case_path).resolve()
+        if len(_RESOLVED) > 256:
+            _RESOLVED.clear()
+        _RESOLVED[key] = found
+    return found
+
+
+#: DP-2717: (current.json, source match) -> the answer and what it was read from.
+_CURRENT_CACHE: dict = {}
+
+
+def _stat_key(path) -> tuple | None:
+    try:
+        stat = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _copied(result):
+    """A cached result its caller may change without changing the cache."""
+    if result is None:
+        return None
+    import copy
+    return replace(result, manifest=copy.deepcopy(result.manifest),
+                   group_manifest=copy.deepcopy(result.group_manifest))
 
 
 def _read_json(path: Path) -> dict:

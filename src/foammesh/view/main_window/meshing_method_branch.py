@@ -839,6 +839,39 @@ class MeshingMethodBranch(QObject):
         if statusbar is not None:
             statusbar.showMessage(message, 8000)
 
+    def _rowFor(self, token: str):
+        """The outline row carrying ``token`` under a branch node, or None."""
+        navigation = getattr(self, '_navigation', None)
+        for parent in getattr(navigation, '_branchNodes', {}).values():
+            for row in range(parent.rowCount()):
+                child = parent.child(row)
+                if child is not None and child.data(TOKEN_ROLE) == token:
+                    return child
+        return None
+
+    def _rowIsShut(self, token: str) -> bool:
+        """DP-1879. Whether the outline draws the row ``token`` disabled.
+
+        A token with no row (a route a reopen restores before the engine has
+        published its rows, a legacy alias) is not shut here: the lock above
+        is the whole answer for it.
+        """
+        row = self._rowFor(token)
+        return row is not None and not row.isEnabled()
+
+    def _reportShutRow(self, token: str) -> None:
+        """Say why a press on a row drawn locked did nothing."""
+        message = self.lockRefusal(token)
+        if not message:
+            row = self._rowFor(token)
+            label = str(row.data(BASE_LABEL_ROLE) or row.text()) if row is not None else ''
+            message = self.tr(
+                '{0} cannot be opened yet: complete the steps before it '
+                'first.').format(label or self.tr('This step'))
+        statusbar = getattr(self._ui, 'statusbar', None)
+        if statusbar is not None:
+            statusbar.showMessage(message, 8000)
+
     def frontierToken(self) -> str:
         """The furthest row the case may currently open.
 
@@ -897,6 +930,17 @@ class MeshingMethodBranch(QObject):
             return False
         if self.isLocked(token) and not self.lockBypass:
             self._reportLocked(token)
+            return False
+        # DP-1879. And the row must be open in the outline too. The task
+        # graph and the outline's painting of it are refreshed at different
+        # moments, and in between the graph can call a row open that the
+        # outline still draws locked. Routing then showed the task's page
+        # while `setBranchCurrent` -- Qt drops a current index on a disabled
+        # row in silence -- left the highlight, and the title, on the band
+        # header: a Quality page under "3. Mesh setup". A page is opened
+        # only when its row can stand with it.
+        if not self.lockBypass and self._rowIsShut(token):
+            self._reportShutRow(token)
             return False
         widget = self.widgetForToken(token)
         if widget is None:

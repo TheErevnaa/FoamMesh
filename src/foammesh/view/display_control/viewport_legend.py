@@ -151,9 +151,12 @@ class LegendBar(QWidget):
         span = (spec.high - spec.low) or 1.0
         room = max(0, self.width() - TICK_X)
         labels = []
-        for value in spec.ticks:
+        for index, value in enumerate(spec.ticks):
             y = self.yOf((value - spec.low) / span)
             words = _format(value)
+            if spec.over_range and index == len(spec.ticks) - 1:
+                # DP-2738. The scale stops short of the largest value.
+                words = '≥' + words
             width = min(room, metrics.horizontalAdvance(words) + 1)
             labels.append((QRectF(TICK_X, y - 8, width, 16), words))
         return labels
@@ -215,6 +218,20 @@ class LegendBar(QWidget):
             end = min(end, tag[2].left() - 2)
         return end
 
+    def overRangeCap(self):
+        """DP-2738. The triangle over the bar's top when values run past
+        the scale, else None (a QPolygonF in this widget's pixels)."""
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPolygonF
+        spec = self._spec
+        if spec is None or not spec.has_bar or not spec.over_range:
+            return None
+        area = self.barRect()
+        top = area.top()
+        return QPolygonF([QPointF(area.left(), top),
+                          QPointF(area.right(), top),
+                          QPointF(area.center().x(), max(0.0, top - BAR_PAD))])
+
     def visibleTickLabels(self) -> list:
         """The tick labels drawn: those the limit tag does not cover."""
         return drop_ticks_under_tag(self.tickLabels(), self.limitRect())
@@ -236,6 +253,14 @@ class LegendBar(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor(0, 0, 0, 128)))
         painter.drawRoundedRect(area.adjusted(0.5, 0.5, -0.5, -0.5), 2, 2)
+        cap = self.overRangeCap()
+        if cap is not None:
+            # DP-2738. A cap in the top colour: values run on past the bar.
+            colour = self.colourAt(1.0)
+            painter.setPen(QPen(QColor(0, 0, 0, 128)))
+            painter.setBrush(_qcolour(colour) if colour is not None else text)
+            painter.drawPolygon(cap)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         # Ticks: mono 11 px, to the right of the bar, centred on their value.
         # P1b: a tick the limit line or its tag would cover is not drawn.
@@ -866,6 +891,14 @@ class ViewportLegend(QFrame):
             share = figures['within_share']
             rows.append((f'within ±{_format(tolerance)}', f'{100.0 * share:.1f}%',
                          'ok' if share >= 0.95 else 'bad'))
+            above = figures.get('above_scale')
+            if above:
+                # DP-2738. The bar stops at the scale; these faces are past it.
+                rows.append((f'above {_format(spec.high)}', f'{above:,} faces',
+                             'bad'))
+            if spec.tolerance_off_scale():
+                # DP-2739. No line on the bar: the tolerance is past its end.
+                rows.append(('tolerance', 'above the scale', ''))
         elif spec.statistics:
             rows = [(line, '', '') for line in spec.statistics]
         return rows

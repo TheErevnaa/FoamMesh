@@ -291,7 +291,7 @@ _LOCATION_LABEL = {
     'workflow.snap': 'Snap',
     'workflow.layers': 'Layers',
     'workflow.gmsh.global_sizing': 'Sizing',
-    'workflow.gmsh.boundary_layers': 'Boundary layers',
+    'workflow.gmsh.boundary_layers': 'Layers',   # DP-1311: the step's name
     'workflow.gmsh.compute': 'Compute',
 }
 

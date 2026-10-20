@@ -1880,6 +1880,18 @@ class MeshManager(ActorManager):
         """
         if reference is None:
             return 0
+        # Called on stand-ins in the tests: the helpers by the class.
+        surfaces, universe, ticked, notice = MeshManager._liveDeviationPlan(
+            self, identity)
+        distances, prepared = live_distance.measure_surfaces_mm(
+            live_distance.prepare_reference(reference),
+            {name: surfaces[name] for name in ticked}, unit)
+        return MeshManager._paintLive(self, distances, prepared, surfaces,
+                                      universe, ticked, notice, unit,
+                                      tolerance)
+
+    def _liveDeviationPlan(self, identity):
+        """``(surfaces, universe, ticked, notice)`` for a live measurement."""
         surfaces = {}
         for actor_id in self._patchIds:
             actorInfo = self._actorInfos.get(actor_id)
@@ -1905,11 +1917,11 @@ class MeshManager(ActorManager):
             if ticked:
                 notice = ('No patch is traced to the geometry; every patch '
                           'that can be a surface is measured.')
-        prepared = live_distance.prepare_reference(reference)
+        return surfaces, universe, ticked, notice
+
+    def _paintLive(self, distances, prepared, surfaces, universe, ticked,
+                   notice, unit, tolerance) -> int:
         fields = {}
-        measure = {name: surfaces[name] for name in ticked}
-        distances, _prepared = live_distance.measure_surfaces_mm(
-            prepared, measure, unit)
         for name, values in distances.items():
             fields[name] = (np.arange(values.size, dtype=np.int64), values)
         state = {'prepared': prepared, 'unit': unit, 'live': True}
@@ -1920,6 +1932,75 @@ class MeshManager(ActorManager):
             notice=' '.join(part for part in (prepared.notice, notice)
                             if part),
             state=state)
+
+    #: DP-2741. The worker group a live measurement runs in; a second press
+    #: (or a mesh change) cancels it.
+    LIVE_DEVIATION_GROUP = 'live-deviation'
+
+    def cancelLiveDeviation(self) -> None:
+        """DP-2741. Drop the measurement in flight; it paints nothing."""
+        self._liveDeviationTicket = getattr(
+            self, '_liveDeviationTicket', 0) + 1
+        from foammesh.core.jobs import local_worker
+
+        local_worker.cancel_all(self.LIVE_DEVIATION_GROUP)
+
+    async def measureLiveDeviation(self, reference,
+                                   unit=live_distance.DEFAULT_UNIT,
+                                   tolerance=None, identity=None):
+        """DP-2741. `showLiveDeviation`, measured in a worker process.
+
+        Measured: the VTK wheels hold the GIL through
+        ``vtkImplicitPolyDataDistance.FunctionValue`` (a 40.7 s call held the
+        main thread 40.7 s), so a thread would not free the GUI. The window
+        hands the reference's polygons and each patch's face centres to a
+        ``quality.live_deviation`` worker and paints its answer. Returns the
+        painted count, or ``None`` when the measurement was cancelled or the
+        mesh on screen changed meanwhile. A reference with strips or lines,
+        or a worker that cannot start, is measured here as before.
+        """
+        from foammesh.core.jobs import local_worker
+        from foammesh.core.quality.geometry_fidelity import live_worker
+
+        if reference is None:
+            return 0
+        self.cancelLiveDeviation()
+        ticket = self._liveDeviationTicket
+        surfaces, universe, ticked, notice = self._liveDeviationPlan(identity)
+        arrays = live_worker.polys_arrays(reference)
+        centres = {}
+        for name in sorted(ticked):
+            points = live_worker.face_centres(surfaces[name])
+            if points is None:
+                arrays = None
+                break
+            centres[name] = points
+        if arrays is None:
+            return self.showLiveDeviation(reference, unit=unit,
+                                          tolerance=tolerance,
+                                          identity=identity)
+        names, outcome = await live_worker.measure(
+            arrays, centres, unit, group=self.LIVE_DEVIATION_GROUP)
+        del arrays, centres
+        if ticket != self._liveDeviationTicket:
+            return None
+        if any(self._actorInfos.get(name) is None
+               or self._actorInfos[name].dataSet() is not surfaces[name]
+               for name in surfaces):
+            return None
+        if not outcome.ok:
+            if outcome.status == local_worker.CANCELLED:
+                return None
+            logger.warning('live deviation worker %s: %s (%s); measuring '
+                           'in the window', outcome.status, outcome.reason,
+                           outcome.message)
+            return self.showLiveDeviation(reference, unit=unit,
+                                          tolerance=tolerance,
+                                          identity=identity)
+        distances, prepared = live_worker.read_answer(
+            outcome.payload or {}, names, unit)
+        return self._paintLive(distances, prepared, surfaces, universe,
+                               ticked, notice, unit, tolerance)
 
     def _paintDeviation(self, fields, starts, source, *, signed=None,
                         tolerance=None, scale=None, universe=None,
@@ -1980,9 +2061,14 @@ class MeshManager(ActorManager):
         painted = {}
         for name, (face_ids, field) in shown.items():
             actorInfo = self._actorInfos[name]
+            # Plan 46 (GUI-DEFECTS sign question). The signed values go in:
+            # ``magnitude`` colours by |d| through a second array and keeps
+            # these for the labels and the hover. Handing it |d| made every
+            # worst-face label read "+" -- the rounded rim of the dev-sweep
+            # elbow lies 1.08 mm *inside* the CAD and was labelled +1.08.
             if actorInfo.setFaceScalars(
-                    'deviation', face_ids, np.abs(np.asarray(
-                        field, dtype=np.float64)),
+                    'deviation', face_ids, np.asarray(
+                        field, dtype=np.float64),
                     start_face=starts.get(name), value_range=valueRange,
                     lookup_table=lut, magnitude=True):
                 painted[name] = actorInfo.faceScalars('deviation')

@@ -147,6 +147,10 @@ class CaseSession:
         self.change_sets: list[dict] = []
         self.read_only_reason: str | None = None
         self.presentation = None  # attached PresentationState when a desktop surface exists
+        #: DP-2745. What carries a presentation op to the window that shows
+        #: the case: ``renderer(operation, changed, parameters)``; None with
+        #: no window.
+        self.presentation_renderer = None
         self._configuration_cache: tuple[int, dict] | None = None
         # CR4 (F4). The in-memory event list is a bounded window, not a
         # history: it held every line of solver output for the life of the
@@ -225,15 +229,20 @@ class CaseSession:
 
     @classmethod
     def from_state(cls, case_path: str | Path, state: ProjectState, *, storage_path: str | Path | None = None,
-                   read_only: bool = False, jobs: JobManager | None = None) -> 'CaseSession':
-        """Adapt an already-open project without making another state owner."""
+                   read_only: bool = False, jobs: JobManager | None = None,
+                   journal: EventJournal | None = None) -> 'CaseSession':
+        """Adapt an already-open project without making another state owner.
+
+        *journal* is one :meth:`prepare_journal` already set up off the owner
+        loop (DP-2714); without it the journal is set up here.
+        """
         case_path = Path(case_path).resolve()
         session = cls(case_path, Path(storage_path or case_path), state, read_only=read_only)
         if jobs is not None:
             session.jobs = jobs
         session._load_or_create_identity()
         if not read_only:
-            session._start_journal()
+            session._start_journal(journal)
         session.configuration()  # warm the DTO cache before the first command
         session._emit('case.attached', path=str(case_path), read_only=read_only)
         return session
@@ -292,9 +301,25 @@ class CaseSession:
     def latest_change_set(self) -> dict | None:
         return self.change_sets[-1] if self.change_sets else None
 
-    def attach_presentation(self, state) -> None:
-        """Attach a desktop rendering surface so presentation ops are available."""
+    def attach_presentation(self, state, renderer=None) -> None:
+        """Attach a desktop rendering surface so presentation ops are available.
+
+        ``renderer`` is called with each accepted op, what it changed and its
+        parameters, and applies it to the window; it raises
+        ValidationFailedError for a part the window does not hold, and then
+        the state is left as it was.
+        """
         self.presentation = state
+        self.presentation_renderer = renderer
+
+    def presentation_snapshot(self) -> dict:
+        """DP-2745. The presentation as the window shows it now."""
+        if self.presentation is None:
+            return {'attached': False}
+        refresh = getattr(self.presentation_renderer, 'refresh', None)
+        if callable(refresh):
+            refresh(self.presentation)
+        return self.presentation.to_dict()
 
     def bump_presentation(self, event: str, **payload) -> int:
         """Advance the presentation sequence and emit a memory-only event."""
@@ -478,8 +503,22 @@ class CaseSession:
         self.read_only = True
         self.read_only_reason = reason
 
-    def _start_journal(self) -> None:
-        self.journal = EventJournal(self.storage_path / JOURNAL_FILE_NAME, monitor=self.monitor)
+    @staticmethod
+    def prepare_journal(storage_path: str | Path) -> EventJournal:
+        """Set up a case's event journal; plain SQLite, safe off the owner loop.
+
+        DP-2714. MEASURED: the journal's first set-up (WAL switch and table
+        create) held the GUI thread 3.84 s of a case create on a loaded disk.
+        """
+        return EventJournal(Path(storage_path) / JOURNAL_FILE_NAME)
+
+    def _start_journal(self, journal: EventJournal | None = None) -> None:
+        if journal is not None and journal.path.resolve() == (
+                self.storage_path / JOURNAL_FILE_NAME).resolve():
+            journal.monitor = self.monitor
+            self.journal = journal
+        else:
+            self.journal = EventJournal(self.storage_path / JOURNAL_FILE_NAME, monitor=self.monitor)
         self._start_autosave()
         self.event_sequence = self.journal.latest_sequence()
         if self.event_sequence:

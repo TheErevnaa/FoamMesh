@@ -747,8 +747,12 @@ class StepManager(QObject):
             getattr(page, 'resetForRefresh', page.clearResult)()
 
         case_root = app.facadeClient.case_root
+        # DP-2731. A case opened from an empty folder has no case/ until
+        # something is written there; listing it raised FileNotFoundError,
+        # which the window reported as the folder having been deleted.
         times = [path.name for path in case_root.iterdir()
-                 if path.is_dir() and path.name.replace('.', '', 1).isdigit()]
+                 if path.is_dir() and path.name.replace('.', '', 1).isdigit()
+                 ] if case_root.is_dir() else []
         for value in times:
             if float(value) > self._pages[Step.LAST_STEP].OUTPUT_TIME:
                 # C31-12. Scheduled, not blocking. `load()` runs on every
@@ -2729,7 +2733,7 @@ class StepManager(QObject):
     #: What each kept stage is called on screen (the workflow's own names).
     RESUME_STAGE_NAMES = {
         'blockMesh': 'Base grid', 'castellation': 'Castellation',
-        'snap': 'Snap', 'layers': 'Boundary layers',
+        'snap': 'Snap', 'layers': 'Layers',   # DP-1311
         'checkMesh': 'the mesh check',
     }
 

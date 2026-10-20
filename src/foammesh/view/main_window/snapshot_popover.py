@@ -506,15 +506,32 @@ class SnapshotPopover(QFrame):
         self.move(point)
         self.show()
 
-    def showBelow(self, anchor: QWidget) -> None:
-        """Open under *anchor* (the camera button), kept on the screen."""
+    def showBelow(self, anchor: QWidget, within: QWidget | None = None) -> None:
+        """Open under *anchor* (the camera button), its panel whole.
+
+        DP-2742. The panel (not its shadow margin) hangs 4 px under the
+        button, its left edge on the button's; when that would run past the
+        right of *within* (the window) or the screen, its right edge sits on
+        the button's instead. It is then kept inside *within* and the screen,
+        so the title is never cut off.
+        """
         self.adjustSize()
-        point = anchor.mapToGlobal(QPoint(0, anchor.height()))
+        left, top, _right, _bottom = self._elevation.margins
+        panel = self.panelRect()
+        corner = anchor.mapToGlobal(QPoint(0, anchor.height() + 4))
+        x = corner.x()
+        bounds = []
+        if within is not None:
+            bounds.append(QRect(within.mapToGlobal(QPoint(0, 0)), within.size()))
         screen = anchor.screen().availableGeometry() if anchor.screen() else None
         if screen is not None:
-            point.setX(max(screen.left(), min(point.x(),
-                                              screen.right() - self.width())))
-            point.setY(max(screen.top(), min(point.y(),
-                                             screen.bottom() - self.height())))
-        self.move(point)
+            bounds.append(screen)
+        limit = min([b.right() for b in bounds], default=None)
+        if limit is not None and x + panel.width() - 1 > limit:
+            x = anchor.mapToGlobal(QPoint(anchor.width(), 0)).x() - panel.width()
+        px, py = x, corner.y()
+        for box in bounds:
+            px = max(box.left(), min(px, box.right() + 1 - panel.width()))
+            py = max(box.top(), min(py, box.bottom() + 1 - panel.height()))
+        self.move(QPoint(px - left, py - top))
         self.show()

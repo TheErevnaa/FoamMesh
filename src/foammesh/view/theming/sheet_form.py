@@ -669,6 +669,7 @@ def share_label_width(forms, available: int = 0) -> int:
     # MEASURED live: un-wrapping, un-capping and re-capping every label on
     # every run laid each one out six times over, a pin's column relayout.
     naturals = [_cached_natural_width(label) for label in labels]
+    bounds = [(label.minimumWidth(), label.maximumWidth()) for label in labels]
     natural = max(naturals)
     width = natural
     if available > 0:
@@ -706,6 +707,16 @@ def share_label_width(forms, available: int = 0) -> int:
                 holder.setContentsMargins(0, m.top(), 0, m.bottom())
             for label in group:
                 label.setMinimumWidth(width)
+    # DP-2818. QLabel keeps the size hint it worked out under the minimum
+    # width it had then: MEASURED, a label capped from 139 px to 118 px went
+    # on asking its layout for 139 ("Project name", 76 px of text), and every
+    # label this column had narrowed read as cut. Re-setting the indent is
+    # the cheapest call that makes a QLabel measure again; it is made only
+    # for a label whose bounds this run changed.
+    for label, before in zip(labels, bounds):
+        if (isinstance(label, QLabel)
+                and before != (label.minimumWidth(), label.maximumWidth())):
+            label.setIndent(label.indent())
     return width
 
 

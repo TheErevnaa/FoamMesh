@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 STAGE_NAMES = {'blockMesh': 'Base grid', 'castellation': 'Castellation',
                'snappyHexMesh': 'Snappy', 'snap': 'Snap',
-               'layers': 'Boundary layers'}
+               'layers': 'Layers'}   # DP-1311: the step's name
 
 
 #: The geometry operations that are steps of the history, and the label each

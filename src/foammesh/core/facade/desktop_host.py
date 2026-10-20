@@ -36,6 +36,9 @@ class DesktopHost:
     token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     actor_id: str = field(default_factory=lambda: f'desktop-api-{secrets.token_hex(6)}')
     discovery_path: Path | str | None = None
+    #: ``foammesh.support.client_trust.ClientTrust``: with one, the token
+    #: buys only the signed handshake.
+    client_trust: object = None
 
     def __post_init__(self) -> None:
         if not _is_loopback(self.host):
@@ -61,7 +64,8 @@ class DesktopHost:
             raise RuntimeError('desktop API requires the FoamMesh api dependencies') from error
         return create_facade_app(
             self.facade, token=self.token, allowed_case_roots=self.allowed_case_roots,
-            actor_id=self.actor_id, lifecycle=False, title='FoamMesh desktop facade')
+            actor_id=self.actor_id, lifecycle=False, title='FoamMesh desktop facade',
+            client_trust=self.client_trust)
 
     @property
     def bound_port(self) -> int | None:

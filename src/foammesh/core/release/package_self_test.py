@@ -137,15 +137,24 @@ def _openfoam_check() -> dict:
 def _local_api_check() -> dict:
     """Plan 46: the --api-attach host starts, answers, refuses no token, and
     runs an operation (DP-2729: a module the operation reaches lazily was
-    missing from the 1.1.3 candidate, and only a call found it)."""
+    missing from the 1.1.3 candidate, and only a call found it).
+
+    The token alone is refused (403) until a client signs the handshake. The
+    check signs with a throwaway key, so it needs no Erevnaa private key and
+    still proves the packaged build verifies Ed25519 signatures."""
     import asyncio
+    import base64
     import urllib.error
     import urllib.request
 
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     from foammesh.core.facade import FoamMeshFacade
+    from foammesh.support.client_trust import TRUSTED_CLIENT_KEYS, ClientTrust, signed_message
     from foammesh.support.local_api import LocalApi
 
-    def status(url: str, token: str | None, body: dict | None = None) -> int:
+    def call(url: str, token: str | None, body: dict | None = None) -> tuple[int, dict | None]:
         data = None if body is None else json.dumps(body).encode('utf-8')
         request = urllib.request.Request(url, data=data)
         if data is not None:
@@ -154,9 +163,29 @@ def _local_api_check() -> dict:
             request.add_header('Authorization', f'Bearer {token}')
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status
+                return response.status, json.loads(response.read() or b'null')
         except urllib.error.HTTPError as error:
-            return error.code
+            return error.code, None
+
+    def status(url: str, token: str | None, body: dict | None = None) -> int:
+        return call(url, token, body)[0]
+
+    if 'erevnaa-2026-10' not in ClientTrust.erevnaa().keys:
+        raise RuntimeError(f'the stock build trusts {sorted(TRUSTED_CLIENT_KEYS)}, '
+                           'not the Erevnaa key')
+    private = Ed25519PrivateKey.generate()
+    trust = ClientTrust({'self-test': base64.b64encode(private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()})
+
+    def pair(endpoint: str, token: str) -> str | None:
+        code, offer = call(f'{endpoint}/api/v1/handshake', token)
+        if code != 200 or not offer or not offer.get('required'):
+            return None
+        signature = base64.b64encode(private.sign(signed_message(offer['challenge'])))
+        code, won = call(f'{endpoint}/api/v1/handshake', token, {
+            'challenge': offer['challenge'], 'key_id': 'self-test',
+            'signature': signature.decode()})
+        return won.get('session_token') if code == 200 and won else None
 
     async def exercise() -> dict:
         with tempfile.TemporaryDirectory(prefix='foammesh-local-api-') as root:
@@ -164,7 +193,7 @@ def _local_api_check() -> dict:
             facade = FoamMeshFacade()
             case = facade.create_case(Path(root) / 'case')
             api = LocalApi(facade, discovery_path=discovery,
-                           allowed_roots=(Path(root),))
+                           allowed_roots=(Path(root),), client_trust=trust)
             if not await api.start():
                 raise RuntimeError(f'local API did not start: {api.problem}')
             try:
@@ -172,24 +201,29 @@ def _local_api_check() -> dict:
                 capabilities = f'{found["endpoint"]}/api/v1/system/capabilities'
                 health = await asyncio.to_thread(status, f'{found["endpoint"]}/health', None)
                 refused = await asyncio.to_thread(status, capabilities, None)
-                allowed = await asyncio.to_thread(status, capabilities, found['token'])
+                unsigned = await asyncio.to_thread(status, capabilities, found['token'])
+                session = await asyncio.to_thread(pair, found['endpoint'], found['token'])
+                allowed = await asyncio.to_thread(status, capabilities, session)
                 select = (f'{found["endpoint"]}/api/v1/cases/{case.case_id}'
                           '/operations/mesh.engine.select:execute')
-                engine = await asyncio.to_thread(status, select, found['token'], {
+                engine = await asyncio.to_thread(status, select, session, {
                     'parameters': {'engine_id': 'gmsh', 'confirmed': True,
                                    'reason': 'package self-test'}})
             finally:
                 await api.stop()
                 facade.close_case(case.case_id, save=False)
-            if (health, refused, allowed, engine) != (200, 401, 200, 200):
+            if (health, refused, unsigned, allowed, engine) != (200, 401, 403, 200, 200):
                 raise RuntimeError(
-                    f'health {health}, no token {refused}, token {allowed}, '
-                    f'mesh.engine.select {engine} (wanted 200, 401, 200, 200)')
+                    f'health {health}, no token {refused}, token unsigned {unsigned}, '
+                    f'signed {allowed}, mesh.engine.select {engine} '
+                    '(wanted 200, 401, 403, 200, 200)')
             if discovery.exists():
                 raise RuntimeError('the discovery file was left after stop')
             return {'endpoint_host': found['endpoint'].split('//')[1].split(':')[0],
-                    'health': health, 'without_token': refused, 'with_token': allowed,
-                    'mesh_engine_select': engine}
+                    'health': health, 'without_token': refused,
+                    'token_unsigned': unsigned, 'signed_session': allowed,
+                    'mesh_engine_select': engine,
+                    'trusted_key_ids': sorted(TRUSTED_CLIENT_KEYS)}
 
     return asyncio.run(exercise())
 

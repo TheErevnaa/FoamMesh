@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QGroupBox, QHBoxLayout, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QMenu, QPushButton, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout,
 )
 
 from foammesh.core import display_unit
@@ -77,6 +77,20 @@ class RefinementOutline(QGroupBox):
         self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        # DP-2813. In the 1280x800 column the two columns were wider than
+        # the tree, so a horizontal scroll bar opened inside the fixed
+        # header-plus-rows height and covered the one row. The tree never
+        # scrolls sideways: the detail column is as wide as its text, the
+        # name column takes what is left and elides (its tooltip keeps the
+        # whole name).
+        self.tree.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.itemSelectionChanged.connect(self._sync_buttons)
         self.tree.itemDoubleClicked.connect(lambda *_args: self.edit())
         layout.addWidget(self.tree)
@@ -147,7 +161,10 @@ class RefinementOutline(QGroupBox):
             text, self._cell(kind, 'level', row))
 
     def _item(self, kind: str, row: dict, name: str) -> QTreeWidgetItem:
-        item = QTreeWidgetItem((name, self.detail(kind, row)))
+        detail = self.detail(kind, row)
+        item = QTreeWidgetItem((name, detail))
+        item.setToolTip(0, name)   # DP-2813: the name may be elided
+        item.setToolTip(1, detail)
         item.setData(0, KIND_ROLE, kind)
         item.setData(0, KEY_ROLE, row.get('__key__'))
         return item
@@ -170,12 +187,14 @@ class RefinementOutline(QGroupBox):
                 owner = parents.get((band_kind, _text(row.get('group_name'))))
                 band = self._item(band_kind, row, self.detail(band_kind, row))
                 band.setText(1, '')
+                band.setToolTip(1, '')
                 if owner is None:
                     # A band whose group is gone is shown, not dropped.
                     band.setText(0, '%s — %s' % (
                         self.tr('No group "%s"') % _text(
                             row.get('group_name')), self.detail(
                                 band_kind, row)))
+                    band.setToolTip(0, band.text(0))
                     self.tree.addTopLevelItem(band)
                 else:
                     owner.addChild(band)

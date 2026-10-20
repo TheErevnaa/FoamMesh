@@ -591,8 +591,21 @@ class StepRibbon(QFrame):
     def _activate(self, position: int) -> bool:
         if position >= len(self._entries):
             return False
+        # DP-1879. The chips are drawn from the outline on a zero-delay
+        # timer, so between an outline change and that redraw a chip can
+        # still be enabled for a row the outline has just locked (MEASURED on
+        # the ribbon-only snappy walk: "10. Quality" was clickable while the
+        # Layers edit was being committed). The click is answered from the
+        # outline as it is now, not from the last drawing of it.
+        label = self._entries[position].label
+        self.refresh()
+        position = next((at for at, entry in enumerate(self._entries)
+                         if entry.label == label), None)
+        if position is None:
+            return False
         entry = self._entries[position]
         if not self._usable(entry) or not entry.index.isValid():
+            self.clickUnavailable(position)
             return False
         self._navigation.activateRow(QModelIndex(entry.index))
         return True

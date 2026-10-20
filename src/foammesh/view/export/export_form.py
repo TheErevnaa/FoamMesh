@@ -19,11 +19,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QLabel, QLineEdit, QSizePolicy,
-    QVBoxLayout, QWidget)
+    QCheckBox, QComboBox, QFormLayout, QLabel, QLineEdit, QSizePolicy, QStyle,
+    QStyleOptionComboBox, QVBoxLayout, QWidget)
 
 from widgets.new_project_widget import NewProjectWidget
 from widgets.selector_dialog import SelectorDialog, SelectorItem
@@ -225,6 +225,80 @@ def hold_destination_rows_open(widget: QWidget, characters: int = 0):
     return _RowFloors(widget, characters)
 
 
+class FormatCombo(QComboBox):
+    """The Format box: asks for its chosen name's width, up to a ceiling.
+
+    DP-2814. P40GM (DP-2668) gave the box an ``Ignored`` width so the
+    longest name could not widen the column, and the box then took whatever
+    was left beside its label: 140 px at 1280x800, and the chosen name
+    "OpenFOAM case (native)" was clipped to "OpenFOAM case (na". The box now
+    asks for the width of the name it shows, never more than
+    ``WIDTH_CEILING``; a column that cannot hold that beside the label wraps
+    the row (the form's ``WrapLongRows``), label above and box across the
+    column, and a name longer than the column is painted elided (the paint
+    ``sheet_form.elide_combos`` does) with the whole name in the tooltip,
+    never clipped.
+    """
+
+    #: Below P40GM's 200 px, so the box still never sizes the column.
+    WIDTH_CEILING = 190
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.currentIndexChanged.connect(lambda _index: self.updateGeometry())
+
+    def _textHint(self) -> int:
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        metrics = self.fontMetrics()
+        contents = QSize(metrics.horizontalAdvance(self.currentText()) + 6,
+                         metrics.height())
+        return self.style().sizeFromContents(
+            QStyle.ContentsType.CT_ComboBox, opt, contents, self).width()
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        want = min(max(hint.width(), self._textHint()), self.WIDTH_CEILING)
+        return QSize(want, hint.height())
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        return QSize(self.minimumSizeHint().width(), hint.height())
+
+    def room(self) -> int:
+        """The width the style gives the chosen name."""
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, opt,
+            QStyle.SubControl.SC_ComboBoxEditField, self)
+        icon = 0 if opt.currentIcon.isNull() else opt.iconSize.width() + 4
+        return max(0, rect.width() - icon - 4)
+
+    def shownText(self) -> str:
+        """The name as painted: whole, or elided to the room."""
+        text = self.currentText()
+        if self.fontMetrics().horizontalAdvance(text) <= self.room():
+            return text
+        return self.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideRight, self.room())
+
+    def paintEvent(self, event) -> None:
+        text = self.currentText()
+        if self.isEditable() or self.shownText() == text:
+            super().paintEvent(event)
+            return
+        from PySide6.QtWidgets import QStylePainter
+
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = self.shownText()
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
+        painter.end()
+
+
 class ExportForm(QWidget):
     """What an export needs asked, in the order a reader answers it."""
 
@@ -250,7 +324,7 @@ class ExportForm(QWidget):
         apply_form_metrics(chooser)
         layout.addLayout(chooser)
         self._chooserForm = chooser
-        self._format = QComboBox(self)
+        self._format = FormatCombo(self)
         self._format.setObjectName('exportFormat')
         self._format.setAccessibleName(self.tr('Format'))
         self._format.setAccessibleDescription(
@@ -261,10 +335,13 @@ class ExportForm(QWidget):
         self._format.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._format.setMinimumContentsLength(8)
-        self._format.setSizePolicy(QSizePolicy.Policy.Ignored,
+        # DP-2814. Preferred, not Ignored: an Ignored width has no minimum,
+        # so the form never wrapped the row and the name was clipped.
+        self._format.setSizePolicy(QSizePolicy.Policy.Preferred,
                                    QSizePolicy.Policy.Fixed)
         self._format.currentIndexChanged.connect(
             lambda _index: self._format.setToolTip(self._format.currentText()))
+
         formatLabel = QLabel(self)
         formatLabel.setText(self.tr('Format'))
         # W-O1. The label is built by hand rather than by `addRow(text, ...)`,
