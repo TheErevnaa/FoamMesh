@@ -24,12 +24,12 @@ dynamic = ["dependencies"]
 # CAD import (STEP/IGES/BREP) â€” phase 05
 cad = ["pythonocc-core>=7.7"]
 # REST/WebSocket API facade + CLI â€” phase 09
-api = ["fastapi>=0.110", "uvicorn>=0.27", "websockets>=12"]
+api = ["fastapi>=0.110", "uvicorn>=0.27", "websockets>=12", "cryptography>=42"]
 # Neutral export: Gmsh â€” phase 11 (CGNS via VTK which is already a core dep)
 export = ["gmsh>=4.11"]
 # Everything optional, for development
 all = ["pythonocc-core>=7.7", "fastapi>=0.110", "uvicorn>=0.27",
-       "websockets>=12", "gmsh>=4.11"]
+       "websockets>=12", "cryptography>=42", "gmsh>=4.11"]
 
 [project.scripts]
 foammesh = "foammesh.cli.main:main"
