@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -166,36 +165,6 @@ def cmd_operations(args) -> int:
     return 0
 
 
-def cmd_journey(args) -> int:
-    from foammesh.core.automation import (
-        Guardrails, Orchestrator, authored_mesh_recipe, converter_import_recipe,
-        export_archive_recipe, geometry_import_recipe, quality_adjustment_recipe,
-        quality_assessment_recipe, transform_recovery_recipe)
-    options = _coerce(args.parameters) if args.parameters else {}
-    factories = {
-        'geometry': lambda: geometry_import_recipe(options['source']),
-        'authored-mesh': lambda: authored_mesh_recipe(options.get('patch', {})),
-        'qa-assess': quality_assessment_recipe,
-        'qa-adjust': lambda: quality_adjustment_recipe(options['patch']),
-        'transform': lambda: transform_recovery_recipe(options['kind'], options.get('parameters', {})),
-        'converter-import': lambda: converter_import_recipe(options['source'], options['format']),
-        'export-archive': lambda: export_archive_recipe(
-            options['export_destination'], options['archive_destination']),
-    }
-    facade, session = _open(args.case)
-    try:
-        guardrails = Guardrails(
-            max_cells=args.max_cells, max_attempts=args.max_attempts,
-            wall_clock_seconds=args.max_seconds,
-            allowed_roots=(Path(args.allowed_root).resolve(),) if args.allowed_root else ())
-        report = asyncio.run(Orchestrator(facade, guardrails, actor_id='cli-journey').run(
-            session.case_id, factories[args.journey](), estimated_cells=args.estimated_cells))
-        _emit(report.to_dict())
-        return 0 if report.status == 'succeeded' else 2
-    finally:
-        facade.detach(session.case_id)
-
-
 def add_facade_commands(sub: argparse._SubParsersAction) -> None:
     """Register the facade-client subcommands on the CLI parser."""
     fg = sub.add_parser('field-get', help='read a semantic field value from a case')
@@ -243,19 +212,3 @@ def add_facade_commands(sub: argparse._SubParsersAction) -> None:
 
     ops = sub.add_parser('operations', help='list registered facade operations')
     ops.set_defaults(func=cmd_operations)
-
-    # Plan 46 (Plan 38 D3): the scripted recipes are not in the public
-    # release; the command is offered only where core.automation is.
-    if importlib.util.find_spec('foammesh.core.automation') is not None:
-        journey = sub.add_parser('journey', help='run a confirmed deterministic PC6 recipe')
-        journey.add_argument('case')
-        journey.add_argument('journey', choices=(
-            'geometry', 'authored-mesh', 'qa-assess', 'qa-adjust', 'transform',
-            'converter-import', 'export-archive'))
-        journey.add_argument('--parameters', default='{}', help='journey-specific JSON object')
-        journey.add_argument('--max-cells', type=int)
-        journey.add_argument('--estimated-cells', type=int)
-        journey.add_argument('--max-attempts', type=int, default=3)
-        journey.add_argument('--max-seconds', type=float)
-        journey.add_argument('--allowed-root')
-        journey.set_defaults(func=cmd_journey)
