@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QHeaderView, QLabel,
+    QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
@@ -24,8 +24,12 @@ from foammesh.core.naming import humanise_option
 from foammesh.core.quantities import count_text
 from widgets.fit_to_text import FlowLayout
 
+from .shared_pick import SharedPick
+
 COLUMN_NAME, COLUMN_WHAT, COLUMN_ON = range(3)
 DIM_WORDS = (('Point', 0), ('Curve', 1), ('Surface', 2), ('Volume', 3))
+#: The pick filter that selects entities of each dimension.
+DIM_FILTERS = {0: 'Points', 1: 'Curves', 2: 'Surfaces', 3: 'Volumes'}
 
 
 class EntityControlsPanel(QWidget):
@@ -41,6 +45,9 @@ class EntityControlsPanel(QWidget):
         self._stored: list = []
         self._dirty = False
         self._filling = False
+        #: GM7. The Pick tool and the row it is filling.
+        self._picker = None
+        self._pick_row = None
         self.setObjectName('gmshEntityControls')
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -105,6 +112,10 @@ class EntityControlsPanel(QWidget):
         self._problem.setVisible(False)
         layout.addWidget(self._problem)
         self.reload()
+        # Plan 48 PA2: the local API reaches this panel through the case
+        # session, as it reaches the Gmsh tool dock.
+        self._api = EntityControlsApi(self)
+        self.registerApi()
 
     # -- the FieldGroupPage-shaped surface a task page adopts --------------- #
 
@@ -160,11 +171,8 @@ class EntityControlsPanel(QWidget):
 
     def add_row(self, kind: str | None = None, tags=None) -> dict:
         kind = kind or self._kind.currentData()
-        names = {r['name'] for r in self._rows}
-        number = 1
-        while f'{kind}{number}' in names:
-            number += 1
-        row = catalogue.new_row(kind, f'{kind}{number}')
+        row = catalogue.new_row(kind, catalogue.next_row_name(kind,
+                                                              self._rows))
         if tags:
             row['tags'] = list(tags)
         self._rows.append(row)
@@ -177,6 +185,54 @@ class EntityControlsPanel(QWidget):
         if 0 <= index < len(self._rows):
             self._rows.pop(index)
             self._changed()
+
+    # -- the viewport picker (GM7) -------------------------------------------- #
+
+    def set_picker(self, picker) -> None:
+        """Take picks from *picker* (``pickFor(filter) -> bool``, the signal
+        ``pickAccepted`` and ``status()``); by default the application's one
+        Pick tool."""
+        if self._picker is not None:
+            try:
+                self._picker.pickAccepted.disconnect(self._on_picked)
+            except (RuntimeError, TypeError):
+                pass
+        self._picker = picker
+        picker.pickAccepted.connect(self._on_picked)
+
+    def _pick_tool(self):
+        if self._picker is None:
+            self.set_picker(SharedPick('gmsh.entity_controls', parent=self))
+        return self._picker
+
+    def request_pick(self, row_index: int | None = None) -> bool:
+        """Pick the entities of a row in the viewport (the Pick button)."""
+        index = self._table.currentRow() if row_index is None else row_index
+        if not 0 <= index < len(self._rows):
+            return False
+        row = self._rows[index]
+        kind = catalogue.KINDS[row['kind']]
+        dim = row.get('dim')
+        if dim not in kind.dims:
+            dim = kind.dims[0]
+        self._pick_row = (index, dim)
+        tool = self._pick_tool()
+        if not tool.pickFor(DIM_FILTERS[dim]):
+            self._pick_row = None
+            status = getattr(tool, 'status', lambda: '')()
+            self._show_problem(status or self.tr('Nothing can be picked yet.'))
+            return False
+        self._show_problem('')
+        return True
+
+    def _on_picked(self, chosen) -> None:
+        target, self._pick_row = self._pick_row, None
+        if target is None:
+            return
+        index, dim = target
+        tags = [int(entity[1]) for entity in chosen if int(entity[0]) == dim]
+        if tags:
+            self.set_tags(tags, index)
 
     def set_tags(self, tags, row_index: int | None = None) -> None:
         """Fill the entity box of a row (the viewport picker uses this)."""
@@ -260,7 +316,17 @@ class EntityControlsPanel(QWidget):
         tags.setText(', '.join(str(t) for t in row.get('tags') or []))
         tags.editingFinished.connect(
             lambda r=row, e=tags: self._set_tags_text(r, e.text()))
-        self._form.addRow(self.tr('Entity tags'), tags)
+        host = QWidget(self)
+        box = QHBoxLayout(host)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(tags, 1)
+        pick = QPushButton(self.tr('Pick'), host)
+        pick.setObjectName('gmshEntityControlPick')
+        pick.setAccessibleName(self.tr('Pick the entities in the viewport'))
+        pick.clicked.connect(
+            lambda _c=False, r=row: self.request_pick(self._rows.index(r)))
+        box.addWidget(pick)
+        self._form.addRow(self.tr('Entity tags'), host)
         for spec in kind.params:
             editor = self._editor(row, spec)
             editor.setToolTip(spec.help)
@@ -339,3 +405,82 @@ class EntityControlsPanel(QWidget):
     def _show_problem(self, text: str) -> None:
         self._problem.setText(text)
         self._problem.setVisible(bool(text))
+
+    # -- the local API (Plan 48 PA2) ------------------------------------------ #
+
+    def problemText(self) -> str:
+        """The red line under the rows: why they cannot be applied ('' = none)."""
+        return self._problem.text() if not self._problem.isHidden() else ''
+
+    def helpText(self) -> str:
+        return self._help.text()
+
+    def summaryText(self) -> str:
+        return self._summary.text()
+
+    def currentRow(self) -> int:
+        return self._table.currentRow()
+
+    def api(self):
+        return self._api
+
+    def registerApi(self) -> bool:
+        """Tell the case session this panel is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import pa2_routes
+
+        session = pa2_routes.case_session_of(self._client)
+        if session is None:
+            return False
+        pa2_routes.register(session, pa2_routes.ENTITY_CONTROLS_ATTRIBUTE,
+                            self._api)
+        self._api_session = session
+        self.destroyed.connect(
+            lambda *_a, s=session, a=self._api: pa2_routes.unregister(
+                s, pa2_routes.ENTITY_CONTROLS_ATTRIBUTE, a))
+        return True
+
+
+class EntityControlsApi:
+    """What the Entity controls panel does for the local API.
+
+    Methods run on the GUI thread and refuse with ``ValueError(reason)``;
+    ``core/facade/plan48/pa2_routes.py`` calls them.
+    """
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def _gui(self, function, *args):
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+        return on_gui_thread(function, *args)
+
+    def state(self) -> dict:
+        def read():
+            panel = self._panel
+            return {'rows': panel.rows(), 'dirty': panel.is_dirty,
+                    'summary': panel.summaryText(),
+                    'problem': panel.problemText(), 'help': panel.helpText(),
+                    'current_row': panel.currentRow(),
+                    'pending_text': catalogue.rows_to_text(panel.rows())}
+        return self._gui(read)
+
+    def check(self) -> dict:
+        def read():
+            reason = self._panel.check()
+            return {'ok': not reason, 'reason': reason}
+        return self._gui(read)
+
+    def pick(self, row_index=None) -> dict:
+        """The Pick button of a row: the entities arrive when the one Pick
+        tool accepts (``gmsh.entities.pick``)."""
+        def run():
+            panel = self._panel
+            started = panel.request_pick(row_index)
+            if not started:
+                raise ValueError(panel.problemText() or
+                                 'there is no such control row to pick for')
+            return {'started': True, 'row': (panel.currentRow()
+                                             if row_index is None
+                                             else int(row_index))}
+        return self._gui(run)
+

@@ -51,8 +51,7 @@ from foammesh.core.naming import humanise_option
 from foammesh.view.main_window.command_palette import KIND_ACTION, PaletteEntry
 
 #: Gmsh's keys for the Mesh module's first three buttons -> our action id.
-GMSH_SHORTCUTS = {'1': 'generate1d', '2': 'generate2d', '3': 'generate3d',
-                  'F2': 'generate2d', 'F3': 'generate3d'}
+GMSH_SHORTCUTS = actions.SHORTCUTS
 
 #: The page the Generate actions live on.
 GENERATE_TASK = 'gmsh.compute'
@@ -295,6 +294,15 @@ def window_entries(window) -> list:
 # the window-wide keys of gmsh_keys.py
 # --------------------------------------------------------------------------- #
 
+#: The tier headers that are sections of the Gmsh tool dock now (Plan 48 DK):
+#: ``{header object name: dock section key}``.
+DOCK_SECTIONS = {
+    'gmshDisplayHeader': 'visibility',
+    'gmshPluginsHeader': 'plugin_views',
+    'gmshEntityHeader': 'entities',
+}
+
+
 def _show_row(window, task_id: str):
     """Bring the Gmsh row *task_id* forward; its page, or ``None``."""
     pages = gmsh_pages(window)
@@ -338,15 +346,19 @@ def activate_key(window, binding) -> bool:
             return False
         show()
         return True
-    if kind == keys.TIER and binding[2] == keys.DISPLAY:
-        # Plan 43 LY13 D11: the Visibility and display options are in the
-        # side rail, not on a page -- since Plan 45 N in its Show elements
-        # popover (the Display popover is gone).
-        rail = getattr(window, '_viewportRail', None)
-        if rail is None or not gmsh_route_active(window):
+    if kind == keys.TIER and binding[2] in DOCK_SECTIONS:
+        # Plan 48 DK: the Entities, Visibility and display and Plugin views
+        # panels are sections of the Gmsh tool dock in the side rail (the
+        # Visibility panel was in the Show elements popover before, and the
+        # other two were closed tiers on the Geometry and Generate rows).
+        mount = getattr(window, '_gmshTools', None)
+        if mount is not None and gmsh_route_active(window):
+            if binding[2] != keys.DISPLAY and _show_row(
+                    window, binding[1]) is None:
+                return False
+            return bool(mount.reveal_section(DOCK_SECTIONS[binding[2]]))
+        if binding[2] == keys.DISPLAY:
             return False
-        rail.open('elements')
-        return True
     page = _show_row(window, binding[1])
     if page is None:
         return False

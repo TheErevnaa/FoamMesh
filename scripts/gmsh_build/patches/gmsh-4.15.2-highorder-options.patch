@@ -1,0 +1,139 @@
+diff -ru a/src/common/Context.h b/src/common/Context.h
+--- a/src/common/Context.h	2026-10-22 21:27:57.334847572 +0400
++++ b/src/common/Context.h	2026-10-22 21:27:57.334847572 +0400
+@@ -39,6 +39,8 @@
+   int hoOptimize, hoPeriodic, hoNLayers, hoPrimSurfMesh, hoIterMax, hoPassMax;
+   int hoDistCAD, hoSavePeriodic, hoFixBndNodes, hoSkipQualityCheck;
+   double hoThresholdMin, hoThresholdMax, hoPoissonRatio;
++  int hoStrategy, hoMaxAdaptBlob, hoAdaptBlobLayerFact;
++  double hoWeight, hoDistanceFactor, hoAdaptBlobDistFact;
+   bool hoNewFastCurvingAlgo;
+   int hoCurveOuterBL;
+   double hoMaxRho, hoMaxAngle, hoMaxInnerAngle;
+diff -ru a/src/common/DefaultOptions.h b/src/common/DefaultOptions.h
+--- a/src/common/DefaultOptions.h	2026-10-22 21:27:57.334847572 +0400
++++ b/src/common/DefaultOptions.h	2026-10-22 21:27:57.344847567 +0400
+@@ -1232,12 +1232,24 @@
+   { F|O, "Hexahedra" , opt_mesh_hexahedra , 1. ,
+     "Display mesh hexahedra?" },
+ 
++  { F|O, "HighOrderAdaptBlobDistFactor", opt_mesh_ho_adapt_blob_dist_fact, 2.,
++    "Growth factor of the distance factor between patch adaptation iterations "
++    "in high-order optimization (strategy 1)"},
++  { F|O, "HighOrderAdaptBlobLayerFactor", opt_mesh_ho_adapt_blob_layer_fact, 2,
++    "Growth factor of the number of layers between patch adaptation iterations "
++    "in high-order optimization (strategy 1)"},
++  { F|O, "HighOrderDistanceFactor", opt_mesh_ho_distance_factor, 12.,
++    "Elements further than this factor times the maximum distance to the "
++    "straight-sided element are not optimized in high-order optimization"},
+   { F|O, "HighOrderDistCAD", opt_mesh_ho_dist_cad, 0,
+     "Try to optimize distance to CAD in high-order optimizer?"},
+   { F|O, "HighOrderFixBoundaryNodes", opt_mesh_ho_fix_bnd_nodes, 0,
+     "Fix all (1) or periodic (2) boundary nodes during high-order optimization?"},
+   { F|O, "HighOrderIterMax", opt_mesh_ho_iter_max, 100,
+     "Maximum number of iterations in high-order optimization pass"},
++  { F|O, "HighOrderMaxAdaptBlob", opt_mesh_ho_max_adapt_blob, 2,
++    "Maximum number of patch adaptation iterations in high-order optimization "
++    "(strategy 1)"},
+   { F|O, "HighOrderNumLayers", opt_mesh_ho_nlayers, 6.,
+     "Number of layers around a problematic element to consider for high-order "
+     "optimization, or number of element layers to consider in the boundary "
+@@ -1254,12 +1266,17 @@
+   { F|O, "HighOrderPoissonRatio", opt_mesh_ho_poisson, 0.33,
+     "Poisson ratio of the material used in the elastic smoother for high-order meshes "
+     "(between -1.0 and 0.5, excluded)"},
++  { F|O, "HighOrderStrategy", opt_mesh_ho_strategy, 0,
++    "High-order optimization patch strategy (0: disjoint strong, 1: adaptive "
++    "one-by-one, 2: disjoint weak)"},
+   { F|O, "HighOrderSavePeriodic" , opt_mesh_ho_save_periodic , 0.,
+     "Save high-order nodes in periodic section of MSH files?" },
+   { F|O, "HighOrderPrimSurfMesh", opt_mesh_ho_prim_surf_mesh, 0,
+     "Try to fix flipped surface mesh elements in high-order optimizer?"},
+   { F|O, "HighOrderThresholdMin", opt_mesh_ho_threshold_min, 0.1,
+     "Minimum threshold for high-order element optimization"},
++  { F|O, "HighOrderWeight", opt_mesh_ho_weight, 1.,
++    "Weight on node displacement in high-order optimization"},
+   { F|O, "HighOrderThresholdMax", opt_mesh_ho_threshold_max, 2.0,
+     "Maximum threshold for high-order element optimization"},
+   { F|O, "HighOrderFastCurvingNewAlgo", opt_mesh_ho_fast_new_algo, 0,
+diff -ru a/src/common/Options.cpp b/src/common/Options.cpp
+--- a/src/common/Options.cpp	2026-10-22 21:27:57.334847572 +0400
++++ b/src/common/Options.cpp	2026-10-22 21:27:57.334847572 +0400
+@@ -6440,6 +6440,45 @@
+   return CTX::instance()->mesh.hoSkipQualityCheck;
+ }
+ 
++double opt_mesh_ho_strategy(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) {
++    int s = (int)val;
++    CTX::instance()->mesh.hoStrategy = (s < 0) ? 0 : (s > 2) ? 2 : s;
++  }
++  return CTX::instance()->mesh.hoStrategy;
++}
++
++double opt_mesh_ho_weight(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) CTX::instance()->mesh.hoWeight = val;
++  return CTX::instance()->mesh.hoWeight;
++}
++
++double opt_mesh_ho_distance_factor(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) CTX::instance()->mesh.hoDistanceFactor = val;
++  return CTX::instance()->mesh.hoDistanceFactor;
++}
++
++double opt_mesh_ho_max_adapt_blob(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) CTX::instance()->mesh.hoMaxAdaptBlob = (int)val;
++  return CTX::instance()->mesh.hoMaxAdaptBlob;
++}
++
++double opt_mesh_ho_adapt_blob_layer_fact(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) CTX::instance()->mesh.hoAdaptBlobLayerFact = (int)val;
++  return CTX::instance()->mesh.hoAdaptBlobLayerFact;
++}
++
++double opt_mesh_ho_adapt_blob_dist_fact(OPT_ARGS_NUM)
++{
++  if(action & GMSH_SET) CTX::instance()->mesh.hoAdaptBlobDistFact = val;
++  return CTX::instance()->mesh.hoAdaptBlobDistFact;
++}
++
+ double opt_mesh_second_order_linear(OPT_ARGS_NUM)
+ {
+   if(action & GMSH_SET) {
+diff -ru a/src/common/Options.h b/src/common/Options.h
+--- a/src/common/Options.h	2026-10-22 21:27:57.334847572 +0400
++++ b/src/common/Options.h	2026-10-22 21:27:57.334847572 +0400
+@@ -592,6 +592,12 @@
+ double opt_mesh_ho_max_in_angle(OPT_ARGS_NUM);
+ double opt_mesh_ho_fix_bnd_nodes(OPT_ARGS_NUM);
+ double opt_mesh_ho_skip_quality_check(OPT_ARGS_NUM);
++double opt_mesh_ho_strategy(OPT_ARGS_NUM);
++double opt_mesh_ho_weight(OPT_ARGS_NUM);
++double opt_mesh_ho_distance_factor(OPT_ARGS_NUM);
++double opt_mesh_ho_max_adapt_blob(OPT_ARGS_NUM);
++double opt_mesh_ho_adapt_blob_layer_fact(OPT_ARGS_NUM);
++double opt_mesh_ho_adapt_blob_dist_fact(OPT_ARGS_NUM);
+ double opt_mesh_second_order_linear(OPT_ARGS_NUM);
+ double opt_mesh_second_order_incomplete(OPT_ARGS_NUM);
+ double opt_mesh_cgns_import_order(OPT_ARGS_NUM);
+diff -ru a/src/mesh/Generator.cpp b/src/mesh/Generator.cpp
+--- a/src/mesh/Generator.cpp	2026-10-22 21:27:57.334847572 +0400
++++ b/src/mesh/Generator.cpp	2026-10-22 21:27:57.354847569 +0400
+@@ -968,6 +968,12 @@
+     p.BARRIER_MAX = CTX::instance()->mesh.hoThresholdMax;
+     p.itMax = CTX::instance()->mesh.hoIterMax;
+     p.optPassMax = CTX::instance()->mesh.hoPassMax;
++    p.weight = CTX::instance()->mesh.hoWeight;
++    p.distanceFactor = CTX::instance()->mesh.hoDistanceFactor;
++    p.strategy = CTX::instance()->mesh.hoStrategy;
++    p.maxAdaptBlob = CTX::instance()->mesh.hoMaxAdaptBlob;
++    p.adaptBlobLayerFact = CTX::instance()->mesh.hoAdaptBlobLayerFact;
++    p.adaptBlobDistFact = CTX::instance()->mesh.hoAdaptBlobDistFact;
+     p.fixBndNodes = CTX::instance()->mesh.hoFixBndNodes;
+     p.dim = m->getDim();
+     p.optPrimSurfMesh = CTX::instance()->mesh.hoPrimSurfMesh;

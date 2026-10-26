@@ -142,10 +142,11 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 # how finely a curved edge is walked.
                 'gmsh/globalSizing/minimumCirclePoints',
                 'gmsh/globalSizing/minimumCurvePoints',
-                'gmsh/globalSizing/minimumElementsPerTwoPi',
                 'gmsh/algorithms/surface', 'gmsh/algorithms/volume',
                 'gmsh/algorithms/cellShape',
                 'gmsh/algorithms/algorithmFallback',
+                # Plan 48 D4 (DP-2952). Mesh.MaxRetries, its own number.
+                'gmsh/algorithms/maxRetries',
                 'gmsh/globalSizing/barycentricRefinement',
                 # Plan 31 follow-up. Recombination itself, and the recombiner
                 # it chooses. FC-C shipped splitQuadrangles -- which is only
@@ -157,7 +158,12 @@ GMSH_WORKFLOW = WorkflowDescriptor(
                 'gmsh/algorithms/recombine',
                 'gmsh/algorithms/recombinationAlgorithm',
                 'gmsh/algorithms/splitQuadrangles',
-                'gmsh/parallel/threads')),
+                'gmsh/parallel/threads',
+                # Plan 48 ST (DP-4605). Next to the thread count.
+                'gmsh/parallel/reproducible',
+                # Plan 48 D4 (DP-2952). One count per stage, 0 automatic.
+                'gmsh/parallel/curveThreads', 'gmsh/parallel/surfaceThreads',
+                'gmsh/parallel/volumeThreads')),
         WorkflowTask(
             'gmsh.size_fields', 'Size fields', 30,
             cardinality=TaskCardinality.OPTIONAL,
@@ -872,8 +878,9 @@ class GmshMeshingEngine:
         from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
 
         policy = execution_policy(db)
-        threads = resolve_parallel_threads(
-            policy, requested=_saved_thread_request(db))
+        # Plan 48 ST (DP-4605): "Reproducible (single-thread)" is one thread.
+        threads = (1 if _saved_reproducible(db) else resolve_parallel_threads(
+            policy, requested=_saved_thread_request(db)))
         return write_job(_ResolvedThreads(db, threads), bbox, case_path,
                          prepared_geometry=prepared_geometry,
                          profile=self.resolve_profile())
@@ -923,6 +930,13 @@ def _saved_thread_request(db) -> int:
     except (TypeError, ValueError):
         return 0
     return threads if threads > 1 else 0
+
+
+def _saved_reproducible(db) -> bool:
+    """Plan 48 ST (DP-4605). The case asks for a single-thread, repeatable
+    mesh (``gmsh/parallel/reproducible``)."""
+    parallel = ((_project_data(db).get('gmsh') or {}).get('parallel') or {})
+    return bool(parallel.get('reproducible'))
 
 
 class _ResolvedThreads:

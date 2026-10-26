@@ -1,0 +1,1302 @@
+diff -u -r a/src/automaticMeshSizeField.cpp b/src/automaticMeshSizeField.cpp
+--- a/src/automaticMeshSizeField.cpp	2026-10-10 21:17:13.794148589 +0400
++++ b/src/automaticMeshSizeField.cpp	2026-10-10 21:17:13.804148589 +0400
+@@ -4,12 +4,17 @@
+ // Please report all issues on https://gitlab.onelab.info/gmsh/gmsh/issues.
+ //
+ // Contributed by Arthur Bawin
++//
++// FOAMMESH: lifted from gmsh-4.15.2-source/src/mesh/automaticMeshSizeField.cpp.
++// The forest (octree) functions are upstream's, verbatim. Removed: the
++// GModel -> HXT conversion (Gmsh2Hxt*, getAllFacesOfAllRegions,
++// getAllEdgesOfAllFaces) and the Field subclass (operator(), updateHXT,
++// update), which FoamMesh replaces with surface_io.cpp and
++// foammesh_sizefield.cpp. Debug .pos files are now opt-in. Every change is
++// marked FOAMMESH and listed in ../UPSTREAM.md.
+ 
+ #include "automaticMeshSizeField.h"
+-#include "GModel.h"
+-#include "GRegion.h"
+-#include "GFace.h"
+-#include "GEntity.h"
++// FOAMMESH: GModel.h, GRegion.h, GFace.h, GEntity.h removed (no CAD model here).
+ #include "MVertex.h"
+ #include "MTetrahedron.h"
+ #include "SBoundingBox3d.h"
+@@ -20,13 +25,19 @@
+ 
+ #include <queue>
+ #include <inttypes.h>
++#include <set>
++#include <map>
++#include <algorithm>
++#include <iostream>
++#include <cfloat>
++#include <cassert>
+ 
+ #ifdef HAVE_HXT
+ extern "C" {
+ #include "hxt_tools.h"
+-#include "hxt_edge.h"
++// FOAMMESH: hxt_edge.h (HXT reparam) removed: nothing in this file calls it.
+ #include "hxt_bbox.h"
+-#include "hxt_tetMesh.h"
++// FOAMMESH: hxt_tetMesh.h removed: only the Delaunay subset of HXT tetMesh is built.
+ #include "hxt_tetUtils.h"
+ #include "hxt_tetFlag.h"
+ #include "hxt_tetDelaunay.h"
+@@ -67,346 +78,10 @@
+   fclose(f);
+ }
+ 
+-static HXTStatus getAllFacesOfAllRegions(std::vector<GRegion *> &regions,
+-                                         HXTMesh *m,
+-                                         std::vector<GFace *> &allFaces)
+-{
+-  std::set<GFace *, GEntityPtrLessThan> allFacesSet;
+-  if(m) {
+-    m->brep.numVolumes = regions.size();
+-    HXT_CHECK(hxtAlignedMalloc(&m->brep.numSurfacesPerVolume,
+-                               m->brep.numVolumes * sizeof(uint32_t)));
+-  }
+-  uint32_t to_alloc = 0;
+-  for(std::size_t i = 0; i < regions.size(); i++) {
+-    std::vector<GFace *> const &f = regions[i]->faces();
+-    std::vector<GFace *> const &f_e = regions[i]->embeddedFaces();
+-    if(m) {
+-      m->brep.numSurfacesPerVolume[i] = f.size() + f_e.size();
+-      to_alloc += m->brep.numSurfacesPerVolume[i];
+-    }
+-    allFacesSet.insert(f.begin(), f.end());
+-    allFacesSet.insert(f_e.begin(), f_e.end());
+-  }
+-  allFaces.insert(allFaces.begin(), allFacesSet.begin(), allFacesSet.end());
+-
+-  if(!m) return HXT_STATUS_OK;
+-
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->brep.surfacesPerVolume, to_alloc * sizeof(uint32_t)));
+-
+-  uint32_t counter = 0;
+-  for(std::size_t i = 0; i < regions.size(); i++) {
+-    std::vector<GFace *> const &f = regions[i]->faces();
+-    std::vector<GFace *> const &f_e = regions[i]->embeddedFaces();
+-    for(size_t j = 0; j < f.size(); j++)
+-      m->brep.surfacesPerVolume[counter++] = f[j]->tag();
+-    for(size_t j = 0; j < f_e.size(); j++)
+-      m->brep.surfacesPerVolume[counter++] = f_e[j]->tag();
+-  }
+-
+-  // printf("volume 0 has %d faces\n",m->brep.numSurfacesPerVolume[0]);
+-  // for (int
+-  // i=0;i<m->brep.numSurfacesPerVolume[0];i++)printf("%d",m->brep.surfacesPerVolume[i]);
+-  // printf("\n");
+-
+-  return HXT_STATUS_OK;
+-}
+-
+-static HXTStatus getAllEdgesOfAllFaces(std::vector<GFace *> &faces, HXTMesh *m,
+-                                       std::vector<GEdge *> &allEdges)
+-{
+-  if(m) {
+-    m->brep.numSurfaces = faces.size();
+-    HXT_CHECK(hxtAlignedMalloc(&m->brep.numCurvesPerSurface,
+-                               m->brep.numSurfaces * sizeof(uint32_t)));
+-  }
+-  uint32_t to_alloc = 0;
+-
+-  std::set<GEdge *, GEntityPtrLessThan> allEdgesSet;
+-  for(std::size_t i = 0; i < faces.size(); i++) {
+-    std::vector<GEdge *> const &f = faces[i]->edges();
+-    std::vector<GEdge *> const &f_e = faces[i]->embeddedEdges();
+-    if(m) {
+-      m->brep.numCurvesPerSurface[i] = f.size() + f_e.size();
+-      to_alloc += m->brep.numCurvesPerSurface[i];
+-    }
+-    allEdgesSet.insert(f.begin(), f.end());
+-    allEdgesSet.insert(f_e.begin(), f_e.end());
+-  }
+-  allEdges.insert(allEdges.begin(), allEdgesSet.begin(), allEdgesSet.end());
+-
+-  if(!m) return HXT_STATUS_OK;
+-
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->brep.curvesPerSurface, to_alloc * sizeof(uint32_t)));
+-
+-  uint32_t counter = 0;
+-  for(std::size_t i = 0; i < faces.size(); i++) {
+-    std::vector<GEdge *> const &f = faces[i]->edges();
+-    std::vector<GEdge *> const &f_e = faces[i]->embeddedEdges();
+-    for(size_t j = 0; j < f.size(); j++)
+-      m->brep.curvesPerSurface[counter++] = f[j]->tag();
+-    for(size_t j = 0; j < f_e.size(); j++)
+-      m->brep.curvesPerSurface[counter++] = f_e[j]->tag();
+-  }
+-  return HXT_STATUS_OK;
+-}
+-
+-HXTStatus Gmsh2Hxt(std::vector<GRegion *> &regions, HXTMesh *m,
+-                   std::map<MVertex *, uint32_t> &v2c,
+-                   std::vector<MVertex *> &c2v);
+-
+-HXTStatus Gmsh2Hxt(std::vector<GFace *> &faces, HXTMesh *m,
+-                   std::map<MVertex *, uint32_t> &v2c,
+-                   std::vector<MVertex *> &c2v)
+-{
+-  std::vector<GEdge *> edges;
+-  HXT_CHECK(getAllEdgesOfAllFaces(faces, m, edges));
+-  std::set<MVertex *> all;
+-
+-  uint64_t ntri = 0;
+-  uint64_t nedg = 0;
+-
+-  for(size_t j = 0; j < edges.size(); j++) {
+-    GEdge *ge = edges[j];
+-    nedg += ge->lines.size();
+-    for(size_t i = 0; i < ge->lines.size(); i++) {
+-      all.insert(ge->lines[i]->getVertex(0));
+-      all.insert(ge->lines[i]->getVertex(1));
+-    }
+-  }
+-
+-  for(size_t j = 0; j < faces.size(); j++) {
+-    GFace *gf = faces[j];
+-    ntri += gf->triangles.size();
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      all.insert(gf->triangles[i]->getVertex(0));
+-      all.insert(gf->triangles[i]->getVertex(1));
+-      all.insert(gf->triangles[i]->getVertex(2));
+-    }
+-  }
+-
+-  m->vertices.num = m->vertices.size = all.size();
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->vertices.coord, 4 * m->vertices.num * sizeof(double)));
+-
+-  size_t count = 0;
+-  c2v.resize(all.size());
+-  // for(auto it = all.begin(); it != all.end(); it++)
+-  // {
+-  //   m->vertices.coord[4 * count + 0] = (*it)->x();
+-  //   m->vertices.coord[4 * count + 1] = (*it)->y();
+-  //   m->vertices.coord[4 * count + 2] = (*it)->z();
+-  //   m->vertices.coord[4 * count + 3] = 0.0;
+-  //   v2c[*it] = count;
+-  //   c2v[count++] = *it;
+-  // }
+-  for(MVertex *v : all) {
+-    m->vertices.coord[4 * count + 0] = v->x();
+-    m->vertices.coord[4 * count + 1] = v->y();
+-    m->vertices.coord[4 * count + 2] = v->z();
+-    m->vertices.coord[4 * count + 3] = 0;
+-    // if(CTX::instance()->mesh.lcFromPoints) { // size on embedded points in
+-    // volume
+-    //   auto it = vlc.find(v);
+-    //   if(it != vlc.end())
+-    //     m->vertices.coord[4 * count + 3] = it->second;
+-    // }
+-    v2c[v] = count;
+-    c2v[count++] = v;
+-  }
+-  all.clear();
+-
+-  m->lines.num = m->lines.size = nedg;
+-  uint64_t index = 0;
+-
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->lines.node, (m->lines.num) * 2 * sizeof(uint32_t)));
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->lines.color, (m->lines.num) * sizeof(uint32_t)));
+-
+-  for(size_t j = 0; j < edges.size(); j++) {
+-    GEdge *ge = edges[j];
+-    for(size_t i = 0; i < ge->lines.size(); i++) {
+-      m->lines.node[2 * index + 0] = v2c[ge->lines[i]->getVertex(0)];
+-      m->lines.node[2 * index + 1] = v2c[ge->lines[i]->getVertex(1)];
+-      m->lines.color[index] = ge->tag();
+-      index++;
+-    }
+-  }
+-
+-  m->triangles.num = m->triangles.size = ntri;
+-  HXT_CHECK(hxtAlignedMalloc(&m->triangles.node,
+-                             (m->triangles.num) * 3 * sizeof(uint32_t)));
+-  HXT_CHECK(hxtAlignedMalloc(&m->triangles.color,
+-                             (m->triangles.num) * sizeof(uint32_t)));
+-
+-  index = 0;
+-  for(size_t j = 0; j < faces.size(); j++) {
+-    GFace *gf = faces[j];
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      m->triangles.node[3 * index + 0] = v2c[gf->triangles[i]->getVertex(0)];
+-      m->triangles.node[3 * index + 1] = v2c[gf->triangles[i]->getVertex(1)];
+-      m->triangles.node[3 * index + 2] = v2c[gf->triangles[i]->getVertex(2)];
+-      m->triangles.color[index] = gf->tag();
+-      index++;
+-    }
+-  }
+-  return HXT_STATUS_OK;
+-}
+-
+-// HXTStatus Gmsh2Hxt(std::vector<GRegion *> &regions, HXTMesh *m,
+-// std::map<MVertex *, uint32_t> &v2c, std::vector<MVertex *> &c2v);
+-
+-// HXTStatus Gmsh2Hxt(std::vector<GFace *> &faces, HXTMesh *m, std::map<MVertex
+-// *, uint32_t> &v2c, std::vector<MVertex *> &c2v);
+-
+-HXTStatus Gmsh2HxtLocal(std::vector<GFace *> &faces, HXTMesh *m,
+-                        std::map<MVertex *, uint32_t> &v2c,
+-                        std::vector<MVertex *> &c2v)
+-{
+-  std::vector<GEdge *> edges;
+-  HXT_CHECK(getAllEdgesOfAllFaces(faces, m, edges));
+-  std::set<MVertex *> all;
+-
+-  uint64_t ntri = 0;
+-  uint64_t nedg = 0;
+-
+-  for(size_t j = 0; j < edges.size(); j++) {
+-    GEdge *ge = edges[j];
+-    nedg += ge->lines.size();
+-    for(size_t i = 0; i < ge->lines.size(); i++) {
+-      // all.insert(ge->lines[i]->getVertex(0));
+-      // all.insert(ge->lines[i]->getVertex(1));
+-    }
+-  }
+-
+-  for(size_t j = 0; j < faces.size(); j++) {
+-    GFace *gf = faces[j];
+-    ntri += gf->triangles.size();
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      all.insert(gf->triangles[i]->getVertex(0));
+-      all.insert(gf->triangles[i]->getVertex(1));
+-      all.insert(gf->triangles[i]->getVertex(2));
+-    }
+-  }
+-
+-  // printf("%d vertices %d triangles\n",all.size(),ntri);
+-
+-  m->vertices.num = m->vertices.size = all.size();
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->vertices.coord, 4 * m->vertices.num * sizeof(double)));
+-
+-  size_t count = 0;
+-  c2v.resize(all.size());
+-  for(auto it = all.begin(); it != all.end(); it++) {
+-    m->vertices.coord[4 * count + 0] = (*it)->x();
+-    m->vertices.coord[4 * count + 1] = (*it)->y();
+-    m->vertices.coord[4 * count + 2] = (*it)->z();
+-    m->vertices.coord[4 * count + 3] = 0.0;
+-    v2c[*it] = count;
+-    c2v[count++] = *it;
+-  }
+-  all.clear();
+-
+-  m->lines.num = m->lines.size = nedg;
+-  uint64_t index = 0;
+-
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->lines.node, (m->lines.num) * 2 * sizeof(uint32_t)));
+-  HXT_CHECK(
+-    hxtAlignedMalloc(&m->lines.color, (m->lines.num) * sizeof(uint32_t)));
+-
+-  for(size_t j = 0; j < edges.size(); j++) {
+-    GEdge *ge = edges[j];
+-    for(size_t i = 0; i < ge->lines.size(); i++) {
+-      m->lines.node[2 * index + 0] = v2c[ge->lines[i]->getVertex(0)];
+-      m->lines.node[2 * index + 1] = v2c[ge->lines[i]->getVertex(1)];
+-      m->lines.color[index] = ge->tag();
+-      index++;
+-    }
+-  }
+-
+-  m->triangles.num = m->triangles.size = ntri;
+-  HXT_CHECK(hxtAlignedMalloc(&m->triangles.node,
+-                             (m->triangles.num) * 3 * sizeof(uint32_t)));
+-  HXT_CHECK(hxtAlignedMalloc(&m->triangles.color,
+-                             (m->triangles.num) * sizeof(uint32_t)));
+-
+-  index = 0;
+-  for(size_t j = 0; j < faces.size(); j++) {
+-    GFace *gf = faces[j];
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      m->triangles.node[3 * index + 0] = v2c[gf->triangles[i]->getVertex(0)];
+-      m->triangles.node[3 * index + 1] = v2c[gf->triangles[i]->getVertex(1)];
+-      m->triangles.node[3 * index + 2] = v2c[gf->triangles[i]->getVertex(2)];
+-      m->triangles.color[index] = gf->tag();
+-      index++;
+-    }
+-  }
+-  return HXT_STATUS_OK;
+-}
+-
+-HXTStatus Gmsh2HxtGlobal(std::vector<GFace *> &faces, HXTMesh *m,
+-                         std::map<MVertex *, uint32_t> &v2c,
+-                         std::vector<MVertex *> &c2v)
+-{
+-  std::vector<GEdge *> edges;
+-  HXT_CHECK(getAllEdgesOfAllFaces(faces, m, edges));
+-  std::set<MVertex *> all;
+-
+-  uint64_t cumsum = 0;
+-  uint64_t cumsumNoEdges = 0;
+-  for(size_t j = 0; j < edges.size(); j++) {
+-    GEdge *ge = edges[j];
+-    cumsum += ge->lines.size();
+-    for(size_t i = 0; i < ge->lines.size(); i++) {
+-      all.insert(ge->lines[i]->getVertex(0));
+-      all.insert(ge->lines[i]->getVertex(1));
+-    }
+-  }
+-
+-  for(size_t j = 0; j < faces.size(); j++) {
+-    GFace *gf = faces[j];
+-    cumsum += gf->triangles.size();
+-    cumsumNoEdges += gf->triangles.size();
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      all.insert(gf->triangles[i]->getVertex(0));
+-      all.insert(gf->triangles[i]->getVertex(1));
+-      all.insert(gf->triangles[i]->getVertex(2));
+-    }
+-  }
+-
+-  c2v.resize(cumsum);
+-  all.clear();
+-
+-  cumsum = 0;
+-  size_t count_c2v2 = 0;
+-  for(size_t j = 0; j < faces.size(); ++j) {
+-    // all propre à la face
+-    GFace *gf = faces[j];
+-    cumsum += gf->triangles.size();
+-    for(size_t i = 0; i < gf->triangles.size(); i++) {
+-      all.insert(gf->triangles[i]->getVertex(0));
+-      all.insert(gf->triangles[i]->getVertex(1));
+-      all.insert(gf->triangles[i]->getVertex(2));
+-    }
+-    size_t count = 0;
+-    for(auto it = all.begin(); it != all.end(); it++) {
+-      v2c[*it] = count++;
+-      c2v[count_c2v2++] = *it;
+-    }
+-    all.clear();
+-  }
+-
+-  return HXT_STATUS_OK;
+-}
+-
+-/* ======================================================================================
+-   Functions from hxt_octree
+-   ======================================================================================
+- */
++// FOAMMESH: upstream lines 70-410 removed here: getAllFacesOfAllRegions,
++// getAllEdgesOfAllFaces, Gmsh2Hxt, Gmsh2HxtLocal, Gmsh2HxtGlobal built the
++// HXTMesh from a Gmsh GModel. FoamMesh builds it from STL files in
++// surface_io.cpp.
+ 
+ static bool rtreeCallback(uint64_t id, void *ctx)
+ {
+@@ -623,8 +298,16 @@
+   /* Initialize MPI; see sc_mpi.h.
+    * If configure --enable-mpi is given these are true MPI calls.
+    * Else these are dummy functions that simulate a single-processor run. */
+-  mpiret = sc_MPI_Init(&argc, &argv);
+-  SC_CHECK_MPI(mpiret);
++  // FOAMMESH: the driver may have initialised MPI already (to set the sc
++  // and p4est log levels before any p4est call); only initialise it once.
++  int mpiInitialised = 0;
++#ifdef SC_ENABLE_MPI
++  MPI_Initialized(&mpiInitialised);
++#endif
++  if(!mpiInitialised) {
++    mpiret = sc_MPI_Init(&argc, &argv);
++    SC_CHECK_MPI(mpiret);
++  }
+   mpicomm = sc_MPI_COMM_WORLD;
+ 
+   /* These functions are optional.  If called they store the MPI rank as a
+@@ -671,8 +354,7 @@
+    * This should be called if sc_init () has been called earlier. */
+   // sc_finalize();
+   /* This is standard MPI programs.  Without --enable-mpi, this is a dummy. */
+-  int mpiret = sc_MPI_Finalize();
+-  SC_CHECK_MPI(mpiret);
++  // FOAMMESH: MPI is finalised by the driver, after the forest is gone.
+ 
+   HXT_CHECK(hxtFree(forest));
+ 
+@@ -1021,25 +703,31 @@
+   p4est_balance_ext(forest->p4est, P4EST_CONNECT_FACE, initializeCell, nullptr);
+   // Assign size on the new cells
+ 
+-  forest->forestOptions->file1 = fopen("nonNorme.pos", "w");
+-  if(forest->forestOptions->file1 == nullptr)
+-    return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
+-  forest->forestOptions->file2 = fopen("norme.pos", "w");
+-  if(forest->forestOptions->file2 == nullptr)
+-    return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
+-
+-  fprintf(forest->forestOptions->file1, "View \"nonNorme\" {\n");
+-  fprintf(forest->forestOptions->file2, "View \"norme\" {\n");
++  // FOAMMESH: upstream always opened nonNorme.pos / norme.pos in the working
++  // directory (nothing is written to them in 4.15.2: the writes in
++  // assignSizeAfterRefinement are commented out). Opt-in, in debugDir.
++  ForestOptions *fo = forest->forestOptions;
++  if(fo->debugPos) {
++    std::string d = fo->debugDir ? std::string(fo->debugDir) + "/" : "";
++    fo->file1 = fopen((d + "nonNorme.pos").c_str(), "w");
++    if(fo->file1 == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
++    fo->file2 = fopen((d + "norme.pos").c_str(), "w");
++    if(fo->file2 == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
++    fprintf(fo->file1, "View \"nonNorme\" {\n");
++    fprintf(fo->file2, "View \"norme\" {\n");
++  }
+ 
+   p4est_iterate(forest->p4est, nullptr, forest->forestOptions,
+                 assignSizeAfterRefinement, nullptr, nullptr, nullptr);
+   // p4est_iterate(forest->p4est, NULL, forest->forestOptions,
+   // assignSizeAfterRefinementAniso, NULL, NULL, NULL);
+ 
+-  fprintf(forest->forestOptions->file1, "};");
+-  fclose(forest->forestOptions->file1);
+-  fprintf(forest->forestOptions->file2, "};");
+-  fclose(forest->forestOptions->file2);
++  if(fo->debugPos) {
++    fprintf(fo->file1, "};");
++    fclose(fo->file1);
++    fprintf(fo->file2, "};");
++    fclose(fo->file2);
++  }
+ 
+   return HXT_STATUS_OK;
+ }
+@@ -1967,12 +1655,18 @@
+   std::set<MEdge, MEdgeLessThan> axis;
+   int elemDrawn = 0;
+ 
+-  FILE *file = fopen("medialAxis_toDraw.pos", "w");
+-  if(file == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
+-  FILE *file2 = fopen("keptEdges.pos", "w");
+-  if(file2 == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
+-
+-  bool draw = true;
++  // FOAMMESH: the medial-axis drawings were always written to the working
++  // directory; now only with debugPos, into debugDir.
++  bool draw = forest->forestOptions->debugPos != 0;
++  FILE *file = nullptr, *file2 = nullptr;
++  if(draw) {
++    std::string d = forest->forestOptions->debugDir ?
++      std::string(forest->forestOptions->debugDir) + "/" : "";
++    file = fopen((d + "medialAxis_toDraw.pos").c_str(), "w");
++    if(file == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
++    file2 = fopen((d + "keptEdges.pos").c_str(), "w");
++    if(file2 == nullptr) return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
++  }
+   if(draw) {
+     fprintf(file, "View \"medialAxis\" {\n");
+     fprintf(file2, "View \"keptEdges\" {\n");
+@@ -2084,6 +1778,7 @@
+               sizeAtVertices[v0] = fmin(h, sizeAtVertices[v0]);
+               sizeAtVertices[v1] = fmin(h, sizeAtVertices[v1]);
+ 
++              if(draw)
+               fprintf(file2, "SL(%f,%f,%f, %f,%f,%f){%f,%f};\n",
+                       e.getVertex(0)->x(), e.getVertex(0)->y(),
+                       e.getVertex(0)->z(), e.getVertex(1)->x(),
+@@ -2144,6 +1839,8 @@
+   if(draw) {
+     fprintf(file, "};");
+     fclose(file);
++    fprintf(file2, "};");
++    fclose(file2);
+   }
+ 
+   // // Assign feature size in the octree cells
+@@ -2162,6 +1859,10 @@
+     (*forest->forestOptions->featureSizeAtVertices)[i] = sizeAtVertices[i];
+   }
+ 
++  // FOAMMESH: upstream leaked the MVertex / MTetrahedron objects.
++  for(MTetrahedron *t : allTets) delete t;
++  for(MVertex *v : allVertices) delete v;
++
+   return HXT_STATUS_OK;
+ }
+ 
+@@ -2334,7 +2035,10 @@
+   p4est_iterate(forest->p4est, nullptr, &cellCenters, assignDirections, nullptr,
+                 nullptr, nullptr);
+ 
+-  forest->forestOptions->file3 = fopen("directions.pos", "w");
++  // FOAMMESH: into debugDir instead of the working directory.
++  std::string dirFile = (forest->forestOptions->debugDir ?
++    std::string(forest->forestOptions->debugDir) + "/" : "") + "directions.pos";
++  forest->forestOptions->file3 = fopen(dirFile.c_str(), "w");
+   if(forest->forestOptions->file3 == nullptr)
+     return HXT_ERROR(HXT_STATUS_FILE_CANNOT_BE_OPENED);
+ 
+@@ -2452,508 +2156,86 @@
+   return HXT_STATUS_OK;
+ }
+ 
+-#endif
+ 
+-/* ======================================================================================
+-   End functions from hxt_octree
+-   ======================================================================================
+- */
+-
+-double automaticMeshSizeField::operator()(double X, double Y, double Z,
+-                                          GEntity *ge)
+-{
+-  double val = 1.e17;
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-  HXTStatus s = forestSearchOne(forest, X, Y, Z, &val, true);
+-  if(s == HXT_STATUS_OK) { return val; }
+-  else
+-    Msg::Error("Cannot find point %g %g %g in the octree", X, Y, Z);
+-#else
+-  Msg::Error("Gmsh has to be compiled with HXT and P4EST for using "
+-             "automaticMeshSizeField");
+-#endif
+-  return val;
+-}
+-
+-void automaticMeshSizeField::operator()(double X, double Y, double Z,
+-                                        SMetric3 &m, GEntity *ge)
+-{
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-  HXTStatus s = forestSearchOneAniso(forest, X, Y, Z, m, false);
+-  if(fabs(m.determinant()) < 1e-13) m = SMetric3();
+-  m.print("m");
+-  if(s != HXT_STATUS_OK)
+-    Msg::Error("Cannot find point %g %g %g in the octree", X, Y, Z);
+-#else
+-  Msg::Error("Gmsh has to be compiled with HXT and P4EST for using "
+-             "automaticMeshSizeField");
+-#endif
+-}
++// FOAMMESH: collect every leaf (center, edge length, prescribed size, level,
++// corner points) so the driver can write the octree as a .vtu and estimate
++// per region. Corner points are shared between leaves: they are keyed by
++// their integer octree coordinates, which are exact, so the written grid is
++// a connected hexahedral mesh, not eight points per leaf.
++#include <unordered_map>
++struct forest_collect_ctx {
++  std::vector<forest_leaf_t> *leaves;
++  std::vector<double> *points;
++  std::unordered_map<uint64_t, uint32_t> index; // packed (x,y,z) -> point
++};
+ 
+-automaticMeshSizeField::~automaticMeshSizeField()
++static void collectLeafCallback(p4est_iter_volume_info_t *info, void *user_data)
+ {
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-  if(forest) forestDelete(&forest);
+-  if(forestOptions) forestOptionsDelete(&forestOptions);
+-#endif
++  p4est_quadrant_t *q = info->quad;
++  size_data_t *data = (size_data_t *)q->p.user_data;
++  forest_collect_ctx *ctx = (forest_collect_ctx *)user_data;
++  forest_leaf_t leaf;
++  getCellCenter(info->p4est, info->treeid, q, leaf.center);
++  leaf.h = data->h;
++  leaf.size = data->size;
++  leaf.level = q->level;
++  leaf.xyz[0] = q->x;
++  leaf.xyz[1] = q->y;
++  leaf.xyz[2] = q->z;
++  for(int k = 0; k < 6; ++k) leaf.m[k] = 0.0;
++  p4est_qcoord_t len = P4EST_QUADRANT_LEN(q->level);
++  // VTK_HEXAHEDRON order: (0,0,0) (1,0,0) (1,1,0) (0,1,0) then z = 1
++  static const int d[8][3] = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
++                              {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}};
++  for(int c = 0; c < 8; ++c) {
++    p4est_qcoord_t x = q->x + d[c][0] * len, y = q->y + d[c][1] * len,
++                   z = q->z + d[c][2] * len;
++    // corner coordinates run 0..P4EST_ROOT_LEN = 2^P4EST_MAXLEVEL per axis
++    // (2^19 for p8est), so 21 bits per axis pack exactly into one 64-bit key
++    static_assert(P4EST_MAXLEVEL <= 20, "corner key packs 21 bits per axis");
++    uint64_t key = ((uint64_t)x << 42) | ((uint64_t)y << 21) | (uint64_t)z;
++    auto it = ctx->index.find(key);
++    if(it == ctx->index.end()) {
++      double v[3];
++      p4est_qcoord_to_vertex(info->p4est->connectivity, info->treeid, x, y, z, v);
++      uint32_t id = (uint32_t)(ctx->points->size() / 3);
++      ctx->points->push_back(v[0]);
++      ctx->points->push_back(v[1]);
++      ctx->points->push_back(v[2]);
++      it = ctx->index.emplace(key, id).first;
++    }
++    leaf.corner[c] = it->second;
++  }
++  ctx->leaves->push_back(leaf);
++}
++
++HXTStatus forestCollectLeaves(Forest *forest,
++                              std::vector<forest_leaf_t> *leaves,
++                              std::vector<double> *points)
++{
++  forest_collect_ctx ctx;
++  ctx.leaves = leaves;
++  ctx.points = points;
++  p4est_iterate(forest->p4est, nullptr, (void *)&ctx, collectLeafCallback,
++                nullptr, nullptr, nullptr);
++  return HXT_STATUS_OK;
+ }
+ 
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-HXTStatus automaticMeshSizeField::updateHXT()
++HXTStatus forestRootCube(Forest *forest, double origin[3], double *length)
+ {
+-  if(!updateNeeded) return HXT_STATUS_OK;
+-
+-  if(forestOptions) HXT_CHECK(forestOptionsDelete(&forestOptions));
+-  if(forest) HXT_CHECK(forestDelete(&forest));
+-
+-  updateNeeded = false;
+-
+-  if(!_forestFile.empty()) {
+-    // Load .p4est file if given a valid file name
+-    Msg::Info("Loading size field from %s", _forestFile.c_str());
+-    HXT_CHECK(forestOptionsCreate(&forestOptions));
+-    size_t lastindex = _forestFile.find_last_of(".");
+-    std::string root = _forestFile.substr(0, lastindex);
+-    std::string forestFile = root + ".p4est";
+-    std::string dataFile = root + ".data";
+-    HXT_CHECK(
+-      forestLoad(&forest, forestFile.c_str(), dataFile.c_str(), forestOptions));
+-  }
+-  else {
+-    // Compute the size field otherwise
+-    int dim = GModel::current()->getDim();
+-
+-    HXT_CHECK(forestOptionsCreate(&forestOptions));
+-
+-    Msg::Info("Gradation = %f\n", _gradation);
+-    Msg::Info("Node density = %d\n", _nPointsPerCircle);
+-    if(dim == 3) {
+-      if(_nPointsPerGap > 0) {
+-        Msg::Info("Layers per gap = %d\n", _nPointsPerGap);
+-      }
+-      else {
+-        Msg::Info("Layers per gap = %d : not detecting features.\n",
+-                  _nPointsPerGap);
+-      }
+-    }
+-
+-    // The bounding box of the mesh/model
+-    double bbox_vertices[6];
+-
+-    RTree<uint64_t, double, 3> triRTree;
+-    HXTMesh *mesh;
+-    double *nodalCurvature;
+-    // double *nodeNormals;
+-    // std::vector<std::function<double(double)>> curvFunctions;
+-    // std::vector<std::function<double(double)>> xFunctions;
+-    // std::vector<std::function<double(double)>> yFunctions;
+-
+-    int debug = true;
+-
+-    GModel *gm = GModel::current();
+-
+-    size_t numVertices = gm->getNumMeshVertices();
+-    HXT_CHECK(hxtMalloc(&nodalCurvature, 6 * numVertices * sizeof(double)));
+-    std::vector<double> nodeNormals;
+-    for(size_t i = 0; i < 6 * numVertices; ++i) { nodalCurvature[i] = NAN; }
+-
+-    if(dim == 3) {
+-      // Get all faces of the model
+-      std::vector<GFace *> faces;
+-      std::vector<GRegion *> regions;
+-      for(auto it = GModel::current()->firstRegion();
+-          it != GModel::current()->lastRegion(); ++it) {
+-        regions.push_back(*it);
+-      }
+-      if(!regions.empty()) {
+-        HXT_CHECK(getAllFacesOfAllRegions(regions, nullptr, faces));
+-      }
+-      else {
+-        Msg::Info("No volume in the model : looping over faces instead.");
+-        for(auto it = GModel::current()->firstFace();
+-            it != GModel::current()->lastFace(); ++it) {
+-          faces.push_back(*it);
+-        }
+-      }
+-
+-      if(regions.empty()) {
+-        Msg::Error("Erreur : Pas de volume dans le modèle.");
+-      }
+-
+-      // Create global HXT mesh structure
+-      HXT_CHECK(hxtMeshCreate(&mesh));
+-      std::map<MVertex *, uint32_t> v2c;
+-      std::vector<MVertex *> c2v;
+-      Gmsh2Hxt(faces, mesh, v2c, c2v);
+-      // Gmsh2Hxt(regions, mesh, v2c, c2v);
+-
+-      // if(!regions.empty()){
+-      //   Msg::Info("Volume found.");
+-      //   HXT_CHECK( getAllFacesOfAllRegions(regions, NULL, faces) );
+-      // } else{
+-      //   Msg::Info("No volume in the model : looping over faces instead.");
+-      //   regions[0] = new GRegion(GModel::current(),-1);
+-      //   for(auto it = GModel::current()->firstFace(); it !=
+-      //   GModel::current()->lastFace(); ++it){
+-      //     faces.push_back(*it);
+-      //     regions[0]->addEmbeddedFace(*it);
+-      //   }
+-      // }
+-
+-      // // Create global HXT mesh structure
+-      // HXT_CHECK(hxtMeshCreate(&mesh));
+-      // std::map<MVertex *, uint32_t> v2c;
+-      // std::vector<MVertex *> c2v;
+-      // // Gmsh2Hxt(faces, mesh, v2c, c2v);
+-      // Gmsh2Hxt(regions, mesh, v2c, c2v);
+-
+-      if(mesh->vertices.num == 0) {
+-        Msg::Error("Surface mesh is empty");
+-        HXT_CHECK(hxtMeshDelete(&mesh));
+-        Msg::Exit(1);
+-      }
+-
+-      // HXT_CHECK(hxtMalloc(&nodalCurvature,6*mesh->vertices.num*sizeof(double)));
+-      // for(uint64_t i = 0; i < 6*mesh->vertices.num; ++i){ nodalCurvature[i] =
+-      // NAN; printf("%d\n",i);}
+-
+-      // Create HXT mesh structure for each GFace
+-      std::vector<HXTMesh *> faceMeshes;
+-      for(size_t i = 0; i < faces.size(); ++i) {
+-        HXTMesh *meshFace;
+-        HXT_CHECK(hxtMeshCreate(&meshFace));
+-        std::vector<GFace *> oneFace;
+-        oneFace.push_back(faces[i]);
+-        std::map<MVertex *, uint32_t> v2cLoc;
+-        std::vector<MVertex *> c2vLoc;
+-        Gmsh2HxtLocal(oneFace, meshFace, v2cLoc, c2vLoc);
+-        faceMeshes.push_back(meshFace);
+-      }
+-
+-      std::map<MVertex *, uint32_t> v2c2;
+-      std::vector<MVertex *> c2v2;
+-      Gmsh2HxtGlobal(faces, nullptr, v2c2, c2v2);
+-
+-      size_t nVertices = 0;
+-
+-      assert(faces.size() == faceMeshes.size());
+-
+-      // Compute curvature of the faces
+-      int counter = 0;
+-      for(auto it = gm->firstFace(); it != gm->lastFace(); ++it) {
+-        HXTMesh *meshFace = faceMeshes[counter++];
+-
+-        if(meshFace == nullptr) { Msg::Error("meshFace == NULL"); }
+-
+-        GFace *gf = *it;
+-        std::map<MVertex *, int> nodeIndex;
+-        std::vector<SPoint3> nodes;
+-        std::vector<int> tris;
+-        std::vector<std::pair<SVector3, SVector3> > curv;
+-        for(std::size_t i = 0; i < gf->triangles.size(); i++) {
+-          MTriangle *t = gf->triangles[i];
+-          for(int j = 0; j < 3; j++) {
+-            MVertex *v = t->getVertex(j);
+-            if(nodeIndex.find(v) == nodeIndex.end()) {
+-              int idx = nodes.size();
+-              nodeIndex[v] = idx;
+-              nodes.push_back(v->point());
+-              tris.push_back(idx);
+-            }
+-            else {
+-              tris.push_back(nodeIndex[v]);
+-            }
+-          }
+-        }
+-
+-        for(size_t i = 0; i < meshFace->vertices.num; ++i) {
+-          nodes[i] = SPoint3(meshFace->vertices.coord[(size_t)4 * i + 0],
+-                             meshFace->vertices.coord[(size_t)4 * i + 1],
+-                             meshFace->vertices.coord[(size_t)4 * i + 2]);
+-          // nodes[i] = gm->getMeshVertexByTag(i)
+-        }
+-
+-        for(size_t i = 0; i < meshFace->triangles.num; ++i) {
+-          tris[3 * i + 0] = meshFace->triangles.node[3 * i + 0];
+-          tris[3 * i + 1] = meshFace->triangles.node[3 * i + 1];
+-          tris[3 * i + 2] = meshFace->triangles.node[3 * i + 2];
+-        }
+-
+-        if(gf->triangles.empty()) {
+-          Msg::Info("Skipping curvature computation on face %d with 0 element",
+-                    counter - 1);
+-        }
+-        else {
+-          // Compute curvature of the face
+-          CurvatureRusinkiewicz(tris, nodes, curv);
+-
+-          // Assemble curvature vectors of the face in global nodalCurvature
+-          // structure
+-          for(uint64_t i = 0; i < meshFace->vertices.num; ++i) {
+-            uint64_t nodeGlobal = v2c[c2v2[nVertices + i]];
+-
+-            debug = true;
+-            if(debug) { // Check the vertex of the face and the global vertex
+-                        // are the same
+-              double x1, y1, z1, x2, y2, z2;
+-              x1 = meshFace->vertices.coord[(size_t)4 * i + 0];
+-              y1 = meshFace->vertices.coord[(size_t)4 * i + 1];
+-              z1 = meshFace->vertices.coord[(size_t)4 * i + 2];
+-              x2 = mesh->vertices.coord[(size_t)4 * nodeGlobal + 0];
+-              y2 = mesh->vertices.coord[(size_t)4 * nodeGlobal + 1];
+-              z2 = mesh->vertices.coord[(size_t)4 * nodeGlobal + 2];
+-              if(!isPoint(x1, y1, z1, x2, y2, z2, 1e-12)) {
+-                printf("Mismatch : (%10.12e,%10.12e,%10.12e) - "
+-                       "(%10.12e,%10.12e,%10.12e)\n",
+-                       x1, y1, z1, x2, y2, z2);
+-              }
+-              assert(isPoint(x1, y1, z1, x2, y2, z2, 1e-15));
+-            }
+-
+-            nodalCurvature[6 * nodeGlobal + 0] = curv[i].first[0];
+-            nodalCurvature[6 * nodeGlobal + 1] = curv[i].first[1];
+-            nodalCurvature[6 * nodeGlobal + 2] = curv[i].first[2];
+-            nodalCurvature[6 * nodeGlobal + 3] = curv[i].second[0];
+-            nodalCurvature[6 * nodeGlobal + 4] = curv[i].second[1];
+-            nodalCurvature[6 * nodeGlobal + 5] = curv[i].second[2];
+-          }
+-
+-          nVertices += meshFace->vertices.num;
+-        }
+-      } // for faces.size()
+-
+-      debug = true;
+-      if(debug)
+-        writeNodalCurvature(nodalCurvature, mesh->vertices.num,
+-                            "nodalCurvature.txt");
+-
+-      // Compute Delaunay tetrahedrization of the (empty) surface mesh
+-      HXTDelaunayOptions delaunayOptions = {nullptr, nullptr, 0, 0, 0, 2, 1, 0};
+-      HXT_CHECK(hxtEmptyMesh(mesh, &delaunayOptions));
+-
+-      // Compute normal vectors
+-      std::vector<int> tris(3 * mesh->triangles.num, 0);
+-      for(std::size_t i = 0; i < mesh->triangles.num; ++i) {
+-        tris[3 * i + 0] = mesh->triangles.node[3 * i + 0];
+-        tris[3 * i + 1] = mesh->triangles.node[3 * i + 1];
+-        tris[3 * i + 2] = mesh->triangles.node[3 * i + 2];
+-      }
+-
+-      std::vector<SPoint3> nodes(mesh->vertices.num);
+-      for(size_t i = 0; i < mesh->vertices.num; ++i) {
+-        nodes[i] = SPoint3(mesh->vertices.coord[(size_t)4 * i + 0],
+-                           mesh->vertices.coord[(size_t)4 * i + 1],
+-                           mesh->vertices.coord[(size_t)4 * i + 2]);
+-      }
+-
+-      std::vector<std::pair<SVector3, SVector3> > curv;
+-      nodeNormals.reserve(3 * mesh->vertices.num);
+-
+-      // Same function but returns the normals
+-      CurvatureRusinkiewicz(tris, nodes, curv, nodeNormals);
+-
+-      // Add bboxes of the surface mesh to rtree
+-      HXTBbox bbox_triangle;
+-      for(uint64_t i = 0; i < mesh->triangles.num; ++i) {
+-        hxtBboxInit(&bbox_triangle);
+-        for(uint64_t j = 0; j < 3; ++j) {
+-          double coord[3];
+-          uint32_t node = mesh->triangles.node[3 * i + j];
+-          for(uint32_t k = 0; k < 3; ++k) {
+-            coord[k] = mesh->vertices.coord[(size_t)4 * node + k];
+-          }
+-          hxtBboxAddOne(&bbox_triangle, coord);
+-        }
+-        SBoundingBox3d cube_bbox(bbox_triangle.min[0], bbox_triangle.min[1],
+-                                 bbox_triangle.min[2], bbox_triangle.max[0],
+-                                 bbox_triangle.max[1], bbox_triangle.max[2]);
+-        // cube_bbox.makeCube();
+-        triRTree.Insert((double *)(cube_bbox.min()),
+-                        (double *)(cube_bbox.max()), i);
+-      }
+-
+-      // Compute bbox of the mesh
+-      HXTBbox bbox_mesh;
+-      hxtBboxInit(&bbox_mesh);
+-      hxtBboxAdd(&bbox_mesh, mesh->vertices.coord, mesh->vertices.num);
+-      for(int i = 0; i < 3; ++i) {
+-        bbox_vertices[i] = bbox_mesh.min[i];
+-        bbox_vertices[i + 3] = bbox_mesh.max[i];
+-      }
+-
+-      // Export RTree in .pos file
+-      bool exportRTree = false;
+-      if(exportRTree) {
+-        RTree<uint64_t, double, 3>::Iterator it;
+-        FILE *f = fopen("rtree.pos", "w");
+-        fprintf(f, "View \"sizeField\" {\n");
+-        int itIndex = 0;
+-        double s = 1.0;
+-        double x[8], y[8], z[8];
+-        // Using custom GetNext2 to display intermediary rectangles
+-        for(triRTree.GetFirst(it); !triRTree.IsNull(it);
+-            triRTree.GetNext2(it)) {
+-          int value = triRTree.GetAt(it);
+-          double boundsMin[3] = {0, 0, 0};
+-          double boundsMax[3] = {0, 0, 0};
+-          it.GetBounds(boundsMin, boundsMax);
+-          std::cout << "it[" << itIndex++ << "] " << value << " = ("
+-                    << boundsMin[0] << "," << boundsMin[1] << ","
+-                    << boundsMin[2] << "," << boundsMax[0] << ","
+-                    << boundsMax[1] << "," << boundsMax[2] << ")\n";
+-          x[0] = x[3] = x[4] = x[7] = boundsMin[0];
+-          x[1] = x[2] = x[5] = x[6] = boundsMax[0];
+-          y[0] = y[1] = y[4] = y[5] = boundsMin[1];
+-          y[2] = y[3] = y[6] = y[7] = boundsMax[1];
+-          z[0] = z[1] = z[2] = z[3] = boundsMin[2];
+-          z[4] = z[5] = z[6] = z[7] = boundsMax[2];
+-          fprintf(f,
+-                  "SH(%f,%f,%f, %f,%f,%f, %f,%f,%f, %f,%f,%f, %f,%f,%f, "
+-                  "%f,%f,%f, %f,%f,%f, %f,%f,%f){%f,%f,%f,%f,%f,%f,%f,%f};\n",
+-                  x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2], x[3],
+-                  y[3], z[3], x[4], y[4], z[4], x[5], y[5], z[5], x[6], y[6],
+-                  z[6], x[7], y[7], z[7], s, s, s, s, s, s, s, s);
+-        }
+-        // Adding the root rectangle (the bbox)
+-        x[0] = x[3] = x[4] = x[7] = bbox_mesh.min[0];
+-        x[1] = x[2] = x[5] = x[6] = bbox_mesh.max[0];
+-        y[0] = y[1] = y[4] = y[5] = bbox_mesh.min[1];
+-        y[2] = y[3] = y[6] = y[7] = bbox_mesh.max[1];
+-        z[0] = z[1] = z[2] = z[3] = bbox_mesh.min[2];
+-        z[4] = z[5] = z[6] = z[7] = bbox_mesh.max[2];
+-        fprintf(f,
+-                "SH(%f,%f,%f, %f,%f,%f, %f,%f,%f, %f,%f,%f, %f,%f,%f, "
+-                "%f,%f,%f, %f,%f,%f, %f,%f,%f){%f,%f,%f,%f,%f,%f,%f,%f};\n",
+-                x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2], x[3],
+-                y[3], z[3], x[4], y[4], z[4], x[5], y[5], z[5], x[6], y[6],
+-                z[6], x[7], y[7], z[7], s, s, s, s, s, s, s, s);
+-        fprintf(f, "};");
+-        fclose(f);
+-      }
+-    }
+-
+-    if(dim == 2) {
+-      Msg::Error("2D size field is not yet operational");
+-
+-      SBoundingBox3d bbox = GModel::current()->bounds();
+-      for(int i = 0; i < 3; ++i) {
+-        bbox_vertices[i] = bbox.min()[i];
+-        bbox_vertices[i + 3] = bbox.max()[i];
+-      }
+-
+-      mesh = nullptr;
+-
+-      // for(auto it = GModel::current()->firstEdge(); it !=
+-      // GModel::current()->lastEdge(); ++it){
+-      //   GEdge *e = *it;
+-      //   curvFunctions.push_back([e](double par){ return e->curvature(par);
+-      //   }); xFunctions.push_back([e](double par){ return e->point(par).x();
+-      //   }); yFunctions.push_back([e](double par){ return e->point(par).y();
+-      //   });
+-      // }
+-
+-      // forestOptions->curvFunctions = &curvFunctions;
+-      // forestOptions->xFunctions = &xFunctions;
+-      // forestOptions->yFunctions = &yFunctions;
+-    }
+-
+-    // Set the bulk size and the min size from the bbox
+-    if(_hbulk < 0 || _hmin < 0) {
+-      double L = -1.0;
+-      for(int i = 0; i < 3; ++i) {
+-        L = fmax(L, bbox_vertices[i + 3] - bbox_vertices[i]);
+-      }
+-      _hbulk < 0 ? _hbulk = L / 20. : _hbulk;
+-      _hmin < 0 ? _hmin = L / 1000. : _hmin;
+-      Msg::Info("Bulk size is set to %f", _hbulk);
+-      Msg::Info("Min  size is set to %f", _hmin);
+-    }
+-
+-    if(_hmax < 0) _hmax = _hbulk;
+-
+-    std::vector<double> sizeAtVertices(mesh->vertices.num, DBL_MAX);
+-
+-    forestOptions->dim = dim;
+-    forestOptions->hmax = _hmax;
+-    forestOptions->hmin = _hmin;
+-    forestOptions->hbulk = _hbulk;
+-    forestOptions->gradation = _gradation;
+-    forestOptions->nodePerTwoPi = _nPointsPerCircle;
+-    forestOptions->nodePerGap = _nPointsPerGap;
+-    forestOptions->bbox = bbox_vertices;
+-    forestOptions->sizeFunction = nullptr;
+-    forestOptions->nodalCurvature = nodalCurvature;
+-    forestOptions->nodeNormals = &nodeNormals[0];
+-    forestOptions->featureSizeAtVertices = &sizeAtVertices;
+-    forestOptions->triRTree = (dim == 3) ? &triRTree : nullptr;
+-    forestOptions->mesh = mesh;
+-
+-    HXT_CHECK(forestCreate(0, nullptr, &forest, nullptr, forestOptions));
+-
+-    if(dim == 3) {
+-      if(_nPointsPerGap > 0) {
+-        Msg::Info("Detecting features...");
+-        HXT_CHECK(featureSize(forest));
+-      }
+-
+-      if(_nPointsPerCircle > 0) {
+-        Msg::Info("Refining octree...");
+-        HXT_CHECK(forestRefine(forest));
+-      }
+-
+-      if(_smoothing) {
+-        Msg::Info("Smoothing size gradient...");
+-        HXT_CHECK(forestSizeSmoothing(forest));
+-      }
+-
+-      double elemEstimation;
+-      HXT_CHECK(hxtOctreeElementEstimation(forest, &elemEstimation));
+-      Msg::Info("Estimated number of tetrahedra in the bounding box : %ld",
+-                (uint64_t)ceil(elemEstimation));
+-    }
+-    else {
+-      HXT_CHECK(forestRefine(forest));
+-      if(_smoothing) {
+-        Msg::Info("Smoothing size gradient...");
+-        HXT_CHECK(forestSizeSmoothing(forest));
+-      }
+-    }
+-
+-    // forestInterpolateDirections(forest);
+-
+-    // Save forest in .p4est file
+-    std::string forestFile = GModel::current()->getName() + ".p4est";
+-    std::string dataFile = GModel::current()->getName() + ".data";
+-    Msg::Info("Saving size field in %s", forestFile.c_str());
+-    HXT_CHECK(forestSave(forest, forestFile.c_str(), dataFile.c_str()));
+-
+-    debug = false;
+-    if(debug) {
+-      // Export size field in .pos file
+-      forestFile = GModel::current()->getName() + ".pos";
+-      HXT_CHECK(forestExport(forest, forestFile.c_str()));
+-    }
+-
+-    if(dim == 3) {
+-      if(nodalCurvature) HXT_CHECK(hxtFree(&nodalCurvature));
+-      // if(nodeNormals)    HXT_CHECK(hxtFree(&nodeNormals));
+-      HXT_CHECK(hxtMeshDelete(&mesh));
+-    }
+-  }
+-
++  double a[3], b[3];
++  p4est_qcoord_to_vertex(forest->p4est->connectivity, 0, 0, 0, 0, a);
++  p4est_qcoord_to_vertex(forest->p4est->connectivity, 0, P4EST_ROOT_LEN, 0, 0, b);
++  for(int k = 0; k < 3; ++k) origin[k] = a[k];
++  *length = b[0] - a[0];
+   return HXT_STATUS_OK;
+ }
+-
+ #endif
+ 
+-void automaticMeshSizeField::update()
+-{
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-  HXTStatus s = updateHXT();
+-  if(s != HXT_STATUS_OK)
+-    Msg::Error("Something went wrong when computing the octree");
+-#else
+-  Msg::Error(
+-    "Gmsh has to be compiled with HXT and P4EST to use automaticMeshSizeField");
+-#endif
+-};
++/* ======================================================================================
++   End functions from hxt_octree
++   ======================================================================================
++ */
++
++// FOAMMESH: upstream lines 2462-2959 removed here: the Field subclass
++// (operator(), destructor, updateHXT, update). See foammesh_sizefield.cpp.
+diff -u -r a/src/automaticMeshSizeField.h b/src/automaticMeshSizeField.h
+--- a/src/automaticMeshSizeField.h	2026-10-10 21:17:13.794148589 +0400
++++ b/src/automaticMeshSizeField.h	2026-10-10 21:17:13.794148589 +0400
+@@ -4,17 +4,22 @@
+ // Please report all issues on https://gitlab.onelab.info/gmsh/gmsh/issues.
+ //
+ // Contributed by Arthur Bawin
++//
++// FOAMMESH: lifted from gmsh-4.15.2-source/src/mesh/automaticMeshSizeField.h.
++// The ForestOptions / Forest / size_data / size_point / interpolation_data
++// structs and the forest function declarations are upstream's. The Gmsh
++// `Field` subclass is gone: FoamMesh drives the forest from
++// foammesh_sizefield.cpp on a surface tessellation read from STL files, so
++// nothing here needs GModel, Field, Context or GmshConfig. Every change is
++// marked FOAMMESH and listed in ../UPSTREAM.md.
+ 
+ #ifndef AUTOMATIC_MESH_SIZE_FIELD_H
+ #define AUTOMATIC_MESH_SIZE_FIELD_H
+ 
+-#include "GmshConfig.h"
+-#include "GModel.h"
+-#include "GRegion.h"
+-#include "MTriangle.h"
+-#include "MLine.h"
+-#include "Field.h"
+-#include "Context.h"
++#include <vector>
++#include <cstdio>
++#include <cstdint>
++
+ #include "STensor3.h"
+ #include "curvature.h"
+ 
+@@ -59,6 +64,11 @@
+   FILE *file1;
+   FILE *file2;
+   FILE *file3;
++  // FOAMMESH: upstream wrote its debug .pos files into the working directory
++  // unconditionally; they are now written only when debugPos is set, into
++  // debugDir.
++  int debugPos;
++  const char *debugDir;
+ } ForestOptions;
+ 
+ // The structure containing the size field information (forest)
+@@ -102,6 +112,18 @@
+   double denom;
+ } interpolation_data_t;
+ 
++// FOAMMESH: one octree leaf, as collected by forestCollectLeaves for the
++// .vtu export and the element estimate per region.
++typedef struct forest_leaf {
++  double center[3];
++  double h; // edge length of the leaf
++  double size; // prescribed mesh size in the leaf
++  int level;
++  uint32_t corner[8]; // indices into the shared corner-point list (VTK hex order)
++  int32_t xyz[3]; // quadrant coordinates (0 .. P4EST_ROOT_LEN) of the low corner
++  double m[6]; // metric xx xy xz yy yz zz; filled by the driver with --aniso
++} forest_leaf_t;
++
+ #if defined(HAVE_HXT) && defined(HAVE_P4EST)
+ HXTStatus forestOptionsCreate(ForestOptions **forestOptions);
+ HXTStatus forestOptionsDelete(ForestOptions **forestOptions);
+@@ -119,97 +141,28 @@
+ 
+ HXTStatus forestSearchOne(Forest *forest, double x, double y, double z,
+                           double *size, int linear);
+-#endif
+ 
+-class automaticMeshSizeField : public Field {
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-  struct Forest *forest;
+-  struct ForestOptions *forestOptions;
+-  HXTStatus updateHXT();
+-#endif
+-
+-  std::string _forestFile;
+-  int _nPointsPerCircle;
+-  int _nPointsPerGap;
+-  double _hmin, _hmax;
+-  double _hbulk;
+-  double _gradation;
+-  bool _smoothing, _gaps;
+-
+-public:
+-  ~automaticMeshSizeField();
+-  automaticMeshSizeField(
+-    std::string fFile = "",
+-    int minElementsPerTwoPi = CTX::instance()->mesh.lcFromCurvature,
+-    int nLayersPerGap = CTX::instance()->mesh.nLayersPerGap,
+-    double gradation = CTX::instance()->mesh.gradation, double hmin = -1.0,
+-    double hmax = -1.0, double hbulk = -1.0, int smoothing = true,
+-    int gaps = true)
+-#if defined(HAVE_HXT) && defined(HAVE_P4EST)
+-    : forest(nullptr), forestOptions(nullptr)
++// FOAMMESH: these were file-local to the upstream .cpp (the Field subclass
++// called them from the same translation unit); the FoamMesh driver lives in
++// another file, so they are declared here.
++HXTStatus featureSize(Forest *forest);
++HXTStatus forestRefine(Forest *forest);
++HXTStatus forestSizeSmoothing(Forest *forest);
++HXTStatus hxtOctreeElementEstimation(Forest *forest, double *elemEstimate);
++HXTStatus forestSearchOneAniso(Forest *forest, double x, double y, double z,
++                               SMetric3 &m, int linear);
++HXTStatus forestInterpolateDirections(Forest *forest);
++HXTStatus hxtForestSearch(Forest *forest, std::vector<double> *x,
++                          std::vector<double> *y, std::vector<double> *z,
++                          std::vector<double> *size);
++// FOAMMESH: added, see the .cpp.
++HXTStatus forestCollectLeaves(Forest *forest,
++                              std::vector<forest_leaf_t> *leaves,
++                              std::vector<double> *points);
++// FOAMMESH: the root cube of the single octree (origin = the corner with
++// quadrant coordinates 0,0,0; length = its edge); the quadrant coordinates
++// run 0 .. P4EST_ROOT_LEN = 2^19 along it.
++HXTStatus forestRootCube(Forest *forest, double origin[3], double *length);
+ #endif
+-  {
+-    _forestFile = fFile;
+-    _nPointsPerCircle = minElementsPerTwoPi ? minElementsPerTwoPi : 20;
+-    _nPointsPerGap = nLayersPerGap ? nLayersPerGap : 0;
+-    _hmin = hmin;
+-    _hmax = hmax;
+-    _hbulk = hbulk;
+-    _gradation = (int)gradation ? gradation : 1.1;
+-    _smoothing = smoothing;
+-    _gaps = gaps;
+-
+-    options["p4estFileToLoad"] = new FieldOptionString(
+-      _forestFile, "p4est file containing the size field", &updateNeeded);
+-
+-    options["nPointsPerCircle"] = new FieldOptionInt(
+-      _nPointsPerCircle,
+-      "Number of points per circle (adapt to curvature of surfaces)",
+-      &updateNeeded);
+-
+-    options["nPointsPerGap"] = new FieldOptionInt(
+-      _nPointsPerGap, "Number of layers of elements in thin layers",
+-      &updateNeeded);
+-
+-    options["hMin"] =
+-      new FieldOptionDouble(_hmin, "Minimum size", &updateNeeded);
+-
+-    options["hMax"] =
+-      new FieldOptionDouble(_hmax, "Maximum size", &updateNeeded);
+-
+-    options["hBulk"] = new FieldOptionDouble(
+-      _hbulk, "Default size where it is not prescribed", &updateNeeded);
+-
+-    options["gradation"] = new FieldOptionDouble(
+-      _gradation, "Maximum growth ratio for the edges lengths", &updateNeeded);
+-
+-    options["smoothing"] = new FieldOptionBool(
+-      _smoothing, "Enable size smoothing (should always be true)",
+-      &updateNeeded);
+-
+-    options["features"] = new FieldOptionBool(
+-      _gaps, "Enable computation of local feature size (thin channels)",
+-      &updateNeeded);
+-
+-    updateNeeded = true;
+-
+-    if(fFile != "") update();
+-  }
+-
+-  virtual bool isotropic() const { return false; }
+-  const char *getName() { return "AutomaticMeshSizeField"; }
+-
+-  std::string getDescription()
+-  {
+-    return "Compute a mesh size field that is quite automatic "
+-           "Takes into account surface curvatures and closeness of objects";
+-  }
+-
+-  void update();
+-  virtual double operator()(double X, double Y, double Z,
+-                            GEntity *ge = nullptr);
+-  virtual void operator()(double x, double y, double z, SMetric3 &m,
+-                          GEntity *ge = nullptr);
+-};
+ 
+ #endif

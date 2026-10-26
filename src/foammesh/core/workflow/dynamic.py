@@ -133,6 +133,31 @@ class EngineWorkflowGraph:
             f'task is locked by prerequisites: {task_id}'
             + (f' (waiting on {names})' if names else ''))
 
+    def _skip_walked_past(self, task_id: str) -> None:
+        """Record SKIPPED on the untouched optional steps ``task_id`` was
+        reached past (DP-5739).
+
+        DP-144 lets an untouched optional parent be walked through, and a run
+        writes each one it walks past as SKIPPED (DP-35). Configuring,
+        starting or completing a task by hand left them READY or LOCKED under
+        a task that had moved on, and the loader refuses that document (a
+        finished task over a parent that never ran), so the next reload threw
+        away every saved state. Only the steps on the way to this task: their
+        own descendants are this task, so nothing is made stale.
+        """
+        stack = list(self.descriptor.task(task_id).depends_on)
+        seen: set[str] = set()
+        while stack:
+            parent = stack.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if (self._state[parent] in {TaskState.LOCKED, TaskState.READY}
+                    and self.descriptor.task(parent).cardinality
+                    is not TaskCardinality.REQUIRED):
+                self._state[parent] = TaskState.SKIPPED
+                stack.extend(self.descriptor.task(parent).depends_on)
+
     def begin_edit(self, task_id: str) -> TaskTransition:
         if not self.is_runnable(task_id):
             raise self._locked(task_id)
@@ -146,6 +171,7 @@ class EngineWorkflowGraph:
         if not self.is_runnable(task_id):
             raise self._locked(task_id)
         before = self._state[task_id]
+        self._skip_walked_past(task_id)
         self._state[task_id] = TaskState.CONFIGURED
         invalidated = self._invalidate_descendants(task_id)
         self._refresh_ready()
@@ -158,6 +184,7 @@ class EngineWorkflowGraph:
         if before not in {TaskState.READY, TaskState.CONFIGURED, TaskState.STALE,
                           TaskState.FAILED, TaskState.WARNING}:
             raise ValueError(f'task cannot start from {before.value}: {task_id}')
+        self._skip_walked_past(task_id)
         self._state[task_id] = TaskState.RUNNING
         return TaskTransition(task_id, before, TaskState.RUNNING)
 
@@ -217,6 +244,7 @@ class EngineWorkflowGraph:
         if before not in COMPLETABLE:
             raise ValueError(
                 f'task cannot complete from {before.value}: {task_id}')
+        self._skip_walked_past(task_id)
         self._state[task_id] = TaskState.COMPLETED
         invalidated = self._invalidate_descendants(task_id)
         self._refresh_ready()

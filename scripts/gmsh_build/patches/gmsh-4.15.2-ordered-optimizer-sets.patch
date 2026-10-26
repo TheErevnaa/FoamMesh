@@ -1,0 +1,137 @@
+--- a/contrib/MeshOptimizer/MeshOpt.cpp
++++ b/contrib/MeshOptimizer/MeshOpt.cpp
+@@ -42,10 +42,10 @@
+ #include <optimization.h>
+ #endif
+ 
+-MeshOpt::MeshOpt(const std::map<MElement *, GEntity *> &element2entity,
+-                 const std::map<MElement *, GEntity *> &bndEl2Ent,
+-                 const std::set<MElement *> &els, std::set<MVertex *> &toFix,
+-                 const std::set<MElement *> &bndEls,
++MeshOpt::MeshOpt(const std::map<MElement *, GEntity *, MElementPtrLessThan> &element2entity,
++                 const std::map<MElement *, GEntity *, MElementPtrLessThan> &bndEl2Ent,
++                 const std::set<MElement *, MElementPtrLessThan> &els, std::set<MVertex *, MVertexPtrLessThan> &toFix,
++                 const std::set<MElement *, MElementPtrLessThan> &bndEls,
+                  const MeshOptParameters &par)
+   : patch(element2entity, bndEl2Ent, els, toFix, bndEls, par.fixBndNodes),
+     _verbose(0), _nCurses(1), _iPass(0), _iter(0), _intervDisplay(0),
+--- a/contrib/MeshOptimizer/MeshOpt.h
++++ b/contrib/MeshOptimizer/MeshOpt.h
+@@ -41,10 +41,10 @@
+ class MeshOpt {
+ public:
+   Patch patch;
+-  MeshOpt(const std::map<MElement *, GEntity *> &element2entity,
+-          const std::map<MElement *, GEntity *> &bndEl2Ent,
+-          const std::set<MElement *> &els, std::set<MVertex *> &toFix,
+-          const std::set<MElement *> &bndEls, const MeshOptParameters &par);
++  MeshOpt(const std::map<MElement *, GEntity *, MElementPtrLessThan> &element2entity,
++          const std::map<MElement *, GEntity *, MElementPtrLessThan> &bndEl2Ent,
++          const std::set<MElement *, MElementPtrLessThan> &els, std::set<MVertex *, MVertexPtrLessThan> &toFix,
++          const std::set<MElement *, MElementPtrLessThan> &bndEls, const MeshOptParameters &par);
+   ~MeshOpt();
+   int optimize(const MeshOptParameters &par);
+   void updateMesh(const std::vector<double> &x);
+--- a/contrib/MeshOptimizer/MeshOptimizer.cpp
++++ b/contrib/MeshOptimizer/MeshOptimizer.cpp
+@@ -43,14 +43,14 @@
+ 
+ typedef std::vector<MElement *> elVec;
+ typedef elVec::const_iterator elVecConstIter;
+-typedef std::set<MElement *> elSet;
++typedef std::set<MElement *, MElementPtrLessThan> elSet;
+ typedef elSet::iterator elSetIter;
+-typedef std::set<MVertex *> vertSet;
+-typedef std::map<MElement *, GEntity *> elEntMap;
+-typedef std::map<MElement *, MElement *> elElMap;
++typedef std::set<MVertex *, MVertexPtrLessThan> vertSet;
++typedef std::map<MElement *, GEntity *, MElementPtrLessThan> elEntMap;
++typedef std::map<MElement *, MElement *, MElementPtrLessThan> elElMap;
+ 
+-typedef std::map<MVertex *, elVec> vertElVecMap;
+-typedef std::map<MElement *, elSet> elElSetMap;
++typedef std::map<MVertex *, elVec, MVertexPtrLessThan> vertElVecMap;
++typedef std::map<MElement *, elSet, MElementPtrLessThan> elElSetMap;
+ typedef std::pair<elSet, vertSet> elSetVertSetPair;
+ 
+ namespace {
+@@ -291,7 +291,7 @@
+ 
+     // Compute patch connectivity
+     Msg::Info("Computing patch connectivity...");
+-    std::map<MElement *, std::set<int> > tags;
++    std::map<MElement *, std::set<int>, MElementPtrLessThan> tags;
+     std::vector<std::set<int> > patchConnect(primPatches.size());
+     for(size_t iB = 0; iB < primPatches.size(); ++iB) {
+       elSet &patch = primPatches[iB];
+@@ -606,7 +606,8 @@
+         elSet toOptimize;
+         std::set_difference(toOptimizePrim.begin(), toOptimizePrim.end(),
+                             badElts.begin(), badElts.end(),
+-                            std::inserter(toOptimize, toOptimize.end()));
++                            std::inserter(toOptimize, toOptimize.end()),
++                            MElementPtrLessThan());
+ 
+         // Get boundary elements adjacent to patch if required
+         elSet bndElts;
+--- a/contrib/MeshOptimizer/Patch.cpp
++++ b/contrib/MeshOptimizer/Patch.cpp
+@@ -36,10 +36,10 @@
+ #include "nodalBasis.h"
+ #include "GModel.h"
+ 
+-Patch::Patch(const std::map<MElement *, GEntity *> &element2entity,
+-             const std::map<MElement *, GEntity *> &bndEl2Ent,
+-             const std::set<MElement *> &els, std::set<MVertex *> &toFix,
+-             const std::set<MElement *> &bndEls, int fixBndNodes)
++Patch::Patch(const std::map<MElement *, GEntity *, MElementPtrLessThan> &element2entity,
++             const std::map<MElement *, GEntity *, MElementPtrLessThan> &bndEl2Ent,
++             const std::set<MElement *, MElementPtrLessThan> &els, std::set<MVertex *, MVertexPtrLessThan> &toFix,
++             const std::set<MElement *, MElementPtrLessThan> &bndEls, int fixBndNodes)
+   : _typeLengthScale(LS_NONE), _invLengthScaleSq(0.)
+ {
+   _dim = (*els.begin())->getDim();
+@@ -186,7 +186,7 @@
+ }
+ 
+ int Patch::addFreeVert(MVertex *vert, const int iV, const int nPCV,
+-                       VertexCoord *param, std::set<MVertex *> &toFix)
++                       VertexCoord *param, std::set<MVertex *, MVertexPtrLessThan> &toFix)
+ {
+   auto itVert = find(_freeVert.begin(), _freeVert.end(), vert);
+   if(itVert == _freeVert.end()) {
+--- a/contrib/MeshOptimizer/Patch.h
++++ b/contrib/MeshOptimizer/Patch.h
+@@ -29,6 +29,8 @@
+ 
+ #include <vector>
+ #include <map>
++#include "MElement.h"
++#include "MVertex.h"
+ #include <set>
+ #include "fullMatrix.h"
+ #include "SPoint3.h"
+@@ -40,10 +42,10 @@
+ 
+ class Patch {
+ public:
+-  Patch(const std::map<MElement *, GEntity *> &element2entity,
+-        const std::map<MElement *, GEntity *> &bndEl2Ent,
+-        const std::set<MElement *> &els, std::set<MVertex *> &toFix,
+-        const std::set<MElement *> &bndEls, int fixBndNodes);
++  Patch(const std::map<MElement *, GEntity *, MElementPtrLessThan> &element2entity,
++        const std::map<MElement *, GEntity *, MElementPtrLessThan> &bndEl2Ent,
++        const std::set<MElement *, MElementPtrLessThan> &els, std::set<MVertex *, MVertexPtrLessThan> &toFix,
++        const std::set<MElement *, MElementPtrLessThan> &bndEls, int fixBndNodes);
+ 
+   // Mesh entities and variables
+   inline const int &dim() { return _dim; }
+@@ -142,7 +144,7 @@
+   std::vector<VertexCoord *> _coordFV; // Parametrization for a free vertex
+   int addVert(MVertex *vert);
+   int addFreeVert(MVertex *vert, const int iV, const int nPCV,
+-                  VertexCoord *param, std::set<MVertex *> &toFix);
++                  VertexCoord *param, std::set<MVertex *, MVertexPtrLessThan> &toFix);
+   static inline int indJB2DBase(int nNod, int l, int i, int j)
+   {
+     return (l * nNod + i) * nNod + j;

@@ -1134,7 +1134,12 @@ class ChildControlPanel(QGroupBox):
         rows = max(self.MIN_VISIBLE_ROWS,
                    min(len(self._rows), self.MAX_VISIBLE_ROWS))
         row_height = self.table.verticalHeader().defaultSectionSize()
-        header = self.table.horizontalHeader().height()
+        # DP-5650. The header's height lags its heading wrap: a fit that
+        # wraps the headings reads the old height here, and the fixed table
+        # stayed a line or two short of its two rows. The size hint is what
+        # the header will be once laid out.
+        head = self.table.horizontalHeader()
+        header = max(head.height(), head.sizeHint().height())
         # R59. The columns are sized to their contents now, so the table can
         # be wider than the panel and needs somewhere to put the horizontal
         # scrollbar; without this it is drawn over the last row.

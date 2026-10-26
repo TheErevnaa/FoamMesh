@@ -495,6 +495,66 @@ class RunPanel(QWidget):
             self.setAccessibleDescription(description)
 
 
+    # ------------------------------------------------------------ read-back
+    def readout(self) -> dict:
+        """Everything the panel shows, as it shows it (Plan 48 PA5).
+
+        The local API returns this: the status and timing labels, the bar, the
+        facts and summary lines, the stage rows, and the series the three
+        charts draw. The labels are brought up to date first, so a panel that
+        is not on screen (its timer is stopped) reads as it will when shown.
+        """
+        self._paint_status()
+        progress = self.progress
+
+        def shown(widget) -> bool:
+            return not widget.isHidden() and widget.isVisibleTo(self)
+
+        stages = []
+        for stage in progress.stages:
+            label = self._stages._labels.get(stage.key)
+            stages.append({
+                'key': stage.key, 'label': stage.label,
+                'status': stage.status,
+                'text': label.text() if label is not None else '',
+                'iterations': stage.iterations, 'total': stage.total})
+
+        def chart(widget, series) -> dict:
+            return {'title': widget.title(), 'has_data': widget.has_data(),
+                    'empty_text': widget.empty_text, 'shown': shown(widget),
+                    'series': series}
+
+        refinement = [{'label': step.label, 'cells': step.cells,
+                       'faces': step.faces, 'points': step.points,
+                       'levels': {str(level): cells for level, cells
+                                  in sorted(step.levels.items())}}
+                      for step in progress.refinement]
+        snap = [{'iteration': step.iteration, 'average': step.average,
+                 'minimum': step.minimum, 'maximum': step.maximum}
+                for step in progress.snap]
+        layers = [{'patch': patch.patch, 'faces': patch.faces,
+                   'layers': patch.layers, 'thickness': patch.thickness,
+                   'percent': patch.percent}
+                  for patch in progress.layer_patches]
+        return {
+            'state': progress.state, 'running': bool(progress.running),
+            'engine': self.shown_engine(),
+            'status': self._status.text(), 'timing': self._timing.text(),
+            'bar': {'value': self._bar.value(),
+                    'maximum': self._bar.maximum(),
+                    'fraction': float(progress.fraction),
+                    'shown': shown(self._bar)},
+            'facts': {'text': self._facts.text(), 'shown': shown(self._facts)},
+            'summary': {'text': self._summary.text(),
+                        'shown': not self._summary.isHidden()},
+            'stages': stages,
+            'charts': {
+                'refinement': chart(self.refinement_chart, refinement),
+                'snap': chart(self.snap_chart, snap),
+                'layers': chart(self.layer_chart, layers)},
+        }
+
+
 def install_run_panel(tabs) -> RunPanel:
     """Add the Live run tab to ``tabs`` and follow the job events.
 

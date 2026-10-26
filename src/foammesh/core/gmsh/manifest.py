@@ -39,6 +39,27 @@ def sha256_of(path: Path) -> str:
 MESH_LAYOUT_KEY = 'mesh_layout'
 
 
+def parallel_record_of_job(job) -> dict:
+    """``{'threads': n, 'reproducible': bool}``: how many threads the job
+    asks for and whether it is the single-thread repeatable mode.
+
+    Plan 48 ST (DP-4605). Gmsh 4.15.2 meshes differently from run to run with
+    more than one thread, so two runs of one model that differ in element
+    count are explained by this note: a run that says ``reproducible: true``
+    ran on one thread and repeats; one that says false may not.
+    """
+    parallel = ((job or {}).get('intent') or {}).get('parallel') or {}
+    try:
+        threads = max(1, int(parallel.get('threads') or 1))
+    except (TypeError, ValueError):
+        threads = 1
+    record = {'threads': threads,
+              'reproducible': bool(parallel.get('reproducible'))}
+    if parallel.get('retriedFromThreads'):
+        record['retried_from_threads'] = int(parallel['retriedFromThreads'])
+    return record
+
+
 def mesh_layout_of_job(job) -> dict:
     """The ``{'cores', 'decomposed'}`` this run will mesh with.
 
@@ -216,6 +237,7 @@ class RunBuilder:
             'artifacts': _artifact_rows(
                 layout, tuple((job.get('output') or {}).keys())),
             MESH_LAYOUT_KEY: mesh_layout_of_job(job),
+            'parallel': parallel_record_of_job(job),
         }
         manifest = RunManifest(run_id, layout, document)
         manifest.write()
@@ -257,6 +279,14 @@ class RunBuilder:
         written by the thing being audited.
         """
         statistics = dict(result.get('statistics') or {})
+        if manifest.layout.job.is_file():
+            # The job as it ran: a crash retry rewrites it at one thread.
+            try:
+                manifest.document['parallel'] = parallel_record_of_job(
+                    json.loads(manifest.layout.job.read_text(
+                        encoding='utf-8')))
+            except (OSError, ValueError):
+                pass
         manifest.document.update({
             'status': result.get('status', 'failed'),
             'finished_at': result.get('finished_at') or utc_now(),
@@ -275,6 +305,11 @@ class RunBuilder:
                 (statistics.get('interfacePairs') or {}).get('pairs') or ()),
         })
         manifest.document['meshed_by'] = _meshed_by(statistics)
+        # Plan 48 FIX3 (DP-4406). What the engine measured about itself
+        # (the peak resident set), kept where `results.run_cost` reads it.
+        resources = result.get('resources')
+        if isinstance(resources, dict) and resources:
+            manifest.document['resources'] = dict(resources)
         if manifest.layout.mesh.is_file():
             manifest.document['mesh_sha256'] = sha256_of(manifest.layout.mesh)
         # DP-133. The surface pass, recorded in its own key rather than as an
@@ -297,6 +332,56 @@ class RunBuilder:
             rows = [row for row in rows if row['exists']]
         manifest.document['artifacts'] = _refresh_artifacts(
             manifest.layout, rows)
+        manifest.write()
+        return manifest
+
+    @staticmethod
+    def combine_peaks(peaks) -> dict | None:
+        """One run's peak from its jobs' peaks: the largest measured one.
+
+        A snappy run is several utilities one after another (blockMesh,
+        surfaceFeatures, snappyHexMesh, ...); the run's peak is the highest
+        any of them reached. With none measured the first reason stands.
+        """
+        rows = [dict(item) for item in peaks or () if isinstance(item, dict) and item]
+        measured = [row for row in rows if (row.get('peak_rss_bytes') or 0) > 0]
+        if measured:
+            best = dict(max(measured, key=lambda row: row['peak_rss_bytes']))
+            best['jobs_measured'] = len(measured)
+            best['jobs'] = len(rows)
+            return best
+        return rows[0] if rows else None
+
+    @staticmethod
+    def record_executions(manifest: RunManifest, executions) -> RunManifest:
+        """Fold the peak memory of the jobs a run ran (``execution.to_payload()``
+        dicts, each carrying ``job.peak_memory``) into the manifest."""
+        peaks = [((item or {}).get('job') or {}).get('peak_memory')
+                 for item in executions or ()]
+        return RunBuilder.record_peak_memory(
+            manifest, RunBuilder.combine_peaks(peaks))
+
+    @staticmethod
+    def record_peak_memory(manifest: RunManifest, peak: dict | None) -> RunManifest:
+        """Keep the peak memory the WSL wrapper measured for this run.
+
+        Plan 48 PM (DP-4603, DP-4406). ``peak`` is ``JobResult.peak_memory``:
+        ``{'peak_rss_bytes', 'measure', 'source'}`` or
+        ``{'measure': 'unavailable', 'reason'}``. It is always kept whole under
+        ``wrapper_resources``. It becomes ``resources`` -- the key
+        ``results.run_cost`` reads -- only when the run has no measure of its
+        own: the Gmsh runner records its own VmHWM there and that stays the
+        Gmsh source (the wrapper's figure includes the Python startup of the
+        runner and is kept beside it for comparison), so Gmsh is never
+        double-counted. A native launch or an old distro is recorded as
+        unavailable with its reason, never as a number.
+        """
+        if not isinstance(peak, dict) or not peak:
+            return manifest
+        manifest.document['wrapper_resources'] = dict(peak)
+        own = manifest.document.get('resources')
+        if not (isinstance(own, dict) and own.get('peak_rss_bytes')):
+            manifest.document['resources'] = dict(peak)
         manifest.write()
         return manifest
 
@@ -581,6 +666,11 @@ def accepted_artifact(case_path: str | Path, fmt: str) -> dict | None:
     quality gate had just refused. An export is built from the result the user
     accepted, so a rejected, cancelled, failed or unfinished run is passed
     over here whatever it left in its own directory.
+
+    DP-5916. Only the newest kept run is asked: when it has no file of *fmt*
+    (a snappyHexMesh run kept after a Gmsh run, or a ``mesh.msh`` that is
+    gone) the answer is ``None``, never an older run's file, which would
+    pass an earlier mesh off as the current one.
     """
     for root, document in run_documents(case_path):
         if run_disposition(document) not in EXPORTABLE:
@@ -590,6 +680,7 @@ def accepted_artifact(case_path: str | Path, fmt: str) -> dict | None:
             if path.is_file():
                 return {**row, 'run_id': document.get('run_id', root.name),
                         'run_path': str(root), 'run_manifest': document}
+        return None
     return None
 
 
@@ -656,6 +747,25 @@ def accepted_run_layout(case_path: str | Path) -> dict | None:
         if layout is None:
             return None
         return {**layout,
+                'run_id': str(document.get('run_id') or root.name),
+                'run_path': str(root)}
+    return None
+
+
+def accepted_run_engine(case_path: str | Path) -> dict | None:
+    """The engine of the newest run the user kept, or ``None`` for no run.
+
+    DP-5753. The mesh being exported belongs to the newest kept run, the
+    question :func:`accepted_run_layout` asks about its layout; this asks
+    which engine made it, so an export only one engine produces (SU2, Gmsh
+    only) can refuse the other's mesh. A manifest with no ``engine_id`` was
+    written before snappy recorded runs at all (Plan 30 F-15), so it is a
+    Gmsh run's.
+    """
+    for root, document in run_documents(case_path):
+        if run_disposition(document) not in EXPORTABLE:
+            continue
+        return {'engine_id': str(document.get('engine_id') or 'gmsh'),
                 'run_id': str(document.get('run_id') or root.name),
                 'run_path': str(root)}
     return None

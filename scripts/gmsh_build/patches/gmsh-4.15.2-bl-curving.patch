@@ -1,0 +1,25 @@
+--- a/src/mesh/Generator.cpp	2026-10-23 09:14:56.726359169 +0400
++++ b/src/mesh/Generator.cpp	2026-10-23 09:14:56.736359166 +0400
+@@ -994,13 +994,21 @@
+ #if defined(HAVE_OPTHOM)
+     FastCurvingParameters p;
+     p.dim = m->getMeshDim();
+-    p.thickness = false;
++    // FoamMesh: Mesh.HighOrderFastCurvingNewAlgo is the "Boundary layer
++    // curving" of the high-order tools window (thickness on, the surfaces
++    // first in 3D); 4.15.2 declared the option and never read it.
++    p.thickness = CTX::instance()->mesh.hoNewFastCurvingAlgo;
+     p.curveOuterBL =
+       (FastCurvingParameters::OUTERBLCURVE)CTX::instance()->mesh.hoCurveOuterBL;
+     p.maxNumLayers = CTX::instance()->mesh.hoNLayers;
+     p.maxRho = CTX::instance()->mesh.hoMaxRho;
+     p.maxAngle = CTX::instance()->mesh.hoMaxAngle;
+     p.maxAngleInner = CTX::instance()->mesh.hoMaxInnerAngle;
++    if(p.thickness && p.dim == 3) {
++      p.dim = 2;
++      HighOrderMeshFastCurving(m, p, false);
++      p.dim = 3;
++    }
+     HighOrderMeshFastCurving(m, p, false);
+ #else
+     Msg::Error("High-order mesh optimization requires the OPTHOM module");

@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import logging
+
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, Signal
-from foammesh.view.theming.metrics import UnitLabel
+from foammesh.view.theming.metrics import FORM_MARGIN, UnitLabel
 from foammesh.view.workflow_controls.length_box import ModelLengthBox
 from foammesh.core import display_unit
-from foammesh.rendering import layers_grown
+from foammesh.rendering import actor_info, layers_grown
 from PySide6.QtGui import (
     QAction, QColor, QGuiApplication, QIcon, QKeySequence, QLinearGradient,
     QPainter, QPen, QPixmap)
@@ -169,6 +171,188 @@ class ElidingLabel(QLabel):
             super().setToolTip('\n'.join(parts))
         else:
             super().setToolTip(self._note)
+
+
+# -- Plan 48 OP: the Surface opacity rail tool --------------------------------- #
+
+#: A square seen through: the surface drawn faint.
+_SURFACE_OPACITY_SVG = (
+    '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" '
+    'stroke="{c}" stroke-width="2.25" stroke-linecap="round">'
+    '<rect x="3.5" y="3.5" width="17" height="17" rx="1.5" '
+    'fill="{c}" fill-opacity="0.28"/>'
+    '<path d="M8.5 15.5l7-7M8.5 11l3.5-3.5M12 16.5l4.5-4.5"/></svg>')
+
+
+def surfaceOpacityIcon(size: int = 64) -> QIcon:
+    """The glyph in the running theme's ink, for every mode and state."""
+    from PySide6.QtCore import QByteArray
+    from PySide6.QtGui import QPalette
+    from PySide6.QtSvg import QSvgRenderer
+    from foammesh.view.main_window.mesh_lines_control import _ink
+
+    ink = _ink('foreground.strong', QPalette.ColorGroup.Active)
+    faint = _ink('disabled.foreground', QPalette.ColorGroup.Disabled)
+    screen = QGuiApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    icon = QIcon()
+    for mode, color in ((QIcon.Mode.Normal, ink), (QIcon.Mode.Active, ink),
+                        (QIcon.Mode.Selected, ink),
+                        (QIcon.Mode.Disabled, faint)):
+        renderer = QSvgRenderer(QByteArray(
+            _SURFACE_OPACITY_SVG.format(c=color).encode()))
+        for side in sorted({16, 20, 24, 32, 64, int(size)}):
+            pixels = max(1, round(side * dpr))
+            pixmap = QPixmap(pixels, pixels)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            renderer.render(painter)
+            painter.end()
+            pixmap.setDevicePixelRatio(dpr)
+            for state in (QIcon.State.Off, QIcon.State.On):
+                icon.addPixmap(pixmap, mode, state)
+    return icon
+
+
+def _surfaceOpacityKey():
+    from types import SimpleNamespace
+    return SimpleNamespace(value='surface_opacity')
+
+
+def _loadedSettings():
+    """The application's loaded settings store, or None where none is loaded
+    (a test, a headless run: neither reads nor writes the user's file)."""
+    settings = getattr(app, '_settings', None)
+    return settings if hasattr(settings, '_get') else None
+
+
+def savedSurfaceOpacity() -> dict:
+    """The per-route Surface opacity kept in the application settings."""
+    settings = _loadedSettings()
+    if settings is None:
+        return {}
+    try:
+        record = settings._get(_surfaceOpacityKey(), {})
+    except Exception:                                      # noqa: BLE001
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    saved = {}
+    for route in actor_info.SURFACE_OPACITY_DEFAULTS:
+        try:
+            saved[route] = min(1.0, max(0.0, float(record[route])))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return saved
+
+
+def keepSurfaceOpacity() -> None:
+    """Write both routes' values to the application settings."""
+    settings = _loadedSettings()
+    if settings is None:
+        return
+    try:
+        settings._set(_surfaceOpacityKey(), {
+            route: actor_info.routeSurfaceOpacity(route)
+            for route in actor_info.SURFACE_OPACITY_DEFAULTS})
+    except Exception:                                      # noqa: BLE001
+        # A settings file that cannot be written must not stop the view
+        # from repainting; the choice just lasts this session.
+        pass
+
+
+def loadSavedSurfaceOpacity() -> None:
+    for route, value in savedSurfaceOpacity().items():
+        actor_info.setRouteSurfaceOpacity(value, route)
+
+
+class SurfaceOpacityPanel(QWidget):
+    """One slider: how opaque the open case's route draws its surfaces."""
+    opacityChanged = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QHBoxLayout, QSlider
+
+        self.setObjectName('surfaceOpacityPanel')
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(
+            FORM_MARGIN, FORM_MARGIN, FORM_MARGIN, FORM_MARGIN)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setObjectName('surfaceOpacitySlider')
+        self._slider.setRange(round(actor_info.SURFACE_OPACITY_MIN * 100), 100)
+        self._slider.setMinimumWidth(140)
+        self._slider.setAccessibleName(self.tr('Surface opacity'))
+        self._label = QLabel()
+        self._label.setObjectName('surfaceOpacityValue')
+        self._label.setMinimumWidth(36)
+        layout.addWidget(self._slider)
+        layout.addWidget(self._label)
+        self.syncFromRoute()
+        self._slider.valueChanged.connect(self._moved)
+        actor_info.surfaceOpacityNotifier().changed.connect(self.syncFromRoute)
+
+    def slider(self):
+        return self._slider
+
+    def opacity(self) -> float:
+        return self._slider.value() / 100.0
+
+    def syncFromRoute(self):
+        shown = round(actor_info.routeSurfaceOpacity() * 100)
+        self._slider.blockSignals(True)
+        self._slider.setValue(shown)
+        self._slider.blockSignals(False)
+        self._label.setText(f'{shown}%')
+
+    def _moved(self, value):
+        self._label.setText(f'{value}%')
+        actor_info.setRouteSurfaceOpacity(value / 100.0)
+        keepSurfaceOpacity()
+        self.opacityChanged.emit(value / 100.0)
+
+
+class SurfaceOpacityButton(QToolButton):
+    """The rail entry: an icon that opens the Surface opacity slider."""
+    opacityChanged = Signal(float)
+
+    def __init__(self, parent=None, *, size=None, iconSize=None):
+        super().__init__(parent)
+        self.setObjectName('viewportSurfaceOpacity')
+        self.setIcon(surfaceOpacityIcon())
+        if iconSize is not None:
+            self.setIconSize(iconSize)
+        if size is not None:
+            self.setMaximumSize(size)
+            self.setMinimumSize(size)
+        tip = self.tr('Surface opacity: how see-through the surfaces are')
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+        self.setAutoRaise(True)
+        self.setProperty('foammeshFlat', True)
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._panel = SurfaceOpacityPanel()
+        self._panel.opacityChanged.connect(self.opacityChanged)
+        menu = QMenu(self)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(self._panel)
+        menu.addAction(action)
+        menu.aboutToShow.connect(self._panel.syncFromRoute)
+        self.setMenu(menu)
+        try:
+            from foammesh.app import app as shared
+            manager = getattr(shared, 'themeManager', None)
+        except Exception:                                  # noqa: BLE001
+            manager = None
+        if manager is not None:
+            manager.themeChanged.connect(self.retint)
+
+    def panel(self) -> SurfaceOpacityPanel:
+        return self._panel
+
+    def retint(self, *_args) -> None:
+        self.setIcon(surfaceOpacityIcon())
 
 
 class RenderingTool(QObject):
@@ -1194,9 +1378,20 @@ class RenderingTool(QObject):
         into its ``...`` menu (higher goes first). The row lets go of them.
         """
         ui = self._ui
+        if getattr(self, '_surfaceOpacityButton', None) is None:
+            self._surfaceOpacityButton = SurfaceOpacityButton(
+                size=BUTTON_SIZE, iconSize=ICON_SIZE)
+            self._surfaceOpacityButton.opacityChanged.connect(
+                lambda _value: self._view.refresh())
+            loadSavedSurfaceOpacity()
+            self._followSurfaceRoute()
         tools = [
             ('meshLines', self.tr('Mesh lines'), self._meshLinesButton, None,
              self.tr('Mesh lines: opacity, colour and width of the grid'), 2),
+            ('surfaceOpacity', self.tr('Surface opacity'),
+             self._surfaceOpacityButton, None,
+             self.tr('Surface opacity: how see-through the surfaces are; '
+                     'each route keeps its own'), 3),
             ('originAxes', self.tr('Origin axes'), ui.axis, None,
              self.tr('Origin axes: show the axes at the origin'), 5),
             ('cubeAxes', self.tr('Cube axes'), ui.cubeAxis, None,
@@ -1219,6 +1414,44 @@ class RenderingTool(QObject):
         self._railOwned = [entry[2] for entry in tools]
         self._regroupAfterRail()
         return tools
+
+    # -- Plan 48 OP: the route-wide Surface opacity ---------------------------- #
+
+    def _followSurfaceRoute(self):
+        """Draw by the Surface opacity of the route the open case is on."""
+        try:
+            from foammesh.view.gmsh_tools import engine_switch
+            engine_switch.follow(engine_switch.context(),
+                                 self._surfaceRouteChanged)
+        except Exception:                                  # noqa: BLE001
+            logging.getLogger(__name__).debug(
+                'the Surface opacity does not follow the engine',
+                exc_info=True)
+
+    def _surfaceRouteChanged(self, onGmsh: bool):
+        actor_info.setSurfaceRoute('gmsh' if onGmsh else 'snappy')
+        self._view.refresh()
+
+    def surfaceOpacity(self) -> float:
+        """The Surface opacity the rail tool shows (the open route's)."""
+        panel = self._surfaceOpacityPanel()
+        return (panel.opacity() if panel is not None
+                else actor_info.routeSurfaceOpacity())
+
+    def setSurfaceOpacity(self, value: float) -> float:
+        """Move the rail tool's slider, as a person does; what it shows."""
+        panel = self._surfaceOpacityPanel()
+        if panel is None:
+            return actor_info.setRouteSurfaceOpacity(value)
+        panel.slider().setValue(round(float(value) * 100))
+        return panel.opacity()
+
+    def surfaceOpacityRoute(self):
+        return actor_info.surfaceRoute()
+
+    def _surfaceOpacityPanel(self):
+        button = getattr(self, '_surfaceOpacityButton', None)
+        return button.panel() if button is not None else None
 
     def displayPanel(self):
         """The Show elements popover's body (Plan 45 N; the name is kept).
@@ -1243,54 +1476,19 @@ class RenderingTool(QObject):
             elements.setParent(panel)
             grid.addWidget(elements, row, 0)
             row += 1
-        # Plan 43 LY13 D11. Gmsh's visibility and display options hang in
-        # this popover too, in a section the Gmsh pages fill and empty: it is
-        # hidden whenever no Gmsh page has mounted a panel into it.
-        host = QWidget(panel)
-        host.setObjectName('gmshDisplayHost')
-        QVBoxLayout(host).setContentsMargins(0, 0, 0, 0)
-        host.setVisible(False)
-        grid.addWidget(host, row, 0)
-        grid.setRowStretch(row + 1, 1)
-        self._gmshDisplayHost = host
-        self._gmshDisplayPanel = None
+        # Plan 48 DK: Gmsh's visibility and display options are a section of
+        # the Gmsh tool dock now, not of this popover.
+        grid.setRowStretch(row, 1)
         self._displayPanel = panel
         return panel
 
-    def mountGmshDisplay(self, widget) -> bool:
-        """Plan 43 LY13 D11. Put Gmsh's display panel in the Show elements
-        popover (Plan 45 N; it was the Display popover).
-
-        The panel is the Gmsh page's own object, every control in it kept; a
-        panel mounted earlier (a page rebuilt by an engine switch) is
-        released first. False when the popover has not been built.
-        """
-        host = getattr(self, '_gmshDisplayHost', None)
-        if host is None:
-            return False
-        self.unmountGmshDisplay(self._gmshDisplayPanel)
-        widget.setParent(host)
-        host.layout().addWidget(widget)
-        widget.setVisible(True)
-        host.setVisible(True)
-        self._gmshDisplayPanel = widget
-        return True
-
-    def unmountGmshDisplay(self, widget) -> None:
-        """Release *widget* (if it is the mounted panel) and hide the section."""
-        if widget is None:
-            return
-        try:
-            if widget is getattr(self, '_gmshDisplayPanel', None):
-                self._gmshDisplayPanel = None
-                self._gmshDisplayHost.setVisible(False)
-            widget.setParent(None)
-            widget.deleteLater()
-        except RuntimeError:
-            pass                                   # already gone
-
     def gmshDisplayPanel(self):
-        return getattr(self, '_gmshDisplayPanel', None)
+        """Gmsh's Visibility and display panel, in the Gmsh tool dock (Plan 48
+        DK), or ``None`` while no Gmsh page has mounted it."""
+        from foammesh.view.gmsh_tools import hosting
+
+        panel = hosting.dock_panel()
+        return panel.hosted(hosting.VISIBILITY) if panel is not None else None
 
     def railOwnedControls(self) -> list:
         return list(self._railOwned)

@@ -267,6 +267,9 @@ _METHOD_PAGE = frozenset((
     'preferences.execution', 'workflow.step'))
 _PREPARATION = frozenset((
     'workflow.geometry_repair', 'workflow.reference_readiness'))
+#: Plan 49 SR8. The surface-role model's document values belong to the
+#: Geometry step, whose surface tab they describe.
+_GEOMETRY = frozenset(('workflow.geometry',))
 
 _LOCATION_LABEL = {
     'meshing_method': 'Mesh setup',
@@ -276,6 +279,7 @@ _LOCATION_LABEL = {
     'workflow.step': 'Mesh setup',
     'workflow.geometry_repair': 'Preparation',
     'workflow.reference_readiness': 'Preparation',
+    'workflow.geometry': 'Geometry',
     # Plan 42 SG11 (D4): asked on the Gmsh Edit geometry row.
     'workflow.gmsh.describe_geometry': 'Edit geometry',
     'workflow.gmsh': 'Size fields',
@@ -303,11 +307,13 @@ def location_label(location: str) -> str:
 
 def route_for_location(location: str, tokens):
     """Where the field of ``location`` is edited: ``('token', t)``,
-    ``('step', 'preparation')`` or ``None`` when this outline has no such page.
+    ``('step', 'preparation')``, ``('step', 'geometry')`` or ``None`` when this outline has no such page.
     """
     tokens = set(tokens or ())
     if location in _PREPARATION:
         return ('step', 'preparation')
+    if location in _GEOMETRY:
+        return ('step', 'geometry')
     if location in _METHOD_PAGE:
         return ('token', 'meshing_method')
     prefix = 'engine_task:'
@@ -494,7 +500,8 @@ class _FieldNavigator(QObject):
             navigation.requestBranch(target)
         else:
             from foammesh.db.configurations_schema import Step
-            navigation.openStep(Step.GEOMETRY_REPAIR)
+            navigation.openStep(Step.GEOMETRY if target == 'geometry'
+                                else Step.GEOMETRY_REPAIR)
         self._field = descriptor.id
         self._left = 20
         self._timer.start()

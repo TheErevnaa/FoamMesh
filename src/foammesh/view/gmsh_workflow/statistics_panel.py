@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget,
+    QCheckBox, QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -34,6 +34,27 @@ def _table(parent, name: str, headings) -> QTableWidget:
 
 def _number(value) -> str:
     return f'{float(value):.6g}'
+
+
+#: Plan 48 GM11b. The Geometry tab of Gmsh's Statistics window: how many
+#: points, curves, surfaces and volumes the model has.
+GEOMETRY_KINDS = ((0, 'Points'), (1, 'Curves'), (2, 'Surfaces'),
+                  (3, 'Volumes'))
+
+
+def geometry_counts(entities, hidden=(), visible_only: bool = False) -> dict:
+    """``{dim: count}`` of the ``(dim, tag)`` pairs in *entities*.
+
+    With *visible_only* the entities in *hidden* are left out, as Gmsh's
+    "Visible only" option does.
+    """
+    hidden = {tuple(h) for h in hidden} if visible_only else set()
+    counts = {dim: 0 for dim, _name in GEOMETRY_KINDS}
+    for dim, tag in {tuple(e) for e in entities}:
+        if (dim, tag) in hidden or dim not in counts:
+            continue
+        counts[dim] += 1
+    return counts
 
 
 class GmshStatisticsPanel(QWidget):
@@ -78,6 +99,19 @@ class GmshStatisticsPanel(QWidget):
             (self.tr('Physical group'), self.tr('Kind'), self.tr('Elements')))
         self._groups.setMaximumHeight(130)
         layout.addWidget(self._groups)
+
+        # Plan 48 GM11b. Gmsh's Geometry tab: entity counts, all or visible.
+        self._geometry = _table(
+            self, 'gmshStatisticsGeometry',
+            (self.tr('Geometry'), self.tr('Count')))
+        self._geometry.setMaximumHeight(130)
+        layout.addWidget(self._geometry)
+        self._visibleOnly = QCheckBox(self.tr('Visible entities only'), self)
+        self._visibleOnly.setObjectName('gmshStatisticsVisibleOnly')
+        self._visibleOnly.setToolTip(self.tr(
+            'Count only the entities that are not hidden in the viewport'))
+        self._visibleOnly.toggled.connect(lambda _on: self.refreshGeometry())
+        layout.addWidget(self._visibleOnly)
 
         self._counts = _table(self, 'gmshStatisticsCounts',
                               (self.tr('Element type'), self.tr('Count')))
@@ -145,6 +179,85 @@ class GmshStatisticsPanel(QWidget):
 
     def statistics(self) -> dict:
         return dict(self._stats)
+
+    # -- what the panel shows (Plan 48 PA4: the local API reads the same) ------ #
+
+    @staticmethod
+    def _rows_of(table) -> list:
+        return [[(table.item(row, column).text()
+                  if table.item(row, column) is not None else '')
+                 for column in range(table.columnCount())]
+                for row in range(table.rowCount())]
+
+    def shown(self) -> dict:
+        """Every read-out of the panel as the person reads it (text)."""
+        histogram = self._histogram
+        return {
+            'summary': self._summary.text(),
+            'bounds': self._bounds.text(),
+            'groups': self._rows_of(self._groups),
+            'groups_shown': not self._groups.isHidden(),
+            'geometry': self._rows_of(self._geometry),
+            'counts': self._rows_of(self._counts),
+            'quality': self._rows_of(self._quality),
+            'passes': self._rows_of(self._passes),
+            'plugin': self._rows_of(self._plugin),
+            'plugin_shown': not self._plugin.isHidden(),
+            'message': self._message.text(),
+            'plotted': self._plotted,
+            'histogram': {'metric': histogram._metric,
+                          'edges': list(histogram.edges()),
+                          'counts': list(histogram.counts()),
+                          'total': int(histogram.total)},
+        }
+
+    # -- Geometry tab (Plan 48 GM11b) ----------------------------------------- #
+
+    def visibleOnly(self) -> bool:
+        return self._visibleOnly.isChecked()
+
+    def setVisibleOnly(self, on: bool) -> None:
+        self._visibleOnly.setChecked(bool(on))
+
+    def geometryCounts(self) -> dict:
+        """``{'Points': n, ...}`` as the Geometry table shows them."""
+        return {self._geometry.item(row, 0).text(): int(
+            self._geometry.item(row, 1).text().replace(',', ''))
+            for row in range(self._geometry.rowCount())}
+
+    def _geometry_source(self) -> tuple:
+        """``(entities, hidden)`` of the model on screen, from the picker."""
+        try:
+            from foammesh.view.gmsh_workflow.shared_pick import (
+                selection_service)
+            source = selection_service().pick_source
+            picker = source.picker() if source is not None else None
+            entities = picker.map.entities() if picker is not None else []
+        except Exception:                             # noqa: BLE001
+            entities = []
+        hidden = ()
+        try:
+            from foammesh.app import app
+            window = app.window
+            panel = window._renderingTool.gmshDisplayPanel()
+            hidden = panel.visibilityModel().hidden
+        except Exception:                             # noqa: BLE001
+            hidden = ()
+        return entities, hidden
+
+    def show_geometry(self, entities, hidden=()) -> dict:
+        """Fill the Geometry table from the model's ``(dim, tag)`` pairs."""
+        counts = geometry_counts(entities, hidden, self.visibleOnly())
+        self._geometry.setRowCount(len(GEOMETRY_KINDS))
+        for row, (dim, name) in enumerate(GEOMETRY_KINDS):
+            self._geometry.setItem(row, 0, QTableWidgetItem(self.tr(name)))
+            self._geometry.setItem(row, 1, QTableWidgetItem(
+                f'{counts[dim]:,}'))
+        return counts
+
+    def refreshGeometry(self) -> dict:
+        entities, hidden = self._geometry_source()
+        return self.show_geometry(entities, hidden)
 
     def show_statistics(self, stats: dict) -> None:
         """Fill every table from *stats* (``element_quality.statistics``)."""
@@ -247,6 +360,7 @@ class GmshStatisticsPanel(QWidget):
 
     def refresh(self) -> None:
         """Read the statistics of the mesh the viewport shows."""
+        self.refreshGeometry()
         controller = self._controller()
         if controller is None:
             self.clear()

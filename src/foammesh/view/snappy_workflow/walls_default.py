@@ -4,11 +4,9 @@ Plan 40 UXA2 (#3, #31, F1c, 4.1.2).
 
 A new snappy case used to leave its walls at level 0 and explain why in a
 paragraph; the first mesh was poor (F1b). It now holds one surface refinement
-group, *walls*, binding every wall-typed surface at the levels the shared
-derivation proposes for the chosen Mesh size, with feature refinement at the
-same level. Like the layers page's *Walls* group it is made once per case
-(``castellation/defaulted``), so a group the user removes stays removed, and a
-case saved before the flag counts as having had its say (schema migration).
+group, *walls*. Which surfaces it binds, at which levels, and when it is made
+is decided in ``core/meshing/walls_default`` (DP-6063), which the run path
+asks too; this module is the pages' write of that decision.
 
 The project feature angle (``mesh/featureAngle``) is written here as well:
 :func:`apply_project_angle` is the one write that changes every place the
@@ -17,11 +15,10 @@ angle is read (see ``core/facade/feature_angle.py``).
 from __future__ import annotations
 
 from foammesh.core.facade import feature_angle as angles
-from foammesh.core.geometry.boundary_roles import (
-    boundaries_from_manifest, default_layer_targets)
+from foammesh.core.meshing import walls_default as model
 from foammesh.view.facade_client import query, submit
 
-GROUP_NAME = 'walls'
+GROUP_NAME = model.GROUP_NAME
 DEFAULTED_FIELD = 'meshing.castellation.defaulted'
 REFINEMENT_COLLECTION = 'meshing.castellation.surface_refinements'
 
@@ -36,84 +33,55 @@ def _configuration(client) -> dict:
 
 
 def case_was_defaulted(client) -> bool:
-    castellation = _configuration(client).get('castellation')
-    return bool(isinstance(castellation, dict)
-                and castellation.get('defaulted'))
+    return model.was_defaulted(_configuration(client))
 
 
-def wall_names(client) -> tuple:
-    """The boundaries the prepared geometry gives the wall role."""
+def prepared_manifest(client):
+    """The prepared geometry's group manifest, or ``None``."""
     try:
         payload = query(client, 'geometry.prepared.current', {}).payload or {}
     except Exception:                                    # noqa: BLE001
-        return ()
+        return None
     prepared = payload.get('prepared')
     if not isinstance(prepared, dict):
-        return ()
+        return None
     manifest = prepared.get('group_manifest')
     if not isinstance(manifest, dict) or not manifest:
-        manifest = prepared if 'groups' in prepared else {}
-    return default_layer_targets(boundaries_from_manifest(manifest))
+        manifest = prepared if 'groups' in prepared else None
+    return manifest
 
 
 def derived_levels(client) -> tuple:
     """``(min, max, feature)`` level for the case's Mesh size choice."""
-    from foammesh.core.sizing import derive_sizes
-
-    preset = ((_configuration(client).get('mesh') or {}).get('sizePreset'))
-    proposal = derive_sizes(preset, diagonal=1.0)
-    return (proposal.surface_min_level, proposal.surface_max_level,
-            proposal.feature_level)
-
-
-def wall_rows(configuration, names) -> list:
-    """Geometry row ids that refine as walls, given the wall boundary *names*.
-
-    The rows a group may refine are the picker's (``RefinementMembership``);
-    of those, the ones named like a wall boundary. When the prepared geometry
-    names no wall among them, every eligible surface is a wall.
-    """
-    from .refinement_membership import (
-        RefinementMembership, SURFACE, geometry_rows)
-
-    class _Config:
-        def configuration(self):
-            return configuration
-
-    picker = RefinementMembership(_Config(), SURFACE)
-    entries = picker._eligible(configuration, None)       # noqa: SLF001
-    rows = geometry_rows(configuration)
-    chosen = [gId for gId, _label, _checked in entries
-              if str(rows.get(gId, {}).get('name') or '') in set(names)]
-    return chosen or [gId for gId, _label, _checked in entries]
+    return model.derived_levels(_configuration(client))
 
 
 def ensure_walls_group(client, then=None) -> bool:
     """Make the case's *walls* group once; ``True`` when a write was sent.
 
-    Nothing happens without a surface to bind (the geometry may not be in yet,
-    and the case is not marked, so the group is made when it is), with a group
-    already present (the case is marked and left alone), or after the case has
-    had its say.
+    The decision is ``core/meshing/walls_default.plan_walls_group``, the one
+    the run path asks (DP-6063): nothing without a surface to bind, nothing
+    after the case has had its say, and only the mark over a group already
+    present. The page writes through the facade so the group and its
+    bindings arrive as the person's own edits would.
     """
     key = id(client)
-    if key in _building or case_was_defaulted(client):
+    if key in _building:
         return False
     configuration = _configuration(client)
-    existing = (configuration.get('castellation') or {}).get(
-        'refinementSurfaces') or {}
-    if existing:
+    if model.was_defaulted(configuration):
+        return False
+    plan = model.plan_walls_group(configuration, prepared_manifest(client))
+    if plan is None:
+        return False
+    if plan.mark_only:
         submit(client, 'configuration.patch',
                {'patch': {DEFAULTED_FIELD: True}})
         return False
-    rows = wall_rows(configuration, wall_names(client))
-    if not rows:
-        return False
+    rows = list(plan.rows)
     from .refinement_membership import (
         RefinementMembership, SURFACE, _patch_bindings)
 
-    low, high, feature = derived_levels(client)
-    included = angles.included_angle(angles.project_angle(configuration))
     _building.add(key)
 
     def finish(*_args) -> None:
@@ -139,10 +107,10 @@ def ensure_walls_group(client, then=None) -> bool:
 
     submit(client, REFINEMENT_COLLECTION + '.create', {'fields': {
         'group_name': GROUP_NAME,
-        'surface_refinement.minimum_level': low,
-        'surface_refinement.maximum_level': high,
-        'feature_edge_refinement_level': feature,
-        'included_angle': included}}, then=created)
+        'surface_refinement.minimum_level': plan.minimum_level,
+        'surface_refinement.maximum_level': plan.maximum_level,
+        'feature_edge_refinement_level': plan.feature_level,
+        'included_angle': plan.included_angle}}, then=created)
     return True
 
 

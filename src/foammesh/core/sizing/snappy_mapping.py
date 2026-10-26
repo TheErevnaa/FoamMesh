@@ -32,8 +32,8 @@ SURFACES = 'meshing.castellation.surface_refinements'
 VOLUMES = 'meshing.castellation.volume_refinements'
 FEATURE_BANDS = 'meshing.castellation.feature_bands'
 VOLUME_BANDS = 'meshing.castellation.volume_bands'
-EXPLICIT_SNAP = 'meshing.snap.explicit_feature_snap'
-IMPLICIT_SNAP = 'meshing.snap.implicit_feature_snap'
+#: DP-5712. Explicit, implicit or none: one choice.
+FEATURE_SNAPPING = 'meshing.snap.feature_snapping'
 LAYER_ANGLE = angle_rules.LAYER_FIELD
 LAYER_GROUPS = 'meshing.layers.groups'
 
@@ -150,12 +150,37 @@ def cell_limits(estimated_cells: int) -> list[Proposal]:
 
 # -- surface refinement ------------------------------------------------------ #
 
+#: DP-2877 (measured 2026-10-21, OpenFOAM 13). A curved wall takes layers
+#: only when its cells resolve the radius: the jacketed pipe at 3.75 cells per
+#: radius (level 1) grew layers on 21-25 % of the fluid wall, at 7.5 (level 2)
+#: on 75 %; the elbow at 9.3 on 89 %.
+CELLS_PER_RADIUS = 6.0
+
+
+def curvature_level(base_cell: float, stats: dict) -> int:
+    """The level whose cell puts ``CELLS_PER_RADIUS`` cells on the radius."""
+    curvature = stats.get('curvature_p50')
+    if curvature is None or not math.isfinite(curvature) or curvature <= 0             or base_cell <= 0:
+        return 0
+    wanted = 1.0 / (float(curvature) * CELLS_PER_RADIUS)
+    return max(0, int(math.ceil(math.log2(base_cell / wanted) - 1e-9)))
+
+
+def max_level(base_cell: float, stats: dict) -> int:
+    """A surface's maximum level: the field's p10 size, and its curvature."""
+    return max(level_for(base_cell, stats['size_p10']),
+               curvature_level(base_cell, stats))
+
+
 def surface_levels(field, base_cell: float) -> list[Proposal]:
-    """Per surface ``level (min max)`` from the p90 and p10 sizes (O10)."""
+    """Per surface ``level (min max)`` from the p90 and p10 sizes (O10).
+
+    DP-2877. The maximum is never coarser than ``curvature_level``.
+    """
     rows = []
     for name, stats in field.per_surface().items():
         low = level_for(base_cell, stats['size_p90'])
-        high = max(low, level_for(base_cell, stats['size_p10']))
+        high = max(low, max_level(base_cell, stats))
         got = cell_size_at(base_cell, high)
         badge = (f'field: {_mm(stats["size_p10"])} -> level {high} '
                  f'({_mm(got)})')
@@ -210,7 +235,7 @@ def gap_level_increment(stats: dict, base_cell: float, nodes_per_gap: int,
     feature = stats.get('feature_size_p10')
     if not nodes_per_gap or feature is None or not math.isfinite(feature)             or feature <= 0 or feature >= 1e29:
         return None
-    high = level_for(base_cell, stats['size_p10'])
+    high = max_level(base_cell, stats)
     h_level = cell_size_at(base_cell, high)
     needed = float(feature)
     finest = stats.get('size_min')
@@ -249,8 +274,12 @@ def distance_bands(distances_by_level: dict, surface: str) -> list[Proposal]:
     ``distances_by_level`` maps level k -> the distance at which the field
     first reaches ``baseCell / 2**k`` (see ``distance_to_level``). Writes
     strictly ordered pairs: larger distance, lower level.
+
+    DP-2866. One proposal per surface whose value is the whole ramp
+    ``[[distance, level], ...]``, nearest first: snappy reads a ramp per
+    ``geometry{}`` entry, and ``castellation/volumeBands`` holds it as rows
+    named by the group, so a band per proposal named a row no store has.
     """
-    rows = []
     # strictly ordered: distance increases as level decreases
     usable = [(level, d) for level, d in distances_by_level.items()
               if d is not None and math.isfinite(d) and d > 0]
@@ -260,15 +289,17 @@ def distance_bands(distances_by_level: dict, surface: str) -> list[Proposal]:
         if distance > previous:
             ordered.append((level, distance))
             previous = distance
-    for index, (level, distance) in enumerate(ordered):
-        key = f'{surface}.{index + 1}'
-        rows.append(Proposal(row_target(VOLUME_BANDS, key, 'distance'),
-                             distance, 'distance where the field reaches '
-                             'baseCell / 2^level',
-                             f'field: level {level} to {_mm(distance)}'))
-        rows.append(Proposal(row_target(VOLUME_BANDS, key, 'level'), level,
-                             'band level', f'field: level {level}'))
-    return rows
+    if not ordered:
+        return []
+    ramp = [[float(distance), int(level)] for level, distance in ordered]
+    return [Proposal(ramp_target(surface), ramp,
+                     'distance where the field reaches baseCell / 2^level',
+                     f'field: {len(ramp)} bands to {_mm(ramp[-1][0])}')]
+
+
+def ramp_target(key: str) -> str:
+    """The whole distance ramp of one body: ``volume_bands[<group>]``."""
+    return f'{VOLUME_BANDS}[{key}]'
 
 
 def distance_to_level(field, origins, directions, base_cell: float,
@@ -303,8 +334,8 @@ def snap_features(feature_edge_count: int) -> list[Proposal]:
     badge = (f'field: {feature_edge_count} feature edges' if explicit
              else 'field: no feature edges')
     rule = 'explicit when O5 is non-empty, implicit otherwise'
-    return [Proposal(EXPLICIT_SNAP, explicit, rule, badge),
-            Proposal(IMPLICIT_SNAP, not explicit, rule, badge)]
+    return [Proposal(FEATURE_SNAPPING,
+                     'explicit' if explicit else 'implicit', rule, badge)]
 
 
 # -- boundary layers ---------------------------------------------------------- #
@@ -316,32 +347,132 @@ def layer_feature_angle(feature_angle: float) -> Proposal:
                     f'field: {value:g} deg')
 
 
+#: Plan 47 S16. Both walls of a gap carry a stack; together they may take at
+#: most half the gap, so one stack is at most a quarter of it.
+GAP_LAYER_SHARE = 0.25
+
+
 def layer_thicknesses(wall_size: float, expansion: float = DEFAULT_EXPANSION,
-                      ) -> dict:
-    """first = 0.3 h_wall, final = h_wall, layers from the user's ratio."""
+                      gap: float | None = None) -> dict:
+    """first = 0.3 h_wall, final = h_wall, layers from the user's ratio.
+
+    Plan 47 S16 (DP-2869). Where the wall faces a thin gap (``gap``, the
+    field's feature size times the nodes per gap), the stack is cut to
+    ``GAP_LAYER_SHARE`` of the gap: layers first, then the first layer
+    itself. The number is the answer; nothing is said beside it.
+    """
     first = FIRST_LAYER_FRACTION * wall_size
     ratio = max(float(expansion), 1.0001)
     layers = max(1, int(math.ceil(
         math.log(wall_size / first) / math.log(ratio) - 1e-9))) \
         if wall_size > first else 1
-    total = sum(first * ratio ** i for i in range(layers))
-    return {'first': first, 'final': wall_size, 'layers': layers,
-            'expansion': ratio, 'total': total}
+
+    def stack(count, height):
+        return sum(height * ratio ** i for i in range(count))
+
+    final = wall_size
+    if gap is not None and math.isfinite(gap) and gap > 0:
+        room = GAP_LAYER_SHARE * float(gap)
+        while layers > 1 and stack(layers, first) > room:
+            layers -= 1
+        if stack(layers, first) > room:
+            first = room
+        final = min(wall_size, first * ratio ** (layers - 1))
+    return {'first': first, 'final': final, 'layers': layers,
+            'expansion': ratio, 'total': stack(layers, first)}
+
+
+def wall_gaps(field, nodes_per_gap: int) -> dict:
+    """``{surface: gap}`` where the field measured a thin gap at the wall."""
+    if not nodes_per_gap:
+        return {}
+    gaps = {}
+    for name, stats in field.per_surface().items():
+        feature = stats.get('feature_size_p10')
+        if feature is None or not math.isfinite(feature) or feature <= 0 \
+                or feature >= 1e29:
+            continue
+        gaps[name] = float(feature) * int(nodes_per_gap)
+    return gaps
+
+
+#: DP-2864. Below this share of the first layer a stack is not worth keeping.
+MIN_THICKNESS_FRACTION = 0.5
+LAYER_MODEL = 'firstAndExpansion'
+
+#: DP-2877 (measured 2026-10-21, elbow, OpenFOAM 13). snappy grows layers
+#: into the cell at the wall, so the stack is sized from that cell, not from
+#: the field's wall size. Relative sizes, first 0.3 of the cell, ratio 1.2:
+#: 3 layers grew on 89.1 % of the elbow wall, 4 on 88.3 %; the old rule's 7
+#: layers (about 3.9 cells deep) on 14.7 %, and in metres on 10.6 %. On the
+#: jacketed pipe 3 layers grew on 75.5 % (fluid) and 86.3 % (solid), 4 on
+#: 39.9 % and 46.6 %.
+SNAPPY_LAYERS = 3
+#: 3 layers of 0.3 at 1.2, in wall cells.
+MAX_STACK_CELLS = 1.1
+#: A tenth of the wall cell, the minimum the measured runs used.
+MIN_RELATIVE_THICKNESS = 0.1
+
+
+def wall_cell(base_cell: float, stats: dict) -> float:
+    """The cell snappy puts on a surface: the cell of its maximum level."""
+    return cell_size_at(base_cell, max_level(base_cell, stats))
+
+
+def snappy_layer_stack(cell: float, expansion: float = DEFAULT_EXPANSION,
+                       gap: float | None = None) -> dict:
+    """Relative sizes for snappy: ``first`` and ``total`` in wall cells.
+
+    DP-2877. At most ``SNAPPY_LAYERS`` layers and ``MAX_STACK_CELLS`` deep.
+    Where the wall faces a thin gap (DP-2869) the stack is cut to
+    ``GAP_LAYER_SHARE`` of the gap: layers first, then the first layer.
+    ``metres`` is the total for *cell*.
+    """
+    ratio = max(float(expansion), 1.0001)
+    first = FIRST_LAYER_FRACTION
+
+    def stack(count, height):
+        return sum(height * ratio ** i for i in range(count))
+
+    layers = SNAPPY_LAYERS
+    while layers > 1 and stack(layers, first) > MAX_STACK_CELLS:
+        layers -= 1
+    if gap is not None and math.isfinite(gap) and gap > 0 and cell > 0:
+        room = GAP_LAYER_SHARE * float(gap) / cell
+        while layers > 1 and stack(layers, first) > room:
+            layers -= 1
+        if stack(layers, first) > room:
+            first = room
+    total = stack(layers, first)
+    return {'first': first, 'layers': layers, 'expansion': ratio,
+            'total': total, 'metres': total * cell,
+            'min': min(MIN_RELATIVE_THICKNESS, 0.5 * first)}
 
 
 def boundary_layers(field, patch_sizes: dict, expansion=DEFAULT_EXPANSION,
-                    ) -> list[Proposal]:
-    """Per patch: first/final thickness and layer count (relative mode)."""
+                    gaps=None) -> list[Proposal]:
+    """Per patch: first thickness, expansion and layer count, relative.
+
+    ``patch_sizes`` maps a patch to the cell at its wall (``wall_cell``).
+    DP-2877. The sizes are relative to that cell (``relativeSizes true``,
+    the layer groups' own default, so a case's other groups agree: v13 reads
+    the switch once), with ``minThickness`` relative too (DP-2864: a
+    minimum in the wrong units dropped every layer).
+    """
     rows = []
-    for patch, wall in patch_sizes.items():
-        layer = layer_thicknesses(wall, expansion)
-        badge = (f'field: wall {_mm(wall)} -> {layer["layers"]} layers, '
-                 f'first {_mm(layer["first"])}')
+    for patch, cell in patch_sizes.items():
+        layer = snappy_layer_stack(cell, expansion, (gaps or {}).get(patch))
+        badge = (f'field: wall cell {_mm(cell)} -> {layer["layers"]} layers, '
+                 f'{_mm(layer["metres"])} deep')
         for element, value, rule in (
-                ('firstLayerThickness', layer['first'], '0.3 x h_wall'),
-                ('finalLayerThickness', layer['final'], 'h_wall'),
+                ('thicknessModel', LAYER_MODEL, 'the sizes are first + ratio'),
+                ('relativeSizes', True, 'the sizes are shares of the wall cell'),
+                ('firstLayerThickness', layer['first'], '0.3 x the wall cell'),
+                ('expansionRatio', layer['expansion'], 'the expansion ratio'),
+                ('minThickness', layer['min'], 'a tenth of the wall cell'),
                 ('nSurfaceLayers', layer['layers'],
-                 'ceil(log(final / first) / log(ratio))')):
+                 f'at most {SNAPPY_LAYERS}, at most {MAX_STACK_CELLS:g} '
+                 'wall cells deep')):
             rows.append(Proposal(row_target(LAYER_GROUPS, patch, element),
                                  value, rule, badge))
     return rows

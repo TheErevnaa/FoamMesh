@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
-from foammesh.view.workflow_controls.child_controls import ChildControlPanel
-
 from foammesh.view.widgets.empty_state import attach_empty_state
 
 from .base import GmshTaskPage
 from .periodic_arrow import PeriodicArrowView, scope_centre
+from .periodic_pair_panel import GmshPeriodicPairPanel
 
 
 class GmshPeriodicPage(GmshTaskPage):
@@ -39,21 +38,31 @@ class GmshPeriodicPage(GmshTaskPage):
 
     def geometryPairLines(self) -> list[str]:
         """One line per cyclic pair the Geometry page defines (UXD9, #32)."""
+        # Plan 49 SR3. The sides are named from the pair's periodic relation
+        # (the surface names, following a rename), not by patch uuid.
         try:
-            node = self._client.configuration().get('interfacePairs') or {}
+            document = self._client.configuration()
         except Exception:                                    # noqa: BLE001
             return []
-        rows = node.values() if isinstance(node, dict) else node
+        node = document.get('interfacePairs') or {}
+        labels = {}
+        for relation in (document.get('surfaceRelations') or {}).values():
+            if isinstance(relation, dict):
+                labels[str(relation.get('legacySource') or '')] = (
+                    relation.get('ownerLabel'), relation.get('neighbourLabel'))
+        items = node.items() if isinstance(node, dict) else enumerate(node)
         lines = []
-        for row in rows:
+        for key, row in items:
             if not isinstance(row, dict) or str(
                     row.get('coupling') or '') != 'cyclic':
                 continue
             state = '' if row.get('enabled', True) else ' (off)'
+            owner, neighbour = labels.get(f'interfacePairs/{key}',
+                                          (None, None))
             lines.append('%s: %s to %s%s' % (
                 row.get('name') or 'pair',
-                row.get('masterScopeToken') or '?',
-                row.get('slaveScopeToken') or '?', state))
+                owner or row.get('masterScopeToken') or '?',
+                neighbour or row.get('slaveScopeToken') or '?', state))
         return lines
 
     def openGeometry(self) -> bool:
@@ -94,7 +103,7 @@ class GmshPeriodicPage(GmshTaskPage):
         self._transformNote = note
         layout.addWidget(note)
 
-        self.panel = ChildControlPanel(
+        self.panel = GmshPeriodicPairPanel(
             self._client, 'gmsh.periodic_pairs.controls',
             self.tr('Periodic pairs'), columns=self.COLUMNS, parent=self,
             headings=self.HEADINGS, inline=True)

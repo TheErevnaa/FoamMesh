@@ -35,7 +35,7 @@ from foammesh.view.theming.metrics import (GAP_TIGHT, MARGIN_NONE,
 from foammesh.core.facade.field_tiers import (
     COMMON, ESSENTIAL, EXPERT, tier_of)
 from foammesh.view.widgets.folder_header import FolderHeader
-from .field_widgets import FieldEditor
+from .field_widgets import FieldEditor, add_editor_row
 from .page_action import PageAction
 from .page_filter import make_filter_box
 from .tiers import expert_visibility, make_expert_toggle
@@ -193,10 +193,10 @@ class FieldGroupPage(QWidget):
             # ~34 px of a row built with `unit_cell` on the same page.
             row.setContentsMargins(
                 MARGIN_NONE, MARGIN_NONE, MARGIN_NONE, MARGIN_NONE)
-            row.addWidget(editor.editor, 1)
             # DP-156, as on the task page: the cell always ends with the unit
-            # label so the column can be given one width.
-            row.addWidget(editor.unit_label)
+            # label so the column can be given one width. DP-2873: a number
+            # box keeps a compact width.
+            add_editor_row(row, editor)
             container = QWidget(self._form)
             container.setLayout(row)
             layout.addRow(editor.label, container)

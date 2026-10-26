@@ -372,39 +372,125 @@ def display_budget(log_directory=None) -> DisplayBudget:
     return current(log_directory).budget
 
 
-#: Share of the memory free now that the preview the window holds may take.
+#: The window needs about 1 / this share of RAM to open a preview file of a
+#: given size (the .vtp read back, the VTK objects, the packed copy): so a
+#: preview file may take this share of the RAM that is free.
 PREVIEW_MEMORY_SHARE = 0.25
+
+
+def _free_ram() -> int:
+    """The RAM free now for the window (``resource_budget`` budget), else 0."""
+    from foammesh.support import resource_budget
+    try:
+        measured = resource_budget.quick_snapshot()
+    except Exception:                                      # noqa: BLE001
+        return 0
+    if not measured.forced and measured.total <= 0:
+        return 0
+    return max(0, int(measured.budget))
+
+
+def draws_from_ram(budget: DisplayBudget | None = None) -> bool:
+    """True unless a discrete card with its own memory draws the viewport.
+
+    The user's rule (DP-5715, 2026-10-23): integrated graphics share the
+    PC's RAM, so there -- and when the device is unknown or software -- the
+    limit of what the viewport holds is the PC's free RAM."""
+    shown = budget if budget is not None else display_budget()
+    return shown.tier != DISCRETE
 
 
 def preview_budget(budget: DisplayBudget | None = None,
                    available: int | None = None) -> tuple[int, int]:
-    """``(max_triangles, max_bytes)`` for the boundary preview.
+    """``(max_triangles, max_bytes)`` the boundary preview is decimated to.
 
-    The user's rule (2026-10-01): no fixed display cap. The triangles the
-    preview keeps follow the GPU that draws it (2 M before a view has drawn,
-    8 M on an integrated GPU, scaled with a discrete card's memory -- about
-    100 M on a 20 GB card). The bytes are the window's own memory, so they
-    are also held to :data:`PREVIEW_MEMORY_SHARE` of what is free now, and
-    never below resource_budget's D12 figures (2 M triangles, 256 MB).
+    These are display limits: above them the picture is decimated and says
+    so; nothing is refused for them. They follow the memory of the device
+    that draws the picture (DP-5715):
+
+    * a discrete card: the triangles its dedicated memory holds
+      (:func:`budget_for`, :data:`GPU_MEMORY_SHARE` of it);
+    * integrated graphics, software or unknown: the picture is drawn out of
+      the PC's RAM, so the triangles the free RAM holds at
+      :data:`GPU_MEMORY_SHARE` of it, a triangle costing its GPU buffers and
+      its preview bytes (no fixed 8 M / 2 M figure).
+
+    ``available`` is the free RAM (``resource_budget`` budget; measured when
+    None). The bytes are also held to :data:`PREVIEW_MEMORY_SHARE` of it, so
+    the window can open what the worker writes. Never below
+    resource_budget's D12 floor (2 M triangles, 256 MB): a smaller preview is
+    not drawn smaller, it is decimated less.
     """
     from foammesh.support import resource_budget
 
     shown = budget if budget is not None else display_budget()
     floor_triangles = resource_budget.PREVIEW_MAX_TRIANGLES
     floor_bytes = resource_budget.PREVIEW_MAX_BYTES
-    triangles = max(floor_triangles, shown.preview_max_triangles)
-    limit = max(floor_bytes, shown.preview_max_bytes)
     if available is None:
-        try:
-            available = resource_budget.physical_memory()[1]
-        except Exception:                                  # noqa: BLE001
-            available = 0
+        available = _free_ram()
+    available = max(0, int(available or 0))
+    per_triangle = max(1, shown.preview_max_bytes
+                       // max(1, shown.preview_max_triangles))
+    if draws_from_ram(shown) and available:
+        triangles = int(available * GPU_MEMORY_SHARE
+                        / (GPU_BYTES_PER_TRIANGLE + PREVIEW_BYTES_PER_TRIANGLE))
+        triangles = max(floor_triangles,
+                        min(PREVIEW_CEILING_TRIANGLES, triangles))
+        limit = triangles * PREVIEW_BYTES_PER_TRIANGLE
+        per_triangle = PREVIEW_BYTES_PER_TRIANGLE
+    else:
+        triangles = max(floor_triangles, shown.preview_max_triangles)
+        limit = max(floor_bytes, shown.preview_max_bytes)
     if available:
-        limit = max(floor_bytes, min(limit, int(available * PREVIEW_MEMORY_SHARE)))
-        per_triangle = max(1, shown.preview_max_bytes
-                           // max(1, shown.preview_max_triangles))
+        limit = max(floor_bytes,
+                    min(limit, int(available * PREVIEW_MEMORY_SHARE)))
         triangles = max(floor_triangles, min(triangles, limit // per_triangle))
     return int(triangles), int(limit)
+
+
+def window_room(available: int | None = None) -> int | None:
+    """Bytes of preview file the window can open with the RAM free now
+    (:data:`PREVIEW_MEMORY_SHARE` of it), or None when it cannot be read --
+    then nothing is refused for it. The only byte refusal of a surface
+    preview: above it, opening the file needs more than the RAM free."""
+    if available is None:
+        available = _free_ram()
+    if not available:
+        return None
+    return int(int(available) * PREVIEW_MEMORY_SHARE)
+
+
+def drawing_device(profile: GpuProfile | None = None):
+    """The device that draws the viewport, for the admission
+    (``resource_budget.DrawingDevice``): its name, tier and, for a discrete
+    card, its dedicated memory. Reads :func:`current`; probes nothing."""
+    from foammesh.support import resource_budget
+
+    shown = profile if profile is not None else current()
+    name = (shown.adapter.name if shown.adapter is not None
+            else shown.renderer) or ''
+    memory = int(shown.gpu_memory_bytes or 0) if shown.tier == DISCRETE else 0
+    return resource_budget.DrawingDevice(name, shown.tier or UNKNOWN, memory)
+
+
+def gpu_bytes_for(operation: str, counts: dict | None) -> int:
+    """What the result of ``operation`` uploads to the GPU, from the header
+    counts (0 when they say nothing): its drawn triangles (about two a
+    boundary face, the volume's exterior drawn as its surface) at
+    :data:`GPU_BYTES_PER_TRIANGLE`. The boundary preview is decimated to fit
+    the card (:func:`preview_budget`), so it never needs more than the
+    triangles the card holds; the section's polygons are not known before it
+    is cut (the window checks the RAM its files need)."""
+    counts = dict(counts or {})
+    faces = int(counts.get('boundary_faces') or 0)
+    if not faces:
+        return 0
+    triangles = 2 * faces
+    if operation == 'mesh.preview':
+        triangles = min(triangles, display_budget().preview_max_triangles)
+    elif operation != 'mesh.volume':
+        return 0
+    return int(triangles * GPU_BYTES_PER_TRIANGLE)
 
 
 def reset() -> None:
@@ -691,5 +777,6 @@ __all__ = ['Adapter', 'DisplayBudget', 'GpuProfile', 'FALLBACK_ORDER',
            'adapter_tier', 'budget_for', 'classify', 'current',
            'display_adapters', 'display_budget', 'make_adapter',
            'match_adapter', 'prefer_discrete_gpu', 'preview_budget',
+           'drawing_device', 'gpu_bytes_for', 'window_room', 'draws_from_ram',
            'profile_from', 'ranked',
            'set_current', 'switch_hint']

@@ -39,6 +39,18 @@ def apply_color_swatch(widget, color: QColor | None) -> None:
 
 
 
+def apply_value_swatch(widget, red: int, green: int, blue: int) -> None:
+    """Paint a button in a colour the user picked, with legible text on it.
+
+    Plan 48 UF (DP-5656): the Gmsh Drawing colour buttons wrote this sheet
+    themselves, from the panel; a colour that is data lives here, with the
+    other swatches.
+    """
+    ink = 'black' if red + green + blue > 380 else 'white'
+    widget.setStyleSheet(
+        f'background-color: rgb({red},{green},{blue}); color: {ink};')
+
+
 def swatch_color(widget) -> QColor | None:
     """The colour :func:`apply_color_swatch` last painted on *widget*.
 

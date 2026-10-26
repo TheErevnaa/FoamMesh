@@ -234,15 +234,15 @@ CONTROLS = _register(
     SnappyControl('snap/nSolveIter', WRITER, SNAP, 'nSolveIter'),
     SnappyControl('snap/nRelaxIter', WRITER, SNAP, 'nRelaxIter'),
     SnappyControl('snap/nFeatureSnapIter', WRITER, SNAP, 'nFeatureSnapIter'),
-    SnappyControl('snap/implicitFeatureSnap', WRITER, SNAP,
-                  'implicitFeatureSnap'),
-    SnappyControl('snap/explicitFeatureSnap', WRITER, SNAP,
+    SnappyControl('snap/featureSnapping', WRITER, SNAP,
                   'explicitFeatureSnap',
-                  note='independent of implicitFeatureSnap; v13 accepts both '
-                       'on, which is the usual setting for an STL with '
-                       'extracted feature edges'),
+                  note='one choice (DP-5712): explicit, implicit or none, '
+                       'written as explicitFeatureSnap and '
+                       'implicitFeatureSnap with at most one true'),
     SnappyControl('snap/multiRegionFeatureSnap', WRITER, SNAP,
-                  'multiRegionFeatureSnap'),
+                  'multiRegionFeatureSnap',
+                  note='written true only with explicit feature snapping on '
+                       'a case with more than one region or zone'),
     SnappyControl('snap/detectNearSurfacesSnap', WRITER, SNAP,
                   'detectNearSurfacesSnap',
                   note='left unwritten while it is DEFAULT'),

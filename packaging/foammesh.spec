@@ -49,6 +49,13 @@ SIZEFIELD_TOOL = ROOT / 'src' / 'resources' / 'sizefield' / 'linux-x86_64' / 'fo
 if not SIZEFIELD_TOOL.is_file():
     raise SystemExit(f'{SIZEFIELD_TOOL} is missing: the packaged app could not set up automatic sizing')
 
+# Plan 48 GM16a (DP-2901): FoamMesh's own Gmsh build ships the same way (the
+# app installs it into the user's WSL distribution with "Set up FoamMesh's
+# Gmsh"); without it the High-order tools' patch fields would have no Gmsh.
+GMSH_BUNDLE = ROOT / 'src' / 'resources' / 'gmsh_runtime' / 'linux-x86_64' / 'gmsh-4.15.2-revoropt-6.tar.gz'
+if not GMSH_BUNDLE.is_file():
+    raise SystemExit(f'{GMSH_BUNDLE} is missing: the packaged app could not set up its own Gmsh')
+
 datas = [
     *tree(ROOT / 'src' / 'resources', 'resources'),
     *tree(ROOT / 'docs', 'docs'),
@@ -118,6 +125,27 @@ def crash_resilience_modules():
 
 
 hiddenimports += crash_resilience_modules()
+
+
+def plan48_route_modules():
+    """DP-5747: every Plan 48 local-API route module.
+
+    `core/facade/plan48` finds its `*_routes` modules at run time
+    (pkgutil.iter_modules), so static analysis collects only the ones another
+    module imports by name. The packaged 1.1.4 served 108 of the 208 Plan 48
+    operations: no window.* control, no interface-pair check. The rule here
+    is the discovery's own (name ends in _routes, no leading underscore).
+    """
+    folder = SRC / 'foammesh' / 'core' / 'facade' / 'plan48'
+    names = sorted(module.stem for module in folder.glob('*_routes.py')
+                   if not module.stem.startswith('_'))
+    if not names:
+        raise SystemExit(f'foammesh.spec: no route modules under {folder}')
+    return ['foammesh.core.facade.plan48',
+            *(f'foammesh.core.facade.plan48.{name}' for name in names)]
+
+
+hiddenimports += plan48_route_modules()
 
 # The exe's version resource is the committed template plus the PySide6 and
 # VTK versions of this build (packaging/version_resource.py).

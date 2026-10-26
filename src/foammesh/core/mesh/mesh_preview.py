@@ -840,6 +840,11 @@ def build_preview(operation: str, args: dict) -> dict:
     max_bytes = args.get('max_bytes') or (
         None if volume else budget.PREVIEW_MAX_BYTES)
     max_bytes = None if max_bytes is None else int(max_bytes)
+    # DP-5715. ``max_bytes`` is what the surface is decimated to; the files
+    # are refused only above ``refuse_bytes``, the window's room in the RAM
+    # free (0: unreadable, nothing refused for size). Absent, max_bytes.
+    refuse_bytes = args.get('refuse_bytes', max_bytes)
+    refuse_bytes = None if not refuse_bytes else int(refuse_bytes)
     max_cells = args.get('max_cells')
     max_cells = None if max_cells is None else int(max_cells)
     seeds = [(name, point) for name, point in (args.get('region_seeds') or ())]
@@ -944,11 +949,12 @@ def build_preview(operation: str, args: dict) -> dict:
                                 'name': name, 'path': str(path),
                                 'bytes': size, 'ids': ids is not None,
                                 'cells': int(grid.GetNumberOfCells())})
-        if max_bytes is not None and total > max_bytes:
+        if refuse_bytes is not None and total > refuse_bytes:
             raise PreviewRefused(
                 'volume_too_large' if volume else 'preview_too_large',
-                f'the preview files take {total:,} bytes; the limit is '
-                f'{max_bytes:,}', bytes=total, max_bytes=max_bytes)
+                f'the preview files take {total:,} bytes; the window can '
+                f'open {refuse_bytes:,} with the RAM free', bytes=total,
+                max_bytes=refuse_bytes)
     except BaseException:
         for path in written:
             try:

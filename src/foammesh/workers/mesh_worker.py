@@ -330,8 +330,8 @@ def main(argv=None) -> int:
     except MemoryError:
         document = {'status': 'failed', 'operation': operation,
                     'reason': 'over_budget',
-                    'message': 'the worker ran out of the memory it was '
-                               'granted'}
+                    # DP-5715: a heavy worker's cap is the free RAM.
+                    'message': 'it needed more RAM than this PC has free'}
         code = EXIT_OVER_BUDGET
     except Exception as error:                              # noqa: BLE001
         import traceback

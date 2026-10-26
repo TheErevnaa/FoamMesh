@@ -135,6 +135,8 @@ class WslHealthMonitor:
         self.last_probe_at: float | None = None
         self.last_alive_at: float | None = None
         self.last_probe: ProbeResult | None = None
+        #: DP-6059. The shared probe whose answer is already in the state.
+        self._applied = None
         self.jobs_running = 0
         self._timeouts = 0
         self._down = False
@@ -210,11 +212,14 @@ class WslHealthMonitor:
         argv = probe_argv(self.executable, self.distribution)
         return await asyncio.to_thread(self._call, argv, self.probe_timeout)
 
-    async def _shared_probe(self) -> ProbeResult:
+    def _shared_task(self):
         # Concurrent askers share one wsl.exe process.
         if self._probing is None or self._probing.done():
             self._probing = asyncio.ensure_future(self._probe_once())
-        return await asyncio.shield(self._probing)
+        return self._probing
+
+    async def _shared_probe(self) -> ProbeResult:
+        return await asyncio.shield(self._shared_task())
 
     async def probe(self, cause: str = 'idle', *, within: float | None = None) -> str:
         """Ask the runtime ``--exec true`` and fold the answer into the state.
@@ -227,11 +232,19 @@ class WslHealthMonitor:
         *within* bounds the wait: past it the probe counts as timed out even
         if ``wsl.exe`` has not been reaped yet, so a deadline is a deadline.
         """
+        task = self._shared_task()
         try:
             if within is None:
-                result = await self._shared_probe()
+                result = await asyncio.shield(task)
             else:
-                result = await asyncio.wait_for(self._shared_probe(), max(0.0, within))
+                result = await asyncio.wait_for(asyncio.shield(task),
+                                                max(0.0, within))
+            # DP-6059. Askers share one probe; its answer is one answer.
+            # Folded in once per asker, one slow reply counted as two
+            # timeouts and took the runtime straight to unreachable.
+            if task is self._applied:
+                return self.state
+            self._applied = task
         except asyncio.TimeoutError:
             result = ProbeResult(False, float(within or 0.0), True,
                                  f'no answer within {self.probe_timeout:g} s')

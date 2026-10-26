@@ -32,13 +32,16 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from foammesh.core import display_unit
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, place_unit
+from foammesh.view.theming.status_colors import apply_value_swatch
 from foammesh.view.workflow_controls.length_box import ModelLengthBox
 from foammesh.core.gmsh import session_display as sd
 from foammesh.core.gmsh.session_entities import EntityRecord
@@ -99,6 +102,7 @@ class GmshDisplayPanel(QWidget):
         layout.addWidget(self._tabs)
         self._buildVisibility()
         self._buildCamera()
+        self._buildDrawing()
         self._status = QLabel('', self)
         self._status.setObjectName('gmshDisplayStatus')
         self._status.setWordWrap(True)
@@ -140,7 +144,308 @@ class GmshDisplayPanel(QWidget):
     def busy(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
 
+    # -- Drawing (Plan 48 GM2) ------------------------------------------------- #
+
+    #: Emitted with ``(option name, value)`` when a drawing control changes.
+    drawingChanged = Signal(str, object)
+
+    def _loadDrawing(self) -> 'sd.GmshDisplaySettings':
+        return sd.load_saved_settings()
+
+    def _saveDrawing(self) -> None:
+        sd.save_settings(self._drawing)
+
+    def reloadDrawing(self) -> None:
+        """Take the kept settings again (the local API may have set some)."""
+        kept = self._loadDrawing()
+        for name in sd.DISPLAY_BINDINGS:
+            if self._drawing.get(name) != kept.get(name):
+                self._drawing.set(name, kept.get(name))
+                control = self._drawingControls.get(name)
+                if control is not None:
+                    self._showInControl(control, kept.get(name))
+
+    @staticmethod
+    def _showInControl(control, now) -> None:
+        control.blockSignals(True)
+        try:
+            if isinstance(control, QCheckBox):
+                control.setChecked(bool(now))
+            elif isinstance(control, QComboBox):
+                control.setCurrentIndex(max(control.findData(int(now)), 0))
+            elif isinstance(control, QPushButton):
+                GmshDisplayPanel._paintSwatch(control, now)
+            elif isinstance(control, ModelLengthBox):
+                control.setModelValue(float(now))
+            else:
+                control.setValue(float(now))
+        finally:
+            control.blockSignals(False)
+
+    def _buildDrawing(self) -> None:
+        """One control for each Gmsh display option no other control holds.
+
+        The values are :class:`sd.GmshDisplaySettings`; the controls of the
+        Elements group and the Section tool keep the options they own
+        (:data:`sd.DISPLAY_BINDINGS` says which).  The viewport draws from
+        :meth:`drawingSettings` (Plan 48 GM11a).
+        """
+        self._drawing = self._loadDrawing()
+        self._drawingControls = {}
+        box = self._tab(self.tr('Drawing'), 'gmshDisplayDrawingTab')
+        scroll = QScrollArea(self)
+        scroll.setObjectName('gmshDrawingScroll')
+        scroll.setWidgetResizable(True)
+        inner = QWidget(scroll)
+        outer = QVBoxLayout(inner)
+        titles = (('Geometry', self.tr('Geometry')),
+                  ('Mesh', self.tr('Mesh')),
+                  ('colour', self.tr('Colours')))
+        forms = {}
+        for key, title in titles:
+            group = QGroupBox(title, inner)
+            group.setObjectName('gmshDrawing_' + key)
+            forms[key] = QFormLayout(group)
+            outer.addWidget(group)
+        for name, binding in sd.DISPLAY_BINDINGS.items():
+            if binding.shared:
+                continue
+            key = 'colour' if binding.kind == 'color' else name.split('.')[0]
+            label = name.split('.', 1)[1]
+            control = self._drawingControl(inner, name, binding)
+            self._drawingControls[name] = control
+            forms[key].addRow(label, control)
+        outer.addStretch(1)
+        scroll.setWidget(inner)
+        box.addWidget(scroll)
+        reset = QPushButton(self.tr('Reset drawing options'), self)
+        reset.setObjectName('gmshDrawingReset')
+        reset.clicked.connect(self.resetDrawing)
+        box.addWidget(reset)
+
+    def _drawingControl(self, parent, name, binding):
+        option = sd.oc_get(name)
+        value = self._drawing.get(name)
+        if binding.kind == 'bool':
+            control = QCheckBox(parent)
+            control.setChecked(bool(value))
+            control.toggled.connect(
+                lambda on, n=name: self._drawingSet(n, int(on)))
+        elif binding.kind == 'enum':
+            control = QComboBox(parent)
+            for key, text in option.choices:
+                control.addItem(f'{key}: {text}', key)
+            control.setCurrentIndex(max(control.findData(int(value)), 0))
+            control.activated.connect(
+                lambda _i, n=name, c=control: self._drawingSet(
+                    n, c.currentData()))
+        elif binding.kind == 'color':
+            control = QPushButton(parent)
+            self._paintSwatch(control, value)
+            control.clicked.connect(
+                lambda _c=False, n=name, c=control: self._pickColour(n, c))
+        elif option.is_length:
+            # UXB3c: a length (Geometry.OffsetX/Y/Z) shows in the project
+            # display unit and reaches Gmsh in model units.
+            low = option.minimum if option.minimum is not None else -1e9
+            high = option.maximum if option.maximum is not None else 1e9
+            control = ModelLengthBox(parent, minimum=low, maximum=high)
+            control.setModelValue(float(value))
+            control.modelValueChanged.connect(
+                lambda v, n=name: self._drawingSet(n, v))
+        else:
+            control = CompactDoubleSpinBox(parent)
+            whole = binding.kind in ('int', 'bitmask')
+            control.setDecimals(0 if whole else 3)
+            low = option.minimum if option.minimum is not None else -1e9
+            high = option.maximum if option.maximum is not None else 1e9
+            control.setRange(low, high)
+            control.setValue(float(value))
+            control.valueChanged.connect(
+                lambda v, n=name: self._drawingSet(n, v))
+        control.setObjectName('gmshDrawing_' + name)
+        control.setAccessibleName(name)
+        control.setToolTip(option.help)
+        return control
+
+    @staticmethod
+    def _paintSwatch(button, value) -> None:
+        red, green, blue = (int(v) for v in value[:3])
+        button.setText(f'{red}, {green}, {blue}')
+        apply_value_swatch(button, red, green, blue)
+
+    def _pickColour(self, name, button) -> None:
+        current = self._drawing.colour(name)
+        chosen = QColorDialog.getColor(QColor(*current[:3]), self)
+        if chosen.isValid():
+            self._drawingSet(name, [chosen.red(), chosen.green(),
+                                    chosen.blue(), current[3]])
+            self._paintSwatch(button, self._drawing.get(name))
+
+    def _drawingSet(self, name, value) -> bool:
+        try:
+            self._drawing.set(name, value)
+        except ValueError as error:
+            self._say(str(error))
+            return False
+        self._saveDrawing()
+        self.drawingChanged.emit(name, self._drawing.get(name))
+        self.displayChanged.emit()
+        return True
+
+    def drawingSettings(self) -> 'sd.GmshDisplaySettings':
+        """The values of every drawing option (a live object)."""
+        return self._drawing
+
+    def setDrawingOption(self, name: str, value) -> bool:
+        """Set one drawing option as its control would (and show it)."""
+        if not self._drawingSet(name, value):
+            return False
+        control = self._drawingControls.get(name)
+        if control is not None:
+            self._showInControl(control, self._drawing.get(name))
+        return True
+
+    def resetDrawing(self) -> None:
+        for name in list(self._drawing.changed()):
+            self.setDrawingOption(name, sd.oc_get(name).default)
+
+    # -- what the local API reaches (Plan 48 PA1) ----------------------------- #
+
+    #: The tabs, by the key the API names them with.
+    TAB_KEYS = {'visibility': 'gmshDisplayVisibilityTab',
+                'camera': 'gmshDisplayCameraTab',
+                'drawing': 'gmshDisplayDrawingTab'}
+
+    def tabKeys(self) -> list:
+        return list(self.TAB_KEYS)
+
+    def currentTab(self) -> str:
+        """The key of the tab on show (the one a person has chosen)."""
+        name = self._tabs.currentWidget().objectName()
+        for key, value in self.TAB_KEYS.items():
+            if value == name:
+                return key
+        return ''
+
+    def showTab(self, key: str) -> bool:
+        """Choose a tab as a click on its title does (and as Shift+Ctrl+M
+        chooses Camera)."""
+        wanted = self.TAB_KEYS.get(str(key))
+        if wanted is None:
+            raise ValueError('there is no such tab; the tabs are %s'
+                             % ', '.join(self.TAB_KEYS))
+        for index in range(self._tabs.count()):
+            if self._tabs.widget(index).objectName() == wanted:
+                self._tabs.setCurrentIndex(index)
+                return True
+        return False
+
+    def drawingValues(self) -> dict:
+        """Every drawing option the window holds, by Gmsh name."""
+        settings = self._drawing
+        out = {}
+        for name in sd.DISPLAY_BINDINGS:
+            value = settings.get(name)
+            out[name] = list(value) if isinstance(value, tuple) else value
+        return out
+
+    def drawingFollowedBy(self) -> dict:
+        """Whether the viewport takes these values: the Elements group draws
+        from the same settings object the Drawing tab holds."""
+        elements = self.elements()
+        reader = getattr(elements, 'drawingSettings', None)
+        return {'elements': bool(callable(reader)
+                                 and reader() is self._drawing)}
+
+    def checkDrawing(self, wanted: dict) -> dict:
+        """The values ``wanted`` would give, or ``ValueError`` with the
+        refusal the control would show; nothing is changed."""
+        scratch = sd.GmshDisplaySettings(self._drawing.changed())
+        for name, value in wanted.items():
+            scratch.set(name, value)
+        return {name: scratch.get(name) for name in wanted}
+
+    def waitIdle(self, timeout: float = 120.0) -> bool:
+        """Wait for the session work a control started (a visibility step) and
+        take its answer as the window does. True when it finished."""
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout)
+        from PySide6.QtCore import QCoreApplication, QEvent
+
+        QCoreApplication.sendPostedEvents(self._bridge, QEvent.Type.MetaCall)
+        return not self.busy()
+
     # -- Visibility ---------------------------------------------------------- #
+
+    def setVisibilityFilter(self, dims=None, tags=None, physical=None) -> None:
+        """Fill the filter as a person does: the dimension ticks, the tag
+        ranges and the physical group."""
+        if dims is not None:
+            for dim, box in self._dimBoxes.items():
+                box.setChecked(dim in dims)
+        if tags is not None:
+            self._tagRanges.setText(str(tags))
+        if physical is not None:
+            self._physical.setText(str(physical))
+
+    def setAffectsMeshing(self, on: bool) -> None:
+        """The Visibility affects meshing tick (Mesh.MeshOnlyVisible)."""
+        self._affects.setChecked(bool(on))
+
+    def affectsMeshing(self) -> bool:
+        return self._affects.isChecked()
+
+    def visibilityState(self) -> dict:
+        """What the Visibility tab shows."""
+        model = self._visibility
+        return {
+            'dims': [d for d, b in self._dimBoxes.items() if b.isChecked()],
+            'tags': self._tagRanges.text(),
+            'physical': self._physical.text(),
+            'affects_meshing': self._affects.isChecked(),
+            'only_visible': bool(model.only_visible),
+            'count_text': self._visLabel.text(),
+            'visible': len(model.visible), 'total': len(self._records),
+            'hidden': sorted([int(d), int(t)] for d, t in model.hidden),
+            'entities': len(self._records)}
+
+    # -- the Camera tab ------------------------------------------------------ #
+
+    POSE_KEYS = ('rx', 'ry', 'rz', 'tx', 'ty', 'tz', 'scale')
+
+    def setPoseValues(self, values: dict) -> dict:
+        """Type values into the seven fields; the range of each field is its
+        own, and a value outside it is refused rather than clipped."""
+        for name in values:
+            if name not in self._pose:
+                raise ValueError('%s is not a camera pose value; they are %s'
+                                 % (name, ', '.join(self.POSE_KEYS)))
+        checked = {}
+        for name, value in values.items():
+            spin = self._pose[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError('%s must be a number' % name)
+            low, high = (spin.minimum(), spin.maximum()) if not isinstance(
+                spin, ModelLengthBox) else (-1e9, 1e9)
+            if not low <= float(value) <= high:
+                raise ValueError('%s is out of range (%g to %g)'
+                                 % (name, low, high))
+            checked[name] = float(value)
+        for name, value in checked.items():
+            spin = self._pose[name]
+            if isinstance(spin, ModelLengthBox):
+                spin.setModelValue(value)
+            else:
+                spin.setValue(value)
+        return self.poseDict()
+
+    def poseDict(self) -> dict:
+        pose = self.poseValue()
+        return {name: float(getattr(pose, name)) for name in self.POSE_KEYS}
+
+    # -- the Visibility tab ---------------------------------------------------- #
 
     def _buildVisibility(self) -> None:
         box = self._tab(self.tr('Visibility'), 'gmshDisplayVisibilityTab')
@@ -211,23 +516,33 @@ class GmshDisplayPanel(QWidget):
 
     def applyVisibility(self, mode: str) -> list:
         """Show, hide, show only or show all of the filtered entities."""
+        self._refusal = ''
         if not self._records:
-            self._say(self.tr('Show the model first; there are no entities '
-                              'to filter.'))
+            self._refuse(self.tr('Show the model first; there are no '
+                                 'entities to filter.'))
             return []
         try:
             selected = sd.matching_entities(self._records, self.filterValue(),
                                             self._group_names)
             steps = sd.visibility_steps(self._records, selected, mode)
         except ValueError as error:
-            self._say(str(error))
+            self._refuse(str(error))
             return []
         if mode != 'all' and not selected:
-            self._say(self.tr('No entity matches the filter.'))
+            self._refuse(self.tr('No entity matches the filter.'))
             return []
         self._applySteps(steps)
         self._say(self.tr('%d entities selected.') % len(selected))
         return steps
+
+    def _refuse(self, text: str) -> None:
+        """Say why a press did nothing, and keep the reason for the API."""
+        self._refusal = str(text)
+        self._say(text)
+
+    def lastRefusal(self) -> str:
+        """Why the last Show / Hide / Show only / Show all did nothing."""
+        return getattr(self, '_refusal', '')
 
     def _applySteps(self, steps) -> None:
         self._visibility.apply(steps)
@@ -512,6 +827,7 @@ class GmshDisplayPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self.reloadDrawing()
         self.opened.emit()
 
     # -- the session --------------------------------------------------------- #
@@ -527,7 +843,10 @@ class GmshDisplayPanel(QWidget):
         directory = tempfile.mkdtemp(prefix='foammesh-display-')
 
         def work():
-            rows, _vtp = controller.entity_model(directory)
+            # DP-5710: the visibility table acts on the mesh, so it lists the
+            # model the mesh is made on (the late stages included), not the
+            # model the pickers offer
+            rows, _vtp = controller.entity_model(directory, meshed=True)
             return rows, controller.physical_editor().groups()
 
         self._start('model', work)

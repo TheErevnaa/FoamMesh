@@ -30,6 +30,12 @@ ESTIMATE_CEILING = 10 ** 15
 FIELD_COMBINERS = {'min': 'Min', 'max': 'Max'}
 
 
+#: Plan 48 D4 (DP-2952). ``Mesh.MeshSizeExtendFromBoundary``: choice -> the
+#: Gmsh number, the whole set Gmsh has.
+from foammesh.db.configurations_schema import (  # noqa: E402
+    GMSH_SIZE_EXTENSION_CODES as EXTEND_FROM_BOUNDARY, gmshCode, gmshJobCode)
+
+
 class SizingError(ValueError):
     pass
 
@@ -41,7 +47,9 @@ class GlobalSizing:
     size_factor: float
     from_curvature: int
     from_points: bool
-    extend_from_boundary: bool
+    #: Plan 48 D4 (DP-2952). The Gmsh number, one of
+    #: :data:`EXTEND_FROM_BOUNDARY` (0, 1, 2, -2, -3); it was on/off.
+    extend_from_boundary: int
     #: Plan 30 WP12. 'min' or 'max': which Gmsh field folds the size fields
     #: into the single background field. Always Min before this.
     field_combiner: str = 'min'
@@ -49,8 +57,6 @@ class GlobalSizing:
     #: (7, 3, 0, off) so an untouched case meshes exactly as before.
     minimum_circle_points: int = 7
     minimum_curve_points: int = 3
-    #: 0 means "unset": Mesh.MeshSizeFromCurvature alone decides.
-    minimum_elements_per_two_pi: int = 0
     #: Plan 31 FC-C. Gmsh's barycentric subdivision, which MEASURED as a
     #: refinement rather than a change of family -- 415 tetrahedra became
     #: 1660 tetrahedra on a one-metre box, behind the same 260 boundary
@@ -68,11 +74,10 @@ class GlobalSizing:
             'sizeFactor': self.size_factor,
             'fromCurvature': self.from_curvature,
             'fromPoints': self.from_points,
-            'extendFromBoundary': self.extend_from_boundary,
+            'extendFromBoundary': gmshJobCode(self.extend_from_boundary),
             'fieldCombiner': self.field_combiner,
             'minimumCirclePoints': self.minimum_circle_points,
             'minimumCurvePoints': self.minimum_curve_points,
-            'minimumElementsPerTwoPi': self.minimum_elements_per_two_pi,
             'barycentricRefinement': self.barycentric_refinement,
             'sources': dict(self.sources),
             'warnings': list(self.warnings),
@@ -152,8 +157,14 @@ def derive_global_sizing(values: dict, bbox=None,
         sources['minimumSize'] = 'clamped'
 
     factor = _positive(values.get('sizeFactor')) or 1.0
-    if not 0.01 <= factor <= 100:
-        raise SizingError(f'sizeFactor {factor} is outside 0.01-100')
+    # Plan 48 DP-3005 / DP-2952. The range is Gmsh's own, read from the option
+    # catalogue so the page and the catalogue cannot disagree again.
+    from foammesh.core.gmsh import option_catalogue
+    factor_option = option_catalogue.get('Mesh.MeshSizeFactor')
+    low = 0.001 if factor_option.minimum is None else factor_option.minimum
+    high = 1000.0 if factor_option.maximum is None else factor_option.maximum
+    if not low <= factor <= high:
+        raise SizingError(f'sizeFactor {factor} is outside {low:g}-{high:g}')
 
     # UXA1: unset means the Mesh size choice's points per circle; a typed
     # value (including zero) is never replaced.
@@ -188,28 +199,31 @@ def derive_global_sizing(values: dict, bbox=None,
 
     circle_points = _bounded(values, 'minimumCirclePoints', 7, 3, 200)
     curve_points = _bounded(values, 'minimumCurvePoints', 3, 2, 200)
-    # Plan 31 FC-B. This warned that a per-turn floor set with
-    # ``fromCurvature`` at zero does nothing, on the reasoning that Gmsh reads
-    # the floor through the curvature pass. Measured, that was wrong: on the
-    # annulus a floor of 60 raised the mesh from 17,697 elements to 83,798 with
-    # ``MeshSizeFromCurvature`` at zero, against 83,490 with it at twelve --
-    # the floor drives the curvature adaptation on its own. The warning would
-    # have told users to change a setting to make something work that was
-    # already working, so it is gone rather than reworded.
-    per_two_pi = _bounded(values, 'minimumElementsPerTwoPi', 0, 0, 200)
+    # Plan 31 FC-B measured that a per-turn floor drives the curvature
+    # adaptation on its own (annulus 17,697 -> 83,490 elements). That floor
+    # was Mesh.MinimumElementsPerTwoPi, the older name of
+    # Mesh.MeshSizeFromCurvature; Plan 48 DP-3035 left one control for it,
+    # ``fromCurvature``, and migrateDocument moves a stored old value there.
 
     return GlobalSizing(
         target_size=target, minimum_size=minimum, size_factor=factor,
         from_curvature=curvature,
         from_points=bool(values.get('fromPoints', True)),
-        extend_from_boundary=bool(values.get('extendFromBoundary', True)),
+        extend_from_boundary=_extension(values.get('extendFromBoundary')),
         field_combiner=combiner,
         minimum_circle_points=circle_points,
         minimum_curve_points=curve_points,
-        minimum_elements_per_two_pi=per_two_pi,
         barycentric_refinement=bool(values.get('barycentricRefinement',
                                                False)),
         sources=sources, warnings=tuple(warnings))
+
+
+def _extension(value) -> int:
+    """``Mesh.MeshSizeExtendFromBoundary`` as Gmsh takes it (DP-2952)."""
+    try:
+        return gmshCode(value, EXTEND_FROM_BOUNDARY, 1)
+    except ValueError as error:
+        raise SizingError(f'extend sizes from the boundary: {error}') from None
 
 
 def _bounded(values: dict, key: str, default: int, low: int, high: int) -> int:

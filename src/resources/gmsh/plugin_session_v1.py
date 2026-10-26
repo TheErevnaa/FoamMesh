@@ -226,8 +226,16 @@ def describe_entity(gmsh, dim: int, tag: int, directory, write_vtk,
 
 
 def listing(gmsh) -> list:
-    return [{'tag': int(t), 'name': gmsh.view.option.getString(t, 'Name'),
-             'index': i} for i, t in enumerate(gmsh.view.getTags())]
+    """Every view in the session: a plugin result, a loaded data view, a
+    quality view.  Any of them can be the input view of a plugin (Plan 48
+    GM9); ``kind`` says whether it is list-based or model-based."""
+    rows = []
+    for i, t in enumerate(gmsh.view.getTags()):
+        listed, _payload = _is_list_based(gmsh, t)
+        rows.append({'tag': int(t),
+                     'name': gmsh.view.option.getString(t, 'Name'),
+                     'index': i, 'kind': 'list' if listed else 'model'})
+    return rows
 
 
 def remove(gmsh, tag=None) -> dict:
@@ -236,6 +244,16 @@ def remove(gmsh, tag=None) -> dict:
         if item in gmsh.view.getTags():
             gmsh.view.remove(item)
     return {'removed': tags, 'left': listing(gmsh)}
+
+
+def _why(name, error, lines) -> str:
+    """The reason a plugin run failed, from Gmsh's own log lines."""
+    said = [line.split(': ', 1)[-1].strip() for line in lines
+            if line.startswith(('Error', 'Warning'))]
+    text = str(error)
+    if text.startswith('Exception: '):
+        text = text[len('Exception: '):]
+    return '%s failed: %s' % (name, '; '.join(said[-3:]) if said else text)
 
 
 def run(gmsh, name, numbers, strings, directory, write_vtk, *,
@@ -257,12 +275,27 @@ def run(gmsh, name, numbers, strings, directory, write_vtk, *,
     for key, value in (strings or {}).items():
         gmsh.plugin.setString(name, key, str(value))
     entities = set(gmsh.model.getEntities())
+    # Plugins write side files (VoroMetal, Bubbles) next to the process: keep
+    # them in the plugin folder, not wherever the session started.
+    here = os.getcwd()
+    try:
+        os.makedirs(directory, exist_ok=True)
+        os.chdir(directory)
+    except OSError:
+        here = None
     gmsh.logger.start()
     try:
-        returned = gmsh.plugin.run(name)
+        try:
+            returned = gmsh.plugin.run(name)
+        except Exception as error:                       # noqa: BLE001
+            # Gmsh answers "Unknown plugin or plugin action" for any error
+            # during a run: say what its log said instead.
+            raise RuntimeError(_why(name, error, gmsh.logger.get())) from None
         log = [line for line in gmsh.logger.get()]
     finally:
         gmsh.logger.stop()
+        if here is not None:
+            os.chdir(here)
     after = list(gmsh.view.getTags())
     made = [t for t in after if t not in tags]
     views = [describe(gmsh, t, directory, write_vtk) for t in made]

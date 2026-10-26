@@ -1831,6 +1831,66 @@ class SectionPanel(QWidget):
     def sectionStatus(self) -> str:
         return self._statusLabel.text()
 
+    # -- Plan 48 PA1: what the local API reaches ---------------------------- #
+
+    #: The drag-axis combo's entries by the name the API uses.
+    DRAG_AXIS_KEYS = {'free': None, 'x': 0, 'y': 1, 'z': 2,
+                      'normal': AXIS_NORMAL}
+
+    def selectPlane(self, index: int) -> None:
+        """Choose plane *index* (its radio button)."""
+        if not 0 <= int(index) < len(self._planes):
+            raise ValueError('the section has no plane %d' % index)
+        self._selectPlane(int(index))
+
+    def flipActive(self) -> None:
+        """The Flip button: keep the other side of the active plane."""
+        self._flip()
+
+    def setDragAxisKey(self, key: str) -> None:
+        """The Drag combo, by name: free, x, y, z or normal."""
+        if key not in self.DRAG_AXIS_KEYS:
+            raise ValueError('the drag axes are ' + ', '.join(self.DRAG_AXIS_KEYS))
+        position = self._dragAxis.findData(self.DRAG_AXIS_KEYS[key])
+        if position >= 0:
+            self._dragAxis.setCurrentIndex(position)
+
+    def dragAxisKey(self) -> str:
+        data = self._dragAxis.currentData()
+        for name, value in self.DRAG_AXIS_KEYS.items():
+            if value == data:
+                return name
+        return 'free'
+
+    def setStepChoice(self, choice: str) -> None:
+        """The Step combo: ``cell`` (cell-scale) or ``typed``."""
+        position = self._stepChoice.findData(choice)
+        if position < 0:
+            raise ValueError('the step is cell or typed')
+        self._stepChoice.setCurrentIndex(position)
+
+    def setTypedStep(self, text: str) -> None:
+        """Type the step and leave the box, as a person does."""
+        self._stepEdit.setText(str(text))
+        self._stepEdited()
+
+    def readState(self) -> dict:
+        """What the panel shows beyond the mode and the plane (Plan 48 PA1)."""
+        plane = self._activePlane()
+        step, source = self.currentStep()
+        return {
+            'plane': self._active, 'planes': len(self._planes),
+            'enabled_planes': len(self.enabledPlanes()),
+            'combine': self.combine().value,
+            'cell_rule': self.cellRule().value,
+            'solo': self.soloIndex(), 'lock': self.isLocked(),
+            'drag_axis': self.dragAxisKey(),
+            'step_choice': self.stepChoice(), 'step_text': self.typedStep(),
+            'step_m': float(step or 0.0), 'step_source': source,
+            'sheet_opacity': self.sheetOpacity(),
+            'handle_visible': bool(plane.handle_visible),
+            'status': self.sectionStatus()}
+
     def setSectionBusy(self, busy: bool):
         """Plan 39 VI11. Show *Cancel* while a section is being worked out."""
         self._cancelButton.setVisible(bool(busy))

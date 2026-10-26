@@ -58,6 +58,18 @@ def describe_changes(entries: list[dict]) -> str:
     return '\n'.join(lines)
 
 
+def changes_body(entries: list[dict], dropped: int = 0) -> str:
+    """The text the changes window shows (Plan 48 PA5: one body, two readers)."""
+    from PySide6.QtCore import QCoreApplication
+    body = describe_changes(entries)
+    if dropped:
+        body += '\n\n' + QCoreApplication.translate(
+            'ChangesDialog', '{0} damaged and cannot be restored.').format(
+                count_text(dropped, 'further record was',
+                           'further records were'))
+    return body
+
+
 class ChangesDialog(QDialog):
     """[Show what changed]: the list, non-modal, choosing nothing."""
 
@@ -75,13 +87,7 @@ class ChangesDialog(QDialog):
         self.text = QPlainTextEdit(self)
         self.text.setObjectName('recoveryChangesText')
         self.text.setReadOnly(True)
-        body = describe_changes(entries)
-        if dropped:
-            body += '\n\n' + self.tr(
-                '{0} damaged and cannot be restored.').format(
-                    count_text(dropped, 'further record was',
-                               'further records were'))
-        self.text.setPlainText(body)
+        self.text.setPlainText(changes_body(entries, dropped))
         layout.addWidget(self.text, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         buttons.rejected.connect(self.close)
@@ -137,6 +143,29 @@ class RecoveryOfferBar(_Bar):
             self.tr('Open last saved'), 'recoveryDiscard', self._discard)
         self.showButton = self._button(
             self.tr('Show what changed'), 'recoveryShow', self.showChanges)
+
+    def changesText(self) -> str:
+        """What [Show what changed] lists, or '' once the offer is settled."""
+        offer = self._autosave.pending_recovery()
+        if offer is None:
+            return ''
+        return changes_body(offer.describe(), offer.dropped_records)
+
+    def readout(self) -> dict:
+        """The bar as it reads now (Plan 48 PA5)."""
+        offer = self._autosave.pending_recovery()
+        return {
+            'offered': offer is not None and not self.isHidden(),
+            'text': self.text(),
+            'count': offer.count if offer is not None else 0,
+            'dropped': offer.dropped_records if offer is not None else 0,
+            'restore': {'text': self.restoreButton.text(),
+                        'enabled': self.restoreButton.isEnabled()},
+            'discard': {'text': self.discardButton.text(),
+                        'enabled': self.discardButton.isEnabled()},
+            'show': {'text': self.showButton.text(),
+                     'enabled': self.showButton.isEnabled()},
+            'changes_text': self.changesText()}
 
     def showChanges(self) -> ChangesDialog | None:
         offer = self._autosave.pending_recovery()
@@ -209,6 +238,14 @@ class ProtectionBar(_Bar):
         self._remove = autosave.add_status_listener(_status)
         failure = autosave.failure
         self.setStatus(failure is None, failure or '')
+
+    def readout(self) -> dict:
+        """The bar as it reads now (Plan 48 PA5)."""
+        return {'shown': not self.isHidden(), 'text': self.text(),
+                'save_now': {'text': self.saveButton.text(),
+                             'enabled': self.saveButton.isEnabled()},
+                'save_as': {'text': self.saveAsButton.text(),
+                            'enabled': self.saveAsButton.isEnabled()}}
 
     def setStatus(self, ok: bool, reason: str) -> None:
         if ok:

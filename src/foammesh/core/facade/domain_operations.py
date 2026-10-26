@@ -13,6 +13,7 @@ No module here imports Qt or a view; the shared services under
 """
 from __future__ import annotations
 
+import copy
 import asyncio
 import inspect
 import json
@@ -252,6 +253,10 @@ def retry_at_one_thread(layout, job, payload, *, attempt: int = 0) -> str:
     parallel = dict(intent.get('parallel') or {})
     try:
         threads = int(parallel.get('threads', 1) or 1)
+        # Plan 48 DP-2952: the most threads any stage was given.
+        threads = max([threads] + [
+            int(parallel.get(stage) or 0) for stage in (
+                'curveThreads', 'surfaceThreads', 'volumeThreads')])
     except (TypeError, ValueError):
         return ''
     ended = payload.get('job') or {}
@@ -261,6 +266,11 @@ def retry_at_one_thread(layout, job, payload, *, attempt: int = 0) -> str:
         return ''
     parallel.update({'threads': 1, 'effectiveVolumeThreads': 1,
                      'retriedFromThreads': threads})
+    # Plan 48 DP-2952: a stage with its own count is put on one thread too,
+    # or the retry would still mesh that stage threaded.
+    for stage in ('curveThreads', 'surfaceThreads', 'volumeThreads'):
+        if parallel.get(stage):
+            parallel[stage] = 1
     intent['parallel'] = parallel
     layout.job.write_text(
         json.dumps(job, indent=2, sort_keys=True) + chr(10), encoding='utf-8')
@@ -325,6 +335,12 @@ def _kept_apart_pairs(record) -> list:
     Plan 42 SG22 Q2. Read from the runner's own record of what it built
     (state ``non_conformal``), not from the request: a pair the run could not
     keep apart is not declared here.
+
+    DP-6075. For an output other than OpenFOAM the runner labels the pair
+    ``unmatched`` and claims no coupling, but the two bodies were still
+    meshed apart, so their coincident nodes are as intentional there. Left
+    undeclared they failed the publication check as ``duplicate_nodes`` on a
+    mesh that was fine.
     """
     rows = ((_read_runner_result(record.layout).get('statistics') or {})
             .get('interfacePairs') or {}).get('pairs') or ()
@@ -332,8 +348,50 @@ def _kept_apart_pairs(record) -> list:
              'masterSolverName': str(row['masterPatch']),
              'slaveSolverName': str(row['slavePatch'])}
             for row in rows
-            if isinstance(row, dict) and row.get('state') == 'non_conformal'
+            if isinstance(row, dict)
+            and (row.get('state') == 'non_conformal'
+                 or (row.get('state') == 'unmatched'
+                     and row.get('coupling') == 'non_conformal'))
             and row.get('masterPatch') and row.get('slavePatch')]
+
+
+def _job_surface_roles(record) -> dict:
+    """Plan 49 SR5. The run's surface roles, for the publisher.
+
+    The job's ``surfaceIntent`` surfaces (the authored patch types), and from
+    the runner's own record the baffles it cracked, the internal faces it
+    meshed and the non-conformal region interfaces it kept apart (each
+    lowered from a relation, and so coupled after the region split).
+    """
+    try:
+        job = json.loads(record.layout.job.read_text(encoding='utf-8'))
+    except (OSError, ValueError, AttributeError):
+        job = {}
+    block = ((job.get('intent') or {}).get('surfaceIntent') or {})         if isinstance(job, dict) else {}
+    statistics = (_read_runner_result(record.layout).get('statistics') or {}
+                  if getattr(record.layout, 'result', None) is not None
+                  else {})
+    recorded = statistics.get('surfaceRoles') or {}
+    pairs = (statistics.get('interfacePairs') or {}).get('pairs') or ()
+    non_conformal = [
+        {'name': str(row.get('name') or ''),
+         'masterSolverName': str(row['masterPatch']),
+         'slaveSolverName': str(row['slavePatch']),
+         'relationId': str(row['relationId'])}
+        for row in pairs
+        if isinstance(row, dict) and row.get('state') == 'non_conformal'
+        and row.get('relationId') and row.get('masterPatch')
+        and row.get('slavePatch')]
+    roles = {}
+    if block.get('surfaces'):
+        roles['surfaces'] = list(block['surfaces'])
+    if recorded.get('baffles'):
+        roles['baffles'] = list(recorded['baffles'])
+    if recorded.get('internalFaces'):
+        roles['internalFaces'] = list(recorded['internalFaces'])
+    if non_conformal:
+        roles['nonConformal'] = non_conformal
+    return roles
 
 
 def _job_extrusion(record):
@@ -629,11 +687,28 @@ def non_conformal_couples(manifest: Mapping) -> tuple[dict, ...]:
         str(item.get('patch_uuid') or ''): item
         for item in (manifest.get('groups') or ())
         if isinstance(item, dict)}
+    # Plan 49 SR4 (DP-5790). The region each side's patch belongs to: the
+    # prepared region that lists the patch, else the region the relation
+    # records. OpenFOAM 13 couples two regions only through a dictionary
+    # entry naming both, so a couple that names none can only be coupled
+    # inside one mesh.
+    region_of: dict[str, str] = {}
+    for region in (manifest.get('regions') or ()):
+        if not isinstance(region, dict):
+            continue
+        name = str(region.get('solver_name') or region.get('display_name')
+                   or region.get('region_uuid') or '').strip()
+        for token in (region.get('boundary_patch_uuids') or ()):
+            region_of.setdefault(str(token), name)
     resolved: list[dict] = []
     for pair in (manifest.get('interface_pairs') or ()):
         if not isinstance(pair, dict):
             continue
         if str(pair.get('coupling')) != 'non_conformal':
+            continue
+        if str(pair.get('state') or 'valid') != 'valid':
+            # An unresolved relation is refused where the dictionaries are
+            # written; it is never coupled.
             continue
         pair_id = str(pair.get('pair_id') or '').strip()
         master = groups.get(str(pair.get('master_scope_id') or ''))
@@ -649,10 +724,16 @@ def non_conformal_couples(manifest: Mapping) -> tuple[dict, ...]:
             raise ValidationFailedError(
                 f'non-conformal pair {pair_id or "<unnamed>"} requires '
                 'two distinct solver patch names')
+        master_token = str(pair.get('master_scope_id') or '')
+        slave_token = str(pair.get('slave_scope_id') or '')
         resolved.append({
             'pair_id': pair_id or str(len(resolved)),
             'master_patch': master_name,
             'slave_patch': slave_name,
+            'owner_region': (region_of.get(master_token)
+                             or str(pair.get('owner_region') or '')),
+            'neighbour_region': (region_of.get(slave_token)
+                                 or str(pair.get('neighbour_region') or '')),
         })
     return tuple(resolved)
 
@@ -859,16 +940,56 @@ def _merge_surfaces(surfaces: list) -> tuple:
     return np.concatenate(vertices), np.concatenate(triangles)
 
 
+#: Plan 49 SR7. The surface-intent digest a Gmsh run was written from.
+_BUILT_INTENT_FILE = 'surface-intent-digest.txt'
+
+
+def _run_intent_digest(record) -> str:
+    try:
+        return (Path(record.layout.root) / _BUILT_INTENT_FILE).read_text(
+            encoding='utf-8').strip()
+    except (AttributeError, OSError, TypeError):
+        return ''
+
+
 def _prepared_boundary_categories(db, geometry_entries: list[dict]) -> dict:
     """Derive a patch category per prepared patch from current project state.
 
     Without this every prepared patch stays ``unclassified`` and publishes as a
     plain OpenFOAM ``patch``, so a published mesh would reach the solver with
-    no walls. A patch named after a category adopts it; everything else takes
+    no walls.
+
+    Plan 49 SR7 (DP-5788). The category is the purpose the project stores on
+    the surface (``boundaryCategory``), never the name the surface has now:
+    renaming ``wall_bore`` to ``inlet_bore`` kept the face a wall in the
+    project and published it as an inlet ``patch``. A surface nobody has
+    assessed is assessed on a copy exactly as opening the project would
+    assess it -- its name read once, as a migration hint marked
+    ``inferred`` for review -- and a patch no surface row stands for takes
     the configured geometry-preparation default.
     """
     from foammesh.db.configurations_schema import BoundaryCategory
+    from foammesh.db.surface_intent import (
+        EXTERNAL, migrate_surface_intent, prepared_surface_intent)
     known = {item.value for item in BoundaryCategory}
+    stored: dict = {}
+    content = getattr(db, 'data', None)
+    if callable(content):
+        try:
+            document = copy.deepcopy(content() or {})
+        except Exception:  # noqa: BLE001 - a db with no document
+            document = {}
+        if isinstance(document, dict) and document.get('geometry'):
+            migrate_surface_intent(document, [])
+            for token, found in prepared_surface_intent(
+                    document, geometry_entries).items():
+                category = str(found.get('boundary_category') or '').lower()
+                if category in known:
+                    stored[token] = category
+                elif found.get('role') not in (None, EXTERNAL):
+                    # A face zone, a baffle or an interface side: its purpose
+                    # is not a boundary's; the default publishes it as before.
+                    stored[token] = None
     try:
         default = str(db.getValue(
             'geometryPreparation/defaultBoundaryCategory')).split('.')[-1]
@@ -890,10 +1011,23 @@ def _prepared_boundary_categories(db, geometry_entries: list[dict]) -> dict:
             patch_uuid = str(patch.get('patch_uuid') or '').strip()
             if not patch_uuid:
                 continue
-            name = str(patch.get('name') or entry.get('name') or '')
-            name = name.strip().lower().replace(' ', '_')
-            categories[patch_uuid] = _category_for_name(name, known, default)
+            categories[patch_uuid] = stored.get(patch_uuid) or default
     return categories
+
+
+def _prepared_surface_intent(db, geometry_entries: list[dict]) -> dict:
+    """Plan 49 SR1: the project's surface intent, by prepared patch uuid.
+
+    The bridge plan section 2.3 found missing: role, purpose, mesh type and
+    relations reach the prepared groups (and their digest) beside the
+    category above. Nothing downstream reads them yet; SR4/SR5 lower them.
+    """
+    from foammesh.db.surface_intent import prepared_surface_intent
+    try:
+        document = db.data()
+    except Exception:  # noqa: BLE001 - a db with no document has no intent
+        return {}
+    return prepared_surface_intent(document, geometry_entries)
 
 
 #: How long a runtime verdict stays believable. Long enough that opening a
@@ -1029,7 +1163,8 @@ def _ensure_prepared_geometry(session, *, producer: str,
         store, producer=producer,
         boundary_categories=_prepared_boundary_categories(
             session.state.db, entries),
-        fluid_seed=_prepared_fluid_seed(session.state.db, entries))
+        fluid_seed=_prepared_fluid_seed(session.state.db, entries),
+        surface_intent=_prepared_surface_intent(session.state.db, entries))
 
 
 #: DP-1230. Which case-root mesh the processor cases were split from;
@@ -1351,6 +1486,13 @@ class DomainOperations:
             'case.export.format_convert': self._export_format_convert,
             'case.export.authored': self._export_authored,
         }
+        # Plan 48 seam: handlers declared in core/facade/plan48/*_routes.py.
+        from .plan48 import discover_handlers
+        for operation, handler in discover_handlers().items():
+            if operation in table:
+                raise RuntimeError(
+                    f'{operation} is already a facade operation')
+            table[operation] = handler
         _assert_worker_isolation(table)
         return table
 
@@ -1393,6 +1535,8 @@ class DomainOperations:
         if categories is None:
             categories = _prepared_boundary_categories(
                 session.state.db, store.source.entries())
+        intent = _prepared_surface_intent(
+            session.state.db, store.source.entries())
         try:
             # DP-122. The automatic route recorded the classifier's volume
             # count on the revision and this one, the route the GUI's Prepare
@@ -1411,7 +1555,8 @@ class DomainOperations:
                     preparation=preparation,
                     boundary_categories=categories,
                     fluid_seed=command.parameters.get('fluid_seed'),
-                    transform=command.parameters.get('transform'))
+                    transform=command.parameters.get('transform'),
+                    surface_intent=intent)
 
             result = await asyncio.to_thread(build)
         except (PreparedGeometryError, TypeError, ValueError) as error:
@@ -1720,6 +1865,9 @@ class DomainOperations:
                 'compatible_engines': list(compatible_engines(token)),
                 'qa_operation': self._qa_operation_for(token),
                 'transaction': transaction.to_dict(),
+                # Plan 49 SR7. The surface intent judged for the new target.
+                'surface_intent_issues': self._surface_intent_issues(
+                    session, engine_id, token),
             })
 
     def _prepared_diagonal(self, session: CaseSession) -> float:
@@ -2701,8 +2849,11 @@ class DomainOperations:
                        if hasattr(estimate, 'to_dict') else {},
                        retryable=outcome.status != local_worker.FAILED)
         if outcome.status == local_worker.OVER_BUDGET:
+            # DP-5715: the check ran under the free RAM; say it needed more.
             raise CheckOverBudgetError(
-                f'{operation} stopped: {outcome.message}', details=details)
+                '{0} stopped: {1}'.format(operation, budget.ran_out_text(
+                    outcome.cap_bytes or grant.cap_bytes, grant.snapshot)),
+                details=details)
         if outcome.status == local_worker.FAILED:
             # The body refused, in the worker, exactly as it would have here:
             # re-raise the same facade error with the same code.
@@ -3371,11 +3522,50 @@ class DomainOperations:
         checked is not one they should trust.
 
         The body of :meth:`GmshMeshingEngine.run`, which is what reaches it.
+
+        DP-5743. The run holds a cancel token for its case, so the one Cancel
+        reaches it between its steps as well as inside its two jobs; it is
+        honoured up to the moment the new mesh replaces the case mesh.
         """
+        from foammesh.core.jobs import pipeline_cancel
+
+        session.require_writable()
+        token = pipeline_cancel.start(session.case_path)
+        try:
+            return await self._run_gmsh_pipeline_steps(session, command, token)
+        except pipeline_cancel.PipelineCancelled:
+            return self._gmsh_run_cancelled(session, command, None, {})
+        finally:
+            pipeline_cancel.finish(token)
+
+    def _gmsh_run_cancelled(self, session: CaseSession, command: Command,
+                            record, payload: dict) -> OperationResult:
+        """DP-5743. The user's Cancel reached the run between two steps.
+
+        The same shape a cancelled Gmsh job reports, so the window says
+        "cancelled" and keeps the case mesh it had: nothing was published.
+        """
+        from foammesh.core.gmsh.manifest import RunBuilder
+        from foammesh.core.run_result import failure_payload
+
+        reason = 'the run was cancelled before it finished'
+        if record is not None:
+            RunBuilder.record_cancelled(record, reason)
+        payload = dict(payload)
+        payload.update(failure_payload(
+            task='gmsh.compute', reason=reason,
+            log=str(record.layout.log) if record is not None else ''))
+        payload['cancelled'] = True
+        return OperationResult('failed', command.operation,
+                               session.revisions, payload=payload)
+
+    async def _run_gmsh_pipeline_steps(self, session: CaseSession,
+                                       command: Command, token
+                                       ) -> OperationResult:
+        """:meth:`run_gmsh_pipeline`'s steps, checking *token* between them."""
         import time as _time
 
         started_at = _time.monotonic()
-        session.require_writable()
         import asyncio
         import uuid
 
@@ -3409,6 +3599,7 @@ class DomainOperations:
             raise PreconditionFailedError(
                 'import geometry before running Gmsh; there is nothing to '
                 'prepare or mesh')
+        token.check()
 
         # Plan 33 W-G1 (FIELD-06, CURVE-04). Every enabled control that names
         # geometry is resolved against the revision about to be meshed, here,
@@ -3431,10 +3622,23 @@ class DomainOperations:
                 prepared_geometry=prepared.reference, profile=profile,
                 run_id=run_id)
         except ExecutionError as error:
-            raise ValidationFailedError(str(error)) from error
+            raise ValidationFailedError(
+                str(error), details=getattr(error, 'details', None)
+            ) from error
         _require_every_prepared_source(prepared, written['job'])
+        # Plan 49 SR7. This run replaces the mesh the record describes.
+        from foammesh.core.engine.surface_capabilities import (
+            forget_built_record)
+        forget_built_record(session.case_path)
 
         layout = RunLayout(RunBuilder(session.case_path).root(run_id))
+        # The intent the job was written from, kept with the run so that
+        # accepting it later records what it was really built from.
+        try:
+            (layout.root / _BUILT_INTENT_FILE).write_text(
+                self._intent_digest_now(session), encoding='utf-8')
+        except OSError:
+            pass
         record = RunManifest.read(layout.root)
         launch = profile.runner_argv(
             _gmsh_runner_path(), layout.job, cwd=session.case_path)
@@ -3448,6 +3652,9 @@ class DomainOperations:
             log_path=layout.log,
             cleanup_argv=launch.cleanup_argv,
             invalidated_outputs=('quality', 'exports'))
+        if token.cancelled:
+            return self._gmsh_run_cancelled(session, command, record, {
+                'run_id': run_id})
         execution = await self._context(session).executor.execute(
             session, spec, on_line=command.parameters.get('on_line'))
 
@@ -3485,6 +3692,10 @@ class DomainOperations:
         # the Runs list offered the user no way to tell a mesh they stopped
         # from a mesh that could not be built. The job knows which happened.
         cancelled = str((payload.get('job') or {}).get('status') or '') == 'cancelled'
+        if token.cancelled and not cancelled:
+            # DP-5743: the Cancel came as the job ended; nothing is published.
+            payload.update({'run_id': run_id, 'run_manifest': record.document})
+            return self._gmsh_run_cancelled(session, command, record, payload)
         if cancelled:
             RunBuilder.record_cancelled(
                 record, 'the run was cancelled before it finished')
@@ -3604,12 +3815,17 @@ class DomainOperations:
 
         # Plan 31 CP-05 item 4. The rest of this run is the same work
         # accepting a stored candidate does, so it lives in one place.
-        return await self._finish_gmsh_run(
-            session, command, record, prepared, payload,
-            accepted=verdict.accepted,
-            warning=bool(_real_verdict_warnings(
-                getattr(verdict, 'warnings', ()))),
-            seconds=_time.monotonic() - started_at)
+        from foammesh.core.jobs.pipeline_cancel import PipelineCancelled
+        try:
+            token.check()
+            return await self._finish_gmsh_run(
+                session, command, record, prepared, payload,
+                accepted=verdict.accepted,
+                warning=bool(_real_verdict_warnings(
+                    getattr(verdict, 'warnings', ()))),
+                seconds=_time.monotonic() - started_at)
+        except PipelineCancelled:
+            return self._gmsh_run_cancelled(session, command, record, payload)
 
 
     async def _finish_gmsh_run(self, session: CaseSession, command: Command,
@@ -3728,6 +3944,11 @@ class DomainOperations:
                      'reason': 'checkMesh reads a polyMesh, and this run '
                                'published none'}
             payload['check_mesh'] = check
+        # Plan 49 SR7. What this mesh was built from, for the export gate.
+        self._record_built_intent(
+            session, 'gmsh', 'su2' if export_settings.get('writesSu2') else
+            'openfoam' if export_settings.get('publishesPolyMesh', True)
+            else 'native', _run_intent_digest(record))
         # One native Gmsh run satisfies the whole engine chain, so the workflow
         # has to be told. Without this the state machine never advances and QA
         # stays "locked by prerequisites" behind a mesh that already exists.
@@ -3780,13 +4001,18 @@ class DomainOperations:
             return []
         rows = ((_read_runner_result(record.layout).get('statistics') or {})
                 .get('interfacePairs') or {}).get('pairs') or ()
+        # Plan 49 SR5 (DP-5762). A pair lowered from a region-interface
+        # relation is not coupled here, positionally on the one mesh: the
+        # region split would drop it. The publication recorded it, with its
+        # two regions, for the export to couple after the split.
         pairs = [
             {'pair_id': str(row.get('name') or ''),
              'master_patch': str(row['masterPatch']),
              'slave_patch': str(row['slavePatch'])}
             for row in rows
             if isinstance(row, dict) and row.get('state') == 'non_conformal'
-            and row.get('masterPatch') and row.get('slavePatch')]
+            and row.get('masterPatch') and row.get('slavePatch')
+            and not row.get('relationId')]
         return await self._run_non_conformal_couples(session, command, pairs)
 
     @staticmethod
@@ -4130,6 +4356,17 @@ class DomainOperations:
         try:
             mesh = read_poly_mesh(session.case_path, layout_expectation='any')
         except PolyMeshReadError as error:
+            # Plan 48 GM12 (DP-4356). No polyMesh, but a native .msh or SU2
+            # file was named: rank its elements, in the same shape.
+            native = str(command.parameters.get('path') or '').strip()
+            if native and Path(native).suffix.lower() in (
+                    '.msh', '.su2') and Path(native).is_file():
+                from foammesh.core.gmsh import element_quality
+                count = int(command.parameters.get('rank_n') or 50)
+                return self._read_result(session, command, {
+                    'ranked': element_quality.rank_worst(
+                        element_quality.measure_file(native), count),
+                    'source': 'gmsh file', 'path': native})
             raise PreconditionFailedError(
                 f'the case has no readable mesh to measure: {error}') from error
 
@@ -5093,17 +5330,24 @@ class DomainOperations:
 
         staged = record.layout.root / 'publication' / 'polyMesh'
         region_metadata = self._gmsh_volume_types(session, prepared)
+        # Plan 48 WG (DP-445, DP-4215): the patches a build declared as the
+        # front/back (empty) or wedge pair publish with that type, checked.
+        from foammesh.core.gmsh import geometry_build as _gb
+        roles = _gb.publish_roles(session.case_path)
         try:
             report = await asyncio.to_thread(
                 publish,
                 record.layout.mesh, staged,
                 categories={**_gmsh_patch_categories(prepared),
+                            **roles['categories'],
                             **_job_edge_categories(record)},
+                declared=roles['declared'] or None,
                 identities=_gmsh_patch_identities(prepared),
                 region_metadata=region_metadata,
                 periodic_pairs=_job_periodic_pairs(record),
                 non_conformal_pairs=_kept_apart_pairs(record),
                 extrusion=_job_extrusion(record),
+                surface_roles=_job_surface_roles(record) or None,
                 source_fingerprint=record.document.get('job_digest', ''))
         except PublishError as error:
             RunBuilder.record_publication_failure(record, str(error))
@@ -5131,6 +5375,14 @@ class DomainOperations:
         # at all -- MEASURED, indistinguishable from a run that deliberately
         # published nothing, and the reopened case called it accepted. Saying
         # it first is what makes the interruption legible afterwards.
+        # DP-5743. The last moment the user's Cancel can leave the case mesh
+        # as it was; from here the run commits (a Cancel says so). A stored
+        # run being accepted holds no token.
+        from foammesh.core.jobs import pipeline_cancel
+
+        token = pipeline_cancel.current(session.case_path)
+        if token is not None:
+            token.commit()
         await asyncio.to_thread(
             RunBuilder.record_publication_started,
             record, session.case_path / 'constant' / 'polyMesh')
@@ -5141,6 +5393,14 @@ class DomainOperations:
             Event.ARTIFACT_MESH_CHANGED, operation='mesh.publish',
             run_id=record.run_id)
         document = {**report.to_dict(), **activation}
+        # Plan 49 SR5 (DP-5762). The non-conformal region interfaces, with
+        # the regions they join, for the export to couple after the split;
+        # a publication without any clears the last one's record.
+        from foammesh.core.gmsh.role_publication import record_couplings
+        await asyncio.to_thread(
+            record_couplings, session.case_path,
+            (getattr(report, 'surface_roles', None) or {}).get('couplings')
+            or ())
         document['case_scaffolding'] = self._ensure_openfoam_case(session)
         document['patch_identity'] = await asyncio.to_thread(
             self._write_patch_identity,
@@ -5225,6 +5485,52 @@ class DomainOperations:
             return PreparedGeometryStore(session.case_path).current()
         except (PreparedGeometryError, OSError, ValueError):
             return None
+
+    @staticmethod
+    def _surface_intent_gate(session: CaseSession, route: str, target,
+                             *, stage: str, **options) -> list:
+        """Plan 49 SR7. The one surface-intent check before a run or export.
+
+        The logic is ``core/engine/surface_capabilities.gate``; this maps its
+        refusal to the facade's error, with the issues as details
+        (``error: surface_intent_refused``). A run also forgets the record of
+        the mesh it replaces, so a mesh half-made from new intent is never
+        taken for the one recorded.
+        """
+        from foammesh.core.engine import surface_capabilities
+        try:
+            issues = surface_capabilities.gate(
+                session.state.db, session.case_path, route, target,
+                stage=stage, **options)
+        except surface_capabilities.SurfaceIntentRefused as refusal:
+            raise ValidationFailedError(
+                str(refusal), details=refusal.details()) from refusal
+        if stage == 'run':
+            surface_capabilities.forget_built_record(session.case_path)
+        return issues
+
+    def _snappy_intent_gate(self, session: CaseSession) -> list:
+        from foammesh.core.engine.registry import configured_target_solver
+        return self._surface_intent_gate(
+            session, 'snappy', configured_target_solver(session.state.db),
+            stage='run')
+
+    @staticmethod
+    def _intent_digest_now(session: CaseSession) -> str:
+        """Plan 49 SR7. The digest of the intent a run starts from."""
+        from foammesh.core.engine import surface_capabilities
+        document = surface_capabilities.document_of(session.state.db)
+        return surface_capabilities.intent_digest(document) if document else ''
+
+    @staticmethod
+    def _record_built_intent(session: CaseSession, route: str, target,
+                             digest: str = '') -> None:
+        """Plan 49 SR7. What the mesh just published was built from."""
+        from foammesh.core.engine import surface_capabilities
+        if not digest:
+            return
+        surface_capabilities.write_built_record(
+            session.case_path, None, route, target, digest=digest)
 
     def _write_snappy_patch_identity(self, session: CaseSession,
                                      prepared=None) -> dict:
@@ -5616,23 +5922,19 @@ runTimeModifiable true;
 
     @staticmethod
     def _pipeline_interface_couples(session: CaseSession) -> tuple[dict, ...]:
-        """The couples this case's group manifest schedules, if any.
+        """The couples the snappy run itself schedules: none.
 
-        No manifest and no pairs both mean the same thing -- nothing to
-        couple -- so the pipeline is unchanged for every case that never
-        authored an interface pair.
+        Plan 49 SR4 (DP-5762). The pipeline used to couple each
+        non-conformal pair positionally on the single snappy mesh, before
+        the export split it into regions. That made a same-region
+        ``nonConformalCyclic`` where two regions were meant, and
+        ``splitMeshRegions`` then dropped every coupled patch (SR0 probe 2).
+        Non-conformal and periodic couplings are now made after the split,
+        by the export, from the ``couplings`` the case builder records in
+        the group manifest (``core/import_export/couplings.py``), with each
+        side named with its region. The run publishes the uncoupled mesh.
         """
-        from foammesh.openfoam.case_builder import group_manifest_path
-        path = group_manifest_path(session.case_path)
-        if not path.is_file():
-            return ()
-        try:
-            manifest = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValidationFailedError(
-                'case group manifest could not be read for interface pairing'
-            ) from error
-        return non_conformal_couples(manifest)
+        return ()
 
     async def _apply_non_conformal_pairs(
             self, session: CaseSession, parent: Command,
@@ -5667,6 +5969,18 @@ runTimeModifiable true;
         if not pairs:
             return []
 
+        for pair in pairs:
+            owner = str(pair.get('owner_region') or '')
+            neighbour = str(pair.get('neighbour_region') or '')
+            if owner and neighbour and owner != neighbour:
+                # DP-5790. The positional form couples two patches of one
+                # mesh; across two regions it makes a same-region cyclic the
+                # split then drops. The export couples it after the split.
+                raise ValidationFailedError(
+                    f'non-conformal pair {pair.get("pair_id") or ""} joins '
+                    f'the regions {owner} and {neighbour}; it is coupled '
+                    'when the mesh is exported, after it is split into its '
+                    'regions, not on the unsplit mesh')
         await self._utility_ready('createNonConformalCouples')
         registry = self._capabilities_registry()
         results = []
@@ -5775,7 +6089,11 @@ runTimeModifiable true;
             changed_fields=(('mesh.engine',) if preview.changed else ()),
             invalidated_outputs=preview.invalidated_tasks,
             payload={'preview': preview.to_dict(),
-                     'transaction': transaction.to_dict() if transaction else None})
+                     'transaction': transaction.to_dict() if transaction else None,
+                     # Plan 49 SR7. The surface intent judged for the new
+                     # route; the mesh built on the old one is stale.
+                     'surface_intent_issues': self._surface_intent_issues(
+                         session, engine_id)})
 
     @staticmethod
     def _refuse_farfield_for_engine(session: CaseSession,
@@ -5975,7 +6293,20 @@ runTimeModifiable true;
         ``cgns`` are converted from its ``mesh.msh``; each of those is
         satisfied by the artifact its exporter actually reads, asked for
         through the same reader the exporter asks with.
+
+        DP-5753. SU2 is a Gmsh-route output only (Plan 28), and a published
+        polyMesh used to satisfy this for it whatever had meshed it, so a
+        snappyHexMesh or imported mesh reached the polyMesh-to-SU2 writer.
+        That is asked first, before any mesh is looked for.
         """
+        if entry_id == 'su2':
+            from foammesh.core.import_export.service import (
+                ImportExportService)
+            refusal = ImportExportService.su2_route_refusal(session.case_path)
+            if refusal:
+                raise PreconditionFailedError(refusal, details={
+                    'case_path': str(session.case_path),
+                    'entry_id': entry_id, 'error': 'su2_needs_gmsh_route'})
         poly_mesh = session.case_path / 'constant' / 'polyMesh'
         if (poly_mesh / 'points').exists() or (poly_mesh / 'faces').exists():
             return poly_mesh
@@ -6862,14 +7193,23 @@ runTimeModifiable true;
                                command: Command) -> OperationResult:
         """Every boundary the case would produce, and what each covers."""
         rows = self._patch_editor(session).rows()
-        return self._read_result(session, command, {
+        payload = {
             'patches': rows,
             'count': len(rows),
             # The one-boundary case is worth saying out loud here as well as on
             # the readiness task: a caller that never opens the GUI still has
             # to be able to see it.
             'single_boundary': len(rows) == 1,
-        })
+        }
+        # DP-5717. A Gmsh geometry build replaced the prepared surfaces: the
+        # boundaries the run will publish are the built model's, so they are
+        # said beside the prepared rows (which the patch edits still act on).
+        from foammesh.core.gmsh import geometry_build as _gb
+
+        built = _gb.built_model(session.case_path)
+        if built:
+            payload['built_model'] = built
+        return self._read_result(session, command, payload)
 
     def _geometry_patch_edit(self, session: CaseSession, command: Command,
                              apply) -> OperationResult:
@@ -7104,8 +7444,9 @@ runTimeModifiable true;
         because ``surfaceZonesInfo.C:79-82`` makes the point mandatory under
         ``mode insidePoint`` and an interface -- enclosing nothing -- cannot
         be written any other way. And the interface itself becomes a surface
-        row typed ``interface`` under that volume, which is the shape
-        ``_effective_cfd_type`` reads to decide the wall carves the zone.
+        row typed ``interface`` under that volume, which is the shape the
+        Plan 49 SR1 migration reads as a conformal region interface carving
+        the zone (``db/surface_intent.py``), and the snappy writer lowers.
         """
         from foammesh.core.geometry import GeometryArtifactStore
         from foammesh.core.geometry.patches.pieces import patch_polydata
@@ -7135,8 +7476,22 @@ runTimeModifiable true;
             kept = self._rows_for(manifest, geometry_id)
             pieces = patch_polydata(artifact, kept)
             refreshed = self._refresh_polydata(data, keys, kept, pieces)
+            # DP-6060. A surface whose every face became the interface is
+            # gone from the artifact, so the row that showed it goes too.
+            dropped = {str(item) for item in body.get('dropped_patch_uuids') or ()}
+            removed = []
+            for key in keys:
+                element = data.getElement('geometry', key)
+                if str(element.value('patchUuid') or '') not in dropped:
+                    continue
+                path = element.value('path')
+                if path:
+                    data.removeGeometryPolyData(path)
+                data.removeElement('geometry', key)
+                removed.append(str(key))
             summary['bodies'][geometry_id] = {'refreshed': True,
-                                              'rows': refreshed}
+                                              'rows': refreshed,
+                                              'removed': removed}
 
         for item in result['interfaces']:
             enclosed = str(item.get('inside_geometry_id') or '')
@@ -7977,6 +8332,16 @@ runTimeModifiable true;
         except (PreparedGeometryError, TypeError, ValueError) as error:
             raise ValidationFailedError(
                 f'geometry preparation failed: {error}') from error
+        self._default_walls_group(session, prepared)
+        if getattr(engine, 'dictionaries_carry_surface_intent', False):
+            # Plan 49 (DP-6051). The surface intent is judged by the one
+            # capability table before the case builder meets it, so its
+            # refusal carries the issues instead of the writer's text alone.
+            from foammesh.core.engine.registry import configured_target_solver
+            self._surface_intent_gate(
+                session, engine.engine_id,
+                configured_target_solver(session.state.db),
+                stage='dictionaries')
         try:
             manifest = await asyncio.to_thread(
                 engine.generate_config, session.state.db, bbox, session.case_path,
@@ -8086,6 +8451,7 @@ runTimeModifiable true;
         feature_payload = None
         seed_warnings: list[str] = []
         if definition.stage in {'castellation', 'snappyHexMesh'}:
+            self._default_walls_group(session)
             seed_warnings = await self._snappy_seed_gate(
                 session, allow_region_clash=self._allows_region_clash(command))
             # Snappy consumes ``.eMesh`` edges that only ``surfaceFeatures``
@@ -9070,6 +9436,8 @@ runTimeModifiable true;
                 f'{definition.dictionary} is required; generate dictionaries first')
         if definition.utility in {'surfaceFeatures', 'snappyHexMesh'}:
             self._preflight_snappy_inputs(session, definition.utility)
+            # Plan 49 SR7. The same surface-intent gate as the pipeline.
+            self._snappy_intent_gate(session)
         try:
             # Plan 35 CR2 (F11). Preparing the stage copies the input mesh
             # aside -- a whole polyMesh, gigabytes on a large case -- and
@@ -9500,7 +9868,8 @@ runTimeModifiable true;
 
     @staticmethod
     def _close_run_manifest(record, *, status: str, reason: str = '',
-                            publication: dict | None = None) -> None:
+                            publication: dict | None = None,
+                            executions=None) -> None:
         from foammesh.core.gmsh.manifest import RunBuilder
 
         if record is None:
@@ -9508,6 +9877,9 @@ runTimeModifiable true;
         try:
             RunBuilder.record_result(
                 record, {'status': status, 'error': reason})
+            if executions:
+                # DP-4603. The largest stage peak is the run's peak memory.
+                RunBuilder.record_executions(record, executions)
             if status == 'cancelled':
                 # CP-05 item 7. `record_result` maps anything that is not a
                 # success onto the runner's own vocabulary; a run the user
@@ -9864,7 +10236,12 @@ runTimeModifiable true;
             if not (session.case_path / 'system' / name).is_file():
                 raise PreconditionFailedError(
                     f'{name} is required; generate dictionaries first')
+        # Plan 49 SR7. The surface intent, judged by the one capability table
+        # before anything is written or launched (plan D7).
+        self._snappy_intent_gate(session)
+        built_from = self._intent_digest_now(session)
         engine = resolve_engine(session.state.db)
+        self._default_walls_group(session)
         try:
             manifest = engine.refresh_pipeline_config(
                 session.state.db, session.case_path)
@@ -10174,7 +10551,7 @@ runTimeModifiable true;
                           else explained['reason'])
                 self._close_run_manifest(
                     record, status='cancelled' if stopped else 'failed',
-                    reason=reason)
+                    reason=reason, executions=executions)
                 # DP-1236. What finished stays finished: each stage this run
                 # kept is recorded done, the interrupted node alone was rolled
                 # back (the executor's recovery point, or the parked root),
@@ -10233,7 +10610,8 @@ runTimeModifiable true;
                 prepared_revision=revision_seal.get('prepared_revision', '')))
         if divergence:
             self._close_run_manifest(
-                record, status='failed', reason=divergence)
+                record, status='failed', reason=divergence,
+                executions=executions)
             raise ValidationFailedError(
                 'this run did not read one revision throughout: '
                 + divergence)
@@ -10265,6 +10643,8 @@ runTimeModifiable true;
         prepared = self._current_prepared(session)
         patch_identity_state = self._write_snappy_patch_identity(
             session, prepared)
+        # Plan 49 SR7. What this mesh was built from, for the export gate.
+        self._record_built_intent(session, 'snappy', 'openfoam', built_from)
         last_checkpoint = ''
         for item in checkpoints:
             if item.get('saved'):
@@ -10334,7 +10714,8 @@ runTimeModifiable true;
             publication={'status': 'published',
                          'artifact': str(session.case_path / 'constant'
                                          / 'polyMesh'),
-                         'mesh_state': reference.to_dict()})
+                         'mesh_state': reference.to_dict()},
+            executions=executions)
         return OperationResult(
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('quality', 'exports'),
@@ -12008,6 +12389,56 @@ runTimeModifiable true;
         self._record_retained_estimate(session, excludes)
         return warnings
 
+    def _default_walls_group(self, session: CaseSession,
+                             prepared=None) -> bool:
+        """DP-6063. Make the case's default *walls* refinement group.
+
+        The Castellation and Surface features pages made it when they
+        opened, so a case run over the local API without opening them
+        meshed every surface at level (0 0) (run sr9h, the snappy CHT tube).
+        The run paths ask here before a dictionary is written; the rule is
+        ``core/meshing/walls_default`` and the pages ask the same one. It is
+        made once (``castellation/defaulted``), never over a group the
+        person made or removed, and never while Castellation is locked.
+        Returns whether anything was written.
+        """
+        from foammesh.core.engine import configured_engine_id, resolve_engine
+        from foammesh.core.meshing import walls_default
+        try:
+            if configured_engine_id(session.state.db) == 'unselected':
+                return False
+            task = getattr(resolve_engine(session.state.db),
+                           'default_walls_group_task', None)
+            if not task:
+                return False
+            plan = walls_default.plan_walls_group(
+                session.configuration(), None)
+            if plan is None:
+                return False
+            if not plan.mark_only:
+                from .facade import _locked_tasks_of
+                locked = _locked_tasks_of(session)
+                if locked is not None and task in locked[2]:
+                    return False
+                if prepared is None:
+                    prepared = self._current_prepared(session)
+                manifest = getattr(prepared, 'group_manifest', None)
+                plan = walls_default.plan_walls_group(
+                    session.configuration(), manifest)
+                if plan is None:
+                    return False
+        except Exception:  # noqa: BLE001 - a default never blocks a run
+            return False
+        from foammesh.core.project import Source
+        data = session.state.checkout()
+        walls_default.apply_walls_group(data, plan)
+        session.state.commit(
+            data, action='default walls group', source=Source.SYSTEM,
+            target='castellation/refinementSurfaces',
+            reason=('a refinement group already exists' if plan.mark_only
+                    else 'proposed: no surface refinement group was set'))
+        return True
+
     def _default_fluid_region(self, session: CaseSession) -> str | None:
         """UXA1 / U1: a footer-only snappy case gets a fluid region.
 
@@ -12765,29 +13196,33 @@ runTimeModifiable true;
         settings = service.stored_inputs(session.state.db)
         settings.update(inputs.to_dict())
         store = service.store_for(session.case_path)
+        # Plan 47 SZ9 (Q1). The field is the Gmsh background once it exists,
+        # unless the user switched that off; the Gmsh numbers follow suit.
+        settings['use_as_background'] = service.background_wanted(
+            settings, store)
+        # GN25f. A split STL stages its solids (face0) but the groups are bound
+        # to the patches cut from them (elbow_1): say which is which.
+        aliases, categories = self._sizing_patch_names(session)
+        # Plan 47 SZ1. Both engines on every run, whichever is selected.
         # FIX-H. A grid the user typed or already ran is respected, and
         # every level is computed against the cell it really gives (Plan 41
         # 4.8.3), not against the field's own grid. The service decides which
         # engines have such a grid.
-        extra = service.grid_extras(engine, session.state.db,
-                                    session.case_path, bounds)
+        extras = {engine_id: service.grid_extras(
+            engine_id, session.state.db, session.case_path, bounds)
+            for engine_id in service.ENGINES}
         # GN25f. Curves and volumes of the prepared geometry (Gmsh rows).
-        extra.update(service.gmsh_extras(
-            engine, session.state.db, session.case_path, staged, settings))
-        notes = list(extra.pop('notes', ()))
-        rows = service.proposals_for(engine, field, staged, bounds, settings,
-                                     **extra)
+        gmsh_extra = service.gmsh_extras(
+            'gmsh', session.state.db, session.case_path, staged, settings)
+        notes = list(gmsh_extra.pop('notes', ()))
+        gmsh_extra['walls'] = {
+            name for name in field.per_surface()
+            if service.publishes_as_wall((aliases.get(name, name), categories.get(
+                aliases.get(name, name), '')))}
+        extras['gmsh'].update(gmsh_extra)
+        rows = service.proposals_all(field, staged, bounds, settings, extras)
+        rows.append(service.background_proposal())
         # Plan 41 GN25c. The case refines groups, not surfaces.
-        # GN25f. A split STL stages its solids (face0) but the groups are bound
-        # to the patches cut from them (elbow_1): say which is which.
-        aliases = {}
-        try:
-            for patch in self._patch_editor(session).rows():
-                for ref in patch.get('source_refs') or ():
-                    if ref.get('original_name') and patch.get('name'):
-                        aliases[service._safe(ref['original_name'])] =                             service._safe(patch['name'])
-        except Exception:                                    # noqa: BLE001
-            aliases = {}
         rows, unbound = service.regroup(session.state.db, rows, aliases)
         changed = store.propose(rows, field_digest=key)
         store.notes = notes
@@ -12801,6 +13236,38 @@ runTimeModifiable true;
             'badges': store.badges()})
         return OperationResult(
             'accepted', command.operation, session.revisions, payload=payload)
+
+    def _sizing_patch_names(self, session: CaseSession) -> tuple[dict, dict]:
+        """``(aliases, categories)`` of the patches the field's surfaces became.
+
+        ``aliases`` maps a staged solid (``face0``) to the patch cut from it
+        (``elbow_1``); ``categories`` maps a patch to its boundary category.
+        """
+        from foammesh.core.sizing import service
+        aliases, categories = {}, {}
+        try:
+            for patch in self._patch_editor(session).rows():
+                name = patch.get('name')
+                if not name:
+                    continue
+                categories[service._safe(name)] = str(
+                    patch.get('category') or '')
+                for ref in patch.get('source_refs') or ():
+                    if ref.get('original_name'):
+                        aliases[service._safe(ref['original_name'])] = \
+                            service._safe(name)
+        except Exception:                                    # noqa: BLE001
+            aliases, categories = {}, {}
+        # Plan 47 SZ12 (live, elbow). The patch `elbow` cut from the solid
+        # `elbow` aliases nothing; the tree row it stands for is the body's
+        # one surface (`elbow_surface`).
+        aliases = {k: v for k, v in aliases.items() if k != v}
+        for body, surface in service.body_aliases(session.state.db).items():
+            aliases.setdefault(body, surface)
+            # The patch `elbow` is a wall, so its row is one.
+            if body in categories:
+                categories.setdefault(surface, categories[body])
+        return aliases, categories
 
     def _sizing_proposals_get(self, session: CaseSession,
                               command: Command) -> OperationResult:
@@ -12830,11 +13297,36 @@ runTimeModifiable true;
         store = service.store_for(session.case_path)
         wanted = command.parameters.get('targets')
         wanted = set(wanted) if wanted else None
-        values, unresolved = service.current_values(
-            session.state.db, list(store.entries))
+        engine = command.parameters.get('engine') or None
+        if engine is not None and engine not in service.ENGINES:
+            raise ValidationFailedError(
+                f'engine must be one of {", ".join(service.ENGINES)}')
+        data = session.state.checkout()
+        # Plan 47 SZ4. A surface or body no group refines gets one, so the
+        # field's levels, layers and bands have somewhere to land.
+        aliases, categories = self._sizing_patch_names(session)
+        targets = [t for t, e in store.entries.items()
+                   if (wanted is None or t in wanted)
+                   and (engine is None or e.engine == engine)
+                   and not e.locked]
+        created = service.ensure_groups(data, targets, aliases, categories)
+        values, unresolved = service.current_values(data, list(store.entries))
         writes, skipped = store.apply(
-            values, targets=wanted, defaults=service.defaults_for(values))
-        skipped.update(unresolved)
+            values, targets=wanted,
+            defaults=service.defaults_for(values, data),
+            engine=engine)
+        skipped.update({t: r for t, r in unresolved.items()
+                        if engine is None
+                        or store.entries[t].engine == engine})
+        from foammesh.core.sizing.proposals import SOURCE_USER
+        for target in list(writes):
+            if service.ramp_is_users(data, target):
+                # DP-2865. The body's group is not a distance ramp: the
+                # user chose another mode, and that choice is theirs.
+                writes.pop(target)
+                skipped[target] = 'typed'
+                store.entries[target].source = SOURCE_USER
+                store.entries[target].applied = None
         # GN25f. The grid's counts are read in counts mode only. A target cell
         # size the user typed keeps the mode it was typed for.
         # FIX-H. And keeps its grid: the counts beside a typed target size
@@ -12866,14 +13358,25 @@ runTimeModifiable true;
             entry = store.entries.get(target)
             if entry is not None:
                 entry.applied = None
-        data = session.state.checkout()
-        done, failed = service.write_values(data, session.state.db, writes)
+        # Plan 47 SZ12. Surfaces sharing one group write one finest value.
+        before = dict(writes)
+        writes, merged = service.merge_shared(data, writes, values)
+        for target, value in merged.items():
+            entry = store.entries.get(target)
+            if entry is not None:
+                entry.applied = value
+            if target not in writes and target in before:
+                # Held already, or written once through the group it shares.
+                skipped[target] = ('unchanged' if values.get(target) is not None
+                                   and service._same_value(values[target], value)
+                                   else 'shared_group')
+        done, failed = service.write_values(data, data, writes)
         skipped.update(failed)
         for target in failed:
             entry = store.entries.get(target)
             if entry is not None:
                 entry.applied = None
-        if done:
+        if done or created:
             source_map = {
                 'gui': Source.GUI, 'rest': Source.API, 'cli': Source.CLI,
                 'automation': Source.AGENT, 'system': Source.SYSTEM}
@@ -12886,7 +13389,8 @@ runTimeModifiable true;
         store.save()
         return OperationResult(
             'accepted', command.operation, session.revisions,
-            payload={'applied': done, 'skipped': skipped})
+            payload={'applied': done, 'skipped': skipped,
+                     'groups_created': created})
 
     def _sizing_proposals_lock(self, session: CaseSession,
                                command: Command) -> OperationResult:
@@ -15158,6 +15662,65 @@ runTimeModifiable true;
             raise PreconditionFailedError(str(error)) from error
         return stamp.to_manifest()
 
+    @staticmethod
+    def _surface_intent_issues(session: CaseSession, route=None,
+                               target=None) -> list:
+        """Plan 49 SR7. What the surface intent would meet on *route* for
+        *target* (the configured ones when omitted), as the dialog shows it:
+        ``[{subject, reason, remedy, route, target, code, kind, blocking,
+        text}]``. Nothing is measured or written."""
+        from foammesh.core.engine import surface_capabilities
+        from foammesh.core.engine.registry import (
+            configured_engine_id, configured_target_solver)
+        db = session.state.db
+        try:
+            route = route or configured_engine_id(db)
+            target = target or configured_target_solver(db)
+        except Exception:  # noqa: BLE001 - nothing configured to judge for
+            return []
+        route = surface_capabilities.normalise_route(route)
+        if route not in surface_capabilities.ROUTES:
+            return []
+        document = surface_capabilities.document_of(db)
+        if not document:
+            return []
+        issues = surface_capabilities.validate(
+            document, route, target, stage='run')
+        return [issue.to_dict() for issue in issues]
+
+    def _export_intent_gate(self, session: CaseSession, target: str) -> str:
+        """Plan 49 SR7. The surface-intent gate every export passes first.
+
+        Judged on the route the mesh was built on (its record) or, for a mesh
+        from before SR7, the configured engine; a mesh built from other
+        intent than the project now holds is refused as stale. A case with no
+        meshing route (an imported mesh, no engine chosen) is not judged.
+        Returns the route judged, or ``''``.
+        """
+        from foammesh.core.engine import surface_capabilities
+        from foammesh.core.engine.registry import configured_engine_id
+        record = surface_capabilities.read_record(session.case_path) or {}
+        route = str(record.get('route') or '')
+        if not route:
+            try:
+                route = str(configured_engine_id(session.state.db) or '')
+            except Exception:  # noqa: BLE001 - no engine to judge for
+                route = ''
+        if route not in surface_capabilities.ROUTES:
+            return ''
+        self._surface_intent_gate(session, route, target, stage='export',
+                                  stale=True)
+        return route
+
+    @staticmethod
+    def _record_export_intent(session: CaseSession, target: str,
+                              destination) -> None:
+        from foammesh.core.engine import surface_capabilities
+        document = surface_capabilities.document_of(session.state.db)
+        if document:
+            surface_capabilities.write_exported_record(
+                session.case_path, document, target, destination)
+
     def _qualification_summary(self, session: CaseSession):
         """§9's summary document, or ``None`` when the case has none.
 
@@ -15213,6 +15776,7 @@ runTimeModifiable true;
 
     def _export_native(self, session: CaseSession, command: Command) -> OperationResult:
         from foammesh.core.import_export.service import ImportExportService
+        self._export_intent_gate(session, 'openfoam')   # Plan 49 SR7
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
         # DP-2732. A case with no mesh, or a destination already there, is a
@@ -15222,6 +15786,7 @@ runTimeModifiable true;
             result = ImportExportService().export_native_case(session.case_path, destination)
         except (OSError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
+        self._record_export_intent(session, 'openfoam', destination)
         return self._read_result(session, command, {'export': _to_payload(result),
                                                     'destination': str(destination),
                                                     'qualification': qualification})
@@ -15234,6 +15799,10 @@ runTimeModifiable true;
 
     async def _dataset_export(self, session, command, entry_id) -> OperationResult:
         self._require_exportable_mesh(session, entry_id)
+        # Plan 49 SR7. SU2 is judged as SU2; every other dataset carries the
+        # mesh's named groups and no solver coupling.
+        intent_target = 'su2' if entry_id == 'su2' else 'native'
+        self._export_intent_gate(session, intent_target)
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
         from foammesh.core.import_export.service import ImportExportService
@@ -15257,6 +15826,7 @@ runTimeModifiable true;
                         session.case_path, destination)))
         except (OSError, ValueError) as error:
             raise ValidationFailedError(str(error)) from error
+        self._record_export_intent(session, intent_target, destination)
         payload['qualification'] = qualification
         return self._read_result(session, command, payload)
 
@@ -15388,6 +15958,7 @@ runTimeModifiable true;
             session.revisions, invalidated_outputs=('quality',), payload=result.to_dict())
 
     async def _export_authored(self, session: CaseSession, command: Command) -> OperationResult:
+        self._export_intent_gate(session, 'openfoam')   # Plan 49 SR7
         qualification = self._require_export_authorization(session, command)
         destination = self._destination(session, command)
         raw_options = command.parameters.get('options')
@@ -15403,6 +15974,8 @@ runTimeModifiable true;
             except (KeyError, TypeError, ValueError) as error:
                 raise ValidationFailedError('invalid authored extrusion options') from error
         from foammesh.core.import_export.authored import AuthoredExportService
+        from foammesh.core.import_export.handoff import (
+            HandoffVerificationError)
         try:
             with self._replacing(session, command, destination, 'openfoam'):
                 payload = await AuthoredExportService(
@@ -15412,9 +15985,17 @@ runTimeModifiable true;
                     options=options,
                     on_line=command.parameters.get('on_line'),
                     on_progress=command.parameters.get('on_progress'))
+        except HandoffVerificationError as error:
+            # Plan 49 SR8 (DP-6007). The final check's refusal carries the
+            # sidecar's verdict -- its path and each fault's code -- not
+            # only the sentence.
+            raise ValidationFailedError(str(error), details={
+                'error': 'handoff_check_failed',
+                'handoff': error.result.summary()}) from error
         except (OSError, ValueError, RuntimeError) as error:
             raise ValidationFailedError(str(error)) from error
         payload = dict(payload or {})
+        self._record_export_intent(session, 'openfoam', destination)
         payload['qualification'] = qualification
         return self._read_result(session, command, payload)
 
@@ -15480,8 +16061,8 @@ def _actionable_check_error(title: str, operation: str,
                     'the memory the mesher used, {2}').format(
                         title, raw, _CHECK_AGAIN)
         else:
-            text = ('{0} ran out of the memory set aside for it and was '
-                    'stopped ({1}). The mesh is unchanged. Close other '
+            text = ('{0} needed more memory than this PC had free and '
+                    'was stopped ({1}). The mesh is unchanged. Close other '
                     'programs to free memory, {2}').format(
                         title, raw, _CHECK_AGAIN)
     elif isinstance(error, CheckUnavailableError):

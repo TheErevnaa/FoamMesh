@@ -180,7 +180,8 @@ FIELD_HELP: dict[str, str] = {
         'small gaps and bad tolerances before meshing.'),
     'gmsh.describe_geometry.import_labels': (
         'Keep the names and colours stored in a STEP file so surfaces '
-        'arrive with their names.'),
+        "arrive with their names. The third choice also applies Gmsh's "
+        'slower fix for parts stored at the wrong place.'),
     'gmsh.describe_geometry.import_scaling': (
         'A factor applied to the geometry when it is read. Use 0.001 to '
         'read a file drawn in millimetres as metres.'),
@@ -234,8 +235,13 @@ FIELD_HELP: dict[str, str] = {
         'Tetrahedral fills the volume with tetrahedra. Hexahedral asks '
         'for hexahedra and needs a surface meshed with quadrilaterals.'),
     'gmsh.global_sizing.extend_from_boundary': (
-        'Let the sizes on the surfaces spread into the volume. Turn it '
-        'off to size the volume from the other controls alone.'),
+        'Where the sizes on the boundary spread inwards: never, into '
+        'surfaces and volumes, the same using the smallest surface edge '
+        'for volumes, surfaces only, or volumes only. Never sizes the '
+        'inside from the other controls alone.'),
+    'gmsh.global_sizing.max_retries': (
+        'How many times Gmsh meshes a curve or surface again when it is '
+        "left unfinished. 0 never retries. Gmsh's default is 10."),
     'gmsh.global_sizing.field_combiner': (
         'When several size controls overlap, take the smallest size '
         '(min) or the largest (max). Min keeps every refinement.'),
@@ -252,9 +258,6 @@ FIELD_HELP: dict[str, str] = {
     'gmsh.global_sizing.minimum_curve_points': (
         'The fewest nodes put on any curve, whatever the size says. '
         'Keeps short curves from being left with one cell.'),
-    'gmsh.global_sizing.minimum_elements_per_two_pi': (
-        'The fewest cells around a full circle of curvature. 0 leaves '
-        'this to the curvature rule above.'),
     'gmsh.global_sizing.minimum_size': (
         'No cell edge is made shorter than this, in metres. Leave it '
         'unset to let curvature and size fields go as small as they '
@@ -283,6 +286,19 @@ FIELD_HELP: dict[str, str] = {
     'gmsh.global_sizing.threads': (
         'How many threads Gmsh uses to mesh. The Mesh setup page sets '
         'the default for the whole run.'),
+    'gmsh.global_sizing.curve_threads': (
+        'Threads for meshing the curves. Auto (0) uses the Threads count.'),
+    'gmsh.global_sizing.surface_threads': (
+        'Threads for meshing the surfaces. Auto (0) uses the Threads '
+        'count.'),
+    'gmsh.global_sizing.volume_threads': (
+        'Threads for filling the volumes. Auto (0) uses the Threads count. '
+        'Only the HXT volume algorithm uses more than one.'),
+    'gmsh.global_sizing.reproducible': (
+        'Mesh on one thread in every stage, so two runs of one case give '
+        'the same mesh. Gmsh 4.15.2 with several threads can mesh the same '
+        'model into a different number of elements each run. Unticked keeps '
+        'the thread count above, which is faster.'),
     'gmsh.global_sizing.volume': (
         'The algorithm that fills the volume. Delaunay is robust; HXT '
         'is fast and uses several threads; Frontal gives smoother '
@@ -394,15 +410,13 @@ FIELD_HELP: dict[str, str] = {
         'On slip patches, edges sharper than this angle keep their '
         'layer points fixed to the feature.'),
     # ---- snappy: snap -----------------------------------------------
-    'meshing.snap.explicit_feature_snap': (
-        'Snap to the feature edges listed in the .eMesh files from '
-        'Surface features. Needs those edges to have been extracted.'),
-    'meshing.snap.implicit_feature_snap': (
-        'Find sharp edges from the surface itself while snapping, '
-        'without extracted edge files. Slower, and no files needed.'),
+    'meshing.snap.feature_snapping': (
+        'Explicit snaps to the edges extracted on Surface features; '
+        'Implicit finds sharp edges from the surface while snapping; '
+        'None snaps to the surface only.'),
     'meshing.snap.multi_region_feature_snap': (
-        'Snap to feature edges that lie between different regions of '
-        'the same surface as well as on its outer edges.'),
+        'Snap to feature edges where regions or zones meet. Shown with '
+        'explicit snapping on a case with more than one region or zone.'),
     'meshing.snap.n_feature_snap_iter': (
         'The iterations spent pulling cells onto the feature edges. '
         'Raise it if edges are still rounded after snapping.'),
@@ -536,17 +550,20 @@ _GMSH_KEYWORDS: dict[str, str] = {
         'Mesh.MeshSizeExtendFromBoundary',
     'gmsh.global_sizing.minimum_circle_points': 'Mesh.MinimumCirclePoints',
     'gmsh.global_sizing.minimum_curve_points': 'Mesh.MinimumCurvePoints',
-    'gmsh.global_sizing.minimum_elements_per_two_pi':
-        'Mesh.MinimumElementsPerTwoPi',
     'gmsh.global_sizing.surface': 'Mesh.Algorithm',
     'gmsh.global_sizing.volume': 'Mesh.Algorithm3D',
     'gmsh.global_sizing.algorithm_fallback': 'Mesh.AlgorithmSwitchOnFailure',
+    'gmsh.global_sizing.max_retries': 'Mesh.MaxRetries',
     'gmsh.global_sizing.recombine': 'Mesh.RecombineAll',
     'gmsh.global_sizing.recombination_algorithm':
         'Mesh.RecombinationAlgorithm',
     'gmsh.global_sizing.split_quadrangles': 'Mesh.SubdivisionAlgorithm',
     'gmsh.global_sizing.barycentric_refinement': 'Mesh.SubdivisionAlgorithm',
     'gmsh.global_sizing.threads': 'Mesh.MaxNumThreads3D',
+    'gmsh.global_sizing.reproducible': 'General.NumThreads',
+    'gmsh.global_sizing.curve_threads': 'Mesh.MaxNumThreads1D',
+    'gmsh.global_sizing.surface_threads': 'Mesh.MaxNumThreads2D',
+    'gmsh.global_sizing.volume_threads': 'Mesh.MaxNumThreads3D',
     'gmsh.compute.optimize': 'Mesh.Optimize',
     'gmsh.compute.netgen': 'Mesh.OptimizeNetgen',
     'gmsh.compute.optimize_threshold': 'Mesh.OptimizeThreshold',
@@ -612,7 +629,6 @@ DIAGRAMS: dict[str, str] = {
     'gmsh.global_sizing.size_factor': 'size',
     'gmsh.global_sizing.from_curvature': 'curvature',
     'gmsh.global_sizing.minimum_circle_points': 'curvature',
-    'gmsh.global_sizing.minimum_elements_per_two_pi': 'curvature',
     'meshing.base_grid.target_cell_size': 'size',
     'meshing.snap.tolerance': 'snap',
     'meshing.castellation.cells_between_levels': 'levels',

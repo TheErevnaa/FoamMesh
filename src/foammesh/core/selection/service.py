@@ -294,14 +294,27 @@ class SelectionService:
         self._pick_reason = str(reason)
 
     def begin_pick(self, request, *, engine: str = 'gmsh',
-                   mesh_on_screen: bool = False) -> bool:
+                   mesh_on_screen: bool | None = None) -> bool:
         """Ask the Pick tool to serve *request*; False says why in
-        :attr:`pick_reason`."""
-        from .pick import pick_filters
+        :attr:`pick_reason`.
+
+        Cells and Patches are offered only while a mesh is on screen:
+        *mesh_on_screen* says so, and ``None`` asks the viewport that shows
+        the mesh (Plan 48 PK)."""
+        from .pick import MESH_FILTERS, pick_filters
 
         self._pick_reason = ''
+        if mesh_on_screen is None:
+            from .mesh_on_screen import mesh_on_screen as _on_screen
+            mesh_on_screen = _on_screen()
         offered = pick_filters(engine, mesh_on_screen=mesh_on_screen)
         missing = [name for name in request.filters if name not in offered]
+        if missing and not mesh_on_screen and all(
+                name in MESH_FILTERS for name in missing):
+            self._pick_reason = (
+                'There is no mesh on screen to pick %s in; generate or load '
+                'a mesh first.' % ', '.join(missing).lower())
+            return False
         if missing:
             self._pick_reason = (
                 '%s cannot be picked with the %s engine here.'

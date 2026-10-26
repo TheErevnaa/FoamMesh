@@ -64,6 +64,8 @@ class Configurations(SimpleDB):
         #: and the project's autosave journal once a session attaches one.
         self.savedSeq = 0
         self.autosave = None
+        #: DP-5712. Sentences the load migration left for the Console.
+        self.loadNotes = []
 
     def create(self, path):
         self._path = path / FILE_NAME
@@ -84,8 +86,12 @@ class Configurations(SimpleDB):
         # A *renamed* field has to be rewritten before that, because
         # validation keeps only the keys the schema names and would otherwise
         # throw the old spelling away and substitute a default.
+        # DP-5712. What the migration had to read differently, for the
+        # window to print in the Console once the project is open.
+        notes = []
         self._content = self.validateData(
-            migrateDocument(document), fillWithDefault=True)
+            migrateDocument(document, notes), fillWithDefault=True)
+        self.loadNotes = notes
         self._files = files
         Configurations._geometryNextKey = maxIds[FileGroup.GEOMETRY_POLY_DATA.value]
         self.savedSeq = readSavedSeq(self._path)
@@ -165,7 +171,29 @@ class Configurations(SimpleDB):
         for key in data._files:
             self._files[key].update(data._files[key])
 
-        return super().commit(data)
+        from .surface_intent import assess_before_rename, unassessed_names
+        names_before = unassessed_names(self._content)
+        remap = super().commit(data)
+        # Plan 49 SR7 (DP-5788). A surface renamed before anyone assessed it
+        # keeps the purpose its old name gave it.
+        assess_before_rename(self._content, names_before)
+        # Plan 49 (DP-6050). A surface this commit added is assessed now, as
+        # opening the project would assess it, so the run and export gates
+        # and the hand-off read the same roles before and after a reopen.
+        if unassessed_names(self._content):
+            from .surface_intent import migrate_surface_intent
+            migrate_surface_intent(self._content)
+        # Plan 49 SR1. A deleted, replaced or renamed surface reaches every
+        # relation naming it in the same change, so the relation is marked
+        # unresolved (or follows the rename) in the snapshot undo restores.
+        # Reads only, unless the project holds surface intent.
+        # Plan 49 SR3. A periodic pair edited on the Geometry or the Gmsh
+        # Periodic page reaches its relation in the same change.
+        from .surface_intent import (refresh_surface_intent,
+                                     sync_periodic_relations)
+        sync_periodic_relations(self._content)
+        refresh_surface_intent(self._content)
+        return remap
 
     def _newDB(self, schema, editable=False):
         db = Configurations(schema)

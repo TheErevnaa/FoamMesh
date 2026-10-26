@@ -356,6 +356,106 @@ def split_conjugate_assembly(members, triangles, sources=None):
     return None
 
 
+def _open_rim(triples) -> dict:
+    """``{edge: (from, to)}`` for each edge one triangle of *triples* uses."""
+    uses: dict = {}
+    directed: dict = {}
+    for triple in triples:
+        for index in range(3):
+            one, other = int(triple[index]), int(triple[(index + 1) % 3])
+            edge = (min(one, other), max(one, other))
+            uses[edge] = uses.get(edge, 0) + 1
+            directed[edge] = (one, other)
+    return {edge: directed[edge] for edge, used in uses.items() if used == 1}
+
+
+def plan_interface_sheets(triangles: dict, groups: dict | None = None) -> dict:
+    """Which imported sheets are the face two imported bodies share.
+
+    DP-6056. The Split tab hands an assembly over in the other form from
+    the runner's ``plan_shared_faces``: each body open where it meets the
+    other, and
+    the face between them once, in a file of its own. A sheet whose open rim
+    is an open rim of exactly two other surfaces, wound against one of them
+    and along the other, is that pair's shared face: it closes the first in
+    its own winding and the second reversed.
+
+    By the rims alone the relation is symmetric: a box open on one side and
+    the square that closes it have the same rim, so each reads as the
+    other's face. The face is the smaller of the two, so surfaces are tried
+    as faces fewest triangles first, and one taken as a body is not tried.
+
+    A pairing is kept only when it closes both bodies -- every open edge of
+    each is on a face paired with it -- so a body with a hole somewhere else
+    is still refused for that hole rather than hidden behind its face.
+
+    The runner asks it of the imported surfaces before it classifies them,
+    and the host's solid detection (``core.mesh.cad_solids``) of the regions
+    of a tessellated entry, so both read the same assembly as the same
+    bodies. *triangles* maps any tag to node-id triples, nodes welded.
+
+    *groups* maps a tag to the body it came from (the runner's imported
+    file). DP-6060: a body imported as several named solids is several
+    surfaces, none of which holds the whole rim of the face it meets -- the
+    tube's core is its two end caps, each with one of the face's two
+    circles -- so the rims are then measured per body, and a body is named
+    in the answer by its lowest tag.
+
+    Returns ``{sheet: (first, second)}``, the first being the body the sheet
+    is wound outward from.
+    """
+    if groups:
+        members: dict = {}
+        for tag in triangles:
+            members.setdefault(groups.get(tag, ('tag', tag)), []).append(tag)
+        if any(len(tags) > 1 for tags in members.values()):
+            merged = {min(tags): [triple for tag in sorted(tags)
+                                  for triple in triangles[tag]]
+                      for tags in members.values()}
+            found = plan_interface_sheets(merged)
+            answer = {}
+            for sheet, owners in found.items():
+                key = groups.get(sheet, ('tag', sheet))
+                for tag in members[key]:
+                    answer[tag] = owners
+            return answer
+    rims = {tag: _open_rim(triples) for tag, triples in triangles.items()}
+    pairs: dict = {}
+    bodies: set = set()
+    for sheet in sorted(rims, key=lambda tag: (len(triangles[tag]), tag)):
+        rim = rims[sheet]
+        if not rim or sheet in bodies:
+            continue
+        holders = [tag for tag in sorted(rims)
+                   if tag != sheet and tag not in pairs
+                   and rim.keys() <= rims[tag].keys()]
+        if len(holders) != 2:
+            continue
+
+        def against(tag):
+            return all(rims[tag][edge] == (rim[edge][1], rim[edge][0])
+                       for edge in rim)
+
+        def along(tag):
+            return all(rims[tag][edge] == rim[edge] for edge in rim)
+
+        first, second = holders
+        if against(second) and along(first):
+            first, second = second, first
+        elif not (against(first) and along(second)):
+            continue
+        pairs[sheet] = (first, second)
+        bodies.update((first, second))
+    covered: dict = {}
+    for sheet, owners in pairs.items():
+        for owner in owners:
+            covered.setdefault(owner, set()).update(rims[sheet])
+    closed = {owner for owner, edges in covered.items()
+              if owner not in pairs and edges == set(rims[owner])}
+    return {sheet: owners for sheet, owners in pairs.items()
+            if set(owners) <= closed}
+
+
 # --------------------------------------------------------------------------- #
 # Containment
 # --------------------------------------------------------------------------- #

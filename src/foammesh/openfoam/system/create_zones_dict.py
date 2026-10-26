@@ -87,7 +87,10 @@ class CreateZonesDict(DictionaryFile):
             return self
 
         generators = {}
-        regions = self._db.getElements('region')
+        # DP-6058. The regions the export splits by: on Gmsh the typed
+        # solids, which hold no ``region`` row.
+        from foammesh.core.import_export.export_regions import export_regions
+        regions = export_regions(self._db)
         if len(regions) > 1:
             # ``splitMeshRegions -cellZonesOnly`` hands every region mesh the
             # zones it was split by (DP-538 writes one per region), so each

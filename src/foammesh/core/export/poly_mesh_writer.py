@@ -271,6 +271,11 @@ def _write_boundary(path, patch_ids, start_face, metadata):
             name = _foam_name(item.get('solver_name') or item.get('name') or
                               f'patch_{int(patch_id)}')
             patch_type = _foam_patch_type(item.get('category'))
+            # Plan 49 SR5. A free mesh patch type the user chose on the
+            # surface (``symmetry`` has no category of its own: the
+            # ``symmetry`` category has always written ``symmetryPlane``).
+            if str(item.get('patch_type') or '') in _FREE_PATCH_TYPES:
+                patch_type = str(item['patch_type'])
             stream.write(
                 f'{name}\n{{\n    type {patch_type};\n')
             interface = item.get('interface') or {}
@@ -323,6 +328,11 @@ def _write_boundary(path, patch_ids, start_face, metadata):
             current += int(count)
         stream.write(')\n')
     return rows
+
+
+#: Plan 49 SR5. The mesh patch types a surface may be given directly.
+_FREE_PATCH_TYPES = ('patch', 'wall', 'symmetry', 'symmetryPlane', 'empty',
+                     'wedge')
 
 
 def _foam_patch_type(category):

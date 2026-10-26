@@ -106,7 +106,23 @@ LEAF_ALIASES = {
 }
 
 # Top-level storage keys that are internal bookkeeping, not editable fields.
-INTERNAL_KEYS = {'version'}
+INTERNAL_KEYS = {
+    'version',
+    # Plan 49 SR8. `surfaceRelations` and `surfaceIntent` were held here by
+    # SR1 until the local API exposed them on purpose. They are now the
+    # read-only collection `geometry.surface_relations` and the read-only
+    # fields `surface_intent.model_version` / `.conversion_report`; see
+    # plans/evidence/plan49/sr8/API_CHANGES.md.
+}
+
+#: Plan 49 SR8. Collections the local API reads but never writes row by
+#: row. A surface relation is written by the surface tab's partner and
+#: region controls (`geometry.surface_intent.edit`) and by the two periodic
+#: pair tables (`geometry.interface_pairs`, `gmsh.periodic_pairs.controls`),
+#: which keep each side's role and the relation's state consistent; a free
+#: create/patch/remove would not. No create, patch or remove operation is
+#: published for these; asking for one is refused by name.
+READ_ONLY_COLLECTIONS = frozenset({'geometry.surface_relations'})
 
 # Storage keys whose subtree is a workflow selector rather than a mesh field.
 STANDALONE_SEMANTIC = {'step': 'workflow.step'}
@@ -521,6 +537,9 @@ def _collection_id(path: str) -> str:
         'gmsh/curveControls': 'gmsh.curve_controls.controls',
         'gmsh/volumeControls': 'gmsh.volume_controls.controls',
         'gmsh/periodicPairs': 'gmsh.periodic_pairs.controls',
+        # Plan 49 SR8. Next to `geometry.interface_pairs`, on the page that
+        # owns the surfaces it couples.
+        'surfaceRelations': 'geometry.surface_relations',
     }
     return mapping.get(path, _snake(path.replace('/', '.')))
 

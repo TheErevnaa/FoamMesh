@@ -593,6 +593,38 @@ class RegionSeedPanel(ChildControlPanel):
         """The placements this editor session has made, oldest first."""
         return list(self._placements)
 
+    def placementState(self) -> dict:
+        """The seed editor as it stands (Plan 48 PA5): is it open, where the
+        seed is, the placements made, what undo and redo can do, and what the
+        feedback line under the point says."""
+        point = self.seedPoint() if self.isEditing() else None
+        return {'editing': self.isEditing(),
+                'point': list(point) if point is not None else None,
+                'placements': [list(p) for p in self._placements],
+                'index': self._placementIndex,
+                'can_undo': self.canUndoPlacement(),
+                'can_redo': self.canRedoPlacement(),
+                'note': self.note()}
+
+    def movePlacement(self, point) -> None:
+        """Put the seed at *point* as a drag of the handle ends there.
+
+        The fields say where, the position is judged, and the drag's end
+        records one placement and announces it (the handle's own sequence).
+        """
+        if self._openDialog is None:
+            raise ValueError('open a region editor first')
+        point = tuple(float(v) for v in point)
+        if len(point) != 3:
+            raise ValueError('point is three numbers: x, y, z')
+        self._gizmoMoved(point)
+        if self._gizmo is not None and hasattr(self._gizmo, 'setPosition'):
+            try:
+                self._gizmo.setPosition(point)
+            except Exception:  # noqa: BLE001 - the fields are the record
+                pass
+        self._placementFinished()
+
     def canUndoPlacement(self) -> bool:
         return self._placementIndex > 0
 
@@ -1671,6 +1703,30 @@ class ExcludePointPanel(ChildControlPanel):
         if self._findings is None or self._findings.isHidden():
             return ''
         return self._findings.text()
+
+    def findingsReadout(self) -> dict:
+        """The findings as the page shows them, and the report behind them.
+
+        Plan 48 PA5. ``text`` is the label under the table (empty when it is
+        hidden); ``status`` is how the label is coloured; ``errors``,
+        ``warnings`` and ``removals`` are the preflight report's own rows.
+        """
+        self._showFindings()
+        report = self._report
+        label = self._findings
+        shown = label is not None and not label.isHidden()
+        return {
+            'text': label.text() if shown else '',
+            'shown': bool(shown),
+            'status': ('error' if report is not None and report.errors
+                       else 'warning' if report is not None
+                       and report.warnings else ''),
+            'errors': [one.to_dict() for one in report.errors]
+            if report is not None else [],
+            'warnings': [one.to_dict() for one in report.warnings]
+            if report is not None else [],
+            'removals': list(report.removals) if report is not None else [],
+            'points': len(self._points())}
 
     def _showFindings(self) -> None:
         if self._findings is None:

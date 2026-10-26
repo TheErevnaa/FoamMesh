@@ -25,12 +25,17 @@ from typing import Callable, Iterable
 
 import numpy as np
 
-#: Selection filter -> entity dimension.  ``Elements`` is the mesh element
-#: filter of the same chip row; it is carried by the viewport (GN13).
+#: Selection filter -> entity dimension.  ``Cells`` is the mesh element
+#: filter of the same chip row (Plan 48 PK, DP-4503; GN13 called it
+#: ``Elements``); the mesh viewport carries it and a picked element is the
+#: pair ``(ELEMENT_DIM, element tag)``.
 FILTERS = {'Points': 0, 'Curves': 1, 'Surfaces': 2, 'Volumes': 3}
-FILTER_ORDER = tuple(FILTERS) + ('Elements',)
-_PREFIX = {0: 'P', 1: 'C', 2: 'S', 3: 'V'}
-_DIM_NAME = {0: 'point', 1: 'curve', 2: 'surface', 3: 'volume'}
+CELLS = 'Cells'
+ELEMENT_DIM = 4
+FILTER_ORDER = tuple(FILTERS) + (CELLS,)
+_PREFIX = {0: 'P', 1: 'C', 2: 'S', 3: 'V', ELEMENT_DIM: 'E'}
+_DIM_NAME = {0: 'point', 1: 'curve', 2: 'surface', 3: 'volume',
+             ELEMENT_DIM: 'element'}
 
 Entity = tuple  # (dim, tag)
 
@@ -215,8 +220,8 @@ class EntityPicker:
             self._filter = name
             self._hover = None
             # Picks of another kind are not mixed into one list.
-            self._chosen = [e for e in self._chosen
-                            if name in FILTERS and e[0] == FILTERS[name]]
+            dim = ELEMENT_DIM if name == CELLS else FILTERS[name]
+            self._chosen = [e for e in self._chosen if e[0] == dim]
             self._notify('filter')
 
     def begin(self, filter_name: str | None = None, *,
@@ -232,8 +237,8 @@ class EntityPicker:
 
     def resolve(self, cell: int | None = None, world=None) -> Entity | None:
         """The entity under the cursor for the current filter, or None."""
-        if self._filter == 'Elements':
-            return None
+        if self._filter == CELLS:
+            return None             # the mesh viewport answers: click_element
         dim = FILTERS[self._filter]
         if dim == 0:
             return self._nearest_point(world)
@@ -283,6 +288,32 @@ class EntityPicker:
         found = self.resolve(cell, world)
         if found is None:
             return None
+        if shift:
+            if found in self._chosen:
+                self._chosen.remove(found)
+            else:
+                self._chosen.append(found)
+        else:
+            self._chosen = [found]
+        self._notify('selection')
+        return found
+
+    def hover_element(self, tag: int | None) -> Entity | None:
+        """The mesh viewport's hover under the Cells filter."""
+        found = ((ELEMENT_DIM, int(tag)) if self._active
+                 and self._filter == CELLS and tag is not None else None)
+        if found != self._hover:
+            self._hover = found
+            self._notify('hover')
+        return found
+
+    def click_element(self, tag: int | None, *,
+                      shift: bool = False) -> Entity | None:
+        """A click on a mesh element (its tag) under the Cells filter; the
+        same rules as :meth:`click`."""
+        if not self._active or self._filter != CELLS or tag is None:
+            return None
+        found = (ELEMENT_DIM, int(tag))
         if shift:
             if found in self._chosen:
                 self._chosen.remove(found)
@@ -416,6 +447,10 @@ class PhysicalGroupEditor:
         if not entities:
             raise PickRefusal('pick at least one entity first')
         dims = {e[0] for e in entities}
+        if ELEMENT_DIM in dims:
+            raise PickRefusal('mesh elements cannot be put in a physical '
+                              'group; pick points, curves, surfaces or '
+                              'volumes')
         if len(dims) != 1:
             raise PickRefusal(
                 'a physical group holds one kind of entity; the pick mixes %s'

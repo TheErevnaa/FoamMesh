@@ -5,11 +5,19 @@ goes through.  It asks the resident session for the facts of its mesh,
 refuses a writer that cannot carry them with the reason
 (:func:`export_writers.refusal`), writes through the session with the options
 chosen, and reads the file back to compare counts.  OpenFOAM and Fluent are
-entries of the same list: the session writes MSH 4.1 (binary) and the
-publisher of :mod:`publish` turns it into a polyMesh, from which
-``foamMeshToFluent`` writes the Fluent file.
+entries of the same list: the session writes a hidden MSH 2.2 copy (the one
+``gmshToFoam`` and the publisher of :mod:`publish` read) and the publisher
+turns it into a polyMesh, from which ``foamMeshToFluent`` writes the Fluent
+file.
 
 Nothing here depends on the solver the mesh is meant for.
+
+Plan 48 GM4 (output honesty).  The user's own ``.msh`` is written exactly as
+chosen (any version, ASCII or binary, SaveAll, parametric, split), and
+OpenFOAM never reads it: the polyMesh comes from the hidden copy (D1).  A mesh
+the target matrix marks CONVERTED is written only through the conversion the
+caller names, on a copy made for that write; the mesh in the session and the
+user's files are never changed.
 """
 from __future__ import annotations
 
@@ -47,6 +55,11 @@ class ExportResult:
     def ok(self) -> bool:
         return not self.problems and self.bytes > 0
 
+    @property
+    def publisher_copy(self) -> dict:
+        """The hidden MSH 2.2 copy OpenFOAM was built from (D1), when there was one."""
+        return dict(self.extra.get('publisher_copy') or {})
+
     def to_dict(self) -> dict:
         return {'writer': self.writer, 'path': self.path,
                 'files': list(self.files), 'bytes': self.bytes,
@@ -77,9 +90,21 @@ def _split_options(raw: dict | None) -> tuple[dict, dict]:
 class MeshExporter:
     """Exports the mesh a :class:`GmshSession` holds."""
 
-    def __init__(self, session_getter, *, profile=None):
+    def __init__(self, session_getter, *, profile=None, overrides=None):
         self._session_getter = session_getter
         self._profile = profile
+        #: ``() -> {option: value}``: the project's stored Gmsh options. The
+        #: unit pins (D2) are read from it; without it they are locked.
+        self._overrides = overrides
+
+    def unit_scaling(self) -> float:
+        """Metres in one unit of the model, from the unit pins (1 when locked)."""
+        try:
+            stored = dict(self._overrides() or {}) if self._overrides else {}
+        except Exception:                                    # noqa: BLE001
+            stored = {}
+        factor = writers.metres_per_unit(stored)
+        return float(factor) if factor else 1.0
 
     # -- the mesh in hand ------------------------------------------------ #
 
@@ -94,9 +119,25 @@ class MeshExporter:
         return writers.MeshFacts.from_dict(self.session().export_facts())
 
     def refusal(self, writer_id: str, options=None,
-                facts: writers.MeshFacts | None = None) -> str:
+                facts: writers.MeshFacts | None = None, convert=None) -> str:
         facts = facts or self.facts()
-        return writers.refusal(writer_id, facts, options)
+        return writers.refusal(writer_id, facts, options, convert=convert)
+
+    def conversions(self, writer_id: str, options=None,
+                    facts: writers.MeshFacts | None = None) -> list:
+        """The conversions this write needs on the mesh in hand (§4.9.1)."""
+        if writers.retired(writer_id):
+            return []
+        facts = facts or self.facts()
+        return writers.conversions(writers.writer(writer_id), facts, options)
+
+    def drops(self, writer_id: str, options=None,
+              facts: writers.MeshFacts | None = None) -> list:
+        """What this write loses on the mesh in hand, stated before it is written."""
+        if writers.retired(writer_id):
+            return []
+        facts = facts or self.facts()
+        return writers.stated_drops(writers.writer(writer_id), facts, options)
 
     def offered(self, facts: writers.MeshFacts | None = None) -> list:
         """``[(writer, reason or '')]`` for every entry the page lists."""
@@ -108,23 +149,47 @@ class MeshExporter:
 
     def write(self, writer_id: str, destination, options: dict | None = None,
               *, overwrite: bool = False, verify: bool = True,
-              check_mesh: bool = False) -> ExportResult:
-        item = writers.writer(writer_id)
+              check_mesh: bool = False, convert=None,
+              extrusion: dict | None = None) -> ExportResult:
+        # DP-1437: a retired writer (Medit) is refused before anything else,
+        # and so is a destination only a retired writer writes.
+        sentence = writers.retired(writer_id) or writers.retired_path(
+            destination)
+        if sentence:
+            raise ExportRefused(sentence)
+        try:
+            item = writers.writer(writer_id)
+        except KeyError as error:
+            raise ExportRefused(str(error)) from error
         facts = self.facts()
-        reason = writers.refusal(writer_id, facts, options)
+        chosen = ((convert,) if isinstance(convert, str)
+                  else tuple(convert or ()))
+        unknown = [name for name in chosen if name not in writers.CONVERSIONS]
+        if unknown:
+            raise ExportRefused(
+                f'there is no export conversion called {unknown[0]!r}; the '
+                f'choices are {", ".join(writers.CONVERSIONS)}')
+        reason = writers.refusal(writer_id, facts, options, convert=chosen)
         if reason:
             raise ExportRefused(reason)
+        stated = writers.stated_drops(item, facts, options)
         try:
             write_options, read_options = _split_options(
                 writers.option_values(writer_id, options))
         except catalogue.OptionRefusal as error:
             raise ExportRefused(str(error)) from error
         if item.kind == writers.FOAM:
-            return self._write_openfoam(item, Path(destination), facts,
-                                        overwrite, check_mesh=check_mesh)
+            result = self._write_openfoam(
+                item, Path(destination), facts, overwrite,
+                check_mesh=check_mesh, convert=chosen, extrusion=extrusion)
+            result.notes += stated
+            return result
         if item.kind == writers.FLUENT:
-            return self._write_fluent(item, Path(destination), facts,
-                                      overwrite)
+            result = self._write_fluent(item, Path(destination), facts,
+                                        overwrite, convert=chosen,
+                                        extrusion=extrusion)
+            result.notes += stated
+            return result
         path = self._named(item, Path(destination))
         outputs = writers.output_paths(item.id, path)
         existing = [Path(out) for out in outputs if Path(out).exists()]
@@ -132,11 +197,15 @@ class MeshExporter:
             raise ExportRefused(f'{existing[0]} already exists; choose '
                                 'another name or allow overwriting')
         path.parent.mkdir(parents=True, exist_ok=True)
+        scale_note = ''
+        if (item.id == 'su2' and 'Mesh.ScalingFactor' not in write_options
+                and self.unit_scaling() != 1.0):
+            write_options['Mesh.ScalingFactor'] = self.unit_scaling()
+            scale_note = (f'the model is not in metres (unit pins): the file '
+                          f'is scaled by {self.unit_scaling():g} to metres')
         try:
-            answer = self.session().export_file(
-                path, write_options,
-                kind='geometry' if item.kind == writers.GEOMETRY else 'mesh',
-                outputs=outputs)
+            answer = self._session_write(
+                path, write_options, item, outputs, chosen)
         except ExportRefused:
             raise
         except Exception as error:                           # noqa: BLE001
@@ -144,7 +213,34 @@ class MeshExporter:
         if (verify and item.verify == 'gmsh' and path.is_file()
                 and path.stat().st_size):
             answer['found'] = self.read_back(path, read_options)
-        return self._judge(item, path, outputs, answer, facts, verify)
+        result = self._judge(item, path, outputs, answer, facts, verify)
+        if 'first_order_copy' in chosen:
+            result.notes.append(
+                f'{item.label} holds the corner nodes of the order '
+                f'{facts.order} mesh (a first-order copy); the mesh in the '
+                'session is unchanged')
+        if scale_note:
+            result.notes.append(scale_note)
+        result.notes += stated
+        return result
+
+    def _session_write(self, path, write_options, item, outputs, chosen,
+                       timeout=None) -> dict:
+        """Write through the session, on a first-order copy when chosen."""
+        session = self.session()
+        kind = 'geometry' if item.kind == writers.GEOMETRY else 'mesh'
+        if 'first_order_copy' not in chosen:
+            return session.export_file(path, write_options, kind=kind,
+                                       outputs=outputs)
+        result = session.call(
+            'session.export_converted', session.runtime_path(path),
+            options=dict(write_options), kind=kind,
+            outputs=[session.runtime_path(out) for out in outputs],
+            convert='first_order_copy', timeout=timeout)
+        root = Path(path).parent
+        for entry in result.get('files', ()):
+            entry['host_path'] = str(root / Path(entry['path']).name)
+        return result
 
     def read_back(self, path, read_options: dict | None = None) -> dict:
         """The census of *path* read by a Gmsh of its own (never the session's)."""
@@ -205,19 +301,65 @@ class MeshExporter:
 
     # -- OpenFOAM and Fluent --------------------------------------------- #
 
-    def _msh_for_openfoam(self, directory: Path, facts) -> Path:
-        path = directory / 'session.msh'
-        session = self.session()
-        options = {'Mesh.MshFileVersion': 4.1, 'Mesh.Binary': 1.0}
-        if not facts.physical_groups:
-            options['Mesh.SaveAll'] = 1.0
-        session.export_file(path, options, outputs=(path,))
+    #: Plan 48 GM4 (D1). The hidden copy OpenFOAM is built from: the one
+    #: version ``gmshToFoam`` and the publisher read, ASCII, the physical
+    #: groups as they are (SaveAll only when there are none to name the
+    #: patches). It is written beside the work, never as the user's file.
+    PUBLISHER_COPY = {'Mesh.MshFileVersion': 2.2, 'Mesh.Binary': 0.0,
+                      'Mesh.SaveParametric': 0.0,
+                      'Mesh.PartitionSplitMeshFiles': 0.0}
+
+    def _msh_for_openfoam(self, directory: Path, facts, chosen=()) -> Path:
+        from . import publish
+
+        path = directory / ('session' + publish.PUBLISHER_COPY_SUFFIX)
+        options = dict(self.PUBLISHER_COPY)
+        options['Mesh.SaveAll'] = 0.0 if facts.physical_groups else 1.0
+        scale = self.unit_scaling()
+        if scale != 1.0:
+            options['Mesh.ScalingFactor'] = scale
+        self._session_write(path, options, writers.writer('msh'), (path,),
+                            chosen)
         if not path.is_file() or not path.stat().st_size:
             raise ExportRefused('Gmsh wrote no mesh to convert')
         return path
 
+    def _publish_arguments(self, facts, chosen, extrusion) -> dict:
+        """The conversions of a polyMesh write, as the publisher takes them."""
+        from . import publish
+
+        arguments: dict = {}
+        if 'extrude_2d' in chosen:
+            values = dict(extrusion or {})
+            bounds = list(getattr(facts, 'bounds', ()) or ())
+            extent = max((bounds[i + 3] - bounds[i] for i in range(3)),
+                         default=0.0) if len(bounds) == 6 else 0.0
+            values.setdefault('thickness', extent * 0.01 if extent else 0.01)
+            arguments['extrusion'] = publish.SectionExtrusion(**values)
+        if 'cyclic_patches' in chosen:
+            arguments['periodic_pairs'] = [
+                {'name': f'{pair["slave"]}_{pair["master"]}',
+                 'masterSolverName': pair['master'],
+                 'slaveSolverName': pair['slave'],
+                 'transform': 'translation',
+                 'translation': list(pair['translation']),
+                 'matchTolerance': 1e-6}
+                for pair in facts.periodic_pairs]
+        # Plan 48 WG (DP-445, DP-4215): the build's declared empty/wedge pair.
+        getter = getattr(self, '_session_getter', None)
+        case_path = getattr(getter() if getter else None, 'case_path', None)
+        if case_path is not None:
+            from . import geometry_build
+            roles = geometry_build.publish_roles(case_path)
+            if roles['categories']:
+                arguments['categories'] = roles['categories']
+            if roles['declared']:
+                arguments['declared'] = roles['declared']
+        return arguments
+
     def _write_openfoam(self, item, destination: Path, facts, overwrite,
-                        check_mesh=False) -> ExportResult:
+                        check_mesh=False, convert=(), extrusion=None
+                        ) -> ExportResult:
         from . import publish
 
         if destination.exists() and any(destination.iterdir()) and not overwrite:
@@ -228,17 +370,26 @@ class MeshExporter:
         destination.mkdir(parents=True)
         with tempfile.TemporaryDirectory(prefix='foammesh-gmsh-',
                                          dir=destination) as work:
-            msh = self._msh_for_openfoam(Path(work), facts)
+            msh = self._msh_for_openfoam(Path(work), facts, convert)
+            copy_info = {'version': 2.2, 'binary': False, 'hidden': True,
+                         'name': msh.name, 'bytes': msh.stat().st_size}
             try:
-                report = publish.publish(msh, destination / 'constant' /
-                                         'polyMesh')
+                report = publish.publish(
+                    msh, destination / 'constant' / 'polyMesh',
+                    **self._publish_arguments(facts, convert, extrusion))
             except publish.PublishError as error:
                 raise ExportRefused(str(error)) from error
         write_case_files(destination)
         result = ExportResult(writer=item.id, path=str(destination))
+        result.extra['publisher_copy'] = copy_info
         expected_cells = sum(
             count for name, count in facts_family_counts(self.session())
             .items() if name in writers.VOLUME_FAMILIES)
+        if 'extrude_2d' in convert:
+            # the extrusion makes the cells: one layer of the section's cells
+            expected_cells = sum(
+                count for name, count in facts_family_counts(self.session())
+                .items() if name in writers.SURFACE_FAMILIES)
         result.expected = {'cells': expected_cells}
         result.found = {'cells': report.cells, 'points': report.points,
                         'patches': list(report.patches),
@@ -264,14 +415,14 @@ class MeshExporter:
         return result
 
     def _write_fluent(self, item, destination: Path, facts,
-                      overwrite) -> ExportResult:
+                      overwrite, convert=(), extrusion=None) -> ExportResult:
         path = self._named(item, destination)
         if path.exists() and not overwrite:
             raise ExportRefused(f'{path} already exists')
         with tempfile.TemporaryDirectory(prefix='foammesh-fluent-') as work:
             case = Path(work) / 'case'
             self._write_openfoam(writers.writer('openfoam'), case, facts,
-                                 False)
+                                 False, convert=convert, extrusion=extrusion)
             outcome = run_foam_utility(case, 'foamMeshToFluent', self._profile)
             produced = case / 'fluentInterface' / f'{case.name}.msh'
             if not outcome['ok'] or not produced.is_file():
@@ -291,6 +442,8 @@ class MeshExporter:
     @staticmethod
     def write_options_file(path, writer_id: str, options: dict) -> Path:
         """Save the options of one export as a Gmsh ``.opt`` file (F-15)."""
+        if writers.retired(writer_id):
+            raise ExportRefused(writers.retired(writer_id))
         values = writers.option_values(writer_id, options)
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)

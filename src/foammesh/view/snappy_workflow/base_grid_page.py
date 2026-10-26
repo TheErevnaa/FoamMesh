@@ -1082,20 +1082,75 @@ class BlockPanel(ChildControlPanel):
     def describe_directions(self) -> None:
         """Say where Start is for this block, from the vertices typed."""
         editor = self.editor('vertices')
-        numbers = str(editor.value() if editor is not None else '').split()
-        for axis, (first, last) in self.AXIS_ENDS.items():
+        texts = self.directionDescriptions(
+            str(editor.value() if editor is not None else ''))
+        for axis, text in texts.items():
+            self._directions[axis].setText(text)
+
+    @classmethod
+    def directionDescriptions(cls, vertices: str) -> dict:
+        """Where each local direction starts and ends, for the typed vertices.
+
+        The sentences the three labels under the grading boxes carry
+        (Plan 48 PA5: one text, for the window and for the local API).
+        """
+        from PySide6.QtCore import QCoreApplication
+        translate = lambda text: QCoreApplication.translate(  # noqa: E731
+            'BlockPanel', text)
+        numbers = str(vertices or '').split()
+        texts = {}
+        for axis, (first, last) in cls.AXIS_ENDS.items():
             if len(numbers) == 8:
-                text = self.tr(
+                texts[axis] = translate(
                     'Local {0} runs from vertex {1} (Start) toward vertex {2} '
                     '(End), in this block\'s own vertex order.').format(
                         axis, numbers[first], numbers[last])
             else:
-                text = self.tr(
+                texts[axis] = translate(
                     'Local {0} runs from the first vertex listed (Start) '
                     'toward the {1} (End).').format(
                         axis, {'X': 'second', 'Y': 'fourth',
                                'Z': 'fifth'}[axis])
-            self._directions[axis].setText(text)
+        return texts
+
+    @classmethod
+    def gradingFields(cls, axis: str, fine=None, ratio=None,
+                      text=None) -> dict:
+        """The block fields one direction's grading writes.
+
+        The widget's rule (Plan 37 UF12): a side (Start, End, Centre, Both
+        edges) with a ratio *regenerates* the text beside them; Custom
+        profile keeps the typed text and leaves the ratio alone. Returns the
+        ``grading_<axis>_fine`` / ``_ratio`` / ``grading_<axis>`` values to
+        store, or raises ``ValueError`` with the refusal the widget would
+        not even let through.
+        """
+        axis = str(axis).lower()
+        if axis not in ('x', 'y', 'z'):
+            raise ValueError('axis is x, y or z')
+        values = {}
+        if fine is not None:
+            fine = str(getattr(fine, 'value', fine))
+            values[f'grading_{axis}_fine'] = fine
+        if ratio is not None:
+            values[f'grading_{axis}_ratio'] = ratio
+        if text is not None:
+            values[f'grading_{axis}'] = str(text)
+        side = values.get(f'grading_{axis}_fine')
+        if side in background_mesh.FINE_PRESETS:
+            if ratio is None:
+                raise ValueError('a side needs its ratio (never below 1)')
+            try:
+                values[f'grading_{axis}'] = background_mesh.preset_text(
+                    side, ratio)
+            except (background_mesh.BackgroundMeshError, TypeError,
+                    ValueError) as error:
+                raise ValueError(str(error)) from error
+        elif side is None and text is not None:
+            # Typing in the text while a side is chosen is a request for the
+            # text: the side falls back to Custom profile.
+            values[f'grading_{axis}_fine'] = background_mesh.FINE_CUSTOM_PROFILE
+        return values
 
     def _load_selected(self) -> None:
         super()._load_selected()

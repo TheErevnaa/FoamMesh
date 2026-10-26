@@ -127,3 +127,56 @@ class MapperColouring:
             if table is not None:
                 target.SetLookupTable(table)
             target.SetScalarModeToDefault()
+
+
+# -- Plan 48 GM12: colouring a section of a Gmsh mesh (plan 4.10.1) ------------- #
+
+#: Gmsh's own categorical colourings: (key, label, array on the dataset).
+#: The quality measures are `section_colour`'s ``gmsh.<name>`` choices already.
+GMSH_CATEGORIES = (
+    ('gmsh.physical', 'Gmsh: physical group', 'gmshPhysicalGroup'),
+    ('gmsh.entity', 'Gmsh: entity', 'gmshEntity'),
+    ('gmsh.partition', 'Gmsh: partition', 'gmshPartitionId'),
+    ('gmsh.element_type', 'Gmsh: element type', 'gmshElementTypeId'),
+)
+GMSH_CATEGORY_KEYS = tuple(item[0] for item in GMSH_CATEGORIES)
+
+
+def gmshChoices():
+    """`section_colour.ColourChoice`s for the four categorical Gmsh colourings."""
+    from foammesh.core.section.section_colour import ColourChoice
+
+    return tuple(ColourChoice(key, label, array, categorical=True, gmsh=True,
+                              worker=None)
+                 for key, label, array in GMSH_CATEGORIES)
+
+
+def isGmshCategory(key) -> bool:
+    return key in GMSH_CATEGORY_KEYS
+
+
+def gmshMapping(key, values, names=()) -> dict:
+    """The legend mapping of a Gmsh categorical colouring over *values*.
+
+    The same dict `section_colour.mapping` gives a categorical choice
+    (``kind``, ``array``, ``label``, ``categories``), so `lookupTable` and
+    `MapperColouring.colour` take it unchanged.  *values* are the codes on the
+    cells on screen; *names* the label of each code (-1 is "none").
+    """
+    label = {k: lab for k, lab, _a in GMSH_CATEGORIES}.get(key)
+    array = {k: arr for k, _l, arr in GMSH_CATEGORIES}.get(key)
+    if label is None:
+        return {'kind': 'none'}
+    codes = (sorted(int(code) for code in np.unique(values))
+             if values is not None and len(values) else [])
+    categories = []
+    for code in codes:
+        if code < 0:
+            name = 'None'
+        elif 0 <= code < len(names):
+            name = str(names[code])
+        else:
+            name = str(code)
+        categories.append((code, name))
+    return {'kind': 'categorical', 'array': array, 'label': label,
+            'categories': categories}

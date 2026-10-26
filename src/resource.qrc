@@ -64,6 +64,7 @@
     <file alias="planeHandle.svg">resources/graphicsIcons/planeHandle.svg</file>
     <file alias="volume.svg">resources/graphicsIcons/volume.svg</file>
     <file alias="resetOverlays.svg">resources/graphicsIcons/resetOverlays.svg</file>
+    <file alias="resetField.svg">resources/graphicsIcons/resetField.svg</file>
   </qresource>
   <qresource prefix="icons">
     <file alias="add-circle-outline.svg">resources/ionicons/add-circle-outline.svg</file>

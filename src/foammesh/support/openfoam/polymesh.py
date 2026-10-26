@@ -88,6 +88,13 @@ def removeVoidBoundaries(caseRoot: Path):
         boundaries = boundaryDict.content
 
         for b in list(boundaries.keys()):
+            # Plan 49 SR4 (DP-5763). A non-conformal coupled patch and its
+            # error patch hold no faces of their own -- the faces are made
+            # at run time from the original patches -- so an empty one is
+            # the coupling, not a void boundary. Deleting them deleted every
+            # coupling createNonConformalCouples made (SR0 probe 2).
+            if str(boundaries[b].get('type', '')).startswith('nonConformal'):
+                continue
             if boundaries[b]['nFaces'] == 0:
                 del boundaries[b]
 

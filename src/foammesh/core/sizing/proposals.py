@@ -16,7 +16,11 @@ import math
 import os
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+#: Plan 47 SZ1. Schema 2 records which engine each proposal is for; one field
+#: run proposes for both engines, and a schema 1 store is read by target.
+SCHEMA_VERSION = 2
+ENGINE_SNAPPY = 'snappy'
+ENGINE_GMSH = 'gmsh'
 SOURCE_FIELD = 'field'
 SOURCE_USER = 'user'
 SKIP_LOCKED = 'locked'
@@ -33,7 +37,14 @@ def proposals_path(case_path) -> Path:
 
 
 def _empty(value) -> bool:
+    if isinstance(value, (list, tuple)):
+        return not value
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def engine_of(target: str) -> str:
+    """The engine a target belongs to, read from its registry id."""
+    return ENGINE_GMSH if str(target).startswith('gmsh.') else ENGINE_SNAPPY
 
 
 def _number(value):
@@ -60,6 +71,17 @@ def _same(left, right) -> bool:
     return left == right
 
 
+class AnyOf(tuple):
+    """Several values an untouched control may hold (Plan 47 SZ12): its
+    schema default and the value the app's own default group gave it."""
+
+
+def _is_default(held, default) -> bool:
+    if isinstance(default, AnyOf):
+        return any(_is_default(held, item) for item in default)
+    return default is not None and _same(held, default)
+
+
 @dataclass
 class Proposal:
     target: str
@@ -70,6 +92,12 @@ class Proposal:
     locked: bool = False
     #: What the last Apply wrote into the control; ``None`` before one did.
     applied: object = None
+    #: Plan 47 SZ1. ``snappy`` or ``gmsh``; empty is read off the target.
+    engine: str = ''
+
+    def __post_init__(self):
+        if not self.engine:
+            self.engine = engine_of(self.target)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -137,6 +165,18 @@ class ProposalStore:
             if not _same(old.value, item.value):
                 changed.append(item.target)
             old.value, old.rule, old.badge = item.value, item.rule, item.badge
+            old.engine = item.engine or old.engine
+        # Plan 47 SZ12 (live, elbow). A field-owned proposal the new run no
+        # longer makes is gone: a surface first sized on its own and then
+        # bound to `walls` left its own rows behind, each naming no row.
+        # A locked or typed entry is the user's and stays.
+        fresh = {item.target if isinstance(item, Proposal) else item[0]
+                 for item in proposals}
+        for target in [t for t, e in self.entries.items()
+                       if t not in fresh and not e.locked
+                       and e.source != SOURCE_USER]:
+            del self.entries[target]
+            changed.append(target)
         return changed
 
     def lock(self, target: str, locked: bool = True) -> bool:
@@ -154,7 +194,7 @@ class ProposalStore:
 
     # -- applying ---------------------------------------------------------- #
 
-    def apply(self, current: dict, targets=None, defaults=None
+    def apply(self, current: dict, targets=None, defaults=None, engine=None
               ) -> tuple[dict, dict]:
         """``(writes, skipped)`` for the controls whose values are *current*.
 
@@ -162,18 +202,24 @@ class ProposalStore:
         empty or field-sourced ones. ``skipped`` maps target -> reason.
         A stored control always holds something, so one still holding its
         schema default (``defaults``) counts as empty: nobody typed it.
+        ``engine`` limits the apply to that engine's proposals (Plan 47 SZ1);
+        ``None`` fills both.
         """
         defaults = defaults or {}
         writes, skipped = {}, {}
         for target, entry in self.entries.items():
             if targets is not None and target not in targets:
                 continue
+            if engine and entry.engine != engine:
+                continue
             if entry.locked:
                 skipped[target] = SKIP_LOCKED
                 continue
             held = current.get(target)
-            untouched = (defaults.get(target) is not None
-                         and _same(held, defaults[target]))
+            # DP-2872. At its default, a control nobody typed into is empty;
+            # after an Apply wrote something else, the default is a choice.
+            untouched = (entry.applied is None
+                         and _is_default(held, defaults.get(target)))
             field_owned = _empty(held) or untouched or (
                 entry.source == SOURCE_FIELD and entry.applied is not None
                 and _same(held, entry.applied))

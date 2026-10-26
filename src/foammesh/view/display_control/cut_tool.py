@@ -1506,8 +1506,10 @@ class CutTool(QObject):
             # Every piece keeps its cell's id and type through the cut.
             before = info.dataSet().GetMTime()
             stampCellIdentity(info.dataSet())
-            if field is not None and not case_fields.attach(info.dataSet(),
-                                                            field):
+            attach = (case_fields.attach_gmsh
+                      if field is not None and case_fields.is_gmsh_field(
+                          field.key) else case_fields.attach)
+            if field is not None and not attach(info.dataSet(), field):
                 self._colourSkipped += 1
                 continue
             if info.dataSet().GetMTime() != before:
@@ -1564,11 +1566,24 @@ class CutTool(QObject):
                                                          key == item.key)
                 if key == item.key:
                     field = read
+        gmshField = case_fields.is_gmsh_field(item.key)
+        if native and source == section_colour.SOURCE_VOLUME:
+            # Plan 48 GM12 (DP-4357): the Gmsh categories (physical group,
+            # entity, partition, element type) are read from the mesh file.
+            for key in case_fields.GMSH_MEMBERS:
+                states[key], read = self._gmshFieldState(key, key == item.key)
+                if key == item.key:
+                    field = read
         allowed, reason = states[item.key]
         self._colouring.restore()
         mapped = {'kind': 'none'}
         caseField = case_fields.is_case_field(item.key) \
             and source == section_colour.SOURCE_VOLUME and not native
+        if gmshField and allowed and field is None \
+                and source == section_colour.SOURCE_VOLUME and native:
+            reason = self.tr('Reading {0} from the mesh file…').format(
+                item.label)
+            allowed = False
         if caseField and allowed and field is None:
             # Being read: the choice stays, the cut waits uncoloured.
             reason = self.tr('Reading {0} from the case…').format(
@@ -1577,7 +1592,8 @@ class CutTool(QObject):
         if item.key != section_colour.NONE and allowed:
             try:
                 targets = self._colourTargets(source, field)
-                if caseField and not targets:
+                if (caseField or gmshField and field is not None) \
+                        and not targets:
                     raise _NotWholeMesh()
                 values = []
                 for _prop, _mapper, data in targets:
@@ -1590,10 +1606,16 @@ class CutTool(QObject):
                     names = field.names
                 elif item.key == section_colour.CELL_ZONE and targets:
                     names = fieldString(targets[0][2], 'cellZoneNames')
-                mapped = section_colour.mapping(
-                    item.key, np.concatenate(values) if values else None,
-                    colourRange=self._colourRange, names=names,
-                    whole=self._wholeMeshValues(item, source))
+                if gmshField and field is not None:
+                    from foammesh.rendering import section_colour_map
+                    mapped = section_colour_map.gmshMapping(
+                        item.key, np.concatenate(values) if values else None,
+                        field.names)
+                else:
+                    mapped = section_colour.mapping(
+                        item.key, np.concatenate(values) if values else None,
+                        colourRange=self._colourRange, names=names,
+                        whole=self._wholeMeshValues(item, source))
                 for prop, mapper, _data in targets:
                     self._colouring.colour(mapper, mapped)
                     prop.Modified()
@@ -1746,6 +1768,67 @@ class CutTool(QObject):
 
             loop.create_task(run())
         return kept[1] if kept is not None else None
+
+    def _gmshFieldState(self, key, wanted):
+        """``((allowed, reason), field)`` for Gmsh category *key* on the mesh
+        file on screen (Plan 48 GM12, DP-4357).
+
+        The codes are made from ``element_quality.measure_file`` of the file,
+        read off the GUI thread when an event loop runs (the cut is recoloured
+        when it lands). *field* is ``None`` until it has been read.
+        """
+        from foammesh.core.gmsh import element_quality
+
+        label = section_colour.choice(key).label
+        manager = getattr(app.window, 'meshManager', None)
+        native = getattr(manager, 'nativePath', None)
+        path = native() if callable(native) else None
+        if path is None:
+            return (False, case_fields.gmsh_absent_reason(key)), None
+        try:
+            stamp = Path(path).stat().st_mtime_ns
+        except OSError as error:
+            return (False, self.tr('{0}: the mesh file cannot be read ({1}).')
+                    .format(label, error)), None
+        slot = ('gmsh', str(path), stamp)
+        arrays = self._caseFields.get(slot)
+        if arrays is None:
+            if wanted and slot not in self._caseReads:
+                self._readGmshArrays(slot, path, element_quality.measure_file)
+            return (True, ''), None
+        if isinstance(arrays, Exception):
+            return (False, str(arrays)), None
+        field = case_fields.read_gmsh_field(arrays, key, str(stamp))
+        if field.status != case_fields.READ:
+            return (False, field.reason), None
+        return (True, ''), field
+
+    def _readGmshArrays(self, slot, path, measure):
+        """Measure the mesh file once per version, off the GUI thread."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._caseFields[slot] = measure(path)
+            except Exception as error:                     # noqa: BLE001
+                self._caseFields[slot] = error
+            return
+        self._caseReads.add(slot)
+
+        async def _read():
+            try:
+                result = await asyncio.to_thread(measure, path)
+            except Exception as error:                     # noqa: BLE001
+                logger.debug('gmsh fields for the section', exc_info=True)
+                result = error
+            finally:
+                self._caseReads.discard(slot)
+            self._caseFields[slot] = result
+            if self._colouring is not None:
+                self._recolour()
+                self._view.refresh()
+
+        asyncio.ensure_future(_read())
 
     def _readCaseField(self, meshDir, key):
         """Read *key* from *meshDir*: off the GUI thread when an event

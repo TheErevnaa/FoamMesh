@@ -145,13 +145,13 @@ CONTROLS = _register(
     # says, which is what stops a small hole becoming a triangle. Only
     # Mesh.MeshSizeFromCurvature reached the 1D pass before.
     GmshControl('gmsh/globalSizing/minimumCirclePoints', RUNNER,
-                'Mesh.MinimumCirclePoints'),
+                'Mesh.MinCircleNodes'),
     GmshControl('gmsh/globalSizing/minimumCurvePoints', RUNNER,
-                'Mesh.MinimumCurvePoints'),
-    GmshControl('gmsh/globalSizing/minimumElementsPerTwoPi', RUNNER,
-                'Mesh.MinimumElementsPerTwoPi',
-                note='read through the curvature pass, so it does nothing '
-                     'with fromCurvature at zero; the derivation warns'),
+                'Mesh.MinCurveNodes'),
+    # Plan 48 DP-3035. Mesh.MinimumElementsPerTwoPi is the older name of
+    # Mesh.MeshSizeFromCurvature, so there is one control for it
+    # (gmsh/globalSizing/fromCurvature); a stored project holding the old
+    # key is migrated into it on load (migrateDocument).
     # Mesh.MeshSizeFromParametricPoints is deliberately absent. Plan 31
     # FC-B built it, then measured it on seven geometries and could not make
     # it move a mesh: +0.2, -0.6, -0.2, 0.0, +0.5, 0.0 and +2.1 per cent, a
@@ -246,8 +246,8 @@ CONTROLS = _register(
     # clamped to 0 in silence.
     GmshControl('gmsh/algorithms/recombinationAlgorithm', RUNNER,
                 'Mesh.RecombinationAlgorithm',
-                note='only read when recombination is on; values outside the '
-                     'qualified four are refused with the reason'),
+                note='only read when recombination is on; the whole Gmsh '
+                     'range 0-4 (Plan 48 D4), anything else refused'),
     # Plan 31 FC-B. One control, two options. Gmsh defaults both on, so what
     # this buys is not the retry -- that was always happening -- but the
     # ability to turn it off, and `measure_algorithms` in the runner, which
@@ -255,9 +255,13 @@ CONTROLS = _register(
     # log and records it. The option cannot be read back for this: it still
     # holds the algorithm that failed.
     GmshControl('gmsh/algorithms/algorithmFallback', RUNNER,
-                'Mesh.AlgorithmSwitchOnFailure+Mesh.MaxRetries',
+                'Mesh.AlgorithmSwitchOnFailure',
                 note='on by default in Gmsh itself; the run manifest names '
                      'the algorithm that actually meshed each surface'),
+    # Plan 48 D4 (DP-2952). Its own number; it was 10 or 0 from the box
+    # above. A project saved before keeps what the box gave it.
+    GmshControl('gmsh/algorithms/maxRetries', RUNNER, 'Mesh.MaxRetries',
+                note='Gmsh default 10, floor 0'),
     # Plan 31 FC-C. Not an option: it is a call that rewrites the surface mesh
     # between the 2D and the 3D pass, which is the only place it works --
     # after the 3D pass the pyramids recombination made are already there and
@@ -334,7 +338,31 @@ CONTROLS = _register(
                      'volume limit takes what the chosen volume algorithm '
                      'can actually use. Mesh.MaxNumThreads1D exists in this '
                      'build and is deliberately not set — see the '
-                     'curve-stage row of the capability ledger'),
+                     'curve-stage row of the capability ledger. A stage with '
+                     'its own count (the three rows below) takes that '
+                     'instead'),
+
+    # Plan 48 D4 (DP-2952). One count per stage; 0 is automatic (Threads).
+    GmshControl('gmsh/parallel/curveThreads', RUNNER, 'Mesh.MaxNumThreads1D',
+                note="0: automatic, left at Gmsh's own 0 (= General."
+                     "NumThreads); ledger row gmsh/parallel/threads.1d"),
+    GmshControl('gmsh/parallel/surfaceThreads', RUNNER,
+                'Mesh.MaxNumThreads2D',
+                note='0: automatic, the Threads count; ledger row '
+                     'gmsh/parallel/threads.2d'),
+    GmshControl('gmsh/parallel/volumeThreads', RUNNER, 'Mesh.MaxNumThreads3D',
+                note='0: automatic, the Threads count; a single-threaded '
+                     'volume algorithm still gets 1; ledger row '
+                     'gmsh/parallel/threads.3d'),
+
+    GmshControl('gmsh/parallel/reproducible', RUNNER,
+                'General.NumThreads+Mesh.MaxNumThreads1D'
+                '+Mesh.MaxNumThreads2D+Mesh.MaxNumThreads3D',
+                note='ticked: one thread in every stage, in the batch runner '
+                     'and in the session (the ledger rows are '
+                     'gmsh/parallel/threads, .1d, .2d, .3d); Gmsh 4.15.2 '
+                     'with several threads can mesh one model into a '
+                     'different element count each run'),
 
     # -- healing --------------------------------------------------------- #
     GmshControl('gmsh/healing/importTolerance', RUNNER, 'Geometry.Tolerance'),
@@ -382,7 +410,7 @@ CONTROLS = _register(
     GmshControl('gmsh/healing/autoFix', RUNNER, 'Geometry.OCCAutoFix',
                 note='probed default 1; off is how a repaired import is '
                      'compared against the raw CAD'),
-    GmshControl('gmsh/healing/unionUnify', RUNNER, 'Geometry.OCCUnionUnify',
+    GmshControl('gmsh/healing/unionUnify', RUNNER, 'Geometry.OCCBooleanSimplify',
                 note='probed default 1; off keeps the fragments a boolean '
                      'left behind'),
     GmshControl('gmsh/healing/booleanTolerance', RUNNER,

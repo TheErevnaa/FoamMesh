@@ -14,7 +14,8 @@ from foammesh.app import app
 from foammesh.core.geometry.boundary_roles import (
     LAYER_ROLES, defaulted_targets_sentence)
 from foammesh.core.gmsh.layer_targets import (
-    MODE_ALL_WALLS, boundary_category, eligible_wall_names, normalise_mode)
+    MODE_ALL_WALLS, MODE_SELECTED, boundary_category, eligible_wall_names,
+    normalise_mode)
 from foammesh.core.gmsh.execution import nothing_chosen_layer_refusal
 from foammesh.view.theming.metrics import MARGIN_TIGHT, apply_form_metrics
 from foammesh.view.theming.status_colors import apply_color_swatch
@@ -425,6 +426,12 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         selection something a user can make. The category is the one snappy
         publication reads, so both engines agree on which patch is a wall.
         """
+        # DP-5717. A geometry build replaced the prepared surfaces: the
+        # boundaries a layer can stand on are the built model's, named as the
+        # run names them, with front/back of a 2D case as `empty`.
+        built = self.builtPatches()
+        if built:
+            return built
         # DP-92. Through the canonical map, because the second half of an
         # interface written twice is merged away before the mesher sees it:
         # offering it here is offering a patch layers cannot grow on.
@@ -440,6 +447,37 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             seen.add(name)
             patches.append((name, str(group.get('category') or 'wall').lower()))
         return patches
+
+    def builtPatches(self) -> list:
+        """DP-5717. ``(patch name, category)`` of the model the geometry
+        build made, when it replaced the prepared surfaces; else ``[]``."""
+        try:
+            case_path = self._client.case_path
+        except Exception:                        # noqa: BLE001
+            return []
+        if not case_path:
+            return []
+        try:
+            from foammesh.core.gmsh import geometry_build
+
+            built = geometry_build.built_model(case_path)
+        except Exception:                        # noqa: BLE001 - advisory
+            return []
+        return [(str(row['name']), str(row.get('category') or 'wall'))
+                for row in built.get('patches') or ()]
+
+    def oneCellBuild(self) -> list:
+        """DP-5717. The front/back patches of a built 2D-case or wedge model
+        (declared ``empty``/``wedge``), or ``[]``."""
+        return [name for name, category in self.builtPatches()
+                if category in ('empty', 'wedge')]
+
+    def preparedRegions(self) -> list:
+        """The prepared regions, or none on a model a geometry build
+        replaced: their patch lists name surfaces that are gone."""
+        if self.builtPatches():
+            return []
+        return super().preparedRegions()
 
     def preparedIdentity(self) -> dict:
         """Patch name -> what the viewport and the selection know it by.
@@ -574,6 +612,14 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             'reads them off the geometry it imports. Choose Selected to tick '
             'or untick surfaces yourself.'))
 
+    def writeField(self, field_id, value) -> None:
+        """Put a value the page proposes into one of its own editors."""
+        editor = self._editors.get(field_id)
+        if editor is None or editor.value() == value:
+            return
+        editor.set_value(value)
+        self._on_field_changed(field_id, value)
+
     def writeSelection(self, names) -> None:
         """Put a selection into the field the runner actually reads."""
         editor = self._editors.get(self.PATCH_FIELD)
@@ -621,7 +667,35 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         else:
             withdrawn = False
         proposed = []
-        if mode == MODE_ALL_WALLS:
+        if (mode == MODE_ALL_WALLS and len(regions) > 1
+                and not self.patchesWereSet()
+                and self.assemblyLayerRefusal(
+                    enabled=True, patches=list(self.eligibleWalls()),
+                    patch_mode=mode)):
+            # DP-2875. A new case grows layers on every eligible wall (Plan 40
+            # UXA1), and on an assembly those walls bound more than one
+            # volume, which the run refuses. MEASURED on `gmsh jacketed_pipe`
+            # with every default: Generate refused "boundary layers are not
+            # supported on a 2-volume assembly ...". Nobody chose that mode,
+            # so the page answers as it does for a selection nobody made
+            # (DP-88): the walls of one volume, ticked, and layers off when
+            # no such set meshes.
+            mode = MODE_SELECTED
+            self.writeField(self.PATCH_MODE_FIELD, MODE_SELECTED)
+            proposed = self.proposedSelection(patches, regions)
+            if proposed and self.assemblyLayerRefusal(
+                    enabled=True, patches=proposed, patch_mode=MODE_SELECTED):
+                # A patch bounding both volumes is still one volume's wall to
+                # the ranking; the run's own pre-flight is the judge.
+                proposed = []
+            if proposed:
+                self.writeSelection(proposed)
+                self.rememberProposal(proposed, known)
+            else:
+                self.writeField(self.SWITCH_FIELD, False)
+            self.storeProposal()
+            selected = self.selectedPatches()
+        elif mode == MODE_ALL_WALLS:
             # The choice is the answer, so the names are only a record of it.
             # Keeping them in step means a saved case still reads as the set
             # it would grow on, and a reader can see which surfaces those are.
@@ -729,13 +803,15 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         # A name in the field that no prepared patch answers to still has to
         # show, or the boxes would quietly contradict the field -- and the
         # runner warns about exactly that name when the run reaches it.
+        replaced = set(self.buildReplacedNames()) if any(
+            name not in self._patchChecks for name in selected) else set()
         for name in selected:
             if name not in self._patchChecks:
-                self.addPatchCheck(
-                    name,
-                    str(self.tr('%s — not in the prepared geometry'))
-                    % name,
-                    True, '', locked)
+                # DP-5717. A wall the geometry build took away says so.
+                text = (self.tr('%s — replaced by the geometry build')
+                        if name in replaced
+                        else self.tr('%s — not in the prepared geometry'))
+                self.addPatchCheck(name, str(text) % name, True, '', locked)
         self._patchLocked = locked
         self._syncPatchTable()
 
@@ -876,6 +952,22 @@ class GmshBoundaryLayersPage(GmshTaskPage):
 
     def updatePatchNote(self, patches, selected, proposed) -> None:
         """Say what a run would do now, in patch names."""
+        thin = self.oneCellBuild()
+        if thin:
+            # DP-5718. A one-cell-thick built case grows its layer in its own
+            # plane (`stages.layers.grow_in_plane_layers`), off the edges the
+            # ticked walls share with the front and back; the page says how,
+            # since the front and back are not walls to tick.
+            text = str(self.tr(
+                'The geometry build made a mesh one cell thick (%s). The '
+                'layer grows in that plane, off the edges each ticked wall '
+                'shares with those faces, and the one cell carries it '
+                'through. Tick walls only: %s are not walls.')) % (
+                    ', '.join(thin), ' and '.join(thin))
+            self._patchNote.setText(text)
+            self._patchNote.setSummary(text.split('. ')[0])
+            self._patchNote.setVisible(True)
+            return
         if not patches and not selected:
             self._patchNote.setText(self.tr(
                 'No prepared geometry yet, so there are no patch names to '
@@ -921,6 +1013,15 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             text += ' ' + str(self.tr(
                 '%s stay flat; the runner rebuilds them from the inner edge '
                 'of the layers, so the mesh still closes.')) % ', '.join(flat)
+        # DP-5716. A geometry build that took the ticked walls away: the run
+        # drops them, and the page says so in the same words.
+        replaced = self.buildReplacedNames()
+        if replaced:
+            from foammesh.core.gmsh.geometry_build import replaced_layer_note
+
+            note = replaced_layer_note(selected, replaced)
+            if note:
+                text += ' ' + note
         if proposed:
             # Plan 32 W4: say which targets were defaulted, in the words the
             # snappy layers page uses for the same event. The sentence this
@@ -931,6 +1032,26 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         self._patchNote.setText(text)
         self._patchNote.setSummary(text.split('. ')[0])
         self._patchNote.setVisible(True)
+
+    def buildReplacedNames(self) -> list:
+        """The prepared patch names the project's geometry build took off
+        the model (DP-5716), as the session followed it; empty without a
+        build."""
+        try:
+            case_path = self._client.case_path
+        except Exception:                        # noqa: BLE001
+            return []
+        if not case_path:
+            return []
+        try:
+            from foammesh.core.gmsh import geometry_build
+            from foammesh.core.gmsh.execution import geometry_build_steps
+
+            if not geometry_build_steps(case_path):
+                return []
+            return geometry_build.load_replaced(case_path)
+        except Exception:                        # noqa: BLE001 - advisory
+            return []
 
     def categoriesRead(self, patches) -> str:
         """The categories the prepared surfaces announce, in first order.

@@ -92,6 +92,17 @@ CHOICES = (
     *(ColourChoice(GMSH_PREFIX + name, f'Gmsh: {label}', name, gmsh=True,
                    worker=GMSH_PREFIX + name)
       for name, label in GMSH_QUALITY_FIELDS),
+    # Plan 48 GM12 (DP-4357). Gmsh's own categories; offered only where a Gmsh
+    # mesh carries them (`availability`, `section_case_fields.is_gmsh_field`).
+    # `rendering.section_colour_map.gmshChoices()` builds the same four.
+    ColourChoice('gmsh.physical', 'Gmsh: physical group', 'gmshPhysicalGroup',
+                 categorical=True, gmsh=True),
+    ColourChoice('gmsh.entity', 'Gmsh: entity', 'gmshEntity',
+                 categorical=True, gmsh=True),
+    ColourChoice('gmsh.partition', 'Gmsh: partition', 'gmshPartitionId',
+                 categorical=True, gmsh=True),
+    ColourChoice('gmsh.element_type', 'Gmsh: element type',
+                 'gmshElementTypeId', categorical=True, gmsh=True),
     ColourChoice(CELL_TYPE, 'Cell type', 'cellType', categorical=True,
                  worker=CELL_TYPE),
     ColourChoice(CELL_LEVEL, 'Refinement level', 'cellLevel',

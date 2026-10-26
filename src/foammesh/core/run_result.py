@@ -225,6 +225,45 @@ def failure_cause(text: str) -> tuple[str, str]:
             '\n'.join(meaningful[-_DETAIL_LINES:]))
 
 
+_PROGRESS_FAILED = re.compile(r'^FOAMMESH_PROGRESS (\{.*"kind":"failed".*\})\s*$')
+
+
+def progress_failure_message(text: str) -> str:
+    """The message of the last ``failed`` progress record in *text*, or ``''``.
+
+    DP-6074. A Gmsh runner that refuses a job says why in a ``kind: failed``
+    progress record (and ``result.json``); the job reported only
+    ``process exited with code 1``, so the one sentence that says what to
+    change reached the run's log and nothing else.
+    """
+    import json
+    message = ''
+    for line in str(text or '').splitlines():
+        found = _PROGRESS_FAILED.match(line.strip())
+        if found is None:
+            continue
+        try:
+            message = str(json.loads(found.group(1)).get('message') or '')
+        except ValueError:
+            continue
+    return message.strip()
+
+
+def read_progress_failure(log) -> str:
+    """:func:`progress_failure_message` of the log at *log*; ``''`` if unreadable."""
+    if not log:
+        return ''
+    try:
+        with Path(log).open('rb') as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - _CAUSE_TAIL_BYTES))
+            raw = stream.read()
+    except (OSError, ValueError):
+        return ''
+    return progress_failure_message(raw.decode('utf-8', errors='replace'))
+
+
 def read_failure_cause(log) -> tuple[str, str]:
     """:func:`failure_cause` of the log at *log*; ``('', '')`` if unreadable."""
     if not log:

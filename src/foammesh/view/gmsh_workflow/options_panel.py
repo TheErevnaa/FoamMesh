@@ -27,14 +27,14 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.core import display_unit
+from foammesh.core.facade.plan48.pa4_routes import replacement_set
 from foammesh.core.gmsh import option_catalogue as catalogue
 from foammesh.view.workflow_controls.length_box import (
     LengthItemDelegate, mark_length_item,
 )
 
-#: Rows drawn at once.  719 rows are cheap to hold and slow to lay out; the
-#: label says how many matched so a search is never silently truncated.
-ROW_LIMIT = 250
+#: Plan 48 GM2. There is no row cut-off: every option of the build is a row,
+#: and the label says how many matched the search and the group.
 _REMOVE = object()
 
 
@@ -222,9 +222,11 @@ class GmshOptionsPanel(QWidget):
         options = self._scope()
         if self._changed.isChecked():
             options = [o for o in options if o.name in mapping]
-        shown = options[:ROW_LIMIT]
+        shown = options
         self._filling = True
+        self._table.setUpdatesEnabled(False)
         try:
+            self._table.clearContents()
             self._table.setRowCount(len(shown))
             for index, option in enumerate(shown):
                 name_item = QTableWidgetItem(option.name)
@@ -264,14 +266,56 @@ class GmshOptionsPanel(QWidget):
                 page_item.setToolTip(note)
                 self._table.setItem(index, 3, page_item)
                 self._table.setItem(index, 4, unit_item)
+                if not option.read_only and option.kind in ('bool', 'enum'):
+                    self._table.setCellWidget(
+                        index, 1, self._combo_for(option, value))
         finally:
+            self._table.setUpdatesEnabled(True)
             self._filling = False
-        total = len(options)
-        more = '' if total <= ROW_LIMIT else (
-            f' (first {ROW_LIMIT}; narrow the search)')
         self._summary.setText(
-            f'{len(shown)} of {total} options shown{more}. '
+            f'{len(shown)} options shown. '
             f'{len(mapping)} set from this list.')
+
+    @staticmethod
+    def _choices_of(option):
+        if option.kind == 'bool':
+            return ((0, 'off'), (1, 'on'))
+        return tuple(option.choices)
+
+    def _combo_for(self, option, value):
+        """Plan 48 GM2. A bool or an enum is picked from its native range."""
+        combo = QComboBox(self._table)
+        combo.setObjectName('gmshOptionCombo')
+        combo.setAccessibleName(option.name)
+        combo.setProperty('optionName', option.name)
+        choices = self._choices_of(option)
+        try:
+            current = int(float(value))
+        except (TypeError, ValueError):
+            current = None
+        for key, label in choices:
+            combo.addItem(f'{key}: {label}', key)
+        index = combo.findData(current)
+        if index < 0 and current is not None:
+            combo.addItem(f'{current}', current)
+            index = combo.count() - 1
+        combo.setCurrentIndex(max(index, 0))
+        combo.setToolTip(self._describe(option))
+        combo.activated.connect(
+            lambda _i, combo=combo, name=option.name:
+            self._combo_picked(name, combo.currentData()))
+        return combo
+
+    def _combo_picked(self, name, key) -> None:
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item and item.text() == name:
+                self._filling = True
+                try:
+                    self._table.item(row, 1).setText(_text(key))
+                finally:
+                    self._filling = False
+        self.set_option(name, key, _from_table=True)
 
     @staticmethod
     def _describe(option) -> str:
@@ -279,6 +323,14 @@ class GmshOptionsPanel(QWidget):
         if option.kind == 'enum':
             text += ' | allowed: ' + ', '.join(
                 f'{key}: {label}' for key, label in option.choices)
+        elif option.kind == 'bitmask' and option.bits:
+            text += ' | bits: ' + ', '.join(
+                f'{2 ** bit} = {label}' if option.name.endswith('Clip')
+                else f'digit {bit} = {label}' for bit, label in option.bits)
+        elif option.minimum is not None or option.maximum is not None:
+            low = '' if option.minimum is None else f'{option.minimum:g}'
+            high = '' if option.maximum is None else f'{option.maximum:g}'
+            text += f' | range: {low} to {high}'
         if option.read_only:
             text += ' | read-only'
         note = catalogue.precedence_note(option.name)
@@ -386,16 +438,12 @@ class GmshOptionsPanel(QWidget):
             self._show_error(str(error))
             return False
         self._show_error('')
+        wanted = replacement_set(mapping)
         for name in list(self.effective()):
-            if name not in mapping:
+            if name not in wanted:
                 self._stage(name, _REMOVE)
-        for name, value in mapping.items():
-            option = catalogue.get(name)
-            parsed = catalogue.parse_value(name, value)
-            parsed = list(parsed) if isinstance(parsed, tuple) else parsed
-            self._stage(name, _REMOVE
-                        if catalogue.same_value(option, parsed, option.default)
-                        else parsed)
+        for name, value in wanted.items():
+            self._stage(name, value)
         self._fill()
         return True
 

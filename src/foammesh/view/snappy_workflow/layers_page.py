@@ -26,7 +26,8 @@ from foammesh.core import display_unit
 from foammesh.view.facade_client import query, submit
 from foammesh.view.widgets.folded_note import FoldedNote, FoldedNotes
 from foammesh.view.workflow_controls.child_controls import ChildControlPanel
-from foammesh.view.workflow_controls.y_plus_helper import YPlusButton, fill_editor
+from foammesh.view.workflow_controls.y_plus_helper import (
+    YPlusButton, fill_editor, prompts as y_plus_prompts)
 
 from .base import SnappyTaskPage
 from .mesher_limits import MesherLimitsGroup, fold_limits
@@ -160,30 +161,66 @@ class LayerGroupPanel(ChildControlPanel):
         if editor is not None:
             editor.valueChanged.connect(self.membership.syncSelector)
 
-    def _fillFirstLayer(self, metres: float) -> bool:
-        """Write the estimated height into the group editor's own box.
+    def _relativeSizesNote(self, metres: float) -> str:
+        """Why the estimate cannot be entered, or ``''`` when it can.
 
         ``relativeSizes`` makes the box a fraction of the local cell size
         rather than a length, and an absolute height in it would be read as a
         multiple of the cell, so a relative group is told so instead.
         """
-        editor = self.editor('first_layer_thickness')
         relative = self.editor('relative_sizes')
+        if relative is None or not relative.value():
+            return ''
+        return self.tr(
+            'First-layer height: {0}\n'
+            'The layer sizes are '
+            'relative to the local cell size, so this length '
+            'was not entered. Turn off the relative sizes '
+            'setting to enter lengths.').format(
+                display_unit.format_length(metres))
+
+    def _fillFirstLayer(self, metres: float) -> bool:
+        """Write the estimated height into the group editor's own box."""
+        editor = self.editor('first_layer_thickness')
         if editor is None:
             return False
-        if relative is not None and relative.value():
+        note = self._relativeSizesNote(metres)
+        if note:
             from widgets import async_message_box as messages
             messages.information(
-                self, self.tr('Estimated first-layer height'),
-                self.tr('First-layer height: {0}\n'
-                        'The layer sizes are '
-                        'relative to the local cell size, so this length '
-                        'was not entered. Turn off the relative sizes '
-                        'setting to enter lengths.').format(
-                    display_unit.format_length(metres)))
+                self, self.tr('Estimated first-layer height'), note)
             return False
         fill_editor(editor, metres)
         return True
+
+    def estimateFirstLayer(self, target_yplus: float, velocity: float,
+                           density: float, viscosity: float, length: float,
+                           apply: bool = False) -> dict:
+        """The y+ helper without its five dialogs (Plan 48 PA5).
+
+        The same maths the button uses (``first_layer_height``); with
+        ``apply`` the height goes where the button puts it -- into the group
+        editor's own first-layer box -- or the relative-sizes sentence says
+        why it did not, without the message box.
+        """
+        from foammesh.core.mesh.sizing import first_layer_height
+        values = (target_yplus, velocity, density, viscosity, length)
+        for (label, _default), value in zip(y_plus_prompts(), values):
+            if not 1e-12 <= float(value) <= 1e12:
+                raise ValueError(
+                    f'{label} must be between 1e-12 and 1e12')
+        metres = first_layer_height(*[float(v) for v in values])
+        result = {'height_m': metres,
+                  'text': display_unit.format_length(metres),
+                  'applied': False, 'refusal': ''}
+        if apply:
+            editor = self.editor('first_layer_thickness')
+            result['refusal'] = self._relativeSizesNote(metres)
+            if editor is not None and not result['refusal']:
+                fill_editor(editor, metres)
+                result['applied'] = True
+            self.yplus_button.last_height = metres
+        return result
 
     def _selectorValue(self):
         editor = self.editor('patch_selector')

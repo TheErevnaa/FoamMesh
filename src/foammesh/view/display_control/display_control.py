@@ -144,6 +144,10 @@ class DisplayControl(QObject):
         self._ui = ui
         self._list = ui.actors
         self._view: RenderingWidget = ui.renderingView
+        # Plan 48 OP. Translucent Gmsh surfaces (no part of this list) and a
+        # change of the route's Surface opacity reopen the question of peeling.
+        from foammesh.rendering import actor_info
+        actor_info.addTranslucencyHook(self._updateTransparency)
 
         self._cutTool = CutTool(ui)
         self._meshQualityInfo = MeshQualityInfo(ui)
@@ -879,8 +883,17 @@ class DisplayControl(QObject):
         lying about what it showed. Peeling and multisampling are mutually
         exclusive on this backend, so the trade is made only when it is needed.
         """
-        translucent = any(
-            (item.actorInfo().properties().opacity or 1.0) < 1.0
+        from foammesh.rendering import actor_info
+
+        # Plan 48 OP. What is drawn, not what the part asked for: the route's
+        # Surface opacity multiplies in, and the Gmsh model's surfaces count.
+        def drawnOpacity(info):
+            drawn = getattr(info, 'effectiveOpacity', None)
+            return (drawn() if callable(drawn)
+                    else (info.properties().opacity or 1.0))
+
+        translucent = actor_info.externalTranslucent() or any(
+            drawnOpacity(item.actorInfo()) < 1.0
             and item.actorInfo().isVisible()
             for item in self._items.values())
         setter = getattr(self._view, 'setOrderIndependentTransparency', None)

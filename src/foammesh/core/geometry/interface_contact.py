@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Mapping
 
 __all__ = ('FaceContact', 'contacting_face_pairs', 'face_contact',
-           'group_manifest_of')
+           'face_triangles', 'group_manifest_of')
 
 
 @dataclass(frozen=True)
@@ -175,8 +175,11 @@ def _solid_name(group: Mapping) -> str:
     return str(group.get('display_name') or '')
 
 
-def _read_solids(path: Path, wanted: set) -> dict:
-    """Triangles of the named solids of an ASCII STL, as ``[(3,3) list]``."""
+def _read_solids(path: Path, wanted: set | None) -> dict:
+    """Triangles of the named solids of an ASCII STL, as ``[(3,3) list]``.
+
+    ``wanted`` of ``None`` reads every solid.
+    """
     solids: dict[str, list] = {}
     current, vertices = None, []
     try:
@@ -191,7 +194,8 @@ def _read_solids(path: Path, wanted: set) -> dict:
             keyword = words[0].lower()
             if keyword == 'solid':
                 name = ' '.join(words[1:])
-                current = name if name in wanted else None
+                current = (name if wanted is None or name in wanted
+                           else None)
                 if current is not None:
                     solids.setdefault(current, [])
             elif keyword == 'endsolid':
@@ -206,37 +210,174 @@ def _read_solids(path: Path, wanted: set) -> dict:
     return solids
 
 
-def _distances(points, triangles):
-    """The distance from each point to the nearest of *triangles*."""
+def _is_ascii(path: Path) -> bool:
+    """The test ``stl_importer._is_ascii_stl`` makes, without importing VTK."""
+    try:
+        with path.open('rb') as stream:
+            head = stream.read(1024)
+    except OSError:
+        return False
+    if not head.lstrip().lower().startswith(b'solid'):
+        return False
+    try:
+        text = head.decode('ascii').lower()
+    except UnicodeDecodeError:
+        return False
+    return 'facet' in text or 'endsolid' in text
+
+
+def _read_binary(path: Path):
+    """Every triangle of a binary STL, as an ``(n, 3, 3)`` float array."""
     import numpy as np
 
-    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
-    normal = np.cross(b - a, c - a)
-    squared = (normal * normal).sum(1)
-    valid = squared > 0
-    unit = np.where(valid[:, None], normal
-                    / np.sqrt(np.where(valid, squared, 1.0))[:, None], 0.0)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 84:
+        return None
+    count = int.from_bytes(data[80:84], 'little')
+    record = np.dtype([('normal', '<f4', (3,)), ('vertices', '<f4', (3, 3)),
+                       ('attribute', '<u2')])
+    count = min(count, (len(data) - 84) // record.itemsize)
+    if count <= 0:
+        return None
+    return np.frombuffer(data, dtype=record, count=count,
+                         offset=84)['vertices'].astype(float)
 
-    def segment(p, start, end):
+
+def face_triangles(prepared: Mapping, patch_uuid: str):
+    """``(triangles, reason)`` of one prepared face, read from its own file.
+
+    Plan 49 SR3 (DP-5785). Each face is read from the prepared surface of the
+    geometry file it came from, so two faces of two files are measured like
+    two faces of one. ``triangles`` is an ``(n, 3, 3)`` array, or ``None``
+    with the reason nothing could be read. A face that is the only one its
+    file holds is the whole file, whatever its solid is called or however it
+    is stored (ASCII or binary).
+    """
+    import numpy as np
+
+    groups = _groups(group_manifest_of(prepared))
+    group = groups.get(str(patch_uuid))
+    if group is None:
+        return None, 'a face is not in the prepared geometry'
+    geometry_id = str(group.get('geometry_id') or '')
+    path = _surface_path(prepared, geometry_id)
+    if path is None:
+        return None, 'the prepared tessellation could not be read'
+    alone = sum(1 for item in groups.values()
+                if str(item.get('geometry_id') or '') == geometry_id) == 1
+    if _is_ascii(path):
+        name = _solid_name(group)
+        triangles = _read_solids(path, {name}).get(name)
+        if not triangles and alone:
+            triangles = [tri for solid in _read_solids(path, None).values()
+                         for tri in solid]
+        if not triangles:
+            return None, ('a face has no triangles of its own in the '
+                          'prepared tessellation')
+        return np.asarray(triangles, dtype=float), ''
+    if not alone:
+        return None, ('a binary surface file holds several faces and does '
+                      'not say which triangles are whose')
+    triangles = _read_binary(path)
+    if triangles is None or not len(triangles):
+        return None, 'the prepared tessellation could not be read'
+    return triangles, ''
+
+
+def _distances(points, triangles):
+    """The distance from each point to the nearest of *triangles*.
+
+    Plan 49 SR3. Exact either way. Small inputs are compared all against
+    all; larger ones only against the triangles that can be nearest: the
+    nearest triangle's centroid lies within ``d0 + R`` of the point, where
+    ``d0`` is the distance to the nearest centroid and ``R`` the largest
+    centroid-to-vertex distance (measured: 4,000 points against 51,200
+    triangles took 121 s all against all).
+    """
+    import numpy as np
+
+    points = np.asarray(points, dtype=float)
+    triangles = np.asarray(triangles, dtype=float)
+    if len(points) == 0:
+        return np.zeros(0)
+    if len(triangles) == 0:
+        return np.full(len(points), np.inf)
+    if len(points) * len(triangles) <= _ALL_AGAINST_ALL:
+        return _all_against_all(points, triangles)
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:                                  # pragma: no cover
+        return _all_against_all(points, triangles)
+    centroids = triangles.mean(axis=1)
+    reach = float(np.linalg.norm(triangles - centroids[:, None, :],
+                                 axis=-1).max())
+    tree = cKDTree(centroids)
+    nearest, _index = tree.query(points)
+    candidates = tree.query_ball_point(points, nearest + reach * (1 + 1e-9)
+                                       + 1e-12)
+    counts = np.fromiter((len(item) for item in candidates), dtype=np.int64,
+                         count=len(points))
+    owner = np.repeat(np.arange(len(points)), counts)
+    which = np.fromiter((index for item in candidates for index in item),
+                        dtype=np.int64, count=int(counts.sum()))
+    best = np.full(len(points), np.inf)
+    step = _ALL_AGAINST_ALL
+    for begin in range(0, len(owner), step):
+        rows = owner[begin:begin + step]
+        chosen = triangles[which[begin:begin + step]]
+        np.minimum.at(best, rows, _point_triangle(
+            points[rows], chosen[:, 0], chosen[:, 1], chosen[:, 2]))
+    return best
+
+
+#: Point-triangle pairs compared in one numpy pass.
+_ALL_AGAINST_ALL = 2_000_000
+
+
+def _point_triangle(p, a, b, c):
+    """Distance from each point ``p`` to the triangle ``a b c`` beside it.
+
+    The arrays broadcast against each other: one point against many
+    triangles, or point ``i`` against triangle ``i``.
+    """
+    import numpy as np
+
+    normal = np.cross(b - a, c - a)
+    squared = (normal * normal).sum(-1)
+    valid = squared > 0
+    unit = np.where(valid[..., None], normal
+                    / np.sqrt(np.where(valid, squared, 1.0))[..., None], 0.0)
+
+    def segment(start, end):
         edge = end - start
         length = (edge * edge).sum(-1)
         t = np.clip(((p - start) * edge).sum(-1)
                     / np.where(length > 0, length, 1.0), 0.0, 1.0)
         return np.linalg.norm(p - (start + t[..., None] * edge), axis=-1)
 
+    height = ((p - a) * unit).sum(-1)
+    foot = p - height[..., None] * unit
+    inside = valid & np.all([
+        (np.cross(y - x, foot - x) * unit).sum(-1) >= 0
+        for x, y in ((a, b), (b, c), (c, a))], axis=0)
+    plane = np.where(inside, np.abs(height), np.inf)
+    edges = np.minimum(np.minimum(segment(a, b), segment(b, c)),
+                       segment(c, a))
+    return np.minimum(plane, edges)
+
+
+def _all_against_all(points, triangles):
+    import numpy as np
+
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
     best = np.full(len(points), np.inf)
-    step = max(1, 2_000_000 // max(len(triangles), 1))
+    step = max(1, _ALL_AGAINST_ALL // max(len(triangles), 1))
     for begin in range(0, len(points), step):
         p = points[begin:begin + step, None, :]
-        height = ((p - a) * unit).sum(-1)
-        foot = p - height[..., None] * unit
-        inside = valid & np.all([
-            (np.cross(y - x, foot - x) * unit).sum(-1) >= 0
-            for x, y in ((a, b), (b, c), (c, a))], axis=0)
-        plane = np.where(inside, np.abs(height), np.inf)
-        edges = np.minimum(np.minimum(segment(p, a, b), segment(p, b, c)),
-                           segment(p, c, a))
-        best[begin:begin + step] = np.minimum(plane, edges).min(1)
+        best[begin:begin + step] = _point_triangle(p, a, b, c).min(1)
     return best
 
 
@@ -260,22 +401,15 @@ def face_contact(prepared: Mapping, master: str, slave: str,
     marked = _marked_contact(first, second)
     if marked:
         return FaceContact(True, marked)
-    names = {_solid_name(first), _solid_name(second)}
-    geometry_id = str(first.get('geometry_id') or '')
-    if str(second.get('geometry_id') or '') != geometry_id:
-        return FaceContact(None, 'the faces come from different geometry files')
-    path = _surface_path(prepared, geometry_id)
-    if path is None:
-        return FaceContact(None, 'the prepared tessellation could not be read')
-    solids = _read_solids(path, names)
-    triangles = [solids.get(_solid_name(group)) for group in (first, second)]
-    if not all(triangles):
-        return FaceContact(None, 'a face has no triangles of its own in the '
-                                 'prepared tessellation')
+    # Plan 49 SR3 (DP-5785). Each face is read from its own file: a pair
+    # across two files used to come back "not evidence either way" unmeasured.
+    first_tri, reason = face_triangles(prepared, master)
+    if first_tri is None:
+        return FaceContact(None, reason)
+    second_tri, reason = face_triangles(prepared, slave)
+    if second_tri is None:
+        return FaceContact(None, reason)
     import numpy as np
-
-    first_tri, second_tri = (np.asarray(item, dtype=float)
-                             for item in triangles)
 
     def area(tri):
         return 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0],
@@ -294,7 +428,8 @@ def face_contact(prepared: Mapping, master: str, slave: str,
         0.5 * (small + np.roll(small, 1, axis=1)).reshape(-1, 3)]), axis=0)
     gap = float(_distances(points, large).max())
     allowed = max(abs(float(tolerance or 0.0)),
-                  _deflection(prepared, geometry_id))
+                  _deflection(prepared, str(first.get('geometry_id') or '')),
+                  _deflection(prepared, str(second.get('geometry_id') or '')))
     if gap <= allowed:
         return FaceContact(True, f'the faces lie within {gap:.3g} m of each '
                                  'other')

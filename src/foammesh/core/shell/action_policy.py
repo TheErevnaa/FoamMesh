@@ -106,6 +106,13 @@ ACTION_OBJECT_NAMES: Mapping[ActionId, str] = {
 }
 
 
+#: Why Save is off while a mesh operation writes the case (DP-1264, DP-5711).
+SAVE_WHILE_RUNNING = (
+    'Save is unavailable while the active mesh operation runs. Each finished '
+    'stage is kept automatically, and a stopped run can be resumed from the '
+    'last one.')
+
+
 @dataclass(frozen=True)
 class AppSnapshot:
     project_ready: bool = False
@@ -180,8 +187,12 @@ class ActionPolicy:
         result[ActionId.CLOSE_PROJECT] = self._capability_action(
             snapshot, ActionId.CLOSE_PROJECT, True)
 
+        # DP-5711. Save is offered whenever no job is writing the case, not
+        # only when something is unsaved. A run saves each stage it finishes
+        # (R182/R202), so after a stop the case was clean and Save sat grey:
+        # the engineer read that as "my progress cannot be saved".
         result[ActionId.SAVE] = ActionPresentation(
-            snapshot.dirty and project_idle,
+            project_idle,
             reason=self._save_reason(snapshot, project_reason))
         result[ActionId.UNDO] = ActionPresentation(
             snapshot.undo_available and project_idle,
@@ -236,11 +247,18 @@ class ActionPolicy:
         from the last of them (DP-1236). The tooltip now says so.
         """
         if snapshot.job is JobState.RUNNING_MUTATION:
-            return ('Save is unavailable while the active mesh operation '
-                    'runs. Each finished stage is kept automatically, and a '
-                    'stopped run can be resumed from the last one.')
+            return SAVE_WHILE_RUNNING
+        if snapshot.job is JobState.CANCELLING:
+            return ('Save is unavailable while the active operation is being '
+                    'cancelled. It is offered again as soon as it has stopped.')
+        if snapshot.job is not JobState.IDLE:
+            return ('Save is unavailable until the active operation '
+                    'finishes.')
         if not snapshot.dirty:
-            return 'No unsaved changes'
+            # DP-5711. Enabled, so this is the tooltip, not a refusal.
+            return ('Everything is saved. Finished steps are kept as they '
+                    'finish, and the case is saved when you move to another '
+                    'step.')
         return project_reason
 
     @staticmethod

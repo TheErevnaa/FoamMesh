@@ -1,4 +1,6 @@
-"""'field: 4' beside every control the size field has proposed a value for.
+"""A ``*`` beside every control the size field has proposed a value for.
+
+Plan 47 SZ11: it was the text 'field: 4'; the number in the field says it.
 
 Plan 41 GN25c (section 4.8.2). The proposals live in
 ``foammesh/sizing/proposals.json`` and are read through the facade
@@ -108,8 +110,13 @@ class RowBadgeLabel(QLabel):
         return f'{self._panel.collection_id}[{safe_key(name)}].{element}'
 
     def refresh(self) -> str:
+        """The row's ``*`` (Plan 47 SZ11); the rule stays in ``detail``."""
+        from foammesh.view.workflow_controls.field_widgets import (
+            PROPOSED_MARK, PROPOSED_TIP)
         text = self._badges.get(self.target(), '')
-        self.setText(text)
+        self.detail = text
+        self.setText(PROPOSED_MARK if text else '')
+        self.setToolTip(PROPOSED_TIP if text else '')
         self.setVisible(bool(text))
         return text
 

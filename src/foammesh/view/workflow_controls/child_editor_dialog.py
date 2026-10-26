@@ -21,8 +21,8 @@ import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QBoxLayout, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
-    QScrollArea, QVBoxLayout, QWidget,
+    QBoxLayout, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QHBoxLayout, QLabel, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from foammesh.core.gmsh import fields as _gmsh_fields
@@ -31,6 +31,8 @@ from foammesh.view.theming.status_colors import set_status
 from foammesh.db.configurations_schema import (
     GmshPeriodicTransform, InterfaceTransform, ThicknessModel,
 )
+from foammesh.view.workflow_controls.field_widgets import (
+    NUMBER_FIELD_MAX_WIDTH, add_editor_row)
 
 
 #: ``translation_x`` / ``centre.x`` -- both spellings are in the schema.
@@ -584,7 +586,10 @@ class ChildEditorDialog(QDialog):
                 pass
         self._relevanceSources = []
         for editor in list(self._editors.values()):
-            for widget in (editor.label, editor.editor, editor.unit_label):
+            # DP-2874: the reset arrow and the `*` are the editor's too.
+            for widget in (editor.label, editor.editor, editor.unit_label,
+                           getattr(editor, 'reset_button', None),
+                           getattr(editor, 'badge_label', None)):
                 try:
                     if widget is not None and widget.parent() is not editor:
                         widget.setParent(editor)
@@ -672,9 +677,7 @@ class ChildEditorDialog(QDialog):
         host = QWidget(self)
         row = QHBoxLayout(host)
         row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(editor.editor, 1)
-        if editor.descriptor.unit:
-            row.addWidget(editor.unit_label)
+        add_editor_row(row, editor)           # DP-2873: compact numbers
         return host
 
     def _vector(self, keys) -> QWidget:
@@ -700,8 +703,11 @@ class ChildEditorDialog(QDialog):
                 or f'{humanise(_COMPONENT.match(str(key)).group("base"))} '
                    f'{axis.upper()}')
             pairRow.addWidget(caption)
+            # DP-2873. Each component box is a compact number too.
+            if isinstance(editor.editor, (QSpinBox, QDoubleSpinBox)):
+                editor.editor.setMaximumWidth(NUMBER_FIELD_MAX_WIDTH)
             pairRow.addWidget(editor.editor, 1)
-            row.addWidget(pair, 1)
+            row.addWidget(pair, 0)
             unit = unit or (editor.descriptor.unit or '')
         if unit and pair is not None:
             pair.layout().addWidget(QLabel(unit, pair))

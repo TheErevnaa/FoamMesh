@@ -227,3 +227,66 @@ class CheckHighlightLayer:
     def clear(self) -> None:
         for name in list(self._shown):
             self.hide(name)
+
+
+# -- Plan 48 GM12: failed cells on a mesh from outside (plan 4.14) -------------- #
+
+#: Below this SICN a cell is listed as poor when the caller gives no limit.
+DEFAULT_SICN_LIMIT = 0.1
+
+
+def gmsh_failed_cells(arrays: dict, lookup=None, *,
+                      sicn_limit: float = DEFAULT_SICN_LIMIT) -> dict:
+    """The cells that fail the checks that can be run now, and what cannot.
+
+    *arrays* are a file's quality arrays
+    (:func:`foammesh.core.gmsh.element_quality.measure_file`).  What is run on
+    the numbers is **measured**: cells with a non-positive Jacobian
+    (``minDetJac`` <= 0, inverted) and cells below *sicn_limit* (SICN).  What
+    the *run* flagged -- Gmsh's own failure tags, checkMesh's sets -- is in the
+    project's record only; with no record it is **unavailable**, with the
+    reason, and no list is made up.  The 3D elements are judged on a volume
+    mesh and the surface elements on a surface one.
+    """
+    import numpy as np
+
+    from foammesh.core import provenance
+    from foammesh.core.gmsh import quality
+
+    dims = np.asarray(arrays.get('gmshEntityDim', ()))
+    judged = int(dims.max()) if len(dims) else 0
+    mask = dims == judged
+    tags = np.asarray(arrays.get('gmshElementTag', ()))[mask]
+    centroids = (np.asarray(arrays['__centroids'])[mask]
+                 if '__centroids' in arrays else None)
+    measured = {'dimension': judged, 'cells': int(mask.sum())}
+    sicn = arrays.get('gmshSICN')
+    jac = arrays.get('gmshMinDetJac')
+    if sicn is not None:
+        block = quality.block_from_arrays(
+            'sicn', np.asarray(sicn)[mask], tags, sicn_limit,
+            centroids=centroids)
+        measured['sicn'] = {'limit': float(sicn_limit),
+                            'below': block['below_threshold'],
+                            'minimum': block['minimum'],
+                            'worst': block['offending'][:50]}
+    if jac is not None:
+        values = np.asarray(jac, dtype=np.float64)[mask]
+        bad = np.nonzero(np.isfinite(values) & (values <= 0.0))[0]
+        measured['inverted'] = {
+            'count': int(len(bad)),
+            'tags': [int(t) for t in tags[bad][:1000]],
+            'centroids': ([] if centroids is None else
+                          [list(map(float, c)) for c in centroids[bad][:1000]]),
+        }
+    unavailable = {}
+    if lookup is not None:
+        unavailable['gmsh'] = provenance.failed_elements(
+            lookup, 'gmsh').to_dict()
+        unavailable['checkMesh'] = provenance.failed_elements(
+            lookup, 'checkMesh').to_dict()
+    else:
+        for source in ('gmsh', 'checkMesh'):
+            unavailable[source] = provenance.unavailable(
+                provenance.NO_FAILURE_TAGS).to_dict()
+    return {'measured': measured, 'run_failure_tags': unavailable}

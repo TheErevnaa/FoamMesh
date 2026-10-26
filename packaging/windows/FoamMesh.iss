@@ -1,5 +1,5 @@
 #define AppName "FoamMesh"
-#define AppVersion "1.1.3"
+#define AppVersion "1.1.4"
 #define AppPublisher "Erevnaa"
 #define AppExeName "FoamMesh.exe"
 

@@ -180,6 +180,36 @@ def new_row(kind: str, name: str, dim: int | None = None) -> dict:
             'params': {p.name: p.default for p in spec.params}}
 
 
+def with_automatic_row(rows, dim=3, tags=(),
+                       corner_angle=DEFAULT_CORNER_ANGLE, recombine=True,
+                       name: str = '') -> tuple[list, dict, bool]:
+    """DP-5738 (DP-4216). The rows with the Automatic transfinite row that
+    "Make structured where possible" sets: ``(rows, row, added)``.
+
+    The action sets the constraints on the session's model, which a
+    re-import (any changed stage input) starts again and the batch run never
+    sees, so the press is kept as the row it is a one-press form of. An
+    enabled row already asking for the same is reused, not repeated.
+    """
+    tags = sorted(int(t) for t in (tags or ()))
+    for row in rows:
+        params = row.get('params') or {}
+        if (row.get('kind') == 'transfiniteAutomatic'
+                and row.get('enabled', True)
+                and int(row.get('dim', 3)) == int(dim)
+                and sorted(parse_tags(row.get('tags'))) == tags
+                and abs(float(params.get('corner_angle', DEFAULT_CORNER_ANGLE))
+                        - float(corner_angle)) < 1e-9
+                and bool(params.get('recombine', True)) == bool(recombine)):
+            return list(rows), row, False
+    row = new_row('transfiniteAutomatic', name or 'transfiniteAutomatic1',
+                  dim)
+    row['tags'] = tags
+    row['params'] = dict(row['params'], corner_angle=float(corner_angle),
+                         recombine=bool(recombine))
+    return [*rows, row], row, True
+
+
 def rows_from_text(text) -> list[dict]:
     text = str(getattr(text, 'value', text) or '').strip()
     if not text:
@@ -421,3 +451,103 @@ def preview_on_session(call, ops) -> dict:
     if not surfaces:
         return {'surfaces': [], 'skipped': []}
     return runtime.block_grid(remote, surfaces)
+
+
+# -- Plan 48 GM6: pre-check, make structured, hex-dominant -------------------- #
+
+def precheck_on_session(call, dim, tags, corners=()) -> dict:
+    """Can each of *tags* be transfinite?  ``{'entities': [{'tag',
+    'qualifies', 'reason', 'corner_candidates', ...}]}``: the reason is
+    Gmsh's own topology rule, named (more than four sides, a hole, a face of
+    seven sides); the corner candidates are the points the person may pick."""
+    return call('session.structure_precheck', dim=int(dim),
+                tags=[int(t) for t in tags],
+                corners=[int(c) for c in corners or ()])
+
+
+def precheck_row_on_session(call, row: dict) -> dict:
+    """The pre-check of one stored row (its tags and picked corners)."""
+    kind = KINDS.get(row.get('kind'))
+    if kind is None or row.get('kind') == 'transfiniteAutomatic':
+        raise StructureRefusal('only a transfinite surface or volume row '
+                               'has a corner pre-check')
+    dim = 2 if row['kind'] == 'transfiniteSurface' else 3
+    tags = parse_tags(row.get('tags'))
+    if not tags:
+        raise StructureRefusal('pick the %s to check'
+                               % ('surfaces' if dim == 2 else 'volumes'))
+    return precheck_on_session(call, dim, tags, parse_tags(
+        row.get('corners'), unique=False))
+
+
+def make_structured_on_session(call, dim=3, tags=(),
+                               corner_angle=DEFAULT_CORNER_ANGLE,
+                               recombine=True, apply=True) -> dict:
+    """"Make structured where possible": which volumes (``dim`` 3) or
+    surfaces (``dim`` 2) can be transfinite, set on those that can
+    (``apply``), the others named with the reason.  ``colours`` maps an
+    entity tag to the RGB the preview paints it."""
+    runtime = runtime_module()
+    try:
+        return runtime.make_structured(RemoteGmsh(call), int(dim), tags,
+                                       float(corner_angle), bool(recombine),
+                                       bool(apply))
+    except runtime.BuildError as error:
+        raise ValueError(str(error)) from error
+
+
+def hex_dominant_on_session(call, level=1, conformity=0,
+                            time_limit=None) -> dict:
+    """The "Hex-dominant (experimental)" action: 3D recombination on, mesh,
+    and the count of tetrahedra, hexahedra, prisms and pyramids.
+
+    Plan 48 TL: the 3D meshing runs under the Recombine3D time limit
+    (*time_limit* seconds, else the project's, else the default; 0 for
+    none). A mesh that does not return is refused with the Gmsh 4.15.2 limit
+    named, and the session is restarted from its log.
+    """
+    from . import generate_actions as actions
+
+    runtime = runtime_module()
+    owner = getattr(call, '__self__', None)
+    if time_limit is None:
+        time_limit = actions.limit_for(
+            'recombine3d', getattr(owner, 'time_limits', None))
+    seconds = float(time_limit or 0)
+
+    def limited(op, *args, **kwargs):
+        if op == 'model.mesh.generate' and seconds:
+            kwargs.setdefault('timeout', seconds)
+        return call(op, *args, **kwargs)
+
+    try:
+        algorithm = call('option.getNumber', 'Mesh.Algorithm3D')
+    except Exception:                                  # noqa: BLE001
+        algorithm = None
+
+    def refuse():
+        restarted = actions.restart_after_limit(owner)
+        # DP-4217: the action meshes with Mesh.Algorithm3D = 9; the restarted
+        # session replays that from its log, so the person's choice is put
+        # back here
+        if algorithm is not None:
+            try:
+                call('option.setNumber', 'Mesh.Algorithm3D', algorithm)
+            except Exception:                          # noqa: BLE001
+                pass
+        return actions.TimeLimitRefusal(
+            actions.LIMIT_WHAT['recombine3d'], seconds, restarted)
+
+    try:
+        return runtime.hex_dominant(RemoteGmsh(limited), int(level),
+                                    int(conformity))
+    except runtime.BuildError as error:
+        # BuildError wraps the crash that ended the 3D mesh.
+        cause = error.__cause__
+        if cause is not None and seconds and actions.is_time_limit(cause):
+            raise refuse() from None
+        raise ValueError(str(error)) from error
+    except Exception as error:                         # noqa: BLE001
+        if seconds and actions.is_time_limit(error):
+            raise refuse() from None
+        raise

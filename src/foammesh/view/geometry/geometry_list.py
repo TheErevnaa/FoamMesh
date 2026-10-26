@@ -29,6 +29,27 @@ def cfdTypeToText(cfdType):
     }.get(cfdType)
 
 
+#: Plan 49 SR2. The type column's word for each stored surface role.
+ROLE_COLUMN_TEXT = {
+    'externalBoundary': 'Boundary',
+    'internalFace': 'Internal face',
+    'regionInterfaceConformal': 'Interface',
+    'regionInterfaceNonConformal': 'Interface (non-conformal)',
+    'blockingBaffle': 'Baffle',
+}
+
+
+def _surfaceRole(geometry):
+    if geometry.value('gType') != GeometryType.SURFACE.value:
+        return None
+    try:
+        role = geometry.value('surfaceRole')
+    except (LookupError, TypeError):
+        return None
+    role = getattr(role, 'value', role)
+    return str(role) if role else None
+
+
 def defaultBoundaryCategory():
     """The category a patch adopts when its name announces none.
 
@@ -56,7 +77,20 @@ def typeColumnText(geometry):
     that out was to read the published file by hand. The category is derived
     from the name by exactly the rule publication uses, so what the list shows
     is what the solver will get.
+
+    Plan 49 SR2 (DP-5814). A surface with a stored role is shown by that
+    role and, for an external boundary, its stored purpose -- not by the
+    legacy type and not by a purpose read again from the name, which a
+    rename would change while the stored purpose stays.
     """
+    role = _surfaceRole(geometry)
+    if role:
+        text = QCoreApplication.translate('GeometryPage', ROLE_COLUMN_TEXT.get(role, role))
+        category = geometry.value('boundaryCategory')
+        if role == 'externalBoundary' and category:
+            return f'{text} ({str(getattr(category, "value", category))})'
+        return text
+
     if geometry.value('cfdType') == CFDType.INTERFACE.value and geometry.value('interRegion'):
         text = QCoreApplication.translate('GeometryPage', 'Interface(R)')
     else:

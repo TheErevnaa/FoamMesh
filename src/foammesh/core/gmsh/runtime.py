@@ -19,7 +19,9 @@ import hashlib
 import json
 import subprocess
 
-from .launch_profiles import GmshLaunchProfile, configured_profiles
+from .launch_profiles import (
+    BUILD_BUNDLE_RELATIVE, BUILD_ID, BUILD_REQUIRED_OPTION,
+    BUILD_SETUP_ACTION, GmshLaunchProfile, configured_profiles)
 
 
 class GmshFailureCategory(str, Enum):
@@ -44,6 +46,42 @@ class GmshFailureCategory(str, Enum):
 REQUIRED_CAPABILITIES = ('gmsh.occ', 'gmsh.boundary_layer', 'gmsh.periodic')
 
 _MARKER = '__FOAMMESH_GMSH__'
+
+#: Which Gmsh answered: FoamMesh's own build (Revoropt on, CVTRemesh) or the
+#: official wheel that stands in when the build is not installed.
+BUILD_FOAMMESH = 'foammesh'
+BUILD_WHEEL = 'wheel'
+
+#: Said whenever the wheel answers, so the fallback is never silent.
+WHEEL_NOTICE = (
+    "FoamMesh's own Gmsh build is not installed in this runtime, so the "
+    'official Gmsh wheel is in use and CVT surface remeshing is not '
+    'available. Use "' + BUILD_SETUP_ACTION + '" to install it (about one '
+    'file copied into your home folder in the runtime; nothing is '
+    'downloaded and nothing needs administrator rights).')
+
+
+def build_options_from(text: str) -> str:
+    """The ``Build options:`` words in ``General.BuildInfo`` (or bare options)."""
+    text = str(text or '').strip()
+    marker = 'Build options:'
+    if marker in text:
+        text = text.split(marker, 1)[1]
+        text = text.split(';', 1)[0]
+    return ' '.join(text.split())
+
+
+def option_words(options: str) -> frozenset:
+    return frozenset(str(options).split())
+
+
+def build_kind(options: str, gmsh_file: str = '') -> str:
+    """``foammesh`` when the Revoropt build answered, else ``wheel``."""
+    if BUILD_REQUIRED_OPTION in option_words(options):
+        return BUILD_FOAMMESH
+    if BUILD_ID in str(gmsh_file or ''):
+        return BUILD_FOAMMESH
+    return BUILD_WHEEL
 
 
 def decode_process_output(raw: bytes) -> str:
@@ -89,6 +127,11 @@ class GmshRuntimeReport:
     capabilities: tuple[tuple[str, bool], ...] = ()
     runtime_fingerprint: str = ''
     distribution: str = ''
+    #: Plan 48 GM16a. ``foammesh`` or ``wheel``; the options it reported; and
+    #: the sentence to show when the wheel stands in for the build.
+    build: str = ''
+    build_options: str = ''
+    notice: str = ''
     raw_output: str = field(default='', repr=False)
 
     def to_dict(self) -> dict:
@@ -103,6 +146,9 @@ class GmshRuntimeReport:
             'capabilities': dict(self.capabilities),
             'runtime_fingerprint': self.runtime_fingerprint,
             'distribution': self.distribution,
+            'build': self.build,
+            'build_options': self.build_options,
+            'notice': self.notice,
         }
 
 
@@ -242,11 +288,17 @@ class GmshRuntimeProbe:
             ('gmsh.periodic', bool(payload.get('has_periodic'))),
         )
         missing = [name for name, present in capabilities if not present]
+        options = build_options_from(payload.get('build') or '')
+        kind = build_kind(options, str(payload.get('gmsh_file') or ''))
         identity = {
             'profile': profile.fingerprint,
             'version': version,
             'python': str(payload.get('python') or ''),
             'capabilities': dict(capabilities),
+            # A rebuilt Gmsh is another runtime: evidence measured on the
+            # other one is stale (Plan 48 section 4.15).
+            'build': kind,
+            'build_options': options,
         }
         fingerprint = hashlib.sha256(json.dumps(
             identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -259,7 +311,10 @@ class GmshRuntimeProbe:
                 version=version, python_version=str(payload.get('python') or ''),
                 threads=int(payload.get('threads') or 0),
                 capabilities=capabilities, runtime_fingerprint=fingerprint,
-                distribution=profile.distribution, raw_output=raw)
+                distribution=profile.distribution, build=kind,
+                build_options=options,
+                notice=WHEEL_NOTICE if kind == BUILD_WHEEL else '',
+                raw_output=raw)
 
         return GmshRuntimeReport(
             profile_id=profile.profile_id, available=True,
@@ -267,7 +322,10 @@ class GmshRuntimeProbe:
             version=version, python_version=str(payload.get('python') or ''),
             threads=int(payload.get('threads') or 0),
             capabilities=capabilities, runtime_fingerprint=fingerprint,
-            distribution=profile.distribution, raw_output=raw)
+            distribution=profile.distribution, build=kind,
+            build_options=options,
+            notice=WHEEL_NOTICE if kind == BUILD_WHEEL else '',
+            raw_output=raw)
 
 
 def probe_configured(*, timeout_seconds: float = 60.0,
@@ -296,3 +354,146 @@ def unavailable_reason(reports) -> str:
                 'distribution and this host has none')
     return '; '.join(
         f'{item.profile_id}: {item.reason}' for item in reports if item.reason)
+
+
+# --------------------------------------------------------------------------- #
+# FoamMesh's own Gmsh build in the user's distribution (Plan 48 GM16a)
+# --------------------------------------------------------------------------- #
+#
+# The same shape as ``foammesh-sizefield`` (``core/sizing/tool_setup.py``): the
+# build is one file FoamMesh ships, copied into the distribution the user
+# already has on their say-so, checked by sha256 and by importing it. There is
+# no distribution image and nothing is downloaded. See ``launch_profiles`` for
+# how every Python in the distribution then finds it.
+
+class GmshBuildSetupError(RuntimeError):
+    pass
+
+
+def bundle_path():
+    """The build as this FoamMesh ships it (a tarball; may be absent)."""
+    from resources import resource
+    return resource.file(BUILD_BUNDLE_RELATIVE)
+
+
+def _file_sha256(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _build_runner(argv, timeout):
+    from foammesh.core.openfoam_runtime.detect import _run
+    return _run(argv, timeout)
+
+
+def _build_text(output: bytes) -> str:
+    from foammesh.core.openfoam_runtime.detect import _text
+    return _text(output)
+
+
+def _key_values(output: bytes) -> dict:
+    found = {}
+    for line in _build_text(output).splitlines():
+        key, separator, value = line.strip().partition('=')
+        if separator:
+            found.setdefault(key, value.strip())
+    return found
+
+
+def build_status(profile: GmshLaunchProfile, *, runner=None,
+                 timeout: float = 60.0,
+                 expected_bundle_sha: str | None = None) -> dict:
+    """Where FoamMesh's Gmsh build is in *profile*'s distribution.
+
+    ``state``: ``ok`` (installed, in use, and the shipped one when the
+    shipped sha is known), ``stale`` (installed but not the shipped file),
+    ``not_in_use`` (the files are there but nothing points Python at them),
+    ``missing`` or ``unreachable``. ``in_use`` is what the wheel fallback
+    notice is decided from; ``message`` is always readable.
+    """
+    runner = runner or _build_runner
+    code, output = runner(profile.build_status_argv(), timeout)
+    values = _key_values(output)
+    result = {
+        'distribution': str(getattr(profile, 'distribution', '') or ''),
+        'user': values.get('user.name', ''), 'build_id': BUILD_ID,
+        'path': values.get('build.dir', ''), 'sha256': values.get('build.sha', ''),
+        'in_use': False, 'state': 'missing', 'message': WHEEL_NOTICE,
+        'expected_bundle_sha256': expected_bundle_sha or '',
+    }
+    if code != 0 or not values.get('user.name'):
+        result.update(state='unreachable', message=(
+            "The OpenFOAM 13 runtime did not answer, so FoamMesh's Gmsh "
+            'build could not be looked for.'))
+        return result
+    if 'build.dir' not in values:
+        return result
+    record = {}
+    if values.get('build.record'):
+        try:
+            record = json.loads(values['build.record'])
+        except ValueError:
+            record = {}
+    in_use = (values.get('pth.target', '').rstrip('/')
+              == values['build.dir'].rstrip('/') + '/lib')
+    result.update(in_use=in_use, record=record)
+    if expected_bundle_sha and record.get('bundle_sha256') != expected_bundle_sha:
+        result.update(state='stale', message=(
+            "The Gmsh build in the runtime is not the one this FoamMesh "
+            'ships. Use "' + BUILD_SETUP_ACTION + '" to copy it again.'))
+    elif not in_use:
+        result.update(state='not_in_use', message=WHEEL_NOTICE)
+    else:
+        result.update(state='ok', message='')
+    return result
+
+
+def install_build(profile: GmshLaunchProfile, *, runner=None,
+                  timeout: float = 600.0, bundle=None) -> dict:
+    """Copy the shipped build into the runtime and switch to it; never silent.
+
+    Raises :class:`GmshBuildSetupError` with the measured reason when the
+    bundle is missing, the copy fails, or the installed Gmsh does not import.
+    """
+    from pathlib import Path
+    runner = runner or _build_runner
+    source = Path(bundle) if bundle is not None else Path(bundle_path())
+    if not source.is_file():
+        raise GmshBuildSetupError(
+            f"This FoamMesh does not contain its Gmsh build ({source}).")
+    expected = _file_sha256(source)
+    before = build_status(profile, runner=runner, timeout=timeout,
+                          expected_bundle_sha=expected)
+    if before['state'] == 'unreachable':
+        raise GmshBuildSetupError(before['message'])
+    if before['state'] == 'ok':
+        return before
+    code, output = runner(profile.build_install_argv(
+        profile.translate_host_path(source), expected), timeout)
+    if code != 0 or 'done=' not in _build_text(output):
+        raise GmshBuildSetupError(
+            "Copying FoamMesh's Gmsh into the runtime failed: "
+            + (_build_text(output).strip()[-400:] or f'exit code {code}'))
+    after = build_status(profile, runner=runner, timeout=timeout,
+                         expected_bundle_sha=expected)
+    if after['state'] != 'ok':
+        raise GmshBuildSetupError(
+            "The copied Gmsh build did not pass its check: "
+            + (after['message'] or after['state']))
+    after['copied'] = True
+    return after
+
+
+def disable_build(profile: GmshLaunchProfile, *, runner=None,
+                  timeout: float = 60.0) -> dict:
+    """Stop using the build (the wheel answers again, with the notice)."""
+    runner = runner or _build_runner
+    code, output = runner(profile.build_disable_argv(), timeout)
+    if code != 0:
+        raise GmshBuildSetupError(
+            'Switching back to the Gmsh wheel failed: '
+            + (_build_text(output).strip()[-400:] or f'exit code {code}'))
+    return build_status(profile, runner=runner, timeout=timeout)

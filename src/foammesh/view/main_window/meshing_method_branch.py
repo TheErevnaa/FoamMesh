@@ -891,6 +891,61 @@ class MeshingMethodBranch(QObject):
                 frontier = token
         return frontier
 
+    #: DP-5711. The task states a reopened case counts as finished work.
+    FINISHED_STATES = frozenset({
+        TaskState.PASSED, TaskState.WARNING, TaskState.COMPLETED,
+        TaskState.WAIVED, TaskState.SKIPPED})
+
+    def _rowFinished(self, token: str) -> bool:
+        """Whether the row ``token`` is finished, read as the outline paints it.
+
+        DP-5744. The row's own task is finished, and no task its press also
+        settles failed or went stale (the member news the outline folds into
+        the row). A member left ready -- an optional size field nobody added
+        -- does not hold the row back: DP-5711 asked every member, and a
+        ticked Sizing row with untouched optional members reopened the case
+        on Preparation.
+        """
+        graph = getattr(self._branch, 'graph', None)
+        if graph is None or not token.startswith(TASK_TOKEN_PREFIX):
+            return False
+        task_id = token[len(TASK_TOKEN_PREFIX):]
+        engine_id = str(getattr(self._branch, 'engine_id', '') or '')
+        members = row_tasks(engine_id, task_id) or (task_id,)
+        try:
+            if graph.state(task_id) not in self.FINISHED_STATES:
+                return False
+            return not any(graph.state(member) in (TaskState.FAILED,
+                                                   TaskState.STALE)
+                           for member in members if member != task_id)
+        except Exception:                                    # noqa: BLE001
+            return False
+
+    def resumeToken(self) -> str | None:
+        """Where a reopened case continues (DP-5711), or None.
+
+        The row after the last finished task row, when that row can be
+        opened; the last finished row itself when nothing after it can. None
+        when no task row is finished, so a case with no finished work opens
+        as it always did.
+        """
+        node = self._navigation.branchNode(METHOD_TOKEN)
+        if node is None or self._branch is None:
+            return None
+        tokens = [str(node.child(row).data(TOKEN_ROLE) or '')
+                  for row in range(node.rowCount())]
+        tokens = [token for token in tokens
+                  if token.startswith(TASK_TOKEN_PREFIX)]
+        finished = [index for index, token in enumerate(tokens)
+                    if self._rowFinished(token)]
+        if not finished:
+            return None
+        last = finished[-1]
+        for token in tokens[last + 1:]:
+            if not self.isLocked(token) and not self._rowIsShut(token):
+                return token
+        return tokens[last]
+
     def setLockBypass(self, flag: bool) -> None:
         """Open every row regardless of the workflow. Harnesses only.
 

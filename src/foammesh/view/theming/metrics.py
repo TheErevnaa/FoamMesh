@@ -779,6 +779,13 @@ def _value_sized_hint(box, hint):
     return hint
 
 
+#: DP-2873 (user, 2026-10-21): a size field is a short number, not a row.
+#: Every number box of both engines stops at this width, and a field row gives
+#: its choice and text boxes the same one (one right edge per column, DP-156).
+#: A special text longer than it is elided, whole in the tooltip.
+NUMBER_FIELD_MAX_WIDTH = 150
+
+
 class CompactDoubleSpinBox(QDoubleSpinBox):
     """A number box that keeps nine decimals and does not display nine.
 
@@ -801,6 +808,8 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # DP-2873. A number, not a row: compact on every page.
+        self.setMaximumWidth(NUMBER_FIELD_MAX_WIDTH)
         # DP-130. The hint below depends on the value, so the layout has to
         # be told when the value moves.
         self.valueChanged.connect(self._reHint)
@@ -833,6 +842,7 @@ class CompactSpinBox(QSpinBox):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMaximumWidth(NUMBER_FIELD_MAX_WIDTH)        # DP-2873
         self.valueChanged.connect(self._reHint)
 
     def _reHint(self, _value) -> None:

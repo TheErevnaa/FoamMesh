@@ -359,6 +359,51 @@ class SheetHeader(QWidget):
         """The subtitle as the header draws it now ('' = not drawn)."""
         return self._title.subtitleShown()
 
+    def _line_text(self) -> str:
+        """The title line as drawn, as plain words."""
+        line = self._title
+        text = line.text()
+        if line.textFormat() == Qt.TextFormat.RichText:
+            from PySide6.QtGui import QTextDocumentFragment
+            text = QTextDocumentFragment.fromHtml(text).toPlainText()
+        return text.replace(chr(0xa0), ' ')
+
+    def readout(self) -> dict:
+        """The header as it reads now (Plan 48 PA5).
+
+        ``title`` and ``subtitle`` are the words of the step; ``shown`` is
+        the line as the header draws it (the title elided to fit, the
+        subtitle in the longest form that fits, or none). ``chip`` is the
+        step number the chip stands for -- the chip itself is a 10 px dot --
+        and ``buttons`` says what each of the header's controls reads.
+        """
+        number, _name = split_step(self._title.fullText())
+        setup = (number is not None
+                 and SETUP_FIRST <= number <= SETUP_LAST)
+
+        def button(widget) -> dict:
+            return {'text': widget.text(), 'tip': widget.toolTip(),
+                    'enabled': widget.isEnabled(),
+                    'shown': not widget.isHidden(),
+                    'checked': widget.isChecked()
+                    if widget.isCheckable() else False}
+
+        more = self._more
+        return {
+            'title': self.title(), 'subtitle': self.subtitle(),
+            'shown': {'line': self._line_text(),
+                      'subtitle': self.subtitle_shown()},
+            'chip': {'step': number,
+                     'setup_position': (number - SETUP_FIRST + 1)
+                     if setup else None,
+                     'setup_count': SETUP_COUNT if setup else None,
+                     'shown': not self._chip.isHidden()},
+            'pinned': self._pinned,
+            'side': str(self._side.property('side') or ''),
+            'buttons': {'pin': button(self._pin), 'side': button(self._side),
+                        'minimise': button(self._minimise),
+                        'more': button(more) if more is not None else None}}
+
     # -- state -------------------------------------------------------------- #
 
     def set_step(self, name: str) -> None:

@@ -232,6 +232,8 @@ class StepManager(QObject):
     workingStepChanged = Signal(Step)
     batchStarted = Signal()
     batchStopped = Signal()
+    #: DP-5711. The panel moved to another row (a step or a branch task).
+    routeEntered = Signal()
 
     def __init__(self, navigation, ui):
         super().__init__()
@@ -260,6 +262,9 @@ class StepManager(QObject):
         self._contentStack.addWidget(self._emptyCasePage)
 
         self._batchRunning = False
+        # DP-5711. The first load opens a case, so it resumes where work
+        # stopped (cleared by that load, set again by `unload`).
+        self._resumeOnOpen = True
         # Plan 40 UXA8 (#27). Whether a case is open. With none, the footer
         # and the Geometry page's Import and Add have nothing to act on.
         self._caseOpen = False
@@ -773,11 +778,33 @@ class StepManager(QObject):
         # a step whose page is gone; nothing but an empty shell lives
         # behind those indices now, so a reopen on one of them stops at Preparation (Export is live and
         # stays where it was saved).
+        # DP-5711. The first load after a case is opened continues where the
+        # work stopped; every later load is a refresh and leaves the panel be.
+        resume = self.__dict__.pop('_resumeOnOpen', False)
         if not self._restoreBranchRoute():
             if Step.REGION <= step <= Step.BOUNDARY_LAYER:
                 step = Step.GEOMETRY_REPAIR
             self._open(Step(step))
+            if resume and step != Step.EXPORT:
+                self._resumeWhereWorkStopped()
         self._paintSetupRows()
+
+    def _resumeWhereWorkStopped(self) -> bool:
+        """Stand a reopened case on the row after its last finished one.
+
+        DP-5711. A reopen used to stop at `3. Preparation` whatever had been
+        finished, so the person had to find their place again by hand. The
+        finished rows are kept and are not re-run; this only chooses the row
+        the panel opens on. A case with no finished task row, or one saved
+        on Export, opens as before.
+        """
+        resume = getattr(self._methodBranch, 'resumeToken', None)
+        try:
+            token = resume() if callable(resume) else None
+        except Exception:                                   # noqa: BLE001
+            logger.debug('no row to resume on', exc_info=True)
+            return False
+        return bool(token) and bool(self.restoreRouteMemo(token))
 
     def _paintSetupRows(self) -> None:
         """Tick `1. Geometry`, `2. Mesh setup` and `3. Preparation` from their records.
@@ -864,6 +891,8 @@ class StepManager(QObject):
         return self._methodBranch.route(token)
 
     def unload(self):
+        # DP-5711. The next load opens a case: it resumes where work stopped.
+        self._resumeOnOpen = True
         self._externalMeshMode = False
         self._sceneVisible = False
         self._navigation.setExternalMeshMode(False)
@@ -1352,10 +1381,18 @@ class StepManager(QObject):
         if widget is None:
             return
         entry = (widget, token or None)
-        if not self._routeHistory or self._routeHistory[-1] != entry:
+        moved = not self._routeHistory or self._routeHistory[-1] != entry
+        if moved:
             self._routeHistory.append(entry)
         self._updateWizardActions()
         self._dropStrandedBaseGridOutline(widget)
+        # DP-5711. A move to another row is a step boundary, where the case
+        # is saved; a refresh that lands on the same row is not one.
+        if moved:
+            try:
+                self.routeEntered.emit()
+            except (AttributeError, RuntimeError):
+                pass  # a stand-in manager has no signal to send it on
 
     def _dropStrandedBaseGridOutline(self, widget):
         """The domain box belongs to the page that draws it (DP-139).
@@ -1858,6 +1895,12 @@ class StepManager(QObject):
         branch = self._methodBranch.branch
         if widget is branch and branch is not None:
             task_page = branch.stack.currentWidget()
+            # DP-5737. The press belongs to the row it was made on. Every
+            # await below lets the window run, and a person who clicks
+            # another row while this one commits (the Sizing commit takes a
+            # second or two) used to have that row settled, locked and
+            # stepped past: the token was read after the commit.
+            token = self._methodBranch.currentToken
             if not await commit_page_edits(task_page, branch):
                 # DP-254. A press that will not move says why. It used to
                 # return here without a word, which read as a dead button.
@@ -1866,8 +1909,7 @@ class StepManager(QObject):
                             'workflow stayed here. Correct them and press '
                             'Proceed again.'), 8000)
                 return
-            task_id = self._taskIdForToken(
-                self._methodBranch.currentToken, task_page)
+            task_id = self._taskIdForToken(token, task_page)
             if task_id == 'common.export':
                 # Plan 30 WP-09. Export is a branch task on both engines now,
                 # so its Proceed comes through here rather than through the
@@ -1893,7 +1935,10 @@ class StepManager(QObject):
                     return
                 if task_id:
                     await self._lockStep(task_id)
-                token = self._methodBranch.currentToken
+                if self._methodBranch.currentToken != token:
+                    # The person opened another row meanwhile: stay there.
+                    self._updateWizardActions()
+                    return
                 next_token = self._methodBranch.nextAvailableTaskToken(token)
                 if next_token:
                     self._navigation.requestBranch(next_token)
@@ -2019,7 +2064,7 @@ class StepManager(QObject):
                 | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Open)
             if answer == QMessageBox.StandardButton.Open:
-                first = blocking[0]
+                first = self._firstOpenable(branch, blocking[0])
                 if first not in HOSTED_TASKS:
                     first = owning_row(
                         str(getattr(branch, 'engine_id', '') or ''),
@@ -2028,6 +2073,28 @@ class StepManager(QObject):
 
         # Opened with no task current, as `_reportNoNextTask`'s is.
         say(offer)
+
+    @staticmethod
+    def _firstOpenable(branch, task_id: str) -> str:
+        """The task to open for a blocker: ``task_id`` itself, or, while it
+        is locked behind its own prerequisites, the first of those (DP-5740).
+
+        Opening a locked row is refused, so "Open the first one now?" pointed
+        at a blocker that was itself waiting did nothing and the question came
+        back on the next press (window walk dp4216).
+        """
+        runnable = getattr(branch, 'is_runnable', None)
+        ask = getattr(branch, 'blocking_prerequisites', None)
+        if not callable(runnable) or not callable(ask):
+            return task_id
+        seen = {task_id}
+        while not runnable(task_id):
+            earlier = [dep for dep in (ask(task_id) or ()) if dep not in seen]
+            if not earlier:
+                break
+            task_id = earlier[0]
+            seen.add(task_id)
+        return task_id
 
     #: Legacy snappy step pages and the tree task each one owns.
     _SNAPPY_STEP_TASKS = {

@@ -129,6 +129,10 @@ def describe_cancellation(payload, allocation=None) -> str:
     except (TypeError, ValueError):
         stopped = 0
     clause = describe_workers(allocation)
+    if stopped <= 0 and payload.get('pipeline_committing'):
+        # DP-5743: the new mesh is already replacing the case mesh.
+        return ('Too late to cancel: the new mesh is already replacing the '
+                'case mesh, so the run finishes.')
     if stopped <= 0:
         return 'Nothing was running, so nothing was stopped.'
     what = 'job' if stopped == 1 else 'jobs'

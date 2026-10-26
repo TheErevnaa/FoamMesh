@@ -1608,12 +1608,32 @@ class GeometryArtifactStore:
                 # nothing the cut could keep.
                 kept = (self._artifact_solid_names(entry, cut)
                         or {0: item['name']})
+                metadata = {'kind': 'interface_split',
+                            'interface_split': {'removed': int(item['removed']),
+                                                'kept': int(item['triangles'])}}
+                if item.get('solids'):
+                    # DP-6060. A body imported as several named solids keeps
+                    # them: the cut is written one block per surviving solid,
+                    # and the surfaces whose every face became the interface
+                    # leave the entry instead of naming nothing.
+                    kept, patches, dropped = self._kept_solid_records(
+                        entry, item['solids'])
+                    metadata['patches'] = patches
+                    metadata['interface_split']['emptied'] = [
+                        solid['name'] for solid in item['solids']
+                        if not solid['triangles']]
+                    body['dropped_patch_uuids'] = dropped
+                    if entry.get('regions') and dropped:
+                        gone = set(dropped)
+                        metadata['regions'] = [
+                            {**region, 'boundary_patch_uuids': [
+                                value for value in
+                                region.get('boundary_patch_uuids') or ()
+                                if str(value) not in gone]}
+                            for region in entry['regions']]
+                metadata['solid_names'] = kept
                 written = self._replace_artifact_revision(
-                    entries, index, entry, cut,
-                    {'kind': 'interface_split',
-                     'solid_names': kept,
-                     'interface_split': {'removed': int(item['removed']),
-                                         'kept': int(item['triangles'])}})
+                    entries, index, entry, cut, metadata)
                 body['revision'] = int(written['revision'])
             result['bodies'].append(body)
         for item in record['interfaces']:
@@ -1631,6 +1651,57 @@ class GeometryArtifactStore:
                     enclosed[1]['geometry_id'] if enclosed else None)
             result['interfaces'].append(joined)
         return result
+
+    @staticmethod
+    def _kept_solid_records(entry: dict, solids: list) -> tuple:
+        """``(solid names, patch records, dropped patch uuids)`` after a cut.
+
+        DP-6060. *solids* is the cut's count per source solid, in file order.
+        The kept file holds the non-empty ones in that order, so the reader
+        numbers them by position among the kept (or by their own ``face<N>``);
+        each surviving patch record moves to its solid's new number, and a
+        record whose solid was emptied is dropped with its patch identity
+        returned, for the project tree to drop the row that showed it.
+        """
+        from .importers.stl_importer import face_ids_for
+
+        kept_names = [str(solid['name']) for solid in solids
+                      if int(solid.get('triangles') or 0)]
+        emptied = {str(solid['name']) for solid in solids
+                   if not int(solid.get('triangles') or 0)}
+        numbers = dict(zip(kept_names, face_ids_for(kept_names)))
+
+        def moved(record):
+            # None when the record's solid was emptied; else the record with
+            # its face number moved to where the kept file puts the solid.
+            ref = dict(record.get('source_ref') or {})
+            name = str(ref.get('original_name') or record.get('name') or '')
+            if name in emptied:
+                return None
+            if name in numbers:
+                ref['face_index'] = numbers[name]
+                return {**record, 'source_ref': ref}
+            return record
+
+        records, dropped = [], []
+        for record in entry.get('patches') or ():
+            if record.get('members'):
+                # A merged boundary keeps the members that still have faces.
+                members = [moved(member) for member in record['members']]
+                members = [member for member in members if member is not None]
+                if members:
+                    records.append({**record, 'members': members})
+                    continue
+                result = None
+            else:
+                result = moved(record)
+            if result is None:
+                if record.get('patch_uuid'):
+                    dropped.append(str(record['patch_uuid']))
+                continue
+            records.append(result)
+        names = {number: name for name, number in numbers.items()}
+        return names, records, dropped
 
     @staticmethod
     def _interface_labels(entries: list[dict]) -> list[str]:

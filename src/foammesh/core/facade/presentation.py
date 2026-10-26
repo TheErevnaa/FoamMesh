@@ -49,8 +49,65 @@ ELEMENT_NUMBERS = {'node_size': (0.5, 50.0), 'line_width': (0.5, 20.0),
 #: DP-2766. The Elements group's combos. What *Colour by* and *Label type*
 #: offer depends on the mesh on screen, so the window checks the choice
 #: against its combo; *Node style* is fixed.
-ELEMENT_CHOICES = ('colour_by', 'label_type', 'node_style')
+ELEMENT_CHOICES = ('colour_by', 'label_type', 'node_style', 'light_lines')
 NODE_STYLES = ('dots', 'spheres')
+#: Plan 48 PA1. *Light the edges* (Mesh.LightLines): the code Gmsh keeps and
+#: the words the combo shows. ``light_lines`` is given as either.
+LIGHT_LINES = {0: 'No', 1: 'Surface', 2: 'Volume and surface'}
+#: Plan 48 PA1. Worst cells: how the cut is made (``MeshQualityInfo``), the
+#: section panel's choices (``core.section``; the view layer checks them).
+WORST_MODES = ('range', 'count', 'limit')
+#: Plan 48 PA1. What each presentation op PA1 added or extended does, for the
+#: operation catalogue (operations.py lists a presentation op with only its
+#: name until it reads this; see requests/pa1.md).
+PRESENTATION_SUMMARIES = {
+    'presentation.preview_notice': (
+        'The viewport preview notice (the line saying the picture is not the '
+        'whole mesh): send nothing to read it (shown, text, patches, actions); '
+        'action dismiss closes it, retry, load_volume and build_anyway press '
+        'its buttons. build_anyway needs confirm true, the answer to the '
+        "window's Yes/No question."),
+    'presentation.surface_opacity': (
+        'The viewport rail Surface opacity tool: opacity in [0, 1] moves its '
+        'slider (the Gmsh route keeps its own value, default 0.3, and the '
+        'snappy route its own, default 1); send nothing to read it. Answers '
+        'opacity and route.'),
+    'presentation.elements': (
+        'The Display popover Elements group: Show, the ticks and numbers '
+        '(options), Colour by, Label type, Node style, Light the edges '
+        '(light_lines 0, 1, 2 or its words) and the cell types. Answers the '
+        'status line and the cell-type note the group shows.'),
+    'presentation.worst_cells': (
+        'The toolbar Worst cells and the Mesh quality tab choice: visible, '
+        'metric, mode (range, count, limit), count (10, 100, 1000), limit or '
+        'limit_from (mesher, check), beyond. Answers the band, the legend '
+        'title, the distribution and the cells beyond the limit as the tab '
+        'shows them.'),
+    'presentation.section': (
+        'The section tool: enabled, mode (slice, cut_cells = slab, clip, '
+        'clip_whole_cells), plane, origin, normal, flip, combine, cell_rule, '
+        'solo, lock, drag_axis, step_choice, step, sheet_opacity, '
+        'handle_visible (the H key) and nudge (PgUp/PgDn, Shift = fine). '
+        'Answers what the section panel shows.'),
+    'presentation.deviation.read': (
+        'Read the deviation panel without changing it: the source sentence, '
+        'tolerance, scale, Auto state, surfaces, the summary figures and the '
+        'histogram bars.'),
+    'presentation.quality.ranking': (
+        'Mesh quality tab Rank: the worst cells of a metric into the table '
+        '(metric, count). Answers the rows when the ranking ends.'),
+    'presentation.quality.fly_to': (
+        'Select a row of the worst-cell table (row or tag): the camera goes '
+        'to the cell. failed_cells frames the failed-cell set.'),
+    'presentation.quality.inspect': (
+        'Inspect element by tag: answers the cell facts the tab shows.'),
+    'presentation.quality.pick': (
+        'Switch Inspect element: click a cell on or off.'),
+}
+SECTION_COMBINE = ('common', 'remove_common', 'each')
+SECTION_CELL_RULES = ('any', 'centroid', 'entire')
+SECTION_DRAG_AXES = ('free', 'x', 'y', 'z', 'normal')
+SECTION_STEP_CHOICES = ('cell', 'typed')
 
 
 def _point(value, what: str):
@@ -134,6 +191,11 @@ class PresentationState:
     last_snapshot: dict | None = None
     #: DP-2765. The names in the camera button's Saved views menu.
     named_views: tuple[str, ...] = ()
+    #: Plan 48 PA1. What the Worst cells choice and the Mesh quality tab show.
+    worst_cells: dict = field(default_factory=dict)
+    #: Plan 48 OP. The viewport rail's Surface opacity: ``opacity`` (0-1) of
+    #: the route the open case is on and that ``route`` ('gmsh' or 'snappy').
+    surface_opacity: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -157,6 +219,8 @@ class PresentationState:
             'camera_history': dict(self.camera_history),
             'last_snapshot': self.last_snapshot,
             'named_views': list(self.named_views),
+            'worst_cells': dict(self.worst_cells),
+            'surface_opacity': dict(self.surface_opacity),
         }
 
 
@@ -177,6 +241,10 @@ class PresentationOperations:
             'presentation.visibility': self._visibility,
             'presentation.color': self._color,
             'presentation.opacity': self._opacity,
+            # Plan 48 OP. The rail's Surface opacity: read, or set.
+            'presentation.surface_opacity': self._surface_opacity,
+            # DP-5734. The viewport's preview notice and its buttons.
+            'presentation.preview_notice': self._preview_notice,
             'presentation.measurement': self._measurement,
             # DP-2750..2761. The rest of the viewport's controls.
             'presentation.view.mode': self._view_mode,
@@ -186,7 +254,13 @@ class PresentationOperations:
             'presentation.deviation': self._inspection('deviation'),
             'presentation.deviation.settings': self._deviation_settings,
             'presentation.feature_edges': self._inspection('feature_edges'),
-            'presentation.worst_cells': self._inspection('worst_cells'),
+            'presentation.worst_cells': self._worst_cells,
+            # Plan 48 PA1. The deviation read-outs and the worst-cell table.
+            'presentation.deviation.read': self._deviation_read,
+            'presentation.quality.ranking': self._quality_ranking,
+            'presentation.quality.fly_to': self._quality_fly_to,
+            'presentation.quality.inspect': self._quality_inspect,
+            'presentation.quality.pick': self._quality_pick,
             'presentation.failed_cells': self._failed_cells,
             'presentation.reset_inspection': self._reset_inspection,
             'presentation.colour_scale': self._colour_scale,
@@ -309,6 +383,51 @@ class PresentationOperations:
         return {'entity_id': entity_id, 'opacity': state.opacity[entity_id]}
 
     @staticmethod
+    def _surface_opacity(state: PresentationState, parameters: dict) -> dict:
+        """The rail's Surface opacity: send ``opacity`` (0-1) to move the
+        slider of the route the open case is on, send nothing to read it."""
+        unknown = sorted(set(parameters) - {'opacity'})
+        if unknown:
+            raise ValidationFailedError(
+                'presentation.surface_opacity takes only opacity',
+                details={'unknown': unknown})
+        opacity = _number(parameters, 'opacity', 0.0, 1.0)
+        if opacity is None:
+            return {'surface_opacity_read': True}
+        state.surface_opacity = {**state.surface_opacity, 'opacity': opacity}
+        return {'surface_opacity': {'opacity': opacity}}
+
+    #: DP-5734. What the preview notice's controls do: its close control and
+    #: its three buttons.
+    PREVIEW_NOTICE_ACTIONS = ('dismiss', 'retry', 'load_volume', 'build_anyway')
+
+    @classmethod
+    def _preview_notice(cls, _state: PresentationState, parameters: dict) -> dict:
+        """The viewport preview notice: read it, close it or press a button."""
+        unknown = sorted(set(parameters) - {'action', 'confirm'})
+        if unknown:
+            raise ValidationFailedError(
+                'presentation.preview_notice takes action and confirm',
+                details={'unknown': unknown})
+        action = parameters.get('action')
+        confirm = _flag(parameters, 'confirm')
+        if action is None:
+            if confirm is not None:
+                raise ValidationFailedError('confirm goes with action build_anyway')
+            return {'preview_notice_read': True}
+        if action not in cls.PREVIEW_NOTICE_ACTIONS:
+            raise ValidationFailedError('unknown preview notice action', details={
+                'action': action, 'allowed': list(cls.PREVIEW_NOTICE_ACTIONS)})
+        if confirm is not None and action != 'build_anyway':
+            raise ValidationFailedError('confirm goes with action build_anyway')
+        if action == 'build_anyway' and confirm is not True:
+            raise ValidationFailedError(
+                'Build anyway asks first: the preview worker may use up to 90% '
+                "of this computer's memory. Send confirm true to answer Yes.",
+                details={'action': action, 'confirm': confirm})
+        return {'preview_notice': {'action': action}}
+
+    @staticmethod
     def _measurement(state: PresentationState, parameters: dict) -> dict:
         start = parameters.get('start')
         end = parameters.get('end')
@@ -406,6 +525,128 @@ class PresentationOperations:
         state.deviation.update(changed)
         return {'deviation': changed}
 
+    # -- Plan 48 PA1: worst cells, the table, the deviation read-out -------- #
+
+    @staticmethod
+    def _worst_cells(state: PresentationState, parameters: dict) -> dict:
+        """The toolbar's Worst cells, with the choice it is pressed with."""
+        changed = {}
+        visible = _flag(parameters, 'visible')
+        read = _flag(parameters, 'read')
+        metric = parameters.get('metric')
+        if metric is not None:
+            if not isinstance(metric, str) or not metric.strip():
+                raise ValidationFailedError(
+                    'metric must name a quality metric',
+                    details={'example': 'nonOrthoAngle'})
+            changed['metric'] = metric.strip()
+        mode = parameters.get('mode')
+        if mode is not None:
+            if mode not in WORST_MODES:
+                raise ValidationFailedError('unknown worst-cell mode', details={
+                    'mode': mode, 'allowed': list(WORST_MODES)})
+            changed['mode'] = mode
+        count = parameters.get('count')
+        if count is not None:
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValidationFailedError('count is a whole number from 1',
+                                            details={'count': count})
+            changed['count'] = count
+        if 'limit' in parameters:
+            limit = parameters['limit']
+            if limit is not None:
+                limit = _number(parameters, 'limit')
+            changed['limit'] = limit
+        source = parameters.get('limit_from')
+        if source is not None:
+            if source not in ('mesher', 'check'):
+                raise ValidationFailedError(
+                    'limit_from is mesher or check (the tab two buttons)',
+                    details={'limit_from': source})
+            if 'limit' in changed:
+                raise ValidationFailedError(
+                    'give limit or limit_from, not both')
+            changed['limit_from'] = source
+        beyond = _flag(parameters, 'beyond')
+        if beyond is not None:
+            changed['beyond'] = beyond
+        if changed.get('mode') == 'count' and 'count' not in changed:
+            raise ValidationFailedError('mode count needs count')
+        current = bool(state.inspection.get('worst_cells', False))
+        if read:
+            if changed or visible is not None:
+                raise ValidationFailedError('read is sent on its own')
+            return {'inspection': 'worst_cells', 'visible': current,
+                    'read': True}
+        if changed and visible is None:
+            wanted = True
+        else:
+            wanted = (not current) if visible is None else visible
+        state.inspection['worst_cells'] = wanted
+        state.worst_cells.update(changed)
+        return {'inspection': 'worst_cells', 'visible': wanted, **changed}
+
+    @staticmethod
+    def _deviation_read(state: PresentationState, parameters: dict) -> dict:
+        """Read the deviation panel: source text, scale, summary, histogram."""
+        if parameters:
+            raise ValidationFailedError(
+                'presentation.deviation.read takes no parameters')
+        return {'deviation_read': True}
+
+    @staticmethod
+    def _quality_ranking(state: PresentationState, parameters: dict) -> dict:
+        """Rank the worst cells (Mesh quality tab: metric, Worst N, Rank)."""
+        changed = {}
+        metric = parameters.get('metric')
+        if metric is not None:
+            if not isinstance(metric, str) or not metric.strip():
+                raise ValidationFailedError('metric must name a quality metric')
+            changed['metric'] = metric.strip()
+        count = parameters.get('count')
+        if count is not None:
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValidationFailedError('count is a whole number from 1',
+                                            details={'count': count})
+            changed['count'] = count
+        return {'ranking': changed}
+
+    @staticmethod
+    def _quality_fly_to(state: PresentationState, parameters: dict) -> dict:
+        """Select a row of the worst-cell table: the camera goes to the cell."""
+        row, tag = parameters.get('row'), parameters.get('tag')
+        failed = _flag(parameters, 'failed_cells')
+        given = [name for name, value in (('row', row), ('tag', tag),
+                                          ('failed_cells', failed))
+                 if value is not None]
+        if len(given) != 1:
+            raise ValidationFailedError('give one of row, tag or failed_cells',
+                                        details={'given': given})
+        for name, value in (('row', row), ('tag', tag)):
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, int)
+                                      or value < 0):
+                raise ValidationFailedError(f'{name} is a whole number',
+                                            details={name: value})
+        return {'fly_to': {name: parameters[name] for name in given}}
+
+    @staticmethod
+    def _quality_inspect(state: PresentationState, parameters: dict) -> dict:
+        """Read an element (Inspect element: its tag)."""
+        tag = parameters.get('tag')
+        if isinstance(tag, bool) or not isinstance(tag, int):
+            raise ValidationFailedError('tag is the element tag (a whole number)',
+                                        details={'tag': tag})
+        return {'inspect': {'tag': tag}}
+
+    @staticmethod
+    def _quality_pick(state: PresentationState, parameters: dict) -> dict:
+        """Switch *click a cell to read it* on or off."""
+        enabled = _flag(parameters, 'enabled')
+        if enabled is None:
+            raise ValidationFailedError('enabled (true or false) is required')
+        return {'pick': {'enabled': enabled}}
+
     @staticmethod
     def _colour_scale(state: PresentationState, parameters: dict) -> dict:
         changed = {}
@@ -471,15 +712,71 @@ class PresentationOperations:
                 changed[name] = _point(parameters[name], name)
         if 'normal' in changed and not any(changed['normal']):
             raise ValidationFailedError('normal must not be zero')
+        # Plan 48 PA1. The rest of the section panel.
+        for name in ('flip', 'lock', 'handle_visible'):
+            value = _flag(parameters, name)
+            if value is not None:
+                changed[name] = value
+        for name, allowed in (('combine', SECTION_COMBINE),
+                              ('cell_rule', SECTION_CELL_RULES),
+                              ('drag_axis', SECTION_DRAG_AXES),
+                              ('step_choice', SECTION_STEP_CHOICES)):
+            value = parameters.get(name)
+            if value is not None:
+                if value not in allowed:
+                    raise ValidationFailedError(f'unknown {name}', details={
+                        name: value, 'allowed': list(allowed)})
+                changed[name] = value
+        for name in ('plane', 'solo'):
+            if name in parameters:
+                value = parameters[name]
+                if value is not None and (isinstance(value, bool)
+                                          or not isinstance(value, int)
+                                          or value < 0):
+                    raise ValidationFailedError(
+                        f'{name} is a plane number from 0'
+                        + (' or null' if name == 'solo' else ''),
+                        details={name: value})
+                changed[name] = value
+        step = parameters.get('step')
+        if step is not None:
+            if not isinstance(step, (str, int, float)) or isinstance(step, bool):
+                raise ValidationFailedError('step is the typed step',
+                                            details={'step': step})
+            changed['step'] = str(step)
+        opacity = _number(parameters, 'sheet_opacity', 0.0, 0.5)
+        if opacity is not None:
+            changed['sheet_opacity'] = opacity
+        nudge = parameters.get('nudge')
+        if nudge is not None:
+            if (not isinstance(nudge, dict)
+                    or set(nudge) - {'direction', 'fine', 'times'}
+                    or isinstance(nudge.get('direction'), bool)
+                    or nudge.get('direction') not in (1, -1)):
+                raise ValidationFailedError(
+                    'nudge is {direction: 1 or -1, fine: bool, times: n}',
+                    details={'nudge': nudge})
+            times = nudge.get('times', 1)
+            if isinstance(times, bool) or not isinstance(times, int) \
+                    or not 1 <= times <= 1000:
+                raise ValidationFailedError('times is a whole number, 1 to 1000')
+            changed['nudge'] = {'direction': nudge['direction'],
+                                'fine': bool(nudge.get('fine', False)),
+                                'times': times}
         if enabled is False and changed:
             raise ValidationFailedError(
                 'a section taken down takes no mode, origin or normal')
         if enabled is None and not changed:
-            raise ValidationFailedError('give enabled, mode, origin or normal')
+            raise ValidationFailedError(
+                'give enabled, mode, origin, normal, flip, combine, '
+                'cell_rule, solo, lock, drag_axis, step_choice, step, '
+                'sheet_opacity, handle_visible, plane or nudge')
         wanted = True if enabled is None else enabled
         changed['enabled'] = wanted
         state.inspection['section'] = wanted
-        state.section = ({**state.section, **changed} if wanted
+        # the actions are not state the view keeps
+        kept = {k: v for k, v in changed.items() if k not in ('flip', 'nudge')}
+        state.section = ({**state.section, **kept} if wanted
                          else {'enabled': False})
         return {'section': changed}
 
@@ -589,6 +886,15 @@ class PresentationOperations:
                     checked[key] = value
                 elif key in ELEMENT_NUMBERS:
                     checked[key] = _number(options, key, *ELEMENT_NUMBERS[key])
+                elif key == 'light_lines' and (
+                        isinstance(value, int) and not isinstance(value, bool)):
+                    if value not in LIGHT_LINES:
+                        raise ValidationFailedError(
+                            'light_lines is 0, 1 or 2', details={
+                                'light_lines': value,
+                                'allowed': {str(k): v for k, v in
+                                            LIGHT_LINES.items()}})
+                    checked[key] = value
                 elif key in ELEMENT_CHOICES:
                     if not isinstance(value, str) or not value.strip():
                         raise ValidationFailedError(

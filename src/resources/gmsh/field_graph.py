@@ -318,13 +318,15 @@ def _row_nodes(row, index):
             node_id=f'{prefix}/frustum', row=name, kind='Frustum',
             # The inner radii are zero: the refinement runs from the axis out
             # to the end radius, and the two ends carry their own radius --
-            # that is what makes it a frustum rather than a tube.
+            # that is what makes it a frustum rather than a tube. The names
+            # are Gmsh 4.15.2's own (Plan 48 GM8); R1_inner and the like are
+            # its deprecated spellings of the same options.
             numbers=(('X1', cx), ('Y1', cy), ('Z1', cz),
                      ('X2', cx + ax), ('Y2', cy + ay), ('Z2', cz + az),
-                     ('R1_inner', 0.0), ('R1_outer', _number(row, 'radius')),
-                     ('R2_inner', 0.0), ('R2_outer', _number(row, 'radiusEnd')),
-                     ('V1_inner', inside), ('V1_outer', outside),
-                     ('V2_inner', inside), ('V2_outer', outside)),
+                     ('InnerR1', 0.0), ('OuterR1', _number(row, 'radius')),
+                     ('InnerR2', 0.0), ('OuterR2', _number(row, 'radiusEnd')),
+                     ('InnerV1', inside), ('OuterV1', outside),
+                     ('InnerV2', inside), ('OuterV2', outside)),
             output=True),)
 
     if kind == 'math_eval':

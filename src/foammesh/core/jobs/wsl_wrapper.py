@@ -37,6 +37,11 @@ import shlex
 RUN_PREFIX = 'FOAMMESH_RUN '
 EXIT_PREFIX = 'FOAMMESH_EXIT '
 HEARTBEAT_PREFIX = 'FOAMMESH_HB '
+#: Plan 48 PM. ``FOAMMESH_PEAK <run_id> kb=<n> measure=<how> reason=<why>``
+#: goes out just before the exit line: the peak resident set of the mesher, or
+#: ``measure=unavailable`` with the reason. ``kb`` is empty when unavailable.
+PEAK_PREFIX = 'FOAMMESH_PEAK '
+PEAK_MEASURE = 'time'
 #: The environment variables ``JobManager`` passes through ``WSLENV``.
 RUN_ID_VARIABLE = 'FOAMMESH_RUN_ID'
 RUN_DIR_VARIABLE = 'FOAMMESH_RUN_DIR'
@@ -77,20 +82,33 @@ def wrapped_script(*, prelude: str, runtime_cwd: str, run: str,
     reads, relative to *runtime_cwd*.
     """
     pid = shlex.quote(pid_name)
-    grouped = 'setsid bash -c ' + shlex.quote('exec stdbuf -oL -eL ' + run)
+    # Plan 48 PM. `/usr/bin/time -f %M` (GNU time) execs the mesher as its
+    # child, reports the peak resident set in kB to a side file (never to the
+    # mesher's stdout or stderr) and exits with the mesher's own status. When
+    # the distro has no /usr/bin/time the mesher runs bare and the peak is
+    # reported as unavailable; a missing measure never fails a run.
+    inner = (
+        'if [ -x /usr/bin/time ] && [ -n "$FM_TIME_FILE" ]; then '
+        'exec /usr/bin/time -f %M -o "$FM_TIME_FILE" stdbuf -oL -eL ' + run
+        + '; else exec stdbuf -oL -eL ' + run + '; fi')
+    grouped = 'setsid bash -c ' + shlex.quote(inner)
     watcher = shlex.quote(_WATCHER)
     parts = [
         f'rid="${{{RUN_ID_VARIABLE}:-{token}}}"',
         f'rdir="${{{RUN_DIR_VARIABLE}:-}}"',
         'rec=""; [ -n "$rdir" ] && mkdir -p "$rdir" 2>/dev/null && rec="$rdir/$rid.linux"',
         'child=""',
+        'peak=""; pmeasure=""; preason=""',
+        'export FM_TIME_FILE="${rdir:-/tmp}/.foammesh-$rid.time"',
         # A record only ever says `exited` when nothing of the run is left.
         'fm_exit() { rc=$?; '
         'if [ -n "$child" ] && { kill -0 -- "-$child" 2>/dev/null '
         '|| pgrep -s "$child" >/dev/null 2>&1; }; then exit "$rc"; fi; '
         '[ -n "$rec" ] && printf \'{"run_id":"%s","pgid":%s,"sid":%s,'
-        '"state":"exited","rc":%s,"at":"%s"}\\n\' "$rid" "${child:-null}" '
-        '"${child:-null}" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        '"state":"exited","rc":%s,"peak_kb":%s,"peak_measure":"%s",'
+        '"at":"%s"}\\n\' "$rid" "${child:-null}" '
+        '"${child:-null}" "$rc" "${peak:-null}" "${pmeasure:-unavailable}" '
+        '"$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
         '> "$rec.tmp" 2>/dev/null && mv -f "$rec.tmp" "$rec" 2>/dev/null; '
         'echo "FOAMMESH_EXIT $rid rc=$rc" >&2; exit "$rc"; }',
         'trap fm_exit EXIT',
@@ -102,7 +120,7 @@ def wrapped_script(*, prelude: str, runtime_cwd: str, run: str,
         script += f'{prelude} || exit $?; '
     script += (
         f'cd {shlex.quote(runtime_cwd)} || exit $?; '
-        f'rm -f {pid}; '
+        f'rm -f {pid} "$FM_TIME_FILE"; '
         f'{grouped} </dev/null 3<&- & child=$!; '
         f'echo "$child" > {pid}; '
         '[ -n "$rec" ] && printf \'{"run_id":"%s","pgid":%s,"sid":%s,'
@@ -118,6 +136,15 @@ def wrapped_script(*, prelude: str, runtime_cwd: str, run: str,
         '( while kill -0 "$child" 2>/dev/null; do '
         f'echo "FOAMMESH_HB $rid" >&2; sleep {HEARTBEAT_SECONDS}; done ) & hb=$!; '
         'wait "$child"; status=$?; '
+        # The measure file is the mesher's, read once it has ended.
+        'pmeasure=unavailable; preason=no-usr-bin-time; '
+        'if [ -x /usr/bin/time ]; then preason=no-measure-file; '
+        'if [ -s "$FM_TIME_FILE" ]; then '
+        'peak=$(tail -n 1 "$FM_TIME_FILE" 2>/dev/null); '
+        'case "$peak" in ""|*[!0-9]*) peak=""; preason=unreadable-measure;; '
+        f'*) pmeasure={PEAK_MEASURE}; preason="";; esac; fi; fi; '
+        'rm -f "$FM_TIME_FILE" 2>/dev/null; '
+        'echo "FOAMMESH_PEAK $rid kb=$peak measure=$pmeasure reason=$preason" >&2; '
         'kill "$hb" 2>/dev/null; '
         # Anything the mesher left behind in its group or session is a stray
         # writer; nothing is reported finished while one lives.

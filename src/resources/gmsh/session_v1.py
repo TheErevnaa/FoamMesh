@@ -47,6 +47,24 @@ import traceback
 
 import numpy as np
 
+# Plan 48 seam: one mixin per area, each in its own file next to this one.
+# Running this file as a script already puts its directory on the path;
+# loading it as a module by file does not.
+try:
+    import session_options_v1  # noqa: F401
+except ImportError:  # pragma: no cover - exercised only by the module loader
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from session_options_v1 import SessionOptionsMixin
+from session_readers_v1 import SessionReadersMixin
+from session_geometry_v1 import SessionGeometryMixin
+from session_mesh_v1 import SessionMeshMixin
+from session_plugins_v1 import SessionPluginsMixin
+from session_export_v1 import SessionExportMixin
+from session_fields_v1 import SessionFieldsMixin
+from session_cvt_v1 import SessionCvtMixin
+# Plan 48 RR (DP-4009): the stage functions the batch runner also plays.
+from stages.session import SessionStageOperations
+
 PROTOCOL = 1
 EXIT_ABORTED = 75
 EXIT_TIMEOUT = 76
@@ -72,6 +90,7 @@ _VTK_CELLS = {
     6: (13, 6, None),
     7: (14, 5, None),
     15: (1, 1, None),
+    140: (10, 4, None),          # trihedron (MSH_TRIH_4), a 4-node carrier
     # High-order curves and surfaces keep every node, in VTK's Lagrange (and
     # quadratic quad) cells, whose node order is Gmsh's: corners, edge nodes
     # along each edge, interior. The viewer cuts each edge into
@@ -105,7 +124,19 @@ _MUTATING_SESSION = ('session.import', 'session.script',
                      'session.size_field', 'session.size_field_off',
                      'session.open', 'session.reclassify',
                      'session.create_topology', 'session.create_geometry',
-                     'session.remesh_surfaces', 'session.plugin_edit')
+                     'session.remesh_surfaces', 'session.plugin_edit',
+                     # Plan 48 GM7: the mesh edits, logged and replayed.
+                     # (reclassify_edges, list_mesh_elements and
+                     # get_mesh_order are reads.)
+                     'session.regularize', 'session.remove_elements',
+                     'session.delete_entity_mesh',
+                     'session.reclassify_subset', 'session.quad_layout',
+                     # Plan 48 GM16b: the CVT apply, logged and replayed
+                     # (cvt_run only writes files and stays out).
+                     'session.cvt_apply',
+                     # Plan 48 RR (DP-4009): the shared stages, logged and
+                     # replayed (stage_report only reads).
+                     'session.stage_import', 'session.stage_apply')
 _ROOTS = ('model', 'option', 'merge', 'write', 'clear', 'logger', 'plugin',
           'onelab', 'view')
 
@@ -289,6 +320,14 @@ def _write_calls(text: str) -> None:
         handle.write(text + '\n')
 
 
+
+def _gmsh_last_error(gmsh) -> str:
+    """The last error Gmsh logged, '' when it keeps none."""
+    try:
+        return str(gmsh.logger.getLastError() or '')
+    except Exception:                                    # noqa: BLE001
+        return ''
+
 class _Recorder:
     """The Gmsh module, with every model-changing call written down."""
 
@@ -344,6 +383,10 @@ def _append_log(request: dict) -> None:
         return
     entry = {'op': request['op'], 'args': request.get('args') or [],
              'kwargs': request.get('kwargs') or {}}
+    if request.get('again') is not None:
+        # DP-5738: a step the controller made again after a re-import; a
+        # rebuild from the log runs it, the build list skips it
+        entry['again'] = request['again']
     os.makedirs(os.path.dirname(_log_path) or '.', exist_ok=True)
     with open(_log_path, 'a', encoding='utf-8') as handle:
         handle.write(json.dumps(entry, separators=(',', ':'),
@@ -538,7 +581,15 @@ def _collect(gmsh, dims, *, quality: bool):
 
 # -- operations -------------------------------------------------------------- #
 
-class Session:
+def _has_elements(gmsh, dim: int) -> bool:
+    """Whether any entity of dimension *dim* holds an element."""
+    return any(len(t) for _d, e in gmsh.model.getEntities(dim)
+               for t in gmsh.model.mesh.getElements(dim, e)[1])
+
+
+class Session(SessionOptionsMixin, SessionReadersMixin, SessionGeometryMixin,
+              SessionMeshMixin, SessionPluginsMixin, SessionExportMixin,
+              SessionFieldsMixin, SessionCvtMixin, SessionStageOperations):
     def __init__(self, gmsh):
         #: the Gmsh module itself, for the few calls that must not be recorded
         self.raw = gmsh
@@ -563,6 +614,10 @@ class Session:
                                           'extrudeBoundaryLayer'),
             'has_periodic': hasattr(gmsh.model.mesh, 'setPeriodic'),
             'build': build,
+            # Plan 48 GM16a: the file the imported gmsh module came from, so
+            # the build kind (FoamMesh's own or the wheel) is read from the
+            # resident process, not only from the identity probe.
+            'gmsh_file': str(getattr(gmsh, '__file__', '') or ''),
         }
 
     def set_log(self, path, **_):
@@ -604,9 +659,66 @@ class Session:
         return {'entities': [list(item) for item in
                              gmsh.model.getEntities()]}
 
+    def stage_import(self, job, paths=None, **_):
+        """Plan 48 RR (DP-4009). Import the job's CAD as the batch run does
+        (``stages.GeometryStage``): the healing pass, the duplicate-face
+        fusion, the farfield and the scope resolution."""
+        self.model_unit = _occ_unit(self.gmsh)
+        return self._stages_import(job, paths)
+
     def generate(self, dim=3, **_):
         started = time.monotonic()
-        self.gmsh.model.mesh.generate(int(dim))
+        gmsh = self.gmsh
+        if int(dim) > 2 and _has_elements(gmsh, 2) \
+                and not _has_elements(gmsh, 3):
+            # DP-5742: the surface mesh already there (a CVT replace, the 2D
+            # the person made) is what the volumes are meshed from. A surface
+            # cleared and filled again (as the CVT replace does) stays marked
+            # unmeshed in Gmsh, so a plain generate meshed it once more; only
+            # the empty entities are meshed now, one dimension in turn
+            # (MEASURED in ``regenerate``: one generate(3) with MeshOnlyEmpty
+            # meshes nothing). MEASURED (4.15.2): generate(1) deletes every
+            # surface mesh, so the curves, meshed already, are not redone.
+            previous = gmsh.option.getNumber('Mesh.MeshOnlyEmpty')
+            gmsh.option.setNumber('Mesh.MeshOnlyEmpty', 1)
+            try:
+                for step in range(2 if _has_elements(gmsh, 1) else 1,
+                                  int(dim) + 1):
+                    gmsh.model.mesh.generate(step)
+            finally:
+                gmsh.option.setNumber('Mesh.MeshOnlyEmpty', previous)
+        else:
+            if int(dim) > 2 and getattr(self, '_stage_run', None) is not None:
+                # Plan 48 RR (DP-4009). The batch run always meshes the
+                # surfaces in a pass of their own before the volume pass
+                # (``GmshRun.generate``); MEASURED on the sphere farfield
+                # case, one generate(3) holds 164,569 cells and the two passes
+                # 164,661, the batch run's count.
+                gmsh.model.mesh.generate(2)
+                copy = getattr(self._stage_run, 'copy_periodic_surfaces',
+                               None)
+                if copy is not None and getattr(self._stage_run,
+                                                'periodic_copies', None):
+                    # DP-6054. A periodic side the layer stage rebuilt takes
+                    # its partner's surface mesh before the volume pass, as
+                    # in the batch run.
+                    copy()
+                gmsh.model.mesh.generate(int(dim))
+                strips = getattr(self._stage_run, 'declare_periodic_strips',
+                                 None)
+                if copy is not None and strips is not None and getattr(
+                        self._stage_run, 'periodic_copies', None):
+                    # DP-6066. The pairs' layer strips are declared once the
+                    # stacks beside them are extruded, as in the batch run.
+                    strips()
+            else:
+                gmsh.model.mesh.generate(int(dim))
+        crack =getattr(getattr(self, '_stage_run', None),
+                        'crack_baffles', None)
+        if int(dim) > 2 and crack is not None:
+            # Plan 49 SR5. A blocking baffle is split into its two sides
+            # after the volume mesh, as the batch run does.
+            crack()
         return {'dim': int(dim), 'seconds': time.monotonic() - started,
                 'state': self.state()}
 
@@ -757,6 +869,24 @@ class Session:
         self.gmsh.write(path)
         return {'path': path, 'bytes': os.path.getsize(path)}
 
+    def write_surface(self, path, **_):
+        """Write the mesh in hand, every element, as ASCII MSH 2.2 (Plan 48
+        GM12, DP-4355): after Mesh 2D the file holds the surface mesh alone,
+        which ``surface_deviation`` measures straight away. The session's own
+        options are put back; the model and the op log are untouched."""
+        option = self.gmsh.option
+        names = ('Mesh.SaveAll', 'Mesh.MshFileVersion', 'Mesh.Binary')
+        before = {name: option.getNumber(name) for name in names}
+        try:
+            option.setNumber('Mesh.SaveAll', 1)
+            option.setNumber('Mesh.MshFileVersion', 2.2)
+            option.setNumber('Mesh.Binary', 0)
+            self.gmsh.write(path)
+        finally:
+            for name, value in before.items():
+                option.setNumber(name, value)
+        return {'path': path, 'bytes': os.path.getsize(path)}
+
     # Plan 41 GN15: save the session mesh in any format, read it back ------- #
     def export_facts(self, **_):
         """Order, element families, partitions and counts of the mesh in hand."""
@@ -784,6 +914,45 @@ class Session:
                     done += 1
         return {'replayed': done}
 
+    def _entity_extent(self, dim, tag):
+        """The bounding box of an entity, also of one with no CAD extent.
+
+        The built-in kernel's boundary-layer curves and surfaces
+        (``geo.extrudeBoundaryLayer``) have no geometry of their own, and
+        ``getBoundingBox`` raises "Empty bounding box" for them; their mesh
+        nodes stand in, else their boundary points, so a model with layers
+        does not take the whole entity table down (DP-5709).
+        """
+        gmsh = self.raw
+        try:
+            return gmsh.model.getBoundingBox(dim, tag)
+        except Exception:                                # noqa: BLE001
+            pass
+        xyz = []
+        try:
+            _nodes, coords, _p = gmsh.model.mesh.getNodes(
+                dim, tag, includeBoundary=True)
+            xyz = [coords[i:i + 3] for i in range(0, len(coords), 3)]
+        except Exception:                                # noqa: BLE001
+            pass
+        if not xyz:
+            try:
+                points = [(0, tag)] if dim == 0 else [
+                    e for e in gmsh.model.getBoundary(
+                        [(dim, tag)], combined=False, oriented=False,
+                        recursive=True) if e[0] == 0]
+            except Exception:                            # noqa: BLE001
+                points = []
+            for _d, t in points:
+                try:
+                    xyz.append(gmsh.model.getValue(0, abs(int(t)), []))
+                except Exception:                        # noqa: BLE001
+                    pass
+        if not xyz:
+            return [0.0] * 6
+        return ([min(p[i] for p in xyz) for i in range(3)]
+                + [max(p[i] for p in xyz) for i in range(3)])
+
     def entities(self, **_):
         """Every entity of the model for picking (Plan 41 GN4).
 
@@ -799,7 +968,7 @@ class Session:
                 groups.setdefault((dim, int(entity)), []).append(int(ptag))
         rows = []
         for dim, tag in gmsh.model.getEntities():
-            extent = gmsh.model.getBoundingBox(dim, tag)
+            extent = self._entity_extent(dim, tag)
             row = {'dim': int(dim), 'tag': int(tag),
                    'name': gmsh.model.getEntityName(dim, tag),
                    'physical': groups.get((dim, int(tag)), []),
@@ -924,7 +1093,19 @@ class Session:
             raise ValueError(str(error)) from error
 
     def open(self, path, mode='open', **options):
-        """File > Open (replace the model) or File > Merge (add to it)."""
+        """File > Open (replace the model) or File > Merge (add to it).
+
+        Plan 48 DP-4050 / DP-4051. A reader ``open_file`` does not list (.nas,
+        .neu, .p3d, .diff, .wrl, .vrml, .iv, .geom, .mmed, .rmed, .vis, and
+        .dat, which is not refused) and a ``.gz`` of any format go to
+        ``read_file`` (``OpenRequest.operation``).
+        """
+        lowered = str(path).lower()
+        if lowered.endswith('.gz') and not lowered.endswith('.nii.gz'):
+            return self.read_file(path, mode)
+        extension = os.path.splitext(lowered)[1]
+        if extension in self._reader_only_extensions():
+            return self.read_file(path, mode)
         result = self._imported_call('open_file', path, mode, **options)
         applied = (result.get('applied') or {}).get('unit')
         if applied is not None and (mode == 'open'
@@ -933,6 +1114,20 @@ class Session:
         elif mode == 'open':
             self.model_unit = None
         return result
+
+    def _reader_only_extensions(self):
+        """Extensions ``read_file`` takes that ``open_file`` does not list."""
+        try:
+            import session_readers_v1 as readers
+        except ImportError:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import session_readers_v1 as readers
+        return set(readers.READERS) - set(self._importer().KINDS)
+
+    def prime_unit(self, **_):
+        """Plan 48 DP-4001. Prime the OCC reader so ``Geometry.OCCTargetUnit``
+        can be set before an IGES is read (no empty-file trick)."""
+        return self._imported_call('prime_unit')
 
     def reclassify(self, **options):
         """Mesh > Reclassify 2D (every ``classifySurfaces`` argument)."""
@@ -958,11 +1153,35 @@ class Session:
         except ImportError:                              # pragma: no cover
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import geometry_build_v1 as builder
+        # DP-5602: synchronize re-reads every OpenCASCADE face, and one of an
+        # imported model (the kept pipe's surface 5) logs "Could not fix wire";
+        # the native window prints it and adds the box, the API (AbortOnError
+        # 2) threw it and lost the step. Run the step as the window does; an
+        # operation that really fails still throws, and Gmsh's error is shown.
+        gmsh = self.gmsh
+        # DP-5716. The stage run's names and scopes follow the build, as the
+        # batch run's do at its ``geometry`` hook (runner_parts.geometry).
+        run = getattr(self, '_stage_run', None)
+        snapshot = (run.build_snapshot()
+                    if run is not None and getattr(run, 'gmsh', None) is gmsh
+                    and hasattr(run, 'build_snapshot') else None)
+        abort = gmsh.option.getNumber('General.AbortOnError')
+        last = _gmsh_last_error(gmsh)
+        gmsh.option.setNumber('General.AbortOnError', 0)
         try:
-            result = builder.apply(self.gmsh, kind, params)
+            result = builder.apply(gmsh, kind, params)
         except builder.BuildError as error:
             raise ValueError(str(error)) from error
-        result['entities'] = {str(d): len(self.gmsh.model.getEntities(d))
+        finally:
+            gmsh.option.setNumber('General.AbortOnError', abort)
+        if snapshot is not None:
+            followed = run.follow_geometry_build(snapshot, kinds=[kind])
+            if followed:
+                result['followed'] = followed
+        error = _gmsh_last_error(gmsh)
+        if error and error != last:
+            result['gmsh_error'] = error
+        result['entities'] = {str(d): len(gmsh.model.getEntities(d))
                               for d in range(4)}
         return result
 
@@ -1015,6 +1234,9 @@ class Session:
             native.remove(self.gmsh, [old])
             self._combiner_tag = None
         tags = list(getattr(self, '_user_background', []))
+        # Plan 48 RR: the per-volume sizes of the volume controls, which the
+        # batch run assembles into the same background.
+        tags.extend(getattr(self, '_stage_background', []))
         auto = getattr(self, '_auto', None)
         if auto is not None:
             tags.append(auto['field'])
@@ -1197,8 +1419,14 @@ class Session:
             low, high = gmsh.model.getBoundingBox(-1, -1)[:3], \
                 gmsh.model.getBoundingBox(-1, -1)[3:]
             diagonal = float(np.linalg.norm(np.subtract(high, low))) or 1.0
+            # DP-5732: no curvature sizing here. On a Built-in model a
+            # degenerate spline (a straight edge kept as a NURBS) gives Gmsh's
+            # curvature sizing no end, and every hand-over waited minutes.
+            # Circles and curves get their points from Gmsh's minimums.
             for name, value in (('Mesh.MeshSizeMax', diagonal / 20.0),
-                                ('Mesh.MeshSizeFromCurvature', 12.0)):
+                                ('Mesh.MeshSizeFromCurvature', 0.0),
+                                ('Mesh.MinimumCirclePoints', 24.0),
+                                ('Mesh.MinimumCurvePoints', 8.0)):
                 saved[name] = gmsh.option.getNumber(name)
                 gmsh.option.setNumber(name, value)
             gmsh.model.mesh.generate(2)
@@ -1233,10 +1461,20 @@ class Session:
         return {'path': path, 'cells': len(order)}
 
 
+_MEDIT_RETIRED = ("Medit (.mesh) export was retired in 1.1.4: Gmsh 4.15.2's "
+                  'writer crashes; export .msh, .su2, VTK or polyMesh instead.')
+
+
 def dispatch(session: Session, request: dict):
     op = request['op']
     args = request.get('args') or []
     kwargs = request.get('kwargs') or {}
+    if op in ('write', 'session.write', 'session.export'):
+        # DP-1437: Gmsh 4.15.2's Medit writer segfaults this process on
+        # tet+prism meshes; the Medit export is retired from FoamMesh.
+        target = args[0] if args else kwargs.get('path', kwargs.get('fileName'))
+        if str(target or '').lower().endswith(('.mesh', '.meshb')):
+            raise ValueError(_MEDIT_RETIRED)
     if op == 'session.import':
         return session.import_(*args, **kwargs)
     if op == 'mesh.generate':

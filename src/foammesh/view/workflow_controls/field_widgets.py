@@ -16,8 +16,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QPainter, QPalette, QValidator
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QLabel, QLineEdit, QMenu,
-    QSpinBox, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+    QSpinBox, QToolButton, QWidget,
 )
 
 from shiboken6 import isValid
@@ -25,7 +25,7 @@ from shiboken6 import isValid
 from foammesh.core import display_unit, quantity_expr
 from foammesh.core.facade.field_tiers import tier_of
 from foammesh.view.theming.metrics import (
-    CompactDoubleSpinBox, CompactSpinBox, UnitLabel,
+    NUMBER_FIELD_MAX_WIDTH, CompactDoubleSpinBox, CompactSpinBox, UnitLabel,
 )
 from foammesh.view.combo_items import set_item_enabled
 from foammesh.view import inline_error
@@ -88,6 +88,43 @@ def unset_phrase(field_id: str) -> str:
 #: grid's floor for every spin box (``sheet_form.elide_combos``).
 SPECIAL_TEXT_FLOOR = 72
 _ELIDER_PROPERTY = 'foammeshSpecialTextElider'
+#: DP-2874 (user, 2026-10-21): a field that was rewritten carries a small
+#: anticlockwise arrow beside it; one click puts it back.
+#: DP-2873. Editors that draw a frame share the compact field width.
+FRAMED_EDITORS = (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit)
+EDITOR_STRETCH = 100
+RESET_ICON = ':/graphicsIcons/resetField.svg'
+#: Plan 47 SZ11 (user, 2026-10-21): a number the size field proposed carries
+#: only this mark; the tooltip names who proposed it.
+PROPOSED_MARK = '*'
+PROPOSED_TIP = 'Proposed by FoamMesh sizing'
+RESET_BUTTON_SIZE = 16
+RESET_ICON_SIZE = 12
+
+
+def add_editor_row(row, editor) -> None:
+    """Put *editor*, its unit, its reset arrow and its ``*`` into *row*.
+
+    DP-2873. The editor takes the compact field width and the rest of the row
+    is empty. Every framed editor (number, choice, text) gets the same width,
+    so a column still ends its boxes at one x (DP-156). The editor's stretch
+    far outweighs the trailing one, so it fills to the cap before the space
+    goes to the empty end, and on a narrow panel it narrows like the others.
+    """
+    widget = editor.editor
+    if isinstance(widget, FRAMED_EDITORS):
+        widget.setMaximumWidth(NUMBER_FIELD_MAX_WIDTH)
+    row.addWidget(widget, EDITOR_STRETCH)
+    row.addWidget(editor.unit_label)
+    # The arrow and the ``*`` sit together with no gap: on a sheet column
+    # every pixel of a row's minimum counts (Plan 45 V11, 257 px).
+    marks = QHBoxLayout()
+    marks.setContentsMargins(0, 0, 0, 0)
+    marks.setSpacing(0)
+    marks.addWidget(editor.reset_button)
+    marks.addWidget(editor.badge_label)
+    row.addLayout(marks)
+    row.addStretch(1)
 
 
 class _SpecialTextElider(QObject):
@@ -158,8 +195,11 @@ class _SpecialTextElider(QObject):
             return False
         if not (isValid(self._box) and isValid(self._edit)):
             return False
+        # DP-2873 (live). The text can arrive after the box took its width
+        # (Threads gets "Mesh setup (15 threads)" from its page), so the
+        # tooltip is kept in step at paint as well as at resize.
+        self._tooltip()
         if kind == QEvent.Type.Resize:
-            self._tooltip()
             return False
         if not self.isElided():
             return False
@@ -212,12 +252,53 @@ def fit_special_text(widget) -> None:
         return
     # The minimum width is set, never left at 0: a 0 lets the layout fall
     # back on the minimum size hint, which counts the special text whole.
-    widget.setMinimumWidth(max(int(base or 0), SPECIAL_TEXT_FLOOR))
+    _fit_number(widget)
     if (getattr(widget, '_foammeshSpecialElider', None) is None
             and hasattr(widget, 'lineEdit')):
         setattr(widget, '_foammeshSpecialElider', _SpecialTextElider(widget))
         widget.setProperty(_ELIDER_PROPERTY, True)
+        if hasattr(widget, 'valueChanged'):
+            widget.valueChanged.connect(lambda *_a, w=widget: _fit_number(w))
     widget.updateGeometry()
+
+
+def number_width(widget) -> int:
+    """The width a spin box needs to show its value whole, as Qt sizes it.
+
+    DP-2879 (live, 1280x800 and 1600x1000): a box with a special text kept
+    only the sheet's floor as its minimum, so on a narrow column the number
+    lost its leading digits (``0.0007706`` showed as ``007706``). The number
+    is what the box is for; only the special text may be elided.
+    """
+    from PySide6.QtCore import QSize
+    from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox
+    if not hasattr(widget, 'textFromValue'):
+        return 0
+    if widget.specialValueText() and widget.value() == widget.minimum():
+        return 0
+    metrics = widget.fontMetrics()
+    # QAbstractSpinBox::sizeHint: the text, a space, and 2 px for the cursor.
+    text = (widget.prefix() + widget.textFromValue(widget.value())
+            + widget.suffix() + ' ')
+    contents = QSize(metrics.horizontalAdvance(text) + 2,
+                     widget.lineEdit().sizeHint().height())
+    option = QStyleOptionSpinBox()
+    widget.initStyleOption(option)
+    return widget.style().sizeFromContents(
+        QStyle.ContentsType.CT_SpinBox, option, contents, widget).width()
+
+
+def _fit_number(widget) -> None:
+    if not isValid(widget):
+        return
+    base = widget.property('foammeshBaseMinWidth')
+    wanted = max(int(base or 0), SPECIAL_TEXT_FLOOR)
+    if widget.specialValueText():
+        wanted = max(wanted, number_width(widget))
+    wanted = min(wanted, widget.maximumWidth())
+    if widget.minimumWidth() != wanted:
+        widget.setMinimumWidth(wanted)
+        widget.updateGeometry()
 
 
 def auto_text(field_id: str, effective: str | None = None) -> str:
@@ -756,6 +837,7 @@ class FieldEditor(QWidget):
         fit_badge(self.badge_label)
         self.badge_label.setProperty('foammeshStatus', 'info')
         self.badge_label.setVisible(False)
+        self.reset_button = self._reset_button()
         _connect(self._editor, self._emit)
         if isinstance(self._editor, LengthDoubleSpinBox):
             display_unit.subscribe(self._on_display_unit)
@@ -784,16 +866,22 @@ class FieldEditor(QWidget):
     # -- the size field's badge (Plan 41 GN25c) ------------------------------ #
 
     def setFieldBadge(self, text: str) -> None:
-        """Say the size field proposed this control ('' takes the badge off)."""
+        """Say the size field proposed this control ('' takes the badge off).
+
+        Plan 47 SZ11 (user, 2026-10-21): the number in the field is the whole
+        statement; beside it is only a ``*`` whose tooltip says who proposed
+        it. *text* (the rule, "field: 20 mm") is kept for ``fieldBadge``.
+        """
         text = str(text or '').strip()
-        self.badge_label.setText(text)
-        self.badge_label.setToolTip(text)
-        self.badge_label.setAccessibleName(text)
+        self._badge_detail = text
+        self.badge_label.setText(PROPOSED_MARK if text else '')
+        self.badge_label.setToolTip(PROPOSED_TIP if text else '')
+        self.badge_label.setAccessibleName(PROPOSED_TIP if text else '')
         self.badge_label.setVisible(bool(text) and self._applies
                                     and not self._tier_hidden)
 
     def fieldBadge(self) -> str:
-        return self.badge_label.text()
+        return getattr(self, '_badge_detail', '')
 
     # -- tiers, the default marker and reset (UXD4) ------------------------ #
 
@@ -829,10 +917,36 @@ class FieldEditor(QWidget):
         self.valueChanged.emit(self.field_id, self.value())
         return True
 
+    def _reset_button(self) -> QToolButton:
+        """The small anticlockwise arrow shown while the field is rewritten."""
+        from PySide6.QtCore import QSize
+        from foammesh.view.theming.icons import load_themed_icon
+        button = QToolButton(self)
+        button.setObjectName('fieldResetButton')
+        button.setIcon(load_themed_icon(RESET_ICON))
+        button.setIconSize(QSize(RESET_ICON_SIZE, RESET_ICON_SIZE))
+        button.setFixedSize(RESET_BUTTON_SIZE, RESET_BUTTON_SIZE)
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        text = QCoreApplication.translate('FieldEditor', 'Reset to default')
+        button.setToolTip(text)
+        button.setAccessibleName(f'{text}: {self._name}')
+        # Keeps its room while hidden, so a column's boxes keep one right
+        # edge whether or not the arrow shows (DP-156).
+        policy = button.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        button.setSizePolicy(policy)
+        button.clicked.connect(self.resetToDefault)
+        button.setVisible(False)
+        return button
+
     def _refresh_marker(self) -> None:
         try:
             self.label.setMarked(not self.isAtDefault())
-        except (RuntimeError, ValueError, TypeError):
+            button = getattr(self, 'reset_button', None)
+            if button is not None:
+                button.setVisible(self.canReset() and not self._tier_hidden)
+        except (RuntimeError, ValueError, TypeError, AttributeError):
             pass
 
     def _show_menu(self, host, position) -> None:
@@ -984,6 +1098,8 @@ class FieldEditor(QWidget):
             _write(self._editor, self.descriptor, value)
         finally:
             self._editor.blockSignals(blocked)
+        if getattr(self._editor, '_foammeshSpecialElider', None) is not None:
+            _fit_number(self._editor)       # DP-2879: signals were blocked
         inline_error.clear_invalid(self._editor)
         self._refresh_marker()
 

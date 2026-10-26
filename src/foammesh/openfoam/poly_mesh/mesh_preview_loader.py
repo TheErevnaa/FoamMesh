@@ -141,30 +141,36 @@ class MeshPreviewLoader(QObject):
         if self._buildAnyway:
             total, _available = await asyncio.to_thread(budget.physical_memory)
             override = int(total * BUILD_ANYWAY_SHARE)
+        # DP-5715. The pool is the device that draws the viewport: the free
+        # RAM for the worker, and a discrete card's own memory for what the
+        # picture uploads to it (integrated graphics draw out of the RAM).
+        device, gpu_bytes = await asyncio.to_thread(
+            _drawing_need, operation, counts)
         self.progress.emit(self.tr('Waiting for the mesh worker…'))
         try:
             grant = await budget.controller().admit(
                 operation, estimate, priority=budget.PRIORITY_PREVIEW,
-                budget_override=override)
+                budget_override=override, device=device, gpu_bytes=gpu_bytes)
         except budget.OverBudget as refusal:
             if self._mode == AUTO and volume:
                 return _RETRY_AS_SURFACE
             return await self._outline(
                 'over_budget',
-                self.tr('Preview not built: it needs about {0} and {1} is '
-                        'free.').format(
-                    budget.format_bytes(refusal.estimate.peak_bytes),
-                    budget.format_bytes(refusal.snapshot.budget)),
+                self.tr('Preview not built: {0}.').format(refusal.plain()),
                 refusal=True)
         from foammesh.core.jobs import local_worker
 
         # The volume has no fixed cell or byte cap: its memory was admitted
         # above, and its files are checked against the free RAM before they
         # are opened (`_refuseFiles`).
-        # The surface keeps as many triangles as the GPU that draws it can
-        # hold, its bytes held to a share of the free RAM (gpu_profile).
+        # The surface keeps as many triangles as the device that draws it
+        # can hold (a discrete card's memory, else the free RAM), its bytes
+        # held to what the window can open with the RAM free (gpu_profile).
+        # Those decimate; only the RAM free refuses (DP-5715).
         max_triangles, preview_bytes = await asyncio.to_thread(
             gpu_profile.preview_budget)
+        room = None if volume else await asyncio.to_thread(
+            gpu_profile.window_room)
         max_bytes = None if volume else preview_bytes
         args = {'case': str(self._caseDir), 'time': time,
                 'region_seeds': self._regionSeeds,
@@ -172,6 +178,7 @@ class MeshPreviewLoader(QObject):
                 'max_triangles': max_triangles}
         if max_bytes is not None:
             args['max_bytes'] = max_bytes
+            args['refuse_bytes'] = room if room is not None else 0
         self.progress.emit(self.tr('Building the mesh preview…'))
         async with grant:
             outcome = await local_worker.run_worker(
@@ -183,9 +190,9 @@ class MeshPreviewLoader(QObject):
             if self._mode == AUTO and volume:
                 return _RETRY_AS_SURFACE
             if outcome.status == local_worker.OVER_BUDGET:
-                text = self.tr('Preview not built: the worker ran out of the '
-                               '{0} it was given.').format(
-                    budget.format_bytes(outcome.cap_bytes or grant.cap_bytes))
+                text = self.tr('Preview not built: {0}.').format(
+                    budget.ran_out_text(outcome.cap_bytes or grant.cap_bytes,
+                                        grant.snapshot))
                 return await self._outline('over_budget', text, refusal=True)
             if outcome.reason in ('preview_too_large', 'volume_too_large'):
                 return await self._outline(
@@ -203,7 +210,9 @@ class MeshPreviewLoader(QObject):
         # the system for free memory; on Windows a handle closed on a file
         # just written waits for the virus scanner, 1 to 1.8 s measured on
         # the GUI thread with the 6.6 M-cell impeller (VI14), so not there.
-        refused = await asyncio.to_thread(self._refuseFiles, payload, max_bytes)
+        refused = await asyncio.to_thread(
+            self._refuseFiles, payload, max_bytes,
+            args.get('refuse_bytes'))
         if refused:
             mesh_preview.remove_files(payload)
             return await self._outline('preview_too_large', refused)
@@ -224,8 +233,14 @@ class MeshPreviewLoader(QObject):
                 'patches': [], 'actions': []}
         return scene
 
-    def _refuseFiles(self, payload: dict, max_bytes: int) -> str:
-        """Why the worker's files must not be opened, or ''."""
+    def _refuseFiles(self, payload: dict, max_bytes: int,
+                     refuse_bytes: int | None = None) -> str:
+        """Why the worker's files must not be opened, or ''.
+
+        DP-5715: a size is refused only when opening it needs more RAM than
+        is free -- ``refuse_bytes`` (the window's room in the free RAM), not
+        the decimation target ``max_bytes``. 0 means the RAM could not be
+        read: nothing is refused for size."""
         cache = mesh_preview.cache_dir(self._caseDir).resolve()
         total = 0
         for path, stated in mesh_preview.payload_files(payload):
@@ -241,16 +256,20 @@ class MeshPreviewLoader(QObject):
                 return self.tr('Preview not built: {0} changed after the '
                                'worker wrote it.').format(path.name)
             total += size
-        if max_bytes is not None and total > max_bytes:
-            return self.tr('Preview not built: its files take {0}, over the '
-                           '{1} limit.').format(budget.format_bytes(total),
-                                                budget.format_bytes(max_bytes))
+        limit = max_bytes if refuse_bytes is None else refuse_bytes
+        if max_bytes is not None and limit and total > limit:
+            share = gpu_profile.PREVIEW_MEMORY_SHARE
+            return self.tr('Preview not built: opening it needs about {0} '
+                           'and this PC has {1} of RAM free.').format(
+                budget.format_bytes(int(total / share)),
+                budget.format_bytes(int(limit / share)))
         if max_bytes is None and not self._buildAnyway:
             needed = mesh_preview.VOLUME_LOAD_FACTOR * total
             measured = budget.quick_snapshot()
             if needed > measured.budget:
                 return self.tr('Preview not built: opening the volume needs '
-                               'about {0} of RAM and {1} is free.').format(
+                               'about {0} and this PC has {1} of RAM '
+                               'free.').format(
                     budget.format_bytes(needed),
                     budget.format_bytes(measured.budget))
         return ''
@@ -284,3 +303,14 @@ class MeshPreviewLoader(QObject):
 
 
 _RETRY_AS_SURFACE = object()
+
+
+def _drawing_need(operation: str, counts):
+    """``(device, gpu_bytes)`` for the admission: the device that draws the
+    viewport and what the picture uploads to it (DP-5715)."""
+    try:
+        return (gpu_profile.drawing_device(),
+                gpu_profile.gpu_bytes_for(operation, counts))
+    except Exception:                                      # noqa: BLE001
+        logger.debug('drawing device unreadable', exc_info=True)
+        return None, 0

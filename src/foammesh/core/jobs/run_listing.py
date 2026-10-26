@@ -17,6 +17,8 @@ import os
 import re
 from pathlib import Path
 
+from foammesh.core.naming import EXACT_NAMES
+
 SCHEMA_VERSION = 1
 DIRECTORY = ('foammesh', 'run-listing')
 #: The newest entries kept; older ones are removed when a new one is written.
@@ -75,7 +77,8 @@ def list_entries(case_path) -> list[dict]:
 
 
 #: DP-2855. What a run of each engine is called in the listing.
-RUN_NAMES = {'gmsh': 'Gmsh mesh run', 'snappy': 'snappyHexMesh mesh run'}
+RUN_NAMES = {engine: f'{EXACT_NAMES[engine]} mesh run'
+             for engine in ('gmsh', 'snappy')}
 
 #: DP-2855. A run manifest's disposition as the listing's status, in the
 #: words its stage and session-action rows use. ``accepted`` is the quality

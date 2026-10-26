@@ -59,6 +59,18 @@ SINGLE_BOUNDARY_DETAIL = (
 VOLUME_ROW = object()
 
 
+def built_model_reason(tr, built) -> str:
+    """DP-5717/DP-5719. Why the boundary tools are off after a geometry
+    build that replaced the model, said the same in the table and the tree."""
+    rows = list(built.get('patches') or ())
+    replaced = ', '.join(built.get('replaced') or ())
+    return str(tr(
+        '{0} boundaries of the model the geometry build made; it replaced '
+        '{1}. Rename them in the physical-group table of the geometry '
+        'builder: rename, merge and split here act on the prepared patches '
+        'the build replaced.')).format(len(rows), replaced)
+
+
 class BoundaryOperations:
     """Rename, merge, split and split-by-angle, without a list of their own.
 
@@ -482,7 +494,22 @@ class BoundaryActions(QWidget, BoundaryOperations):
             self._say(self.tr('Boundaries unavailable: {0}').format(error))
             return
         self._patches = list(payload.get('patches', []))
-        if payload.get('single_boundary'):
+        # DP-5719. After a geometry build that replaced the model, the
+        # prepared patches these four act on are not what the run publishes;
+        # the built surfaces are renamed in the build's physical-group table.
+        built = payload.get('built_model') or {}
+        reason = built_model_reason(self.tr, built) if built else ''
+        self._builtReason = reason
+        for action in self.boundaryActions():
+            if not hasattr(action, '_plainTip'):
+                action._plainTip = action.toolTip()
+            action.setEnabled(not built)
+            action.setToolTip(reason or action._plainTip)
+        self._editButton.setEnabled(not built)
+        self._featureAngle.setEnabled(not built)
+        if built:
+            self._say(reason)
+        elif payload.get('single_boundary'):
             self._say(self.tr(SINGLE_BOUNDARY_NOTE),
                       self.tr(SINGLE_BOUNDARY_DETAIL))
         else:
@@ -695,6 +722,13 @@ class BoundaryPanel(QWidget, BoundaryOperations):
                 self.tr('Boundaries unavailable: {0}').format(error))
             return
         rows = payload.get('patches', [])
+        built = payload.get('built_model') or {}
+        for button in (self._mergePatches, self._splitPatch,
+                       self._splitByAngle, self._featureAngle):
+            button.setEnabled(not built)
+        if built:
+            self._showBuiltModel(built)
+            return
         # Blocked while filling: every setItem emits itemChanged, and an
         # unguarded handler would send a rename for each row it just drew.
         with QSignalBlocker(self._patchTable):
@@ -715,6 +749,33 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         else:
             self._patchNote.setText(self.tr('{0} boundaries.').format(
                 payload.get('count', len(rows))))
+
+    def _showBuiltModel(self, built):
+        """DP-5717. The boundaries of the model a geometry build made.
+
+        A Gmsh build that replaced the prepared surfaces (delete the pipe,
+        draw a slab, 2D case) leaves a model whose boundaries are the
+        build's groups and the new faces, named as the run names them. The
+        prepared rows are no longer what the solver will see, so the table
+        lists the built ones; they are renamed in the physical-group table
+        of the geometry builder, so here they are read only.
+        """
+        rows = list(built.get('patches') or ())
+        with QSignalBlocker(self._patchTable):
+            self._patchTable.setRowCount(len(rows))
+            for row, patch in enumerate(rows):
+                values = (str(patch.get('name') or ''),
+                          self.tr('Geometry build'),
+                          str(patch.get('surfaces', 1)))
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole,
+                                     {**dict(patch), 'built': True})
+                        item.setToolTip(str(patch.get('category') or ''))
+                    self._patchTable.setItem(row, column, item)
+        self._patchNote.setText(built_model_reason(self.tr, built))
 
     def _highlightPatches(self):
         """Say in the viewport which face the selected row is.
@@ -758,6 +819,6 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         if item.column() != 0:
             return
         patch = item.data(Qt.ItemDataRole.UserRole) or {}
-        if not patch:
+        if not patch or patch.get('built'):
             return
         self._renameTo(patch, item.text().strip())

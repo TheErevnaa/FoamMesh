@@ -64,7 +64,52 @@ def accepted_mesh(case_path) -> RunMesh:
         raise RunMeshRefused(
             f'The mesh of run {run_id} ({path.name}) is not a Gmsh .msh '
             'file; run the mesh again.')
+    record_provenance(Path(case_path), path, row)
     return RunMesh(run_id, path, path.stat().st_mtime_ns)
+
+
+def record_provenance(case_path, mesh_path, row=None) -> bool:
+    """Plan 48 GM12 (DP-4359, DP-4358, DP-4360): keep how the run's mesh was
+    made, keyed by the mesh file, so the viewport tools read the layers the run
+    asked for instead of "unavailable".
+
+    The request comes from the run's own ``job.json``. Once per mesh file: a
+    record that is already there is left alone. Never raises (a missing job
+    only means less is recorded). Returns whether a record was written.
+    """
+    import json
+
+    from foammesh.core import provenance
+
+    case_path, mesh_path = Path(case_path), Path(mesh_path)
+    roots = [case_path]
+    if mesh_path.parent != case_path:
+        roots.append(mesh_path.parent)
+    try:
+        if provenance.find(roots, mesh_path).found:
+            return False
+        job = {}
+        run_path = (row or {}).get('run_path') or str(mesh_path.parent)
+        try:
+            job = json.loads((Path(run_path) / 'job.json').read_text(
+                encoding='utf-8'))
+        except (OSError, ValueError):
+            job = {}
+        intent = job.get('intent') or {}
+        layers = intent.get('layers') or {}
+        requested = None
+        if layers.get('enabled') and layers.get('patches'):
+            requested = {str(name): int(layers.get('layerCount') or 0)
+                         for name in layers['patches']}
+        cad = next((item for item in job.get('geometry') or ()
+                    if Path(str(item)).is_file()), None)
+        for root in roots:
+            provenance.record_mesh(
+                root, mesh_path, route='gmsh', settings=intent or None,
+                requested_layers=requested, cad_reference=cad)
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
 
 
 def loaded(controller) -> tuple | None:

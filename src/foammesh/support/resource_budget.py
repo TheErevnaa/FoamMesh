@@ -150,6 +150,20 @@ HEAVY_OPERATIONS = frozenset({
     'quality.fidelity', 'quality.resolution', 'quality.cell_fields',
     'mesh.preview', 'mesh.volume', 'mesh.section',
 })
+#: DP-5714 / DP-5715. Operations whose worker runs under the free RAM
+#: (:attr:`MemorySnapshot.budget`: available - WSL VM - GUI reserve), not under
+#: 1.5x its estimate. "Load full volume" on a 2.12 M-cell snappy mesh was
+#: granted 1.7 GB (1.5x a ~1.1 GB estimate) and stopped there, whatever RAM
+#: was free: the rows are calibrated on hex boxes and a large polyhedral mesh
+#: was never measured (DP-1429). User rule 2026-10-23 (DP-5715): no per-job cap
+#: may stop a display worker short of what the machine has free, and the
+#: memory notice comes up only when the need exceeds what is free. So every
+#: heavy worker -- the preview, the volume, the section (and its quality
+#: colour) and the quality checks, which read the same mesh -- runs under the
+#: free RAM; the estimate still admits or refuses it up front. The CAD and
+#: export workers keep the 1.5x headroom (not display workers; own caps).
+RAM_CAPPED_OPERATIONS = frozenset(HEAVY_OPERATIONS | {
+    'mesh.preview.vtk', 'mesh.section.quality', 'mesh.section_batch'})
 #: Queue priorities: lower goes first. The preview goes before the checks,
 #: because the user is looking at the viewport (CR3 step 2).
 PRIORITY_PREVIEW = 0
@@ -475,26 +489,70 @@ def estimate_peak_bytes(operation: str, counts: dict | None) -> Estimate:
 # --------------------------------------------------------------------------- #
 
 class OverBudget(Exception):
-    """The worker was not started: the estimate exceeds the budget."""
+    """The worker was not started: the estimate exceeds the free memory of
+    the device it needs -- the PC's RAM, or (DP-5715) the dedicated memory of
+    the discrete GPU that draws the viewport, for what is uploaded to it."""
 
     reason = 'over_budget'
 
-    def __init__(self, estimate: Estimate, snapshot_: MemorySnapshot):
+    def __init__(self, estimate: Estimate, snapshot_: MemorySnapshot, *,
+                 device: DrawingDevice | None = None, gpu_bytes: int = 0):
         self.estimate = estimate
         self.snapshot = snapshot_
-        super().__init__(
-            '{0} needs about {1} and {2} is free for it ({3} available, '
-            '{4} held by WSL, {5} kept for the window)'.format(
-                estimate.operation, format_bytes(estimate.peak_bytes),
-                format_bytes(snapshot_.budget),
-                format_bytes(snapshot_.available),
-                format_bytes(snapshot_.wsl_vm),
-                format_bytes(snapshot_.reserve)))
+        self.device = device
+        self.gpu_bytes = int(gpu_bytes or 0)
+        #: Which memory ran short: ``'ram'`` or ``'gpu'``.
+        self.pool = 'gpu' if device is not None and self.gpu_bytes else 'ram'
+        if self.pool == 'gpu':
+            message = ('{0} needs about {1} of graphics memory and the {2} '
+                       'has {3}'.format(
+                           estimate.operation, format_bytes(self.gpu_bytes),
+                           device.name or 'graphics card',
+                           format_bytes(device.memory_bytes)))
+        else:
+            message = (
+                '{0} needs about {1} and {2} is free for it ({3} available, '
+                '{4} held by WSL, {5} kept for the window)'.format(
+                    estimate.operation, format_bytes(estimate.peak_bytes),
+                    format_bytes(snapshot_.budget),
+                    format_bytes(snapshot_.available),
+                    format_bytes(snapshot_.wsl_vm),
+                    format_bytes(snapshot_.reserve)))
+        super().__init__(message)
+
+    @property
+    def needed_bytes(self) -> int:
+        return self.gpu_bytes if self.pool == 'gpu' else int(
+            self.estimate.peak_bytes)
+
+    @property
+    def free_bytes(self) -> int:
+        if self.pool == 'gpu':
+            return int(self.device.memory_bytes)
+        return int(self.snapshot.budget)
+
+    def plain(self) -> str:
+        """Need against free on the device that is short, in plain words:
+        "it needs about 9.8 GB and this PC has 6.1 GB of RAM free"."""
+        if self.pool == 'gpu':
+            return ('it needs about {0} of graphics memory and the {1} has '
+                    'only {2}'.format(format_bytes(self.gpu_bytes),
+                                      self.device.name or 'graphics card',
+                                      format_bytes(self.device.memory_bytes)))
+        return 'it needs about {0} and this PC has {1} of RAM free'.format(
+            format_bytes(self.estimate.peak_bytes),
+            format_bytes(self.snapshot.budget))
 
     def to_dict(self) -> dict:
-        return {'reason': self.reason, 'message': str(self),
+        data = {'reason': self.reason, 'message': str(self),
                 'estimate': self.estimate.to_dict(),
-                'budget': self.snapshot.to_dict()}
+                'budget': self.snapshot.to_dict(), 'pool': self.pool,
+                'needed_bytes': self.needed_bytes,
+                'free_bytes': self.free_bytes}
+        if self.device is not None:
+            data['device'] = self.device.to_dict()
+            data['gpu_bytes'] = self.gpu_bytes
+        return data
 
 
 def format_bytes(value: int) -> str:
@@ -539,15 +597,80 @@ class Grant:
                 'budget': self.snapshot.to_dict()}
 
 
-def cap_for(estimate: Estimate, snapshot_: MemorySnapshot) -> int:
-    """The Job Object limit a granted worker runs under."""
+def cap_for(estimate: Estimate, snapshot_: MemorySnapshot,
+            operation: str | None = None) -> int:
+    """The Job Object limit a granted worker runs under.
+
+    ``operation``: the one admitted, when it differs from the estimate's row
+    (the section is admitted as ``mesh.section`` with a
+    ``mesh.section.quality`` estimate). A named :data:`ENV_WORKER_CAP` wins
+    over everything."""
     forced = _env_bytes(ENV_WORKER_CAP)
     if forced is not None:
         return forced
     wanted = max(int(estimate.peak_bytes * CAP_HEADROOM), WORKER_FLOOR_BYTES)
+    ram_capped = (estimate.operation in RAM_CAPPED_OPERATIONS
+                  or operation in RAM_CAPPED_OPERATIONS)
     if snapshot_.budget > 0:
+        if ram_capped:
+            # DP-5714 / DP-5715. Only the free RAM limits these: the estimate
+            # admits or refuses up front, and a worker that needs more than
+            # it said may use what is free rather than die at 1.5x a guess.
+            return int(max(snapshot_.budget, WORKER_FLOOR_BYTES))
         wanted = min(wanted, max(snapshot_.budget, estimate.peak_bytes))
     return int(wanted)
+
+
+def free_ram(snapshot_: MemorySnapshot) -> int:
+    """The RAM free for a worker: available - WSL VM - GUI reserve (or the
+    forced budget). "Build anyway" raises ``budget``; this is the real one."""
+    if snapshot_.forced:
+        return int(snapshot_.budget)
+    return max(0, int(snapshot_.available) - int(snapshot_.wsl_vm)
+               - int(snapshot_.reserve))
+
+
+def ran_out_text(cap_bytes: int, snapshot_: MemorySnapshot | None) -> str:
+    """Why a worker that reached its cap stopped, as need against free.
+
+    DP-5715: never "the N GB it was given". A display worker's cap is the
+    free RAM, so the sentence says that is what it needed more than; a cap
+    named by :data:`ENV_WORKER_CAP` is named as that."""
+    forced = _env_bytes(ENV_WORKER_CAP)
+    if forced is not None and int(cap_bytes or 0) == forced:
+        return ('it needed more than {0}, the memory limit set by {1}'
+                ).format(format_bytes(forced), ENV_WORKER_CAP)
+    free = free_ram(snapshot_) if snapshot_ is not None else 0
+    if free <= 0:
+        free = int(cap_bytes or 0)
+    if cap_bytes and int(cap_bytes) > free * 1.05:
+        return ('it needed more than {0}, and this PC has {1} of RAM free'
+                ).format(format_bytes(cap_bytes), format_bytes(free))
+    return 'it needed more than the {0} of RAM this PC has free'.format(
+        format_bytes(free))
+
+
+@dataclass(frozen=True)
+class DrawingDevice:
+    """The device that draws the viewport, as far as memory goes (DP-5715).
+
+    ``kind`` is the GPU tier (``gpu_profile``: discrete, integrated,
+    software, unknown). A discrete card has its own ``memory_bytes``
+    (dedicated video memory) for what is uploaded to it; anything else draws
+    out of the PC's RAM, so its limit is the free RAM."""
+
+    name: str = ''
+    kind: str = 'unknown'
+    memory_bytes: int = 0
+
+    @property
+    def own_memory(self) -> bool:
+        return self.kind == 'discrete' and int(self.memory_bytes) > 0
+
+    def to_dict(self) -> dict:
+        return {'name': self.name, 'kind': self.kind,
+                'memory_bytes': int(self.memory_bytes),
+                'pool': 'gpu' if self.own_memory else 'ram'}
 
 
 class AdmissionController:
@@ -569,12 +692,21 @@ class AdmissionController:
 
     async def admit(self, operation: str, estimate: Estimate, *,
                     priority: int = PRIORITY_INTERACTIVE,
-                    budget_override: int | None = None) -> Grant:
+                    budget_override: int | None = None,
+                    device: DrawingDevice | None = None,
+                    gpu_bytes: int = 0) -> Grant:
         """Wait for the heavy slot, then grant or refuse with the numbers.
 
         The budget is measured when the slot is reached, not when the request
         was queued: the job ahead may have been a WSL run that left the VM
         holding gigabytes.
+
+        DP-5715. Refused only when the need exceeds the free memory of the
+        device: the worker's estimate against the free RAM; and, when a
+        discrete GPU draws the viewport (``device.own_memory``),
+        ``gpu_bytes`` -- what the result uploads to it -- against its
+        dedicated memory. On integrated graphics or an unknown device the
+        picture is drawn out of the PC's RAM, so the RAM is the only pool.
         """
         heavy = operation in HEAVY_OPERATIONS
         if heavy:
@@ -587,11 +719,16 @@ class AdmissionController:
                     measured, budget=int(budget_override))
             if estimate.peak_bytes > measured.budget:
                 raise OverBudget(estimate, measured)
-            cap = cap_for(estimate, measured)
+            if (budget_override is None and device is not None
+                    and device.own_memory
+                    and int(gpu_bytes or 0) > int(device.memory_bytes)):
+                raise OverBudget(estimate, measured, device=device,
+                                 gpu_bytes=int(gpu_bytes))
+            cap = cap_for(estimate, measured, operation)
             if budget_override is not None and _env_bytes(ENV_WORKER_CAP) is None:
                 # "Build anyway" raises the worker's cap to the raised budget
-                # too: an estimate that was low must not end the run at 1.5x
-                # of it after the user asked for it knowingly.
+                # too: an estimate that was low must not end the run short of
+                # it after the user asked for it knowingly.
                 cap = max(cap, int(budget_override))
             return Grant(operation, estimate, cap, measured, heavy, self)
         except BaseException:

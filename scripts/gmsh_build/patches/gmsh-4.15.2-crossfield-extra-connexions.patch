@@ -1,0 +1,16 @@
+--- a/src/mesh/gmshCrossFields.cpp	2026-10-22 22:04:35.384409132 +0400
++++ b/src/mesh/gmshCrossFields.cpp	2026-10-22 22:04:35.414409124 +0400
+@@ -948,8 +948,11 @@
+   int nConn = 2;
+   int groups[2][2] = {{14, 1}, {13, 2}};
+ 
+-  if(G.size() < 2) {
+-    Msg::Debug("Less than 2 groupOfCross2d in assembleExtraConnexions");
++  // groups[] below index G[14] and G[13] (a leftover experiment, see the bare
++  // return in createExtraConnexions): without this bound a model with fewer
++  // groups reads past the vector and crashes computeCrossField.
++  if(G.size() < 15) {
++    Msg::Debug("Less than 15 groupOfCross2d in assembleExtraConnexions");
+     return;
+   }
+ 

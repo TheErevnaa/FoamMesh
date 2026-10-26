@@ -121,14 +121,25 @@ class ViewportToolEdges(QObject):
         self._topFrame = frame
         self._top = ToolEdge(view, 'top', TOP, frame, pin, self._topRect,
                              settled=self._tool.reflowToolbar)
-        # Plan 44 MF3: a pinned top bar floats and reserves nothing. The
-        # notice strip no longer stands below it (the clearance inset that
-        # used to keep it clear of the bar is gone), so nothing the top bar
-        # does moves anything else.
+        # Plan 44 MF3: a pinned top bar floats and reserves nothing, and
+        # nothing the top bar does moves anything else. DP-5713: the notice
+        # strip is a native window, so where it lay over the top bar (and
+        # over the nub that brings the bar back) it took every click meant
+        # for the bar. It stands below the bar's place always -- pinned,
+        # folded or out -- so the bar is never under it and never moves it.
         getter = getattr(view, 'noticeStrip', None)
         strip = getter() if callable(getter) else None
         if strip is not None:
-            strip.setClearance(lambda: 0)
+            strip.setClearance(self.noticeClearance)
+
+    def noticeClearance(self) -> int:
+        """DP-5713. Where the notice strip's top stands: below the top
+        bar's place, whatever the bar is doing."""
+        try:
+            top = self._topRect()
+        except (RuntimeError, AttributeError):
+            return 0
+        return max(0, top.y() + TOP_PILL_HEIGHT + GAP)
 
     def _shapePill(self, frame, height: int) -> None:
         """A floating pill: a rounded plate, 12 px of padding at the ends,

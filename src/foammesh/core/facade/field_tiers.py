@@ -46,7 +46,7 @@ _ESSENTIAL_IDS = frozenset((
     _D + 'enabled', _D + 'shape', _D + 'padding',
     # Global sizing.
     _G + 'target_size', _G + 'minimum_size', _G + 'size_factor',
-    _G + 'from_curvature', _G + 'minimum_elements_per_two_pi',
+    _G + 'from_curvature',
     _G + 'cell_shape',
     # Boundary layers (Gmsh).
     _B + 'enabled', _B + 'patch_mode', _B + 'patches', _B + 'first_height',
@@ -69,7 +69,7 @@ _ESSENTIAL_IDS = frozenset((
     _CA + 'max_local_cells',
     # Snap.
     _SN + 'tolerance', _SN + 'n_solve_iter', _SN + 'n_feature_snap_iter',
-    _SN + 'implicit_feature_snap',
+    _SN + 'feature_snapping',
     # Layers (snappy).
     _LA + 'feature_angle', _LA + 'concave_angle', _LA + 'merge_faces',
     # Quality. Plan 40 UXD9 moved the strict mesher limits onto the Snap page
@@ -100,7 +100,9 @@ _EXPERT_IDS = frozenset((
     _D + 'make_solids',
     # Global sizing.
     _G + 'threads', _G + 'minimum_circle_points', _G + 'minimum_curve_points',
-    _G + 'algorithm_fallback', _G + 'barycentric_refinement',
+    _G + 'algorithm_fallback', _G + 'max_retries',
+    _G + 'curve_threads', _G + 'surface_threads', _G + 'volume_threads',
+    _G + 'barycentric_refinement',
     _G + 'split_quadrangles', _G + 'recombination_algorithm',
     # Compute (Gmsh).
     _C + 'netgen', _C + 'netgen_passes', _C + 'optimize_threshold',

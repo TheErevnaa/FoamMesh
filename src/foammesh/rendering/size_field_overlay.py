@@ -192,6 +192,48 @@ class SizeFieldOverlay:
         self._display.addLegend(FIELD_LEGEND_KEY, bar)
         return drawn
 
+    # -- one field, sampled where Gmsh asks for a size (Plan 48 GM8) -------- #
+
+    def show_samples(self, points, sizes, *, title: str = FIELD_TITLE) -> int:
+        """Points of one size field, coloured by its size on the shared scale.
+
+        The same log scale and the same legend as the field on the surfaces
+        (``show_field``), so one field and the whole background read alike.
+        Returns the number of points drawn.
+        """
+        self.clear_field()
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        sizes = np.asarray(sizes, dtype=float)
+        keep = np.isfinite(sizes) & (sizes > 0)
+        if len(points) != len(sizes) or not keep.any():
+            return 0
+        points, sizes = points[keep], sizes[keep]
+        data = _polydata(points)
+        data.SetVerts(_cells(np.arange(len(points)).reshape(-1, 1)))
+        values = numpy_to_vtk(np.ascontiguousarray(sizes), deep=True)
+        values.SetName('field_size')
+        data.GetPointData().SetScalars(values)
+        table = lookup_table(float(sizes.min()), float(sizes.max()))
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(data)
+        mapper.SetLookupTable(table)
+        mapper.SetScalarRange(table.GetRange())
+        mapper.SetScalarModeToUsePointData()
+        mapper.ScalarVisibilityOn()
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetObjectName('sizeFieldSamples')
+        actor.GetProperty().SetPointSize(4.0)
+        actor.GetProperty().SetLighting(False)
+        actor.GetProperty().RenderPointsAsSpheresOn()
+        actor.PickableOff()
+        self.field_actor = actor
+        self._add(actor)
+        bar = _legend(table, title, FIELD_LEGEND_KEY, self._tokens)
+        self._legends.append(FIELD_LEGEND_KEY)
+        self._display.addLegend(FIELD_LEGEND_KEY, bar)
+        return int(len(points))
+
     # -- the conformity of a mesh ------------------------------------------ #
 
     def show_conformity(self, centres: np.ndarray, ratio: np.ndarray) -> int:
@@ -243,7 +285,8 @@ class SizeFieldOverlay:
 
     def clear_field(self) -> None:
         self._clear({'sizeFieldSurface', 'sizeFieldFeatures',
-                     'sizeFieldThinRegions'}, FIELD_LEGEND_KEY)
+                     'sizeFieldThinRegions', 'sizeFieldSamples'},
+                    FIELD_LEGEND_KEY)
         self.field_actor = None
 
     def clear_conformity(self) -> None:

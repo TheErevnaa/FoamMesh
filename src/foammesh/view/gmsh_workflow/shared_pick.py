@@ -11,6 +11,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Signal
 
 from foammesh.core.selection import SelectionService
+from foammesh.core.selection.mesh_on_screen import mesh_on_screen
 from foammesh.core.selection.pick import PickRequest
 
 _FALLBACK: SelectionService | None = None
@@ -53,7 +54,11 @@ class SharedPick(QObject):
         request = PickRequest(
             (filter_name or 'Surfaces',), requester=self._requester,
             ordered=self._ordered, on_accept=self.pickAccepted.emit)
-        started = service.begin_pick(request, engine='gmsh')
+        source = self._source()
+        asks = getattr(source, 'meshOnScreen', None)
+        started = service.begin_pick(
+            request, engine='gmsh',
+            mesh_on_screen=asks() if callable(asks) else mesh_on_screen())
         self._status = '' if started else service.pick_reason
         return started
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import re
 import shutil
 from pathlib import Path
 
@@ -17,19 +18,23 @@ from foammesh.support.utils import rmtree
 from resources import resource
 
 from foammesh.core.import_export import path_bytes, record_export_event
+from foammesh.core.import_export import couplings as couplings_module
+from foammesh.core.import_export.handoff import write_openfoam_handoff
 from foammesh.core.import_export.region_zones import (
-    RegionZoneError, prepare_region_zones)
+    CELL_ZONES, ORIGINAL_CELL_ZONES, RegionZoneError, decomposed_region_plan,
+    prepare_region_zones, region_zones_dict, require_solid_zones,
+    restore_cell_zones)
+from foammesh.core.import_export.export_regions import (
+    are_solids, export_regions)
 from foammesh.core.run_result import read_failure_cause
-from foammesh.db.configurations_schema import CFDType
+from foammesh.db.configurations_schema import CFDType, RegionType
 from foammesh.openfoam.file_system import FileSystem
 from foammesh.openfoam.constant.region_properties import RegionProperties
 from foammesh.core.jobs import JobRequest, JobStatus
 from foammesh.core.openfoam_runtime import LaunchProfileError
 from foammesh.openfoam.system.collapse_dict import CollapseDict
-from foammesh.openfoam.system.create_patch_dict import CreatePatchDict
 from foammesh.openfoam.system.extrude_mesh_dict import ExtrudeMeshDict
 from foammesh.openfoam.system.create_zones_dict import CreateZonesDict, surfaceFileName
-from foammesh.openfoam.utility.restore_cyclic_patch_names import RestoreCyclicPatchNames
 from foammesh.settings.local_settings import LocalSettings
 from foammesh.core.gmsh.manifest import accepted_run_layout
 from foammesh.openfoam import decomposition
@@ -57,6 +62,120 @@ class _ExportLayout:
 
 #: The time directory every export step moves the mesh through.
 OUTPUT_TIME = 4
+
+#: DP-5749. The ``topoSet`` dictionary a decomposed region split is zoned by.
+REGION_ZONES_DICT = 'topoSetDict.foammesh-regions'
+
+
+def _removeRegionZoneFile(path) -> None:
+    """Remove one thing written for the region split, file or folder.
+
+    A ``cellZones`` written over the mesher's own (DP-5751) gives the
+    mesher's back.
+    """
+    path = Path(path)
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        restore_cell_zones(path)
+
+
+def _writeRegionSolvers(case_root, regions) -> None:
+    """DP-5754. Name every region and its solver in ``system/controlDict``.
+
+    OpenFOAM 13's ``-allRegions`` utilities (``reconstructPar``,
+    ``decomposePar``) and ``foamMultiRun`` read the region list from
+    ``regionSolvers``, not from ``constant/regionProperties``; without it they
+    exit before reading a mesh.
+    """
+    control_dict = Path(case_root) / Directory.SYSTEM_DIRECTORY_NAME / 'controlDict'
+    entries = ''.join(
+        f'    {region.value("name")} '
+        f'{"solid" if region.value("type") == RegionType.SOLID.value else "fluid"};\n'
+        for region in regions.values())
+    text = control_dict.read_text(encoding='utf-8') if control_dict.exists() else ''
+    control_dict.parent.mkdir(parents=True, exist_ok=True)
+    control_dict.write_text(
+        text.rstrip() + f'\n\nregionSolvers\n{{\n{entries}}}\n', encoding='utf-8')
+
+
+def _boundaryNames(path) -> set[str]:
+    """The patch names in one ``polyMesh/boundary`` file."""
+    path = Path(path)
+    if not path.is_file():
+        return set()
+    text = path.read_text(encoding='utf-8', errors='replace')
+    body = text[text.index('(', text.index('FoamFile') if 'FoamFile' in text else 0):]
+    names, depth, word = set(), 0, ''
+    for token in re.findall(r'[{}]|[^\s{}();]+', body):
+        if token == '{':
+            if depth == 0 and word:
+                names.add(word)
+            depth += 1
+        elif token == '}':
+            depth -= 1
+        elif depth == 0:
+            word = token
+    return names
+
+
+def _exportedMeshes(exported, regions) -> dict:
+    """``{region: polyMesh/boundary}`` of the exported case (``None`` alone
+    for a single-region case)."""
+    if len(regions) <= 1:
+        return {None: exported.boundaryFilePath()}
+    return {region.value('name'): exported.boundaryFilePath(region.value('name'))
+            for region in regions.values()}
+
+
+def _legacyInterfaceNames(db) -> list[str]:
+    """Surfaces still typed ``interface`` by hand, with no role.
+
+    Plan 49 SR1 leaves such a surface unresolved: it was written as a cyclic
+    pair (DP-5784), which is not a wall, a region interface or a periodic
+    connection, and what it was meant to be cannot be read from it.
+    """
+    names = []
+    for element in db.getElements(
+            'geometry', lambda _i, e: e['cfdType'] == CFDType.INTERFACE.value
+    ).values():
+        try:
+            role = element.value('surfaceRole')
+        except Exception:  # noqa: BLE001 - a row saved before roles existed
+            role = None
+        role = getattr(role, 'value', role)
+        if not role:
+            names.append(element.value('name'))
+    return names
+
+
+def _refuseLegacyInterfaces(exported, regions, db) -> None:
+    """DP-5760. Refuse a mesh still holding a hand-ticked interface's sides.
+
+    The export used to join ``<name>`` and ``<name>_slave`` into a cyclic
+    pair with ``createPatch`` (DP-5784), which carries flow straight through
+    the sheet; without it they are two open patches and flow leaks out of
+    the domain through them. Neither is what was drawn. The snappy writer
+    now refuses an interface with no role; a mesh made before it is refused
+    here, with the remedy, rather than exported either way.
+    """
+    wanted = _legacyInterfaceNames(db)
+    if not wanted:
+        return
+    found = {region: set(couplings_module.boundary_names(path))
+             for region, path in _exportedMeshes(exported, regions).items()}
+    for name in wanted:
+        where = sorted(str(region or 'the mesh') for region, names
+                       in found.items()
+                       if name in names or f'{name}_slave' in names)
+        if where:
+            raise RuntimeError(
+                f'Surface {name}: it is an interface ticked by hand, and its '
+                f'two sides are in {", ".join(where)} as patches with no '
+                'coupling -- the export no longer joins them into a cyclic '
+                'pair, which let flow through the sheet. Choose what it is '
+                '(a blocking baffle, a region interface with its two regions, '
+                'or one side of a periodic pair), mesh again, then export.')
 
 
 def _mesh_at(root, output_time: int = OUTPUT_TIME):
@@ -305,28 +424,96 @@ class AuthoredExportService:
                 message += f'\nLog: {log_path}'
             raise RuntimeError(message)
 
-    def _requireRegionZones(self, file_system, regions, parallel):
+    async def _requireRegionZones(self, session, file_system, regions,
+                                  parallel, on_line=None):
         """Cell zones for the region split, or a refusal that says why.
 
-        DP-538/DP-539 (MA24-02). Returns the ``cellZones`` file written from
-        the region points, which the caller removes after the split, or
-        ``None`` when the mesh's own zones already cover it. A decomposed
-        mesh is split per processor by OpenFOAM and is not read here.
+        DP-538/DP-539 (MA24-02). Returns what was written for the split from
+        the region points -- the caller removes each with
+        ``_removeRegionZoneFile`` afterwards -- or nothing when the mesh's own
+        zones already cover it.
+
+        DP-5749. A decomposed mesh was returned unzoned, and the parallel
+        split died on "Cell 0 ... is not in a cellZone" (MEASURED: the 15-core
+        CHT tube). Its pieces cross processors, so OpenFOAM makes the zones:
+        ``topoSet -parallel``, ``regionToCell`` from each region point.
+
+        DP-6058. A Gmsh region is a typed solid whose zone the mesher wrote
+        under its name: nothing is made, and a mesh whose zones are not the
+        regions is refused, saying which.
         """
+        if are_solids(regions):
+            names = [region.value('name') for region in regions.values()]
+            sources = ([self._meshSourcePath(file_system, index)
+                        for index in range(parallel.np())]
+                       if parallel.isParallelOn()
+                       else [self._meshSourcePath(file_system)])
+            try:
+                for source in sources:
+                    if source is not None:
+                        require_solid_zones(
+                            source / Directory.POLY_MESH_DIRECTORY_NAME, names)
+            except RegionZoneError as error:
+                raise RuntimeError(
+                    f'the mesh cannot be split into its regions: {error}'
+                ) from error
+            return []
         if parallel.isParallelOn():
-            return None
+            return await self._requireDecomposedRegionZones(
+                session, file_system, regions, parallel, on_line)
         source = self._meshSourcePath(file_system)
         if source is None:
-            return None
+            return []
         # Lazy: the points are read only when the mesh has no zones.
         seeds = ((region.value('name'), region.vector('point'))
                  for region in regions.values())
         try:
-            return prepare_region_zones(
+            written = prepare_region_zones(
                 source / Directory.POLY_MESH_DIRECTORY_NAME, seeds)
         except RegionZoneError as error:
             raise RuntimeError(
                 f'the mesh cannot be split into its regions: {error}') from error
+        return [] if written is None else [written]
+
+    async def _requireDecomposedRegionZones(self, session, file_system,
+                                            regions, parallel, on_line):
+        meshes = []
+        for index in range(parallel.np()):
+            source = self._meshSourcePath(file_system, index)
+            if source is None:
+                return []
+            meshes.append(source / Directory.POLY_MESH_DIRECTORY_NAME)
+        seeds = [(region.value('name'), region.vector('point'))
+                 for region in regions.values()]
+        try:
+            # DP-5751. A mesher's zones are completed and named by region,
+            # as the serial export does (``complete_region_zones``).
+            plan = decomposed_region_plan(meshes, seeds)
+        except RegionZoneError as error:
+            raise RuntimeError(
+                f'the mesh cannot be split into its regions: {error}') from error
+        if plan is None:
+            return []
+        case_root = file_system.caseRoot()
+        dictionary = case_root / 'system' / REGION_ZONES_DICT
+        dictionary.write_text(region_zones_dict(*plan), encoding='ascii',
+                              newline='\n')
+        written = [dictionary]
+        for mesh in meshes:
+            zones = mesh / CELL_ZONES
+            if zones.is_file():
+                shutil.copyfile(zones, mesh / ORIGINAL_CELL_ZONES)
+            written += [zones, mesh / 'sets']
+        try:
+            await self._run(
+                session, 'topoSet',
+                ('-dict', f'system/{REGION_ZONES_DICT}'),
+                cwd=case_root, parallel=parallel, on_line=on_line)
+        except BaseException:
+            for path in written:
+                _removeRegionZoneFile(path)
+            raise
+        return written
 
     def _requireReachableDestination(self, destination, utilities):
         """Refuse a destination no utility can be pointed at, up front.
@@ -396,22 +583,30 @@ class AuthoredExportService:
                 source / Directory.POLY_MESH_DIRECTORY_NAME,
                 destination / Directory.POLY_MESH_DIRECTORY_NAME)
 
-    def _regionMeshRoot(self, file_system, regions):
+    def _regionMeshRoot(self, file_system, regions, index=None):
         """Where splitMeshRegions left the per-region meshes.
 
         It writes to ``constant`` when the mesh it read was there and to the
         latest time directory otherwise, so neither location can be assumed.
+        DP-5752. A parallel split writes them in each processor directory,
+        which ``index`` names.
         """
         probe = next(iter(regions.values())).value('name')
-        candidates = [file_system.constantPath()]
-        candidates += [file_system.timePath(time)
+        if index is None:
+            candidates = [file_system.constantPath()]
+        else:
+            candidates = [file_system.processorPath(index, False)
+                          / Directory.CONSTANT_DIRECTORY_NAME]
+        candidates += [file_system.timePath(time, index)
                        for time in range(self.OUTPUT_TIME, -1, -1)]
         for candidate in candidates:
             if isPolyMesh(candidate / probe / Directory.POLY_MESH_DIRECTORY_NAME):
                 return candidate
 
+        where = '' if index is None else f' for processor{index}'
         raise RuntimeError(
-            'nothing to export: splitMeshRegions produced no region meshes')
+            f'nothing to export{where}: splitMeshRegions produced no region '
+            f'meshes')
 
     async def _createCellZones(self, session, file_system, exported, zones,
                                surfaces, regions, progress, on_line):
@@ -471,6 +666,42 @@ class AuthoredExportService:
                 session, 'createZones', ('-region', name),
                 cwd=exported.caseRoot(), on_line=on_line)
 
+    async def _coupleAfterSplit(self, session, exported, regions,
+                                couplings, progress, on_line):
+        """Couple the recorded region interfaces and periodic pairs.
+
+        Plan 49 SR4 (DP-5761, DP-5762, DP-5791). After the split, with the
+        dictionary form of ``createNonConformalCouples`` that names each
+        side's region; see ``couplings.py``. The coupled patches are checked
+        on disk, so a coupling that did not happen is said, not exported.
+        """
+        meshes = _exportedMeshes(exported, regions)
+        try:
+            renames, entries = couplings_module.plan(couplings, meshes)
+        except couplings_module.CouplingRefusal as refusal:
+            raise RuntimeError(str(refusal)) from refusal
+        if not entries:
+            return
+        for region, old, new in renames:
+            couplings_module.rename_patch(meshes[region], old, new)
+        couplings_module.write(exported.caseRoot(), entries)
+        progress('Coupling interfaces')
+        await self._run(
+            session, 'createNonConformalCouples',
+            ('-case', str(exported.caseRoot())),
+            cwd=exported.caseRoot(), on_line=on_line)
+        coupled = couplings_module.coupled_patch_types(meshes)
+        made = [name for found in coupled.values() for name in found]
+        missing = [str(item.get('name')) for item in couplings
+                   if not any(str(item.get('name') or '') and
+                              name.startswith(str(item.get('name')) + '_on_')
+                              for name in made)]
+        if missing:
+            raise RuntimeError(
+                'createNonConformalCouples ran but the exported mesh holds no '
+                f'coupled patch for {", ".join(missing)}; nothing coupled '
+                'them, so the case is not exported as if it did.')
+
     async def run(self, session, destination: str | Path, *, boundaries=(),
                   options=None, on_line=None, on_progress=None) -> dict:
         destination = Path(destination)
@@ -480,14 +711,15 @@ class AuthoredExportService:
         parallel = _exportLayout(session)
         progress = on_progress or (lambda _message: None)
 
-        regions = db.getElements('region')
-        # Counted here rather than where `createPatch` needs it, so that the
-        # preflight below knows every utility this export will launch into
-        # the destination before it stages anything.
-        interfaces = db.elementCount(
-            'geometry', lambda _i, element:
-            element['cfdType'] == CFDType.INTERFACE.value
-            and not element['interRegion'] and not element['nonConformal'])
+        # DP-6058. On Gmsh the regions are the typed solids.
+        regions = export_regions(db)
+        # Plan 49 SR4. The couplings the mesher recorded for after the split
+        # -- read here so the preflight below knows every utility this
+        # export will launch into the destination before it stages anything.
+        try:
+            couplings = couplings_module.recorded_couplings(session.case_path)
+        except couplings_module.CouplingRefusal as refusal:
+            raise RuntimeError(str(refusal)) from refusal
         # DP-562 (0924 rerun). The destination the Export page shows is the
         # case: ``FileSystem(destination)`` put the case one folder deeper, in
         # ``<destination>/case`` -- the project layout of the application this
@@ -511,7 +743,7 @@ class AuthoredExportService:
         self._requireReachableDestination(destination, (
             *(('reconstructPar',) if parallel.isParallelOn() else ()),
             *(('createZones',) if zones.isBuilt() else ()),
-            *(('createPatch',) if interfaces else ()),
+            *(('createNonConformalCouples',) if couplings else ()),
             *(('extrudeMesh', 'collapseEdges') if options is not None else ())))
 
         if len(regions) > 1:
@@ -521,8 +753,8 @@ class AuthoredExportService:
             # but cannot name them. The zones are made from the region
             # points here, or the export is refused with the reason, before
             # OpenFOAM is started.
-            zones_written = self._requireRegionZones(
-                file_system, regions, parallel)
+            zones_written = await self._requireRegionZones(
+                session, file_system, regions, parallel, on_line)
             progress('Splitting Mesh Regions')
             try:
                 await self._run(
@@ -530,8 +762,8 @@ class AuthoredExportService:
                     cwd=case_root, parallel=parallel, on_line=on_line)
             finally:
                 # The native mesh is left as the mesher wrote it.
-                if zones_written is not None:
-                    zones_written.unlink(missing_ok=True)
+                for path in zones_written:
+                    _removeRegionZoneFile(path)
         else:
             progress('Copying Files')
             await self._stageMesh(file_system, parallel)
@@ -539,18 +771,28 @@ class AuthoredExportService:
         destination.mkdir(parents=True, exist_ok=True)
         exported.createCase(resource.file('openfoam/case'))
         if len(regions) > 1:
-            RegionProperties(exported.caseRoot()).build().write()
+            RegionProperties(exported.caseRoot(), db).build().write()
+            _writeRegionSolvers(exported.caseRoot(), regions)
 
         progress('Exporting Files')
         output_path = (self._regionMeshRoot(file_system, regions)
-                       if len(regions) > 1
+                       if len(regions) > 1 and not parallel.isParallelOn()
                        else file_system.timePath(self.OUTPUT_TIME))
         if parallel.isParallelOn():
             for index in range(parallel.np()):
                 processor = exported.processorPath(index, False)
                 processor.mkdir()
-                shutil.move(file_system.timePath(self.OUTPUT_TIME, index),
-                            processor / Directory.CONSTANT_DIRECTORY_NAME)
+                constant = processor / Directory.CONSTANT_DIRECTORY_NAME
+                if len(regions) > 1:
+                    # DP-5752. A parallel split leaves each processor's
+                    # region meshes in that processor's directory.
+                    root = self._regionMeshRoot(file_system, regions, index)
+                    constant.mkdir()
+                    for region in regions.values():
+                        shutil.move(root / region.value('name'), constant)
+                else:
+                    shutil.move(file_system.timePath(self.OUTPUT_TIME, index),
+                                constant)
             # DP-229. ``reconstructPar`` reads ``system/decomposeParDict``
             # from the case it is pointed at, and the exported case template
             # (``src/resources/openfoam/case``) carries no such file, so the
@@ -563,7 +805,9 @@ class AuthoredExportService:
             progress('Reconstructing exported mesh')
             await self._run(
                 session, 'reconstructPar',
-                ('-constant', '-noFields', '-case', str(exported.caseRoot())),
+                ('-constant', '-noFields',
+                 *(('-allRegions',) if len(regions) > 1 else ()),
+                 '-case', str(exported.caseRoot())),
                 cwd=exported.caseRoot(), on_line=on_line)
         elif len(regions) > 1:
             for region in regions.values():
@@ -576,19 +820,12 @@ class AuthoredExportService:
             session, file_system, exported, zones, surfaces, regions,
             progress, on_line)
 
-        if interfaces:
-            prefix = 'NFBRM_'
-            CreatePatchDict(prefix, exported, db).build().write()
-            # MEASURED on OpenFOAM 13 (`createPatch -help`, build
-            # 13-58ed5c2046ef): `-overwrite  Deprecated option, this is now
-            # default behaviour`. Overwriting in place is what v13 does unless
-            # `-noOverwrite` asks otherwise, so the flag is dropped rather than
-            # carried as a no-op that reads like a requirement.
-            await self._run(
-                session, 'createPatch',
-                ('-allRegions', '-case', str(exported.caseRoot())),
-                cwd=exported.caseRoot(), on_line=on_line)
-            RestoreCyclicPatchNames(prefix, exported, db).restore()
+        # DP-5760/DP-5784. A hand-ticked interface is no longer joined into a
+        # cyclic pair; a mesh still holding one is refused.
+        _refuseLegacyInterfaces(exported, regions, db)
+        if couplings:
+            await self._coupleAfterSplit(
+                session, exported, regions, couplings, progress, on_line)
 
         if options is not None:
             progress('Extruding Mesh')
@@ -622,6 +859,14 @@ class AuthoredExportService:
             rmtree(output_path)
         rmtree(exported.polyMeshPath() / 'sets')
         removeVoidBoundaries(exported.caseRoot())
+        # Plan 49 SR6. The hand-off sidecar and the final check, as a separate
+        # step after the export has finished: it reads what is on disk and
+        # changes none of it, writes constant/foammesh_handoff.json, and
+        # refuses (after writing it) an export that does not carry the
+        # authored roles and relations.
+        handoff = write_openfoam_handoff(
+            exported.caseRoot(), source_case=session.case_path, db=db,
+            couplings=couplings).summary()
         entry = record_export_event(
             session.case_path, entry_id='openfoam', destination=destination,
             total_bytes=path_bytes(destination),
@@ -635,7 +880,10 @@ class AuthoredExportService:
                      # what left the reader guessing.
                      **export_layout_details(
                          parallel.source, parallel.run_id, parallel.np(),
-                         parallel.isParallelOn())})
+                         parallel.isParallelOn()),
+                     'handoff': handoff})
         return {'destination': str(destination), 'history_entry_id': entry.entry_id,
                 'total_bytes': path_bytes(destination),
-                'two_dimensional': options is not None}
+                'two_dimensional': options is not None,
+                # Plan 49 SR6: the sidecar beside the mesh, and its verdict.
+                'handoff': handoff}

@@ -90,6 +90,8 @@ class DesktopPresentationRenderer:
         self._status = StatusTap(getattr(ui, 'statusbar', None))
         #: DP-2741. Snapshot files still being written off the GUI thread.
         self._writing = []
+        #: Plan 48 PA1. A worst-cell ranking started by the last op.
+        self._pendingRanking = None
 
     async def settle(self) -> None:
         """DP-2741. Wait, without holding the event loop, for the files the
@@ -99,6 +101,37 @@ class DesktopPresentationRenderer:
         writing, self._writing = getattr(self, '_writing', []), []
         for thread in writing:
             await asyncio.to_thread(thread.join)
+        await self._settleRanking()
+
+    #: Plan 48 PA1. The longest an op waits for a worst-cell ranking.
+    RANKING_SETTLE_SECONDS = 600.0
+
+    async def _settleRanking(self) -> None:
+        """Plan 48 PA1. Fill in the ranking the last op asked for.
+
+        ``presentation.quality.ranking`` starts the same ranking the Rank
+        button starts -- with its progress strip and Cancel -- and answers
+        with the dict this fills in once the table is up.
+        """
+        import asyncio
+
+        pending, self._pendingRanking = getattr(self, '_pendingRanking', None), None
+        if pending is None:
+            return
+        task, answer, tab = pending
+        try:
+            outcome, rows = await asyncio.wait_for(
+                asyncio.shield(task), self.RANKING_SETTLE_SECONDS)
+        except asyncio.TimeoutError:
+            answer.update(outcome='pending',
+                          note='the ranking is still running; it will fill '
+                               'the Mesh quality table when it ends')
+            return
+        except Exception as error:                         # noqa: BLE001
+            answer.update(outcome='failed', note=str(error))
+            return
+        answer.update(outcome=outcome, title=tab.listed_title(),
+                      rows=_plain(tab.listed_elements()), listed=len(rows))
 
     #: DP-2851/DP-2852. The longest an op waits for a mesh still being drawn.
     MESH_SETTLE_SECONDS = 180.0
@@ -124,6 +157,11 @@ class DesktopPresentationRenderer:
         except asyncio.TimeoutError:
             logger.warning('%s: the mesh was still being drawn after %.0f s',
                            operation, self.MESH_SETTLE_SECONDS)
+
+    def gmsh_display_panel(self):
+        """Plan 48 PA1. The Gmsh route's Display panel, or ``None``."""
+        getter = getattr(self._tool, 'gmshDisplayPanel', None)
+        return getter() if callable(getter) else None
 
     def window(self):
         """The main window: given, or the app's."""
@@ -214,6 +252,56 @@ class DesktopPresentationRenderer:
         self._known([changed['entity_id']])
         self._display.setPartOpacity(changed['entity_id'], changed['opacity'])
 
+    def _surface_opacity(self, changed):
+        """The rail's Surface opacity: move the slider, or just read it."""
+        tool = self._tool
+        asked = changed.get('surface_opacity') or {}
+        if 'opacity' in asked:
+            tool.setSurfaceOpacity(asked['opacity'])
+        return self._answer(surface_opacity=self._surfaceOpacityRead(tool))
+
+    @staticmethod
+    def _surfaceOpacityRead(tool) -> dict:
+        return {'opacity': tool.surfaceOpacity(),
+                'route': tool.surfaceOpacityRoute()}
+
+    def _readSurfaceOpacity(self, state, tool):
+        state.surface_opacity = self._surfaceOpacityRead(tool)
+
+    def _preview_notice(self, changed):
+        """DP-5734. The viewport preview notice: read it, close it, or press
+        Try again, Load full volume or Build anyway as a person would.
+
+        A control the notice does not offer is refused with what it does
+        offer. Build anyway's Yes/No question is answered by the op's
+        ``confirm`` (the facade refuses it without one), so the window does
+        not ask it a second time.
+        """
+        window = self.window()
+        overlay = getattr(window, '_viewportOverlay', None)
+        if overlay is None:
+            from foammesh.core.facade.errors import PresentationUnavailableError
+            raise PresentationUnavailableError('the window has no viewport overlay')
+        asked = changed.get('preview_notice') or {}
+        action = asked.get('action')
+        if action is not None:
+            notice = overlay.previewNoticeState()
+            offered = notice['actions'] + (['dismiss'] if notice['shown'] else [])
+            if action not in offered:
+                from foammesh.core.facade.errors import ValidationFailedError
+                raise ValidationFailedError(
+                    'no preview notice is shown' if not notice['shown'] else
+                    'the preview notice does not offer that', details={
+                        'action': action, 'offered': offered})
+            if action == 'build_anyway':
+                import asyncio
+                manager = getattr(window, '_meshManager', None)
+                overlay._noticeDismissed = None
+                asyncio.ensure_future(manager.buildPreviewAnyway())
+            else:
+                overlay.pressPreviewNotice(action)
+        return self._answer(preview_notice=overlay.previewNoticeState())
+
     def _measurement(self, changed):
         measured = changed.get('measurement')
         if measured is None:
@@ -243,7 +331,9 @@ class DesktopPresentationRenderer:
                      'sub_edges': '_subEdges'}
     #: DP-2766. The Elements group's choices -> its combos.
     ELEMENT_COMBOS = {'colour_by': '_colour', 'label_type': '_labelType',
-                      'node_style': '_nodeStyle'}
+                      'node_style': '_nodeStyle',
+                      # Plan 48 PA1: Mesh.LightLines.
+                      'light_lines': '_lightLines'}
     #: A part's right-click Display mode -> the slot of its menu entry.
     DISPLAY_MODE_SLOTS = {'wireframe': '_displayWireframe',
                           'surface': '_displaySurface',
@@ -277,7 +367,8 @@ class DesktopPresentationRenderer:
                      self._readCameraHistory, self._readExplode,
                      self._readColours, self._readBackground,
                      self._readSection, self._readElements,
-                     self._readNamedViews):
+                     self._readNamedViews, self._readWorstCells,
+                     self._readSurfaceOpacity):
             try:
                 read(state, tool)
             except (AttributeError, RuntimeError, TypeError, KeyError,
@@ -338,13 +429,30 @@ class DesktopPresentationRenderer:
         plane = panel.activePlane()
         state.section = {'enabled': True, 'mode': panel.mode().value,
                          'origin': [float(v) for v in plane.origin],
-                         'normal': [float(v) for v in plane.normal]}
+                         'normal': [float(v) for v in plane.normal],
+                         **self._sectionDetails(panel)}
+
+    def _readWorstCells(self, state, _tool):
+        """Plan 48 PA1. The choice Worst cells is pressed with."""
+        info = self._display.meshQualityInfo()
+        choice = info.worstChoice()
+        index = choice['metric']
+        state.worst_cells = {
+            'metric': index.value, 'mode': choice['mode'],
+            'count': choice['count'], 'limit': info.limitFor(index),
+            'limit_set': bool(info.limitIsSet(index)),
+            'highlighting': bool(info.isHighlighting()),
+            'band': [float(v) for v in (info.band() or ())],
+            'band_label': info.bandLabel(),
+            'legend_title': info.legendTitle(),
+            'metrics': [m.value for m in info.metricOrder()]}
 
     def _readElements(self, state, _tool):
         panel = self._display.elementDisplay()
         if panel is not None:
             state.elements['visible'] = bool(panel.isShown())
             state.elements.update(self._elementChoices(panel))
+            state.elements.update(self._elementTexts(panel))
 
     # -- view mode and camera history --------------------------------------- #
 
@@ -410,7 +518,208 @@ class DesktopPresentationRenderer:
         return self._press('feature_edges', changed['visible'])
 
     def _worst_cells(self, changed):
-        return self._press('worst_cells', changed['visible'])
+        """The toolbar's Worst cells and the choice it is pressed with."""
+        from foammesh.rendering.actor_info import MeshQualityIndex
+
+        if not any(key in changed for key in (
+                'metric', 'mode', 'count', 'limit', 'limit_from', 'beyond',
+                'read')):
+            answer = self._press('worst_cells', changed['visible'])
+            reader = getattr(self._display, 'meshQualityInfo', None)
+            if callable(reader):
+                answer['worst_cells'] = self._worstCellsRead(reader())
+            return answer
+        info = self._display.meshQualityInfo()
+        index = None
+        if changed.get('metric') is not None:
+            order = info.metricOrder()
+            try:
+                index = MeshQualityIndex(changed['metric'])
+            except ValueError:
+                index = None
+            if index is None or index not in order:
+                self._invalid('the mesh on screen cannot be judged by '
+                              'this metric', metric=changed['metric'],
+                              allowed=[m.value for m in order])
+        mode = changed.get('mode')
+        count = changed.get('count')
+        if count is not None:
+            # The toolbar menu offers a few counts (Worst 10, 100, 1,000).
+            if mode not in (None, 'count'):
+                self._invalid('count goes with mode count', mode=mode)
+            if count not in info.WORST_COUNTS:
+                self._invalid('the Worst cells menu offers only these counts',
+                              count=count, allowed=list(info.WORST_COUNTS))
+            mode = 'count'
+        target = index or info.activeIndex()
+        if index is not None:
+            info.setWorstChoice(index)
+        if 'limit' in changed:
+            info.setLimit(target, changed['limit'])
+        if 'limit_from' in changed:
+            if info.useLimit(target, changed['limit_from']) is None:
+                self._refused('there is no %s limit for this metric'
+                              % changed['limit_from'], metric=target.value)
+        if mode == 'limit' and info.limitFor(target) is None:
+            self._refused('this metric has no limit: give limit or take '
+                          'the check\'s limit first', metric=target.value)
+        asked = any(key in changed for key in ('metric', 'mode', 'count'))
+        if asked:
+            info.setWorstChoice(index, mode, count)
+        if changed.get('read'):
+            answer = self._answer(inspection='worst_cells',
+                                  visible=bool(info.isHighlighting()),
+                                  pressed=False)
+        elif (changed['visible'] and asked
+                and self._tool.isInspectionActive('poorCells')):
+            # Already painted: paint it again with the new choice, as the
+            # Mesh quality tab's controls do.
+            info.highlightWorst()
+            answer = self._answer(inspection='worst_cells', visible=True,
+                                  pressed=False, repainted=True)
+        else:
+            answer = self._press('worst_cells', changed['visible'])
+        if ('beyond' in changed and not info.showBeyondLimit(changed['beyond'])
+                and changed['beyond']):
+            self._refused('there are no cells beyond the limit to show: '
+                          'this metric has no limit, or no mesh is measured',
+                          metric=target.value)
+        self._showInspector(info)
+        answer['worst_cells'] = self._worstCellsRead(info)
+        return answer
+
+    def _showInspector(self, info) -> None:
+        """The Mesh quality tab's limit, its two sources, the histogram and
+        the count beyond the limit, as the window refreshes them after a
+        metric or a limit changes."""
+        tab = getattr(self.window(), '_meshQualityTab', None)
+        if tab is None:
+            return
+        index = info.activeIndex()
+        tab.set_limit(info.limitFor(index))
+        tab.set_limit_sources(info.mesherLimitFor(index),
+                              info.checkLimitFor(index))
+        info.refreshDistribution(tab, mayCompute=False)
+        tab.set_beyond_count(info.beyondCount(), info.limitFor(index))
+
+    def _worstCellsRead(self, info) -> dict:
+        """What the Mesh quality tab shows of the metric in force: limit,
+        band, the cells beyond the limit and the distribution."""
+        index = info.activeIndex()
+        choice = info.worstChoice()
+        beyond = info.beyondCount(index)
+        histogram = info.distribution(index)
+        return {
+            'metric': index.value, 'mode': choice['mode'],
+            'count': choice['count'], 'limit': info.limitFor(index),
+            'limit_set': bool(info.limitIsSet(index)),
+            'highlighting': bool(info.isHighlighting()),
+            'band': [float(v) for v in (info.band() or ())],
+            'band_label': info.bandLabel(),
+            'legend_title': info.legendTitle(),
+            'beyond_text': self._beyondText(),
+            'showing_beyond': bool(info.isShowingBeyondLimit()),
+            'beyond_limit': (None if beyond is None
+                             else {'cells': int(beyond[0]),
+                                   'of': int(beyond[1])}),
+            'distribution': _plain(histogram)}
+
+    def _beyondText(self) -> str:
+        tab = getattr(self.window(), '_meshQualityTab', None)
+        return tab.beyond_text() if tab is not None else ''
+
+    # -- Plan 48 PA1: the Mesh quality tab's worst-cell table -------------------- #
+
+    def _qualityTab(self):
+        tab = getattr(self.window(), '_meshQualityTab', None)
+        if tab is None:
+            self._refused('the window has no Mesh quality tab')
+        return tab
+
+    def _quality_ranking(self, changed):
+        """Rank button: the worst N cells of a metric, into the table."""
+        from foammesh.rendering.actor_info import MeshQualityIndex
+
+        info = self._display.meshQualityInfo()
+        tab = self._qualityTab()
+        asked = changed['ranking']
+        metric = asked.get('metric')
+        if metric is not None:
+            order = [m.value for m in info.metricOrder()]
+            if metric not in order:
+                self._invalid('the mesh on screen cannot be ranked by this '
+                              'metric', metric=metric, allowed=order)
+        if 'count' in asked:
+            tab._rank_count.setValue(asked['count'])
+        count = tab.rank_count()
+        if metric is not None:
+            tab.set_rank_metric(metric)
+        use = tab.rank_metric() or info.activeIndex().value
+        task = info.requestRanking(tab, MeshQualityIndex(use), count)
+        answer = {'metric': use, 'count': count, 'outcome': 'running'}
+        self._pendingRanking = (task, answer, tab)
+        return self._answer(ranking=answer)
+
+    def _quality_fly_to(self, changed):
+        """A row of the table selected (the camera goes to the cell), or the
+        failed cells framed."""
+        info = self._display.meshQualityInfo()
+        asked = changed['fly_to']
+        if 'failed_cells' in asked:
+            moved = bool(info.flyToFailedCells())
+            if not moved:
+                self._refused('no failed-cell set is on screen to fly to')
+            return self._answer(fly_to={'failed_cells': True, 'moved': True})
+        tab = self._qualityTab()
+        tags = tab.listed_tags()
+        listed = tab.listed_elements()
+        if 'tag' in asked:
+            if asked['tag'] not in tags:
+                self._invalid('the table lists no such element', tag=asked['tag'],
+                              listed=tags[:50])
+            row = tags.index(asked['tag'])
+        else:
+            row = asked['row']
+        if not 0 <= row < len(listed):
+            self._invalid('the table has no such row', row=row,
+                          rows=len(listed),
+                          note='rank the worst cells first' if not listed else '')
+        tab._elements.selectRow(row)
+        focused = info.focusedElement()
+        return self._answer(fly_to={
+            'row': row, 'element': _plain(listed[row]),
+            'moved': focused is not None,
+            'focused': _plain(focused) if isinstance(focused, dict) else None})
+
+    def _quality_inspect(self, changed):
+        """Inspect element, by tag."""
+        from foammesh.core.mesh import cell_inspect
+
+        info = self._display.meshQualityInfo()
+        tag = changed['inspect']['tag']
+        found = info.inspectElementTag(tag)
+        if not found:
+            self._refused('the mesh on screen holds no element with this tag',
+                          tag=tag)
+        tab = getattr(self.window(), '_meshQualityTab', None)
+        return self._answer(inspect={
+            'tag': tag, 'element': _plain(found),
+            'lines': [list(row) for row in cell_inspect.lines(found)],
+            'readout': tab.inspection_text() if tab is not None else ''})
+
+    def _quality_pick(self, changed):
+        """The tab's *Inspect element: click a cell* tick."""
+        info = self._display.meshQualityInfo()
+        tab = self._qualityTab()
+        on = changed['pick']['enabled']
+        tab.set_picking_element(on)
+        if info.isPickingElements() != on:
+            info.setPickingElements(on)
+        picked = info.inspected()
+        return self._answer(pick={
+            'enabled': bool(info.isPickingElements()),
+            'inspected': _plain(picked),
+            'readout': tab.inspection_text()})
 
     def _failed_cells(self, changed):
         name = changed.get('set')
@@ -470,7 +779,29 @@ class DesktopPresentationRenderer:
         return self._answer(deviation={
             'tolerance_mm': panel.tolerance(),
             'surfaces': {name: panel.surfaceCheck(name).isChecked()
-                         for name in panel.surfaceNames()}})
+                         for name in panel.surfaceNames()},
+            **self._deviationState(panel)})
+
+    @staticmethod
+    def _deviationState(panel) -> dict:
+        """Plan 48 PA1. What the panel says: source, scale, figures, bars."""
+        reader = getattr(panel, 'readState', None)
+        return _plain(reader()) if callable(reader) else {}
+
+    def _deviation_read(self, _changed):
+        """Read the deviation panel without changing it."""
+        panel = getattr(self.window(), '_deviationPanel', None)
+        if panel is None:
+            self._refused('the window has no deviation panel')
+        state = self._deviationState(panel)
+        if not state.get('shown'):
+            self._refused('no deviation is on screen: turn the deviation '
+                          'colouring on first')
+        return self._answer(deviation={
+            'tolerance_mm': panel.tolerance(),
+            'surfaces': {name: panel.surfaceCheck(name).isChecked()
+                         for name in panel.surfaceNames()},
+            **state})
 
     # -- colour ---------------------------------------------------------------- #
 
@@ -530,6 +861,11 @@ class DesktopPresentationRenderer:
                 self._tool._sectionButton.click()
             if not cut.isSectionActive():
                 self._refused(self._statusLine() or 'Nothing is loaded to cut yet.')
+        if 'plane' in asked:
+            if not 0 <= asked['plane'] < len(panel.planes()):
+                self._invalid('the section has no such plane',
+                              plane=asked['plane'], planes=len(panel.planes()))
+            panel.selectPlane(asked['plane'])
         if 'mode' in asked:
             panel.setMode(SectionMode(asked['mode']))
         if 'origin' in asked or 'normal' in asked:
@@ -541,11 +877,59 @@ class DesktopPresentationRenderer:
             sync = getattr(cut, '_syncGizmos', None)
             if callable(sync):
                 sync()
+        self._sectionExtras(panel, asked)
         plane = panel.activePlane()
         return self._answer(section={
             'enabled': cut.isSectionActive(), 'mode': panel.mode().value,
             'origin': [float(v) for v in plane.origin],
-            'normal': [float(v) for v in plane.normal]})
+            'normal': [float(v) for v in plane.normal],
+            **self._sectionDetails(panel)})
+
+    def _sectionExtras(self, panel, asked) -> None:
+        """Plan 48 PA1. The section panel's other controls, in the order the
+        panel lists them: side, how planes combine, the cell rule, solo, the
+        gizmo, the step, the sheet, and the PgUp/PgDn nudge."""
+        from foammesh.core.section.pieces import CellRule, Combine
+
+        if asked.get('flip'):
+            panel.flipActive()
+        if 'combine' in asked:
+            panel.setCombine(Combine(asked['combine']))
+        if 'cell_rule' in asked:
+            panel.setCellRule(CellRule(asked['cell_rule']))
+        if 'solo' in asked:
+            panel.setSolo(asked['solo'])
+            if panel.soloIndex() != asked['solo']:
+                self._refused('a plane is shown on its own only while two or '
+                              'more planes are on and the plane is one of them',
+                              solo=asked['solo'],
+                              enabled=len(panel.enabledPlanes()))
+        if 'lock' in asked:
+            panel.setLocked(asked['lock'])
+        if 'drag_axis' in asked:
+            panel.setDragAxisKey(asked['drag_axis'])
+        if 'handle_visible' in asked:
+            panel.setHandleVisible(panel.activeIndex(), asked['handle_visible'])
+        if 'step_choice' in asked:
+            panel.setStepChoice(asked['step_choice'])
+        if 'step' in asked:
+            panel.setTypedStep(asked['step'])
+        if 'sheet_opacity' in asked:
+            panel.setSheetOpacity(asked['sheet_opacity'])
+        nudge = asked.get('nudge')
+        if nudge:
+            for _ in range(nudge['times']):
+                if not panel.nudge(nudge['direction'], nudge['fine']):
+                    self._refused(
+                        panel.sectionStatus() or 'the plane could not be '
+                        'moved: it is off, or there is no step to take',
+                        step=panel.currentStep()[0])
+
+    @staticmethod
+    def _sectionDetails(panel) -> dict:
+        """Plan 48 PA1. What the section panel shows beyond mode and plane."""
+        reader = getattr(panel, 'readState', None)
+        return _plain(reader()) if callable(reader) else {}
 
     def _explode(self, changed):
         """The Parts card's Explode slider."""
@@ -698,7 +1082,16 @@ class DesktopPresentationRenderer:
             self._refused(notice)
         return self._answer(elements={'visible': panel.isShown(),
                                       'notice': notice,
+                                      **self._elementTexts(panel),
                                       **self._elementChoices(panel)})
+
+    @staticmethod
+    def _elementTexts(panel) -> dict:
+        """Plan 48 PA1. The Elements group's status line and cell-type note."""
+        status = getattr(panel, 'status', None)
+        note = getattr(panel, 'kindNote', None)
+        return {'status': status() if callable(status) else '',
+                'kind_note': note() if callable(note) else ''}
 
     def _elementPick(self, panel, key, value):
         """The combo entry ``value`` names, matched as the combo shows it."""
@@ -708,6 +1101,14 @@ class DesktopPresentationRenderer:
             self._refused('Show a mesh in the viewport first: the Elements '
                           'group offers its choices for the mesh on screen.',
                           option=key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            # A code (Mesh.LightLines 0, 1, 2) is matched on the entry's data.
+            index = combo.findData(value)
+            if index >= 0:
+                return combo, index
+            self._invalid(f'the Elements group offers no such light the '
+                          f'edges code', option=key, value=value,
+                          allowed=offered)
         wanted = str(value).strip().lower()
         for index, text in enumerate(offered):
             if text.strip().lower() == wanted:
@@ -719,7 +1120,12 @@ class DesktopPresentationRenderer:
     def _elementChoices(self, panel) -> dict:
         """What the combos and cell-type boxes show now."""
         shown = {key: getattr(panel, attribute).currentText()
-                 for key, attribute in self.ELEMENT_COMBOS.items()}
+                 for key, attribute in self.ELEMENT_COMBOS.items()
+                 if hasattr(panel, attribute)}
+        light = getattr(panel, '_lightLines', None)
+        if light is not None and light.currentData() is not None:
+            # The code Gmsh keeps (Mesh.LightLines), beside the words.
+            shown['light_lines_code'] = light.currentData()
         shown['cell_types'] = {kind: box.isChecked()
                                for kind, box in panel._kindBoxes.items()}
         return shown
@@ -839,6 +1245,8 @@ class DesktopPresentationRenderer:
 #: a widget the class builds in ``__init__`` by its ``self.<name> =``.
 WINDOW_CONTROLS = {
     'foammesh.view.main_window.rendering_tool:RenderingTool': (
+        'gmshDisplayPanel',
+        'surfaceOpacity', 'setSurfaceOpacity', 'surfaceOpacityRoute',
         'currentViewMode', 'isInspectionActive', 'setInspectionActive',
         'actionReason', 'colourMeshChoice', 'zoomSelectionRequested',
         'setRotationCentre', 'setRotationCentreToModel',
@@ -860,11 +1268,12 @@ WINDOW_CONTROLS = {
     'foammesh.view.main_window.console_view:Console': ('flush', '_view'),
     'foammesh.view.display_control.deviation_panel:DeviationPanel': (
         'setTolerance', 'tolerance', 'scaleBox', 'surfaceNames', 'surfaceCheck',
-        '_scaleEdited', '_scaleReset'),
+        '_scaleEdited', '_scaleReset', 'readState'),
     'foammesh.view.display_control.viewport_overlay:ViewportOverlay': (
         'explodeSlider',),
     'foammesh.view.display_control.display_control:DisplayControl': (
-        'cutTool', 'elementDisplay', 'partIds', 'selectParts',
+        'cutTool', 'elementDisplay', 'meshQualityInfo', 'partIds',
+        'selectParts',
         'selectedActorIds', 'setVisibilities', 'setPartColour',
         'setPartOpacity', 'setPartsDisplayMode', '_selectedItemsInfo',
         '_displayWireframe',
@@ -873,16 +1282,50 @@ WINDOW_CONTROLS = {
         'isSectionActive', 'panel', '_syncGizmos'),
     'foammesh.view.display_control.section_panel:SectionPanel': (
         'mode', 'setMode', 'activeIndex', 'planes', 'activePlane',
-        'setPlaneGeometry', '_emitChanged', '_clearClicked'),
+        'setPlaneGeometry', '_emitChanged', '_clearClicked',
+        'selectPlane', 'flipActive', 'setCombine', 'setCellRule', 'setSolo',
+        'soloIndex', 'enabledPlanes', 'setLocked', 'setDragAxisKey',
+        'setHandleVisible', 'setStepChoice', 'setTypedStep',
+        'setSheetOpacity', 'nudge', 'currentStep', 'sectionStatus',
+        'readState'),
     'foammesh.view.display_control.element_display_panel:ElementDisplayPanel': (
         'isShown', 'notice', '_show', '_flag', '_nodeSize', '_lineWidth',
         '_shrink', '_sampling', '_normals', '_tangents', '_subEdges',
-        '_colour', '_labelType', '_nodeStyle', '_kindBoxes'),
+        '_colour', '_labelType', '_nodeStyle', '_kindBoxes', '_lightLines',
+        'status', 'kindNote'),
+    'foammesh.view.display_control.mesh_quality_info:MeshQualityInfo': (
+        'worstChoice', 'setWorstChoice', 'setLimit', 'limitFor',
+        'limitIsSet', 'highlightWorst', 'isHighlighting', 'band',
+        'bandLabel', 'legendTitle', 'metricOrder', 'activeIndex',
+        'beyondCount', 'distribution', 'requestRanking', 'flyToFailedCells',
+        'focusedElement', 'inspectElementTag', 'inspected',
+        'setPickingElements', 'isPickingElements'),
+    'foammesh.view.main_window.mesh_quality_tab:MeshQualityTab': (
+        'listed_elements', 'listed_tags', 'listed_title', 'rank_count',
+        'rank_metric', 'set_rank_metric', 'set_picking_element',
+        'inspection_text', '_elements', '_rank_count', 'set_limit',
+        'set_limit_sources', 'set_beyond_count', 'beyond_text'),
     'widgets.rendering.rendering_widget:RenderingWidget': (
         'setViewPreset', 'rollCameraBy', 'canGoBack', 'canGoForward',
         'background1', 'background2', 'measureBetween', 'clearMeasure',
         'noticeStrip'),
 }
+
+def _plain(value):
+    """Plan 48 PA1. A value the local API can carry: numpy numbers and
+    arrays, tuples and enums become plain numbers, lists and text."""
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_plain(item) for item in value]
+    if hasattr(value, 'tolist') and not isinstance(value, (str, bytes)):
+        return _plain(value.tolist())
+    if hasattr(value, 'value') and hasattr(type(value), '__members__'):
+        return value.value
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
+
 
 def _colour_of(value):
     """The colour a text names, or None when it names none."""

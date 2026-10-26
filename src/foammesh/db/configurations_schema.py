@@ -248,6 +248,7 @@ class GmshRecombinationAlgorithm(Enum):
     BLOSSOM = 'blossom'
     SIMPLE_FULL_QUAD = 'simple_full_quad'
     BLOSSOM_FULL_QUAD = 'blossom_full_quad'
+    BIPARTITE_LABELLING = 'bipartite_labelling'
 
 
 class GmshCellShape(Enum):
@@ -272,18 +273,19 @@ class GmshCellShape(Enum):
     non-orthogonality above 145 degrees on every geometry tried, and one that
     would not publish at all.
 
-    Plan 31 CP-08 item 3. Gmsh's other two subdivisions are absent for a
-    related reason, MEASURED on duct.step: ``Mesh.SubdivisionAlgorithm`` 1,
-    whose Gmsh name is "all quadrangles", left the mesh exactly as it found it
-    -- 682 triangles and 1044 tetrahedra, the same numbers as no subdivision
-    at all, and no error. 3 (barycentric) split every tetrahedron into four,
-    which is a refinement rather than a change of family. Only 0 and 2 do what
-    their names say, so only 0 and 2 are reachable, and the runner refuses any
-    other code rather than meshing something the user did not ask for.
+    Plan 31 CP-08 item 3 measured Gmsh's other two subdivisions on duct.step:
+    ``Mesh.SubdivisionAlgorithm`` 1 ("all quadrangles") left the mesh as it
+    found it there, and 3 (barycentric) split every tetrahedron into four.
+    Plan 48 D4 (user, 2026-10-21) opens the whole Gmsh range: ``quadrangles``
+    and ``barycentric`` are offered, each value read back live on Gmsh 4.15.2
+    (``plans/evidence/plan48/fragments/gm2/live-enums.json``), and the run
+    ledger records what Gmsh applied.
     """
 
     TETRAHEDRAL = 'tetrahedral'
+    QUADRANGLES = 'quadrangles'
     HEXAHEDRAL = 'hexahedral'
+    BARYCENTRIC = 'barycentric'
 
 
 class DecompositionOrder(Enum):
@@ -391,6 +393,110 @@ class GmshSizeFieldType(Enum):
     #: to a size. `Mesh.MeshSizeFromCurvature` does this globally; this does
     #: it for one face group, with its own range.
     CURVATURE = 'curvature'
+
+
+class GmshSizeExtension(Enum):
+    """``Mesh.MeshSizeExtendFromBoundary``: where the sizes on the boundary
+    spread inwards. Plan 48 D4 (DP-2952): Gmsh's whole set, {0, 1, 2, -2, -3};
+    the codes are ``foammesh.core.gmsh.sizing.EXTEND_FROM_BOUNDARY``. It was
+    an on/off box (1 or 0), and a project saved then loads as 1 or 0
+    (:class:`CodedEnumType`)."""
+
+    NEVER = 'never'
+    SURFACES_AND_VOLUMES = 'surfaces_and_volumes'
+    SURFACES_AND_VOLUMES_SMALLEST_EDGE = 'surfaces_and_volumes_smallest_edge'
+    SURFACES_ONLY = 'surfaces_only'
+    VOLUMES_ONLY = 'volumes_only'
+
+
+class GmshImportLabels(Enum):
+    """``Geometry.OCCImportLabels``: whether STEP names and colours are read.
+    Plan 48 D4 (DP-2952): Gmsh's whole set, {0, 1, 2}; 2 also applies Gmsh's
+    slow fix for parts whose stored location is wrong. Codes are
+    ``foammesh.core.gmsh.topology.IMPORT_LABELS``. It was an on/off box."""
+
+    OFF = 'off'
+    ON = 'on'
+    ON_WITH_LOCATION_FIX = 'on_with_location_fix'
+
+
+#: The Gmsh number each choice stands for (Plan 48 DP-2952).
+GMSH_SIZE_EXTENSION_CODES = {
+    GmshSizeExtension.NEVER.value: 0,
+    GmshSizeExtension.SURFACES_AND_VOLUMES.value: 1,
+    GmshSizeExtension.SURFACES_AND_VOLUMES_SMALLEST_EDGE.value: 2,
+    GmshSizeExtension.SURFACES_ONLY.value: -2,
+    GmshSizeExtension.VOLUMES_ONLY.value: -3,
+}
+GMSH_IMPORT_LABEL_CODES = {
+    GmshImportLabels.OFF.value: 0,
+    GmshImportLabels.ON.value: 1,
+    GmshImportLabels.ON_WITH_LOCATION_FIX.value: 2,
+}
+
+
+def gmshJobCode(code: int):
+    """A coded choice as the job writes it (Plan 48 DP-2952): 0 and 1 stay
+    the booleans the job held before the choice, so an untouched project's
+    job -- whose digest keys the mesh cache -- is byte for byte the same;
+    any other code is its number. The runner reads both."""
+    return bool(code) if code in (0, 1) else int(code)
+
+
+def gmshCode(value, codes: dict, default: int) -> int:
+    """The Gmsh number a stored choice stands for (Plan 48 DP-2952).
+
+    Takes the choice (``'surfaces_only'`` or its enum member), a Gmsh code
+    (``-2``, ``'-2'``), or the ``True`` / ``False`` an older project or job
+    holds (1 / 0). Anything else is refused with the choices named.
+    """
+    if value is None:
+        return int(default)
+    if isinstance(value, bool):
+        return int(value)
+    value = getattr(value, 'value', value)
+    text = str(value).strip()
+    key = text.split('.')[-1].lower()
+    if key in codes:
+        return int(codes[key])
+    try:
+        number = int(text)
+    except ValueError:
+        number = None
+    if number is not None and number in codes.values():
+        return number
+    raise ValueError(
+        f'{value!r} is not one of ' + ', '.join(
+            f'{name} ({code})' for name, code in codes.items()))
+
+
+class CodedEnumType(EnumType):
+    """A choice that stands for a Gmsh number and used to be an on/off box.
+
+    Plan 48 DP-2952. A project saved with the box holds ``True`` / ``False``;
+    those load as the choices whose codes are 1 and 0, so the project meshes
+    as it did. A Gmsh code (``-2``, ``'2'``) is accepted too and stored as its
+    choice, so the local API can give the number Gmsh documents.
+    """
+
+    def __init__(self, enumClass, codes: dict):
+        self._codes = dict(codes)
+        super().__init__(enumClass)
+
+    def validate(self, value, name=None):
+        if isinstance(value, bool):
+            value = int(value)
+        if not isinstance(value, Enum):
+            try:
+                number = int(str(value).strip())
+            except (TypeError, ValueError):
+                number = None
+            if number is not None:
+                for choice, code in self._codes.items():
+                    if code == number:
+                        value = choice
+                        break
+        return super().validate(value, name)
 
 
 class GmshFieldCombiner(Enum):
@@ -605,6 +711,89 @@ class TriSurfaceDeclaration(Enum):
     ASSUME_CLOSED = 'assumeClosed'
 
 
+class SurfaceRole(Enum):
+    """Plan 49 SR1. What a surface is, topologically (plan section 3).
+
+    One of five, chosen once per surface. It is not the purpose (inlet,
+    wall), which is ``boundaryCategory``, and not a mesh patch type, which is
+    ``meshPatchType`` for an external boundary and is generated from a
+    relation for everything coupled. ``foammesh.db.surface_intent`` keeps the
+    model's rules.
+    """
+    #: A surface bounding one region: a named patch of a free type.
+    EXTERNAL_BOUNDARY = 'externalBoundary'
+    #: Identifiable faces inside one region: a face zone, no patch.
+    INTERNAL_FACE = 'internalFace'
+    #: Two regions sharing one face topology; region split pairs the sides.
+    REGION_INTERFACE_CONFORMAL = 'regionInterfaceConformal'
+    #: Two regions meshed separately and coupled non-conformally.
+    REGION_INTERFACE_NON_CONFORMAL = 'regionInterfaceNonConformal'
+    #: An impermeable thin wall inside one region: two same-region walls.
+    BLOCKING_BAFFLE = 'blockingBaffle'
+
+
+class MeshPatchType(Enum):
+    """Plan 49 SR1. The mesh patch types a surface may be given by hand.
+
+    ``symmetry`` and ``symmetryPlane`` are distinct OpenFOAM types and both
+    are offered. Coupled types -- ``cyclic``, ``mappedWall``,
+    ``nonConformalCyclic``, ``nonConformalMappedWall`` and their auxiliary
+    patches -- are deliberately absent: they are generated from a validated
+    ``surfaceRelations`` record, never typed as a free label that has no
+    partner. A choice here is a request; whether a route can build it
+    (``empty``, ``wedge``) is checked against the geometry, not assumed.
+    """
+    PATCH = 'patch'
+    WALL = 'wall'
+    SYMMETRY = 'symmetry'
+    SYMMETRY_PLANE = 'symmetryPlane'
+    EMPTY = 'empty'
+    WEDGE = 'wedge'
+
+
+class SurfaceRelationKind(Enum):
+    """Plan 49 SR1. What one ``surfaceRelations`` record couples."""
+    REGION_INTERFACE_CONFORMAL = 'regionInterfaceConformal'
+    REGION_INTERFACE_NON_CONFORMAL = 'regionInterfaceNonConformal'
+    #: A cyclic/periodic connection with its transform. Its sides stay
+    #: external boundaries; the coupling is the relation's.
+    PERIODIC = 'periodic'
+
+
+class IntentOrigin(Enum):
+    """Plan 49 SR1. Where a surface's stored intent came from."""
+    #: Chosen by a person (or the local API on their behalf).
+    AUTHORED = 'authored'
+    #: Converted from an unambiguous legacy setting when the project opened.
+    MIGRATED = 'migrated'
+    #: Read from the surface's name or the project default, as the meshers
+    #: always did, and stored so a rename no longer changes it. For review.
+    INFERRED = 'inferred'
+
+
+class IntentState(Enum):
+    """Plan 49 SR1 (D7). Whether a surface's or relation's intent can be built.
+
+    An unresolved item is saved as a visibly invalid draft with its reason;
+    it is never refused at save and never dropped. Blocking a run or an
+    export on it is the validation package's job (SR7).
+    """
+    VALID = 'valid'
+    UNRESOLVED = 'unresolved'
+
+
+class RelationVerification(Enum):
+    """Plan 49 SR1. What the geometry has been measured to say about a relation.
+
+    A saved pair is not proof of shared faces, overlap or a transform that
+    maps one side onto the other (plan section 2.1). This records whether
+    anyone measured it; SR1 writes only ``unverified``.
+    """
+    UNVERIFIED = 'unverified'
+    VERIFIED = 'verified'
+    FAILED = 'failed'
+
+
 class CFDType(Enum):
     NONE = 'none'
     CELL_ZONE = 'cellZone'
@@ -668,15 +857,60 @@ class ThicknessModel(Enum):
 
 
 class FeatureSnapType(Enum):
-    """Retired: ``snap`` now carries two independent switches.
+    """Retired: ``snap/featureSnapping`` holds the choice now.
 
     Kept because :func:`migrateDocument` has to read the value an existing
-    project was saved with. OpenFOAM 13 accepts ``implicitFeatureSnap`` and
-    ``explicitFeatureSnap`` both true -- the usual setting for an STL with
-    extracted features -- and this enum could only ever express one of them.
+    project was saved with.
     """
     EXPLICIT = 'explicit'
     IMPLICIT = 'implicit'
+
+
+class FeatureSnapping(Enum):
+    """How snapping pulls points onto feature edges: one choice (DP-5712).
+
+    ``explicit`` snaps to the edges extracted into ``.eMesh`` files,
+    ``implicit`` finds them from the surface while snapping, ``none`` snaps
+    to the surface only. The writer turns the choice into the two
+    ``snapControls`` switches with at most one of them true. Two independent
+    switches let a user ask for both (F-41) -- engineer report 17: a person
+    picks one way of finding edges, not two at once.
+    """
+    EXPLICIT = 'explicit'
+    IMPLICIT = 'implicit'
+    NONE = 'none'
+
+
+def featureSnapSwitches(choice) -> tuple[bool, bool]:
+    """``(implicitFeatureSnap, explicitFeatureSnap)`` for one choice.
+
+    At most one is true (DP-5712); anything unrecognised is the default,
+    explicit.
+    """
+    value = str(getattr(choice, 'value', choice) or '')
+    if value == FeatureSnapping.IMPLICIT.value:
+        return True, False
+    if value == FeatureSnapping.NONE.value:
+        return False, False
+    return False, True
+
+
+def isMultiRegionCase(db) -> bool:
+    """Do regions or zones meet in this case? (DP-5712)
+
+    ``multiRegionFeatureSnap`` is read by the explicit snapper where points
+    sit on more than one region: more than one material point, or a
+    geometry that is a cell zone or an interface. A plain single-region case
+    has nothing for it to do.
+    """
+    try:
+        if db.elementCount('region') > 1:
+            return True
+        zoned = (CFDType.CELL_ZONE.value, CFDType.INTERFACE.value)
+        return db.elementCount(
+            'geometry', lambda _key, element: element['cfdType'] in zoned) > 0
+    except Exception:  # noqa: BLE001 - no case, or no such list yet
+        return False
 
 
 class LayerPolicy(Enum):
@@ -860,6 +1094,27 @@ geometry = {
     'cfdType': EnumType(CFDType),
     'nonConformal': BoolType(False),
     'interRegion': BoolType(False),
+    # Plan 49 SR1. What a surface is for, in three separate fields: the
+    # topology (`surfaceRole`), the purpose handed to the solver set-up as a
+    # hint (`boundaryCategory`, never a field boundary condition) and, for an
+    # external boundary only, the mesh patch type. Coupling is not stored
+    # here: it is the `surfaceRelations` record naming this row. All unset on
+    # a row nobody has assessed, which the meshers read through the legacy
+    # `cfdType`/switches above exactly as before; `migrateDocument` assesses
+    # every saved surface (`foammesh.db.surface_intent`). The three legacy
+    # fields stay until SR4/SR5 move the writers over.
+    'surfaceRole': EnumType(SurfaceRole).setOptional().setDefault(None),
+    'boundaryCategory': EnumType(BoundaryCategory).setOptional()
+    .setDefault(None),
+    'meshPatchType': EnumType(MeshPatchType).setOptional().setDefault(None),
+    # Authored, migrated from an unambiguous legacy value, or inferred from
+    # the name (for review).
+    'intentOrigin': EnumType(IntentOrigin).setOptional().setDefault(None),
+    # D7. The model carries its own validation state: an intent that cannot
+    # be built is saved as an unresolved draft with its reason, not refused
+    # and not lost. Recomputed on every commit (`Configurations.commit`).
+    'intentState': EnumType(IntentState).setOptional().setDefault(None),
+    'intentIssue': TextType().setOptional().setDefault(''),
     'path': TextType().setOptional(),
     'point1': VectorComposite().schema(),
     'point2': VectorComposite().setDefault(1, 1, 1).schema(),
@@ -1066,6 +1321,68 @@ interfacePair = {
     'rotationAxisY': FloatType().setDefault(0.0),
     'rotationAxisZ': FloatType().setDefault(1.0),
     'rotationAngleDegrees': FloatType().setRange(-360, 360).setDefault(0.0),
+}
+
+
+#: Plan 49 SR1. The one authoritative record of a region interface or a
+#: periodic pair (plan section 3). A surface's controls edit this record; no
+#: surface holds a second copy of the coupling. Each side is followed by its
+#: geometry row key and, more durably, by the prepared patch uuid that row was
+#: imported as; the label is the side's last-known name, kept so a relation
+#: whose surface was deleted or replaced still says which surface it meant.
+#: Regions are ``geometry:<row key>`` of the row whose cell zone the region
+#: is, or ``surrounding`` -- the region on the other side of a zone-carving
+#: surface, as the mesh finds it. ``state`` is the model's validation verdict
+#: (recomputed on every commit); ``verification`` is what the geometry was
+#: measured to say, which nothing in SR1 measures.
+surfaceRelation = {
+    'relationId': TextType(),
+    'name': TextType().setOptional().setDefault(''),
+    'kind': EnumType(SurfaceRelationKind),
+    'ownerSurface': IntType().setOptional().setDefault(None),
+    'ownerPatchUuid': TextType().setOptional().setDefault(''),
+    'ownerLabel': TextType().setOptional().setDefault(''),
+    'neighbourSurface': IntType().setOptional().setDefault(None),
+    'neighbourPatchUuid': TextType().setOptional().setDefault(''),
+    'neighbourLabel': TextType().setOptional().setDefault(''),
+    # A conformal interface may be one shared source surface: both sides are
+    # the owner surface, split into its two region patches by the mesh.
+    'sharedSurface': BoolType(False),
+    'ownerRegion': TextType().setOptional().setDefault(''),
+    'neighbourRegion': TextType().setOptional().setDefault(''),
+    'transform': EnumType(InterfaceTransform).setDefault(
+        InterfaceTransform.COINCIDENT),
+    'matchTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
+    'translationX': FloatType().setDefault(0.0),
+    'translationY': FloatType().setDefault(0.0),
+    'translationZ': FloatType().setDefault(0.0),
+    'rotationCentreX': FloatType().setDefault(0.0),
+    'rotationCentreY': FloatType().setDefault(0.0),
+    'rotationCentreZ': FloatType().setDefault(0.0),
+    'rotationAxisX': FloatType().setDefault(0.0),
+    'rotationAxisY': FloatType().setDefault(0.0),
+    'rotationAxisZ': FloatType().setDefault(1.0),
+    'rotationAngleDegrees': FloatType().setRange(-360, 360).setDefault(0.0),
+    'state': EnumType(IntentState).setDefault(IntentState.VALID),
+    'stateReason': TextType().setOptional().setDefault(''),
+    'verification': EnumType(RelationVerification).setDefault(
+        RelationVerification.UNVERIFIED),
+    # Plan 49 SR3. What the measurement said, with its numbers, and a digest
+    # of what it measured (the sides, their files and the transform). A
+    # verdict whose digest no longer matches the relation is stale and is
+    # put back to `unverified` on the next commit.
+    'verificationReason': TextType().setOptional().setDefault(''),
+    'verificationKey': TextType().setOptional().setDefault(''),
+    'origin': EnumType(IntentOrigin).setDefault(IntentOrigin.AUTHORED),
+    # Which legacy record a migrated relation was converted from
+    # (`interfacePairs/<key>` or `geometry/<key>`), so a second open never
+    # converts it twice. Plan 49 SR3: a periodic relation is also *edited*
+    # through the row named here (`interfacePairs/<key>` on the Geometry
+    # page, `gmsh/periodicPairs/<key>` on the Gmsh Periodic page) until SR8
+    # gives the relation store its own controls; every commit carries that
+    # row's sides and transform into the relation
+    # (`surface_intent.sync_periodic_relations`).
+    'legacySource': TextType().setOptional().setDefault(''),
 }
 
 
@@ -1383,6 +1700,18 @@ schema = {
     # Shared geometry-level interface pairing.  Both engines consume this
     # connector model; it is not an engine-specific duplicate.
     'interfacePairs': IntKeyList(interfacePair),
+    # Plan 49 SR1. The authoritative region-interface and periodic relations
+    # (see `surfaceRelation`). `interfacePairs` above is the legacy store the
+    # meshers still read until SR4/SR5; migration converts it into this list
+    # and leaves it as saved.
+    'surfaceRelations': IntKeyList(surfaceRelation),
+    # Plan 49 SR1. The surface-intent model's version and the structured
+    # report of what opening a saved project converted, inferred or left to
+    # repair (JSON, `surface_intent.conversion_report`).
+    'surfaceIntent': {
+        'modelVersion': IntType().setOptional().setDefault(None),
+        'conversionReport': TextType().setOptional().setDefault(''),
+    },
     'region': IntKeyList(region),
     'gmsh': {
         # FC-E. How many dimensions this case is meshed in. It is the first
@@ -1424,11 +1753,14 @@ schema = {
             .setLowLimit(0, False),
             'minimumSize': FloatType().setOptional().setDefault(None)
             .setLowLimit(0, False),
-            'sizeFactor': FloatType().setRange(0.01, 100).setDefault(1.0),
+            'sizeFactor': FloatType().setRange(0.001, 1000).setDefault(1.0),
             'fromCurvature': IntType().setRange(0, 50).setOptional()
             .setDefault(None),
             'fromPoints': BoolType(True),
-            'extendFromBoundary': BoolType(True),
+            # Plan 48 D4 (DP-2952). Gmsh's five values; it was on/off.
+            'extendFromBoundary': CodedEnumType(
+                GmshSizeExtension, GMSH_SIZE_EXTENSION_CODES).setDefault(
+                    GmshSizeExtension.SURFACES_AND_VOLUMES),
             # Plan 31 FC-B. The curve-discretisation floors: how few elements
             # a small circle, a short curve or a full turn may get, whatever
             # the target size says. Defaults are Gmsh 4.15.2's own, probed
@@ -1436,8 +1768,8 @@ schema = {
             # meshes exactly as it did before.
             'minimumCirclePoints': IntType().setRange(3, 200).setDefault(7),
             'minimumCurvePoints': IntType().setRange(2, 200).setDefault(3),
-            # 0 is Gmsh's "unset": the curvature setting alone decides.
-            'minimumElementsPerTwoPi': IntType().setRange(0, 200).setDefault(0),
+            # Plan 48 DP-3035. `minimumElementsPerTwoPi` was Gmsh's older name
+            # for `fromCurvature`; `migrateDocument` moves a stored value.
             # Plan 30 WP12. How the size fields are combined into the one
             # background field Gmsh keeps. `Min` -- the finest request wins --
             # is what shipped and stays the default; `Max` is the Gmsh `Max`
@@ -1468,12 +1800,10 @@ schema = {
             'cellShape': EnumType(GmshCellShape).setDefault(
                 GmshCellShape.TETRAHEDRAL),
             # Plan 30 WP12. Gmsh's recombination: quads on the surfaces and
-            # the hex/prism family that follows from them. Off by default and
-            # only honoured for an SU2 target -- the OpenFOAM route rejects
-            # the result outright, for the reasons GmshCellShape records, so
-            # the derivation clears this with a warning for every other
-            # target rather than letting a run produce a mesh that cannot be
-            # published.
+            # the hex/prism family that follows from them. Off by default.
+            # Honoured for every target (Plan 41 GN2): derive_algorithms
+            # passes it through as chosen, and the export that cannot read
+            # the family declines it (Plan 48 DP-3010).
             'recombine': BoolType(False),
             # Plan 31 CP-08 item 3. Which recombiner. The runner wrote 1
             # (blossom) and nothing could choose otherwise, while the four
@@ -1490,6 +1820,12 @@ schema = {
             # was actually meshed with, read out of Gmsh's own log, so a
             # fallback shows up instead of passing for the chosen algorithm.
             'algorithmFallback': BoolType(True),
+            # Plan 48 D4 (DP-2952). `Mesh.MaxRetries`, its own number: how
+            # many times Gmsh retries a curve or surface left with a pending
+            # mesh. It was 10 with the fallback box ticked and 0 without;
+            # Gmsh's default is 10 and its floor 0. A project saved before
+            # this field gets the number the box gave it (migrateDocument).
+            'maxRetries': IntType().setLowLimit(0).setDefault(10),
             # Plan 31 FC-C. `gmsh.model.mesh.splitQuadrangles`, the answer to
             # a recombined mesh the OpenFOAM route refuses. Until now that
             # request was simply cleared: the user asked for recombination,
@@ -1635,7 +1971,19 @@ schema = {
             # default of four asked for threads the shipped configuration could
             # never use -- and reported nothing. Raising this is worthwhile
             # once the volume algorithm is hxt, which is the threaded one.
-            'threads': IntType().setLowLimit(1).setDefault(1),
+            'threads': IntType().setLowLimit(0).setDefault(1),
+            # Plan 48 ST (DP-4605). Gmsh 4.15.2 with more than one thread can
+            # mesh one model into a different element count each run (2047
+            # against 2068 tetrahedra). Ticked, a run uses one thread in every
+            # stage and repeats.
+            'reproducible': BoolType(False),
+            # Plan 48 D4 (DP-2952). `Mesh.MaxNumThreads1D/2D/3D`: the threads
+            # for curves, surfaces and volumes. 0 is automatic -- as many as
+            # Threads, which is what Gmsh's own 0 means and what every stage
+            # ran on before these existed. "Reproducible" overrides all three.
+            'curveThreads': IntType().setLowLimit(0).setDefault(0),
+            'surfaceThreads': IntType().setLowLimit(0).setDefault(0),
+            'volumeThreads': IntType().setLowLimit(0).setDefault(0),
         },
         'healing': {
             'importTolerance': FloatType().setLowLimit(0, False).setDefault(1e-6),
@@ -1704,7 +2052,10 @@ schema = {
             # names and colours are read in. Patch identity in this
             # application is built from them, so the default stays on; off is
             # the remedy for CAD whose labels collide.
-            'importLabels': BoolType(True),
+            # Plan 48 D4 (DP-2952): Gmsh's three values; it was on/off.
+            'importLabels': CodedEnumType(
+                GmshImportLabels, GMSH_IMPORT_LABEL_CODES).setDefault(
+                    GmshImportLabels.ON),
             # `Geometry.OCCParallel`. Gmsh default 0. Speed only: it lets OCC
             # thread its boolean and import work. It changes how long the
             # import takes, not what it produces.
@@ -1815,9 +2166,9 @@ schema = {
         # See MESHER_ELEMENT_ORDERS / EXPORTER_ELEMENT_ORDERS in
         # core/gmsh/plan_derivation.py.
         'output': {
-            # DP-2699: 1-3, the orders Set order reaches on the Generate page
+            # DP-2699, DP-3006: 1-10, the orders Set order reaches on the Generate page
             # (MESHER_ELEMENT_ORDERS).
-            'elementOrder': IntType().setRange(1, 3).setDefault(1),
+            'elementOrder': IntType().setRange(1, 10).setDefault(1),
             # Serendipity elements: eight nodes on a hex face rather than
             # nine. Read only when the order is 2.
             'secondOrderIncomplete': BoolType(False),
@@ -2037,19 +2388,29 @@ schema = {
         'excludePoints': IntKeyList(excludePoint),
     },
     'snap': {
-        'nSmoothPatch': IntType().setLowLimit(0).setDefault(0),
+        # DP-6076. 3 is OpenFOAM 13's own default (snappyHexMeshDict.cfg) and
+        # what every reference case under test_cases/snappyhexmesh sets. At 0
+        # (inherited, never measured) the patch points are projected straight
+        # off the castellated staircase, so on a curved interface a hex keeps
+        # two faces on the surface, one of them a sliver. Inside the whole
+        # mesh that face sits between two cells and its skewness is < 1; once
+        # splitMeshRegions makes it a region's boundary, checkMesh -region
+        # measures it from one cell and fails it (CHT tube: 5.0 / 5.8 / 5.6
+        # on 84 / 124 / 188 faces). At 3 the same case gives 2.1 / 2.1 / 2.2
+        # and "Mesh OK." in all three regions, at the same cell count.
+        'nSmoothPatch': IntType().setLowLimit(0).setDefault(3),
         # ``nSmoothInternal`` is not read by OpenFOAM Foundation 13 snapControls
         # and was removed rather than shown as a control with no effect.
         'nSolveIter': IntType().setLowLimit(0).setDefault(30),
         'nRelaxIter': IntType().setLowLimit(0).setDefault(5),
         'nFeatureSnapIter': IntType().setLowLimit(0).setDefault(15),
-        # F-41. These were one enum, written as each other's complement, so
-        # the pair OpenFOAM 13 recommends for an STL with extracted feature
-        # edges -- both true -- could not be asked for. They are two keys in
-        # snapControls and they are two switches here. `migrateDocument` maps
-        # a project saved on the old enum onto them.
-        'implicitFeatureSnap': BoolType(False),
-        'explicitFeatureSnap': BoolType(True),
+        # DP-5712. One choice, written as the two snapControls switches with
+        # at most one true. `migrateDocument` reads the two switches (F-41)
+        # and the older `featureSnapType` enum a project was saved with.
+        'featureSnapping': EnumType(FeatureSnapping).setDefault(
+            FeatureSnapping.EXPLICIT),
+        # Read by the explicit snapper only, and only where regions or zones
+        # meet; the writer writes it false anywhere else.
         'multiRegionFeatureSnap': BoolType(False),
         # C31-11. ``snapParameters.C:44-46`` reads this Switch out of
         # snapControls with ``lookupOrDefault(..., true)`` and
@@ -2403,6 +2764,9 @@ ID_REFERENCES = (
     # A geometry row names its layer group, once per side of a baffle.
     IdReference('addLayers/layers', 'geometry/*/layerGroup'),
     IdReference('addLayers/layers', 'geometry/*/slaveLayerGroup'),
+    # Plan 49 SR1. A relation names the surface row on each of its sides.
+    IdReference('geometry', 'surfaceRelations/*/ownerSurface'),
+    IdReference('geometry', 'surfaceRelations/*/neighbourSurface'),
 )
 
 
@@ -2468,8 +2832,47 @@ LAYER_DEFAULTS_BEFORE_U1 = {
 }
 
 
-def migrateDocument(document):
+def _migrateFeatureSnapping(snap: dict, notes=None) -> None:
+    """DP-5712. Read a saved feature-snap setting as the one choice."""
+    if 'featureSnapType' in snap:
+        stored = snap.pop('featureSnapType')
+        stored = getattr(stored, 'value', stored)
+        snap.setdefault(
+            'featureSnapping',
+            FeatureSnapping.IMPLICIT.value
+            if str(stored) == FeatureSnapType.IMPLICIT.value
+            else FeatureSnapping.EXPLICIT.value)
+    if 'implicitFeatureSnap' not in snap and 'explicitFeatureSnap' not in snap:
+        return
+
+    def switch(key, default):
+        value = snap.pop(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ('true', 'yes', 'on', '1')
+        return bool(value)
+
+    implicit = switch('implicitFeatureSnap', False)
+    explicit = switch('explicitFeatureSnap', True)
+    if explicit:
+        choice = FeatureSnapping.EXPLICIT.value
+    elif implicit:
+        choice = FeatureSnapping.IMPLICIT.value
+    else:
+        choice = FeatureSnapping.NONE.value
+    snap.setdefault('featureSnapping', choice)
+    if explicit and implicit and notes is not None:
+        notes.append(
+            'Snap: this project was saved with both explicit and implicit '
+            'feature snapping on. Feature snapping is one choice now, and '
+            'the project opens with Explicit.')
+
+
+def migrateDocument(document, notes=None):
     """Rewrite a saved document onto the current field names, in place.
+
+    ``notes``, when given, is a list the migration appends one sentence to
+    for every saved value it had to read differently, so the window can say
+    so in the Console when the project opens.
 
     There is no version ladder here on purpose (see ``mesh/targetSolver``):
     the loader refuses any version it does not recognise, so bumping
@@ -2481,10 +2884,10 @@ def migrateDocument(document):
 
     Three renames are handled:
 
-    * ``snap/featureSnapType`` (an enum) becomes ``implicitFeatureSnap`` and
-      ``explicitFeatureSnap``. ``implicit`` sets the implicit switch only,
-      ``explicit`` sets the explicit switch only -- exactly the pair the old
-      writer emitted, so no existing project changes mesh.
+    * ``snap/featureSnapType`` (an enum) and the two switches that replaced
+      it, ``implicitFeatureSnap`` and ``explicitFeatureSnap``, become the one
+      ``featureSnapping`` choice (DP-5712). A project saved with both
+      switches on opens as explicit, and a note says so.
     * a layer group with no ``layerPolicy`` gets one from its count: one or
       more layers is ``grow``, zero is ``freeze``.
     * ``addLayers/minMedianAxisAngle`` becomes ``minMedialAxisAngle`` (Plan 30
@@ -2499,6 +2902,13 @@ def migrateDocument(document):
 
     One move is handled: a volume's ``bands`` ramp becomes rows of
     ``castellation/volumeBands`` (DP-2210), see ``foammesh.db.volume_bands``.
+
+    One conversion is handled: Plan 49 SR1's surface intent. Each saved
+    surface's ``cfdType``, switches, zone and name-implied purpose, and each
+    ``interfacePairs`` row, become ``surfaceRole``, ``boundaryCategory``,
+    ``meshPatchType`` and ``surfaceRelations`` where that is unambiguous, and
+    an unresolved repair item where it is not; the legacy values are kept as
+    saved. See ``foammesh.db.surface_intent.migrate_surface_intent``.
 
     One removal is handled: ``mesh/intent`` (Plan 30 WP-09, F-23). Validation
     would drop it anyway; it is dropped here so that a case saved with the six
@@ -2531,12 +2941,8 @@ def migrateDocument(document):
     if isinstance(quality, dict):
         _resetOutOfRange(quality, schema['meshQuality'])
     snap = document.get('snap')
-    if isinstance(snap, dict) and 'featureSnapType' in snap:
-        stored = snap.pop('featureSnapType')
-        stored = getattr(stored, 'value', stored)
-        implicit = str(stored) == FeatureSnapType.IMPLICIT.value
-        snap.setdefault('implicitFeatureSnap', implicit)
-        snap.setdefault('explicitFeatureSnap', not implicit)
+    if isinstance(snap, dict):
+        _migrateFeatureSnapping(snap, notes)
     # DP-2210 (Plan 43 LY13 D1). A volume's distance ramp used to be saved
     # inside the volume (``refinementVolumes/<id>/bands``); the guided editor
     # and the case builder use ``castellation/volumeBands``, so a saved ramp
@@ -2568,6 +2974,8 @@ def migrateDocument(document):
             layerBlock.setdefault('patchMode',
                                   GmshLayerPatchMode.SELECTED.value)
             layerBlock.setdefault('firstHeight', 0.0006)
+    _migrateCurvature(document)
+    _migrateRetries(document)
     baseGrid = document.get('baseGrid')
     if isinstance(baseGrid, dict):
         # Plan 40 UXA3. Before this the default mode was `counts`, so a
@@ -2613,7 +3021,48 @@ def migrateDocument(document):
             group['layerPolicy'] = (
                 LayerPolicy.GROW.value if count >= 1
                 else LayerPolicy.FREEZE.value)
+    # Plan 49 SR1. Last, so it reads the document every rename above has
+    # already settled.
+    from foammesh.db.surface_intent import migrate_surface_intent
+    migrate_surface_intent(document, notes)
     return document
+
+
+def _migrateRetries(document):
+    """Plan 48 DP-2952: ``gmsh/algorithms/maxRetries`` is its own number.
+
+    Before it, the fallback box set ``Mesh.MaxRetries`` too: 10 ticked, 0
+    unticked. A project saved then holds no number, and the schema default
+    (Gmsh's 10) would retry a project whose box was unticked; it gets the 0
+    its box gave it. Read as ``BoolType`` reads the box, so the two agree.
+    """
+    gmsh = document.get('gmsh')
+    algorithms = gmsh.get('algorithms') if isinstance(gmsh, dict) else None
+    if not isinstance(algorithms, dict) or 'maxRetries' in algorithms:
+        return
+    if 'algorithmFallback' in algorithms and not algorithms['algorithmFallback']:
+        algorithms['maxRetries'] = 0
+
+
+def _migrateCurvature(document):
+    """Plan 48 DP-3035: ``gmsh/globalSizing/minimumElementsPerTwoPi`` is gone.
+
+    It was the older Gmsh name for ``fromCurvature`` (Mesh.MeshSizeFromCurvature)
+    and the run wrote it over the curvature whenever it asked for something
+    (above 0), so a stored value above 0 becomes the curvature, kept inside the
+    range that control has. A stored 0 never asked for anything and is dropped.
+    """
+    sizing = (document.get('gmsh') or {}).get('globalSizing')         if isinstance(document.get('gmsh'), dict) else None
+    if not isinstance(sizing, dict) or 'minimumElementsPerTwoPi' not in sizing:
+        return
+    stored = sizing.pop('minimumElementsPerTwoPi')
+    stored = getattr(stored, 'value', stored)
+    try:
+        count = int(float(str(stored).strip() or 0))
+    except ValueError:
+        count = 0
+    if count > 0:
+        sizing['fromCurvature'] = min(count, 50)
 
 
 def _migrateGrading(baseGrid):

@@ -9,11 +9,15 @@ from foammesh.db.configurations_schema import RegionType
 
 
 class RegionProperties(DictionaryFile):
-    def __init__(self, casePath):
+    def __init__(self, casePath, db=None):
         super().__init__(casePath, self.constantLocation(), Directory.REGION_PROPERTIES_FILE_NAME)
+        self._db = db
 
     def build(self):
-        regions = app.db.getElements('region')
+        # DP-6058. The regions the export splits by: on Gmsh the typed
+        # solids, which hold no ``region`` row.
+        from foammesh.core.import_export.export_regions import export_regions
+        regions = export_regions(self._db if self._db is not None else app.db)
 
         if len(regions) > 1:
             fluids = []

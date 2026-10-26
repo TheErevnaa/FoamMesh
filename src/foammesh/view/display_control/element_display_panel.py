@@ -92,6 +92,11 @@ class ElementDisplayPanel(QWidget):
         self._mesh_view = None
         self._legend = None
         self._options = sd.DisplayOptions()
+        #: Plan 48 GM11a. The values of the Gmsh display options
+        #: (:class:`sd.GmshDisplaySettings`): the 24 the controls below hold
+        #: are put into it on every draw, the rest (colours, dual, smooth
+        #: normals, clip mask) are read by the drawing.
+        self._drawing = None
         self._busy = False
         #: The Gmsh entity mask and clip planes (set by the Gmsh page).
         self._hidden = set()
@@ -220,6 +225,18 @@ class ElementDisplayPanel(QWidget):
         self._subEdges.setToolTip(self.tr(
             'Pieces each edge of a second-order or higher element is drawn '
             'in; 1 draws it straight'))
+        # Plan 48 GM11a (DP-4458). Mesh.LightLines: which mesh edges are lit.
+        self._lightLines = QComboBox()
+        self._lightLines.setObjectName('elementLightLines')
+        for code, text in ((0, self.tr('No')), (1, self.tr('Surface')),
+                           (2, self.tr('Volume and surface'))):
+            self._lightLines.addItem(text, code)
+        self._lightLines.setCurrentIndex(2)
+        self._lightLines.setToolTip(self.tr(
+            'Light the mesh edges: none, those of surfaces, or those of '
+            'surfaces and volumes (Mesh.LightLines)'))
+        self._lightLines.currentIndexChanged.connect(self._changed)
+        form.addRow(self.tr('Light the edges'), self._lightLines)
         for text, widget in ((self.tr('Normals (length, 0 off)'),
                               self._normals),
                              (self.tr('Tangents (length, 0 off)'),
@@ -262,6 +279,10 @@ class ElementDisplayPanel(QWidget):
 
     def status(self) -> str:
         return self._status.text()
+
+    def kindNote(self) -> str:
+        """The note under the cell-type boxes (Plan 48 PA1)."""
+        return self._kindNote.text()
 
     # -- wiring --------------------------------------------------------------- #
 
@@ -518,7 +539,8 @@ class ElementDisplayPanel(QWidget):
     def collectOptions(self) -> sd.DisplayOptions:
         flags = {name: box.isChecked() for name, box in self._flag.items()}
         mode = self._colour.currentData()
-        return sd.DisplayOptions(
+        # Fields no control holds (``label_kinds``) keep the value they have.
+        return self._options.with_(
             kinds=tuple(kind for kind, box in self._kindBoxes.items()
                         if box.isChecked()),
             explode=self._shrink.value(), point_size=self._nodeSize.value(),
@@ -529,6 +551,7 @@ class ElementDisplayPanel(QWidget):
             label_sampling=int(self._sampling.value()),
             normals=self._normals.value(), tangents=self._tangents.value(),
             num_sub_edges=int(self._subEdges.value()),
+            light_lines=int(self._lightLines.currentData() or 0),
             **flags)
 
     def _changed(self, *_args) -> None:
@@ -546,6 +569,9 @@ class ElementDisplayPanel(QWidget):
         self._options = options
         view = self._mesh_view
         view.options = options
+        if self._drawing is not None:
+            self._drawing.take_display_options(options)
+            view.settings = self._drawing
         gmsh = self._source.kind == ed.GMSH
         view.hidden = set(self._hidden) if gmsh else set()
         if gmsh:
@@ -558,12 +584,72 @@ class ElementDisplayPanel(QWidget):
         self.changed.emit()
         return report
 
+    # -- the Gmsh display options (Plan 48 GM11a) ------------------------------ #
+
+    def setDrawingSettings(self, settings) -> dict:
+        """Draw by *settings* (:class:`sd.GmshDisplaySettings`, or ``None``
+        for the plain look): the values the Drawing tab and the local API
+        hold.  The controls here follow it (:meth:`syncFromSettings`)."""
+        self._drawing = settings
+        if settings is None:
+            if self._mesh_view is not None:
+                self._mesh_view.settings = None
+            return self._redrawNow()
+        return self.syncFromSettings()
+
+    def drawingSettings(self):
+        return self._drawing
+
+    def syncFromSettings(self) -> dict:
+        """Take the 24 options the Elements controls hold from the settings
+        (the Drawing tab or the API may have changed them) and draw."""
+        if self._drawing is None:
+            return {}
+        if self._source is None:
+            return {}
+        from foammesh.rendering.gmsh_mesh_view import options_of
+
+        merged = options_of(self._drawing, self.collectOptions())
+        self._building = True
+        try:
+            for name, box in self._flag.items():
+                box.setChecked(bool(getattr(merged, name)))
+            for kind, box in self._kindBoxes.items():
+                box.setChecked(kind in merged.kinds)
+            self._shrink.setValue(merged.explode)
+            self._nodeSize.setValue(merged.point_size)
+            self._lineWidth.setValue(merged.line_width)
+            self._nodeStyle.setCurrentIndex(int(merged.point_type))
+            index = self._colour.findData(int(merged.colour_mode))
+            if index >= 0:
+                self._colour.setCurrentIndex(index)
+            self._labelType.setCurrentIndex(int(merged.label_type))
+            self._sampling.setValue(int(merged.label_sampling))
+            self._normals.setValue(merged.normals)
+            self._tangents.setValue(merged.tangents)
+            self._subEdges.setValue(int(merged.num_sub_edges))
+            index = self._lightLines.findData(int(merged.light_lines))
+            if index >= 0:
+                self._lightLines.setCurrentIndex(index)
+        finally:
+            self._building = False
+        self._options = merged
+        return self._draw()
+
     # -- the one categorical legend --------------------------------------------- #
 
     def legendRows(self) -> list:
         if self._source is None:
             return []
-        return ed.legend_rows(self._source, self._options.colour_mode)
+        rows = ed.legend_rows(self._source, self._options.colour_mode)
+        view = self._mesh_view
+        if self._drawing is not None and view is not None and view.loaded:
+            # The legend is in the colours the view draws (the carousel table
+            # and the element-type colours of the Gmsh options).
+            colours = view.legend_colours(self._options.colour_mode)
+            rows = [(label, colour)
+                    for (label, _old), colour in zip(rows, colours)]
+        return rows
 
     def _showLegend(self) -> None:
         self._dropLegend()

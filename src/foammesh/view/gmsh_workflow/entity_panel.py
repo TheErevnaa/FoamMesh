@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from foammesh.core.gmsh import session_entities as entities
 from foammesh.core.naming import humanise_option
+from foammesh.core.selection import mesh_on_screen as _on_screen
 from foammesh.core.selection.pick import pick_filters
 
 
@@ -48,6 +49,7 @@ class GmshEntityPanel(QWidget):
         self._storeProvider = store_provider
         self._provider = controller_provider
         self._view_provider = view_provider
+        self._meshHost = view_provider
         self._controller = None
         self._picker = None
         self._view = None
@@ -58,6 +60,9 @@ class GmshEntityPanel(QWidget):
         self._origins: dict = {}
         self._request = None
         self._queued = None
+        #: GM7. A panel with ``set_tags`` waiting for the next pick.
+        self._tagTarget = None
+        self.pickAccepted.connect(self._deliverTags)
         self._service = None
         self._shared_signature = None
         self._bridge = _Bridge(self)
@@ -79,8 +84,8 @@ class GmshEntityPanel(QWidget):
         self._filters = QButtonGroup(self)
         self._filters.setExclusive(True)
         self._filterButtons: dict = {}
-        offered = pick_filters('gmsh')
-        for name in entities.FILTERS:
+        offered = pick_filters('gmsh', mesh_on_screen=True)
+        for name in tuple(entities.FILTERS) + (entities.CELLS,):
             if name not in offered:
                 continue
             button = QPushButton(self.tr(name), self)
@@ -202,11 +207,25 @@ class GmshEntityPanel(QWidget):
         layout.addWidget(self._status)
         self._syncButtons()
         self.refreshSelections()
+        # Plan 48 PK (DP-4503): Cells is offered while a mesh is on screen.
+        _on_screen.subscribe(self._syncButtons)
+        # Plan 48 PA2: the local API reaches this panel through the case
+        # session (the window registers nothing else for it).
+        self._api = EntityPanelApi(self)
+        self.registerApi()
 
     # -- state -------------------------------------------------------------- #
 
     def picker(self):
         return self._picker
+
+    _refused: bool = False
+    _failed: str = ''
+    _coherenceRemoved: dict = {}
+
+    def idle(self) -> bool:
+        """True when no worker is running and none has a result to deliver."""
+        return self._worker is None
 
     def busy(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
@@ -228,21 +247,87 @@ class GmshEntityPanel(QWidget):
                        self._coherence):
             button.setEnabled(ready)
         self._labels.setEnabled(ready)
-        for button in self._filterButtons.values():
+        for name, button in self._filterButtons.items():
             button.setEnabled(ready)
+            if name == entities.CELLS:
+                button.setVisible(self.meshOnScreen())
+        cells = self._filterButtons.get(entities.CELLS)
+        if (cells is not None and cells.isChecked()
+                and not self.meshOnScreen()):
+            # the mesh went away under a Cells pick: back to surfaces
+            if active:
+                self._picker.abort()
+            self.setFilter('Surfaces')
+
+    def setMeshViewport(self, provider) -> None:
+        """Where this panel looks for the mesh on screen: a callable that
+        returns the viewport (default: the one the model is drawn in)."""
+        self._meshHost = provider
+        self._syncButtons()
+
+    def meshView(self):
+        """The mesh drawing in this panel's viewport, or None."""
+        provider = self._meshHost
+        host = provider() if callable(provider) else None
+        return None if host is None else _on_screen.current(host)
+
+    def meshOnScreen(self) -> bool:
+        return self.meshView() is not None
+
+    def offeredFilters(self) -> list:
+        """The filter buttons on offer: Cells only while a mesh is on screen
+        (Plan 48 PK)."""
+        shown = self.meshOnScreen()
+        return [name for name in self._filterButtons
+                if name != entities.CELLS or shown]
+
+    def _syncMeshPicker(self) -> None:
+        """Cells are hit on the mesh the viewport draws: hand the picker to
+        that drawing while Cells is the filter of a live pick."""
+        view = self.meshView()
+        if view is None or self._picker is None:
+            return
+        if self._picker.active and self._picker.filter == entities.CELLS:
+            view.attach_picker(self._picker)
+        else:
+            view.detach_picker()
 
     def _say(self, text: str) -> None:
         self._status.setText(text)
 
+    def _refuse(self, text: str) -> None:
+        """Say why a button did nothing; the local API reads the flag."""
+        self._refused = True
+        self._say(text)
+
     # -- the model ---------------------------------------------------------- #
+
+    def _currentController(self):
+        """DP-5721. The open case's session controller, asked each time:
+        one kept from the first case listed that case's groups after another
+        was opened (the walk renamed a group the table did not hold)."""
+        controller = self._provider()
+        if controller is not self._controller:
+            known = self._controller is not None
+            self._controller = controller
+            if known:
+                self._picker = None
+                self._groups = []
+                self._origins = {}
+                self._coherenceRemoved = {}
+        return controller
 
     def showModel(self) -> None:
         if self.busy():
+            # DP-5720. A build that lands while the last one is still being
+            # read must not leave the table on the older model.
+            self._showAgain = True
             return
+        self._showAgain = False
         try:
-            controller = self._controller = self._controller or self._provider()
+            controller = self._currentController()
         except Exception as error:                   # noqa: BLE001
-            self._say(str(error))
+            self._refuse(str(error))
             return
         directory = tempfile.mkdtemp(prefix='foammesh-entities-')
         self._say(self.tr('Opening the geometry…'))
@@ -264,12 +349,24 @@ class GmshEntityPanel(QWidget):
                 if self._view is not None:
                     self._view.dispose()
                 self._view = GmshEntityView(host, self._picker)
+                if self._drawing is not None:
+                    self._view.setSettings(*self._drawing)
                 self._view.show(vtp_path)
         self._syncButtons()
         self._refreshChips()
         if self._queued is not None:
             self._queued = None
             self.beginPick()
+
+    _drawing = None
+
+    def setDrawing(self, settings, planes=None) -> None:
+        """Plan 48 GM11a (DP-4457). Draw the geometry by the Gmsh
+        ``Geometry.*`` values (``None``: the plain look); a view made later
+        starts from the same values."""
+        self._drawing = None if settings is None else (settings, planes)
+        if self._view is not None:
+            self._view.setSettings(settings, planes)
 
     # -- picking ------------------------------------------------------------ #
 
@@ -283,11 +380,14 @@ class GmshEntityPanel(QWidget):
         self._filterButtons[name].setChecked(True)
         if self._picker is not None:
             self._picker.set_filter(name)
+            self._syncMeshPicker()
 
     def beginPick(self) -> None:
         if self._picker is None:
             return
-        self._picker.begin(self.filterName())
+        self._picker.begin(self.filterName(), on_accept=self._afterAccept,
+                           on_abort=self._afterAbort)
+        self._syncMeshPicker()
         self._say(self.tr('Click %s in the viewport; shift-click adds more; '
                           'Enter accepts, Escape cancels.')
                   % self.filterName().lower())
@@ -309,8 +409,8 @@ class GmshEntityPanel(QWidget):
 
     def serveRequest(self, request) -> bool:
         """Start a page's :class:`PickRequest`; load the model if needed."""
-        name = next((n for n in request.filters if n in self._filterButtons),
-                    None)
+        name = next((n for n in request.filters
+                     if n in self.offeredFilters()), None)
         if name is None:
             self._service.refuse(self.tr('Nothing here can be picked as %s.')
                                  % ', '.join(request.filters))
@@ -343,38 +443,72 @@ class GmshEntityPanel(QWidget):
         not shown yet.  The result arrives as :attr:`pickAccepted`.
         """
         if self._picker is None:
-            self._say(self.tr('Show the model first; there is nothing to '
-                              'pick yet.'))
+            self._refuse(self.tr('Show the model first; there is nothing to '
+                                 'pick yet.'))
             return False
         if filter_name in self._filterButtons:
             self.setFilter(filter_name)
         self.beginPick()
         return True
 
+    def pickInto(self, target, filter_name: str | None = None,
+                 row_index: int | None = None) -> bool:
+        """Start a pick whose entities fill ``target.set_tags`` (GM7).
+
+        *target* is a panel with ``set_tags(tags, row_index)``: the entity
+        controls (embed, compound, recombine, reverse) and the structure
+        controls. The tags of the accepted entities go into the row, so they
+        are picked, not typed. ``False``, with the reason in the status line,
+        when the model is not shown yet.
+        """
+        if not self.pickFor(filter_name):
+            return False
+        self._tagTarget = (target, row_index)
+        return True
+
+    def _deliverTags(self, chosen) -> None:
+        pending, self._tagTarget = self._tagTarget, None
+        if pending is None:
+            return
+        target, row_index = pending
+        target.set_tags([int(entity[1]) for entity in chosen], row_index)
+
     def acceptPick(self) -> None:
         if self._picker is None:
             return
         try:
-            chosen = self._picker.accept()
+            self._picker.accept()          # -> _afterAccept
         except entities.PickRefusal as error:
-            self._say(str(error))
-            return
+            self._refuse(str(error))
+
+    def _afterAccept(self, chosen) -> None:
+        """The pick ended with *chosen*, by the Accept button or by Enter in
+        the viewport (it used to reach only the button)."""
         self._pending = chosen
+        self._syncMeshPicker()
         self._say(self.tr('%d picked.') % len(chosen))
         self._syncButtons()
         self.pickAccepted.emit(tuple(chosen))
         self._endRequest(tuple(chosen))
 
     def abortPick(self) -> None:
+        was_live = self._picker is not None and self._picker.active
         if self._picker is not None:
-            self._picker.abort()
+            self._picker.abort()           # -> _afterAbort
+        if not was_live:
+            self._afterAbort()
+
+    def _afterAbort(self) -> None:
         self._pending = ()
+        self._tagTarget = None
+        self._syncMeshPicker()
         self._say(self.tr('Pick cancelled.'))
         self._syncButtons()
         self._endRequest()
 
     _pending: tuple = ()
     _reseedAgain: bool = False
+    _showAgain: bool = False
     _note: str = ''
 
     def pickedEntities(self) -> tuple:
@@ -426,14 +560,14 @@ class GmshEntityPanel(QWidget):
                 and group.tag in self._origins)
 
     def _refuseShared(self) -> None:
-        self._say(self.tr('This group is a shared surface name. Change its '
-                          'members or remove it in the Geometry step '
-                          '(Boundaries); rename works here.'))
+        self._refuse(self.tr('This group is a shared surface name. Change '
+                             'its members or remove it in the Geometry '
+                             'step (Boundaries); rename works here.'))
 
     def setMembers(self) -> None:
         group, picked = self._selectedGroup(), self.pickedEntities()
         if group is None:
-            self._say(self.tr('Select a group in the table first.'))
+            self._refuse(self.tr('Select a group in the table first.'))
             return
         if self.isShared(group):
             self._refuseShared()
@@ -444,7 +578,7 @@ class GmshEntityPanel(QWidget):
     def renameGroup(self) -> None:
         group, name = self._selectedGroup(), self._name.text()
         if group is None:
-            self._say(self.tr('Select a group in the table first.'))
+            self._refuse(self.tr('Select a group in the table first.'))
             return
         if self.isShared(group):
             self.renameShared(self._origins[group.tag], name)
@@ -454,7 +588,7 @@ class GmshEntityPanel(QWidget):
     def removeGroup(self) -> None:
         group = self._selectedGroup()
         if group is None:
-            self._say(self.tr('Select a group in the table first.'))
+            self._refuse(self.tr('Select a group in the table first.'))
             return
         if self.isShared(group):
             self._refuseShared()
@@ -470,7 +604,7 @@ class GmshEntityPanel(QWidget):
         """
         name = (name or '').strip()
         if not name:
-            self._say(self.tr('A physical group needs a name.'))
+            self._refuse(self.tr('A physical group needs a name.'))
             return
         from foammesh.app import app
         from foammesh.view.facade_client import FailedResult, submit
@@ -491,7 +625,7 @@ class GmshEntityPanel(QWidget):
             self._reseedAgain = True
             return
         try:
-            controller = self._controller = self._controller or self._provider()
+            controller = self._currentController()
         except Exception as error:                   # noqa: BLE001
             self._say(str(error))
             return
@@ -522,7 +656,7 @@ class GmshEntityPanel(QWidget):
         if self.busy():
             return
         try:
-            controller = self._controller = self._controller or self._provider()
+            controller = self._currentController()
         except Exception as error:                   # noqa: BLE001
             self._say(str(error))
             return
@@ -537,7 +671,7 @@ class GmshEntityPanel(QWidget):
     def loadGroups(self) -> None:
         if self.busy():
             return
-        controller = self._controller = self._controller or self._provider()
+        controller = self._currentController()
         self._start('groups_load',
                     lambda: controller.physical_editor().groups())
 
@@ -636,7 +770,7 @@ class GmshEntityPanel(QWidget):
     def runCoherence(self) -> None:
         if self.busy():
             return
-        controller = self._controller = self._controller or self._provider()
+        controller = self._currentController()
         self._say(self.tr('Removing duplicate entities…'))
         self._start('coherence', controller.coherence)
 
@@ -650,6 +784,8 @@ class GmshEntityPanel(QWidget):
     # -- the worker --------------------------------------------------------- #
 
     def _start(self, token: str, work) -> None:
+        self._failed = ''
+
         def run():
             try:
                 self._bridge.done.emit(token, work())
@@ -680,13 +816,394 @@ class GmshEntityPanel(QWidget):
             self.setGroups(result or [])
             self._say(self.tr('%d physical groups.') % len(self._groups))
         elif token == 'coherence':
+            self._coherenceRemoved = dict(result['removed'])
             removed = sum(result['removed'].values())
             self._note = (self.tr('Coherence removed %d duplicate entities.')
                           % removed)
             self._say(self._note)
             self.showModel()
-        if again and token != 'model':
+        if self._showAgain and not self.busy():
+            self.showModel()                # it re-seeds when it lands
+        elif again and token != 'model':
             self.reseed()
 
     def _onFailed(self, message: str) -> None:
+        # Plan 48 PA2 (DP-4870): a failed worker never cleared ``_worker``,
+        # so ``reseed`` thought it was still running and a client waiting for
+        # the panel to settle never saw it do so.
+        self._worker = None
+        self._failed = message
         self._say(message)
+        if self._showAgain:
+            self.showModel()
+
+
+    # -- the local API (Plan 48 PA2) ------------------------------------------ #
+
+    def api(self):
+        return self._api
+
+    def registerApi(self) -> bool:
+        """Tell the case session this panel is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import pa2_routes
+
+        session = pa2_routes.case_session_of()
+        if session is None:
+            return False
+        pa2_routes.register(session, pa2_routes.ENTITY_ATTRIBUTE, self._api)
+        self.destroyed.connect(
+            lambda *_a, s=session, a=self._api: pa2_routes.unregister(
+                s, pa2_routes.ENTITY_ATTRIBUTE, a))
+        return True
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.registerApi()
+
+    def labelsShown(self) -> bool:
+        return self._labels.isChecked()
+
+    def entityRows(self) -> list:
+        """The entity table behind picking: what the viewport can pick."""
+        if self._picker is None:
+            return []
+        entity_map = self._picker.map
+        rows = []
+        for key in entity_map.entities():
+            record = entity_map.records.get(key)
+            row = {'dim': int(key[0]), 'tag': int(key[1]),
+                   'name': entity_map.name_of(key),
+                   'chip': entities.chip_text(key, entity_map.name_of(key))}
+            if record is not None:
+                row.update({'physical': [int(t) for t in record.physical],
+                            'centre': [float(v) for v in record.centre],
+                            'xyz': (None if record.xyz is None
+                                    else [float(v) for v in record.xyz]),
+                            'up': [int(t) for t in record.up]})
+            rows.append(row)
+        return rows
+
+    def selectGroup(self, dim: int, tag: int) -> bool:
+        """Select the row of a physical group in the table (a click on it)."""
+        for row, group in enumerate(self._groups):
+            if (group.dim, group.tag) == (int(dim), int(tag)):
+                self._table.setCurrentCell(row, 0)
+                return True
+        return False
+
+
+class EntityPanelApi:
+    """What the Entity panel does for the local API.
+
+    Every method drives the panel's own controls (the same handlers a click
+    reaches), runs on the GUI thread and refuses with ``ValueError(reason)``
+    in the panel's words. ``core/facade/plan48/pa2_routes.py`` calls them.
+    """
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    # -- threads ------------------------------------------------------------ #
+
+    def _gui(self, function, *args):
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+        return on_gui_thread(function, *args)
+
+    def settle(self, timeout: float = 600.0) -> None:
+        """Wait until the panel's worker (and what it chains) has delivered."""
+        import time
+        from PySide6.QtCore import QCoreApplication, QThread
+
+        application = QCoreApplication.instance()
+        on_gui = (application is not None
+                  and QThread.currentThread() is application.thread())
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if on_gui:
+                application.processEvents()
+                if self._panel.idle():
+                    return
+            elif self._gui(self._panel.idle):
+                return
+            time.sleep(0.01)
+        raise ValueError('the Entity panel did not finish in time')
+
+    def _begin(self) -> None:
+        self._panel._refused = False
+        self._panel._failed = ''
+
+    def _check(self) -> None:
+        """Raise the panel's own words when its last control refused."""
+        panel = self._panel
+        if panel._refused or panel._failed:
+            raise ValueError(panel.status())
+
+    # -- reads -------------------------------------------------------------- #
+
+    def state(self) -> dict:
+        def read():
+            panel = self._panel
+            picker = panel.picker()
+            return {
+                'has_model': panel.hasModel(), 'busy': not panel.idle(),
+                'status': panel.status(), 'filter': panel.filterName(),
+                'filters': panel.offeredFilters(),
+                'picking': bool(picker is not None and picker.active),
+                'selection': ([[int(d), int(t)] for d, t in picker.selection]
+                              if picker is not None else []),
+                'chips': [panel._chips.item(i).text()
+                          for i in range(panel._chips.count())],
+                'picked': [[int(d), int(t)]
+                           for d, t in panel.pickedEntities()],
+                'groups': self._groups(),
+                'selections': panel.selectionNames(),
+                'labels': panel.labelsShown(),
+                'labels_drawn': panel._view is not None}
+        return self._gui(read)
+
+    def _groups(self) -> list:
+        panel = self._panel
+        return [{'dim': g.dim, 'tag': g.tag, 'name': g.name,
+                 'entities': [[g.dim, int(t)] for t in g.entities],
+                 'shared': bool(panel.isShared(g)),
+                 'origin': ('Shared' if panel.isShared(g) else 'Gmsh')}
+                for g in panel.groups()]
+
+    def entities(self) -> list:
+        return self._gui(self._panel.entityRows)
+
+    # -- the model, the filter, the picking ---------------------------------- #
+
+    def show_model(self) -> dict:
+        def start():
+            self._begin()
+            self._panel.showModel()
+        self._gui(start)
+        self.settle()
+        self._gui(self._check)
+        return self.state()
+
+    def set_filter(self, name: str) -> dict:
+        def run():
+            panel = self._panel
+            if name not in panel.offeredFilters():
+                raise ValueError('selection filter %r is not one of %s'
+                                 % (name, ', '.join(panel.offeredFilters())))
+            panel.setFilter(name)
+        self._gui(run)
+        return self.state()
+
+    def _picker(self):
+        picker = self._panel.picker()
+        if picker is None:
+            raise ValueError(self._panel.tr(
+                'Show the model first; there is nothing to pick yet.'))
+        return picker
+
+    def _click(self, entity, shift: bool) -> None:
+        """Click *entity* as the viewport would (a cell of it, or its point)."""
+        picker = self._picker()
+        entity = (int(entity[0]), int(entity[1]))
+        if entity[0] == entities.ELEMENT_DIM:
+            # an element is clicked in the mesh the viewport draws, by the
+            # path a mouse click takes (Plan 48 PK)
+            view = self._panel.meshView()
+            if view is None:
+                raise ValueError('there is no mesh on screen to pick in')
+            view.click_elements([entity[1]], extend=shift)
+            return
+        record = picker.map.records.get(entity)
+        if entity[0] == 0:
+            if record is None or record.xyz is None:
+                raise ValueError('point %d is not in the model' % entity[1])
+            found = picker.click(world=record.xyz, shift=shift)
+        else:
+            owner = entity
+            if entity[0] == 3:
+                # a volume is picked through one of its bounding surfaces
+                for key, other in picker.map.records.items():
+                    if key[0] == 2 and entity[1] in other.up \
+                            and picker.map.cells_of(key):
+                        owner = key
+                        break
+            cells = picker.map.cells_of(owner)
+            if not cells:
+                raise ValueError('%s has nothing drawn to click'
+                                 % entities.chip_text(entity))
+            found = picker.click(cell=cells[0], shift=shift)
+        if found != entity:
+            raise ValueError(
+                '%s cannot be picked with the %s filter on'
+                % (entities.chip_text(entity), picker.filter.lower()))
+
+    def pick(self, action: str, entities_=None, filter_name=None,
+             extend: bool = False) -> dict:
+        """Start, click, accept, abort or set a pick (``set`` = all four)."""
+        def run():
+            panel = self._panel
+            self._begin()
+            if action == 'start':
+                self._picker()
+                if filter_name:
+                    panel.setFilter(filter_name)
+                panel.beginPick()
+            elif action == 'click':
+                picker = self._picker()
+                if not picker.active:
+                    raise ValueError('there is no pick in progress')
+                for index, entity in enumerate(entities_ or ()):
+                    self._click(entity, extend or index > 0)
+            elif action == 'drop':
+                picker = self._picker()
+                for entity in entities_ or ():
+                    picker.remove_chip((int(entity[0]), int(entity[1])))
+            elif action == 'accept':
+                self._picker()
+                panel.acceptPick()
+                self._check()
+            elif action == 'abort':
+                self._picker()
+                panel.abortPick()
+            elif action == 'set':
+                self._set(entities_ or (), filter_name)
+            else:
+                raise ValueError('pick action %r is not one of start, click, '
+                                 'drop, accept, abort, set' % action)
+        self._gui(run)
+        return self.state()
+
+    def _set(self, wanted, filter_name=None) -> None:
+        """Pick exactly *wanted*: begin, click each, accept."""
+        panel = self._panel
+        wanted = [(int(d), int(t)) for d, t in wanted]
+        if not wanted:
+            raise ValueError('pick at least one entity first')
+        self._picker()
+        if filter_name is None:
+            names = {value: name for name, value in entities.FILTERS.items()}
+            names[entities.ELEMENT_DIM] = entities.CELLS
+            filter_name = names[wanted[0][0]]
+        panel.setFilter(filter_name)
+        panel.beginPick()
+        try:
+            for index, entity in enumerate(wanted):
+                self._click(entity, index > 0)
+        except ValueError:
+            panel.abortPick()
+            raise
+        panel.acceptPick()
+        self._check()
+
+    # -- physical groups ------------------------------------------------------ #
+
+    def _group_edit(self, name, wanted, select, method) -> dict:
+        def start():
+            panel = self._panel
+            self._begin()
+            if wanted:
+                self._set(wanted)
+            if select is not None and not panel.selectGroup(*select):
+                raise ValueError(panel.tr('Select a group in the table '
+                                          'first.'))
+            if name is not None:
+                panel._name.setText(str(name))
+            getattr(panel, method)()
+            self._check()
+        self._gui(start)
+        self.settle()
+        self._gui(self._check)
+        return self.state()
+
+    def add_group(self, name, entities_=None) -> dict:
+        return self._group_edit(name, entities_, None, 'addGroup')
+
+    def set_members(self, dim, tag, entities_=None) -> dict:
+        return self._group_edit(None, entities_, (dim, tag), 'setMembers')
+
+    def rename_group(self, dim, tag, name) -> dict:
+        return self._group_edit(name, None, (dim, tag), 'renameGroup')
+
+    def remove_group(self, dim, tag) -> dict:
+        return self._group_edit(None, None, (dim, tag), 'removeGroup')
+
+    def reload_groups(self) -> dict:
+        def start():
+            self._begin()
+            self._panel.loadGroups()
+        self._gui(start)
+        self.settle()
+        self._gui(self._check)
+        return self.state()
+
+    # -- coherence, labels ----------------------------------------------------- #
+
+    def coherence(self) -> dict:
+        def start():
+            self._begin()
+            self._panel._coherenceRemoved = {}
+            self._panel.runCoherence()
+        self._gui(start)
+        self.settle()
+        self._gui(self._check)
+        state = self.state()
+        state['removed'] = {str(k): int(v) for k, v in
+                            self._panel._coherenceRemoved.items()}
+        return state
+
+    def set_labels(self, shown: bool) -> dict:
+        def run():
+            self._panel._labels.setChecked(bool(shown))
+        self._gui(run)
+        return self.state()
+
+    # -- named selections ------------------------------------------------------ #
+
+    def selection_records(self) -> list:
+        def read():
+            from foammesh.core.gmsh import named_selections as store_
+
+            store = self._panel._store()
+            if store is None:
+                return []
+            loaded = store_.load(store)
+            return [{'name': name, 'entities': record.get('entities') or [],
+                     'created': record.get('created')}
+                    for name, record in sorted(loaded.items())
+                    if record.get('kind') == store_.ENTITY]
+        return self._gui(read)
+
+    def save_selection(self, name, entities_=None) -> dict:
+        def run():
+            panel = self._panel
+            self._begin()
+            if entities_:
+                self._set(entities_)
+            panel._selName.setText(str(name))
+            if not panel.saveSelection():
+                raise ValueError(panel.status())
+        self._gui(run)
+        return self.state()
+
+    def _choose_selection(self, name) -> None:
+        panel = self._panel
+        index = panel._selCombo.findText(str(name))
+        if index < 0:
+            raise ValueError(panel.tr('Choose a saved entity selection '
+                                      'first.'))
+        panel._selCombo.setCurrentIndex(index)
+
+    def show_selection(self, name) -> dict:
+        def run():
+            self._choose_selection(name)
+            if not self._panel.showSelection():
+                raise ValueError(self._panel.status())
+        self._gui(run)
+        return self.state()
+
+    def delete_selection(self, name) -> dict:
+        def run():
+            self._choose_selection(name)
+            if not self._panel.deleteSelection():
+                raise ValueError(self._panel.status())
+        self._gui(run)
+        return self.state()

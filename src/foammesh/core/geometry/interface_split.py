@@ -38,6 +38,7 @@ from pathlib import Path
 from foammesh.core.quantities import count_text
 
 from .domain_topology import _classifier, read_tessellation
+from .importers.stl_importer import _SOLID_LINE
 
 #: Version of the record :func:`split_assembly` writes.
 SCHEMA_VERSION = 1
@@ -279,6 +280,105 @@ def write_stl(path, name, triangles, coordinates) -> str:
     return str(path)
 
 
+def write_solids_stl(path, solids, coordinates) -> str:
+    """One ASCII STL holding several named solids, in the order given.
+
+    *solids* is ``[(name, triangles)]``. DP-6060: a body imported as several
+    named solids keeps them through the cut, so each block is written under
+    the name it arrived with and the file reads back as the same surfaces.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for name, triangles in solids:
+        lines.append(f'solid {name}')
+        for triangle in triangles:
+            normal, _area = _normal(triangle, coordinates)
+            lines.append('  facet normal {0:.9g} {1:.9g} {2:.9g}'.format(*normal))
+            lines.append('    outer loop')
+            for node in triangle:
+                lines.append('      vertex {0:.9g} {1:.9g} {2:.9g}'.format(
+                    *coordinates[node]))
+            lines.append('    endloop')
+            lines.append('  endfacet')
+        lines.append(f'endsolid {name}')
+    path.write_text('\n'.join(lines) + '\n', encoding='ascii')
+    return str(path)
+
+
+def _weld_key(point) -> tuple:
+    # The key ``domain_topology._Welder`` welds on, so a triangle read here
+    # and the same triangle read by the classifier land on the same corners.
+    return tuple(round(float(value), 9) + 0.0 for value in point)
+
+
+def source_solids(path) -> list:
+    """``[(name, {corner triple})]`` for the named solids of an ASCII STL.
+
+    Empty for a file with fewer than two solids, or one that is not ASCII
+    STL: there is then nothing to keep apart and the body is one surface.
+    A nameless block is ``solid_<index>`` and a repeated name is suffixed,
+    as :func:`stl_importer.solid_names` reads them, so the names here are
+    the names the import gave the surfaces.
+    """
+    path = Path(path)
+    if path.suffix.lower() != '.stl':
+        return []
+    data = path.read_bytes()
+    if not (data[:5].lower() == b'solid' and b'facet' in data[:2048].lower()):
+        return []
+    solids: list = []
+    seen: dict = {}
+    corners: list = []
+    for line in data.decode('ascii', 'replace').splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if words[0].lower() == 'solid':
+            name = (_SOLID_LINE.match(line).group(1).strip()
+                    or f'solid_{len(solids) + 1}')
+            if name in seen:
+                seen[name] += 1
+                name = f'{name}_{seen[name]}'
+            seen.setdefault(name, 1)
+            solids.append((name, set()))
+        elif words[0] == 'vertex' and solids:
+            corners.append(_weld_key(words[1:4]))
+        elif words[0] == 'endfacet' and solids:
+            if len(corners) == 3:
+                solids[-1][1].add(tuple(sorted(corners)))
+            corners = []
+    return solids if len(solids) >= 2 else []
+
+
+def _kept_solids(solids, kept, coordinates) -> tuple:
+    """``(blocks, counts)``: the kept triangles grouped by source solid.
+
+    *blocks* is ``[(name, triangles)]`` in file order with the emptied solids
+    left out; *counts* is ``[{'name', 'triangles'}]`` for every source solid,
+    an emptied one at zero, so the caller can drop the surface it named.
+    """
+    owner = {}
+    for position, (_name, triples) in enumerate(solids):
+        for triple in triples:
+            owner.setdefault(triple, position)
+    grouped: dict = {}
+    for triangle in kept:
+        key = tuple(sorted(coordinates[node] for node in triangle))
+        grouped.setdefault(owner.get(key), []).append(triangle)
+    if None in grouped:
+        # A kept face no source solid drew cannot be named, so the solids
+        # cannot be trusted to account for the body; the caller writes it
+        # as one surface, which is what it was before DP-6060.
+        return None, None
+    blocks = [(name, grouped[position])
+              for position, (name, _triples) in enumerate(solids)
+              if grouped.get(position)]
+    counts = [{'name': name, 'triangles': len(grouped.get(position, ()))}
+              for position, (name, _triples) in enumerate(solids)]
+    return blocks, counts
+
+
 # --------------------------------------------------------------------------- #
 # The record
 # --------------------------------------------------------------------------- #
@@ -312,6 +412,13 @@ def split_assembly(paths, *, labels=None, directory=None) -> dict:
             'the import produced no triangles, so there is nothing to split')
         return record
 
+    # Shells are named after their source's stem (``shell_topology``), so
+    # that is the key a shell finds the file it came from by.
+    by_label = {}
+    for item in paths:
+        label = str((labels or {}).get(str(item), str(item)))
+        stem = label.replace('\\', '/').rsplit('/', 1)[-1]
+        by_label[stem.rsplit('.', 1)[0] if '.' in stem else stem] = item
     shells, owned = topology.build_shells(
         surfaces, triangles, coordinates, sources)
     record['shells'] = [shell.name for shell in shells]
@@ -357,10 +464,20 @@ def split_assembly(paths, *, labels=None, directory=None) -> dict:
             'triangles': len(kept),
             'removed': len(owned.get(name, ())) - len(kept),
         }
+        blocks = counts = None
+        source = by_label.get(name)
+        solids = source_solids(source) if source is not None else []
+        if solids and kept:
+            blocks, counts = _kept_solids(solids, kept, coordinates)
+        if counts is not None:
+            entry['solids'] = counts
         if not kept:
             record['warnings'].append(
                 f'every face of {name!r} is shared with another body, so it '
                 'has no outer wall of its own')
+        elif directory is not None and blocks:
+            entry['path'] = write_solids_stl(
+                Path(directory) / f'{name}.stl', blocks, coordinates)
         elif directory is not None:
             entry['path'] = write_stl(
                 Path(directory) / f'{name}.stl', name, kept, coordinates)

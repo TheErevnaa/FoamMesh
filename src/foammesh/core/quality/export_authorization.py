@@ -81,6 +81,21 @@ OUTBOUND_REGISTRY: Mapping[str, OutboundClass] = {
     # case undiagnosable. Found by the coverage test below, not by this list.
     'quality.report.export': OutboundClass.DIAGNOSTIC,
     'quality.canonical.failed_set.export': OutboundClass.DIAGNOSTIC,
+    # Plan 48 UF. The Gmsh route's export operations (GM4, PA4, PA5, GM16b).
+    # The two that write a file others compute on are ENGINEERING; the rest
+    # answer a question or report a stored choice and write nothing outside
+    # the case.
+    'gmsh.export.write': OutboundClass.ENGINEERING,
+    'gmsh.cvt.export': OutboundClass.ENGINEERING,
+    'gmsh.export.check': OutboundClass.INTERNAL,
+    'gmsh.export.load_run_mesh': OutboundClass.INTERNAL,
+    'gmsh.export.matrix': OutboundClass.INTERNAL,
+    'gmsh.export.msh_choice': OutboundClass.INTERNAL,
+    'gmsh.export.publisher_copy': OutboundClass.INTERNAL,
+    'gmsh.export.save_options': OutboundClass.INTERNAL,
+    'gmsh.export.unit_pins': OutboundClass.INTERNAL,
+    'window.export': OutboundClass.INTERNAL,
+
     'case.copy': OutboundClass.TRANSFER,
     'case.archive': OutboundClass.TRANSFER,
 }

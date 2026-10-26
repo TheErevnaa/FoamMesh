@@ -36,7 +36,7 @@ from foammesh.view.widgets.folder_header import FolderHeader
 from .conditional_fields import follows_master, refresh_applicability
 from foammesh.core.facade.field_tiers import (
     COMMON, ESSENTIAL, EXPERT, tier_of)
-from .field_widgets import FieldEditor, same_as_default
+from .field_widgets import FieldEditor, add_editor_row, same_as_default
 from .page_action import PageAction
 from .page_filter import make_filter_box
 from .lock_chip import (CONFIRM, LOCKED, FilterRow, LockChip, ReadOnlyGuard,
@@ -1577,12 +1577,11 @@ class EngineTaskPage(QWidget):
             # MEASURED on the snappy Castellation page, 16 px of nothing under
             # each of its twenty-odd Advanced rows.
             row.setContentsMargins(0, 0, 0, 0)
-            row.addWidget(editor.editor, 1)
-            # DP-156. Added whether or not there is a unit: the column
-            # alignment gives every one of them the same width, so a row with
-            # `deg` and a row with nothing end their editors at the same x.
-            row.addWidget(editor.unit_label)
-            row.addWidget(editor.badge_label)
+            # DP-156. The unit is added whether or not there is one: the
+            # column alignment gives every one of them the same width, so a
+            # row with `deg` and a row with nothing end their editors at the
+            # same x. DP-2873: a number box keeps a compact width.
+            add_editor_row(row, editor)
             container = QWidget(parent)
             container.setLayout(row)
             form.addRow(editor.label, container)

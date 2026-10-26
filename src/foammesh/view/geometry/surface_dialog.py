@@ -2,24 +2,50 @@
 # -*- coding: utf-8 -*-
 
 import qasync
+import copy
+
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QLabel
 
 from foammesh.support.simple_db.simple_schema import ValidationError
-from foammesh.core.facade.errors import ValidationFailedError
+from foammesh.core.facade.errors import FacadeError, ValidationFailedError
 from foammesh.view import inline_error
 from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
 from widgets.async_message_box import AsyncMessageBox
-from widgets.enum_button_group import EnumButtonGroup
 
 from foammesh.app import app
 from foammesh.core.geometry.measure import (format_measurements,
                                              surface_measurements)
-from foammesh.db.configurations_schema import CFDType
+from foammesh.db import surface_authoring as authoring
+from foammesh.db import surface_intent as intent
 from foammesh.rendering.vtk_loader import polyDataToActor
 from foammesh.view.theming.vtk_theme import rgb
 from .surface_dialog_ui import Ui_SurfaceDialog
 from .transform_widget import TransformWidget
+
+
+#: Plan 49 SR2. The five roles, in plain words (plan section 3).
+ROLE_TEXT = (
+    (intent.EXTERNAL, 'External boundary'),
+    (intent.INTERNAL, 'Internal face'),
+    (intent.CONFORMAL, 'Region interface, conformal'),
+    (intent.NON_CONFORMAL, 'Region interface, non-conformal'),
+    (intent.BAFFLE, 'Blocking baffle'),
+)
+
+PURPOSE_TEXT = {
+    'wall': 'Wall', 'inlet': 'Inlet', 'outlet': 'Outlet',
+    'far_field': 'Far field', 'symmetry': 'Symmetry', 'wedge': 'Wedge',
+    'unclassified': 'Unclassified', 'interface': 'Interface',
+}
+
+
+def _patchTypeText(patchType) -> str:
+    """The OpenFOAM type name; ``empty``/``wedge`` say they are not checked."""
+    if patchType in authoring.UNCHECKED_PATCH_TYPES:
+        return f'{patchType} (not checked)'
+    return patchType
 
 
 def _plainName(name) -> str:
@@ -35,7 +61,6 @@ class SurfaceDialog(QDialog):
         self._ui.setupUi(self)
 
         self._renderingView = renderingView
-        self._typeRadios = EnumButtonGroup()
 
         self._transformWidget = TransformWidget(self)
 
@@ -48,9 +73,30 @@ class SurfaceDialog(QDialog):
         self._editable = True
         self._transformed = False
 
-        self._typeRadios.addEnumButton(self._ui.none,       CFDType.NONE)
-        self._typeRadios.addEnumButton(self._ui.boundary,   CFDType.BOUNDARY)
-        self._typeRadios.addEnumButton(self._ui.interface_, CFDType.INTERFACE)
+        # Plan 49 SR2. One role, a purpose and a mesh type for an external
+        # boundary, a partner and the region on each side for an interface.
+        # These edit the SR1 model only; the legacy type radios and the two
+        # interface switches are gone (``surface_authoring`` derives the
+        # legacy fields the unmoved readers still need).
+        for role, text in ROLE_TEXT:
+            self._ui.role.addItem(self.tr(text), role)
+        for patchType in intent.FREE_PATCH_TYPES:
+            self._ui.patchType.addItem(_patchTypeText(patchType), patchType)
+            if patchType in authoring.UNCHECKED_PATCH_TYPES:
+                index = self._ui.patchType.count() - 1
+                self._ui.patchType.setItemData(
+                    index, self.tr('Needs a one-cell-thick extruded (empty) or '
+                                   'revolved (wedge) mesh; nothing checks that '
+                                   'until the mesh is published.'),
+                    Qt.ItemDataRole.ToolTipRole)
+        self._ui.intentIssue.hide()
+        #: The document the dialog opened on, for the live preview.
+        self._document = None
+        self._refusal = None
+        #: Controls the person changed; an untouched one keeps its value.
+        self._touched = set()
+        self._loading = False
+        self._purpose = None
 
         self._ui.dialogContent.layout().addWidget(self._transformWidget)
 
@@ -107,6 +153,14 @@ class SurfaceDialog(QDialog):
         # submitted the same element twice.
         with commit_guard(self._ui.ok):
             try:
+                # Plan 49 SR2. An edit the model cannot hold is refused
+                # before anything is written, the rename included.
+                try:
+                    authoring.plan_edit(app.facadeClient.checkout().data(),
+                                        self._gIds, self._edit())
+                except authoring.EditRefused as error:
+                    inline_error.show(self, str(error))
+                    return
                 if len(self._gIds) == 1:
                     # The name lives in two stores - the tree row and the
                     # artifact's patch manifest - and geometry.rename is the
@@ -123,20 +177,15 @@ class SurfaceDialog(QDialog):
 
                 db = app.facadeClient.checkout()
 
-                for gId in self._gIds:
-                    element = db.checkout(f'geometry/{gId}')
-
-                    cfdType = self._typeRadios.checkedData()
-                    if element.setValue('cfdType', cfdType):
-                        if cfdType != CFDType.INTERFACE:
-                            element.setValue('slaveLayerGroup', None)
-                            if cfdType != CFDType.BOUNDARY:
-                                element.setValue('layerGroup', None)
-
-                    element.setValue('nonConformal', self._ui.nonConformal.isChecked())
-                    element.setValue('interRegion', self._ui.interRegion.isChecked())
-
-                    db.commit(element)
+                # Planned against the copy that is committed, so a rename
+                # that just landed is what the relation labels read.
+                try:
+                    plan = authoring.plan_edit(
+                        db.data(), self._gIds, self._edit())
+                except authoring.EditRefused as error:
+                    inline_error.show(self, str(error))
+                    return
+                authoring.write_plan(db, plan)
 
                 if self._transformed:
                     for gId, polyData in self._sources.items():
@@ -155,9 +204,21 @@ class SurfaceDialog(QDialog):
                     self, self.tr('Case changed'), self.tr(conflict_message(error)))
             except ValidationError as e:
                 inline_error.show(self, e.toMessage())
+            except FacadeError as error:
+                # DP-6078. A locked step (TaskLockedError) escaped to the event
+                # loop's error handler: OK did nothing and nothing said why.
+                # MEASURED on the packaged build 2026-10-26 on a meshed snappy
+                # case. The dialog stays open, the entries kept, the reason shown.
+                inline_error.show(self, self.tr('Not saved: {0}').format(error))
 
     def _connectSignalsSlots(self):
-        self._typeRadios.selectionChanged.connect(self._onTypeChanged)
+        self._ui.role.currentIndexChanged.connect(self._onRoleChanged)
+        self._ui.purpose.currentIndexChanged.connect(self._onPurposeChanged)
+        self._ui.patchType.currentIndexChanged.connect(self._onIntentEdited)
+        self._ui.partner.currentIndexChanged.connect(self._onPartnerChanged)
+        self._ui.ownRegion.currentIndexChanged.connect(self._onIntentEdited)
+        self._ui.partnerRegion.currentIndexChanged.connect(
+            self._onIntentEdited)
         self._transformWidget.transformed.connect(self._onTransformed)
         self._ui.ok.clicked.connect(self._accept)
         self._ui.cancel.clicked.connect(self.close)
@@ -184,27 +245,7 @@ class SurfaceDialog(QDialog):
             else:
                 self._transformWidget.hide()
 
-        cfdType = CFDType(first.value('cfdType'))
-        nonConformal = None
-        interRegion = None
-        self._typeRadios.setCheckedData(cfdType)
-        if cfdType == CFDType.INTERFACE:
-            nonConformal = first.value('nonConformal')
-            interRegion = first.value('interRegion')
-            self._ui.nonConformal.setChecked(nonConformal)
-            self._ui.interRegion.setChecked(interRegion)
-
-        for gId, s in surfaces.items():
-            if cfdType.value != s.value('cfdType'):
-                self._typeRadios.setCheckedData(CFDType.BOUNDARY)
-                break
-
-            if (cfdType == CFDType.INTERFACE
-                    and (nonConformal != s.value('nonConformal') or interRegion != s.value('interRegion'))):
-                self._typeRadios.setCheckedData(CFDType.BOUNDARY)
-                break
-
-        self._onTypeChanged(self._typeRadios.checkedData())
+        self._loadIntent()
 
     async def _transformArtifacts(self, db):
         """Apply the transform to the artifacts the mesher reads, too.
@@ -271,8 +312,260 @@ class SurfaceDialog(QDialog):
         self._sources = self._transformWidget.meshes()
         self._displayPreview()
 
-    def _onTypeChanged(self, value):
-        self._ui.interfaceType.setEnabled(value == CFDType.INTERFACE)
+    # -- Plan 49 SR2: role, purpose, mesh type and partner ---------------- #
+
+    def _keys(self):
+        return [str(gId) for gId in self._gIds]
+
+    def _loadIntent(self):
+        """Fill the controls from the stored model, then show its issues.
+
+        A value the selected surfaces do not share is shown blank and left
+        as it is unless the person picks one.
+        """
+        document = app.facadeClient.checkout().data()
+        self._document = copy.deepcopy(document) if document is not None \
+            else {}
+        rows = [authoring._row(self._document, key) or {}
+                for key in self._keys()]
+
+        def shared(field):
+            values = {intent._text(row.get(field)) for row in rows}
+            return values.pop() if len(values) == 1 else None
+
+        self._loading = True
+        try:
+            self._setData(self._ui.role, shared('surfaceRole'))
+            category = shared('boundaryCategory')
+            self._fillPurposes(category)
+            self._setData(self._ui.purpose, category)
+            self._purpose = category
+            self._setData(self._ui.patchType, shared('meshPatchType'))
+            self._fillPartners()
+            self._fillRegions()
+            if len(self._gIds) == 1:
+                key = self._keys()[0]
+                _relationKey, relation = authoring.interface_relation(
+                    self._document, key)
+                if relation is not None:
+                    self._setData(self._ui.partner,
+                                  authoring.partner_of(relation, key))
+                    own, other = authoring.regions_of(relation, key)
+                    self._setData(self._ui.ownRegion, own)
+                    self._setData(self._ui.partnerRegion, other)
+                else:
+                    self._setData(self._ui.partner, '')
+                    self._setData(self._ui.ownRegion,
+                                  authoring.zone_region(self._document, key))
+            # Nothing the person has touched yet: every control keeps.
+            self._touched = set()
+        finally:
+            self._loading = False
+        self._updateRows()
+        self._showIssues(authoring.all_issues(self._document, self._keys()))
+
+    @staticmethod
+    def _setData(combo, value):
+        index = combo.findData(value) if value not in (None, '') else -1
+        if index < 0 and value == '':
+            index = combo.findData('')
+        combo.setCurrentIndex(index)
+
+    def _fillPurposes(self, stored):
+        self._ui.purpose.clear()
+        purposes = list(authoring.PURPOSES)
+        if stored and stored not in purposes:
+            purposes.append(stored)  # a legacy value migration stored
+        for purpose in purposes:
+            self._ui.purpose.addItem(
+                self.tr(PURPOSE_TEXT.get(purpose, purpose)), purpose)
+
+    def _fillPartners(self):
+        combo = self._ui.partner
+        combo.clear()
+        combo.addItem('', '')
+        combo.addItem(self.tr('This surface (both sides)'), authoring.SHARED)
+        if len(self._gIds) != 1:
+            return
+        mine = self._keys()[0]
+        for key, row in intent._sorted_items(
+                (self._document or {}).get('geometry')):
+            if str(key) == mine or not authoring._is_surface(row):
+                continue
+            combo.addItem(intent._text(row.get('name')) or str(key), str(key))
+
+    def _fillRegions(self):
+        for combo in (self._ui.ownRegion, self._ui.partnerRegion):
+            combo.clear()
+            combo.addItem('', '')
+            for reference, label in authoring.region_choices(self._document):
+                text = (self.tr('Surrounding')
+                        if reference == intent.SURROUNDING_REGION else label)
+                combo.addItem(text, reference)
+
+    def _role(self):
+        role = self._ui.role.currentData()
+        if role is None and self._document is not None:
+            values = {intent._text((authoring._row(self._document, key) or {})
+                                   .get('surfaceRole'))
+                      for key in self._keys()}
+            role = values.pop() if len(values) == 1 else None
+        return role or None
+
+    def _updateRows(self):
+        """Show the controls the role uses, and only those."""
+        role = self._role()
+        external = role == intent.EXTERNAL
+        interface = role in intent.INTERFACE_ROLES and len(self._gIds) == 1
+        layout = self._ui.typeGroupLayout
+        for row, visible in ((1, external), (2, external), (3, interface),
+                             (4, interface), (5, interface)):
+            layout.setRowVisible(row, visible)
+        # One surface is both sides only of a conformal interface.
+        shared = self._ui.partner.findData(authoring.SHARED)
+        if shared >= 0:
+            item = self._ui.partner.model().item(shared)
+            if item is not None:
+                item.setEnabled(role == intent.CONFORMAL)
+
+    def _edit(self):
+        """The edit the controls ask for; an untouched mixed control keeps."""
+        def value(combo, name):
+            if name not in self._touched \
+                    and combo.currentIndex() < 0:
+                return authoring.KEEP
+            if name not in self._touched:
+                return authoring.KEEP
+            data = combo.currentData()
+            return None if data in (None, '') else data
+
+        edit = authoring.SurfaceEdit()
+        if not self._touched:
+            # OK on an untouched dialog renames at most: a surface's
+            # inferred purpose is not turned into an authored one unseen.
+            return edit
+        role = self._ui.role.currentData()
+        if role:
+            edit.role = role
+        if role == intent.EXTERNAL:
+            edit.category = value(self._ui.purpose, 'purpose')
+            edit.patch_type = value(self._ui.patchType, 'patchType')
+        if role in intent.INTERFACE_ROLES and len(self._gIds) == 1:
+            edit.partner = value(self._ui.partner, 'partner')
+            edit.own_region = value(self._ui.ownRegion, 'ownRegion')
+            edit.partner_region = value(self._ui.partnerRegion,
+                                        'partnerRegion')
+        return edit
+
+    def _touch(self, name):
+        if not self._loading:
+            self._touched = self._touched | {name}
+
+    def _onRoleChanged(self, _index):
+        self._touch('role')
+        if not self._loading:
+            role = self._ui.role.currentData()
+            if role == intent.EXTERNAL and self._ui.purpose.currentIndex() < 0 \
+                    and len(self._gIds) == 1:
+                # The purpose and type this surface would take, shown so the
+                # person sees what OK writes.
+                row = authoring._row(self._document, self._keys()[0]) or {}
+                category = intent._text(row.get('boundaryCategory')) or \
+                    intent.category_for_name(
+                        intent._text(row.get('name')),
+                        intent.default_category(self._document))
+                self._loading = True
+                try:
+                    self._setData(self._ui.purpose, category)
+                    self._setData(self._ui.patchType,
+                                  intent._text(row.get('meshPatchType'))
+                                  or authoring.default_patch_type(category))
+                finally:
+                    self._loading = False
+        self._updateRows()
+        self._onIntentEdited()
+
+    def _onPurposeChanged(self, _index):
+        if self._loading:
+            return
+        previous = self._purpose
+        self._touch('purpose')
+        category = self._ui.purpose.currentData()
+        current = self._ui.patchType.currentData()
+        # The type follows the purpose unless it was chosen apart from it.
+        if current in (None, authoring.default_patch_type(previous)):
+            self._loading = True
+            try:
+                self._setData(self._ui.patchType,
+                              authoring.default_patch_type(category))
+            finally:
+                self._loading = False
+            self._touched.add('patchType')
+        self._purpose = category
+        self._onIntentEdited()
+
+    def _onPartnerChanged(self, _index):
+        if self._loading:
+            return
+        self._touch('partner')
+        partner = self._ui.partner.currentData()
+        if partner and 'partnerRegion' not in self._touched:
+            region = (intent.SURROUNDING_REGION if partner == authoring.SHARED
+                      else authoring.zone_region(self._document, partner))
+            self._loading = True
+            try:
+                self._setData(self._ui.partnerRegion, region)
+            finally:
+                self._loading = False
+            self._touched.add('partnerRegion')
+        self._onIntentEdited()
+
+    def _onIntentEdited(self, *_args):
+        """Validate as the person edits: refusals block OK, drafts are shown."""
+        if self._loading or self._document is None:
+            return
+        sender = self.sender()
+        for name in ('patchType', 'ownRegion', 'partnerRegion'):
+            if sender is getattr(self._ui, name):
+                self._touch(name)
+        try:
+            found = authoring.preview(self._document, self._keys(),
+                                      self._edit())
+        except authoring.EditRefused as error:
+            self._refusal = str(error)
+            self._ui.intentIssue.setText(self._refusal)
+            self._ui.intentIssue.show()
+            self._fitToIssue()
+            if self._editable:
+                self._ui.ok.setEnabled(False)
+            return
+        self._refusal = None
+        if self._editable:
+            self._ui.ok.setEnabled(True)
+        self._showIssues(found)
+
+    def _showIssues(self, found):
+        """One plain line per unresolved surface: which, why, what to do."""
+        text = '\n'.join(issue.text() for issue in found)
+        self._ui.intentIssue.setText(text)
+        self._ui.intentIssue.setVisible(bool(text))
+        self._fitToIssue()
+
+    def _fitToIssue(self):
+        """Grow the dialog until the whole note under the controls shows.
+
+        DP-6079. The note is a word-wrapped label, and a dialog that was
+        already open kept its height when a long refusal arrived: the
+        symmetryPlane line was cut off after "and OpenFOAM" (MEASURED on the
+        packaged build 2026-10-26).
+        """
+        label = self._ui.intentIssue
+        # The label sits in a group box whose layout does not pass the wrap
+        # height up, so it is asked for outright: the dialog then grows to
+        # the label's minimum.
+        label.setMinimumHeight(0)
+        if label.isVisibleTo(self) and label.width() > 0:
+            label.setMinimumHeight(label.heightForWidth(label.width()))
 
     def _displayPreview(self):
         for actor in self._actors:

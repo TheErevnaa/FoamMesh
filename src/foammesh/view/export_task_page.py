@@ -594,6 +594,53 @@ class ExportTaskPage(EngineTaskPage):
                          self.tr('nothing is at that path')))
         return tuple(rows)
 
+    def readouts(self) -> dict:
+        """The page's read-outs as its labels show them (Plan 48 PA5).
+
+        Each is ``{'text', 'shown'}``: the sentence on the label (rich text
+        as plain words for the record line) and whether the page shows it.
+        """
+        def label(widget, plain: bool = False) -> dict:
+            if widget is None:
+                return {'text': '', 'shown': False}
+            text = widget.text()
+            if plain and widget.textFormat() == Qt.RichText:
+                from PySide6.QtGui import QTextDocumentFragment
+                text = QTextDocumentFragment.fromHtml(text).toPlainText()
+            return {'text': text, 'shown': not widget.isHidden()}
+
+        record = dict(getattr(self, '_record_now', None) or {})
+        return {
+            'readiness': label(getattr(self, '_readiness', None)),
+            'failed_checks': label(getattr(self, '_quality', None)),
+            'target': label(getattr(self, '_target', None)),
+            'record': {**label(getattr(self, '_record', None), plain=True),
+                       'html': getattr(self, '_record', None).text()
+                       if getattr(self, '_record', None) is not None else '',
+                       'data': record},
+            'destination_missing': label(getattr(self, '_missing', None)),
+            'change_target': {
+                'text': self._changeTarget.text(),
+                'enabled': self._changeTarget.isEnabled()},
+            'can_export': self.canExport(),
+            'open_folder_mode': self.openFolderMode(),
+            'script': self.scriptState()}
+
+    def scriptState(self) -> dict:
+        """The Gmsh page's [Script of the model] header; empty elsewhere."""
+        header = getattr(self, '_scriptHeader', None)
+        if header is None:
+            return {}
+        return {'text': header.text(), 'shown': header.isChecked()}
+
+    def setScriptShown(self, shown: bool) -> dict:
+        """Press [Script of the model] to show or hide the script panel."""
+        header = getattr(self, '_scriptHeader', None)
+        if header is None:
+            raise ValueError('this export page has no script of the model')
+        header.setChecked(bool(shown))
+        return self.scriptState()
+
     def _refreshRecord(self) -> None:
         self.showExportRecord(self.exportRecord())
 
@@ -771,7 +818,8 @@ class GmshExportPage(ExportTaskPage):
         layout.addWidget(heading)
         self._writerPanel = GmshWriterPanel(
             self.sessionController, self, default_folder=self._exportFolder,
-            run_mesh=_RunMeshHost(self))
+            run_mesh=_RunMeshHost(self),
+            client=self._client)
         from foammesh.view.gmsh_workflow.folds import add_fold, clip_header
 
         self._writerFold = add_fold(

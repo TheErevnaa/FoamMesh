@@ -318,6 +318,7 @@ class ViewportRail(QObject):
         self._view = view
         self._tools: dict[str, RailTool] = {}
         self._order: list[str] = []
+        self._off: set[str] = set()
         self._preferences = dict(DEFAULT_PREFERENCES)
         self._transientKey: Optional[str] = None
         self._appFilter = False
@@ -773,6 +774,26 @@ class ViewportRail(QObject):
                 if not self._item(self._tools[k]).isHidden()
                 or k in self._hidden]
 
+    def setToolVisible(self, key: str, visible: bool) -> None:
+        """Plan 48 GM11b. Take a tool off the rail, or put it back.
+
+        The Gmsh tool dock is for the Gmsh route only (R6): on the other
+        engine its button is not folded into the ``...`` menu, it is gone.
+        A tool that is off the rail closes its popover.
+        """
+        if key not in self._tools:
+            raise KeyError(key)
+        if visible:
+            self._off.discard(key)
+        else:
+            if self.isOpen(key):
+                self.close(key)
+            self._off.add(key)
+        self.reflow()
+
+    def isToolVisible(self, key: str) -> bool:
+        return key in self._tools and key not in self._off
+
     def setToolEnabled(self, key: str, enabled: bool, reason: str = ''):
         tool = self._tools[key]
         tool.enabled = bool(enabled)
@@ -966,9 +987,11 @@ class ViewportRail(QObject):
             return
         self._reflowing = True
         try:
-            keys = list(self._order)
-            for k in keys:
-                self._item(self._tools[k]).setVisible(True)
+            # Plan 48 GM11b: a tool taken off the rail for the engine in use
+            # (setToolVisible) stays out of the row, the fold and the menu.
+            keys = [k for k in self._order if k not in self._off]
+            for k in self._order:
+                self._item(self._tools[k]).setVisible(k not in self._off)
             if room is None:
                 # The rail is as tall as its tools, so what it has to fit in
                 # is the view, not its own (shrunk) height.
@@ -1082,6 +1105,98 @@ class ViewportRail(QObject):
         point = self._besidePoint(menu, tool)
         if menu.pos() != point:
             menu.move(point)
+
+    # -- the local API (Plan 48 PA5) ---------------------------------------- #
+
+    def overflowEntries(self) -> list:
+        """What the ``...`` menu lists now: ``{key, text, enabled, checked}``
+        for each folded tool (``key`` is '' for the toolbar's own entries)."""
+        menu = self._more.menu()
+        self._fillMore()
+        keys = list(self._hidden)
+        entries = []
+        for action in menu.actions():
+            if action.isSeparator():
+                continue
+            entries.append({'key': keys[len(entries)]
+                            if len(entries) < len(keys) else '',
+                            'text': action.text(), 'enabled': action.isEnabled(),
+                            'checked': bool(action.isChecked())
+                            if action.isCheckable() else False})
+        return entries
+
+    def railState(self) -> dict:
+        """Everything the rail shows: its tools, popovers, pins, overflow
+        and the Customise choices."""
+        tools = []
+        for key in self._order:
+            tool = self._tools[key]
+            popover = tool.popover
+            size = popover.size() if popover is not None else None
+            user = popover.userSize() if popover is not None else None
+            tools.append({
+                'key': key, 'title': tool.title, 'tip': tool.tip,
+                'visible': self.isToolVisible(key),
+                'on_rail': (self.isToolVisible(key) and key not in self._hidden
+                            and not self._item(tool).isHidden()),
+                'folded': key in self._hidden,
+                'enabled': bool(tool.enabled), 'reason': tool.reason,
+                'checked': bool(tool.button.isChecked())
+                if tool.button is not None and tool.button.isCheckable()
+                else False,
+                'adopted': bool(tool.adopted),
+                'popover': popover is not None,
+                'open': self.isOpen(key),
+                'pinned': popover is not None and popover.isPinned(),
+                'size': ({'width': size.width(), 'height': size.height()}
+                         if size is not None else None),
+                'user_size': ({'width': user.width(), 'height': user.height()}
+                              if user is not None else None)})
+        return {
+            'tools': tools, 'open': self.openKeys(),
+            'pinned': self.pinnedKeys(), 'hidden': self.hiddenTools(),
+            'overflow': {'shown': not self._more.isHidden(),
+                         'entries': self.overflowEntries()},
+            'preferences': self.preferences(),
+            'rail': {'pinned': self._edge.isPinned(),
+                     'revealed': self._edge.isRevealed(),
+                     'available': self._edge.isAvailable(),
+                     'extent': self.extent()}}
+
+    def setRailPinned(self, pinned: bool) -> None:
+        """Press the rail's own pin (the first button of the column)."""
+        if not self._edge.isAvailable():
+            raise ValueError('the tool rail is not shown (Customise > '
+                             'Show the tool rail)')
+        self._pin.setChecked(bool(pinned))
+
+    def setPopoverPinned(self, key: str, pinned: bool) -> None:
+        """Press a popover's pin; the popover must be open, as its button is."""
+        popover = self.popover(key)
+        if popover is None:
+            raise ValueError(f'{key} has no popover')
+        if not popover.isVisible():
+            raise ValueError(f'the {key} popover is not open')
+        popover.setPinned(bool(pinned))
+
+    def setPopoverSize(self, key: str, width=None, height=None) -> None:
+        """Drag a popover's grip to a size; no size gives it back to its content."""
+        popover = self.popover(key)
+        if popover is None:
+            raise ValueError(f'{key} has no popover')
+        if width is None and height is None:
+            popover.setUserSize(None)
+        elif width is None or height is None:
+            raise ValueError('give both width and height, or neither')
+        else:
+            popover.setUserSize(QSize(int(width), int(height)))
+        self.arrange()
+
+    def pressOverflow(self, key: str) -> None:
+        """Choose a tool in the ``...`` menu, as its entry does."""
+        if key not in self._hidden:
+            raise ValueError(f'{key} is not in the overflow menu')
+        self.toggle(key)
 
     # -- Customise ---------------------------------------------------------- #
 

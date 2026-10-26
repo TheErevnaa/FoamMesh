@@ -311,6 +311,20 @@ def cad_scale_to_metres(record: Mapping, polydata=None) -> float:
     return 1.0
 
 
+def _declared_scale(record: Mapping) -> float | None:
+    """Metres per unit of the CAD copy as the revision declares it, or ``None``."""
+    unit = str(record.get('cad_unit') or '')
+    if not unit:
+        return None
+    from foammesh.core.geometry.units import si_factor
+
+    try:
+        factor = float(si_factor(unit))
+    except (KeyError, ValueError):
+        return None
+    return factor if factor > 0 else None
+
+
 def build(record: dict, *, destination_dir: Path, deflection: float,
           prepared_root: Path, tessellator=None) -> SurfaceRecord:
     """Produce the reference surface for one prepared source."""
@@ -341,9 +355,23 @@ def build(record: dict, *, destination_dir: Path, deflection: float,
     # (and, when the source really is in metres, costs nothing more); the
     # deflection is then re-expressed in the file's own unit so the reference
     # is as fine as it was asked to be and no finer.
-    polydata = make(primary, deflection)
+    #
+    # Plan 48 FIX3 (DP-4403). The first pass used the number as it stood, in a
+    # file measured in millimetres: a 0.5 mm tolerance asked for a 2.5e-5
+    # deflection on a 470 mm part, which is 24.7 million triangles, over the
+    # 2,000,000 an import allows, so the worker refused and the reference was
+    # never built ("no reference for section"). When the revision declares the
+    # unit of its CAD copy, the first pass is made in that unit. The measured
+    # ratio still has the last word, below.
+    declared = _declared_scale(record)
+    polydata = make(primary, deflection / declared if declared else deflection)
     factor = cad_scale_to_metres(record, polydata)
-    if factor != 1.0:
+    if declared and factor == declared:
+        if factor != 1.0:
+            from foammesh.core.geometry.units import scale_polydata
+
+            polydata = scale_polydata(polydata, factor)
+    elif factor != 1.0:
         from foammesh.core.geometry.units import scale_polydata
 
         polydata = scale_polydata(make(primary, deflection / factor), factor)

@@ -472,3 +472,252 @@ def block_grid(gmsh, surfaces) -> dict:
     finally:
         gmsh.model.mesh.clear()
     return {'surfaces': shown, 'skipped': skipped}
+
+
+# -- Plan 48 GM6: which entities can be structured ----------------------------- #
+
+#: Preview colours of the "Make structured where possible" result (RGB 0-255).
+QUALIFIES_COLOUR = (46, 160, 67)
+REJECTED_COLOUR = (207, 34, 46)
+
+
+def _curve_ends_of(gmsh, curve: int) -> tuple:
+    raw = [abs(int(t)) for d, t in gmsh.model.getBoundary(
+        [(1, curve)], combined=False, oriented=True) if d == 0]
+    return (raw[0], raw[-1]) if len(raw) >= 2 else (raw[0], raw[0]) if raw \
+        else (0, 0)
+
+
+def surface_loops(gmsh, tag: int) -> list:
+    """The boundary of a surface as loops of curve tags (a hole is a second
+    loop).  Loops are found by joining curves that share an end point."""
+    curves = boundary_curves(gmsh, 2, tag)
+    ends = {c: _curve_ends_of(gmsh, c) for c in curves}
+    parent = {c: c for c in curves}
+
+    def find(c):
+        while parent[c] != c:
+            parent[c] = parent[parent[c]]
+            c = parent[c]
+        return c
+
+    by_point: dict = {}
+    for c, (a, b) in ends.items():
+        for p in (a, b):
+            if p in by_point:
+                parent[find(c)] = find(by_point[p])
+            else:
+                by_point[p] = c
+    loops: dict = {}
+    for c in curves:
+        loops.setdefault(find(c), []).append(c)
+    return [sorted(v) for v in loops.values()]
+
+
+def surface_points(gmsh, tag: int) -> list:
+    return sorted({abs(int(t)) for d, t in gmsh.model.getBoundary(
+        [(2, tag)], combined=False, recursive=True, oriented=False)
+        if d == 0})
+
+
+def volume_points(gmsh, tag: int) -> list:
+    return sorted({abs(int(t)) for d, t in gmsh.model.getBoundary(
+        [(3, tag)], combined=False, recursive=True, oriented=False)
+        if d == 0})
+
+
+def _coords(gmsh, points) -> list:
+    return [{'point': int(p), 'xyz': [float(v) for v in
+                                      gmsh.model.getValue(0, int(p), [])[:3]]}
+            for p in points]
+
+
+def _check_corners(gmsh, dim, tag, corners, points, allowed):
+    """``''`` when the named corners are usable, else the reason."""
+    corners = [int(c) for c in corners or ()]
+    if not corners:
+        return ''
+    if len(set(corners)) != len(corners):
+        return 'a corner point is named twice'
+    outside = [c for c in corners if c not in points]
+    if outside:
+        return ('point %s is not a corner of %s %d (it is not on its '
+                'boundary)' % (', '.join(str(c) for c in outside),
+                               _WORDS[dim], tag))
+    if len(corners) not in allowed:
+        return ('%d corner points named; a transfinite %s takes %s'
+                % (len(corners), _WORDS[dim],
+                   ' or '.join(str(n) for n in allowed)))
+    return ''
+
+
+def precheck(gmsh, dim: int, tag: int, corners=()) -> dict:
+    """Can this surface or volume be transfinite?  Answered from the
+    topology, with the reason when it cannot: a necessary condition, so the
+    mesh is still measured afterwards (Gmsh has no getter either).
+
+    ``{'dim', 'tag', 'qualifies', 'reason', 'sides', 'faces',
+    'corner_candidates'}``.
+    """
+    dim, tag = int(dim), int(tag)
+    if (dim, tag) not in _present(gmsh):
+        return {'dim': dim, 'tag': tag, 'qualifies': False,
+                'reason': '%s %d is not in the model' % (_WORDS[dim], tag),
+                'corner_candidates': []}
+    if dim not in (2, 3):
+        return {'dim': dim, 'tag': tag, 'qualifies': False,
+                'reason': 'only surfaces and volumes can be transfinite',
+                'corner_candidates': []}
+    if _is_discrete(gmsh, dim, tag):
+        return {'dim': dim, 'tag': tag, 'qualifies': False,
+                'reason': 'a discrete (tessellated) entity has no corner '
+                          'points to interpolate between; import the '
+                          'geometry as STEP/IGES/BREP',
+                'corner_candidates': []}
+    out = {'dim': dim, 'tag': tag, 'qualifies': True, 'reason': ''}
+    if dim == 2:
+        out['corner_candidates'] = _coords(gmsh, surface_points(gmsh, tag))
+        loops = surface_loops(gmsh, tag)
+        sides = len(loops[0]) if loops else 0
+        out['sides'] = sides
+        if len(loops) > 1:
+            out['qualifies'] = False
+            out['reason'] = ('surface %d has %d boundary loops (a hole); a '
+                             'transfinite surface has one' % (tag,
+                                                              len(loops)))
+        else:
+            bad = _check_corners(gmsh, 2, tag, corners,
+                                 [c['point'] for c in
+                                  out['corner_candidates']], (3, 4))
+            if bad:
+                out['qualifies'] = False
+                out['reason'] = bad
+            elif not corners and sides not in (3, 4):
+                out['qualifies'] = False
+                out['reason'] = (
+                    'surface %d has %d boundary curves; a transfinite '
+                    'surface has 3 or 4 sides. Name 3 or 4 of its points as '
+                    'corners, or split the surface' % (tag, sides))
+        return out
+    faces = boundary_faces(gmsh, tag)
+    points = volume_points(gmsh, tag)
+    out['corner_candidates'] = _coords(gmsh, points)
+    out['faces'] = len(faces)
+    if len(faces) not in (5, 6):
+        out['qualifies'] = False
+        out['reason'] = ('volume %d has %d faces; a transfinite volume has '
+                         '6 (hexahedron) or 5 (prism)' % (tag, len(faces)))
+        return out
+    bad = _check_corners(gmsh, 3, tag, corners, points, (6, 8))
+    if bad:
+        out['qualifies'] = False
+        out['reason'] = bad
+        return out
+    if corners:
+        want = 6 if len(faces) == 5 else 8
+        if len(corners) != want:
+            out['qualifies'] = False
+            out['reason'] = ('volume %d has %d faces and so %d corners; %d '
+                             'were named' % (tag, len(faces), want,
+                                             len(corners)))
+        return out
+    sides = []
+    for face in faces:
+        loops = surface_loops(gmsh, face)
+        sides.append(len(loops[0]) if len(loops) == 1 else 0)
+    out['face_sides'] = sides
+    wanted = [4] * 6 if len(faces) == 6 else [3, 3, 4, 4, 4]
+    if sorted(sides) != wanted:
+        out['qualifies'] = False
+        odd = [f for f, n in zip(faces, sides) if n not in (3, 4)]
+        out['reason'] = (
+            'volume %d is bounded by faces with %s sides; a %s has %s. '
+            'Name its corner points, or split the volume'
+            % (tag, '/'.join(str(n) for n in sorted(sides)),
+               'hexahedron' if len(faces) == 6 else 'prism',
+               ' and '.join(str(n) for n in wanted)
+               if len(faces) == 6 else 'two triangles and three '
+               'quadrangles') + (' (face %s is not a 3- or 4-sided '
+                                 'patch)' % ', '.join(str(f) for f in odd)
+                                 if odd else ''))
+    return out
+
+
+def make_structured(gmsh, dim: int = 3, tags=(), corner_angle: float = 2.35,
+                    recombine: bool = True, apply: bool = True) -> dict:
+    """"Make structured where possible": find which volumes (``dim`` 3) or
+    surfaces (``dim`` 2) can be transfinite, set
+    ``setTransfiniteAutomatic`` on those that can, and report the rest with
+    the reason.  ``apply=False`` only answers (the coloured preview)."""
+    dim = int(dim)
+    if dim not in (2, 3):
+        raise BuildError('"Make structured" works on volumes or surfaces')
+    wanted = [int(t) for t in tags or ()] or [
+        int(t) for _d, t in gmsh.model.getEntities(dim)]
+    qualifies, rejected = [], []
+    for tag in wanted:
+        verdict = precheck(gmsh, dim, tag)
+        (qualifies if verdict['qualifies'] else rejected).append(verdict)
+    colours = {}
+    for item in qualifies:
+        colours[item['tag']] = list(QUALIFIES_COLOUR)
+    for item in rejected:
+        colours[item['tag']] = list(REJECTED_COLOUR)
+    applied = False
+    if apply and qualifies:
+        try:
+            gmsh.model.mesh.setTransfiniteAutomatic(
+                [(dim, v['tag']) for v in qualifies], float(corner_angle),
+                bool(recombine))
+        except Exception as error:                         # noqa: BLE001
+            raise BuildError('Gmsh refused setTransfiniteAutomatic: %s'
+                             % error) from error
+        applied = True
+    return {'dim': dim, 'qualifies': [v['tag'] for v in qualifies],
+            'rejected': [{'tag': v['tag'], 'reason': v['reason']}
+                         for v in rejected],
+            'colours': colours, 'applied': applied,
+            'corner_angle': float(corner_angle), 'recombine': bool(recombine)}
+
+
+def hex_dominant(gmsh, level: int = 1, conformity: int = 0,
+                 generate: bool = True) -> dict:
+    """The "Hex-dominant (experimental)" action: switch on 3D recombination
+    (``Mesh.Recombine3DAll``, ``Recombine3DLevel``, ``Recombine3DConformity``),
+    mesh in 3D and count the elements by family."""
+    level, conformity = int(level), int(conformity)
+    if not 0 <= level <= 2:
+        raise BuildError('Recombine3DLevel is 0 (simple), 1 or 2')
+    if not 0 <= conformity <= 4:
+        raise BuildError('Recombine3DConformity is 0 to 4')
+    option = gmsh.option
+    option.setNumber('Mesh.Recombine3DAll', 1)
+    option.setNumber('Mesh.Recombine3DLevel', level)
+    option.setNumber('Mesh.Recombine3DConformity', conformity)
+    if generate:
+        # DP-4217 (G15): Gmsh runs Recombine3D only with the R-tree volume
+        # algorithm (Generator.cpp, ALGO_3D_RTREE = 9); with any other
+        # Mesh.Algorithm3D the three options above are ignored.
+        algorithm = option.getNumber('Mesh.Algorithm3D')
+        option.setNumber('Mesh.Algorithm3D', 9)
+        try:
+            gmsh.model.mesh.generate(3)
+        except Exception as error:                         # noqa: BLE001
+            try:
+                option.setNumber('Mesh.Algorithm3D', algorithm)
+            except Exception:                              # noqa: BLE001
+                pass        # the session is gone; its restart replays the log
+            raise BuildError('Gmsh could not mesh the model with hex-dominant '
+                             'recombination: %s' % error) from error
+        option.setNumber('Mesh.Algorithm3D', algorithm)
+    counts = family_counts(gmsh, 3)
+    total = sum(counts[k] for k in ('tetrahedra', 'hexahedra', 'prisms',
+                                    'pyramids'))
+    note = ''
+    if total and not counts['hexahedra']:
+        note = ('The 3D recombination of Gmsh made no hexahedra on this '
+                'model. Structure the volumes instead (Make structured where '
+                'possible, or a transfinite volume), or sweep a surface mesh.')
+    return {'level': level, 'conformity': conformity, 'counts': counts,
+            'volume_cells': total, 'note': note,
+            'hex_fraction': (counts['hexahedra'] / total) if total else 0.0}

@@ -65,6 +65,48 @@ NO_ACCEPTED_RUN = (
     'this format is written by converting the mesh the accepted Gmsh run '
     'produced, and this case has no accepted Gmsh run to convert')
 
+#: DP-5753. Plan 28: SU2 is produced only on the Gmsh route. The sentence an
+#: SU2 refusal starts with, at every entry; the clause after it says what
+#: this case's mesh is instead.
+SU2_GMSH_ONLY = 'SU2 is exported only on the Gmsh route'
+SU2_MESH_WITH_GMSH = 'Mesh the case with Gmsh to export SU2.'
+
+#: What the run manifests and the case sidecar call each meshing route.
+_ROUTE_NAMES = {'snappy': 'snappyHexMesh', 'reconstructPar': 'snappyHexMesh',
+                'gmsh': 'Gmsh'}
+
+
+def _su2_refusal(clause: str) -> str:
+    return f'{SU2_GMSH_ONLY}, and {clause}. {SU2_MESH_WITH_GMSH}'
+
+
+def _poly_mesh_producer(case: Path) -> str:
+    """Which route the case sidecar says wrote ``constant/polyMesh``, or ``''``.
+
+    DP-5753. Every route that writes the case's polyMesh records itself in the
+    sidecar (``generated_by`` ``gmsh:<run>``, ``snappy:<stage>``,
+    ``reconstructPar:<stage>``; an import is ``mesh_external``), with the
+    mesh's fingerprint. The record is believed only while the fingerprint is
+    still the mesh on disk; anything else -- no sidecar, a stale record, a
+    producer this does not know -- answers ``''`` and leaves the decision to
+    the run manifests.
+    """
+    try:
+        from foammesh.core.case.model import (
+            WorkflowMode, fingerprint_poly_mesh, load_case_metadata)
+        metadata = load_case_metadata(case)
+        if metadata.mesh_fingerprint is None:
+            return ''
+        if fingerprint_poly_mesh(case / 'constant' / 'polyMesh') != \
+                metadata.mesh_fingerprint:
+            return ''
+    except Exception:                                        # noqa: BLE001
+        return ''
+    if metadata.workflow is WorkflowMode.MESH_EXTERNAL:
+        return 'external'
+    producer = str((metadata.provenance or {}).get('generated_by') or '')
+    return producer.split(':', 1)[0] if ':' in producer else ''
+
 
 @dataclass(frozen=True)
 class ExportEntry:
@@ -101,11 +143,24 @@ class ExportOutcome:
     destination: Path
     total_bytes: int
     warnings: tuple[str, ...] = ()
+    #: Plan 49 SR6 (DP-5914). What the result says beside the file: for
+    #: SU2, that its markers are not coupling, and the configuration line a
+    #: periodic pair needs.
+    notes: tuple[str, ...] = ()
+    #: Plan 49 SR6 (DP-5910). The hand-off sidecar written beside the file
+    #: (:meth:`foammesh.core.import_export.handoff.HandoffResult.summary`).
+    handoff: dict | None = None
 
     def to_dict(self) -> dict:
-        return {'entry_id': self.entry_id, 'source': str(self.source),
-                'destination': str(self.destination),
-                'total_bytes': self.total_bytes, 'warnings': list(self.warnings)}
+        result = {'entry_id': self.entry_id, 'source': str(self.source),
+                  'destination': str(self.destination),
+                  'total_bytes': self.total_bytes,
+                  'warnings': list(self.warnings)}
+        if self.notes:
+            result['notes'] = list(self.notes)
+        if self.handoff is not None:
+            result['handoff'] = dict(self.handoff)
+        return result
 
 
 @dataclass(frozen=True)
@@ -321,14 +376,73 @@ class ImportExportService:
         name, with B's boundary markers in it. The question an exporter has to
         ask is which artifact was accepted, and that is what
         :func:`accepted_artifact` answers.
+
+        Plan 49 SR6 (DP-5765, DP-5912). :func:`accepted_artifact` walks
+        every kept run, newest first, to the first that wrote the format, so
+        when the newest kept run wrote no ``mesh.su2`` (a Gmsh run aimed at
+        OpenFOAM) it answered with a file an *older* run wrote: not the mesh
+        the case now holds. Only the newest kept run's own file is the mesh.
         """
         if case_path is None:
             return None
         try:
-            from foammesh.core.gmsh.manifest import accepted_artifact
-            return accepted_artifact(Path(case_path), 'su2')
+            from foammesh.core.gmsh.manifest import (
+                accepted_artifact, accepted_run_engine)
+            artifact = accepted_artifact(Path(case_path), 'su2')
+            if artifact is None:
+                return None
+            newest = accepted_run_engine(Path(case_path))
+            if newest is None or \
+                    str(artifact.get('run_id')) != newest['run_id']:
+                return None
+            return artifact
         except Exception:                                    # noqa: BLE001
             return None
+
+    @classmethod
+    def su2_route_refusal(cls, case_path) -> str:
+        """Why this case's mesh cannot be exported as SU2, or ``''``.
+
+        DP-5753. Plan 28 makes SU2 a Gmsh-route output only, and nothing held
+        the export to it: MEASURED 2026-10-24, a case holding nothing but a
+        published hexahedral polyMesh -- no Gmsh run at all -- was offered SU2
+        and :meth:`export_su2` wrote it through the polyMesh writer, the route
+        its docstring called "the only route a snappyHexMesh case has".
+
+        The mesh is the Gmsh route's when the newest kept run is a Gmsh run.
+        When that run left no ``mesh.su2`` (one aimed at OpenFOAM), the SU2
+        file is still derived from the published polyMesh, so the polyMesh has
+        to be that route's too: a case sidecar that says snappyHexMesh or an
+        import wrote it is refused, whatever the manifests say.
+        """
+        if case_path is None:
+            return _su2_refusal('there is no case to export')
+        from foammesh.core.gmsh.manifest import accepted_run_engine
+
+        case = Path(case_path)
+        kept = accepted_run_engine(case)
+        if kept is None:
+            return _su2_refusal(
+                'this case has no kept Gmsh run, so neither a mesh.su2 nor '
+                'a constant/polyMesh here came from Gmsh')
+        engine = kept['engine_id']
+        if engine != 'gmsh':
+            name = _ROUTE_NAMES.get(engine, engine)
+            return _su2_refusal(
+                f'this case\'s mesh comes from a {name} run '
+                f'({kept["run_id"]})')
+        if cls.native_su2_artifact(case) is not None:
+            return ''
+        producer = _poly_mesh_producer(case)
+        if producer == 'external':
+            return _su2_refusal(
+                'the mesh in constant/polyMesh was imported, not meshed by '
+                'Gmsh')
+        if _ROUTE_NAMES.get(producer, 'Gmsh') != 'Gmsh':
+            return _su2_refusal(
+                f'the mesh in constant/polyMesh was written by '
+                f'{_ROUTE_NAMES[producer]}, not by Gmsh run {kept["run_id"]}')
+        return ''
 
     @staticmethod
     def native_msh_artifact(case_path):
@@ -386,6 +500,10 @@ class ImportExportService:
         """Every export format, visible with a truthful availability reason."""
         entries = []
         native_su2 = self.native_su2_artifact(case_path)
+        # DP-5753. Asked only for a case: without one the list says which
+        # writers exist, as it always has.
+        su2_refusal = (self.su2_route_refusal(case_path)
+                       if case_path is not None else '')
         conversion_source, conversion_reason = self.gmsh_conversion_source(case_path)
         for fmt, report in self.formats(case_path=case_path):
             spec = capability(fmt)
@@ -412,6 +530,12 @@ class ImportExportService:
                     source_path=str(native_su2.get('path', '')),
                     notes=(f'Copies mesh.su2 written by Gmsh run '
                            f'{native_su2.get("run_id", "")}.').strip())
+            if fmt is ExportFormat.SU2 and su2_refusal:
+                # DP-5753. Listed and disabled with the reason, not hidden: a
+                # snappyHexMesh project still sees SU2 and why it is not on
+                # offer (see ``ExportForm._fillFormats``).
+                entry = replace(entry, available=False, reason='; '.join(
+                    item for item in (su2_refusal, entry.reason) if item))
             if fmt is ExportFormat.CGNS and conversion_source is not None:
                 # Plan 31 FC-F. One CGNS row, two routes, the working one
                 # preferred -- rather than a second row that says CGNS again.
@@ -704,7 +828,8 @@ class ImportExportService:
         return outcome
 
     def _copy_native_su2(self, case: Path, artifact: dict,
-                         destination) -> ExportOutcome:
+                         destination, *, run=None,
+                         notes: tuple[str, ...] = ()) -> ExportOutcome:
         """Hand over the ``mesh.su2`` the accepted run wrote, checked twice.
 
         Plan 31 CP-05 item 5. Two things had to become true here. The copy is
@@ -739,9 +864,13 @@ class ImportExportService:
                 census, artifact.get('run_manifest') or {})
             if problems:
                 raise ValueError('SU2 validation failed: ' + '; '.join(problems))
+        from foammesh.core.import_export.handoff import write_su2_handoff
+        handoff = write_su2_handoff(target, case_path=case, run=run,
+                                    notes=notes).summary()
         outcome = ExportOutcome(ExportFormat.SU2.value, source, target,
                                 path_bytes(target),
-                                tuple(census.warnings) + tuple(warnings))
+                                tuple(census.warnings) + tuple(warnings),
+                                notes=tuple(notes), handoff=handoff)
         # DP-244. The layout details DP-229 gave the authored OpenFOAM export,
         # filed here too and through the same helper. This writer recorded the
         # run under its own spelling and nothing else, so an SU2 export reached
@@ -758,6 +887,7 @@ class ImportExportService:
                      'markers': list(census.markers),
                      'source': 'native',
                      'run_id': artifact.get('run_id', ''),
+                     'handoff': handoff,
                      **export_layout_details(
                          'accepted-run', artifact.get('run_id', ''),
                          layout.get('cores') or 1, layout.get('decomposed'))})
@@ -770,17 +900,40 @@ class ImportExportService:
         the export: it is the mesh the run produced, it is the only form a
         second-order mesh has, and re-deriving one from the published polyMesh
         would hand the user a different mesh under the same name. The VTK
-        writer in ``su2_export`` stays as the fallback, which is the only route
-        a snappyHexMesh case has.
+        writer in ``su2_export`` stays as the fallback for a Gmsh run that
+        wrote no ``mesh.su2`` (one aimed at OpenFOAM, whose mesh is the
+        polyMesh it published).
+
+        DP-5753. That fallback used to be described as "the only route a
+        snappyHexMesh case has", and it was reached by one: SU2 is a Gmsh-route
+        output only (Plan 28), so any other mesh is refused here, before
+        anything is written, with :meth:`su2_route_refusal`'s reason.
+
+        Plan 49 SR6 (DP-5765). Authored intent an SU2 file cannot express --
+        a region interface, an internal face -- is refused, named, before
+        anything is written; the result says the markers are not coupling;
+        and the hand-off sidecar is written beside the ``.su2``.
         """
         from foammesh.core.export.su2_export import (
             Su2ExportError, validate_against, write_su2_from_case,
         )
+        from foammesh.core.gmsh.manifest import accepted_run_engine
+        from foammesh.core.import_export.handoff import (
+            su2_intent_refusal, su2_notes, write_su2_handoff)
 
         case = Path(case_path).resolve()
+        refusal = self.su2_route_refusal(case)
+        if refusal:
+            raise ValueError(refusal)
+        run = accepted_run_engine(case)
+        refusal = su2_intent_refusal(case, run)
+        if refusal:
+            raise ValueError(refusal)
+        notes = tuple(su2_notes(run))
         native = self.native_su2_artifact(case)
         if native is not None:
-            return self._copy_native_su2(case, native, destination)
+            return self._copy_native_su2(case, native, destination,
+                                         run=run, notes=notes)
         target = self._prepare_file_destination(destination, '.su2')
         with self._staged(target) as staging:
             try:
@@ -794,13 +947,17 @@ class ImportExportService:
                 boundary_faces=report.marker_elements)
             if not ok:
                 raise ValueError('SU2 validation failed: ' + '; '.join(problems))
+        handoff = write_su2_handoff(target, case_path=case, run=run,
+                                    notes=notes).summary()
         outcome = ExportOutcome(ExportFormat.SU2.value, case, target,
-                                path_bytes(target))
+                                path_bytes(target), notes=notes,
+                                handoff=handoff)
         record_export_event(case, entry_id=outcome.entry_id, destination=target,
                             total_bytes=outcome.total_bytes,
                             details={'points': report.points,
                                      'elements': report.elements,
-                                     'markers': list(report.markers)})
+                                     'markers': list(report.markers),
+                                     'handoff': handoff})
         return outcome
 
     def export_gmsh(self, case_path: str | Path, destination: str | Path) -> ExportOutcome:

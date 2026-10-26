@@ -1,6 +1,7 @@
 """Gmsh workflow page: gmsh.global_sizing."""
 from __future__ import annotations
 
+from foammesh.core.facade.plan48 import pa3_routes
 from foammesh.view.widgets.folded_note import FoldedNote
 
 from .base import GmshTaskPage
@@ -54,6 +55,13 @@ class GmshGlobalSizingPage(GmshTaskPage):
         self.sizing_card.applied.connect(self.refresh_keeping_edits)
         self.sizing_card.rowOpenRequested.connect(self.showAutomaticRow)
         layout.insertWidget(0, self.sizing_card)
+        # Plan 48 PA3: the local API reads the notes of this page.
+        self._api = GlobalSizingApi(self)
+        session = pa3_routes.announce(self._client, 'global_sizing', self._api)
+        if session is not None:
+            self.destroyed.connect(
+                lambda *_a, s=session, a=self._api: pa3_routes.unregister_panel(
+                    s, 'global_sizing', a))
 
     def showAutomaticRow(self, name: str) -> None:
         """M-20. Open the Gmsh size fields fold on the row the card made."""
@@ -71,10 +79,41 @@ class GmshGlobalSizingPage(GmshTaskPage):
         if card is not None:
             card.refresh()
         self._showMeshSetupThreads()
+        self._showStageThreadsAuto()
+        self._watchReproducible()
         if hasattr(self, '_threadNote'):
             self._updateThreadNote()
         if hasattr(self, '_surfaceNote'):
             self._updateSurfaceNote()
+
+    #: Plan 48 ST (DP-4605). The box beside Threads.
+    REPRODUCIBLE = 'gmsh.global_sizing.reproducible'
+
+    def reproducibleEditor(self):
+        return self._editors.get(self.REPRODUCIBLE)
+
+    def reproducibleOn(self) -> bool:
+        """Whether "Reproducible (single-thread)" is ticked on the page."""
+        editor = self.reproducibleEditor()
+        return bool(editor is not None and editor.value())
+
+    def _watchReproducible(self) -> None:
+        """Ticking the box re-reads the thread note, as an edit to Threads
+        does; connected once per editor (a reload rebuilds the editors)."""
+        editor = self.reproducibleEditor()
+        if editor is None or getattr(editor, '_stWatched', False):
+            return
+        editor._stWatched = True                          # noqa: SLF001
+        editor.valueChanged.connect(
+            lambda *_a: self._updateThreadNote()
+            if hasattr(self, '_threadNote') else None)
+        tip = self.tr(
+            'Gmsh 4.15.2 with more than one thread can mesh the same model '
+            'into a different number of elements each run. Ticked, the run '
+            'uses one thread for every stage, so two runs of one case '
+            'agree. Unticked keeps the thread count above, which is faster.')
+        editor.editor.setToolTip(tip)
+        editor.label.setToolTip(tip)
 
     def meshSetupThreads(self) -> int:
         """The thread count Mesh setup gives a Gmsh run (Plan 40 UXB8, #29).
@@ -129,11 +168,50 @@ class GmshGlobalSizingPage(GmshTaskPage):
         special = getattr(widget, 'setSpecialValueText', None)
         if special is not None:
             special(self.tr('Mesh setup ({0})').format(words))
+            # DP-2873 (live, 2026-10-21). Set here, past the editor's own
+            # fit, so it had no elider: the 150 px box showed "sh setup (15
+            # threads)", cut on the left.
+            from foammesh.view.workflow_controls.field_widgets import (
+                fit_special_text)
+            fit_special_text(widget)
+            # Plan 48 DP-2952: the box now reaches down to 0 (Gmsh's own
+            # "automatic"), so the special text sits at 0, not at the stored
+            # default of 1. 1 and 0 both mean "nobody asked" to the job, so
+            # an untouched 1 is shown as the Mesh setup text (DP-4651).
+            if widget.value() <= 1 and widget.minimum() == 0:
+                blocked = widget.blockSignals(True)
+                try:
+                    widget.setValue(0)
+                finally:
+                    widget.blockSignals(blocked)
         tip = self.tr(
             'Taken from Mesh setup ({0}). A count typed above the minimum '
             'overrides it for Gmsh only.').format(words)
         widget.setToolTip(tip)
         editor.label.setToolTip(tip)
+
+    #: Plan 48 DP-2952. One count per stage; 0 is automatic.
+    STAGE_THREADS = ('gmsh.global_sizing.curve_threads',
+                     'gmsh.global_sizing.surface_threads',
+                     'gmsh.global_sizing.volume_threads')
+
+    def _showStageThreadsAuto(self) -> None:
+        """Each stage's thread box reads "Auto" at 0, its floor: Gmsh's own
+        0, as many threads as the Threads box gives."""
+        from foammesh.view.workflow_controls.field_widgets import (
+            fit_special_text)
+
+        for field_id in self.STAGE_THREADS:
+            editor = self._editors.get(field_id)
+            widget = getattr(editor, 'editor', None)
+            special = getattr(widget, 'setSpecialValueText', None)
+            if special is None or widget.minimum() != 0:
+                continue
+            if widget.specialValueText() != self.tr('Auto'):
+                special(self.tr('Auto'))
+                fit_special_text(widget)
+            tip = self.tr('Auto (0) uses the Threads count.')
+            widget.setToolTip(tip)
 
     def _updateSurfaceNote(self) -> None:
         """Say what a quadrilateral surface algorithm costs at export.
@@ -182,8 +260,14 @@ class GmshGlobalSizingPage(GmshTaskPage):
             THREADED_VOLUME_ALGORITHMS,
         )
 
+        if self.reproducibleOn():
+            # One thread everywhere: nothing is left to say about the volume
+            # algorithm ignoring a count that is not used.
+            self._threadNote.setVisible(False)
+            return
         values = self._client.field_values(
-            ('gmsh.global_sizing.volume', 'gmsh.global_sizing.threads'))
+            ('gmsh.global_sizing.volume', 'gmsh.global_sizing.threads',
+             'gmsh.global_sizing.volume_threads'))
         algorithm = str(
             getattr(values.get('gmsh.global_sizing.volume'), 'value',
                     values.get('gmsh.global_sizing.volume') or '')
@@ -193,6 +277,13 @@ class GmshGlobalSizingPage(GmshTaskPage):
             threads = int(values.get('gmsh.global_sizing.threads') or default)
         except (TypeError, ValueError):
             threads = default
+        # Plan 48 DP-2952: a volume count of its own is what the volume pass
+        # was asked for; Auto (0) is the Threads count.
+        try:
+            threads = int(values.get('gmsh.global_sizing.volume_threads')
+                          or 0) or threads
+        except (TypeError, ValueError):
+            pass
 
         if algorithm in THREADED_VOLUME_ALGORITHMS or threads <= 1:
             self._threadNote.setVisible(False)
@@ -203,3 +294,107 @@ class GmshGlobalSizingPage(GmshTaskPage):
             'surface meshing. Choose hxt for a threaded volume pass.')
             % (algorithm, threads))
         self._threadNote.setVisible(True)
+
+
+class GlobalSizingApi:
+    """What the local API reads on the open Gmsh Global sizing page (Plan 48
+    PA3); registered on the case session, called by ``pa3_routes``."""
+
+    def __init__(self, page: GmshGlobalSizingPage):
+        self._page = page
+
+    def notes(self) -> dict:
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+
+        def read():
+            page = self._page
+            page._updateThreadNote()                    # noqa: SLF001
+            page._updateSurfaceNote()                   # noqa: SLF001
+
+            def note(label):
+                return {'text': label.text(), 'shown': not label.isHidden()}
+            editor = page._editors.get('gmsh.global_sizing.threads')  # noqa: SLF001
+            special = getattr(getattr(editor, 'editor', None),
+                              'specialValueText', None)
+            return {'thread_note': note(page._threadNote),  # noqa: SLF001
+                    'quad_note': note(page._surfaceNote),   # noqa: SLF001
+                    'threads_text': special() if callable(special) else '',
+                    'mesh_setup_threads': page.meshSetupThreads()}
+        return on_gui_thread(read)
+
+    def reproducible(self, enabled=None, timeout: float = 20.0) -> dict:
+        """Plan 48 ST (DP-4605). Read, or tick / untick and apply, the
+        "Reproducible (single-thread)" box -- as a click on the box and on
+        Apply do. Answers the box and the stored value after."""
+        import time
+
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+
+        page = self._page
+
+        def state():
+            editor = page.reproducibleEditor()
+            if editor is None:
+                raise ValueError(
+                    'this page has no Reproducible (single-thread) box')
+            stored = page._client.field_values(            # noqa: SLF001
+                (page.REPRODUCIBLE,)).get(page.REPRODUCIBLE)
+            return {'reproducible': bool(editor.value()),
+                    'stored': bool(getattr(stored, 'value', stored)),
+                    'pending': page.REPRODUCIBLE in page._pending,
+                    'thread_note_shown': not page._threadNote.isHidden()}
+
+        def click():
+            editor = page.reproducibleEditor()
+            if editor is None:
+                raise ValueError(
+                    'this page has no Reproducible (single-thread) box')
+            if bool(editor.value()) != bool(enabled):
+                editor.editor.setChecked(bool(enabled))
+            page.apply()
+            return state()
+
+        if enabled is None:
+            return on_gui_thread(state)
+        done = on_gui_thread(click)
+        deadline = time.time() + timeout
+        while done['stored'] != bool(enabled) and time.time() < deadline:
+            time.sleep(0.05)
+            done = on_gui_thread(state)
+        return done
+
+    def sizing_view(self, layer: str = '', shown=None) -> dict:
+        """The two viewport toggles of the Automatic sizing card.
+
+        ``field`` is the card's Preview button (the proposed size field) and
+        ``conformity`` its "Show on the mesh" box (the cells whose size is off
+        the field). With *layer* and *shown* the toggle is set as a click sets
+        it, so the card draws or clears the same overlay; the answer is the
+        state of both.
+        """
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+
+        def act():
+            card = self._page.sizing_card
+            toggles = {'field': card.preview_button,
+                       'conformity': card.conformity_view}
+            if layer:
+                if layer not in toggles:
+                    raise ValueError(
+                        f'{layer!r} is not a sizing view; they are '
+                        + ', '.join(toggles))
+                toggle = toggles[layer]
+                if card.after_mesh.isHidden() and layer == 'conformity':
+                    raise ValueError(
+                        'size conformity is shown only on the snappy route')
+                if shown is not None:
+                    if not toggle.isEnabled():
+                        raise ValueError(
+                            'compute the automatic sizing field first')
+                    toggle.setChecked(bool(shown))
+            return {name: {'shown': toggle.isChecked(),
+                           'enabled': toggle.isEnabled(),
+                           'available': not (name == 'conformity'
+                                             and card.after_mesh.isHidden())}
+                    for name, toggle in toggles.items()}
+        return on_gui_thread(act)

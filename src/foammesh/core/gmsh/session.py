@@ -308,7 +308,8 @@ class GmshSession:
                                    response.get('log') or ())
         return response.get('result')
 
-    def _send(self, op, args, kwargs, timeout, *, replay=False) -> dict:
+    def _send(self, op, args, kwargs, timeout, *, replay=False,
+              again=None) -> dict:
         with self._call_lock:
             if not self.alive:
                 raise GmshSessionCrashed(
@@ -323,6 +324,9 @@ class GmshSession:
                 request['timeout'] = float(timeout)
             if replay:
                 request['replay'] = True
+            if again is not None:
+                # DP-5738: logged, marked as made again (see read_op_log)
+                request['again'] = again
             self._current_op = op
             started = time.monotonic()
             self._sink('started', op, args=args)
@@ -382,8 +386,11 @@ class GmshSession:
     def plugin_run(self, name: str, directory: str | Path,
                    numbers: dict | None = None, *, edits: bool = False,
                    view: int | None = None, other_view: int | None = None,
-                   timeout: float | None = None) -> dict:
+                   timeout: float | None = None,
+                   strings: dict | None = None) -> dict:
         """Run Gmsh plugin *name*; its views are written into *directory*.
+
+        Plan 48 GM9 (DP-4301): ``strings`` are the plugin's string options.
 
         Plan 41 GN20. ``edits`` names a run that changes the mesh (it is then
         logged and replays after a crash).  Every view and entity the plugin
@@ -391,6 +398,9 @@ class GmshSession:
         """
         kwargs = {'numbers': dict(numbers or {}),
                   'directory': self.runtime_path(directory)}
+        if strings:
+            kwargs['strings'] = {key: str(value)
+                                 for key, value in strings.items()}
         if view is not None:
             kwargs['view'] = int(view)
         if other_view is not None:
@@ -456,6 +466,12 @@ class GmshSession:
 
     def write_mesh(self, host_path: str | Path) -> dict:
         return self.call('session.write', self.runtime_path(host_path))
+
+    def write_surface_mesh(self, host_path: str | Path) -> dict:
+        """Write the mesh in hand, every element, as MSH 2.2 ASCII (GM12,
+        DP-4355): after Mesh 2D, the file ``surface_deviation`` reads."""
+        return self.call('session.write_surface',
+                         self.runtime_path(host_path))
 
     # -- cancel, crash, recovery ----------------------------------------- #
 

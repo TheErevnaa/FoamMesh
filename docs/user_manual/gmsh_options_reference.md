@@ -21,7 +21,7 @@ Advanced section of the Geometry row.
 
 | Option | Default | Unit | Choices | Help |
 |---|---|---|---|---|
-| `Geometry.AutoCoherence` | 1.0 |  |  | Should all duplicate entities be automatically removed with the built-in geometry kernel? If Geometry.AutoCoherence = 2, also remove degenerate entities. The option has no effect with the OpenCASCADE kernel |
+| `Geometry.AutoCoherence` | on |  |  | Should all duplicate entities be automatically removed with the built-in geometry kernel? If Geometry.AutoCoherence = 2, also remove degenerate entities. The option has no effect with the OpenCASCADE kernel |
 | `Geometry.CopyMeshingMethod` | off |  |  | Copy meshing method (unstructured or transfinite) when duplicating geometrical entities with built-in geometry kernel? |
 | `Geometry.ExactExtrusion` | on |  |  | Use exact extrusion formula in interpolations (set to 0 to allow geometrical transformations of extruded entities) |
 | `Geometry.ExtrudeReturnLateralEntities` | on |  |  | Add lateral entities in lists returned by extrusion commands? |
@@ -40,15 +40,15 @@ Advanced section of the Geometry row.
 | `Geometry.OCCBooleanPreserveNumbering` | 1.0 |  |  | Try to preserve the numbering of entities through OpenCASCADE boolean operations |
 | `Geometry.OCCBooleanSimplify` | 1.0 |  |  | Try to simplify the shape resulting from boolean operations (0: none, 1: only for unions, 2: for all boolean operations |
 | `Geometry.OCCBoundsUseStl` | off |  |  | Use STL mesh for computing bounds of OpenCASCADE shapes (more accurate, but slower) |
-| `Geometry.OCCBrepFormatVersion` | 1.0 |  |  | Version of BREP format used when saving BREP and XAO files (0: current, 1, 2, 3: currently supported versions) |
+| `Geometry.OCCBrepFormatVersion` | 1.0 |  | (0, 'current, 1, 2'), (3, 'currently supported versions') | Version of BREP format used when saving BREP and XAO files (0: current, 1, 2, 3: currently supported versions) |
 | `Geometry.OCCDisableStl` | off |  |  | Disable STL creation in OpenCASCADE kernel |
 | `Geometry.OCCExportOnlyVisible` | 0.0 |  |  | Only consider visible shapes when exporting STEP or BREP models with the OpenCASCADE kernel |
 | `Geometry.OCCFastUnbind` | on |  |  | Use fast (i.e. without recursive checks on boundaries) unbinding of entities in geometrical transformations (1), as well as in boolean operations (2) |
-| `Geometry.OCCFixDegenerated` | 0.0 |  |  | Fix degenerated edges/faces when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
-| `Geometry.OCCFixSmallEdges` | 0.0 |  |  | Fix small edges when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
-| `Geometry.OCCFixSmallFaces` | 0.0 |  |  | Fix small faces when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
+| `Geometry.OCCFixDegenerated` | off |  |  | Fix degenerated edges/faces when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
+| `Geometry.OCCFixSmallEdges` | off |  |  | Fix small edges when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
+| `Geometry.OCCFixSmallFaces` | off |  |  | Fix small faces when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
 | `Geometry.OCCImportLabels` | 1.0 |  | (0, 'no'), (1, 'yes'), (2, 'use slow workaround for bad shape locations') | Import labels and colors when importing STEP models with the OpenCASCADE kernel (0: no, 1: yes, 2: use slow workaround for bad shape locations) |
-| `Geometry.OCCMakeSolids` | 0.0 |  |  | Fix shells and make solids when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
+| `Geometry.OCCMakeSolids` | off |  |  | Fix shells and make solids when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
 | `Geometry.OCCParallel` | off |  |  | Use multi-threaded OpenCASCADE boolean operators |
 | `Geometry.OCCSTEPAuthor` |  |  |  | Author of the STEP file to be written by OpenCASCADE. If left empty, the default value is set by OpenCASCADE |
 | `Geometry.OCCSTEPAuthorization` |  |  |  | Authorization of the STEP file to be written by OpenCASCADE. If left empty, the default value is set by OpenCASCADE |
@@ -60,7 +60,7 @@ Advanced section of the Geometry row.
 | `Geometry.OCCSTEPPreprocessorVersion` |  |  |  | Preprocessor version of the STEP file to be written by OpenCASCADE. If left empty, the default value is set by OpenCASCADE |
 | `Geometry.OCCSTEPSchemaIdentifier` |  |  |  | Schema identifier of the STEP file to be written by OpenCASCADE. If left empty, the default value is set by OpenCASCADE |
 | `Geometry.OCCSTEPTimeStamp` |  |  |  | Time stamp for the creation of the STEP file. If left empty, the default value is current time. |
-| `Geometry.OCCScaling` | on |  |  | Scale STEP, IGES and BRep models by the given factor when importing them with the OpenCASCADE kernel |
+| `Geometry.OCCScaling` | 1.0 |  |  | Scale STEP, IGES and BRep models by the given factor when importing them with the OpenCASCADE kernel |
 | `Geometry.OCCSewFaces` | 0.0 |  |  | Sew faces when importing STEP, IGES and BRep models with the OpenCASCADE kernel |
 | `Geometry.OCCTargetUnit` |  |  |  | Length unit to which coordinates from STEP and IGES files are converted to when imported by OpenCASCADE, e.g. 'M' for meters (leave empty to use the default OpenCASCADE behavior); the option should be set before importing the STEP or IGES file |
 | `Geometry.OCCThruSectionsDegree` | -1.0 |  |  | Maximum degree of surfaces generated by thrusections with the OpenCASCADE kernel, if not explicitly specified (default OCC value if negative) |
@@ -109,9 +109,9 @@ Advanced section of the Global sizing row.
 | `Mesh.MaxNumThreads2D` | 0.0 |  |  | Maximum number of threads for 2D meshing (0: use General.NumThreads) |
 | `Mesh.MaxNumThreads3D` | 0.0 |  |  | Maximum number of threads for 3D meshing (0: use General.NumThreads) |
 | `Mesh.MaxRetries` | 10.0 |  |  | Maximum number of times meshing is retried on curves and surfaces with a pending mesh; also controls maximum number of recursive subdivisions when self-intersecting 1D meshes are detected |
-| `Mesh.MeshSizeExtendFromBoundary` | on |  |  | Extend computation of mesh element sizes from the boundaries into the interior (0: never; 1: for surfaces and volumes; 2: for surfaces and volumes, but use smallest surface element edge length instead of longest length in 3D Delaunay; -2: only for surfaces; -3: only for volumes) |
+| `Mesh.MeshSizeExtendFromBoundary` | 1.0 |  | (0, 'never'), (1, 'for surfaces and volumes'), (2, 'for surfaces and volumes, but use smallest surface element edge length instead of longest length in 3D Delaunay'), (-2, 'only for surfaces'), (-3, 'only for volumes') | Extend computation of mesh element sizes from the boundaries into the interior (0: never; 1: for surfaces and volumes; 2: for surfaces and volumes, but use smallest surface element edge length instead of longest length in 3D Delaunay; -2: only for surfaces; -3: only for volumes) |
 | `Mesh.MeshSizeFactor` | 1.0 |  |  | Factor applied to all mesh element sizes |
-| `Mesh.MeshSizeFromCurvature` | off | rad |  | Automatically compute mesh element sizes from curvature, using the value as the target number of elements per 2 * Pi radians |
+| `Mesh.MeshSizeFromCurvature` | 0.0 | rad |  | Automatically compute mesh element sizes from curvature, using the value as the target number of elements per 2 * Pi radians |
 | `Mesh.MeshSizeFromCurvatureIsotropic` | off |  |  | Force isotropic curvature estimation when the mesh size is computed from curvature |
 | `Mesh.MeshSizeFromParametricPoints` | off |  |  | Compute mesh element sizes from values given at geometry points defining parametric curves |
 | `Mesh.MeshSizeFromPoints` | on |  |  | Compute mesh element sizes from values given at geometry points |
@@ -127,7 +127,7 @@ Advanced section of the Global sizing row.
 | `Mesh.RandomSeed` | 1.0 |  |  | Seed of pseudo-random number generator |
 | `Mesh.ReparamMaxTriangles` | 250000.0 |  |  | Maximum number of triangles in a single parametrization patch |
 | `Mesh.Reproducible` | 0.0 |  |  | Try to produce reproducible meshes even when multi-threaded (experimental) |
-| `Mesh.SmoothCrossField` | off |  |  | Apply n barycentric smoothing passes to the 3D cross field |
+| `Mesh.SmoothCrossField` | 0.0 |  |  | Apply n barycentric smoothing passes to the 3D cross field |
 | `Mesh.SmoothRatio` | 1.8 |  |  | Ratio between mesh sizes at nodes of a same edge (used in BAMG) |
 | `Mesh.StlOneSolidPerSurface` | 0.0 |  | (0, 'single solid'), (1, 'one solid per face'), (2, 'one solid per physical surface') | Create one solid per surface when exporting STL files? (0: single solid, 1: one solid per face, 2: one solid per physical surface) |
 | `Mesh.ToleranceEdgeLength` | 0.0 | length |  | Skip a model edge in mesh generation if its length is less than user's defined tolerance |
@@ -143,13 +143,13 @@ Advanced section of the Structure row.
 |---|---|---|---|---|
 | `Mesh.CompoundClassify` | 1.0 |  | (0, 'on the new discrete surface'), (1, 'on the original geometrical surfaces — incompatible with e.g. high-order meshing') | How are surface mesh elements classified on compounds? (0: on the new discrete surface, 1: on the original geometrical surfaces — incompatible with e.g. high-order meshing) |
 | `Mesh.CompoundMeshSizeFactor` | 0.5 |  |  | Mesh size factor applied to compound parts |
-| `Mesh.FlexibleTransfinite` | off |  |  | Allow transfinite constraints to be modified for recombination (e.g. Blossom) or by global mesh size factor |
+| `Mesh.FlexibleTransfinite` | 0.0 |  |  | Allow transfinite constraints to be modified for recombination (e.g. Blossom) or by global mesh size factor |
 | `Mesh.QuadqsRemeshingBoldness` | 0.66 |  |  | Controls how much cavity remeshing is allowed to distort the quad mesh. From 0 (no quality decrease during remeshing) to 1 (quality can tend to 0 during remeshing). |
 | `Mesh.QuadqsScalingOnTriangulation` | 0.75 |  |  | Ratio on the edge length between the triangulation and the quadrangulation. Use a small ratio (e.g. 0.5) to get a background triangulation finer than the quad mesh. Useful to get a more accurate cross-field. |
 | `Mesh.QuadqsSizemapMethod` | 3.0 |  |  | Size map method in QuadQuasiStructured. 0: default, 1: cross-field,2: cross-field + CAD small features adaptation,3: from background mesh (e.g. sizes in current triangulation),4: cross-field + CAD small features adaptation (clamped by background mesh) |
 | `Mesh.QuadqsTopologyOptimizationMethods` | 0.0 |  |  | Topology optimization methods in QuadQuasiStructured. 0: default (all),100: pattern-based CAD faces,010: disk quadrangulation remeshing,001: cavity remeshing,xxx: combination of multiple methods (e.g. 111 for all) |
-| `Mesh.QuasiTransfinite` | off |  |  | Allow quasi-transfinite meshing of surfaces with non-matching number of nodes on opposite sides |
-| `Mesh.RecombinationAlgorithm` | 1.0 |  | (0, 'simple'), (1, 'blossom'), (2, 'simple full-quad'), (3, 'blossom full-quad') | Mesh recombination algorithm (0: simple, 1: blossom, 2: simple full-quad, 3: blossom full-quad) |
+| `Mesh.QuasiTransfinite` | 0.0 |  |  | Allow quasi-transfinite meshing of surfaces with non-matching number of nodes on opposite sides |
+| `Mesh.RecombinationAlgorithm` | 1.0 |  | (0, 'simple'), (1, 'blossom'), (2, 'simple full-quad'), (3, 'blossom full-quad'), (4, "Christos's bipartite labelling") | Mesh recombination algorithm (0: simple, 1: blossom, 2: simple full-quad, 3: blossom full-quad) |
 | `Mesh.Recombine3DAll` | off |  |  | Apply recombination3D algorithm to all volumes, ignoring per-volume spec (experimental) |
 | `Mesh.Recombine3DConformity` | 0.0 |  | (0, 'nonconforming'), (1, 'trihedra'), (2, 'pyramids+trihedra'), (3, 'pyramids+hexSplit+trihedra'), (4, 'hexSplit+trihedra') | 3d recombination conformity type (0: nonconforming, 1: trihedra, 2: pyramids+trihedra, 3:pyramids+hexSplit+trihedra, 4:hexSplit+trihedra)(experimental) |
 | `Mesh.Recombine3DLevel` | 0.0 |  | (0, 'hex'), (1, 'hex+prisms'), (2, 'hex+prism+pyramids') | 3d recombination level (0: hex, 1: hex+prisms, 2: hex+prism+pyramids) (experimental) |
@@ -175,7 +175,7 @@ Advanced section of the Periodic row.
 
 | Option | Default | Unit | Choices | Help |
 |---|---|---|---|---|
-| `Mesh.HighOrderPeriodic` | off |  |  | Force location of nodes for periodic meshes using periodicity transform (0: assume identical parametrisations, 1: invert parametrisations, 2: compute closest point |
+| `Mesh.HighOrderPeriodic` | 0.0 |  | (0, 'assume identical parametrisations'), (1, 'invert parametrisations'), (2, 'compute closest point') | Force location of nodes for periodic meshes using periodicity transform (0: assume identical parametrisations, 1: invert parametrisations, 2: compute closest point |
 | `Mesh.HighOrderSavePeriodic` | off |  |  | Save high-order nodes in periodic section of MSH files? |
 | `Mesh.IgnorePeriodicity` | 1.0 |  |  | Skip periodic node section and skip periodic boundary alignment step when reading meshes in the MSH2 format |
 
@@ -188,8 +188,8 @@ Advanced section of the Generate row; the Options panel there lists every option
 | `Mesh.ElementOrder` | 1.0 |  |  | Element order (1: first order elements) |
 | `Mesh.HighOrderCurveOuterBL` | 0.0 |  |  | Curve also the outer surface of the boundary layer in the fast curving algorithm (0 = do not curve, 1 = curve according to boundary, 2 = curve without breaking outer elements) |
 | `Mesh.HighOrderDistCAD` | off |  |  | Try to optimize distance to CAD in high-order optimizer? |
-| `Mesh.HighOrderFastCurvingNewAlgo` | 0.0 |  |  | Curve boundary layer with new "fast curving" algorithm (experimental) |
-| `Mesh.HighOrderFixBoundaryNodes` | off |  |  | Fix all (1) or periodic (2) boundary nodes during high-order optimization? |
+| `Mesh.HighOrderFastCurvingNewAlgo` | off |  |  | Curve boundary layer with new "fast curving" algorithm (experimental) |
+| `Mesh.HighOrderFixBoundaryNodes` | 0.0 |  | (0, 'no'), (1, 'all'), (2, 'periodic') | Fix all (1) or periodic (2) boundary nodes during high-order optimization? |
 | `Mesh.HighOrderIterMax` | 100.0 |  |  | Maximum number of iterations in high-order optimization pass |
 | `Mesh.HighOrderMaxAngle` | 0.1745329277777778 |  |  | Maximum angle between layers of BL elements for the detection of columns in the fast curving algorithm |
 | `Mesh.HighOrderMaxInnerAngle` | 0.5235987833333333 |  |  | Maximum angle between edges/faces within layers of BL triangles/tets for the detection of columns in the fast curving algorithm |
@@ -211,9 +211,9 @@ Advanced section of the Generate row; the Options panel there lists every option
 | `Mesh.MetisObjective` | 1.0 |  | (1, 'min. edge-cut'), (2, 'min. communication volume') | METIS objective type 'objtype' (1: min. edge-cut, 2: min. communication volume) |
 | `Mesh.MetisRefinementAlgorithm` | 2.0 |  | (1, 'FM-based cut'), (2, 'Greedy'), (3, 'Two-sided node FM'), (4, 'One-sided node FM') | METIS algorithm for k-way refinement 'rtype' (1: FM-based cut, 2: Greedy, 3: Two-sided node FM, 4: One-sided node FM) |
 | `Mesh.NbPartitions` | 0.0 |  |  | Number of partitions |
-| `Mesh.Optimize` | 1.0 |  |  | Optimize the mesh to improve the quality of tetrahedral elements |
-| `Mesh.OptimizeNetgen` | 0.0 |  |  | Optimize the mesh using Netgen to improve the quality of tetrahedral elements |
-| `Mesh.OptimizePyramids` | 0.0 |  |  | Optimize pyramids in hybrid 3D meshes (0: smoother; 1: untangler) |
+| `Mesh.Optimize` | on |  |  | Optimize the mesh to improve the quality of tetrahedral elements |
+| `Mesh.OptimizeNetgen` | off |  |  | Optimize the mesh using Netgen to improve the quality of tetrahedral elements |
+| `Mesh.OptimizePyramids` | 0.0 |  | (0, 'smoother'), (1, 'untangler') | Optimize pyramids in hybrid 3D meshes (0: smoother; 1: untangler) |
 | `Mesh.OptimizeThreshold` | 0.3 |  |  | Optimize tetrahedra that have a quality below ... |
 | `Mesh.PartitionConvertMsh2` | 1.0 |  |  | When reading partitioned meshes in MSH2 format, create new partition entities |
 | `Mesh.PartitionCreateGhostCells` | 0.0 |  |  | Create ghost cells, i.e. create for each partition a ghost entity containing elements connected to neighboring partitions by at least one node. |
@@ -232,7 +232,7 @@ Advanced section of the Generate row; the Options panel there lists every option
 | `Mesh.PartitionTrihedronWeight` | 0.0 |  |  | Weight of trihedron element for METIS load balancing (-1: automatic) |
 | `Mesh.RefineSteps` | 10.0 |  |  | Number of refinement steps in the MeshAdapt-based 2D algorithms |
 | `Mesh.Renumber` | 1.0 |  |  | Renumber nodes and elements in a continuous sequence after mesh generation |
-| `Mesh.SecondOrderIncomplete` | 0.0 |  |  | Create incomplete second order elements? (8-node quads, 20-node hexas, etc.) |
+| `Mesh.SecondOrderIncomplete` | off |  |  | Create incomplete second order elements? (8-node quads, 20-node hexas, etc.) |
 | `Mesh.SecondOrderLinear` | off |  |  | Should second order nodes (as well as nodes generated with subdivision algorithms) simply be created by linear interpolation? |
 | `Mesh.Smoothing` | 1.0 |  |  | Number of smoothing steps applied to the final mesh |
 
@@ -247,7 +247,7 @@ Advanced section of the Quality row.
 | `Mesh.MinQuality` | 0.0 |  |  | Minimum mesh quality (inverse conditioning number, ICN) after the generation of the current mesh (read-only) (read only) |
 | `Mesh.QualityInf` | 0.0 |  |  | Only display elements whose quality measure is greater than QualityInf |
 | `Mesh.QualitySup` | 0.0 |  |  | Only display elements whose quality measure is smaller than QualitySup |
-| `Mesh.QualityType` | 2.0 |  |  | Type of quality measure (0: SICN~signed inverse condition number, 1: SIGE~signed inverse gradient error, 2: gamma~vol/sum_face/max_edge, 3: Disto~minJ/maxJ |
+| `Mesh.QualityType` | 2.0 |  | (0, 'SICN'), (1, 'SIGE'), (2, 'Gamma'), (3, 'Disto') | Type of quality measure (0: SICN~signed inverse condition number, 1: SIGE~signed inverse gradient error, 2: gamma~vol/sum_face/max_edge, 3: Disto~minJ/maxJ |
 | `Mesh.RadiusInf` | 0.0 |  |  | Only display elements whose longest edge is greater than RadiusInf |
 | `Mesh.RadiusSup` | 0.0 |  |  | Only display elements whose longest edge is smaller than RadiusSup |
 | `Mesh.ScalingFactor` | 1.0 |  |  | Global scaling factor applied to the saved mesh |
@@ -272,22 +272,22 @@ Advanced section of the Export row.
 | `Mesh.Format` | 10.0 |  | (1, 'msh'), (2, 'unv'), (10, 'auto'), (16, 'vtk'), (19, 'vrml'), (21, 'mail'), (26, 'pos stat'), (27, 'stl'), (28, 'p3d'), (30, 'mesh'), (31, 'bdf'), (32, 'cgns'), (33, 'med'), (34, 'diff'), (38, 'ir3'), (39, 'inp'), (40, 'ply2'), (41, 'celum'), (42, 'su2'), (47, 'tochnog'), (49, 'neu'), (50, 'matlab') | Mesh output format (1: msh, 2: unv, 10: auto, 16: vtk, 19: vrml, 21: mail, 26: pos stat, 27: stl, 28: p3d, 30: mesh, 31: bdf, 32: cgns, 33: med, 34: diff, 38: ir3, 39: inp, 40: ply2, 41: celum, 42: su2, 47: tochnog, 49: neu, 50: matlab) |
 | `Mesh.IgnoreUnknownSections` | 0.0 |  |  | Skip unknown sections when reading meshes in the MSH4 format (otherwise the contents of these sections are stored as model attributes) |
 | `Mesh.MedFileMinorVersion` | -1.0 |  |  | Minor version of the MED file format to use (-1: use minor version of the MED library) |
-| `Mesh.MedImportGroupsOfNodes` | off |  |  | Import groups of nodes (0: no; 1: create geometrical point for each node)? |
+| `Mesh.MedImportGroupsOfNodes` | 0.0 |  | (0, 'no'), (1, 'create geometrical point for each node') | Import groups of nodes (0: no; 1: create geometrical point for each node)? |
 | `Mesh.MedSingleModel` | 0.0 |  |  | Import MED meshes in the current model, even if several MED mesh names exist |
 | `Mesh.MshFileVersion` | 4.1 |  |  | Version of the MSH file format to use |
 | `Mesh.PreserveNumberingMsh2` | 0.0 |  |  | Preserve node and element numbering in MSH2 format (will break meshes with multiple physical groups for a single elementary entity) |
 | `Mesh.ReadGroupsOfElements` | 1.0 |  |  | Read groups of elements in UNV meshes (this will discard the elementary entity tags inferred from the element section) |
 | `Mesh.SaveAll` | off |  |  | Save all elements, even if they don't belong to physical groups (for some mesh formats, this removes physical groups altogether) |
 | `Mesh.SaveElementTagType` | 1.0 |  | (1, 'elementary'), (2, 'physical'), (3, 'partition') | Type of the element tag saved in mesh formats that don't support saving physical or partition ids (1: elementary, 2: physical, 3: partition) |
-| `Mesh.SaveGroupsOfElements` | on |  |  | Save groups of elements for each physical group (for UNV and INP mesh format) if value is positive; if negative, save groups of elements for physical groups of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfElements is 1 (for example: -100 will only savesurfaces, while -1010 will save volumes and curves), and for INP skip saving elements of dimension dim altogether if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfElements is 0 |
-| `Mesh.SaveGroupsOfNodes` | off |  |  | Save groups of nodes for each physical group (for UNV, INP and Tochnog mesh formats) if value is positive; if negative, save groups of nodes for physical groups of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfNodes is 1 (for example: -100 will only save surfaces, while -1010 will save volumes and curves); for INP, save groups of nodes for all entities of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfNodes is 2 |
+| `Mesh.SaveGroupsOfElements` | 1.0 |  |  | Save groups of elements for each physical group (for UNV and INP mesh format) if value is positive; if negative, save groups of elements for physical groups of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfElements is 1 (for example: -100 will only savesurfaces, while -1010 will save volumes and curves), and for INP skip saving elements of dimension dim altogether if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfElements is 0 |
+| `Mesh.SaveGroupsOfNodes` | 0.0 |  |  | Save groups of nodes for each physical group (for UNV, INP and Tochnog mesh formats) if value is positive; if negative, save groups of nodes for physical groups of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfNodes is 1 (for example: -100 will only save surfaces, while -1010 will save volumes and curves); for INP, save groups of nodes for all entities of dimension dim if the (dim+1)^th least significant digit of -Mesh.SaveGroupsOfNodes is 2 |
 | `Mesh.SaveParametric` | off |  |  | Save parametric coordinates of nodes |
 | `Mesh.SaveTopology` | off |  |  | Save model topology in MSH2 output files (this is always saved in MSH3 and above) |
 | `Mesh.SaveWithoutOrphans` | 0.0 |  |  | Don't save orphan entities (not connected to any highest dimensional entity in the model) in MSH4 files |
 | `Mesh.StlAngularDeflection` | 0.3 |  |  | Maximum angular deflection when creating STL representations of entities (currently only used with the OpenCASCADE kernel) |
 | `Mesh.StlLinearDeflection` | 0.001 |  |  | Maximum relative linear deflection when creating STL representation of entities (currently only used with the OpenCASCADE kernel) |
 | `Mesh.StlLinearDeflectionRelative` | on |  |  | Compute the linear deflection for STL representations relative to the length of curves (currently only used with the OpenCASCADE kernel) |
-| `Mesh.StlRemoveBadTriangles` | off |  |  | Remove bad triangles when importing STL files (1: remove duplicates; 2: remove duplicate and zero-area triangles) |
+| `Mesh.StlRemoveBadTriangles` | 0.0 |  | (1, 'remove duplicates'), (2, 'remove duplicate and zero-area triangles') | Remove bad triangles when importing STL files (1: remove duplicates; 2: remove duplicate and zero-area triangles) |
 | `Mesh.SwitchElementTags` | 0.0 |  |  | Invert elementary and physical tags when reading the mesh |
 | `Mesh.UnvStrictFormat` | on |  |  | Use strict format specification for UNV files, with 'D' for exponents (instead of 'E' as used by some tools) |
 | `Mesh.ZoneDefinition` | 0.0 |  | (0, 'single zone'), (1, 'by partition'), (2, 'by physical') | Method for defining a zone (0: single zone, 1: by partition, 2: by physical) |
@@ -347,7 +347,7 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 
 | Option | Default | Unit | Choices | Help |
 |---|---|---|---|---|
-| `Geometry.Clip` | off |  |  | Enable clipping planes? (Plane[i]=2^i, i=0,...,5) |
+| `Geometry.Clip` | 0.0 |  |  | Enable clipping planes? (Plane[i]=2^i, i=0,...,5) |
 | `Geometry.Color.Curves` | (0, 0, 255, 255) |  |  | Normal geometry curve color |
 | `Geometry.Color.HighlightOne` | (255, 150, 0, 255) |  |  | Highlight 1 color |
 | `Geometry.Color.HighlightTwo` | (255, 255, 0, 255) |  |  | Highlight 2 color |
@@ -361,7 +361,7 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 | `Geometry.Color.Volumes` | (200, 200, 0, 255) |  |  | Normal geometry volume color |
 | `Geometry.CurveLabels` | off |  |  | Display curve labels? |
 | `Geometry.CurveSelectWidth` | 3.0 |  |  | Display width of selected curves (in pixels) |
-| `Geometry.CurveType` | off |  |  | Display curves as solid color segments (0) or 3D cylinders (1) |
+| `Geometry.CurveType` | 0.0 |  | (0, 'color segment'), (1, '3D cylinder') | Display curves as solid color segments (0) or 3D cylinders (1) |
 | `Geometry.CurveWidth` | 2.0 |  |  | Display width of lines (in pixels) |
 | `Geometry.Curves` | on |  |  | Display geometry curves? |
 | `Geometry.DoubleClickedCurveCommand` | ONELAB |  |  | Command parsed when double-clicking on a curve, or 'ONELAB' to edit associated ONELAB parameters |
@@ -372,24 +372,24 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 | `Geometry.HighlightOrphans` | off |  |  | Highlight orphan and boundary entities? |
 | `Geometry.LabelType` | 0.0 |  | (0, 'description'), (1, 'elementary entity tag'), (2, 'physical group tag'), (3, 'elementary name'), (4, 'physical name'), (5, 'coordinates') | Type of entity label (0: description, 1: elementary entity tag, 2: physical group tag, 3: elementary name, 4: physical name, 5: coordinates) |
 | `Geometry.Light` | on |  |  | Enable lighting for the geometry |
-| `Geometry.LightTwoSide` | 1.0 |  |  | Light both sides of surfaces (leads to slower rendering) |
-| `Geometry.Normals` | off |  |  | Display size of normal vectors (in pixels) |
+| `Geometry.LightTwoSide` | on |  |  | Light both sides of surfaces (leads to slower rendering) |
+| `Geometry.Normals` | 0.0 |  |  | Display size of normal vectors (in pixels) |
 | `Geometry.OffsetX` | 0.0 |  |  | Model display offset along X-axis (in model coordinates) |
 | `Geometry.OffsetY` | 0.0 |  |  | Model display offset along Y-axis (in model coordinates) |
 | `Geometry.OffsetZ` | 0.0 |  |  | Model display offset along Z-axis (in model coordinates) |
 | `Geometry.PointLabels` | off |  |  | Display points labels? |
 | `Geometry.PointSelectSize` | 6.0 |  |  | Display size of selected points (in pixels) |
 | `Geometry.PointSize` | 4.0 |  |  | Display size of points (in pixels) |
-| `Geometry.PointType` | off |  |  | Display points as solid color dots (0) or 3D spheres (1) |
+| `Geometry.PointType` | 0.0 |  | (0, 'color dot'), (1, '3D sphere') | Display points as solid color dots (0) or 3D spheres (1) |
 | `Geometry.Points` | on |  |  | Display geometry points? |
 | `Geometry.SurfaceLabels` | off |  |  | Display surface labels? |
 | `Geometry.SurfaceType` | 0.0 |  | (0, 'cross'), (1, 'wireframe'), (2, 'solid') | Surface display type (0: cross, 1: wireframe, 2: solid). Wireframe and solid are not available with the built-in geometry kernel. |
 | `Geometry.Surfaces` | off |  |  | Display geometry surfaces? |
-| `Geometry.Tangents` | off |  |  | Display size of tangent vectors (in pixels) |
+| `Geometry.Tangents` | 0.0 |  |  | Display size of tangent vectors (in pixels) |
 | `Geometry.VolumeLabels` | off |  |  | Display volume labels? |
 | `Geometry.VolumeType` | 0.0 |  | (0, 'sphere'), (1, 'diamond') | Volume display type (0: sphere, 1: diamond) |
 | `Geometry.Volumes` | off |  |  | Display geometry volumes? |
-| `Mesh.Clip` | off |  |  | Enable clipping planes? (Plane[i]=2^i, i=0,...,5) |
+| `Mesh.Clip` | 0.0 |  |  | Enable clipping planes? (Plane[i]=2^i, i=0,...,5) |
 | `Mesh.Color.Eight` | (228, 255, 0, 255) |  |  | Color 8 in color carousel |
 | `Mesh.Color.Eighteen` | (0, 255, 52, 255) |  |  | Color 18 in color carousel |
 | `Mesh.Color.Eleven` | (0, 76, 255, 255) |  |  | Color 11 in color carousel |
@@ -431,10 +431,10 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 | `Mesh.LabelSampling` | 1.0 |  |  | Label sampling rate (display one label every `LabelSampling' elements) |
 | `Mesh.LabelType` | 0.0 |  | (0, 'node/element tag'), (1, 'elementary entity tag'), (2, 'physical entity tag'), (3, 'partition'), (4, 'coordinates') | Type of element label (0: node/element tag, 1: elementary entity tag, 2: physical entity tag, 3: partition, 4: coordinates) |
 | `Mesh.Light` | on |  |  | Enable lighting for the mesh |
-| `Mesh.LightLines` | 2.0 |  |  | Enable lighting for mesh edges (0: no, 1: surfaces, 2: surfaces+volumes |
-| `Mesh.LightTwoSide` | 1.0 |  |  | Light both sides of surfaces (leads to slower rendering) |
+| `Mesh.LightLines` | 2.0 |  | (0, 'No'), (1, 'Surface'), (2, 'Volume and surface') | Enable lighting for mesh edges (0: no, 1: surfaces, 2: surfaces+volumes |
+| `Mesh.LightTwoSide` | on |  |  | Light both sides of surfaces (leads to slower rendering) |
 | `Mesh.LineLabels` | off |  |  | Display mesh line labels? |
-| `Mesh.LineWidth` | on |  |  | Display width of mesh lines (in pixels) |
+| `Mesh.LineWidth` | 1.0 |  |  | Display width of mesh lines (in pixels) |
 | `Mesh.Lines` | off |  |  | Display mesh lines (1D elements)? |
 | `Mesh.NbHexahedra` | 0.0 |  |  | Number of hexahedra in the current mesh (read-only) (read only) |
 | `Mesh.NbNodes` | 0.0 |  |  | Number of nodes in the current mesh (read-only) (read only) |
@@ -446,9 +446,9 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 | `Mesh.NbTrihedra` | 0.0 |  |  | Number of trihedra in the current mesh (read-only) (read only) |
 | `Mesh.NodeLabels` | off |  |  | Display mesh node labels? |
 | `Mesh.NodeSize` | 4.0 |  |  | Display size of mesh nodes (in pixels) |
-| `Mesh.NodeType` | off |  |  | Display mesh nodes as solid color dots (0) or 3D spheres (1) |
+| `Mesh.NodeType` | 0.0 |  | (0, 'color dot'), (1, '3D sphere') | Display mesh nodes as solid color dots (0) or 3D spheres (1) |
 | `Mesh.Nodes` | off |  |  | Display mesh nodes? |
-| `Mesh.Normals` | off |  |  | Display size of normal vectors (in pixels) |
+| `Mesh.Normals` | 0.0 |  |  | Display size of normal vectors (in pixels) |
 | `Mesh.NumSubEdges` | 2.0 |  |  | Number of edge subdivisions used to draw high-order mesh elements |
 | `Mesh.Prisms` | on |  |  | Display mesh prisms? |
 | `Mesh.Pyramids` | on |  |  | Display mesh pyramids? |
@@ -457,7 +457,7 @@ The Display items of the Generate row (Visibility, Statistics and the viewport o
 | `Mesh.SurfaceEdges` | on |  |  | Display edges of surface mesh? |
 | `Mesh.SurfaceFaces` | off |  |  | Display faces of surface mesh? |
 | `Mesh.SurfaceLabels` | off |  |  | Display surface mesh element labels? |
-| `Mesh.Tangents` | off |  |  | Display size of tangent vectors (in pixels) |
+| `Mesh.Tangents` | 0.0 |  |  | Display size of tangent vectors (in pixels) |
 | `Mesh.Tetrahedra` | on |  |  | Display mesh tetrahedra? |
 | `Mesh.Triangles` | on |  |  | Display mesh triangles? |
 | `Mesh.Trihedra` | on |  |  | Display mesh trihedra? |
@@ -478,7 +478,7 @@ The General tab of the Options panel on the Generate row.
 | `General.ArrowStemLength` | 0.56 |  |  | Relative length of arrow stem |
 | `General.ArrowStemRadius` | 0.02 |  |  | Relative radius of arrow stem |
 | `General.Axes` | 0.0 |  | (0, 'none'), (1, 'simple axes'), (2, 'box'), (3, 'full grid'), (4, 'open grid'), (5, 'ruler') | Axes (0: none, 1: simple axes, 2: box, 3: full grid, 4: open grid, 5: ruler) |
-| `General.AxesAutoPosition` | 1.0 |  |  | Position the axes automatically |
+| `General.AxesAutoPosition` | on |  |  | Position the axes automatically |
 | `General.AxesForceValue` | off |  |  | Force values on axes (otherwise use natural coordinates) |
 | `General.AxesFormatX` | %.3g |  |  | Number format for X-axis (in standard C form) |
 | `General.AxesFormatY` | %.3g |  |  | Number format for Y-axis (in standard C form) |
@@ -489,7 +489,7 @@ The General tab of the Options panel on the Generate row.
 | `General.AxesMaxX` | 1.0 |  |  | Maximum X-axis coordinate |
 | `General.AxesMaxY` | 1.0 |  |  | Maximum Y-axis coordinate |
 | `General.AxesMaxZ` | 1.0 |  |  | Maximum Z-axis coordinate |
-| `General.AxesMikado` | 0.0 |  |  | Mikado axes style |
+| `General.AxesMikado` | off |  |  | Mikado axes style |
 | `General.AxesMinX` | 0.0 |  |  | Minimum X-axis coordinate |
 | `General.AxesMinY` | 0.0 |  |  | Minimum Y-axis coordinate |
 | `General.AxesMinZ` | 0.0 |  |  | Minimum Z-axis coordinate |
@@ -505,11 +505,11 @@ The General tab of the Options panel on the Generate row.
 | `General.BackgroundGradient` | 1.0 |  | (0, 'none'), (1, 'vertical'), (2, 'horizontal'), (3, 'radial') | Draw background gradient (0: none, 1: vertical, 2: horizontal, 3: radial) |
 | `General.BackgroundImage3D` | 0.0 |  |  | Create background image in the 3D model (units = model units) or as 2D background (units = pixels) |
 | `General.BackgroundImageFileName` |  |  |  | Background image file in JPEG, PNG or PDF format |
-| `General.BackgroundImageHeight` | -1.0 |  |  | Height of background image (0: actual height if width = 0, natural scaling if not; -1: graphic window height) |
+| `General.BackgroundImageHeight` | -1.0 |  | (0, 'actual height if width = 0, natural scaling if not'), (-1, 'graphic window height') | Height of background image (0: actual height if width = 0, natural scaling if not; -1: graphic window height) |
 | `General.BackgroundImagePage` | 0.0 |  |  | Page to render in the background image (for multi-page PDFs) |
 | `General.BackgroundImagePositionX` | 0.0 |  |  | X position of background image (for 2D background: < 0: measure from right window edge; >= 1e5: centered) |
 | `General.BackgroundImagePositionY` | 0.0 |  |  | Y position of background image (for 2D background: < 0: measure from bottom window edge; >= 1e5: centered) |
-| `General.BackgroundImageWidth` | -1.0 |  |  | Width of background image (0: actual width if height = 0, natural scaling if not; -1: graphic window width) |
+| `General.BackgroundImageWidth` | -1.0 |  | (0, 'actual width if height = 0, natural scaling if not'), (-1, 'graphic window width') | Width of background image (0: actual width if height = 0, natural scaling if not; -1: graphic window width) |
 | `General.BoundingBoxSize` | 1.0 |  |  | Overall bounding box size (read-only) (read only) |
 | `General.BuildInfo` | Version: 4.15.2; License: GNU General Public License; Build OS: Linux64-sdk; Build date: 20260324; Build host: gmsh.info; Build options: 64Bit ALGLIB[contrib] ANN[contrib] Bamg Blas[petsc] Blossom Cgns DIntegration Dlopen DomHex Eigen[contrib] Fltk Gmm[contrib] Hxt Jpeg Kbipack Lapack[petsc] LinuxJoystick MathEx[contrib] Med Mesh Metis[contrib] Mmg Mpeg Netgen Nii2mesh ONELAB ONELABMetamodel OpenCASCADE OpenCASCADE-CAF OpenGL OpenMP OptHom PETSc Parser Plugins Png Post QuadMeshingTools QuadTri Solver TetGen/BR TinyXML2[contrib] Untangle Voro++[contrib] WinslowUntangler Zlib tinyobjloader; FLTK version: 1.3.11; PETSc version: 3.14.4 (real arithmtic); OCC version: 7.8.1; MED version: 4.1.0; Packaged by: geuzaine; Web site: https://gmsh.info; Issue tracker: https://gitlab.onelab.info/gmsh/gmsh/issues |  |  | Gmsh build information (read-only) (read only) |
 | `General.BuildOptions` | 64Bit ALGLIB[contrib] ANN[contrib] Bamg Blas[petsc] Blossom Cgns DIntegration Dlopen DomHex Eigen[contrib] Fltk Gmm[contrib] Hxt Jpeg Kbipack Lapack[petsc] LinuxJoystick MathEx[contrib] Med Mesh Metis[contrib] Mmg Mpeg Netgen Nii2mesh ONELAB ONELABMetamodel OpenCASCADE OpenCASCADE-CAF OpenGL OpenMP OptHom PETSc Parser Plugins Png Post QuadMeshingTools QuadTri Solver TetGen/BR TinyXML2[contrib] Untangle Voro++[contrib] WinslowUntangler Zlib tinyobjloader |  |  | Gmsh build options (read-only) (read only) |
@@ -630,7 +630,7 @@ The General tab of the Options panel on the Generate row.
 | `General.Light5X` | 0.5 |  |  | X position of light source 5 |
 | `General.Light5Y` | 0.3 |  |  | Y position of light source 5 |
 | `General.Light5Z` | 1.0 |  |  | Z position of light source 5 |
-| `General.LineWidth` | on |  |  | Display width of lines (in pixels) |
+| `General.LineWidth` | 1.0 |  |  | Display width of lines (in pixels) |
 | `General.LogFileName` |  |  |  | Name of log file into which all messages are saved |
 | `General.ManipulatorPositionX` | 650.0 |  |  | Horizontal position (in pixels) of the upper left corner of the manipulator window |
 | `General.ManipulatorPositionY` | 150.0 |  |  | Vertical position (in pixels) of the upper left corner of the manipulator window |
@@ -647,7 +647,7 @@ The General tab of the Options panel on the Generate row.
 | `General.MinY` | 0.0 |  |  | Minimum model coordinate along the Y-axis (read-only) (read only) |
 | `General.MinZ` | 0.0 |  |  | Minimum model coordinate along the Z-axis (read-only) (read only) |
 | `General.MouseHoverMeshes` | off |  |  | Enable mouse hover on meshes |
-| `General.MouseInvertZoom` | 0.0 |  |  | Invert mouse wheel zoom direction |
+| `General.MouseInvertZoom` | off |  |  | Invert mouse wheel zoom direction |
 | `General.MouseSelection` | on |  |  | Enable mouse selection |
 | `General.NativeFileChooser` | off |  |  | Use the native file chooser? |
 | `General.NoPopup` | off |  |  | Disable interactive dialog windows in scripts (and use default values instead) |
@@ -663,7 +663,7 @@ The General tab of the Options panel on the Generate row.
 | `General.PluginPositionY` | 550.0 |  |  | Vertical position (in pixels) of the upper left corner of the plugin window |
 | `General.PluginWidth` | 420.0 |  |  | Width (in pixels) of the plugin window |
 | `General.PointSize` | 3.0 |  |  | Display size of points (in pixels) |
-| `General.PolygonOffsetAlwaysOn` | 0.0 |  |  | Always apply polygon offset, instead of trying to detect when it is required |
+| `General.PolygonOffsetAlwaysOn` | off |  |  | Always apply polygon offset, instead of trying to detect when it is required |
 | `General.PolygonOffsetFactor` | 1.0 |  |  | Polygon offset factor (offset = factor * DZ + r * units) |
 | `General.PolygonOffsetUnits` | 1.0 |  |  | Polygon offset units (offset = factor * DZ + r * units) |
 | `General.ProgressMeterStep` | 10.0 |  |  | Increment (in percent) of the progress meter bar |
@@ -678,7 +678,7 @@ The General tab of the Options panel on the Generate row.
 | `General.RecentFile7` | untitled.geo |  |  | 8th most recent opened file |
 | `General.RecentFile8` | untitled.geo |  |  | 9th most recent opened file |
 | `General.RecentFile9` | untitled.geo |  |  | 10th most recent opened file |
-| `General.RotationCenterGravity` | 1.0 |  |  | Rotate around the (pseudo) center of mass instead of (RotationCenterX, RotationCenterY, RotationCenterZ) |
+| `General.RotationCenterGravity` | on |  |  | Rotate around the (pseudo) center of mass instead of (RotationCenterX, RotationCenterY, RotationCenterZ) |
 | `General.RotationCenterX` | 0.0 |  |  | X coordinate of the center of rotation |
 | `General.RotationCenterY` | 0.0 |  |  | Y coordinate of the center of rotation |
 | `General.RotationCenterZ` | 0.0 |  |  | Z coordinate of the center of rotation |
@@ -725,7 +725,7 @@ The General tab of the Options panel on the Generate row.
 | `General.VisibilityPositionY` | 150.0 |  |  | Vertical position (in pixels) of the upper left corner of the visibility window |
 | `General.WatchFilePattern` |  |  |  | Pattern of files to merge as they become available |
 | `General.ZoomFactor` | 4.0 |  |  | Middle mouse button zoom acceleration factor |
-| `PostProcessing.AnimationCycle` | 0.0 |  |  | Cycle through time steps (0) or views (1) for animations |
+| `PostProcessing.AnimationCycle` | off |  |  | Cycle through time steps (0) or views (1) for animations |
 | `PostProcessing.AnimationDelay` | 0.1 |  |  | Delay (in seconds) between frames in automatic animation mode |
 | `PostProcessing.AnimationStep` | 1.0 |  |  | Step increment for animations |
 | `PostProcessing.Binary` | off |  |  | Write post-processing files in binary format (if possible) |
@@ -753,10 +753,10 @@ The General tab of the Options panel on the Generate row.
 | `Solver.AutoCheck` | on |  |  | Automatically check model every time a parameter is changed |
 | `Solver.AutoLoadDatabase` | off |  |  | Automatically load the ONELAB database when launching a solver |
 | `Solver.AutoMergeFile` | on |  |  | Automatically merge result files |
-| `Solver.AutoMesh` | 2.0 |  |  | Automatically mesh (0: never; 1: if geometry changed, but use existing mesh on disk if available; 2: if geometry changed; -1: the geometry script creates the mesh) |
+| `Solver.AutoMesh` | 2.0 |  | (0, 'never'), (1, 'if geometry changed, but use existing mesh on disk if available'), (2, 'if geometry changed'), (-1, 'the geometry script creates the mesh') | Automatically mesh (0: never; 1: if geometry changed, but use existing mesh on disk if available; 2: if geometry changed; -1: the geometry script creates the mesh) |
 | `Solver.AutoSaveDatabase` | on |  |  | Automatically save the ONELAB database after each computation |
 | `Solver.AutoShowLastStep` | on |  |  | Automatically show the last step in newly merged results, if there are more than 2 steps |
-| `Solver.AutoShowViews` | 2.0 |  |  | Automcatically show newly merged results (0: none; 1: all; 2: last one) |
+| `Solver.AutoShowViews` | 2.0 |  | (0, 'none'), (1, 'all'), (2, 'last one') | Automcatically show newly merged results (0: none; 1: all; 2: last one) |
 | `Solver.Executable0` |  |  |  | System command to launch solver 0 |
 | `Solver.Executable1` |  |  |  | System command to launch solver 1 |
 | `Solver.Executable2` |  |  |  | System command to launch solver 2 |

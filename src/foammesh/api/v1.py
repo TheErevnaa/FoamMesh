@@ -13,6 +13,7 @@ operation registry only (§4.3, §4.4, §11).
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +21,8 @@ from uuid import uuid4
 from foammesh.core.facade import (
     Actor, ActorKind, Command, CommandSource, FacadeError, FoamMeshFacade,
     SecurityPolicyError, ValidationFailedError)
+
+logger = logging.getLogger(__name__)
 
 _CONFLICT_CODES = {
     'revision_conflict', 'case_locked', 'interaction_busy',
@@ -105,6 +108,21 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
         status = 409 if error.code in _CONFLICT_CODES else (
             403 if error.code in _AUTH_CODES else 400)
         return JSONResponse(status_code=status, content={'error': error.to_dict()})
+
+    # DP-6080. An operation handed a parameter it cannot read (a missing key, a
+    # value of the wrong type) answered a bare 500 with no code. It is the
+    # caller's input, so it is a coded 400 that names what was wrong; the
+    # traceback stays in the log for the cases that are a defect after all.
+    def _bad_parameters(_request, error: Exception):
+        logger.warning('operation refused its parameters', exc_info=error)
+        what = (f'missing parameter {error.args[0]!r}' if isinstance(error, KeyError) and error.args
+                else (str(error) or type(error).__name__))
+        return JSONResponse(status_code=400, content={'error': {
+            'code': 'validation_failed', 'message': what,
+            'details': {'exception': type(error).__name__}}})
+
+    for _kind in (KeyError, TypeError, ValueError):
+        app.add_exception_handler(_kind, _bad_parameters)
 
     # ---- events WebSocket (registered first so nothing shadows it) -------- #
 

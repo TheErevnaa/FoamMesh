@@ -351,29 +351,25 @@ QUALITY_BYTES_PER_MESH_CELL = 32
 def _quality(geometry, kept):
     """The quality arrays for ``kept`` (every cell when None), or why not.
 
-    The job was admitted with ``mesh.section.quality`` over
-    ``mesh.section``; a kept set whose quality costs more than that margin
-    leaves the quality colour unavailable, naming the RAM, rather than
-    outgrowing the worker's memory cap."""
+    DP-5715: the worker runs under the free RAM, so a kept set whose
+    quality needs more than the RAM free now (this worker already holding
+    what it holds) leaves the quality colour unavailable, naming both,
+    rather than outgrowing the machine. No margin short of the free RAM."""
     from foammesh.core.quality import cell_fields
     from foammesh.support import resource_budget
 
     mesh = _QualityMesh(geometry)
     if kept is None:
         return cell_fields.compute_cell_fields(mesh)
-    factors = resource_budget.PEAK_FACTORS
-    quality, plain = (factors['mesh.section.quality'],
-                      factors['mesh.section'])
-    margin = ((quality['cells'] - plain['cells']) * mesh.cell_count
-              + quality.get('fixed', 0) - plain.get('fixed', 0))
     grown = cell_fields.subset_cells(mesh, kept).size if kept.size else 0
     needed = (QUALITY_BYTES_PER_CELL * grown
               + QUALITY_BYTES_PER_MESH_CELL * mesh.cell_count)
-    if needed > margin:
+    room = _output_room()
+    if needed > room:
         return ('colouring the {0:,} drawn cells by quality needs about {1} '
-                'of RAM, more than the {2} this section was given for it'
+                'and this PC has {2} of RAM free'
                 ).format(int(kept.size), resource_budget.format_bytes(needed),
-                         resource_budget.format_bytes(int(margin)))
+                         resource_budget.format_bytes(int(room)))
     return cell_fields.compute_cell_fields_for(mesh, kept)
 
 
@@ -785,8 +781,8 @@ def run_batch(args: dict) -> dict:
         except MemoryError:
             entry.update(ok=False, status='out_of_memory',
                          reason='out_of_memory',
-                         message='the worker ran out of the memory it was '
-                                 'granted for this stage', details={})
+                         message='this stage needed more RAM than this '
+                                 'PC has free', details={})
         except Exception as error:                   # noqa: BLE001
             entry.update(ok=False, status='failed', reason='worker_error',
                          message=f'{type(error).__name__}: {error}',
@@ -857,8 +853,9 @@ def _over(quantity: str, limit: int, measured: int, *,
         needed = WINDOW_LOAD_FACTOR * int(measured)
         return SectionRefused(
             'over_budget',
-            f'drawing the section needs about {format_bytes(needed)} of RAM '
-            f'and {format_bytes(room)} is free. The previous section is '
+            f'drawing the section needs about {format_bytes(needed)} and '
+            f'this PC has {format_bytes(room)} of RAM free. The previous '
+            f'section is '
             f'kept: narrow the planes, choose a simpler mode, or free some '
             f'memory and retry.',
             quantity='memory_bytes', limit=int(room), measured=needed,

@@ -43,6 +43,10 @@ class RegionZoneError(RuntimeError):
 #: What the file is called, and what v13 reads it as (``poly_mesh_writer``).
 CELL_ZONES = 'cellZones'
 
+#: DP-5751. Where the mesher's own ``cellZones`` waits while the export's
+#: completed list is split by; ``restore_cell_zones`` puts it back.
+ORIGINAL_CELL_ZONES = CELL_ZONES + '.foammesh-original'
+
 
 def _connected_pieces(cell_count: int, owner, neighbour) -> np.ndarray:
     """A piece id per cell: cells joined through internal faces share one.
@@ -98,6 +102,43 @@ def _cell_centres(mesh) -> np.ndarray:
 def _where(mesh, cell: int) -> str:
     centre = _cell_centres(mesh)[int(cell)]
     return '(' + ' '.join(f'{value:.6g}' for value in centre) + ')'
+
+
+def _point_text(point) -> str:
+    return '(' + ' '.join(f'{float(value):.6g}' for value in point) + ')'
+
+
+def _point_outside_its_zone(name, point, *, cell_distance, zone_cells,
+                            zone_distance) -> str:
+    """Why a region's point missed the cell zone carved for it, and the fix.
+
+    DP-6065. MEASURED on run sr9h, snappy CHT tube: every surface was meshed
+    at level (0 0), the 10 mm steel wall came out a ragged zone of 1,406
+    cells about one cell thick, and the wall's region point fell in an
+    unzoned cell beside it. The refusal said only that the region "lies
+    outside every cell zone, but a cell zone ... is already called" by its
+    name, which told the person nothing they could act on. It now says what
+    was measured -- where the point is, how far the nearest cell and the
+    nearest cell of the zone are from it, how many cells the zone has -- and
+    what to change.
+    """
+    if zone_cells:
+        measured = (
+            f'cell zone {name} holds {zone_cells} cells, and the nearest of '
+            f'them is {zone_distance:.3g} m from the point, while the cell '
+            f'nearest the point ({cell_distance:.3g} m away) belongs to no '
+            f'zone')
+    else:
+        measured = f'cell zone {name} holds no cells'
+    return (
+        f'The region point of {name} at {_point_text(point)} is not inside '
+        f'cell zone {name}, the zone the mesher made for that body: '
+        f'{measured}. This usually means the body is only a cell or two '
+        f'thick at this mesh size, so its zone is too coarse or too ragged '
+        f'to hold the point. Nothing was exported. Refine the surfaces that '
+        f'bound {name} (raise their surface refinement level, or choose a '
+        f'finer Mesh size) so the body is several cells thick, or move the '
+        f'region point of {name} well inside the body, then mesh again.')
 
 
 def _check_existing(mesh) -> None:
@@ -203,6 +244,275 @@ def prepare_region_zones(poly_mesh: Path, seeds) -> Path | None:
     if mesh.cell_count == 0:
         return None
     if mesh.cell_zones:
+        completed = complete_region_zones(mesh, seeds)
+        if completed is None:
+            return None
+        # The mesher's file is kept aside and put back after the split.
+        (poly_mesh / CELL_ZONES).replace(poly_mesh / ORIGINAL_CELL_ZONES)
+        return write_cell_zones(poly_mesh, completed)
+    return write_cell_zones(poly_mesh, region_zones(mesh, seeds))
+
+
+def restore_cell_zones(path: Path) -> None:
+    """Remove a ``cellZones`` written for the split; put the mesher's back."""
+    path = Path(path)
+    path.unlink(missing_ok=True)
+    original = path.with_name(ORIGINAL_CELL_ZONES)
+    if original.is_file():
+        original.replace(path)
+
+
+def _zone_of_cell(mesh) -> np.ndarray:
+    """The index of the zone each cell is in, ``-1`` for none."""
+    owner = np.full(mesh.cell_count, -1, dtype=np.int64)
+    for index, zone in enumerate(mesh.cell_zones):
+        labels = np.asarray(zone.labels, dtype=np.int64)
+        labels = labels[(labels >= 0) & (labels < mesh.cell_count)]
+        owner[labels] = index
+    return owner
+
+
+def complete_region_zones(mesh, seeds) -> dict[str, np.ndarray] | None:
+    """The mesher's zones completed and named by region, or ``None``.
+
+    DP-5751. MEASURED on the CHT tube (cold core, steel wall, hot annulus)
+    after Split interfaces: snappyHexMesh carves the solid as the cell zone
+    of the body the interfaces bound (``zone_02_steel_wall_r50to60mm``) --
+    the v13 ``heatedDuct`` layout, whose fluid is the unzoned rest -- so the
+    export refused it: zones that miss cells. A region whose point lies in a
+    zone takes that zone, under the region's name, and each region whose
+    point lies outside every zone takes the unzoned piece around it, pieces
+    being joined only through faces between unzoned cells. ``None`` when the
+    zones already are the regions, each named after its region and covering
+    every cell once; anything else this cannot settle is refused, saying why.
+    """
+    seeds = [(str(name), tuple(float(value) for value in point))
+             for name, point in seeds]
+    _check_overlaps(mesh)
+    zone_of = _zone_of_cell(mesh)
+    names = [zone.name for zone in mesh.cell_zones]
+    centres = _cell_centres(mesh)
+    claimed: dict[int, str] = {}
+    loose: list[tuple[str, int]] = []
+    for name, point in seeds:
+        nearest = int(np.argmin(
+            np.sum((centres - np.asarray(point)) ** 2, axis=1)))
+        zone = int(zone_of[nearest])
+        if zone < 0:
+            loose.append((name, nearest))
+        elif zone in claimed:
+            raise RegionZoneError(
+                f'the region points of {claimed[zone]} and {name} both lie in '
+                f'cell zone {names[zone]}, so the export cannot tell which '
+                f'cells belong to which region; nothing was exported')
+        else:
+            claimed[zone] = name
+    if not loose and all(names[zone] == name
+                         for zone, name in claimed.items()):
         _check_existing(mesh)
         return None
-    return write_cell_zones(poly_mesh, region_zones(mesh, seeds))
+    zones: dict[str, np.ndarray] = {}
+    for index, zone in enumerate(mesh.cell_zones):
+        zones[claimed.get(index, zone.name)] = np.flatnonzero(zone_of == index)
+    if loose:
+        unzoned = zone_of < 0
+        internal = len(mesh.neighbour)
+        first = np.asarray(mesh.owner[:internal], dtype=np.int64)
+        second = np.asarray(mesh.neighbour, dtype=np.int64)
+        joined = unzoned[first] & unzoned[second]
+        pieces = _connected_pieces(
+            mesh.cell_count, first[joined], second[joined])
+        owners: dict[int, str] = {}
+        for name, cell in loose:
+            piece = int(pieces[cell])
+            if piece in owners:
+                raise RegionZoneError(
+                    f'the region points of {owners[piece]} and {name} lie in '
+                    f'the same connected piece of the mesh, so the export '
+                    f'cannot tell which cells belong to which region; '
+                    f'nothing was exported')
+            if name in zones:
+                point = dict(seeds)[name]
+                distances = np.sqrt(np.sum(
+                    (centres - np.asarray(point)) ** 2, axis=1))
+                own = zones[name]
+                raise RegionZoneError(_point_outside_its_zone(
+                    name, point, cell_distance=float(distances[cell]),
+                    zone_cells=int(own.size),
+                    zone_distance=(float(distances[own].min())
+                                   if own.size else 0.0)))
+            owners[piece] = name
+            zones[name] = np.flatnonzero(unzoned & (pieces == piece))
+    covered = np.zeros(mesh.cell_count, dtype=bool)
+    for labels in zones.values():
+        covered[labels] = True
+    missing = np.flatnonzero(~covered)
+    if missing.size:
+        raise RegionZoneError(
+            f'{missing.size} of the mesh\'s {mesh.cell_count} cells are in no '
+            f'cell zone and hold no region point, starting with cell '
+            f'{int(missing[0])} at {_where(mesh, missing[0])}. Splitting the '
+            f'mesh into regions by cell zone needs every cell in exactly one '
+            f'zone, so nothing was exported; give that part of the domain a '
+            f'region point and mesh again')
+    return zones
+
+
+def require_solid_zones(poly_mesh: Path, names) -> None:
+    """DP-6058. Refuse a Gmsh mesh whose cell zones are not its solids.
+
+    A Gmsh region is a typed solid and its cell zone is the mesher's,
+    published under the region's name, so there is nothing to make: the
+    zones must be exactly the regions, each cell in one. A mesh this cannot
+    read (binary) is left to ``splitMeshRegions``, whose refusal the export
+    reports with its cause.
+    """
+    try:
+        mesh = read_poly_mesh(Path(poly_mesh), layout_expectation='any')
+    except PolyMeshReadError:
+        return
+    if mesh.cell_count == 0:
+        return
+    zones = [zone.name for zone in mesh.cell_zones]
+    wanted = [str(name) for name in names]
+    missing = [name for name in wanted if name not in zones]
+    extra = [name for name in zones if name not in wanted]
+    if missing or extra:
+        said = []
+        if missing:
+            said.append('no cell zone for ' + ', '.join(missing))
+        if extra:
+            said.append('cell zones ' + ', '.join(extra)
+                        + ' that are no typed region')
+        raise RegionZoneError(
+            f'the regions are the typed solids ({", ".join(wanted)}), but the '
+            f'mesh has {" and ".join(said)}. Each solid the mesh holds must '
+            f'be typed fluid or solid, or excluded, before it is meshed; '
+            f'type them on "How many regions?" and mesh again')
+    _check_existing(mesh)
+
+
+#: DP-5751. The cell set of every cell outside the mesher's zones, which
+#: ``regionToCell`` is held inside when a decomposed mesh is completed.
+UNZONED_SET = 'foammesh_unzoned'
+
+
+def decomposed_region_plan(poly_meshes, seeds):
+    """What ``topoSet`` must do to a decomposed mesh, or ``None``.
+
+    DP-5749/DP-5751. The processor meshes are read only to answer, for each
+    region point, which zone -- or none -- the cell nearest it lies in; the
+    zones themselves are made by OpenFOAM, whose ``regionToCell`` walks
+    across processors. Returns ``(zone_names, claimed, loose)``: the mesher's
+    zones, ``{zone: region}`` for each zone holding a region point, and the
+    ``(region, point)`` of every point outside all zones. ``None`` when the
+    zones already are the regions, or the mesh cannot be read here (binary);
+    OpenFOAM's split then says whether they fall short.
+    """
+    seeds = [(str(name), tuple(float(value) for value in point))
+             for name, point in seeds]
+    best: dict[str, tuple[float, str | None]] = {
+        name: (float('inf'), None) for name, _point in seeds}
+    zone_names: list[str] = []
+    # DP-6065: per region, the cells of the zone named after it and the
+    # nearest of them, for the refusal when its point misses that zone.
+    own_cells = {name: 0 for name, _point in seeds}
+    own_nearest = {name: float('inf') for name, _point in seeds}
+    for poly_mesh in poly_meshes:
+        try:
+            mesh = read_poly_mesh(Path(poly_mesh), layout_expectation='any')
+        except PolyMeshReadError:
+            return None
+        if mesh.cell_count == 0:
+            continue
+        for zone in mesh.cell_zones:
+            if zone.name not in zone_names:
+                zone_names.append(zone.name)
+        zone_of = _zone_of_cell(mesh)
+        centres = _cell_centres(mesh)
+        for name, point in seeds:
+            distance = np.sum((centres - np.asarray(point)) ** 2, axis=1)
+            nearest = int(np.argmin(distance))
+            if distance[nearest] < best[name][0]:
+                index = int(zone_of[nearest])
+                best[name] = (float(distance[nearest]),
+                              mesh.cell_zones[index].name if index >= 0 else '')
+            for index, zone in enumerate(mesh.cell_zones):
+                if zone.name != name:
+                    continue
+                inside = np.flatnonzero(zone_of == index)
+                own_cells[name] += int(inside.size)
+                if inside.size:
+                    own_nearest[name] = min(own_nearest[name],
+                                            float(distance[inside].min()))
+    claimed: dict[str, str] = {}
+    loose: list[tuple[str, tuple]] = []
+    for name, point in seeds:
+        zone = best[name][1]
+        if zone is None:
+            return None
+        if not zone:
+            loose.append((name, point))
+        elif zone in claimed:
+            raise RegionZoneError(
+                f'the region points of {claimed[zone]} and {name} both lie in '
+                f'cell zone {zone}, so the export cannot tell which cells '
+                f'belong to which region; nothing was exported')
+        else:
+            claimed[zone] = name
+    if not loose and all(zone == name for zone, name in claimed.items()):
+        return None
+    for name, point in loose:
+        if name in zone_names:
+            raise RegionZoneError(_point_outside_its_zone(
+                name, point, cell_distance=float(np.sqrt(best[name][0])),
+                zone_cells=own_cells[name],
+                zone_distance=(float(np.sqrt(own_nearest[name]))
+                               if own_cells[name] else 0.0)))
+    return zone_names, claimed, loose
+
+
+def region_zones_dict(zone_names, claimed, loose) -> str:
+    """The ``topoSet`` dictionary that carries out ``decomposed_region_plan``."""
+    actions = []
+    if loose and zone_names:
+        for number, zone in enumerate(zone_names):
+            verb = 'new' if number == 0 else 'add'
+            actions.append(
+                f'    {{ name {UNZONED_SET}; type cellSet; action {verb}; '
+                f'source zoneToCell; zone {zone}; }}\n')
+        actions.append(
+            f'    {{ name {UNZONED_SET}; type cellSet; action invert; }}\n')
+    held = f' set {UNZONED_SET};' if zone_names else ''
+    for name, point in loose:
+        where = ' '.join(f'{float(value):g}' for value in point)
+        actions.append(
+            f'    {{ name {name}; type cellSet; action new; '
+            f'source regionToCell;{held} insidePoints (({where})); '
+            f'nErode 0; }}\n'
+            f'    {{ name {name}; type cellZoneSet; action new; '
+            f'source setToCellZone; set {name}; }}\n')
+    for zone, name in claimed.items():
+        if zone == name:
+            continue
+        actions.append(
+            f'    {{ name {name}; type cellSet; action new; '
+            f'source zoneToCell; zone {zone}; }}\n'
+            f'    {{ name {zone}; type cellZoneSet; action remove; }}\n'
+            f'    {{ name {name}; type cellZoneSet; action new; '
+            f'source setToCellZone; set {name}; }}\n')
+    return ('FoamFile\n{\n    format      ascii;\n    class       '
+            'dictionary;\n    object      topoSetDict;\n}\n'
+            '// Generated by FoamMesh from the region points for '
+            'splitMeshRegions\n\nactions\n(\n' + ''.join(actions) + ');\n')
+
+
+def _check_overlaps(mesh) -> None:
+    """Refuse cells the mesher put in two zones, as ``_check_existing`` does."""
+    hits = np.zeros(mesh.cell_count, dtype=np.int64)
+    for zone in mesh.cell_zones:
+        labels = np.asarray(zone.labels, dtype=np.int64)
+        labels = labels[(labels >= 0) & (labels < mesh.cell_count)]
+        np.add.at(hits, labels, 1)
+    if (hits > 1).any():
+        _check_existing(mesh)

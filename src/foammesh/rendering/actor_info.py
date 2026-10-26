@@ -200,6 +200,162 @@ def highlightEdgeOpacity(style: MeshLineStyle = None) -> float:
     style = style or _meshLineStyle
     return min(1.0, max(HIGHLIGHT_EDGE_OPACITY, style.opacity * 1.5))
 
+
+# -- Plan 48 OP: the route-wide Surface opacity ------------------------------ #
+#
+# One value per route, shown by the viewport rail's Surface opacity tool. The
+# Gmsh route draws its model surfaces about 30 % opaque so the points, curves
+# and nodes in and behind them stay readable; the snappy route draws them
+# opaque. It COMBINES with the per-part fades by multiplying: a part keeps its
+# own opacity (the Display control's, the enclosure fade, the see-through fade
+# of the poor cells, the seed-placing fade) in ``Properties.opacity``, and what
+# the prop is drawn with is that times the route value. A fade that ends puts
+# the part's own opacity back, so it returns to the route's value, never to 1.
+SURFACE_OPACITY_DEFAULTS = {'gmsh': 0.3, 'snappy': 1.0}
+_surfaceOpacity = dict(SURFACE_OPACITY_DEFAULTS)
+#: The route the open case is on, or ``None`` before a window has said (a bare
+#: actor in a test, a headless run): then nothing is multiplied.
+_surfaceRoute = None
+
+
+class _SurfaceOpacityNotifier(QObject):
+    changed = Signal()
+
+
+_surfaceNotifier = None
+
+
+def surfaceOpacityNotifier() -> _SurfaceOpacityNotifier:
+    """Says when the route or its Surface opacity changed, whoever changed it."""
+    global _surfaceNotifier
+    if _surfaceNotifier is None:
+        _surfaceNotifier = _SurfaceOpacityNotifier()
+    return _surfaceNotifier
+
+
+#: A surface drawn with no opacity at all is not shown and cannot be picked,
+#: and the surfaces are always shown: the floor of the Surface opacity.
+SURFACE_OPACITY_MIN = 0.02
+
+
+def _clampOpacity(value) -> float:
+    return min(1.0, max(SURFACE_OPACITY_MIN, float(value)))
+
+
+def surfaceRoute():
+    return _surfaceRoute
+
+
+def routeSurfaceOpacity(route=None) -> float:
+    """The Surface opacity of *route* (the current one by default)."""
+    route = _surfaceRoute if route is None else route
+    return _surfaceOpacity.get(route, 1.0)
+
+
+def activeSurfaceOpacity(route=None):
+    """The Surface opacity in force for *route*, or ``None`` when the open
+    case is not on that route (or on none): the legacy drawing."""
+    if _surfaceRoute is None or (route is not None and route != _surfaceRoute):
+        return None
+    return _surfaceOpacity[_surfaceRoute]
+
+
+def setSurfaceRoute(route) -> None:
+    """The window's engine changed: the route's own value now applies."""
+    global _surfaceRoute
+    if route is not None and route not in SURFACE_OPACITY_DEFAULTS:
+        raise ValueError(f'unknown route {route!r}')
+    if route == _surfaceRoute:
+        return
+    _surfaceRoute = route
+    _surfaceOpacityChanged()
+
+
+def setRouteSurfaceOpacity(value, route=None) -> float:
+    """Set the Surface opacity of *route* (the current route by default)."""
+    route = _surfaceRoute if route is None else route
+    if route not in SURFACE_OPACITY_DEFAULTS:
+        raise ValueError(f'unknown route {route!r}')
+    _surfaceOpacity[route] = _clampOpacity(value)
+    _surfaceOpacityChanged()
+    return _surfaceOpacity[route]
+
+
+def resetSurfaceOpacity() -> None:
+    """Back to the defaults and no route (tests, a closed case)."""
+    global _surfaceRoute
+    _surfaceOpacity.update(SURFACE_OPACITY_DEFAULTS)
+    _surfaceRoute = None
+    _translucentSources.clear()
+    _translucentNames.clear()
+    _surfaceOpacityChanged()
+
+
+def _surfaceOpacityChanged() -> None:
+    for actor in list(_liveActors):
+        try:
+            actor.applyRouteOpacity()
+        except RuntimeError:
+            pass                                   # a destroyed C++ object
+    surfaceOpacityNotifier().changed.emit()
+    refreshTranslucency()
+
+
+#: Things that draw translucent surfaces outside any ActorInfo (the Gmsh
+#: entity view). Depth peeling is decided by the Display control from its
+#: parts; it asks here as well, so a translucent Gmsh model is peeled and a
+#: later content change does not switch peeling off under it.
+_translucentSources = weakref.WeakSet()
+_translucentNames = set()
+_translucencyHooks = []
+
+
+def setSourceTranslucent(source, on: bool) -> None:
+    """*source* draws a translucent surface, or stopped. An object is held
+    weakly (a view that is dropped stops counting); a name is held as is."""
+    try:
+        group, add = _translucentSources, _translucentSources.add
+        group.discard(source)
+    except TypeError:
+        group, add = _translucentNames, _translucentNames.add
+        group.discard(source)
+    if on:
+        add(source)
+
+
+def externalTranslucent() -> bool:
+    return bool(len(_translucentSources) or _translucentNames)
+
+
+def addTranslucencyHook(method) -> None:
+    """Call *method* (held weakly) whenever the question of peeling is
+    open again."""
+    _translucencyHooks.append(weakref.WeakMethod(method))
+
+
+def refreshTranslucency(fallback=None) -> bool:
+    """Ask every hook to decide peeling again. True when one answered; with
+    none, *fallback* (a viewport) is told directly."""
+    answered = False
+    for ref in list(_translucencyHooks):
+        hook = ref()
+        if hook is None:
+            _translucencyHooks.remove(ref)
+            continue
+        try:
+            hook()
+            answered = True
+        except RuntimeError:
+            pass                                   # a destroyed C++ object
+        except Exception:                          # noqa: BLE001
+            logging.getLogger(__name__).debug('translucency hook failed', exc_info=True)
+    if not answered and fallback is not None:
+        setter = getattr(fallback, 'setOrderIndependentTransparency', None)
+        if setter is not None:
+            setter(externalTranslucent())
+    return answered
+
+
 #: Feature/boundary edges drawn as a separate prop. This is the outline that
 #: interior edges used to be relied on for, at a width that survives a mesh
 #: dense enough to hide every individual cell.
@@ -590,12 +746,37 @@ class ActorInfo(QObject):
         self._silhouette.SetVisibility(visibility)
         self.appearanceChanged.emit()
 
+    #: Plan 48 OP. Whether the route-wide Surface opacity multiplies this
+    #: actor's own opacity (the model's surfaces do; markers and the mesh do not).
+    ROUTE_OPACITY = False
+
+    def effectiveOpacity(self) -> float:
+        """What the prop is drawn with: its own opacity times the route's."""
+        own = self._properties.opacity if self._properties is not None else None
+        own = 1.0 if own is None else float(own)
+        if self.ROUTE_OPACITY:
+            active = activeSurfaceOpacity()
+            if active is not None:
+                return own * active
+        return own
+
     def setOpacity(self, opacity):
         self._properties.opacity = opacity
-        self._actor.GetProperty().SetOpacity(opacity)
+        shown = self.effectiveOpacity()
+        self._actor.GetProperty().SetOpacity(shown)
         # An outline at full strength around a surface faded to 20% reads as a
         # wireframe cage, so the outline fades with what it outlines.
-        self._silhouette.GetProperty().SetOpacity(opacity)
+        self._silhouette.GetProperty().SetOpacity(shown)
+        self.appearanceChanged.emit()
+
+    def applyRouteOpacity(self):
+        """The route's Surface opacity changed: draw with it again."""
+        if not self.ROUTE_OPACITY or self._properties is None:
+            return
+        shown = self.effectiveOpacity()
+        if not getattr(self, '_skinned', False):
+            self._actor.GetProperty().SetOpacity(shown)
+        self._silhouette.GetProperty().SetOpacity(shown)
         self.appearanceChanged.emit()
 
     def _applyDepthBias(self, units: float):
@@ -1463,7 +1644,7 @@ class MeshActor(ActorInfo):
         surface = self._precomputedSurface
         props = self._properties
         if (surface is None or props is None or not props.visibility
-                or props.opacity < 1.0 or props.highlighted
+                or self.effectiveOpacity() < 1.0 or props.highlighted
                 or props.displayMode is DisplayMode.WIREFRAME
                 or not self._precomputedActive() or self.isCutting()
                 or self._paintColouring is not None
@@ -2164,7 +2345,8 @@ class BoundaryActor(ActorInfo):
         """
         props = self._properties
         return bool(
-            props is not None and props.visibility and props.opacity >= 1.0
+            props is not None and props.visibility
+            and self.effectiveOpacity() >= 1.0
             and not props.highlighted
             and props.displayMode is not DisplayMode.WIREFRAME
             and self._faceScalarName is None
@@ -2186,7 +2368,7 @@ class BoundaryActor(ActorInfo):
         self._actor.SetPickable(not skinned)
         if not skinned:
             prop.SetLighting(True)
-            prop.SetOpacity(self._properties.opacity)
+            prop.SetOpacity(self.effectiveOpacity())
             self._actor.SetVisibility(self._properties.visibility)
             colour = self._currentSurfaceColor()
             prop.SetColor(colour.redF(), colour.greenF(), colour.blueF())
@@ -2353,6 +2535,9 @@ class ExcludeMarkerActor(RegionMarkerActor):
 
 
 class GeometryActor(ActorInfo):
+    #: Plan 48 OP. The model's own surfaces take the route's Surface opacity.
+    ROUTE_OPACITY = True
+
     def __init__(self, dataSet, id_, name):
         super().__init__(dataSet, id_, name, ActorType.GEOMETRY)
 

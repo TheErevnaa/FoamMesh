@@ -138,6 +138,20 @@ class GmshImportPanel(QWidget):
         self._geometry.setChecked(True)
         cform.addRow(self.tr('Angle'), unit_cell(self._angle, 'deg'))
         cform.addRow(self.tr('Curve angle'), unit_cell(self._curve, 'deg'))
+        # Plan 48 TL: Gmsh 4.15.2 can leave createTopology (and a subset
+        # Reclassify) hanging; both stop at this limit and the session stays.
+        self._timeLimit = CompactDoubleSpinBox(self)
+        self._timeLimit.setObjectName('gmshImportTimeLimit')
+        self._timeLimit.setAccessibleName(self.tr('Time limit'))
+        self._timeLimit.setDecimals(0)
+        self._timeLimit.setRange(0.0, 86400.0)
+        self._timeLimit.setValue(300.0)
+        self._timeLimit.setToolTip(self.tr(
+            'Reclassify and Create topology stop after this many seconds if '
+            'Gmsh 4.15.2 does not return (it can hang in createTopology); '
+            'the session is restarted with the model as it was. 0 waits '
+            'without a limit.'))
+        cform.addRow(self.tr('Time limit'), unit_cell(self._timeLimit, 's'))
         for widget in (self._boundary, self._reparam, self._export,
                        self._geometry):
             cform.addRow(widget)
@@ -183,6 +197,33 @@ class GmshImportPanel(QWidget):
 
     def busy(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
+
+    def timeLimit(self) -> float:
+        return float(self._timeLimit.value())
+
+    def showTimeLimit(self, limits: dict) -> None:
+        """Show the project's limit for Reclassify / Create topology."""
+        value = limits.get('topology', limits.get('reclassify'))
+        if value is not None:
+            self._timeLimit.setValue(float(value))
+
+    def _applyTimeLimit(self, controller) -> None:
+        """Hand the typed limit to the project (Plan 48 TL)."""
+        setter = getattr(controller, 'set_time_limit', None)
+        if setter is None:
+            return
+        for kind in ('reclassify', 'topology'):
+            setter(kind, self.timeLimit())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        try:
+            controller = self._controller or self._provider()
+            limits = getattr(controller, 'time_limits', None)
+            if limits is not None and not self.busy():
+                self.showTimeLimit(limits())
+        except Exception:                               # noqa: BLE001
+            pass
 
     def status(self) -> str:
         return self._status.text()
@@ -279,6 +320,12 @@ class GmshImportPanel(QWidget):
             self._say(str(error))
             return
         self._say(self.tr('Working…'))
+        if what in ('reclassify', 'topology'):
+            try:
+                self._applyTimeLimit(controller)
+            except Exception as error:                  # noqa: BLE001
+                self._say(str(error))
+                return
 
         def work():
             try:

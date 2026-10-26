@@ -23,6 +23,8 @@ A grid row whose widgets are all hidden takes neither height nor spacing, so
 """
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtWidgets import (QAbstractSpinBox, QComboBox, QFormLayout, QGridLayout, QLabel,
                                QGroupBox, QLayout, QStyle,
@@ -145,6 +147,37 @@ class SheetForm(QGridLayout):
         self._labelWidth = max(0, int(width))
         self.setColumnMinimumWidth(0, self._labelWidth)
         self.invalidate()
+
+    def fieldWidth(self) -> int:
+        """What the widest labelled row needs beside its label column.
+
+        DP-5657. The field, the unit column when there is one, and the gaps
+        between them: the label column may take only what that leaves.
+        """
+        def need(obj):
+            if isinstance(obj, QWidget):
+                if not _alive(obj) or obj.isHidden():
+                    return 0
+                return max(obj.minimumWidth(),
+                           obj.minimumSizeHint().width())
+            if isinstance(obj, QLayout):
+                return obj.minimumSize().width()
+            return 0
+        widest = 0
+        for row in self._rows:
+            if row.span is not None or row.label is None:
+                continue
+            field = need(row.field)
+            if not field:
+                continue
+            if row.unit is not None:
+                field += COLUMN_GAP + max(need(row.unit),
+                                          self.columnMinimumWidth(2))
+            widest = max(widest, field)
+        if not widest:
+            return 0
+        margins = self.contentsMargins()
+        return widest + COLUMN_GAP + margins.left() + margins.right()
 
     def labelWidgets(self) -> list:
         return [row.label for row in self._rows
@@ -643,11 +676,29 @@ def _labels_of(form) -> list:
     return labels
 
 
-def share_label_width(forms, available: int = 0) -> int:
+def _longest_word(label) -> int:
+    """The width a label cannot wrap below: its longest word, measured from
+    the text (a label not yet wrapped reports its whole line as minimum).
+    Qt's line breaker also breaks after a hyphen, so "Non-orthogonality"
+    is two pieces."""
+    if not isinstance(label, QLabel):
+        return label.minimumSizeHint().width()
+    words = [piece for word in label.text().split()
+             for piece in re.split(r'(?<=-)', word) if piece]
+    if not words:
+        return 0
+    m = label.contentsMargins()
+    return (max(label.fontMetrics().horizontalAdvance(w) for w in words)
+            + 2 * max(label.margin(), 0) + max(label.indent(), 0)
+            + m.left() + m.right() + 1)
+
+
+def share_label_width(forms, available: int = 0, room: int = 0) -> int:
     """Give several forms one label column, capped at 44 % of the page.
 
     ``available`` is the width the page offers its forms; 0 means "no cap
-    known yet". Labels wider than the column wrap inside it, so no label is
+    known yet". ``room`` is what a form may really take, when the caller
+    measured it (DP-5657); the fields beside the column must fit in it. Labels wider than the column wrap inside it, so no label is
     ever cut and no editor is pushed off the sheet.
 
     A form the page still builds with ``QFormLayout`` (a ``FieldGroupPage``
@@ -674,6 +725,16 @@ def share_label_width(forms, available: int = 0) -> int:
     width = natural
     if available > 0:
         width = min(natural, int(available * LABEL_SHARE))
+        # DP-5657. 44 % is the column's share, not a promise the fields
+        # beside it fit: a number box and its unit took 149 px of the
+        # Quality page's 223, so the 98 px column pushed the sheet 8 px
+        # wider than its viewport. The column gives way to the widest field
+        # row, and never below the longest word of a label (it wraps).
+        fields = max((form.fieldWidth() for form, _group in per_form
+                      if isinstance(form, SheetForm)), default=0)
+        if fields:
+            words = max(_longest_word(label) for label in labels)
+            width = min(width, max((room or available) - fields, words))
     in_sheet_form = set()
     for form, group in per_form:
         if isinstance(form, SheetForm):
@@ -808,14 +869,29 @@ class LabelWidthWatcher(QObject):
             # first Resize after it is shown measures again.
             from PySide6.QtWidgets import QCheckBox
             shrink_button_text(self._host.findChildren(QCheckBox))
-            available = self._offered() if self._host.isVisible() else 0
-            if available:
+            offered = self._offered() if self._host.isVisible() else 0
+            available = room = 0
+            if offered:
                 # The page margins and the card padding take their share of
                 # what is offered; the 44 % is of what is left for the form.
-                available = max(1, available - SHEET_INSET)
-            return share_label_width(self._forms(), available)
+                available = max(1, offered - SHEET_INSET)
+                room = self._room(offered)
+            return share_label_width(self._forms(), available, room)
         finally:
             self._busy = False
+
+    def _room(self, offered: int) -> int:
+        """DP-5657. What the widest form may take of ``offered``: the host's
+        own padding around its forms, measured, rather than SHEET_INSET's
+        page margins, which a body inside a scroller does not have."""
+        widest = max((form.minimumSize().width() for form in self._forms()
+                      if isinstance(form, SheetForm) and form.parentWidget()
+                      is not None and form.parentWidget().isVisible()),
+                     default=0)
+        if not widest:
+            return 0
+        around = self._host.minimumSizeHint().width() - widest
+        return max(1, offered - max(around, 0)) if around >= 0 else 0
 
     def _offered(self) -> int:
         """The host's width, or the scroller viewport's when that is less.

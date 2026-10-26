@@ -478,17 +478,22 @@ def _separate_shared_face_regions(surfaces, triangles, coordinates, sources):
     out_triangles: dict = {}
     out_sources: dict = {}
     split: list = []
-    for tag in surfaces:
-        owned = triangles.get(tag, ())
+
+    def keep(tag):
+        fresh = len(out_surfaces) + 1
+        out_surfaces.append(fresh)
+        out_triangles[fresh] = list(triangles.get(tag, ()))
+        out_sources[fresh] = sources.get(tag, '')
+
+    for group in _open_surface_groups(surfaces, triangles):
+        owned = [face for tag in group for face in triangles.get(tag, ())]
         found = shared_face_regions(owned, coordinates)
         if found is None:
-            fresh = len(out_surfaces) + 1
-            out_surfaces.append(fresh)
-            out_triangles[fresh] = list(owned)
-            out_sources[fresh] = sources.get(tag, '')
+            for tag in group:
+                keep(tag)
             continue
         regions, shared = found
-        origin = sources.get(tag, '')
+        origin = '+'.join(dict.fromkeys(sources.get(tag, '') for tag in group))
         split.append({'source': origin, 'regions': len(regions),
                       'shared_faces': shared})
         for number, region in enumerate(regions, start=1):
@@ -497,6 +502,49 @@ def _separate_shared_face_regions(surfaces, triangles, coordinates, sources):
             out_triangles[fresh] = region
             out_sources[fresh] = f'{origin} (region {number})'
     return out_surfaces, out_triangles, out_sources, split
+
+
+def _open_surface_groups(surfaces, triangles):
+    """The surfaces to read together for shared faces, in surface order.
+
+    DP-5750. Split interfaces (DP-421) moves each face two bodies share into a
+    file of its own, so no file of the split assembly closes by itself: every
+    body has lost a wall and every interface is a sheet. MEASURED: a CHT tube
+    of three closed bodies, three volumes before the split, was refused after
+    it as "not closed: 176 edges belong to more than two triangles". A surface
+    that is not closed on its own is therefore read together with every other
+    such surface it meets along an edge; a closed surface stays alone.
+    """
+    def edges(tag):
+        counts: dict = {}
+        for face in triangles.get(tag, ()):
+            for corner in range(3):
+                key = _edge_key(face[corner], face[(corner + 1) % 3])
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    counted = {tag: edges(tag) for tag in surfaces}
+    open_tags = [tag for tag in surfaces
+                 if any(uses != 2 for uses in counted[tag].values())]
+    parent = {tag: tag for tag in open_tags}
+
+    def find(tag):
+        while parent[tag] != tag:
+            parent[tag] = parent[parent[tag]]
+            tag = parent[tag]
+        return tag
+
+    first_owner: dict = {}
+    for tag in open_tags:
+        for key in counted[tag]:
+            other = first_owner.setdefault(key, tag)
+            if other != tag:
+                parent[find(tag)] = find(other)
+    groups: dict = {}
+    for tag in surfaces:
+        root = find(tag) if tag in parent else ('closed', tag)
+        groups.setdefault(root, []).append(tag)
+    return list(groups.values())
 
 
 # --------------------------------------------------------------------------- #

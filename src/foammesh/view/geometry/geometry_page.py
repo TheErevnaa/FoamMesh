@@ -778,8 +778,9 @@ class GeometryPage(StepPage):
         # show them.
         # DP-556. Add opens on two faces that touch, and OK asks before
         # saving a coincident pair whose faces do not.
-        pairsTitle = self.tr(
-            'Conformal, cyclic/periodic and non-conformal interface pairs')
+        # DP-6008. Periodic pairs only; a conformal or non-conformal
+        # interface is the surface's Role and Partner.
+        pairsTitle = self.tr('Periodic (cyclic) interface pairs')
         self._interfacePairs = InterfacePairPanel(
             app.facadeClient, 'geometry.interface_pairs', pairsTitle,
             ('name', 'enabled', 'coupling'), self._widget,
@@ -1815,9 +1816,12 @@ class GeometryPage(StepPage):
             return 0
 
         def of(element):
+            # DP-5748. simple_db's Element reads through value(); indexing it
+            # raised TypeError, read as "no id", so every API import adopted
+            # every store entry again and snappy refused the duplicate rows.
             try:
-                return str(element['geometryId'] or '')
-            except (KeyError, TypeError):
+                return str(element.value('geometryId') or '')
+            except (KeyError, LookupError):
                 return ''
 
         db = app.facadeClient.checkout()

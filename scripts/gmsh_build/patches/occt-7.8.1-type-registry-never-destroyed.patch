@@ -1,0 +1,22 @@
+--- a/src/Standard/Standard_Type.cxx	2024-04-01 02:05:22.000000000 +0400
++++ b/src/Standard/Standard_Type.cxx	2026-10-23 11:09:12.954467098 +0400
+@@ -79,10 +79,17 @@
+ 
+   // Registry is made static in the function to ensure that it gets
+   // initialized by the time of first access
++  //
++  // FoamMesh: the registry is never destroyed. Linked statically (OCCT inside
++  // libgmsh), the static handles of other files (StepAP214_Protocol's type
++  // map, the IGES protocols' atype handles) can be built before it, so they
++  // are destroyed after it, and ~Standard_Type then erased from a destroyed
++  // map: every process that had read or written STEP, or written IGES, ended
++  // in a segmentation fault in exit().
+   registry_type& GetRegistry() 
+   {
+-    static registry_type theRegistry;
+-    return theRegistry;
++    static registry_type* theRegistry = new registry_type;
++    return *theRegistry;
+   }
+ 
+   // To initialize theRegistry map as soon as possible to be destroyed the latest

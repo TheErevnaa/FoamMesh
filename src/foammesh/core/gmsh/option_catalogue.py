@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import re
 
-from .option_catalogue_data import BUILD_VERSION, ROWS
+from .option_catalogue_data import ALIASES, BUILD_VERSION, DETAILS, ROWS
 
 #: The pages that mount an Advanced tier rendered from the catalogue.  The
 #: geometry-description page is deliberately absent: it is shared with the
@@ -87,12 +87,20 @@ class Option:
     name: str
     storage: str          #: number | string | color
     default: object
-    kind: str             #: bool | int | float | enum | string | color
+    kind: str             #: bool | int | float | enum | bitmask | path | string | color
     choices: tuple
     unit: str
     page: str
     read_only: bool
     help: str
+    # Plan 48 GM2: read from Gmsh's source (Context.h, Options.cpp,
+    # optionWindow.cpp), all optional so ``Option(*row)`` of nine stays valid.
+    ctype: str = ''       #: Gmsh's own storage: int, double, bool, ...
+    minimum: object = None    #: native range (widget, else setter clamp)
+    maximum: object = None
+    hard: object = None   #: the setter-enforced ``(low, high, low_exclusive)``
+    bits: tuple = ()      #: for a bitmask: ((bit, label), ...)
+    evidence: str = ''    #: where the kind came from
 
     @property
     def group(self) -> str:
@@ -117,21 +125,108 @@ class Option:
         return self.page in ('display', 'general')
 
 
+#: Plan 48 G15 (DP-5707). Options of FoamMesh's own Gmsh build only: the six
+#: patch fields of the native High-order tools window
+#: (``highOrderToolsWindow.cpp``), added by
+#: ``scripts/gmsh_build/patches/gmsh-4.15.2-highorder-options.patch`` and read
+#: by ``optimize("HighOrder")``. The generated rows come from the stock
+#: 4.15.2, which has none of them, so they are written here by hand; on the
+#: stock wheel the session refuses them with the reason.
+FOAMMESH_BUILD_EVIDENCE = 'FoamMesh Gmsh build (G15 high-order options patch)'
+FOAMMESH_BUILD_ROWS = (
+    ('Mesh.HighOrderStrategy', 'number', 0.0, 'enum',
+     ((0, 'Disjoint strong'), (1, 'Adaptive one-by-one'),
+      (2, 'Disjoint weak')), '', 'gmsh.compute', False,
+     'High-order optimization patch strategy'),
+    ('Mesh.HighOrderWeight', 'number', 1.0, 'float', (), '', 'gmsh.compute',
+     False, 'High-order optimization weight on node displacement'),
+    ('Mesh.HighOrderDistanceFactor', 'number', 12.0, 'float', (), '',
+     'gmsh.compute', False,
+     'High-order optimization distance factor (patch size)'),
+    ('Mesh.HighOrderMaxAdaptBlob', 'number', 2.0, 'int', (), '',
+     'gmsh.compute', False,
+     'Maximum number of patch adaptation iterations (adaptive strategy)'),
+    ('Mesh.HighOrderAdaptBlobLayerFactor', 'number', 2.0, 'int', (), '',
+     'gmsh.compute', False,
+     'Number of layer adaptation factor (adaptive strategy)'),
+    ('Mesh.HighOrderAdaptBlobDistFactor', 'number', 2.0, 'float', (), '',
+     'gmsh.compute', False, 'Distance adaptation factor (adaptive strategy)'),
+)
+FOAMMESH_BUILD_RANGES = {
+    'Mesh.HighOrderStrategy': (0, 2),
+    'Mesh.HighOrderDistanceFactor': (1, 20000),
+    'Mesh.HighOrderMaxAdaptBlob': (1, 100),
+    'Mesh.HighOrderAdaptBlobLayerFactor': (1, 100),
+    'Mesh.HighOrderAdaptBlobDistFactor': (1, 100),
+}
+
+
+#: DP-1437 (user, 2026-10-23). The Medit (.mesh) export is retired: Gmsh
+#: 4.15.2's writer segfaults the session on tet+prism meshes and crashes on
+#: some triangle/quadrangle surface meshes. Reading .mesh files stays.
+MEDIT_RETIRED = ("Medit (.mesh) export was retired in 1.1.4: Gmsh 4.15.2's "
+                 'writer crashes; export .msh, .su2, VTK or polyMesh instead.')
+#: Enum values of generated rows that FoamMesh no longer offers, each with
+#: the sentence a request for it is refused with. ``Mesh.Format`` 30 selects
+#: the Medit writer whatever the file is called.
+RETIRED_CHOICES = {'Mesh.Format': {30: MEDIT_RETIRED}}
+
+
+def _retire_choices(row: tuple) -> tuple:
+    retired = RETIRED_CHOICES.get(row[0])
+    if not retired:
+        return row
+    choices = tuple(item for item in row[4] if item[0] not in retired)
+    help_text = row[8]
+    for key, label in row[4]:
+        if key in retired:
+            help_text = help_text.replace(f', {key}: {label}', '')
+    return row[:4] + (choices,) + row[5:8] + (help_text,) + row[9:]
+
+
 def _build() -> dict:
     table = {}
     for row in ROWS:
-        option = Option(*row)
+        row = _retire_choices(row)
+        extra = DETAILS.get(row[0], {})
+        option = Option(*row, **{key: extra[key] for key in (
+            'ctype', 'minimum', 'maximum', 'hard', 'bits', 'evidence')
+            if key in extra})
         if option.name in table:
             raise ValueError(f'duplicate option {option.name}')
         table[option.name] = option
+    for row in FOAMMESH_BUILD_ROWS:
+        if row[0] in table:
+            raise ValueError(f'duplicate option {row[0]}')
+        low, high = FOAMMESH_BUILD_RANGES.get(row[0], (None, None))
+        table[row[0]] = Option(*row, minimum=low, maximum=high,
+                               evidence=FOAMMESH_BUILD_EVIDENCE)
     return table
 
 
 CATALOGUE: dict[str, Option] = _build()
 
 
+def canonical_name(name: str) -> str:
+    """The option *name* stands for: itself, or the live option a deprecated
+    alias of Gmsh's ``DefaultOptions.h`` forwards to."""
+    return ALIASES.get(str(name), str(name))
+
+
+def is_alias(name: str) -> bool:
+    return str(name) in ALIASES
+
+
 def get(name: str):
-    return CATALOGUE.get(str(name))
+    return CATALOGUE.get(canonical_name(name))
+
+
+def is_view_option(name: str) -> bool:
+    """Plan 48 FIX3 (DP-3002). A ``View.*`` option, or a deprecated name that
+    forwards to one (``View.Format`` -> ``View.NumberFormat``), belongs to a
+    post-processing view. FoamMesh draws no Gmsh view, so a legacy ``.opt``
+    that names one is read and told it is not applied, not refused whole."""
+    return canonical_name(name).startswith('View.')
 
 
 def names() -> tuple[str, ...]:
@@ -202,7 +297,10 @@ def control_for_option() -> dict:
     mapping = {}
     for control in CONTROLS.values():
         if control.native_kind == OPTION and control.native_name:
-            mapping.setdefault(control.native_name, control.path)
+            # GM2. A control may set several options ('A+B+C') or write a
+            # deprecated name; the Options list is keyed by the live names.
+            for part in control.native_name.split('+'):
+                mapping.setdefault(canonical_name(part.strip()), control.path)
     return mapping
 
 
@@ -213,7 +311,7 @@ def precedence_note(name: str) -> str:
     one :func:`resolve_overrides` applies: the Options value is applied after
     the page controls, so it wins.
     """
-    control = control_for_option().get(name)
+    control = control_for_option().get(canonical_name(name))
     if not control:
         return ''
     return (f'Also set by the page control {control}. A value set here is '
@@ -265,6 +363,7 @@ def parse_value(name: str, raw):
     option = get(name)
     if option is None:
         raise OptionRefusal(refusal_for_unknown(str(name)))
+    name = option.name
     if option.read_only:
         raise OptionRefusal(
             f'{name} is read-only in Gmsh {BUILD_VERSION}: it reports a value '
@@ -289,6 +388,9 @@ def parse_value(name: str, raw):
         return tuple(parts)
     value = _number(option, raw)
     if option.kind == 'enum':
+        retired = RETIRED_CHOICES.get(name, {})
+        if value == int(value) and int(value) in retired:
+            raise OptionRefusal(retired[int(value)])
         allowed = {key for key, _label in option.choices}
         if value != int(value) or int(value) not in allowed:
             listing = ', '.join(f'{key}: {label}'
@@ -300,7 +402,8 @@ def parse_value(name: str, raw):
                 'plans/evidence/plan41/measured-refusals.md), so the request '
                 'is refused here')
         return float(int(value))
-    if option.kind in ('bool', 'int') and not option.is_length:
+    _check_hard(option, value, raw)
+    if option.kind in ('bool', 'int', 'bitmask')             and not option.is_length:
         # A length is never a whole number by nature: the generated kind of
         # Mesh.MeshSizeMin / ToleranceEdgeLength is inferred from a default
         # of 0 (UXB3c), and 0.005 m is a valid minimum size.
@@ -309,6 +412,21 @@ def parse_value(name: str, raw):
         if option.kind == 'bool' and int(value) not in (0, 1):
             raise OptionRefusal(f'{name} is on (1) or off (0), not {raw!r}')
     return value
+
+
+def _check_hard(option: Option, value: float, raw) -> None:
+    """Refuse what Gmsh's own setter would refuse or silently rewrite."""
+    if not option.hard:
+        return
+    low, high, exclusive = option.hard
+    if low is not None and (value <= low if exclusive else value < low):
+        raise OptionRefusal(
+            f'{option.name} = {raw!r} is below what Gmsh accepts (it must be '
+            + ('above ' if exclusive else 'at least ') + f'{low:g})')
+    if high is not None and value > high:
+        raise OptionRefusal(
+            f'{option.name} = {raw!r} is above what Gmsh accepts (at most '
+            f'{high:g})')
 
 
 def same_value(option: Option, left, right) -> bool:
@@ -356,13 +474,26 @@ def resolve_overrides(mapping) -> tuple[tuple, tuple[str, ...]]:
     refused = []
     warnings = []
     controls = None
-    for name, raw in sorted(dict(mapping or {}).items()):
+    given = dict(mapping or {})
+    for name, raw in sorted(given.items()):
+        canonical = canonical_name(name)
+        if is_view_option(name):
+            warnings.append(
+                f'Gmsh option {name} belongs to a post-processing view; '
+                'FoamMesh shows no Gmsh view, so it is not applied.')
+            continue
+        if canonical != name and canonical in given:
+            warnings.append(
+                f'Gmsh option {name} is a deprecated name of {canonical}, '
+                f'which is also set; {canonical} wins.')
+            continue
         try:
             value = parse_value(name, raw)
         except OptionRefusal as error:
             refused.append(str(error))
             continue
-        option = CATALOGUE[name]
+        option = CATALOGUE[canonical]
+        name = canonical
         if controls is None:
             controls = control_for_option()
         control = controls.get(name)
@@ -419,16 +550,23 @@ def from_opt_text(text: str) -> dict:
         name, value = match.groups()
         value = value.strip()
         if value.startswith('"') and value.endswith('"'):
-            mapping[name] = value[1:-1]
+            parsed = value[1:-1]
         elif value.startswith('{'):
-            mapping[name] = [int(float(part)) for part in
-                             re.split(r'[\s,{}]+', value) if part]
+            parsed = [int(float(part)) for part in
+                      re.split(r'[\s,{}]+', value) if part]
         else:
             try:
-                mapping[name] = float(value)
+                parsed = float(value)
             except ValueError:
                 raise OptionRefusal(
                     f'line {number}: {value!r} is not a number') from None
+        canonical = canonical_name(name)
+        if canonical != name:
+            # A deprecated name of an old file: the live option takes it, but
+            # a line that names the live option itself wins either way.
+            mapping.setdefault(canonical, parsed)
+        else:
+            mapping[name] = parsed
     return mapping
 
 
@@ -455,6 +593,42 @@ def load_defaults() -> dict:
     if not path.is_file():
         return {}
     return overrides_from_text(path.read_text(encoding='utf-8'))
+
+
+def startup_opt_path() -> Path:
+    """The ``.opt`` file read at start-up (Gmsh reads ``gmsh-options`` from the
+    user's folder the same way)."""
+    override = os.environ.get('FOAMMESH_GMSH_STARTUP_OPT')
+    if override:
+        return Path(override)
+    return Path.home() / '.FoamMesh' / 'gmsh-startup.opt'
+
+
+def startup_defaults() -> dict:
+    """Plan 48 GM2. The options every project starts with: the startup ``.opt``
+    file, then the saved defaults on top of it.  A file that cannot be read is
+    reported (:class:`OptionRefusal`), never skipped."""
+    mapping = {}
+    path = startup_opt_path()
+    if path.is_file():
+        mapping.update(read_opt_file(path))
+    mapping.update(load_defaults())
+    return mapping
+
+
+def with_startup_defaults(stored) -> dict:
+    """*stored* (the project's overrides) over the start-up defaults.
+
+    What the project holds wins; a default fills only an option the project
+    does not mention.  Deprecated names in either are mapped to the live name
+    first, so ``{'Mesh.MinimumElementsPerTwoPi': 8}`` cannot sit beside a
+    default for ``Mesh.MeshSizeFromCurvature``.
+    """
+    merged = {canonical_name(name): value
+              for name, value in startup_defaults().items()}
+    for name, value in dict(stored or {}).items():
+        merged[canonical_name(name)] = value
+    return merged
 
 
 def read_opt_file(path) -> dict:

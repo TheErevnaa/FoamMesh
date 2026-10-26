@@ -8,6 +8,7 @@ does.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
 import re
@@ -31,7 +32,11 @@ ENTITY_SCHEMA_VERSION = 2
 
 
 class ExecutionError(RuntimeError):
-    pass
+    def __init__(self, message='', *, details: dict | None = None):
+        super().__init__(message)
+        #: Plan 49 SR7. Structured refusal for the facade (``surface_intent_
+        #: refused`` and its issues); empty for every other refusal.
+        self.details = dict(details or {})
 
 
 def assembly_layer_refusal(volumes: int) -> str:
@@ -96,15 +101,17 @@ def runner_path() -> Path:
 
 
 def _native_section(db) -> dict:
-    """The ``gmsh`` section, with the Geometry page's cyclic pairs joined in.
+    """The ``gmsh`` section, with its periodic pairs read from the relations.
 
-    DP-641 (field audit 0924 gmsh-sizing D9). A cyclic interface pair is a
-    periodic pair; Gmsh builds one with ``setPeriodic``, which is what the
-    section's own ``periodicPairs`` reach. They are joined here, the one
-    reader every Gmsh plan, scope check and job goes through, as copies: the
-    project's rows are not rewritten by reading them.
+    DP-641 joined the Geometry page's cyclic pairs in here, the one reader
+    every Gmsh plan, scope check and job goes through. Plan 49 SR5 (DP-5805)
+    reads every translation or rotation pair from the relation store instead
+    -- SR3 made each of them, from either page, a periodic relation -- and
+    keeps only the affine rows of the section's own ``periodicPairs``, which
+    have no relation (DP-5832). As copies: the project is not rewritten by
+    reading it.
     """
-    return _with_interface_periodic_pairs(_gmsh_section(db), db)
+    return _with_relation_periodic_pairs(_gmsh_section(db), db)
 
 
 def _gmsh_section(db) -> dict:
@@ -346,58 +353,47 @@ def import_surface_position(aliases: dict, index: int) -> int:
     return first - sum(1 for alias in (aliases or {}) if int(alias) < first)
 
 
-#: Geometry-page transform -> the Gmsh periodic pair's. A coincident cyclic
-#: pair has no transform to give ``setPeriodic`` and is left to the run
-#: record, which says so.
-_PERIODIC_TRANSFORMS = {'translational': 'translation',
-                        'rotational': 'rotation'}
+def _with_relation_periodic_pairs(section: dict, db) -> dict:
+    """*section* with ``periodicPairs`` = its affine rows + the valid periodic
+    relations (``surface_roles.periodic_relation_rows``).
 
+    A translation or rotation row of the section is not read: its relation
+    is. A relation that is not valid is not lowered; ``check_job`` refuses
+    the run with its name and reason.
+    """
+    from .surface_roles import periodic_relation_rows
 
-def _with_interface_periodic_pairs(section: dict, db) -> dict:
-    extra = []
-    declared = set()
     existing = section.get('periodicPairs') or {}
-    for row in (existing.values() if isinstance(existing, dict)
-                else existing):
-        if isinstance(row, dict) and row.get('enabled', True):
-            declared.add(frozenset((
-                str(row.get('masterScopeToken') or '').strip(),
-                str(row.get('slaveScopeToken') or '').strip())))
-    for pair in interface_pair_rows(db):
-        transform = _PERIODIC_TRANSFORMS.get(pair['transform'])
-        if pair['coupling'] != 'cyclic' or transform is None:
-            continue
-        sides = frozenset((pair['masterScope'], pair['slaveScope']))
-        if sides in declared:
-            # The Periodic page already declares this pairing; it wins,
-            # rather than the plan refusing a pairing made twice.
-            continue
-        declared.add(sides)
-        x, y, z = pair['translation']
-        cx, cy, cz = pair['rotationCentre']
-        ax, ay, az = pair['rotationAxis']
-        extra.append({
-            'name': pair['name'], 'enabled': True,
-            'masterScopeToken': pair['masterScope'],
-            'slaveScopeToken': pair['slaveScope'],
-            'transform': transform,
-            'translation': {'x': x, 'y': y, 'z': z},
-            'rotationCentre': {'x': cx, 'y': cy, 'z': cz},
-            'rotationAxis': {'x': ax, 'y': ay, 'z': az},
-            'rotationAngleDegrees': pair['rotationAngleDegrees'],
-            'matchTolerance': pair['matchTolerance'],
-            'origin': 'interfacePairs'})
-    if not extra:
+    lowered, _refused = periodic_relation_rows(db)
+    if isinstance(existing, dict):
+        items = list(existing.items())
+    else:
+        items = list(enumerate(existing))
+    affine = [(key, row) for key, row in items if isinstance(row, dict)
+              and str(row.get('transform') or '') == 'affine']
+    if not lowered and len(affine) == len(items):
         return section
     section = dict(section)
-    if isinstance(existing, dict):
-        merged = dict(existing)
-        for row in extra:
-            merged[f'interface-{row["name"]}'] = row
+    if isinstance(existing, dict) or not existing:
+        merged = dict(affine)
+        for row in lowered:
+            merged[f'relation-{row.get("relationId") or row["name"]}'] = row
     else:
-        merged = [*existing, *extra]
+        merged = [row for _key, row in affine] + list(lowered)
     section['periodicPairs'] = merged
     return section
+
+
+def job_interface_pairs(db, intent) -> list[dict]:
+    """The ``interfacePairs`` a job carries: the Geometry page's rows and,
+    Plan 49 SR5, the region-interface relations of the SR1 store (one pair
+    per coupling; see ``surface_roles.relation_interface_pairs``)."""
+    from .surface_roles import relation_interface_pairs
+    rows = interface_pair_rows(db)
+    block = getattr(intent, 'surface_intent', None) or {}
+    if not block:
+        return rows
+    return relation_interface_pairs(block, rows)
 
 
 def interface_pair_rows(db) -> list[dict]:
@@ -1022,6 +1018,32 @@ def surface_categories(prepared_geometry) -> dict:
     return categories
 
 
+#: Plan 49 SR5. The roles whose surface is no wall a layer may grow on.
+def role_surface_categories(categories: dict, surface_intent) -> dict:
+    """*categories* with each role surface given the category it is.
+
+    Plan 49 SR5. "Every eligible wall" is read off ``surfaceCategories``;
+    an internal face, a baffle or a region interface is no wall to grow a
+    layer on, and a surface authored as a symmetry plane is a symmetry plane
+    whatever its prepared category says.
+    """
+    result = dict(categories or {})
+    for surface in (surface_intent or {}).get('surfaces') or ():
+        if not isinstance(surface, dict) \
+                or surface.get('state', 'valid') != 'valid':
+            continue
+        name = str(surface.get('name') or '')
+        if not name:
+            continue
+        # Plan 49 SR7 (DP-5789). One rule with the snappy layers page.
+        from foammesh.core.geometry.boundary_roles import role_category
+        category = role_category(result.get(name, ''), surface.get('role'),
+                                 surface.get('meshPatchType'))
+        if category:
+            result[name] = category
+    return result
+
+
 def surface_names(prepared_geometry) -> dict:
     """Imported surface index (as a string tag) -> solver patch name."""
     if prepared_geometry is None:
@@ -1112,7 +1134,9 @@ def build_job(intent: JobIntent, *, geometry, outputs: dict,
         # DP-867. The category each patch publishes with, so "every eligible
         # wall" is judged in the runner by what the patch *is*, not by what
         # an importer name like `face0` fails to say.
-        'surfaceCategories': surface_categories(prepared_geometry),
+        'surfaceCategories': role_surface_categories(
+            surface_categories(prepared_geometry),
+            getattr(intent, 'surface_intent', None)),
         'volumeNames': volume_names(prepared_geometry, region_names),
         # DP-423. What to call a volume the maps above do not name, per
         # source, so an artifact that closed into eight volumes publishes
@@ -1166,16 +1190,14 @@ def _with_automatic_field(intent, db, case_path, profile):
     return replace(intent, automatic_field=block)
 
 
-def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
-              run_id: str = '', formats=('msh',)) -> dict:
-    """Derive and persist one run's job. Returns the created run manifest."""
-    case_path = Path(case_path)
-    geometry = prepared_geometry_paths(prepared_geometry, case_path)
-    if not geometry:
-        raise ExecutionError(
-            'Gmsh meshes the prepared CAD directly, so a prepared geometry '
-            'revision is required before a job can be written')
+def derive_page_intent(db, bbox, case_path, *, prepared_geometry=None,
+                       profile=None, run_id: str = '') -> JobIntent:
+    """The intent every Gmsh execution path starts from (Plan 48 GM3).
 
+    ``write_job`` (the batch run) and the resident session's page controls
+    both call this, so a control on a page has one meaning whichever way the
+    mesh is made. Nothing here depends on which path is asking.
+    """
     from foammesh.core.engine.registry import configured_target_solver
 
     intent = derive_from_native(
@@ -1187,10 +1209,56 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         # saved row.
         prepared_geometry=prepared_geometry,
         metadata={'engine_id': 'gmsh', 'run_id': run_id})
+    # Plan 49 SR5 (DP-5783). The surface roles and relations of the patches
+    # this revision prepared, in the intent so the digest covers them.
+    from .surface_roles import lowered_surface_intent
+    block = lowered_surface_intent(db, prepared_geometry)
+    if block:
+        intent = replace(intent, surface_intent=block)
     # Plan 41 GN25f. The automatic size field as the background field: a
     # field that is switched on and cannot be used refuses here, with the
     # reason, rather than meshing without it.
-    intent = _with_automatic_field(intent, db, case_path, profile)
+    return _with_automatic_field(intent, db, case_path, profile)
+
+
+def gate_target(intent) -> str:
+    """The target a Gmsh job's outputs are judged for (Plan 49 SR7)."""
+    export = getattr(intent, 'export', None)
+    if getattr(export, 'writes_su2', False):
+        return 'su2'
+    if getattr(export, 'publishes_poly_mesh', False):
+        return 'openfoam'
+    return 'native'
+
+
+def surface_intent_gate(db, intent, prepared_geometry, geometry) -> None:
+    """Raise :class:`ExecutionError` when the surface intent blocks a run."""
+    from foammesh.core.engine import surface_capabilities
+    from .surface_roles import _prepared_mapping
+    try:
+        surface_capabilities.gate(
+            db, None, 'gmsh', gate_target(intent), stage='run',
+            prepared=_prepared_mapping(prepared_geometry),
+            geometry=[str(item) for item in geometry or ()],
+            dimensionality=getattr(getattr(intent, 'dimensionality', None),
+                                   'mode', None))
+    except surface_capabilities.SurfaceIntentRefused as refusal:
+        raise ExecutionError(str(refusal),
+                             details=refusal.details()) from refusal
+
+
+def check_job(db, intent, prepared_geometry, geometry) -> None:
+    """Refuse, before anything is written or imported, a job the runner
+    would refuse (Plan 48 RR). ``write_job`` and ``session_job`` call it."""
+    from foammesh.core.engine.registry import configured_target_solver
+
+    # Plan 49 SR7. The surface intent first, judged by the one capability
+    # table the surface dialog and the export read (plan D7: an unresolved
+    # surface or relation, an unmeasured or failed periodic pair, a role or
+    # type this target cannot carry). The checks below stay as the route's
+    # own second line.
+    surface_intent_gate(db, intent, prepared_geometry, geometry)
+
     # DP-52/DP-53. The runner refuses this, and it refuses it after WSL has
     # booted and the geometry has been imported -- MEASURED at 71 s on
     # `annulus_shell`, and graded against the geometry rather than against
@@ -1216,8 +1284,31 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
     # reason rather than meshed as the other coupling.
     from foammesh.core.engine.interface_intent import intent_refusal
 
-    pairs = interface_pair_rows(db)
+    pairs = job_interface_pairs(db, intent)
     refusal = intent_refusal('gmsh', configured_target_solver(db), pairs)
+    if not refusal:
+        # Plan 49 SR5 (DP-5805). Every periodic relation, measured again where
+        # its verdict is stale; one that is not valid is refused by name.
+        from .surface_roles import (
+            affine_periodic_refusal, periodic_relation_rows)
+        _lowered, refused = periodic_relation_rows(db, prepared_geometry)
+        refusal = '; '.join(refused)
+        if not refusal:
+            export = getattr(intent, 'export', None)
+            refusal = affine_periodic_refusal(
+                _gmsh_section(db),
+                publishes_poly_mesh=bool(getattr(
+                    export, 'publishes_poly_mesh', False)),
+                writes_su2=bool(getattr(export, 'writes_su2', False)))
+    if not refusal:
+        # Plan 49 SR5. A role the Gmsh route cannot build for this target.
+        from .surface_roles import surface_intent_refusal
+        refusal = surface_intent_refusal(
+            getattr(intent, 'surface_intent', None) or {},
+            target_solver=configured_target_solver(db),
+            geometry=[str(item) for item in geometry],
+            dimensionality_mode=getattr(
+                getattr(intent, 'dimensionality', None), 'mode', 'three_d'))
     if not refusal and any(str(pair.get('coupling')) == 'non_conformal'
                            for pair in pairs):
         # The two bodies of a pair are kept apart by not fusing the copies of
@@ -1237,6 +1328,26 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
                 'model.')
     if refusal:
         raise ExecutionError(refusal)
+
+
+def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
+              run_id: str = '', formats=('msh',)) -> dict:
+    """Derive and persist one run's job. Returns the created run manifest."""
+    case_path = Path(case_path)
+    geometry = prepared_geometry_paths(prepared_geometry, case_path)
+    if not geometry:
+        raise ExecutionError(
+            'Gmsh meshes the prepared CAD directly, so a prepared geometry '
+            'revision is required before a job can be written')
+
+    # Plan 48 GM3. The one derivation: the step-by-step session reads its page
+    # controls from the same function, so the two paths start from one intent.
+    intent = derive_page_intent(
+        db, bbox, case_path, prepared_geometry=prepared_geometry,
+        profile=profile, run_id=run_id)
+    # Plan 48 RR (DP-4009). The refusals below are shared with the resident
+    # session's job (``session_job``): one set of checks for both paths.
+    check_job(db, intent, prepared_geometry, geometry)
     if intent.export.mesh_format == 'su2' and 'su2' not in formats:
         # A second-order mesh only survives in Gmsh's own SU2 file, so the run
         # has to be given somewhere to write it.
@@ -1260,8 +1371,18 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         surface_output=layout.surface,
         # DP-419. What the user called each body, where the tree knows.
         region_names=region_display_names(db),
-        interface_pairs=interface_pair_rows(db),
+        interface_pairs=job_interface_pairs(db, intent),
         execution=_execution_record(db, intent.parallel.threads))
+    # Plan 48 GM5 (DP-4165). What the window's Geometry builder made, so a
+    # batch run rebuilds it on the runner's `geometry` stage.
+    steps = geometry_build_steps(case_path)
+    warnings = list(intent.warnings)
+    if steps:
+        job['geometry_build'] = steps
+        with_build_roles(job, case_path)
+        note = build_replaced_layer_note(case_path, intent)
+        if note:
+            warnings.append(note)
     try:
         script = runner_path()
     except Exception:
@@ -1274,8 +1395,130 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         'manifest': manifest.document,
         'job_path': str(layout.job),
         'run_path': str(layout.root),
-        'warnings': list(intent.warnings),
+        'warnings': warnings,
     }
+
+
+#: The intent sections the shared stage functions read (Plan 48 RR). A change
+#: to one of them changes what a stage did to the model, and a stage cannot be
+#: taken back, so the session starts the model again (as for an entity control).
+STAGE_INTENT_KEYS = ('healing', 'farfield', 'layers', 'periodic',
+                     'curveControls', 'volumeControls', 'structuring',
+                     'dimensionality', 'sizeFields', 'geometry')
+#: The job keys that name what a stage acts on, rather than say how.
+STAGE_JOB_KEYS = ('entitySchemaVersion', 'sources', 'scopeEntities',
+                  'entityNames', 'scopeSurfaces', 'scopeVolumes',
+                  'surfaceNames', 'surfaceCategories', 'volumeNames',
+                  'volumeFallback', 'seedPoint', 'shellRoles',
+                  'interfacePairs')
+
+
+def stage_inputs(job: dict) -> dict:
+    """What of *job* the shared stages read, for comparing two jobs.
+
+    The recombination stage reads ``algorithms.recombine`` and the code; the
+    point-size stage ``sizing.fromPoints``. Everything else in the intent is
+    set on the model by the session at any time and needs no new import.
+    """
+    intent = job.get('intent') or {}
+    algorithms = intent.get('algorithms') or {}
+    sizing = intent.get('sizing') or {}
+    picked = {key: intent.get(key) for key in STAGE_INTENT_KEYS}
+    picked['algorithms'] = {
+        'recombine': algorithms.get('recombine'),
+        'recombinationCode': algorithms.get('recombinationCode')}
+    picked['sizing'] = {'fromPoints': sizing.get('fromPoints')}
+    return {'intent': picked,
+            'job': {key: job.get(key) for key in STAGE_JOB_KEYS}}
+
+
+def session_job(db, bbox, case_path, *, prepared_geometry=None,
+                profile=None, intent=None) -> dict:
+    """The job the resident session's stages read (Plan 48 RR, DP-4009).
+
+    The very job ``write_job`` would write for a batch run of the same
+    project -- the same intent, scope maps, names and pairs, built by the
+    same ``build_job`` after the same refusals -- but not persisted: no run
+    directory, no manifest, no output paths. The stage functions of
+    ``resources/gmsh/stages`` read it in the session exactly as they read it
+    in the runner, which is what makes a stage mean one thing on both paths.
+    """
+    case_path = Path(case_path)
+    geometry = prepared_geometry_paths(prepared_geometry, case_path)
+    if not geometry:
+        raise ExecutionError(
+            'Gmsh meshes the prepared CAD directly, so a prepared geometry '
+            'revision is required before a job can be written')
+    if intent is None:
+        intent = derive_page_intent(
+            db, bbox, case_path, prepared_geometry=prepared_geometry,
+            profile=profile)
+    check_job(db, intent, prepared_geometry, geometry)
+    job = build_job(
+        intent, geometry=geometry, outputs={},
+        prepared_geometry=prepared_geometry, profile=profile,
+        region_names=region_display_names(db),
+        interface_pairs=job_interface_pairs(db, intent),
+        execution=_execution_record(db, intent.parallel.threads))
+    return with_build_roles(job, case_path)
+
+
+def with_build_roles(job: dict, case_path) -> dict:
+    """DP-5717. *job* with the categories of the patches a geometry-build
+    preset declared (front/back ``empty``) in ``surfaceCategories``, so
+    "every eligible wall" of a built model never grows a layer on them, and
+    the built surfaces' names in ``builtSurfaceNames`` (DP-5725)."""
+    from . import geometry_build
+
+    declared = geometry_build.role_categories(
+        geometry_build.load_roles(case_path))
+    if declared:
+        job['surfaceCategories'] = {
+            **dict(job.get('surfaceCategories') or {}), **declared}
+    # DP-5725: the built surfaces as the window names them, so a rename in
+    # the physical-group table reaches the run (it names a built model from
+    # the build's own groups otherwise)
+    built = geometry_build.built_surface_names(case_path)
+    if built and geometry_build_steps(case_path):
+        job['builtSurfaceNames'] = built
+    return job
+
+
+def build_replaced_layer_note(case_path, intent) -> str:
+    """DP-5716. The note for ticked layer walls the geometry build took
+    away, or ``''``. The run drops them (``stages.build_follow``); it never
+    grows them on a new surface that took the old tag."""
+    from . import geometry_build
+
+    layers = getattr(intent, 'layers', None)
+    if layers is None or not getattr(layers, 'enabled', False):
+        return ''
+    return geometry_build.replaced_layer_note(
+        list(getattr(layers, 'patches', ()) or ()),
+        geometry_build.load_replaced(case_path))
+
+
+def geometry_build_steps(case_path) -> list:
+    """The Geometry-module operations of the project, as the job carries them.
+
+    ``[{'kind': <session.build kind>, 'params': {...}}, ...]`` read from the
+    session op log (the ``session.build`` entries, kernel inside ``params``
+    when it is not OpenCASCADE). Empty without a log or without builds.
+    The copies a re-import made again (marked ``again``, DP-5738) are not
+    steps of their own.
+    """
+    from .session import read_op_log
+
+    steps = []
+    for entry in read_op_log(case_path):
+        if entry.get('op') != 'session.build' or 'again' in entry:
+            continue
+        args = entry.get('args') or []
+        if not args:
+            continue
+        steps.append({'kind': str(args[0]),
+                      'params': dict(entry.get('kwargs') or {})})
+    return steps
 
 
 def _execution_record(db, threads: int) -> dict:
@@ -1691,3 +1934,409 @@ def _latest_run_id(case_path: Path) -> str:
         (item for item in root.iterdir() if (item / 'job.json').is_file()),
         key=lambda item: item.stat().st_mtime)
     return candidates[-1].name if candidates else ''
+
+
+# --------------------------------------------------------------------------- #
+# Plan 48 GM3. One execution path: the page controls as option rows
+# --------------------------------------------------------------------------- #
+#
+# The batch runner (``runner_v1.py``) applies the page controls of a job as
+# Gmsh options in a fixed order, and records each one in its ledger. The
+# resident session used to get only the Options panel text, so "Generate step
+# by step" meshed with Gmsh's own defaults wherever the page had a value. The
+# functions below turn the same intent dict into the same option rows, with
+# the same ledger controls, requested values and notes; the session applies
+# them with ``option.setNumber`` and reads each back. The runner cannot import
+# this module (it runs inside WSL with its resource folder only), so
+# ``tests/plan48/gm3`` runs both against a recording Gmsh and compares them.
+
+#: Mirrors of the runner's qualification tables (``runner_v1.py``).
+RUNNER_QUALITY_MEASURE = {'sicn': 0, 'sige': 1, 'gamma': 2, 'disto': 3}
+RUNNER_TESTED_RECOMBINERS = frozenset({0, 1, 2, 3, 4})
+RUNNER_TESTED_SUBDIVISIONS = frozenset({0, 1, 2, 3})
+RUNNER_BARYCENTRIC_SUBDIVISION = 3
+RUNNER_ALGORITHM_RETRIES = 10
+
+#: Suffixes the runner reads as a surface mesh (no CAD importer involved).
+TESSELLATED_SUFFIXES = ('.stl', '.obj', '.ply')
+
+
+@dataclass(frozen=True)
+class PageOption:
+    """One step of the page-control pass.
+
+    ``name`` is the Gmsh option set (``None``: a ledger line only, nothing is
+    set). ``value`` is what is written, ``requested`` what the ledger says was
+    asked for (the value written unless a clamp changed it), ``effective`` the
+    ledger's literal answer for a row that sets nothing, and ``readback``
+    makes the pass read the option and record it without writing.
+    """
+
+    control: str
+    name: str | None = None
+    value: object = None
+    storage: str = 'number'
+    requested: object = None
+    effective: object = None
+    applied: bool = True
+    note: str = ''
+    readback: bool = False
+    warning: str = ''
+
+    def to_dict(self) -> dict:
+        return {'control': self.control, 'name': self.name,
+                'value': self.value, 'storage': self.storage,
+                'requested': self.requested, 'effective': self.effective,
+                'applied': self.applied, 'note': self.note,
+                'readback': self.readback}
+
+
+def sources_are_tessellated(paths) -> bool:
+    """True when the job's sources are surface meshes, as the runner reads it."""
+    names = [str(item).lower() for item in paths or ()]
+    return any(name.endswith(TESSELLATED_SUFFIXES) for name in names)
+
+
+def importer_option_rows(intent: dict, *, tessellated: bool = False
+                         ) -> tuple[PageOption, ...]:
+    """The options that configure the importer, applied BEFORE the import.
+
+    The order and the controls are those of ``GmshRun.import_geometry``:
+    target unit, tolerance, the OCC switches, the scaling pin, the boolean
+    tolerance. A tessellated source skips the ones the CAD importer owns and
+    the ledger says so, as the runner does.
+    """
+    healing = (intent or {}).get('healing') or {}
+    rows: list[PageOption] = [PageOption(
+        'geometry.unit', 'Geometry.OCCTargetUnit',
+        str(((intent or {}).get('geometry') or {}).get('targetUnit') or 'M'),
+        storage='string')]
+    value = float(healing.get('importTolerance', 1e-6) or 1e-6)
+    if not tessellated:
+        rows.append(PageOption('gmsh/healing/importTolerance',
+                               'Geometry.Tolerance', value))
+    else:
+        rows.append(PageOption(
+            'gmsh/healing/importTolerance', 'Geometry.Tolerance', None,
+            requested=value, applied=False, readback=True,
+            note='tessellated import: this tolerance configures the OCC '
+                 'importer, and there is no CAD here for it to import'))
+    skipped = []
+    for option, key, default in (
+            ('Geometry.OCCSewFaces', 'sewFaces', False),
+            ('Geometry.OCCFixDegenerated', 'fixDegenerated', False),
+            ('Geometry.OCCMakeSolids', 'makeSolids', False),
+            ('Geometry.OCCFixSmallEdges', 'fixSmallEdges', False),
+            ('Geometry.OCCFixSmallFaces', 'fixSmallFaces', False),
+            ('Geometry.OCCAutoFix', 'autoFix', True),
+            ('Geometry.OCCBooleanSimplify', 'unionUnify', True),
+            ('Geometry.OCCImportLabels', 'importLabels', True),
+            ('Geometry.OCCParallel', 'occParallel', False)):
+        requested = healing.get(key, default)
+        requested = (option_code(requested) if key == 'importLabels'
+                     else bool(requested))
+        control = f'gmsh/healing/{key}'
+        if not tessellated:
+            rows.append(PageOption(control, option, int(requested)))
+            continue
+        rows.append(PageOption(
+            control, None, requested=requested, effective=None,
+            applied=False,
+            note='tessellated import: this configures the CAD importer, and '
+                 'a surface is read without it'))
+        if requested != default:
+            skipped.append(key)
+    if skipped:
+        rows.append(PageOption(
+            '', None, requested=None, applied=False,
+            warning='these import settings were not applied because they '
+                    'configure the CAD importer and this import is a surface '
+                    f'(STL/OBJ/PLY): {", ".join(skipped)}.'))
+    scaling = float(healing.get('importScaling', 1.0) or 1.0)
+    if not tessellated:
+        rows.append(PageOption('gmsh/healing/importScaling',
+                               'Geometry.OCCScaling', 1.0))
+    if scaling != 1.0:
+        rows.append(PageOption(
+            'gmsh/healing/importScaling', None, requested=scaling,
+            effective=1.0, applied=False,
+            note='pinned at 1: the unit is set at import, and a second '
+                 'factor would size this mesh apart from everything else',
+            warning=f'the import scaling of {scaling:g} was not applied: the '
+                    'geometry is already in metres from its import unit.'))
+    elif tessellated:
+        rows.append(PageOption(
+            'gmsh/healing/importScaling', None, requested=scaling,
+            effective=None, applied=False,
+            note='tessellated import: read without the CAD importer'))
+    rows.append(PageOption(
+        'gmsh/healing/booleanTolerance', 'Geometry.ToleranceBoolean',
+        float(healing.get('booleanTolerance', 0.0) or 0.0)))
+    return tuple(rows)
+
+
+def option_code(value) -> int:
+    """A coded choice as Gmsh takes it: a job holds the number (Plan 48
+    DP-2952), a job written before holds ``True`` / ``False`` (1 / 0). The
+    runner's ``option_code`` reads it the same way."""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(bool(value))
+
+
+def max_retries_of(algorithms: dict) -> int:
+    """``Mesh.MaxRetries`` for a job (Plan 48 DP-2952): the page's number, or
+    -- a job written before it -- 10 with the fallback on, 0 with it off."""
+    retries = (algorithms or {}).get('maxRetries')
+    if retries is None:
+        fallback = bool((algorithms or {}).get('fallback', True))
+        return RUNNER_ALGORITHM_RETRIES if fallback else 0
+    return int(retries)
+
+
+def thread_option_rows(parallel: dict) -> tuple[PageOption, ...]:
+    """The thread options, in the runner's order (Plan 48 DP-2952).
+
+    ``General.NumThreads`` takes Threads. Each stage takes its own count when
+    one is set and Threads when it is automatic (0), the volume stage only
+    what its algorithm can use. The curve stage is left at Gmsh's own 0 (=
+    Threads) unless a count is set or the run is reproducible (DP-4605).
+    """
+    parallel = parallel or {}
+    rows: list[PageOption] = []
+    threads = int(parallel.get('threads', 1) or 1)
+    asked_volume = int(parallel.get('volumeThreads') or 0) or threads
+    volume_threads = int(parallel.get('effectiveVolumeThreads', asked_volume)
+                         or asked_volume)
+    rows.append(PageOption('gmsh/parallel/threads', 'General.NumThreads',
+                           threads))
+    rows.append(PageOption(
+        'gmsh/parallel/threads.3d', 'Mesh.MaxNumThreads3D', volume_threads,
+        note='' if volume_threads == asked_volume else (
+            f'{asked_volume} requested; the chosen volume algorithm is '
+            'single-threaded, so the request applies to surface meshing '
+            'only')))
+    rows.append(PageOption(
+        'gmsh/parallel/threads.2d', 'Mesh.MaxNumThreads2D',
+        int(parallel.get('surfaceThreads') or 0) or threads))
+    if parallel.get('reproducible'):
+        # Plan 48 ST (DP-4605): as the runner does, 1D on one thread too.
+        rows.append(PageOption('gmsh/parallel/threads.1d',
+                               'Mesh.MaxNumThreads1D', 1))
+    elif int(parallel.get('curveThreads') or 0):
+        rows.append(PageOption('gmsh/parallel/threads.1d',
+                               'Mesh.MaxNumThreads1D',
+                               int(parallel['curveThreads'])))
+    return tuple(rows)
+
+
+def page_option_rows(intent: dict) -> tuple[PageOption, ...]:
+    """The page controls as the runner writes them, in the runner's order.
+
+    Threads, global sizing, algorithms, optimisation, recombination, the
+    structuring option and the element order. Nothing here reads the
+    geometry; marking each surface for recombination stays with the session
+    (``GenerateController.apply_page_controls``).
+    """
+    intent = intent or {}
+    sizing = intent.get('sizing') or {}
+    algorithms = intent.get('algorithms') or {}
+    quality = intent.get('quality') or {}
+    export = intent.get('export') or {}
+    parallel = intent.get('parallel') or {}
+    rows: list[PageOption] = []
+
+    def number(control, name, value):
+        rows.append(PageOption(control, name, value))
+
+    for row in thread_option_rows(parallel):
+        rows.append(row)
+
+    number('gmsh/globalSizing/targetSize', 'Mesh.MeshSizeMax',
+           sizing.get('targetSize'))
+    number('gmsh/globalSizing/minimumSize', 'Mesh.MeshSizeMin',
+           sizing.get('minimumSize'))
+    number('gmsh/globalSizing/sizeFactor', 'Mesh.MeshSizeFactor',
+           sizing.get('sizeFactor', 1.0))
+    number('gmsh/globalSizing/fromCurvature', 'Mesh.MeshSizeFromCurvature',
+           sizing.get('fromCurvature', 12))
+    number('gmsh/globalSizing/fromPoints', 'Mesh.MeshSizeFromPoints',
+           int(bool(sizing.get('fromPoints', True))))
+    number('gmsh/globalSizing/extendFromBoundary',
+           'Mesh.MeshSizeExtendFromBoundary',
+           option_code(sizing.get('extendFromBoundary', True)))
+    number('gmsh/globalSizing/minimumCirclePoints', 'Mesh.MinCircleNodes',
+           int(sizing.get('minimumCirclePoints', 7) or 7))
+    number('gmsh/globalSizing/minimumCurvePoints', 'Mesh.MinCurveNodes',
+           int(sizing.get('minimumCurvePoints', 3) or 3))
+    number('gmsh/algorithms/surface', 'Mesh.Algorithm',
+           algorithms.get('surfaceCode', 6))
+    number('gmsh/algorithms/volume', 'Mesh.Algorithm3D',
+           algorithms.get('volumeCode', 1))
+    fallback = bool(algorithms.get('fallback', True))
+    number('gmsh/algorithms/algorithmFallback',
+           'Mesh.AlgorithmSwitchOnFailure', int(fallback))
+    number('gmsh/algorithms/maxRetries', 'Mesh.MaxRetries',
+           max_retries_of(algorithms))
+
+    subdivision = int(algorithms.get('subdivisionAlgorithm', 0) or 0)
+    if subdivision not in RUNNER_TESTED_SUBDIVISIONS:
+        rows.append(PageOption(
+            'gmsh/algorithms/cellShape', None, requested=subdivision,
+            effective=0, applied=False,
+            note='Gmsh subdivision algorithms are 0-3',
+            warning=f'subdivision algorithm {subdivision} was asked for and '
+                    'is not one Gmsh has (0-3), so the run meshed '
+                    'tetrahedra. Choose a hexahedral cell shape for '
+                    'hexahedra'))
+        subdivision = 0
+    number('gmsh/algorithms/cellShape', 'Mesh.SubdivisionAlgorithm',
+           subdivision)
+    if sizing.get('barycentricRefinement'):
+        if subdivision:
+            rows.append(PageOption(
+                'gmsh/globalSizing/barycentricRefinement', None,
+                requested=True, effective=False, applied=False,
+                note='barycentric refinement and a hexahedral cell shape are '
+                     'the same Gmsh setting, so only one of them can hold; '
+                     'the mesh was built as hexahedra, because refining '
+                     'barycentrically would have produced four tetrahedra '
+                     'per cell instead. Refine with a size field to keep '
+                     'the hexahedra'))
+        else:
+            number('gmsh/globalSizing/barycentricRefinement',
+                   'Mesh.SubdivisionAlgorithm',
+                   RUNNER_BARYCENTRIC_SUBDIVISION)
+
+    optimize = bool(quality.get('optimize', True))
+    number('gmsh/optimization/optimize', 'Mesh.Optimize', int(optimize))
+    netgen = bool(quality.get('netgen', True))
+    if netgen and not optimize:
+        rows.append(PageOption(
+            'gmsh/optimization/netgen', 'Mesh.OptimizeNetgen', 0.0,
+            requested=1, applied=False,
+            note='Optimize is off, so the Netgen optimiser was not run'))
+    else:
+        number('gmsh/optimization/netgen', 'Mesh.OptimizeNetgen', int(netgen))
+    number('gmsh/optimization/smoothing', 'Mesh.Smoothing',
+           int(quality.get('smoothing', 1) or 0))
+    number('gmsh/optimization/optimizeThreshold', 'Mesh.OptimizeThreshold',
+           float(quality.get('optimizeThreshold', 0.3)))
+    number('gmsh/optimization/qualityType', 'Mesh.QualityType',
+           RUNNER_QUALITY_MEASURE.get(quality.get('qualityType', 'sicn'), 0))
+    random_factor = quality.get('randomFactor')
+    if random_factor is None:
+        random_factor = algorithms.get('randomFactor')
+    if random_factor is not None:
+        number('gmsh/default/randomFactor', 'Mesh.RandomFactor',
+               float(random_factor))
+    else:
+        rows.append(PageOption(
+            'gmsh/default/randomFactor', 'Mesh.RandomFactor', None,
+            readback=True,
+            note='Gmsh default (Mesh.RandomFactor), not set by FoamMesh'))
+
+    if algorithms.get('recombine'):
+        number('gmsh/algorithms/recombine', 'Mesh.RecombineAll', 1)
+        recombiner = int(algorithms.get('recombinationCode', 1) or 0)
+        if recombiner not in RUNNER_TESTED_RECOMBINERS:
+            rows.append(PageOption(
+                'gmsh/algorithms/recombinationAlgorithm', None,
+                requested=recombiner, effective=1, applied=False,
+                note='qualified values are '
+                     + ', '.join(str(item) for item
+                                 in sorted(RUNNER_TESTED_RECOMBINERS)),
+                warning=f'recombination algorithm {recombiner} was asked '
+                        'for and is not one this product has qualified; '
+                        'blossom was used instead'))
+            recombiner = 1
+        number('gmsh/algorithms/recombinationAlgorithm',
+               'Mesh.RecombinationAlgorithm', recombiner)
+    if (intent.get('structuring') or {}).get('transfiniteTri'):
+        number('gmsh/structuring/transfiniteTri', 'Mesh.TransfiniteTri', 1)
+
+    order = int(export.get('elementOrder', 1) or 1)
+    high = int(quality.get('highOrderOptimize', 0) or 0)
+    if order < 2:
+        route = {'openfoam': 'OpenFOAM', 'su2': 'SU2'}.get(
+            str(export.get('targetSolver') or '').lower())
+        rows.append(PageOption(
+            'gmsh/output/elementOrder', None, requested=order, effective=1,
+            note='first order; the default' + (
+                f' and the only order the {route} export can read'
+                if route else '')))
+        rows.append(PageOption(
+            'gmsh/optimization/highOrderOptimize', None, requested=high,
+            effective=0,
+            note='not set: the high-order optimiser only acts on an order-2 '
+                 'mesh'))
+    else:
+        number('gmsh/output/elementOrder', 'Mesh.ElementOrder', order)
+        number('gmsh/output/secondOrderIncomplete',
+               'Mesh.SecondOrderIncomplete',
+               int(bool(export.get('secondOrderIncomplete', False))))
+        number('gmsh/output/secondOrderLinear', 'Mesh.SecondOrderLinear',
+               int(bool(export.get('secondOrderLinear', False))))
+        number('gmsh/optimization/highOrderOptimize',
+               'Mesh.HighOrderOptimize', high)
+    return tuple(rows)
+
+
+def ledger_matched(requested, effective, matched=None):
+    """The runner ledger's comparison rule (``Ledger.record``)."""
+    import math
+
+    if matched is not None:
+        return bool(matched)
+    if (isinstance(requested, (int, float))
+            and isinstance(effective, (int, float))):
+        return math.isclose(float(requested), float(effective),
+                            rel_tol=1e-9, abs_tol=1e-12)
+    if requested is not None and effective is not None:
+        return str(requested) == str(effective)
+    return None
+
+
+def ledger_entry(control, requested, effective, *, applied=True, note='',
+                 matched=None) -> dict:
+    """One ledger line in the shape the runner writes."""
+    return {'control': control, 'requested': requested,
+            'effective': effective, 'applied': bool(applied),
+            'matched': ledger_matched(requested, effective, matched),
+            'note': note}
+
+
+def ledger_difference(session_entries, run_entries, *,
+                      controls=None) -> list[dict]:
+    """Where the session's ledger and a batch run's disagree.
+
+    Compared by control, over the controls both have (or over *controls*):
+    the requested value, the effective value and whether it applied. An empty
+    list is a session that did what the batch run did.
+    """
+    def by_control(entries):
+        table = {}
+        for entry in entries or ():
+            table.setdefault(entry.get('control'), []).append(entry)
+        return table
+
+    left, right = by_control(session_entries), by_control(run_entries)
+    wanted = (list(controls) if controls is not None
+              else sorted(set(left) & set(right), key=str))
+    differences = []
+    for control in wanted:
+        one, other = left.get(control), right.get(control)
+        if one is None or other is None:
+            differences.append({'control': control, 'session': one,
+                                'run': other,
+                                'why': 'only one path recorded it'})
+            continue
+        keys = ('requested', 'effective', 'applied')
+        if ([[e.get(k) for k in keys] for e in one]
+                != [[e.get(k) for k in keys] for e in other]):
+            differences.append({'control': control, 'session': one,
+                                'run': other, 'why': 'values differ'})
+    return differences

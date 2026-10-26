@@ -1,11 +1,22 @@
 """Gmsh's Plugins window, as a dock on the Generate mesh page.
 
-Plan 41 GN20 (T-02, P-02, M-16).  Choose a plugin, set its options, give it an
-input view where it needs one, and run it on the mesh in the session.  Every
-view the plugin makes is listed with its extremes and drawn in the viewport
-coloured by its value; a result can be kept as the input of the next plugin
-(``CutPlane`` on a ``Distance`` view), hidden, removed, or written as a
-``PostView`` size field.  Nothing here depends on the target solver.
+Plan 41 GN20 (T-02, P-02, M-16), Plan 48 GM9 (section 4.11).  Choose one of
+the 31 mesh plugins, set its options (numbers, switches and text, each with
+Gmsh's own default), give it an input view where it needs one, and run it on
+the mesh in the session.  The input view can be any view of the session: a
+plugin result, an Analyse mesh quality view, a size-data view.  Every view the
+plugin makes is listed with its extremes and drawn in the viewport coloured by
+its value; a result can be kept as the input of the next plugin (``CutPlane``
+on a ``Distance`` view), hidden, removed, or written as a ``PostView`` size
+field.  Nothing here depends on the target solver.
+
+Extension point (GM16b, CVTRemesh).  A package that builds a plugin of its own
+registers a ``plugin_catalogue.Plugin`` with ``plugin_catalogue.register_extra``
+and, if it wants its own form instead of the generated one, a panel in
+``view/gmsh_tools/registry.py`` with ``area=PLUGIN_PANEL_AREA`` and the id
+``extra_panel_id(name)``.  This file is not edited for it: the choice list
+follows the catalogue, and a chosen plugin with a registered panel shows that
+panel in place of the generated form.
 """
 from __future__ import annotations
 
@@ -14,8 +25,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QHBoxLayout,
-    QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QLineEdit, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from foammesh.view.combo_items import set_item_enabled
@@ -26,6 +37,26 @@ from foammesh.view.workflow_controls.length_box import (
 from foammesh.core.gmsh import field_catalogue, plugin_catalogue
 
 COLUMNS = ('View', 'Name', 'Cells', 'Min', 'Average', 'Max', 'Shown')
+
+#: The ``area`` a package gives a registry panel to have it shown as the form of
+#: a plugin (see the module docstring).
+PLUGIN_PANEL_AREA = 'plugins'
+
+
+def extra_panel_id(name: str) -> str:
+    """Registry id of the form for plugin *name* (``gmsh.plugins.cvtremesh``)."""
+    return 'gmsh.plugins.' + str(name).lower()
+
+
+def extra_panel_entry(name: str):
+    """The registry entry that supplies the form of plugin *name*, or None."""
+    from foammesh.view.gmsh_tools import registry
+
+    wanted = extra_panel_id(name)
+    for entry in registry.panels('gmsh'):
+        if entry.id == wanted and entry.area == PLUGIN_PANEL_AREA:
+            return entry
+    return None
 
 
 def _number(value) -> str:
@@ -58,13 +89,7 @@ class GmshPluginsPanel(QWidget):
         self._choice = QComboBox(self)
         self._choice.setObjectName('gmshPluginChoice')
         self._choice.setAccessibleName(self.tr('Gmsh plugin'))
-        for entry in plugin_catalogue.PLUGINS:
-            self._choice.addItem(entry.title, entry.name)
-            if entry.unavailable:
-                last = self._choice.count() - 1
-                set_item_enabled(self._choice, last, False)
-                self._choice.setItemData(
-                    last, entry.unavailable, Qt.ItemDataRole.ToolTipRole)
+        self._fillChoice()
         self._choice.currentIndexChanged.connect(self._onChosen)
         layout.addWidget(self._choice)
 
@@ -85,11 +110,32 @@ class GmshPluginsPanel(QWidget):
         self._input_label = QLabel(self.tr('Input view'), self)
         self._form.addRow(self._input_label, self._input)
 
+        self._extra_host = QWidget(self)
+        self._extra_host.setObjectName('gmshPluginExtraForm')
+        self._extra_layout = QVBoxLayout(self._extra_host)
+        self._extra_layout.setContentsMargins(0, 0, 0, 0)
+        self._extra_host.setVisible(False)
+        self._extra = None
+        layout.addWidget(self._extra_host)
+
         buttons = QHBoxLayout()
         self._run = QPushButton(self.tr('Run plugin'), self)
         self._run.setObjectName('gmshPluginRun')
         self._run.clicked.connect(lambda _c=False: self.run())
         buttons.addWidget(self._run)
+        self._defaults = QPushButton(self.tr('Gmsh defaults'), self)
+        self._defaults.setObjectName('gmshPluginDefaults')
+        self._defaults.setToolTip(self.tr(
+            'Put every option of this plugin back to the value Gmsh itself '
+            'declares'))
+        self._defaults.clicked.connect(lambda _c=False: self.resetDefaults())
+        buttons.addWidget(self._defaults)
+        self._showInput = QPushButton(self.tr('Show input view'), self)
+        self._showInput.setObjectName('gmshPluginShowInput')
+        self._showInput.setToolTip(self.tr(
+            'Draw the chosen input view in the viewport'))
+        self._showInput.clicked.connect(lambda _c=False: self.showInputView())
+        buttons.addWidget(self._showInput)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
@@ -147,15 +193,53 @@ class GmshPluginsPanel(QWidget):
 
     # -- the chosen plugin and its options ----------------------------------- #
 
+    def _fillChoice(self) -> None:
+        keep = self._choice.currentData()
+        self._choice.blockSignals(True)
+        self._choice.clear()
+        for entry in plugin_catalogue.PLUGINS:
+            self._choice.addItem(entry.title, entry.name)
+            last = self._choice.count() - 1
+            self._choice.setItemData(
+                last, entry.summary, Qt.ItemDataRole.ToolTipRole)
+            if entry.unavailable:
+                set_item_enabled(self._choice, last, False)
+                self._choice.setItemData(
+                    last, entry.unavailable, Qt.ItemDataRole.ToolTipRole)
+        index = self._choice.findData(keep) if keep else 0
+        self._choice.setCurrentIndex(max(index, 0))
+        self._choice.blockSignals(False)
+
+    def refreshPlugins(self) -> None:
+        """Follow the catalogue: a package may have registered a plugin."""
+        names = [self._choice.itemData(i) for i in range(self._choice.count())]
+        if names != [p.name for p in plugin_catalogue.PLUGINS]:
+            self._fillChoice()
+            self._onChosen()
+
+    def showEvent(self, event) -> None:
+        self.refreshPlugins()
+        super().showEvent(event)
+
     def pluginName(self) -> str:
         return str(self._choice.currentData() or '')
+
+    def pluginNames(self) -> list:
+        return [self._choice.itemData(i) for i in range(self._choice.count())]
 
     def choosePlugin(self, name: str) -> bool:
         index = self._choice.findData(name)
         if index < 0:
+            self.refreshPlugins()
+            index = self._choice.findData(name)
+        if index < 0:
             return False
         self._choice.setCurrentIndex(index)
         return True
+
+    def extraForm(self):
+        """The registered form shown for the chosen plugin, or None."""
+        return self._extra
 
     def _onChosen(self, *_args) -> None:
         entry = plugin_catalogue.BY_NAME.get(self.pluginName())
@@ -165,12 +249,21 @@ class GmshPluginsPanel(QWidget):
             editor.deleteLater()
             label.deleteLater()
         self._editors = {}
+        self._dropExtra()
         if entry is None:
             return
         self._summary.setText(
             entry.summary + (' ' + entry.unavailable if entry.unavailable
                              else ''))
-        for option in entry.options:
+        self._summary.setToolTip(entry.help)
+        supplied = extra_panel_entry(entry.name)
+        if supplied is not None:
+            self._extra = supplied.factory(self._extra_host)
+            self._extra_layout.addWidget(self._extra)
+        self._extra_host.setVisible(self._extra is not None)
+        self._run.setVisible(self._extra is None)
+        self._defaults.setVisible(self._extra is None)
+        for option in ([] if self._extra is not None else entry.options):
             if option.name in ('View', 'OtherView'):
                 continue             # the input view box fills these
             editor = self._makeEditor(option)
@@ -184,15 +277,35 @@ class GmshPluginsPanel(QWidget):
                      if isinstance(editor, ModelLengthBox) else editor)
             self._form.insertRow(self._form.rowCount() - 1, label, shown)
             self._editors[option.name] = (editor, label)
-        takes_view = entry.needs_view or any(
-            o.name == 'View' for o in entry.options)
+        takes_view = (entry.needs_view or entry.takes_view) \
+            and self._extra is None
         self._input.setVisible(takes_view)
         self._input_label.setVisible(takes_view)
+        self._showInput.setVisible(takes_view)
         self._run.setEnabled(not entry.unavailable)
         self._fillInputs()
 
+    def _dropExtra(self) -> None:
+        if self._extra is not None:
+            self._extra.setParent(None)
+            self._extra.deleteLater()
+            self._extra = None
+
+    def resetDefaults(self) -> None:
+        """Put every option back to the value Gmsh declares for it."""
+        entry = plugin_catalogue.BY_NAME.get(self.pluginName())
+        if entry is None:
+            return
+        for option in entry.options:
+            if option.name in self._editors:
+                self.setValue(option.name, option.default)
+
     def _makeEditor(self, option):
-        if option.kind == 'bool':
+        if option.kind == 'string':
+            editor = QLineEdit(self)
+            editor.setText(str(option.default))
+            editor.setClearButtonEnabled(True)
+        elif option.kind == 'bool':
             editor = QCheckBox(self)
             editor.setChecked(bool(option.default))
         elif option.kind == 'int':
@@ -210,9 +323,12 @@ class GmshPluginsPanel(QWidget):
         return editor
 
     def values(self) -> dict:
+        """Every shown option: a float for a number, a ``str`` for a text."""
         out = {}
         for name, (editor, _label) in self._editors.items():
-            if isinstance(editor, QCheckBox):
+            if isinstance(editor, QLineEdit):
+                out[name] = editor.text()
+            elif isinstance(editor, QCheckBox):
                 out[name] = 1.0 if editor.isChecked() else 0.0
             elif isinstance(editor, ModelLengthBox):
                 out[name] = float(editor.modelValue())
@@ -222,21 +338,41 @@ class GmshPluginsPanel(QWidget):
 
     def setValue(self, name: str, value) -> None:
         editor = self._editors[name][0]
-        if isinstance(editor, QCheckBox):
+        if isinstance(editor, QLineEdit):
+            editor.setText('' if value is None else str(value))
+        elif isinstance(editor, QCheckBox):
             editor.setChecked(bool(value))
         elif isinstance(editor, ModelLengthBox):
             editor.setModelValue(float(value))
         else:
             editor.setValue(value)
 
+    def sessionViews(self) -> list:
+        """Every view the session holds (not only those this panel made)."""
+        controller = self._controller()
+        listing = getattr(controller, 'plugin_views', None)
+        if controller is None or not callable(listing):
+            return []
+        try:
+            return [dict(v) for v in listing() or ()]
+        except Exception:                                # noqa: BLE001
+            return []
+
     def _fillInputs(self) -> None:
         keep = self._input.currentData()
         self._input.blockSignals(True)
         self._input.clear()
         self._input.addItem(self.tr('(none)'), None)
+        seen = set()
         for row in self._rows:
             if row.get('tag') is not None:
+                seen.add(row['tag'])
                 self._input.addItem(f"{row['tag']}: {row['name']}", row['tag'])
+        for view in self.sessionViews():
+            if view.get('tag') is not None and view['tag'] not in seen:
+                seen.add(view['tag'])
+                self._input.addItem(
+                    f"{view['tag']}: {view.get('name', '')}", view['tag'])
         index = self._input.findData(keep) if keep is not None else -1
         if index < 0 and self._input.count() > 1:
             index = self._input.count() - 1
@@ -267,13 +403,13 @@ class GmshPluginsPanel(QWidget):
             return {}
         name = self.pluginName()
         entry = plugin_catalogue.BY_NAME[name]
-        takes_view = entry.needs_view or any(o.name == 'View' for o in entry.options)
+        takes_view = entry.needs_view or entry.takes_view
         view = self._input.currentData() if takes_view else None
         from .generate_panel import beginSessionAction
 
         handle = beginSessionAction(controller, self.tr('Plugin %s') % name)
         try:
-            result = controller.run_plugin(name, self.values(), view=view)
+            result = self._runOn(controller, name, view)
         except Exception as error:                       # noqa: BLE001
             if handle is not None:
                 handle.finish(False, str(error))
@@ -284,6 +420,51 @@ class GmshPluginsPanel(QWidget):
         self._say('')
         self._adopt(result, entry)
         return result
+
+    def _runOn(self, controller, name: str, view) -> dict:
+        """Run with every option, text included.
+
+        The window's controller is a ``GenerateController``; one that offers
+        only ``run_plugin`` (numbers) is still driven, without text options.
+        """
+        if hasattr(controller, '_lock') and hasattr(controller, 'session'):
+            return plugin_catalogue.run_on_controller(
+                controller, name, self.values(), view=view)
+        numbers = plugin_catalogue.numbers_for(name, self.values())
+        return controller.run_plugin(name, numbers, view=view)
+
+    def showInputView(self) -> dict:
+        """Draw the chosen input view, whichever package or plugin made it."""
+        tag = self._input.currentData()
+        if tag is None:
+            self._say(self.tr('Choose an input view first.'))
+            return {}
+        known = [r for r in self._rows if r.get('tag') == tag]
+        if known and known[0].get('path'):
+            return self._draw(known[0])
+        controller = self._controller()
+        with_lock = getattr(controller, '_lock', None)
+        live = getattr(controller, 'session', None)
+        if controller is None or live is None or with_lock is None:
+            self._say(self.tr('There is no mesh yet; generate one first.'))
+            return {}
+        try:
+            with with_lock:
+                directory = controller.plugin_directory()
+                row = live.call('session.plugin_describe', int(tag),
+                                live.runtime_path(directory))
+                if row.get('path'):
+                    row['host_path'] = str(Path(directory) / Path(
+                        row['path']).name)
+        except Exception as error:                       # noqa: BLE001
+            self._say(str(error))
+            return {}
+        if not row.get('path'):
+            self._say(self.tr('That view has no elements to draw.'))
+            return row
+        self._rows = [r for r in self._rows if r.get('tag') != tag] + [row]
+        self._fillTable()
+        return self._draw(row)
 
     def _adopt(self, result: dict, entry) -> None:
         fresh = [dict(item) for item in result.get('views') or ()]
@@ -341,6 +522,34 @@ class GmshPluginsPanel(QWidget):
 
     def selectResult(self, row_index: int) -> None:
         self._table.setCurrentCell(row_index, 0)
+
+    # -- what the panel shows (Plan 48 PA4: the local API reads the same) ------ #
+
+    def noteText(self) -> str:
+        return self._note.text() if not self._note.isHidden() else ''
+
+    def logText(self) -> str:
+        return self._log.text() if not self._log.isHidden() else ''
+
+    def tableRows(self) -> list:
+        """The results table as text, one list per row (View ... Shown)."""
+        return [[(self._table.item(row, column).text()
+                  if self._table.item(row, column) is not None else '')
+                 for column in range(self._table.columnCount())]
+                for row in range(self._table.rowCount())]
+
+    def rowIndexOfTag(self, tag) -> int:
+        """The row of the result that is view *tag*, or -1."""
+        for index, row in enumerate(self._rows):
+            if row.get('tag') is not None and int(row['tag']) == int(tag):
+                return index
+        return -1
+
+    def selectedIndex(self) -> int:
+        return self._table.currentRow()
+
+    def inputTag(self):
+        return self._input.currentData()
 
     def _viewOf(self):
         if self._plugin_view is None:
@@ -438,14 +647,10 @@ class GmshPluginsPanel(QWidget):
         except Exception as error:                       # noqa: BLE001
             self._say(str(error))
             return {}
-        names = {r.get('name') for r in stored}
-        number = 1
-        while f'postView{number}' in names:
-            number += 1
-        new = field_catalogue.new_row('PostView', f'postView{number}')
-        new['params'] = {'ViewTag': int(row['tag'])}
-        new['background'] = True
-        stored.append(new)
+        # The row is built by the helper gmsh.fields.use_view builds it with,
+        # so the button and the route cannot differ (Plan 48 PA3).
+        from foammesh.core.facade.plan48.pa3_routes import use_view_rows
+        stored, new = use_view_rows(stored, int(row['tag']))
         from foammesh.view.facade_client import submit
         submit(self._client, 'configuration.patch',
                {'patch': {field_catalogue.FIELD_ID:

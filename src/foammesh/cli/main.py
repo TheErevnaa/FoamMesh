@@ -225,6 +225,11 @@ def _cmd_export(args) -> int:
     }
     operation = operations.get(args.format)
     if operation is None:
+        from foammesh.core.gmsh.option_catalogue import MEDIT_RETIRED
+        if str(args.format).strip().lower() in ('mesh', 'medit', 'meshb'):
+            # DP-1437: the Medit writer is retired, not unknown.
+            print(f'error: {MEDIT_RETIRED}', file=sys.stderr)
+            return 1
         print(f'error: unknown export format {args.format!r}', file=sys.stderr)
         return 1
     parameters = {'write_format': args.write_format, 'compression': args.compression,

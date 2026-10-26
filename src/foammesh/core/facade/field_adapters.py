@@ -188,6 +188,8 @@ def _collection_ui(collection_id: str) -> str:
         'meshing.castellation.exclude_points': 'workflow.region',
         'meshing.layers.groups': 'workflow.layers',
         'geometry.interface_pairs': 'workflow.geometry.interfaces',
+        # Plan 49 SR8. Read-only; shown in the interface and periodic tables.
+        'geometry.surface_relations': 'workflow.geometry.interfaces',
     }.get(collection_id, '')
 
 

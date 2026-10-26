@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 
 #: Kept here so callers can name the modes without loading the resource file.
@@ -25,21 +26,41 @@ MODE_UNSET = ''
 MODES = (MODE_SELECTED, MODE_ALL_WALLS)
 
 
-def layer_targets_module():
-    """The shared rule, loaded once per process."""
-    module = sys.modules.get('foammesh._layer_targets')
-    if module is not None:
-        return module
-    from resources import resource
+_LOADING = threading.Lock()
+_LOADED = False
 
-    location = Path(resource.file('gmsh/layer_targets.py')).resolve()
-    spec = importlib.util.spec_from_file_location(
-        'foammesh._layer_targets', location)
-    module = importlib.util.module_from_spec(spec)
-    # Registered before execution, as the field graph loader explains.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+
+def layer_targets_module():
+    """The shared rule, loaded once per process.
+
+    The module is registered before it executes, so another thread could
+    find it half made (measured: two matrix judges at once read
+    ``boundary_category`` before it was defined); the lock makes a second
+    caller wait until the first has run the file.
+    """
+    global _LOADED
+    module = sys.modules.get('foammesh._layer_targets')
+    if module is not None and _LOADED:
+        return module
+    with _LOADING:
+        module = sys.modules.get('foammesh._layer_targets')
+        if module is not None and _LOADED:
+            return module
+        from resources import resource
+
+        location = Path(resource.file('gmsh/layer_targets.py')).resolve()
+        spec = importlib.util.spec_from_file_location(
+            'foammesh._layer_targets', location)
+        module = importlib.util.module_from_spec(spec)
+        # Registered before execution, as the field graph loader explains.
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
+        _LOADED = True
+        return module
 
 
 def boundary_category(name, category='') -> str:

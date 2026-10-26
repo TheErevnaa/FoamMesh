@@ -216,6 +216,49 @@ _BOOLEANS = {'cut': 'BooleanDifference', 'fuse': 'BooleanUnion',
              'fragment': 'BooleanFragments'}
 
 
+def _layers(row, count_index, heights_index, recombine_index) -> str:
+    """The ``Layers{...}; Recombine;`` clauses of an extrusion call."""
+    counts = _arg(row, count_index, 'numElements', []) or []
+    heights = _arg(row, heights_index, 'heights', []) or []
+    recombine = _arg(row, recombine_index, 'recombine', False)
+    parts = []
+    if counts:
+        if heights:
+            parts.append('Layers{ %s, %s };' % (_list(counts),
+                                                _list(heights)))
+        elif len(counts) == 1:
+            parts.append('Layers{ %d };' % int(counts[0]))
+        else:
+            parts.append('Layers{ %s, %s };' % (
+                _list(counts), _list([1.0] * len(counts))))
+    if recombine:
+        parts.append('Recombine;')
+    return ' '.join(parts)
+
+
+def _extrusion(last, row):
+    """``Extrude {...} { Surface{1}; Layers{3}; }`` for extrude, revolve and
+    twist (a translation plus a rotation), or ``None``."""
+    a = row.get('a', [])
+    if last == 'extrude':
+        head = '{%s, %s, %s}' % (_num(a[1]), _num(a[2]), _num(a[3]))
+        layers = _layers(row, 4, 5, 6)
+    elif last == 'revolve':
+        head = '{ {%s, %s, %s}, {%s, %s, %s}, %s }' % (
+            _num(a[4]), _num(a[5]), _num(a[6]), _num(a[1]), _num(a[2]),
+            _num(a[3]), _num(a[7]))
+        layers = _layers(row, 8, 9, 10)
+    elif last == 'twist':
+        head = '{ {%s, %s, %s}, {%s, %s, %s}, {%s, %s, %s}, %s }' % (
+            _num(a[4]), _num(a[5]), _num(a[6]), _num(a[7]), _num(a[8]),
+            _num(a[9]), _num(a[1]), _num(a[2]), _num(a[3]), _num(a[10]))
+        layers = _layers(row, 11, 12, 13)
+    else:
+        return None
+    return 'Extrude %s { %s%s }' % (head, _dimtags(a[0]),
+                                    (' ' + layers) if layers else '')
+
+
 def _creation(name: str, row: dict) -> str:
     if name in _SIMPLE:
         return _SIMPLE[name](row)
@@ -250,11 +293,31 @@ def to_geo(calls: list) -> Script:
         gaps.append('%s: %s' % (row['f'], why))
         out.append('// NOT IN THIS SCRIPT (%s): %s' % (why, _call_text(row)))
 
-    for row in calls:
+    skip = -1
+    for position, row in enumerate(calls):
+        if position == skip:
+            continue
         f = row['f']
         a = row.get('a', [])
         if row.get('omitted'):
             gap(row, 'its arguments were too large to keep')
+            continue
+        if f == 'parser.setNumber':
+            # Parameter: Gmsh's own statement is  name = DefineNumber[ v,
+            # Name "path/label" ];  (the session sets the parser value, then
+            # the ONELAB value)
+            following = calls[position + 1] if position + 1 < len(calls) \
+                else None
+            if following and following['f'] == 'onelab.setNumber':
+                out.append('%s = DefineNumber[ %s, Name %s ];' % (
+                    a[0], _num(a[1][0]), _quote(following['a'][0])))
+                skip = position + 1
+            else:
+                out.append('%s = %s;' % (a[0], _num(a[1][0])))
+            continue
+        if f == 'onelab.setNumber':
+            out.append('DefineNumber[ %s, Name %s ];' % (
+                _num(a[1][0]), _quote(a[0])))
             continue
         if f == '#geo':
             out.append(a[0].rstrip())
@@ -294,6 +357,115 @@ def to_geo(calls: list) -> Script:
                 _BOOLEANS[last], _dimtags(objects),
                 ' Delete;' if remove_object else '',
                 _dimtags(tools), ' Delete;' if remove_tool else ''))
+        elif kernel and last in ('extrude', 'revolve', 'twist'):
+            use(kernel)
+            out.append(_extrusion(last, row))
+        elif kernel == 'occ' and last in ('addCircle', 'addEllipse'):
+            use('occ')
+            if last == 'addCircle':
+                axes = [v for v in (_arg(row, 7, 'zAxis', []),
+                                    _arg(row, 8, 'xAxis', [])) if v]
+                if axes:
+                    gap(row, 'a circle with its own axes has no .geo '
+                             'statement')
+                else:
+                    out.append('Circle(%d) = {%s, %s, %s, %s, %s, %s};' % (
+                        _tag(row, 4), _num(a[0]), _num(a[1]), _num(a[2]),
+                        _num(a[3]), _num(_arg(row, 5, 'angle1', 0.0)),
+                        _num(_arg(row, 6, 'angle2', 6.283185307179586))))
+            else:
+                axes = [v for v in (_arg(row, 8, 'zAxis', []),
+                                    _arg(row, 9, 'xAxis', [])) if v]
+                if axes:
+                    gap(row, 'an ellipse with its own axes has no .geo '
+                             'statement')
+                else:
+                    out.append('Ellipse(%d) = {%s, %s, %s, %s, %s, %s, %s};'
+                               % (_tag(row, 5), _num(a[0]), _num(a[1]),
+                                  _num(a[2]), _num(a[3]), _num(a[4]),
+                                  _num(_arg(row, 6, 'angle1', 0.0)),
+                                  _num(_arg(row, 7, 'angle2',
+                                            6.283185307179586))))
+        elif kernel == 'occ' and last == 'addPipe':
+            use('occ')
+            if _arg(row, 2, 'trihedron', ''):
+                gap(row, 'a pipe with a chosen trihedron has no .geo '
+                         'statement')
+            else:
+                out.append('Extrude { %s } Using Wire {%d}' % (
+                    _dimtags(a[0]), int(_arg(row, 1, 'wireTag'))))
+        elif kernel == 'occ' and last == 'addThruSections':
+            use('occ')
+            plain = (_arg(row, 2, 'makeSolid', True)
+                     and int(_arg(row, 4, 'maxDegree', -1)) == -1
+                     and not _arg(row, 5, 'continuity', '')
+                     and not _arg(row, 6, 'parametrization', '')
+                     and not _arg(row, 7, 'smoothing', False))
+            if plain:
+                out.append('%sThruSections(%d) = %s;' % (
+                    'Ruled ' if _arg(row, 3, 'makeRuled', False) else '',
+                    _tag(row, 1), _list(a[0])))
+            else:
+                gap(row, 'a loft with these options has no .geo statement')
+        elif kernel == 'occ' and last == 'addThickSolid':
+            use('occ')
+            out.append('ThickSolid(%d) = %s;' % (
+                _tag(row, 3), _list([a[0]] + list(a[1]) + [a[2]])))
+        elif kernel == 'occ' and last in ('fillet', 'chamfer'):
+            use('occ')
+            if last == 'fillet':
+                if _arg(row, 3, 'removeVolume', True):
+                    out.append('Fillet %s %s %s' % (
+                        _list(a[0]), _list(a[1]), _list(a[2])))
+                else:
+                    gap(row, 'keeping the original volume has no .geo '
+                             'statement')
+            elif _arg(row, 4, 'removeVolume', True):
+                out.append('Chamfer %s %s %s %s' % (
+                    _list(a[0]), _list(a[1]), _list(a[2]), _list(a[3])))
+            else:
+                gap(row, 'keeping the original volume has no .geo '
+                         'statement')
+        elif kernel == 'geo' and last == 'splitCurve':
+            gap(row, 'Split curve has no .geo statement')
+        elif kernel == 'occ' and last in ('addBSplineFilling',
+                                          'addBezierFilling'):
+            # Plan 48 GB. BSpline Surface(n) = {loop}; is Gmsh's statement
+            # for the default filling; it has no word for the type.
+            use('occ')
+            if _arg(row, 2, 'type', ''):
+                gap(row, 'a filling with a chosen type (%s) has no .geo '
+                         'statement' % _arg(row, 2, 'type', ''))
+            else:
+                out.append('%s Surface(%d) = {%d};' % (
+                    'BSpline' if last == 'addBSplineFilling' else 'Bezier',
+                    _tag(row, 1), int(a[0])))
+        elif kernel == 'occ' and last in ('addBSplineSurface',
+                                          'addBezierSurface',
+                                          'addTrimmedSurface'):
+            gap(row, 'a surface from control points, or a trimmed surface, '
+                     'has no .geo statement')
+        elif kernel == 'occ' and last == 'affineTransform':
+            use('occ')
+            out.append('Affine {%s} { %s }' % (
+                ', '.join(_num(v) for v in a[1]), _dimtags(a[0])))
+        elif kernel and last == 'copy':
+            use(kernel)
+            out.append('Duplicata { %s }' % _dimtags(a[0]))
+        elif kernel == 'geo' and last in ('addCompoundSpline',
+                                          'addCompoundBSpline'):
+            use('geo')
+            out.append('Compound %s(%d) = %s Using %d;' % (
+                'Spline' if last == 'addCompoundSpline' else 'BSpline',
+                _tag(row, 2), _list(a[0]),
+                int(_arg(row, 1, 'numIntervals',
+                         5 if last == 'addCompoundSpline' else 20))))
+        elif kernel == 'geo' and last == 'addPolyline':
+            gap(row, 'a polyline has no .geo statement')
+        elif kernel == 'geo' and last == 'addPointOnGeometry':
+            gap(row, 'a point on a geometry has no .geo statement')
+        elif kernel == 'geo' and last == 'addGeometry':
+            gap(row, 'a parametric geometry has no .geo statement')
         elif kernel and last == 'translate':
             use(kernel)
             out.append('Translate {%s, %s, %s} { %s }' % (

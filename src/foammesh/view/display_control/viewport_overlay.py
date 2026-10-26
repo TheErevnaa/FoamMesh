@@ -685,7 +685,26 @@ class ViewportOverlay(QFrame):
         self._noticePatches = QLabel()
         self._noticePatches.setObjectName('overlayPreviewPatches')
         self._noticePatches.setWordWrap(True)
-        noticeLayout.addWidget(self._noticeText)
+        # DP-5713. The notice is a line over the view, never a box the user
+        # cannot get rid of: a close control beside the sentence hides it,
+        # and the same notice is not shown again on the next redraw.
+        self._noticeDismiss = QToolButton()
+        self._noticeDismiss.setObjectName('overlayPreview_dismiss')
+        self._noticeDismiss.setText('×')
+        self._noticeDismiss.setAutoRaise(True)
+        self._noticeDismiss.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._noticeDismiss.setToolTip(self.tr('Dismiss this notice'))
+        self._noticeDismiss.setAccessibleName(self.tr('Dismiss notice'))
+        self._noticeDismiss.clicked.connect(self.dismissPreviewNotice)
+        #: The notice the user closed, so a redraw does not bring it back.
+        self._noticeDismissed = None
+        self._noticeKey = None
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(GAP_TIGHT)
+        head.addWidget(self._noticeText, 1)
+        head.addWidget(self._noticeDismiss, 0, Qt.AlignmentFlag.AlignTop)
+        noticeLayout.addLayout(head)
         noticeLayout.addWidget(self._noticePatches)
         buttons = QHBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
@@ -696,8 +715,7 @@ class ViewportOverlay(QFrame):
             button = QPushButton(label)
             button.setObjectName(f'overlayPreview_{action}')
             button.clicked.connect(
-                lambda _checked=False, a=action:
-                self.previewActionRequested.emit(a))
+                lambda _checked=False, a=action: self._requestPreview(a))
             buttons.addWidget(button)
             self._noticeButtons[action] = button
         buttons.addStretch(1)
@@ -1030,6 +1048,15 @@ class ViewportOverlay(QFrame):
         text = str(notice.get('text') or '')
         patches = list(notice.get('patches') or [])
         actions = set(notice.get('actions') or [])
+        # DP-5713. A notice the user closed stays closed while it is the
+        # same notice: the manager says it again on every scene swap.
+        key = (str(notice.get('kind') or ''), str(notice.get('reason') or ''),
+               text) if text else None
+        self._noticeKey = key
+        if key == self._noticeDismissed and key is not None:
+            text = ''
+        else:
+            self._noticeDismissed = None
         self._noticeText.setText(text)
         self._noticeText.setToolTip(text)
         lines = [self.tr('{0}: {1:,} faces').format(name, int(count))
@@ -1045,6 +1072,43 @@ class ViewportOverlay(QFrame):
         self._notice.updateGeometry()
         self._updateSceneEmpty()
         self.adjustSize()
+
+    def dismissPreviewNotice(self):
+        """DP-5713. Hide the preview notice until a different one comes."""
+        if self._notice.isHidden():
+            return
+        self._noticeDismissed = self._noticeKey
+        self._notice.setVisible(False)
+        self._notice.updateGeometry()
+        self._updateSceneEmpty()
+        self.adjustSize()
+
+    def previewNoticeState(self) -> dict:
+        """DP-5734. What the preview notice shows, for the local API: its
+        sentence, the patch lines under it and the buttons it offers."""
+        shown = not self._notice.isHidden()
+        patches = self._noticePatches.text()
+        return {
+            'shown': shown,
+            'text': self._noticeText.text() if shown else '',
+            'patches': patches.split('\n') if shown and patches else [],
+            'actions': [action for action, button in self._noticeButtons.items()
+                        if shown and not button.isHidden()],
+            'dismissed': self._noticeDismissed is not None,
+        }
+
+    def pressPreviewNotice(self, action: str) -> None:
+        """DP-5734. Press the notice's close control or one of its buttons,
+        as a click would."""
+        if action == 'dismiss':
+            self._noticeDismiss.click()
+        else:
+            self._noticeButtons[action].click()
+
+    def _requestPreview(self, action: str):
+        # Asking again is asking to be told again.
+        self._noticeDismissed = None
+        self.previewActionRequested.emit(action)
 
     def previewNoticeWidget(self) -> QWidget:
         """Plan 43 LY7. The notice, for the Viewport notice strip to adopt.

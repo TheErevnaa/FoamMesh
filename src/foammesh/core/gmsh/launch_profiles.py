@@ -26,6 +26,81 @@ class GmshProfileError(ValueError):
     pass
 
 
+# --------------------------------------------------------------------------- #
+# FoamMesh's own Gmsh build (Plan 48 GM16a, section 4.15)
+# --------------------------------------------------------------------------- #
+#
+# FoamMesh ships its own Gmsh 4.15.2, built with Revoropt on (CVTRemesh) and
+# every other option of the official wheel (``scripts/gmsh_build``). It is put
+# into the user's own distribution the way ``foammesh-sizefield`` is: one file
+# FoamMesh ships, copied on the user's say-so under their home, no root, no
+# distribution image, no download.
+#
+#     ``$HOME/.local/share/foammesh/gmsh/<BUILD_ID>/lib/{gmsh.py,libgmsh.so.4.15}``
+#
+# Every Python the user's distribution starts (the resident session, the batch
+# runner, the export converter, the probe) finds it the same way: a
+# ``foammesh_gmsh.pth`` in the user's own site-packages puts that ``lib``
+# folder ahead of the system ``dist-packages``, where the official wheel is.
+# Nothing is chosen per call, so no path can reach the wheel by accident.
+# When the build is not installed, the wheel is used, and the probe says so
+# (``GmshRuntimeReport.build == 'wheel'`` and a notice that names the action).
+
+#: Bump with any rebuild (it is the folder name and the identity of the build).
+BUILD_ID = 'gmsh-4.15.2-revoropt-6'
+BUILD_VERSION = '4.15.2'
+#: The build option that proves the CVT remesher is in.
+BUILD_REQUIRED_OPTION = 'Revoropt'
+#: The file FoamMesh ships, relative to ``src/resources``.
+BUILD_BUNDLE_RELATIVE = f'gmsh_runtime/linux-x86_64/{BUILD_ID}.tar.gz'
+#: Under the distribution user's home.
+BUILD_USER_DIRECTORY = '.local/share/foammesh/gmsh'
+BUILD_PTH_NAME = 'foammesh_gmsh.pth'
+BUILD_RECORD_NAME = 'installed.json'
+#: The action's name, as the card shows it.
+BUILD_SETUP_ACTION = "Set up FoamMesh's Gmsh"
+
+#: ``bash -c`` script, run with ``$1`` = the python to ask for the user site.
+#: Prints ``key=value`` lines.
+_BUILD_STATUS_SCRIPT = (
+    'D="$HOME/' + BUILD_USER_DIRECTORY + '/' + BUILD_ID + '"; '
+    'echo "user.name=$(id -un)"; echo "home=$HOME"; '
+    'if [ -f "$D/lib/libgmsh.so.4.15" ]; then '
+    'echo "build.dir=$D"; '
+    'echo "build.sha=$(sha256sum "$D/lib/libgmsh.so.4.15" | cut -d" " -f1)"; '
+    '[ -f "$D/' + BUILD_RECORD_NAME + '" ] && '
+    'echo "build.record=$(tr -d "\\n" < "$D/' + BUILD_RECORD_NAME + '")"; fi; '
+    'SP="$("$1" -c "import site;print(site.getusersitepackages())" 2>/dev/null)"; '
+    'if [ -n "$SP" ] && [ -f "$SP/' + BUILD_PTH_NAME + '" ]; then '
+    'echo "pth.path=$SP/' + BUILD_PTH_NAME + '"; '
+    'echo "pth.target=$(head -n 1 "$SP/' + BUILD_PTH_NAME + '")"; fi; '
+    'true')
+
+#: ``$1`` the python, ``$2`` the shipped tarball as the distribution sees it,
+#: ``$3`` the tarball's sha256 (written to the record).
+_BUILD_INSTALL_SCRIPT = (
+    'set -e; umask 022; '
+    'D="$HOME/' + BUILD_USER_DIRECTORY + '"; mkdir -p "$D"; '
+    'T="$D/.incoming.$$"; rm -rf "$T"; mkdir "$T"; '
+    'tar -xzf "$2" -C "$T"; '
+    '[ -f "$T/' + BUILD_ID + '/lib/libgmsh.so.4.15" ] || '
+    '{ echo "the bundle holds no ' + BUILD_ID + '" >&2; rm -rf "$T"; exit 3; }; '
+    'rm -rf "$D/' + BUILD_ID + '"; mv "$T/' + BUILD_ID + '" "$D/' + BUILD_ID + '"; '
+    'rm -rf "$T"; '
+    'SP="$("$1" -c "import site;print(site.getusersitepackages())")"; '
+    'mkdir -p "$SP"; echo "$D/' + BUILD_ID + '/lib" > "$SP/' + BUILD_PTH_NAME + '"; '
+    'printf \'{"build_id": "%s", "bundle_sha256": "%s", "libgmsh_sha256": "%s"}\\n\' '
+    '"' + BUILD_ID + '" "$3" '
+    '"$(sha256sum "$D/' + BUILD_ID + '/lib/libgmsh.so.4.15" | cut -d" " -f1)" '
+    '> "$D/' + BUILD_ID + '/' + BUILD_RECORD_NAME + '"; '
+    'echo "done=$D/' + BUILD_ID + '"')
+
+#: Put the build out of use again (the wheel answers). Keeps the files.
+_BUILD_DISABLE_SCRIPT = (
+    'SP="$("$1" -c "import site;print(site.getusersitepackages())")"; '
+    'rm -f "$SP/' + BUILD_PTH_NAME + '"; echo "disabled"')
+
+
 @dataclass(frozen=True)
 class GmshLaunchCommand:
     argv: tuple[str, ...]
@@ -124,6 +199,26 @@ class GmshLaunchProfile:
         """Run *script* with the profile's interpreter, passing *arguments*."""
         return (*self._wsl_prefix(), self.python, '-c', script, *arguments)
 
+    # -- FoamMesh's own Gmsh build ----------------------------------------- #
+
+    def _bash_argv(self, script: str, *arguments: str) -> tuple[str, ...]:
+        return (*self._wsl_prefix(), 'bash', '-c', script, '_', *arguments)
+
+    def build_status_argv(self) -> tuple[str, ...]:
+        """Where the FoamMesh Gmsh build is in the distribution (key=value)."""
+        return self._bash_argv(_BUILD_STATUS_SCRIPT, self.python)
+
+    def build_install_argv(self, runtime_bundle: str,
+                           bundle_sha256: str) -> tuple[str, ...]:
+        """Unpack the shipped build under the user's home and switch to it."""
+        return self._bash_argv(
+            _BUILD_INSTALL_SCRIPT + ' 2>&1', self.python, str(runtime_bundle),
+            str(bundle_sha256))
+
+    def build_disable_argv(self) -> tuple[str, ...]:
+        """Stop using the build (the wheel answers); the files stay."""
+        return self._bash_argv(_BUILD_DISABLE_SCRIPT, self.python)
+
     # -- probes ------------------------------------------------------------ #
 
     def identity_probe_argv(self) -> tuple[str, ...]:
@@ -144,6 +239,8 @@ class GmshLaunchProfile:
             '    try:\n'
             '        gmsh.initialize()\n'
             '        out["version"] = gmsh.option.getString("General.Version")\n'
+            '        out["build"] = gmsh.option.getString("General.BuildInfo")\n'
+            '        out["gmsh_file"] = getattr(gmsh, "__file__", "")\n'
             '        out["threads"] = gmsh.option.getNumber("General.NumThreads")\n'
             '        out["has_occ"] = hasattr(gmsh.model, "occ")\n'
             '        out["has_boundary_layer"] = hasattr(\n'

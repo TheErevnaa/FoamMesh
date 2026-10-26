@@ -23,6 +23,25 @@ from widgets.rendering.rendering_widget import RenderingWidget
 from foammesh.view.theming.vtk_theme import apply_scalar_bar_theme
 
 
+
+async def rankingFromFile(path, count: int):
+    """The worst *count* elements of every Gmsh measure of a mesh file.
+
+    Plan 48 GM12 (R7): quality on a bare ``.msh`` needs no case. Gmsh measures
+    the file in the qualified runtime, off the GUI thread, and the answer has
+    the shape ``quality.cell_fields`` gives for an OpenFOAM case.
+    """
+    import asyncio
+
+    from foammesh.core.gmsh import element_quality
+
+    def measure():
+        arrays = element_quality.measure_file(path)
+        return element_quality.rank_worst(arrays, int(count))
+
+    return await asyncio.get_running_loop().run_in_executor(None, measure)
+
+
 class MeshQualityInfo(QObject):
     #: What the user should be told about a colouring that could not happen.
     #: A signal rather than a direct status-bar call so the panel stays
@@ -842,8 +861,18 @@ class MeshQualityInfo(QObject):
     async def _workerRanking(self, count: int):
         from foammesh.view.facade_client import query_async
 
-        result = await query_async(
-            app.facadeClient, 'quality.cell_fields', {'rank_n': int(count)})
+        try:
+            result = await query_async(
+                app.facadeClient, 'quality.cell_fields', {'rank_n': int(count)})
+        except Exception:                                          # noqa: BLE001
+            # Plan 48 GM12. A bare Gmsh mesh has no polyMesh for the case
+            # operation to read; it is ranked from the arrays Gmsh measures
+            # on the file itself.
+            manager = getattr(app.window, 'meshManager', None)
+            native = getattr(manager, 'nativePath', lambda: None)()
+            if native is None:
+                raise
+            return await rankingFromFile(native, count)
         return (result.payload or {}).get('ranked')
 
     def requestRanking(self, tab, metric=None, count: int = DEFAULT_RANK_COUNT):

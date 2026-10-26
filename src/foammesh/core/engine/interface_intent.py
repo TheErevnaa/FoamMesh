@@ -46,15 +46,32 @@ def _target_token(target_solver) -> str:
     return str(getattr(target_solver, 'value', target_solver) or '').lower()
 
 
-def intent_report(engine_id: str, target_solver, pairs: Iterable) -> list[dict]:
+#: Plan 49 SR7 (DP-5792, DP-5940). The stages of a pair's report. A pair
+#: is ``planned`` until a mesh built from it was checked, then ``coupled`` or
+#: ``not coupled`` by that evidence; ``unmatched`` when this engine and target
+#: never couple it, ``refused`` when they cannot honour it at all.
+STATE_PLANNED = 'planned'
+STATE_COUPLED = 'coupled'
+STATE_NOT_COUPLED = 'not coupled'
+STATE_UNMATCHED = 'unmatched'
+STATE_REFUSED = 'refused'
+
+
+def intent_report(engine_id: str, target_solver, pairs: Iterable,
+                  built: Mapping | None = None) -> list[dict]:
     """One row per pair whose coupling is ``conformal`` or ``non_conformal``.
 
     ``pairs`` are the job-shaped rows (``coupling``, ``name``) or any mapping
     with those keys. A ``cyclic`` pair is the Periodic page's and is not
     judged here. Each row says what the user intended, whether this engine and
-    target can honour it (``honoured``), whether the result is coupled
-    (``coupled``) and the word to call the result by (``label``), with the
-    ``refusal`` when it cannot be honoured.
+    target can honour it (``honoured``), whether the build will couple it
+    (``will_couple``), and the word to call the result by (``label``), with
+    the ``refusal`` when it cannot be honoured.
+
+    Plan 49 SR7 (DP-5792, DP-5940): ``coupled`` is evidence, not a plan. It
+    is ``None`` until *built* -- ``{pair name: bool}`` measured on a mesh
+    that was built and checked -- says whether the pair came out coupled;
+    ``False`` where nothing will couple it. ``state`` names the stage.
     """
     from foammesh.core.engine.registry import ENGINE_REGISTRY
 
@@ -66,6 +83,7 @@ def intent_report(engine_id: str, target_solver, pairs: Iterable) -> list[dict]:
     name_of_engine = (getattr(getattr(engine, 'descriptor', None),
                               'display_name', '') or str(engine_id))
     openfoam = _target_token(target_solver) == 'openfoam'
+    evidence = dict(built or {})
     rows = []
     for pair in pairs or ():
         intent = _text(pair, 'coupling') or CONFORMAL
@@ -73,35 +91,47 @@ def intent_report(engine_id: str, target_solver, pairs: Iterable) -> list[dict]:
             continue
         name = _text(pair, 'name', 'pairId') or '<unnamed>'
         row = {'pair': name, 'intent': intent, 'engine': str(engine_id),
-               'honoured': True, 'coupled': intent == CONFORMAL,
+               'honoured': True, 'will_couple': intent == CONFORMAL,
                'label': 'conformal' if intent == CONFORMAL else '',
                'refusal': '', 'reason': ''}
         if intent == NON_CONFORMAL:
             if route == ROUTE_NONE:
                 row.update(
-                    honoured=False, coupled=False, label=UNMATCHED,
+                    honoured=False, will_couple=False, label=UNMATCHED,
                     refusal=(f'{name} is a non-conformal pair and '
                              f'{name_of_engine} cannot honour it: it has no '
                              'way to mesh the two sides apart and couple '
                              'them. Make the pair conformal on the Geometry '
                              'page or choose an engine that can.'))
             elif route == ROUTE_STAGED_NCC:
-                row.update(coupled=True,
-                           label='non-conformal (coupled)',
+                row.update(will_couple=True,
+                           label='non-conformal',
                            reason='written for OpenFOAM non-conformal '
                                   'coupling')
             elif openfoam:
-                row.update(coupled=True,
-                           label='non-conformal (coupled)',
+                row.update(will_couple=True,
+                           label='non-conformal',
                            reason='meshed apart, then coupled by '
                                   'createNonConformalCouples after the '
                                   'OpenFOAM conversion')
             else:
-                row.update(coupled=False, label=UNMATCHED,
+                row.update(will_couple=False, label=UNMATCHED,
                            reason='meshed apart; only an OpenFOAM target '
                                   'couples them, so for this output the '
                                   'two sides are unmatched surfaces and no '
                                   'coupling is claimed')
+        if not row['honoured']:
+            row.update(coupled=False, state=STATE_REFUSED)
+        elif not row['will_couple']:
+            row.update(coupled=False, state=STATE_UNMATCHED)
+        elif name in evidence:
+            coupled = bool(evidence[name])
+            row.update(coupled=coupled,
+                       state=STATE_COUPLED if coupled else STATE_NOT_COUPLED)
+            if coupled and intent == NON_CONFORMAL:
+                row['label'] = 'non-conformal (coupled)'
+        else:
+            row.update(coupled=None, state=STATE_PLANNED)
         rows.append(row)
     return rows
 

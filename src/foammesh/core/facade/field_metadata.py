@@ -661,6 +661,28 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': 'How wide a gap still counts as closed. Read only '
                          'when "Close narrow gaps" is on.',
     },
+    # Plan 49 SR8. The surface-role model's two document-level values. Both
+    # are written by the loader's migration, never by a control, so the
+    # local API reads them and refuses a write.
+    'surface_intent.model_version': {
+        'title': 'Surface model version',
+        'documentation': 'Which version of the surface-role model this case '
+                         'is stored in. Written when an older case is opened '
+                         'and converted; never edited.',
+        'read_only': True,
+        'invalidates': (),
+        'ui_location': 'workflow.geometry',
+    },
+    'surface_intent.conversion_report': {
+        'title': 'Conversion report',
+        'documentation': 'What the conversion did to an older case: one '
+                         'line per surface whose role was read from its old '
+                         'type, and why. JSON text; '
+                         'geometry.surface_intent.read returns it parsed.',
+        'read_only': True,
+        'invalidates': (),
+        'ui_location': 'workflow.geometry',
+    },
     'workflow.step': {
         'title': 'Current workflow step',
         'documentation': 'The furthest meshing step the case has reached. '
@@ -1060,6 +1082,90 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # reads. Their element titles come from the schema key, which says
     # 'Vertices' for eight indices in a required order and 'Points' for an
     # arc's midpoint -- the syntax has to be documented where it is typed.
+    # Plan 49 SR8. `geometry.surface_relations` is read-only through the
+    # local API: its rows are written by the surface tab (partner and
+    # regions, geometry.surface_intent.edit) and the two periodic pair
+    # tables, which keep both sides consistent.
+    'geometry.surface_relations/{id}/relation_id': {'title': 'Relation id', 'read_only': True,
+        'documentation': "The relation's own id, kept when its sides are renamed. Read only: written by the surface tab and the periodic pair tables."},
+    'geometry.surface_relations/{id}/name': {'title': 'Name', 'read_only': True,
+        'documentation': "The relation's name, shown in the pair tables. Read only: written by the surface tab and the periodic pair tables."},
+    'geometry.surface_relations/{id}/kind': {'title': 'Kind', 'read_only': True,
+        'documentation': 'Conformal interface, non-conformal interface or periodic pair. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/owner_surface': {'title': 'Owner surface', 'read_only': True,
+        'documentation': 'Geometry id of the first side. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/owner_patch_uuid': {'title': 'Owner patch id', 'read_only': True,
+        'documentation': 'Stable patch id of the first side. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/owner_label': {'title': 'Owner label', 'read_only': True,
+        'documentation': 'Name of the first side when the relation was written. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/neighbour_surface': {'title': 'Neighbour surface', 'read_only': True,
+        'documentation': 'Geometry id of the second side; empty for a shared interface. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/neighbour_patch_uuid': {'title': 'Neighbour patch id', 'read_only': True,
+        'documentation': 'Stable patch id of the second side. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/neighbour_label': {'title': 'Neighbour label', 'read_only': True,
+        'documentation': 'Name of the second side when the relation was written. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/shared_surface': {'title': 'Shared surface', 'read_only': True,
+        'documentation': 'Geometry id of the one surface both regions share, for a shared interface. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/owner_region': {'title': 'Owner region', 'read_only': True,
+        'documentation': 'Region on the owner side of an interface. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/neighbour_region': {'title': 'Neighbour region', 'read_only': True,
+        'documentation': 'Region on the neighbour side of an interface. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/transform': {'title': 'Transform', 'read_only': True,
+        'documentation': 'How a periodic pair maps one side onto the other. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/match_tolerance': {'title': 'Match tolerance', 'read_only': True,
+        'documentation': 'Distance within which two periodic faces count as matched. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/state': {'title': 'State', 'read_only': True,
+        'documentation': 'Valid, or unresolved with the reason in state_reason. Computed when the case is saved. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/state_reason': {'title': 'State reason', 'read_only': True,
+        'documentation': 'Why the relation is unresolved. Computed. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/verification': {'title': 'Verification', 'read_only': True,
+        'documentation': 'Result of the last periodic measurement: unverified, verified or failed. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/verification_reason': {'title': 'Verification reason', 'read_only': True,
+        'documentation': 'What the last measurement found. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/verification_key': {'title': 'Verification key', 'read_only': True,
+        'documentation': 'Fingerprint of the sides the last measurement was made on; a change of either side clears the verdict. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/origin': {'title': 'Origin', 'read_only': True,
+        'documentation': 'Authored in the window, migrated from an older case, or inferred. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/legacy_source': {'title': 'Legacy source', 'read_only': True,
+        'documentation': 'The older field this relation was converted from, if any. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/translation_x': {'title': 'Translation x', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/translation_y': {'title': 'Translation y', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/translation_z': {'title': 'Translation z', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_centre_x': {'title': 'Rotation centre x', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_centre_y': {'title': 'Rotation centre y', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_centre_z': {'title': 'Rotation centre z', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_axis_x': {'title': 'Rotation axis x', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_axis_y': {'title': 'Rotation axis y', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_axis_z': {'title': 'Rotation axis z', 'read_only': True,
+        'documentation': 'Periodic transform component. Read only: written by the surface tab and the periodic pair tables.'},
+    'geometry.surface_relations/{id}/rotation_angle_degrees': {'title': 'Rotation angle', 'read_only': True,
+        'documentation': 'Periodic rotation angle in degrees. Read only: written by the surface tab and the periodic pair tables.'},
+    # Plan 49 SR8. Per-surface role fields, written through the surface
+    # dialog's own planner so the API gets the dialog's refusals.
+    'geometry.items/{id}/surface_role': {'title': 'Surface role',
+        'documentation': 'What the surface is to the mesh: external boundary, internal face, conformal or non-conformal region interface, or blocking baffle. Same rules as the surface tab.'},
+    'geometry.items/{id}/boundary_category': {'title': 'Purpose',
+        'documentation': 'Purpose of an external boundary (wall, inlet, outlet, symmetry, wedge, far field, unclassified).'},
+    'geometry.items/{id}/mesh_patch_type': {'title': 'Patch type',
+        'documentation': 'The OpenFOAM patch type written for an external boundary.'},
+    'geometry.items/{id}/intent_origin': {'title': 'Role origin', 'read_only': True,
+        'documentation': 'Authored in the window, migrated from an older case, or inferred. Set to authored by every role edit.'},
+    'geometry.items/{id}/intent_state': {'title': 'Role state', 'read_only': True,
+        'documentation': 'Valid, or unresolved with the reason in intent_issue. Computed when the case is saved.'},
+    'geometry.items/{id}/intent_issue': {'title': 'Role issue', 'read_only': True,
+        'documentation': 'Why the surface role is unresolved. Computed.'},
+    'geometry.items/{id}/non_conformal': {'title': 'Non-conformal (retired)', 'read_only': True,
+        'documentation': 'Retired by Plan 49 SR8: derived from surface_role. Write surface_role regionInterfaceNonConformal instead.'},
+    'geometry.items/{id}/inter_region': {'title': 'Between regions (retired)', 'read_only': True,
+        'documentation': 'Retired by Plan 49 SR8: derived from surface_role. Write surface_role and the regions (geometry.surface_intent.edit) instead.'},
     'base_grid.vertices/{id}/x': {
         'documentation': (
             'X coordinate of this background vertex, before the '
@@ -2293,11 +2399,24 @@ FIELD_OVERRIDES: dict[str, dict] = {
     # Plan 40 UXB1 (#51, #47, #54). The OpenFOAM or Gmsh keyword is what the
     # help pane shows (documentation, the registry's id); the label is what
     # the setting does, in the words a user would say it.
+    'gmsh.global_sizing.reproducible': {
+        'title': 'Reproducible (single-thread)',
+    },
+    # Plan 48 D4 (DP-2952).
+    'gmsh.global_sizing.max_retries': {
+        'title': 'Meshing retries',
+    },
+    'gmsh.global_sizing.curve_threads': {
+        'title': 'Curve threads',
+    },
+    'gmsh.global_sizing.surface_threads': {
+        'title': 'Surface threads',
+    },
+    'gmsh.global_sizing.volume_threads': {
+        'title': 'Volume threads',
+    },
     'gmsh.global_sizing.field_combiner': {
         'title': 'How size fields combine',
-    },
-    'gmsh.global_sizing.minimum_elements_per_two_pi': {
-        'title': 'Cells per full circle',
     },
     'gmsh.global_sizing.barycentric_refinement': {
         'title': 'Split every cell about its centre',

@@ -1,0 +1,50 @@
+--- a/contrib/MeshOptimizer/MeshOptimizer.cpp	2026-10-23 07:43:27.227459858 +0400
++++ b/contrib/MeshOptimizer/MeshOptimizer.cpp	2026-10-23 07:43:27.237459857 +0400
+@@ -597,7 +597,8 @@
+       // Patch adaptation loop
+       for(int iAdapt = 0; iAdapt < par.patchDef->maxPatchAdapt; iAdapt++) {
+         // Set up patch
+-        const double limDist = par.patchDef->maxDistance(worstEl);
++        const double limDist =
++          distanceFactor * par.patchDef->maxDistance(worstEl);
+         elSet toOptimizePrim =
+           getSurroundingPatch(worstEl, par.patchDef, limDist, maxLayers,
+                               vertex2elements, element2elements, e2ePatch);
+@@ -652,7 +653,7 @@
+ 
+         // If (partial) success, update mesh and break adaptation loop,
+         // otherwise adapt
+-        if((success > 0) || (iAdapt == par.patchDef->maxPatchAdapt - 1)) {
++        if((success >= 0) || (iAdapt == par.patchDef->maxPatchAdapt - 1)) {
+           opt.updateResults();
+           if(newObjFunctionRange.size() == 0) {
+             newObjFunctionRange = opt.objFunction()->minMax();
+@@ -668,18 +669,16 @@
+                          opt.objFunction()->minMax()[i].second);
+             }
+           }
+-          if(success >= 0) {
+-            opt.patch.updateGEntityPositions();
+-            break;
+-          }
+-          else {
+-            distanceFactor *= par.patchDef->distanceAdaptFact;
+-            maxLayers *= par.patchDef->maxLayersAdaptFact;
+-            if(par.verbose > 1)
+-              Msg::Info(
+-                "Patch %i failed (adapt #%i), adapting with increased size",
+-                iBadEl, iAdapt);
+-          }
++          if(success >= 0) opt.patch.updateGEntityPositions();
++          break;
++        }
++        else {
++          distanceFactor *= par.patchDef->distanceAdaptFact;
++          maxLayers *= par.patchDef->maxLayersAdaptFact;
++          if(par.verbose > 1)
++            Msg::Info(
++              "Patch %i failed (adapt #%i), adapting with increased size",
++              iBadEl, iAdapt);
+         }
+ 
+       } // End of adaptation loop

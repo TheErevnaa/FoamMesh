@@ -476,6 +476,13 @@ class DeviationPanel(QFrame):
                     self.tr('Tick to measure this patch anyway')
                     if has or not isRun else
                     self.tr('The stored run has no field for this patch')))
+            # Plan 48 GM12 (plan 4.14). A patch that could not be measured
+            # says why, in its own words; it is never shown as a zero.
+            reason = (getattr(readout, 'unavailable', None) or {}).get(name)
+            if reason:
+                box.setText(self.tr('{0}  (unavailable)').format(name))
+                box.setToolTip(str(reason))
+                box.setEnabled(False)
         self._surfacesCaption.setVisible(bool(rows))
         self._surfaceScroll.setVisible(bool(rows))
 
@@ -511,6 +518,36 @@ class DeviationPanel(QFrame):
 
     def summary(self):
         return self._summary
+
+    def sourceText(self) -> str:
+        """The sentence saying which reference the deviation is against."""
+        return self._source.text()
+
+    def isScaleAuto(self) -> bool:
+        """The scale is the automatic one (Auto not lit)."""
+        return not self._scaleAuto.isEnabled()
+
+    def readState(self) -> dict:
+        """Plan 48 PA1. What the panel says: source, scale, figures, bars."""
+        if self._readout is None or self.isHidden():
+            return {'shown': False}
+        summary = self._summary
+        histogram = self._histogram
+        return {
+            'shown': True, 'source': self.sourceText(),
+            'scale_mm': float(self._scale.value()),
+            'scale_auto': self.isScaleAuto(),
+            'summary': None if summary is None else {
+                'count': summary.count, 'unmeasured': summary.unmeasured,
+                'max_abs_mm': summary.max_abs, 'mean_mm': summary.mean,
+                'rms_mm': summary.rms, 'tolerance_mm': summary.tolerance,
+                'within': summary.within,
+                'within_fraction': summary.within_fraction},
+            'histogram': {
+                'edges': histogram.edges(), 'counts': histogram.counts(),
+                'range': list(histogram.valueRange()),
+                'tolerance_band': list(histogram.toleranceBand()),
+                'tolerance_off_scale': histogram.toleranceOffScale()}}
 
     def histogram(self) -> DeviationHistogram:
         return self._histogram

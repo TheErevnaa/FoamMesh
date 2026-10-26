@@ -24,6 +24,7 @@ import datetime
 import logging
 
 import shiboken6
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QPlainTextEdit,
                                QPushButton, QVBoxLayout)
 
@@ -74,6 +75,32 @@ def profile_lines(payload: dict | None) -> list[str]:
         'Utilities:',
         *(f"  {name}: {path}" for name, path in sorted(utilities.items())),
     ]
+
+
+def profile_from_result(result) -> list[str]:
+    """The profile lines for a facade answer, or the sentence that says why not."""
+    if getattr(result, 'status', '') != 'accepted':
+        return [str(getattr(result, 'message', '')
+                    or QCoreApplication.translate(
+                        'RuntimeDiagnosticsDialog',
+                        'Runtime diagnostics failed.'))]
+    return profile_lines(getattr(result, 'payload', None))
+
+
+def diagnostics_text(result, monitor) -> str:
+    """What the diagnostics window shows once the facade has answered
+    (Plan 48 PA5: one text, for the window and for the local API)."""
+    return '\n'.join([*profile_from_result(result), '',
+                     *health_lines(monitor)])
+
+
+def shutdown_question() -> str:
+    """The sentence [Shut down WSL...] asks before it acts."""
+    return QCoreApplication.translate(
+        'RuntimeDiagnosticsDialog',
+        'This runs "wsl --shutdown": every WSL distribution on this '
+        'computer stops, including any job running in them and any '
+        'other program using WSL. Continue?')
 
 
 def health_lines(monitor) -> list[str]:
@@ -154,11 +181,7 @@ class RuntimeDiagnosticsDialog(QDialog):
         return getattr(self._health, 'current', None) if self._health is not None else None
 
     def setProfile(self, result) -> None:
-        if getattr(result, 'status', '') != 'accepted':
-            self._profile = [str(getattr(result, 'message', '')
-                                 or self.tr('Runtime diagnostics failed.'))]
-        else:
-            self._profile = profile_lines(getattr(result, 'payload', None))
+        self._profile = profile_from_result(result)
         self._render()
 
     def _render(self) -> None:
@@ -170,14 +193,16 @@ class RuntimeDiagnosticsDialog(QDialog):
     def _shutdownClicked(self) -> None:
         self._tasks.spawn(self.shutdownWsl())
 
-    async def shutdownWsl(self) -> str | None:
+    async def shutdownWsl(self, confirmed: bool | None = None) -> str | None:
+        """Shut WSL down. *confirmed* answers the question as its Yes would
+        (the local API); left out, the person is asked (Plan 48 PA5)."""
         monitor = self._monitor()
         if monitor is None:
             return None
-        if not await confirm(self, self.tr('Shut down WSL'), self.tr(
-                'This runs "wsl --shutdown": every WSL distribution on this '
-                'computer stops, including any job running in them and any '
-                'other program using WSL. Continue?')):
+        if confirmed is None:
+            confirmed = await confirm(self, self.tr('Shut down WSL'),
+                                      shutdown_question())
+        if not confirmed:
             return None
         self.shutdownButton.setEnabled(False)
         try:
@@ -282,18 +307,44 @@ class WslHealthBar(_Bar):
             if shiboken6.isValid(self):
                 self.setState(monitor.snapshot())
 
-    async def restartRuntime(self) -> str | None:
+    def restartQuestion(self) -> str:
+        """The sentence [Restart WSL runtime] asks before it acts."""
         monitor = self._monitor()
-        if monitor is None:
-            return None
-        running = monitor.jobs_running
+        running = monitor.jobs_running if monitor is not None else 0
         jobs = (self.tr(' {0} running there now and will stop.').format(
                     count_text(running, 'job is', 'jobs are'))
                 if running else '')
-        if not await confirm(self, self.tr('Restart WSL runtime'), self.tr(
-                'This runs "wsl --terminate {0}". Every program in that '
-                'distribution stops, including any mesher or checkMesh that is '
-                'running.{1} Continue?').format(monitor.distribution, jobs)):
+        return self.tr(
+            'This runs "wsl --terminate {0}". Every program in that '
+            'distribution stops, including any mesher or checkMesh that is '
+            'running.{1} Continue?').format(
+                monitor.distribution if monitor is not None else '', jobs)
+
+    def readout(self) -> dict:
+        """The bar as it reads now (Plan 48 PA5)."""
+        monitor = self._monitor()
+        return {
+            'shown': not self.isHidden(), 'text': self.text(),
+            'state': dict(monitor.snapshot()) if monitor is not None else {},
+            'retry': {'text': self.retryButton.text(),
+                      'enabled': self.retryButton.isEnabled()},
+            'restart': {'text': self.restartButton.text(),
+                        'enabled': self.restartButton.isEnabled(),
+                        'question': self.restartQuestion()},
+            'diagnostics': {'text': self.diagnosticsButton.text(),
+                            'enabled': self.diagnosticsButton.isEnabled()}}
+
+    async def restartRuntime(self, confirmed: bool | None = None
+                             ) -> str | None:
+        """Restart the runtime. *confirmed* answers the question as its Yes
+        would (the local API); left out, the person is asked (PA5)."""
+        monitor = self._monitor()
+        if monitor is None:
+            return None
+        if confirmed is None:
+            confirmed = await confirm(
+                self, self.tr('Restart WSL runtime'), self.restartQuestion())
+        if not confirmed:
             return None
         self._busy(True)
         self._text.setText(self.tr('Restarting {0}…').format(monitor.distribution))

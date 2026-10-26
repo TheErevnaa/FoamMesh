@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, Mapping, Sequence
 
-from .patches.ops import BOUNDARY_CATEGORIES, boundary_category_for_name
+from .patches.ops import BOUNDARY_CATEGORIES
 
 #: The roles that grow boundary layers when nothing was chosen by hand. A
 #: wall is where the boundary layer of the flow is; every other role in
@@ -55,20 +55,50 @@ FLAT_ROLES = tuple(role for role in BOUNDARY_CATEGORIES
 UNKNOWN_ROLE = 'unclassified'
 
 
+#: Plan 49 SR7 (DP-5789). Surface roles that are no boundary of the volume a
+#: layer would grow from: an internal face, a blocking baffle and a region
+#: interface. Shared with the Gmsh route
+#: (``core/gmsh/execution.role_surface_categories``).
+NOT_A_WALL_ROLES = ('internalFace', 'blockingBaffle',
+                    'regionInterfaceConformal', 'regionInterfaceNonConformal')
+
+#: The authored mesh patch types that are a category of their own, whatever
+#: the stored purpose says.
+TYPED_CATEGORIES = {'symmetry': 'symmetry', 'symmetryplane': 'symmetry',
+                    'empty': 'empty', 'wedge': 'wedge'}
+
+
+def role_category(category='', role='', mesh_patch_type='') -> str:
+    """The category a surface's authored role and mesh type make it.
+
+    Plan 49 SR7 (DP-5789): a surface that is not an external boundary is an
+    ``interface`` (never a wall to grow layers on), an authored symmetry,
+    empty or wedge patch is that category, and otherwise the stored
+    *category* stands.
+    """
+    if str(role or '') in NOT_A_WALL_ROLES:
+        return 'interface'
+    typed = TYPED_CATEGORIES.get(str(mesh_patch_type or '').strip().lower())
+    if typed:
+        return typed
+    return str(category or '')
+
+
 def boundary_role(name, category='') -> str:
     """The engine-neutral role of one boundary.
 
-    The stored category wins whenever it says something. When it is absent or
-    still ``unclassified`` the name is read, which is the same rule the
-    publication step applies to give a patch its OpenFOAM type -- so the layer
-    default and the published patch type can never disagree about which
-    boundary is a wall.
+    The stored category wins whenever it says something. Plan 49 SR7
+    (DP-5789): an absent or ``unclassified`` category stays ``unclassified``.
+    The name is never read -- renaming ``wall_bore`` to ``inlet_bore`` must
+    not change where layers grow; the name is read only once, by the load
+    migration, as a purpose flagged for review (``db/surface_intent``).
     """
+    del name
     token = str(getattr(category, 'value', category) or '')
     token = token.strip().lower().split('.')[-1]
-    if token and token != UNKNOWN_ROLE and token in set(BOUNDARY_CATEGORIES):
+    if token and token in set(BOUNDARY_CATEGORIES):
         return token
-    return boundary_category_for_name(name, default=UNKNOWN_ROLE)
+    return UNKNOWN_ROLE
 
 
 def _pair(entry) -> tuple[str, str]:
@@ -76,7 +106,12 @@ def _pair(entry) -> tuple[str, str]:
     if isinstance(entry, Mapping):
         name = (entry.get('solver_name') or entry.get('display_name')
                 or entry.get('name') or '')
-        return str(name).strip(), str(entry.get('category') or '')
+        category = str(entry.get('category') or '')
+        intent = entry.get('intent')
+        if isinstance(intent, Mapping) and                 str(intent.get('state') or 'valid') == 'valid':
+            category = role_category(category, intent.get('role'),
+                                     intent.get('mesh_patch_type'))
+        return str(name).strip(), category
     if isinstance(entry, (tuple, list)) and entry:
         category = entry[1] if len(entry) > 1 else ''
         return str(entry[0]).strip(), str(category or '')

@@ -202,8 +202,7 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
             capabilities=(CapabilityRequirement('snappyHexMesh'),),
             fields=_fields(
                 'snap/nSmoothPatch', 'snap/nSolveIter', 'snap/nRelaxIter',
-                'snap/nFeatureSnapIter', 'snap/implicitFeatureSnap',
-                'snap/explicitFeatureSnap',
+                'snap/nFeatureSnapIter', 'snap/featureSnapping',
                 'snap/multiRegionFeatureSnap',
                 'snap/detectNearSurfacesSnap', 'snap/tolerance'),
             artifacts=(_POLY_MESH,), run_gated=True),
@@ -355,6 +354,13 @@ _STAGES = MappingProxyType({
 
 class SnappyMeshingEngine:
     engine_id = 'snappy'
+    #: Plan 49 (DP-6051). The case builder writes the surfaces' patch types
+    #: into the dictionaries, so the surface-intent gate runs before them.
+    dictionaries_carry_surface_intent = True
+    #: DP-6063. The task whose surface refinement groups the default *walls*
+    #: group joins (``core/meshing/walls_default``); the run paths make it
+    #: before a dictionary is written, unless this task is locked.
+    default_walls_group_task = 'snappy.castellation'
     #: One ``workflow.run_pipeline`` executes blockMesh, surfaceFeatures,
     #: snappyHexMesh (castellate, snap, layers) and checkMesh in a single
     #: supervised DAG, so it is evidence for exactly these tasks. The domain

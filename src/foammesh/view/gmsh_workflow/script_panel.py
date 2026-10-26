@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget)
 
 from foammesh.view.theming.metrics import CompactDoubleSpinBox
+from foammesh.core.gmsh import checkpoints
 from foammesh.core.gmsh import script_export as export
 
 PYTHON, GEO = 'python', 'geo'
@@ -56,6 +57,7 @@ class GmshScriptPanel(QWidget):
         self._geoPath = ''
         self._params: dict = {}
         self._paramControls: dict = {}
+        self._paramRows: list = []
         self._pending = None
         self._script = export.Script('')
 
@@ -72,9 +74,18 @@ class GmshScriptPanel(QWidget):
         self._refreshButton.setObjectName('gmshScriptRefresh')
         self._save = QPushButton(self.tr('Save script…'), self)
         self._save.setObjectName('gmshScriptSave')
+        # Plan 48 GM5: take back the last geometry command; the session
+        # rebuilds the model from the commands before it.
+        self._removeLast = QPushButton(self.tr('Remove last command'), self)
+        self._removeLast.setObjectName('gmshScriptRemoveLast')
+        self._removeLast.setToolTip(self.tr(
+            'Take back the last geometry command and rebuild the model '
+            'from the ones before it'))
+        self._removeLast.clicked.connect(self.removeLastCommand)
         row.addWidget(self._language)
         row.addWidget(self._refreshButton)
         row.addWidget(self._save)
+        row.addWidget(self._removeLast)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -208,6 +219,75 @@ class GmshScriptPanel(QWidget):
     def scriptText(self) -> str:
         return self._view.toPlainText()
 
+    # -- what the panel shows (Plan 48 PA4: the local API reads the same) ------ #
+
+    def setScriptText(self, text: str) -> None:
+        """Replace the text in the script view, as typing in it does.
+
+        Only the ``.geo`` view is editable; the Python view is read-only.
+        """
+        if self._view.isReadOnly():
+            raise ValueError('the Python script is read-only: choose the '
+                             '.geo format to edit it')
+        self._view.setPlainText(str(text))
+
+    def isBusy(self) -> bool:
+        return self._busy
+
+    def noteText(self) -> str:
+        return self._note.text()
+
+    def resultText(self) -> str:
+        return self._result.text()
+
+    def scriptInfo(self) -> dict:
+        """The numbers and sentence under the format box."""
+        return {'calls': self._script.calls,
+                'rebuildable': bool(self._script.rebuildable),
+                'gaps': list(self._script.gaps)}
+
+    def canSave(self) -> bool:
+        return self._save.isEnabled()
+
+    def canReload(self) -> bool:
+        return self._reload.isEnabled() and not self._busy
+
+    def geoPath(self) -> str:
+        return self._geoPath
+
+    def rerunOnChange(self) -> bool:
+        return self._rerun.isChecked()
+
+    def setRerunOnChange(self, on: bool) -> None:
+        self._rerun.setChecked(bool(on))
+
+    def parameterRows(self) -> list:
+        """The ONELAB parameters shown, as the session described them."""
+        return [dict(row) for row in self._paramRows]
+
+    def isConfirming(self) -> bool:
+        """The confirm strip is up (a run waits for its Run or Cancel)."""
+        return self._pending is not None
+
+    def setParameters(self, values: dict, *, run: bool = True) -> None:
+        """Set several ONELAB controls, then run once (as "Run again").
+
+        A person changing one control with "Re-run on change" on runs the
+        script after each; setting many at once runs it after all of them.
+        """
+        for name in values:
+            if name not in self._paramControls:
+                raise KeyError(name)
+        for name, value in values.items():
+            control = self._paramControls[name]
+            control.blockSignals(True)
+            try:
+                self.setParameter(name, value)
+            finally:
+                control.blockSignals(False)
+        if run:
+            self.runAgain()
+
     def refresh(self, *_args) -> None:
         """Rebuild the view from the calls the session recorded."""
         case = self.casePath()
@@ -238,6 +318,24 @@ class GmshScriptPanel(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self.refresh()
+
+    def removeLastCommand(self) -> None:
+        """"Remove last script command": the session rebuilds the model
+        without the last geometry command."""
+        controller = self._controller_getter()
+        if controller is None:
+            self._fail(self.tr('There is no project to remove a command '
+                               'from.'))
+            return
+
+        def work():
+            builder = controller.builder()
+            case_path = getattr(controller, 'case_path', None)
+            if case_path is not None:
+                checkpoints.bind(builder, case_path)
+            return checkpoints.remove_last(builder)
+
+        self._background('remove_last', work)
 
     def saveScript(self, path: str | None = None) -> str:
         """Write the view to a file; the path (empty when cancelled)."""
@@ -326,6 +424,7 @@ class GmshScriptPanel(QWidget):
         while self._paramsForm.rowCount():
             self._paramsForm.removeRow(0)
         self._paramControls = {}
+        self._paramRows = [dict(item) for item in parameters]
         for item in parameters:
             name = item['name']
             values = item.get('values') or [0]

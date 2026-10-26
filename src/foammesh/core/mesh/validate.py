@@ -139,7 +139,11 @@ def _duplicate_point_counts(mesh):
             continue
         for patch_id in np.unique(patch_ids):
             metadata = mesh.patches.get(int(patch_id), {})
-            if metadata.get('interface', {}).get('coupling') != 'non_conformal':
+            # Plan 49 SR5. The two sides of a cracked blocking baffle hold
+            # the same coordinates by construction, as a non-conformal pair's
+            # copies do.
+            if metadata.get('interface', {}).get('coupling') not in (
+                    'non_conformal', 'baffle'):
                 continue
             rows = block.connectivity[patch_ids == patch_id]
             protected.update(int(value) for value in rows.ravel())

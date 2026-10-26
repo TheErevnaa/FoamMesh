@@ -4,16 +4,18 @@ Plan 30 WP-09 / F-17. Every key the legacy Designer page wrote --
 ``nSmoothPatch``, ``nSolveIter``, ``nRelaxIter``, ``nFeatureSnapIter``,
 ``implicitFeatureSnap``, ``explicitFeatureSnap``, ``multiRegionFeatureSnap``
 and ``tolerance`` -- is declared on this task, so the form is the descriptor's.
-The two feature-snap switches are the pair WP-11 (F-41) split out of the old
-``featureSnapType`` enum: OpenFOAM 13 reads them independently and accepts both
-on, which the enum could never express.
+DP-5712 (engineer report 17). WP-11 (F-41) had split the feature-snap choice
+into two independent switches, and a person could tick both. It is one choice
+again -- Explicit, Implicit or None -- and the writer turns it into the two
+``snapControls`` switches with at most one of them true.
 
 Plan 33 OF-06. The page used to be one paragraph, with all nine of those
 settings folded behind the Advanced disclosure underneath it. Three of the
 paragraph clauses said what the feature-snap switches are to each other, and
-the form says that instead: the switches are in a group of their own, and
-multi-region feature snapping -- which the explicit snapper alone reads --
-is on the form only while explicit snapping is on.
+the form says that instead: the choice is in a group of its own, and
+multi-region feature snapping -- which the explicit snapper alone reads, where
+regions or zones meet -- is on the form only with explicit snapping on a case
+with more than one region or zone (DP-5712).
 """
 from __future__ import annotations
 
@@ -24,8 +26,8 @@ from foammesh.view.theming.sheet_form import SheetForm
 from .base import SnappyTaskPage
 from .mesher_limits import MesherLimitsGroup, fold_limits
 
-#: The switch that decides whether multi-region feature snapping is read.
-EXPLICIT_FEATURE_SNAP = 'meshing.snap.explicit_feature_snap'
+#: The choice that decides whether multi-region feature snapping is read.
+FEATURE_SNAPPING = 'meshing.snap.feature_snapping'
 
 #: Read by the explicit snapper only (``snappyHexMeshDict`` snapControls).
 MULTI_REGION_FEATURE_SNAP = 'meshing.snap.multi_region_feature_snap'
@@ -40,8 +42,7 @@ _SNAPPING = (
 )
 _FEATURE_SNAPPING = (
     'meshing.snap.n_feature_snap_iter',
-    'meshing.snap.implicit_feature_snap',
-    EXPLICIT_FEATURE_SNAP,
+    FEATURE_SNAPPING,
     MULTI_REGION_FEATURE_SNAP,
 )
 
@@ -103,26 +104,46 @@ class SnappySnapPage(SnappyTaskPage):
     # -- the one setting that is read only sometimes ------------------------ #
 
     def _explicitSnapIsOn(self) -> bool:
-        editor = self._editors.get(EXPLICIT_FEATURE_SNAP)
+        from foammesh.db.configurations_schema import featureSnapSwitches
+
+        editor = self._editors.get(FEATURE_SNAPPING)
         if editor is None:
             return False
-        return bool(self._pending.get(EXPLICIT_FEATURE_SNAP, editor.value()))
+        choice = self._pending.get(FEATURE_SNAPPING, editor.value())
+        return featureSnapSwitches(choice)[1]
+
+    def _isMultiRegionCase(self) -> bool:
+        from foammesh.db.configurations_schema import isMultiRegionCase
+
+        try:
+            return isMultiRegionCase(self._client.checkout())
+        except Exception:  # noqa: BLE001 - no case open yet
+            return False
 
     def syncFeatureSnapping(self) -> None:
         """Take multi-region feature snapping off the form when nothing reads.
 
         FIELD-02. ``multiRegionFeatureSnap`` is read inside the explicit
-        feature snapper and nowhere else, so with explicit snapping off it is
-        a control whose value cannot change the mesh. It is taken off the
-        form rather than greyed, and its pending edit is dropped with it so a
-        value nothing reads is not written back.
+        feature snapper, where points sit on more than one region, and
+        nowhere else. With another choice, or on a case with one region and
+        no zone, it is a control whose value cannot change the mesh (DP-5712:
+        the writer writes it false there). It is taken off the form rather
+        than greyed, as every inapplicable input is, and its pending edit is
+        dropped with it so a value nothing reads is not written back.
         """
         editor = self._editors.get(MULTI_REGION_FEATURE_SNAP)
         if editor is None:
             return
-        applies = self._explicitSnapIsOn()
-        reason = '' if applies else self.tr(
-            'Read by explicit feature snapping, which is off.')
+        if not self._explicitSnapIsOn():
+            reason = self.tr(
+                'Read by explicit feature snapping, which is not the choice.')
+        elif not self._isMultiRegionCase():
+            reason = self.tr(
+                'Read where regions or zones meet; this case has one region '
+                'and no zone.')
+        else:
+            reason = ''
+        applies = not reason
         editor.setApplicability(applies, reason)
         if applies:
             self._inactive_fields.pop(MULTI_REGION_FEATURE_SNAP, None)
@@ -148,5 +169,5 @@ class SnappySnapPage(SnappyTaskPage):
 
     def _on_field_changed(self, field_id: str, value) -> None:
         super()._on_field_changed(field_id, value)
-        if field_id == EXPLICIT_FEATURE_SNAP:
+        if field_id == FEATURE_SNAPPING:
             self.syncFeatureSnapping()

@@ -261,3 +261,115 @@ def detach(dataSet, key) -> None:
         cellData.RemoveArray(arrayName)
         dataSet.GetFieldData().RemoveArray(ARRAY_REVISION + arrayName)
         dataSet.Modified()
+
+
+# -- Plan 48 GM12: Gmsh's own cell fields for a section (plan 4.10.1) ----------- #
+#
+# A Gmsh mesh has no polyMesh, so cellLevel and cellZones do not exist for it,
+# and the section had nothing to colour by but Gmsh's quality.  The cells of a
+# Gmsh mesh do carry what Gmsh knows about them: the physical group, the
+# entity, the partition and the element type.  They are read from the arrays
+# Gmsh measured on the file (`core.gmsh.element_quality.measure_file`), bound
+# to the file's fingerprint exactly as a case field is bound to its mesh
+# revision, and put on the volume under the same rules as `attach`.
+
+#: The colour choices read from a Gmsh mesh, and the array each reads.
+GMSH_MEMBERS = {'gmsh.physical': 'gmshPhysical',
+                'gmsh.entity': 'gmshEntityTag',
+                'gmsh.partition': 'gmshPartition',
+                'gmsh.element_type': 'gmshElementType'}
+#: The array name each is put under on a dataset (what the mapper selects).
+GMSH_ARRAYS = {'gmsh.physical': 'gmshPhysicalGroup',
+               'gmsh.entity': 'gmshEntity',
+               'gmsh.partition': 'gmshPartitionId',
+               'gmsh.element_type': 'gmshElementTypeId'}
+
+
+def is_gmsh_field(key) -> bool:
+    return key in GMSH_MEMBERS
+
+
+def gmsh_absent_reason(key) -> str:
+    if key == 'gmsh.partition':
+        return 'This mesh was not partitioned, so there are no partitions to show.'
+    return 'This mesh carries no %s values.' % GMSH_MEMBERS.get(key, key)
+
+
+def read_gmsh_field(arrays: dict, key, revision: str = '') -> CaseCellField:
+    """*key*'s per-cell codes from a measured file, or the reason it cannot be.
+
+    The codes are dense (0..n-1, -1 for "none") and ``names`` gives the label
+    of each code, so a legend is built the way a cell-zone legend is.  Only the
+    highest-dimension elements are returned, in the file's order: they are the
+    cells a section cuts.
+    """
+    member = GMSH_MEMBERS.get(key)
+    if member is None:
+        return CaseCellField(key, REFUSED, revision,
+                             reason='%s is not a Gmsh cell field.' % key)
+    raw = arrays.get(member)
+    dims = arrays.get('gmshEntityDim')
+    if raw is None or dims is None:
+        return CaseCellField(key, REFUSED, revision,
+                             reason=gmsh_absent_reason(key))
+    dims = np.asarray(dims)
+    top = int(dims.max()) if dims.size else 0
+    raw = np.asarray(raw)[dims == top]
+    if raw.size == 0:
+        return CaseCellField(key, REFUSED, revision,
+                             reason=gmsh_absent_reason(key))
+    kinds = sorted({int(item) for item in np.unique(raw)})
+    if key == 'gmsh.physical':
+        names = arrays.get('__names') or {}
+        kinds = [item for item in kinds if item]
+        labels = [(str(names.get('%d:%d' % (top, item), '')).strip()
+                   or 'group %d' % item) for item in kinds]
+        empty = -1                                    # no physical group
+    elif key == 'gmsh.partition':
+        kinds = [item for item in kinds if item]
+        if not kinds:
+            return CaseCellField(key, REFUSED, revision,
+                                 reason=gmsh_absent_reason(key))
+        labels = ['partition %d' % item for item in kinds]
+        empty = -1
+    elif key == 'gmsh.element_type':
+        from foammesh.core.gmsh.element_quality import element_type_name
+        labels = [element_type_name(item) for item in kinds]
+        empty = -1
+    else:
+        labels = ['entity %d' % item for item in kinds]
+        empty = -1
+    lookup = {item: index for index, item in enumerate(kinds)}
+    codes = np.array([lookup.get(int(item), empty) for item in raw],
+                     dtype=np.int32)
+    return CaseCellField(key, READ, revision, values=codes,
+                         names=tuple(labels))
+
+
+def attach_gmsh(dataSet, field: CaseCellField) -> bool:
+    """Put a Gmsh cell field on a dataset of exactly its cell count.
+
+    The array is named by :data:`GMSH_ARRAYS`; values already attached at the
+    same revision are left alone, as in `attach`.
+    """
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+
+    if field.status != READ or field.values is None or dataSet is None:
+        return False
+    if dataSet.GetNumberOfCells() != field.cells:
+        return False
+    arrayName = GMSH_ARRAYS[field.key]
+    marker = ARRAY_REVISION + arrayName
+    cellData = dataSet.GetCellData()
+    if (cellData.GetArray(arrayName) is not None
+            and _fieldString(dataSet, marker) == field.revision):
+        return True
+    array = numpy_to_vtk(np.ascontiguousarray(field.values, np.int32),
+                         deep=True)
+    array.SetName(arrayName)
+    if cellData.GetArray(arrayName) is not None:
+        cellData.RemoveArray(arrayName)
+    cellData.AddArray(array)
+    _setFieldString(dataSet, marker, field.revision)
+    dataSet.Modified()
+    return True

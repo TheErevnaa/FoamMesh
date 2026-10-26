@@ -419,6 +419,109 @@ def write(path: str | Path, identity: IdentityMap) -> Path:
     return path
 
 
+def case_identity_path(case_path: str | Path) -> Path:
+    """Where the mesher's publication put this case's identity sidecar."""
+    return (Path(case_path) / 'foammesh' / 'quality' / 'geometry'
+            / IDENTITY_FILENAME)
+
+
+def read_case_identity(case_path: str | Path) -> IdentityMap | None:
+    """The identity map of the mesh this case published, or ``None``.
+
+    The current location first, then the one used before the producer moved
+    (``foammesh/quality/``), as the fidelity reader does.
+    """
+    quality = Path(case_path) / 'foammesh' / 'quality'
+    for sidecar in (quality / 'geometry' / IDENTITY_FILENAME,
+                    quality / IDENTITY_FILENAME):
+        try:
+            return read(sidecar)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Plan 49 SR6: identity of an *exported* patch
+# --------------------------------------------------------------------------- #
+#
+# The sidecar above joins the patches the mesher *published*. The export then
+# turns some of them into others: a baffle's second side is ``<name>_slave``,
+# ``createNonConformalCouples`` adds ``<coupling>_on_<patch>`` and
+# ``nonConformalError_on_<patch>`` (each naming its ``originalPatch``), and
+# ``splitMeshRegions`` makes ``<regionA>_to_<regionB>`` mapped walls. The
+# hand-off sidecar (``core/import_export/handoff.py``) asks this module, the
+# one identity authority, which published patch each exported patch stands
+# for, rather than keeping a second map of its own.
+
+#: Bumped when the rules of :func:`exported_identity` change meaning.
+EXPORTED_IDENTITY_VERSION = 1
+
+#: What made an exported patch, as :func:`exported_identity` reports it.
+EXPORT_PUBLISHED = 'published'
+EXPORT_BAFFLE_SECOND_SIDE = 'baffleSecondSide'
+EXPORT_COUPLING = 'createNonConformalCouples'
+EXPORT_COUPLING_ERROR = 'createNonConformalCouplesError'
+EXPORT_REGION_SPLIT = 'splitMeshRegions'
+EXPORT_UNIDENTIFIED = 'unidentified'
+
+
+@dataclass(frozen=True)
+class ExportedIdentity:
+    """Which published patch(es) one exported patch stands for."""
+
+    generator: str
+    sources: tuple[PatchIdentity, ...] = ()
+    #: ``first`` for the published patch itself, ``second`` for a baffle's
+    #: ``_slave`` side; empty for a generated patch.
+    side: str = ''
+    #: The published patch a generated patch was made from, by name.
+    based_on: str = ''
+
+    @property
+    def auxiliary(self) -> bool:
+        return self.generator in (EXPORT_COUPLING, EXPORT_COUPLING_ERROR,
+                                  EXPORT_REGION_SPLIT)
+
+
+def exported_identity(identity: IdentityMap | None, name: str, *,
+                      patch_type: str = '', original_patch: str = '',
+                      region: str = '', neighbour_region: str = '',
+                      _depth: int = 0) -> ExportedIdentity:
+    """The published identity of exported patch *name*.
+
+    The rules, in order: a non-conformal patch names its ``originalPatch``
+    (an ``nonConformalError`` one is the coupling's error patch); a published
+    name is itself; ``<name>_slave`` of a published name is that patch's
+    second side (a blocking baffle); a ``mappedWall`` named
+    ``<region>_to_<neighbour region>`` was made by the region split. Anything
+    else is unidentified and says so -- it is never joined by a guess.
+    """
+    name = str(name)
+    patch_type = str(patch_type or '')
+    if patch_type.startswith('nonConformal') and original_patch and _depth < 2:
+        base = exported_identity(identity, original_patch,
+                                 _depth=_depth + 1)
+        generator = (EXPORT_COUPLING_ERROR
+                     if patch_type == 'nonConformalError'
+                     or name.startswith('nonConformalError')
+                     else EXPORT_COUPLING)
+        return ExportedIdentity(generator, base.sources,
+                                based_on=str(original_patch))
+    found = identity.get(name) if identity is not None else None
+    if found is not None:
+        return ExportedIdentity(EXPORT_PUBLISHED, (found,), side='first')
+    if name.endswith('_slave') and identity is not None:
+        base = identity.get(name[:-len('_slave')])
+        if base is not None:
+            return ExportedIdentity(EXPORT_BAFFLE_SECOND_SIDE, (base,),
+                                    side='second', based_on=base.solver_name)
+    if (patch_type.startswith('mapped') and region and neighbour_region
+            and name == f'{region}_to_{neighbour_region}'):
+        return ExportedIdentity(EXPORT_REGION_SPLIT)
+    return ExportedIdentity(EXPORT_UNIDENTIFIED)
+
+
 def read(path: str | Path) -> IdentityMap:
     path = Path(path)
     if path.is_dir():

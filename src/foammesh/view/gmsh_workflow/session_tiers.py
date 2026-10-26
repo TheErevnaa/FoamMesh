@@ -91,6 +91,14 @@ class SessionTiers:
         # Plan 42 SG13. This is the one picker; every other page asks the
         # selection service for a PickRequest and this panel serves it.
         self._entityPanel.registerAsPicker()
+        # Plan 48 DK: the panel is a section of the Gmsh tool dock while a
+        # window with the dock is around; a page built alone keeps the tier.
+        from foammesh.view.gmsh_tools import hosting
+        if hosting.mount(hosting.ENTITIES, self._entityPanel, owner=self):
+            self._entityHeader = None
+            self.mountBuildTier(layout)
+            self.mountImportTier(layout)
+            return
         self._entityHeader = self.addTier(
             layout, name='Entity',
             title=self.tr('Pick entities and physical groups'),

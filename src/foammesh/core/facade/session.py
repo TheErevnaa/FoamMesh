@@ -121,6 +121,29 @@ def probe_locking(directory: Path) -> tuple[bool, str]:
     return True, 'file lock and sqlite exclusion verified'
 
 
+def applied_edits(change_sets) -> list[dict]:
+    """DP-6053. The edit records still applied, oldest first.
+
+    Every transaction leaves one record: an edit, an undo or a redo. An
+    undo takes the newest applied edit off, a redo puts back the one the
+    last undo took, and a new edit drops what could have been redone, as
+    the project's own undo stack does. What is left is what a revert may
+    still take back, newest last.
+    """
+    applied: list[dict] = []
+    undone: list[dict] = []
+    for record in change_sets:
+        kind = record.get('kind')
+        if kind == 'edit':
+            applied.append(record)
+            undone.clear()
+        elif kind == 'undo' and applied:
+            undone.append(applied.pop())
+        elif kind == 'redo' and undone:
+            applied.append(undone.pop())
+    return applied
+
+
 @dataclass
 class CaseSession:
     case_path: Path
@@ -308,6 +331,10 @@ class CaseSession:
 
     def latest_change_set(self) -> dict | None:
         return self.change_sets[-1] if self.change_sets else None
+
+    def applied_edits(self) -> list[dict]:
+        """DP-6053. The edit records still applied, oldest first."""
+        return applied_edits(self.change_sets)
 
     def attach_presentation(self, state, renderer=None) -> None:
         """Attach a desktop rendering surface so presentation ops are available.

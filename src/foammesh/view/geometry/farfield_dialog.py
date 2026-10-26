@@ -26,7 +26,8 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFormLayout,
 
 from foammesh.core.mesh import farfield_spec
 from foammesh.view.theming.metrics import align_unit_column, apply_form_metrics
-from foammesh.view.workflow_controls.field_widgets import FieldEditor
+from foammesh.view.workflow_controls.field_widgets import (
+    FieldEditor, add_editor_row)
 
 PREFIX = 'gmsh.describe_geometry.'
 
@@ -132,8 +133,7 @@ class FarfieldDialog(QDialog):
         for field_id, _leaf in FIELDS:
             editor = FieldEditor(client.descriptor(field_id), self)
             row = QHBoxLayout()
-            row.addWidget(editor.editor, 1)
-            row.addWidget(editor.unit_label)
+            add_editor_row(row, editor)       # DP-2873: compact numbers
             cell = QWidget(form_host)
             cell.setLayout(row)
             self._form.addRow(editor.label, cell)

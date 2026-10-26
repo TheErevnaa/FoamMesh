@@ -39,9 +39,14 @@ class PeriodicPair:
     #: Plan 41 GN11 (M-33). The three rows of the linear part of an affine
     #: pair; empty for a translation or a rotation.
     linear_rows: tuple = ()
+    #: Plan 49 SR5 (DP-5805). Where the pair came from: ``surfaceRelations``
+    #: and its relation id for every translation or rotation pair; an affine
+    #: Gmsh pair has no relation and carries neither.
+    origin: str = ''
+    relation_id: str = ''
 
     def to_dict(self) -> dict:
-        return {
+        document = {
             'controlId': self.control_id, 'name': self.name,
             'masterScope': self.master_scope, 'slaveScope': self.slave_scope,
             'transform': self.transform, 'affine': list(self.affine),
@@ -52,6 +57,11 @@ class PeriodicPair:
             'matchTolerance': self.match_tolerance,
             'linearRows': [list(row) for row in self.linear_rows],
         }
+        if self.origin:
+            document['origin'] = self.origin
+        if self.relation_id:
+            document['relationId'] = self.relation_id
+        return document
 
 
 @dataclass(frozen=True)
@@ -261,6 +271,8 @@ def derive_periodic_pairs(rows) -> PeriodicPlan:
             translation=translation, rotation_centre=centre,
             rotation_axis=axis, rotation_angle_degrees=angle,
             match_tolerance=tolerance,
-            linear_rows=linear if kind == 'affine' else ()))
+            linear_rows=linear if kind == 'affine' else (),
+            origin=str(row.get('origin') or ''),
+            relation_id=str(row.get('relationId') or '')))
 
     return PeriodicPlan(pairs=tuple(pairs), warnings=tuple(warnings))

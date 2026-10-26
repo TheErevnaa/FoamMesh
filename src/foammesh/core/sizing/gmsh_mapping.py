@@ -14,13 +14,10 @@ from foammesh.core.facade import feature_angle as angle_rules
 
 from .proposals import Proposal
 from .snappy_mapping import (
-    DEFAULT_EXPANSION, FIRST_LAYER_FRACTION, _mm, row_target)
+    DEFAULT_EXPANSION, _mm, layer_thicknesses, row_target)
 
-GLOBAL_SURFACE = 'gmsh.global_sizing.surface'
-GLOBAL_VOLUME = 'gmsh.global_sizing.volume'
 GLOBAL_TARGET = 'gmsh.global_sizing.target_size'
 GLOBAL_MINIMUM = 'gmsh.global_sizing.minimum_size'
-GLOBAL_MAXIMUM = 'option:Mesh.MeshSizeMax'
 FROM_CURVATURE = 'gmsh.global_sizing.from_curvature'
 FROM_POINTS = 'gmsh.global_sizing.from_points'
 EXTEND_FROM_BOUNDARY = 'gmsh.global_sizing.extend_from_boundary'
@@ -29,6 +26,12 @@ THREADS = 'gmsh.global_sizing.threads'
 CURVES = 'gmsh.curve_controls.controls'
 VOLUMES = 'gmsh.volume_controls.controls'
 BOUNDARY_LAYERS = 'gmsh.boundary_layers'
+LAYER_FIRST = 'gmsh.boundary_layers.first_height'
+LAYER_RATIO = 'gmsh.boundary_layers.ratio'
+LAYER_COUNT = 'gmsh.boundary_layers.layer_count'
+LAYER_TOTAL = 'gmsh.boundary_layers.total_thickness'
+#: The range ``gmsh/globalSizing/fromCurvature`` stores (points per 2 pi).
+CURVATURE_RANGE = (0, 50)
 CLASSIFICATION = angle_rules.CLASSIFICATION_FIELD
 
 #: The three native size sources held at zero while the automatic field is on.
@@ -41,7 +44,8 @@ HELD_OPTIONS = {
 ALGORITHM3D_MMG3D = 7
 #: An estimate, not a measurement: bytes per tetrahedron Gmsh holds.
 BYTES_PER_TET = 1500.0
-DEFAULT_COMBINER = 'Min'
+#: DP-2860. The enum spells it in lower case; ``Min`` was refused.
+DEFAULT_COMBINER = 'min'
 
 
 # -- Sizing > Automatic ------------------------------------------------------ #
@@ -65,22 +69,36 @@ def held_labels(active: bool) -> dict:
 
 # -- Sizing > Global / Curvature / Fields ------------------------------------ #
 
-def global_sizing(field) -> list[Proposal]:
-    """Target = hbulk; minimum = hmin; maximum = hmax."""
-    settings = field.settings
+def global_sizing(field, background: bool = False) -> list[Proposal]:
+    """Target = hbulk (hmax while the field is the background); minimum = hmin.
+
+    DP-2859. The target size is ``Mesh.MeshSizeMax`` (the runner writes it
+    there), so it is the one maximum: the ``option:Mesh.MeshSizeMax`` row
+    beside it was a second copy nothing stored. The surface and volume
+    algorithm enums took a size and were dropped.
+
+    DP-2867. While the field is the background, ``MeshSizeMax`` below the
+    field's own maximum clamps it: the far field the field coarsened came out
+    at hbulk. The target is then the field's maximum, so nothing clamps.
+    """
     hbulk, hmin = field.hbulk, field.hmin
-    hmax = float(settings.get('hmax', hbulk))
-    badge = f'field: {_mm(hbulk)}'
-    return [Proposal(GLOBAL_SURFACE, hbulk, 'hbulk', badge),
-            Proposal(GLOBAL_VOLUME, hbulk, 'hbulk', badge),
-            Proposal(GLOBAL_TARGET, hbulk, 'hbulk', badge),
-            Proposal(GLOBAL_MINIMUM, hmin, 'hmin', f'field: {_mm(hmin)}'),
-            Proposal(GLOBAL_MAXIMUM, hmax, 'hmax', f'field: {_mm(hmax)}')]
+    target, rule = hbulk, 'hbulk'
+    if background:
+        hmax = float(field.settings.get('hmax') or hbulk)
+        target, rule = max(hbulk, hmax), 'hmax: the field is the background'
+    return [Proposal(GLOBAL_TARGET, target, rule, f'field: {_mm(target)}'),
+            Proposal(GLOBAL_MINIMUM, hmin, 'hmin', f'field: {_mm(hmin)}')]
 
 
 def native_curvature(nodes_per_two_pi: int, automatic_active: bool) -> Proposal:
-    """The native alternative: same number, never active beside the field."""
-    value = 0 if automatic_active else int(nodes_per_two_pi)
+    """The native alternative: same number, never active beside the field.
+
+    DP-2862. ``automatic_active`` is whether the field is the background
+    (``sizing.field.use_as_background``); it was always passed as true.
+    """
+    low, high = CURVATURE_RANGE
+    value = 0 if automatic_active else min(high, max(low, int(
+        nodes_per_two_pi)))
     rule = ('off while the automatic field is on' if automatic_active
             else 'nodes per 2 pi of the field')
     return Proposal(FROM_CURVATURE, value, rule,
@@ -155,24 +173,31 @@ def features(feature_angle: float, input_is_stl: bool) -> list[Proposal]:
 # -- Layers ------------------------------------------------------------------- #
 
 def boundary_layers(patch_sizes: dict, expansion=DEFAULT_EXPANSION,
-                    ) -> list[Proposal]:
-    """First = 0.3 h_wall, count from total thickness and ratio (as snappy)."""
-    rows = []
-    for patch, wall in patch_sizes.items():
-        first = FIRST_LAYER_FRACTION * wall
-        ratio = max(float(expansion), 1.0001)
-        count = max(1, int(math.ceil(
-            math.log(wall / first) / math.log(ratio) - 1e-9))) if wall > first else 1
-        total = sum(first * ratio ** i for i in range(count))
-        badge = f'field: wall {_mm(wall)} -> {count} layers'
-        for element, value, rule in (
-                ('first_height', first, '0.3 x h_wall'),
-                ('ratio', ratio, 'the ratio the user has'),
-                ('layer_count', count, 'ceil(log(final / first) / log(ratio))'),
-                ('total_thickness', total, 'sum of the layers')):
-            rows.append(Proposal(row_target(BOUNDARY_LAYERS, patch, element),
-                                 value, rule, badge))
-    return rows
+                    gaps=None) -> list[Proposal]:
+    """First = 0.3 h_wall, count from total thickness and ratio (as snappy).
+
+    DP-2861. ``gmsh/boundaryLayers`` is one block of scalars, not a row per
+    patch, so the proposal is one stack sized for the finest wall: the layer
+    that fits there fits on every coarser one.
+    """
+    walls = [float(size) for size in patch_sizes.values()
+             if size is not None and math.isfinite(size) and size > 0]
+    if not walls:
+        return []
+    wall = min(walls)
+    # Plan 47 S16 (DP-2869): the one stack also fits the thinnest gap.
+    narrow = [float(g) for g in (gaps or {}).values()
+              if g is not None and math.isfinite(g) and g > 0]
+    layer = layer_thicknesses(wall, expansion, min(narrow) if narrow else None)
+    first, ratio = layer['first'], layer['expansion']
+    count, total = layer['layers'], layer['total']
+    badge = f'field: wall {_mm(wall)} -> {count} layers'
+    return [Proposal(LAYER_FIRST, first, '0.3 x h_wall of the finest wall',
+                     badge),
+            Proposal(LAYER_RATIO, ratio, 'the expansion ratio', badge),
+            Proposal(LAYER_COUNT, count,
+                     'ceil(log(h_wall / first) / log(ratio))', badge),
+            Proposal(LAYER_TOTAL, total, 'sum of the layers', badge)]
 
 
 # -- Generate / Quality / Reuse ---------------------------------------------- #

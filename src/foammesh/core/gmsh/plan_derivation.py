@@ -7,6 +7,8 @@ instead of looking identical to one that did not.
 
 from __future__ import annotations
 
+import copy
+
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -95,7 +97,10 @@ THREADED_VOLUME_ALGORITHMS = frozenset({'hxt'})
 #: subdivides every cell into hexahedra.
 CELL_SHAPE = {
     'tetrahedral': 0,
+    # Plan 48 D4 (user, 2026-10-21): the whole Gmsh range, 0-3.
+    'quadrangles': 1,
     'hexahedral': 2,
+    'barycentric': 3,
 }
 #: Plan 31 CP-08 item 3. ``Mesh.RecombinationAlgorithm``. MEASURED on
 #: duct.step: the four produce four different meshes -- 306 quadrangles and 70
@@ -107,6 +112,10 @@ RECOMBINATION_ALGORITHM = {
     'blossom': 1,
     'simple_full_quad': 2,
     'blossom_full_quad': 3,
+    # Plan 48 D4 (user, 2026-10-21): the whole Gmsh range. 4 reads back and
+    # logs quads but leaves no 2D element on 4.15.2; the run's element count
+    # is what tells the user (fragments/gm2/live-enums.json).
+    'bipartite_labelling': 4,
 }
 #: What each combination is supposed to come out as, checked against what the
 #: mesher produced. Surface family first, then volume.
@@ -123,6 +132,12 @@ EXPECTED_FAMILIES = {
     # Subdividing a recombined mesh was measured to change nothing: the same
     # 356 quadrangles and 2208 tetrahedra as recombination alone.
     ('hexahedral', True): (('Quadrilateral',), ('Tetrahedron', 'Pyramid')),
+    # Plan 48 D4. Subdivision 1 writes an all-quadrangle surface (528 of them
+    # on the GM2 probe) and 3 splits each tetrahedron into four.
+    ('quadrangles', False): (('Quadrilateral',), ('Tetrahedron', 'Pyramid')),
+    ('quadrangles', True): (('Quadrilateral',), ('Tetrahedron', 'Pyramid')),
+    ('barycentric', False): (('Triangle',), ('Tetrahedron',)),
+    ('barycentric', True): (('Quadrilateral',), ('Tetrahedron', 'Pyramid')),
 }
 #: Plan 31 FC-C. What automatic structuring owes at the whole-mesh grain,
 #: which is nothing -- and saying nothing here is the honest answer rather
@@ -168,12 +183,15 @@ AUTO_FORMAT_CODE = 10
 #: types 11/12/13/14/17/18/19, so a second-order MSH is a mesh this application
 #: counts, summarises and keeps; exporting it is a separate question from
 #: meshing it.
+#: DP-3006 (user decision D4): the mesher takes Gmsh's own range, 1-10. The
+#: OpenFOAM and SU2 limits are not enforced here; they come from the target
+#: matrix at Export (GM4).
 #: DP-2699. Order 3 is here because the Generate page's Set order reaches 3
 #: (``generate_actions._set_order`` bounds it 1-3) and the census reads the
 #: cubic MSH codes (``MSH_HIGHER_ORDER_VOLUME_TYPES``: 29, 92, ...). With the
 #: table at (1, 2) the stored batch field could not hold the order the page
 #: had just meshed at, so a saved project lost it.
-MESHER_ELEMENT_ORDERS: tuple[int, ...] = (1, 2, 3)
+MESHER_ELEMENT_ORDERS: tuple[int, ...] = tuple(range(1, 11))
 
 #: What each *export adapter* can represent. A target token absent from this
 #: table names no exporter, so the mesher's own capability applies and the run
@@ -332,6 +350,11 @@ def companion_export_formats(requested) -> tuple[str, ...]:
     matters here: a format the product cannot read back is a file whose
     identity it can never check.
     """
+    from .export_writers import retired
+    for token in requested:
+        if retired(token):
+            # DP-1437: a project or job naming the retired Medit writer.
+            raise PlanDerivationError(retired(token))
     unknown = sorted({str(token) for token in requested}
                      - set(COMPANION_EXPORT_FORMATS)
                      - set(NATIVE_EXPORT_FORMATS))
@@ -387,6 +410,17 @@ def element_order_options(target_solver=None
         for order in MESHER_ELEMENT_ORDERS)
 
 
+def _order_refusal(exporter: str, order: int) -> str:
+    """The reason *exporter* declines *order*; orders above 3 share one text."""
+    reason = ELEMENT_ORDER_REFUSALS.get((exporter, order))
+    if reason:
+        return reason
+    name = 'OpenFOAM 13' if exporter == 'openfoam' else 'SU2'
+    return (f'{name} takes first-order elements only, so nothing was written '
+            f'from this order-{order} mesh. The mesh was made at order '
+            f'{order} as asked and the native MSH is kept and counted.')
+
+
 def export_refusals(target_solver, order: int,
                     blockers: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Why the export of *target_solver* declines a mesh, in plain words.
@@ -402,11 +436,11 @@ def export_refusals(target_solver, order: int,
         # quadratic mesh, as it never did.
         if token == 'openfoam' and order not in EXPORTER_ELEMENT_ORDERS[
                 'openfoam']:
-            reasons.append(ELEMENT_ORDER_REFUSALS[('openfoam', order)])
+            reasons.append(_order_refusal('openfoam', order))
         reasons.extend(blockers)
     elif token == 'su2':
         if order not in EXPORTER_ELEMENT_ORDERS['su2']:
-            reasons.append(ELEMENT_ORDER_REFUSALS[('su2', order)])
+            reasons.append(_order_refusal('su2', order))
     return tuple(reasons)
 
 
@@ -427,6 +461,10 @@ class Algorithms:
     #: ``Mesh.MaxRetries``). Gmsh's own default is on; what this adds is that
     #: the run says which algorithm each surface was finally meshed with.
     fallback: bool = True
+    #: Plan 48 D4 (DP-2952). ``Mesh.MaxRetries``, its own number now: how
+    #: many times Gmsh retries a curve or surface left with a pending mesh.
+    #: Gmsh's default (10); it used to be 10 or 0 from :attr:`fallback`.
+    max_retries: int = 10
     #: Plan 31 FC-C. Whether the recombined surfaces are split back into
     #: triangles before the volume pass. Only consulted when
     #: :attr:`recombine` is set, and the reason it exists is the route that
@@ -489,6 +527,15 @@ class Algorithms:
         return surface, volume
 
     def to_dict(self) -> dict:
+        data = self._to_dict()
+        # Plan 48 DP-2952: the number travels only when it is not what the
+        # fallback box gave (10 on, 0 off), so an untouched project writes
+        # the same job, byte for byte, as before the field.
+        if self.max_retries == (10 if self.fallback else 0):
+            del data['maxRetries']
+        return data
+
+    def _to_dict(self) -> dict:
         return {
             'surface': self.surface, 'surfaceCode': self.surface_code,
             'volume': self.volume, 'volumeCode': self.volume_code,
@@ -498,6 +545,7 @@ class Algorithms:
             'recombinationAlgorithm': self.recombination_algorithm,
             'recombinationCode': self.recombination_code,
             'fallback': self.fallback,
+            'maxRetries': self.max_retries,
             'splitQuadrangles': self.split_quadrangles,
             # Carried into the job so the runner can hold the mesh it produced
             # against the mesh this combination was supposed to produce. The
@@ -749,12 +797,39 @@ class Parallel:
     #: the 3D pass runs on one thread regardless; surface meshing still threads,
     #: because independent faces are meshed concurrently whatever the 3D kernel.
     volume_threaded: bool = True
+    #: Plan 48 ST (DP-4605). Gmsh 4.15.2 with more than one thread meshes the
+    #: same model into different element counts from run to run (2047 against
+    #: 2068 tetrahedra on one model). True runs 1D, 2D and 3D on one thread.
+    reproducible: bool = False
+    #: Plan 48 D4 (DP-2952). Threads for curves, surfaces and volumes
+    #: (``Mesh.MaxNumThreads1D/2D/3D``). 0 is automatic: as many as
+    #: :attr:`threads`, which is what every stage ran on before these
+    #: existed. A job carries a stage only when it is set, so an untouched
+    #: project writes the job it always wrote.
+    curve_threads: int = 0
+    surface_threads: int = 0
+    volume_threads: int = 0
+
+    @property
+    def requested_volume_threads(self) -> int:
+        return self.volume_threads or self.threads
+
+    @property
+    def effective_volume_threads(self) -> int:
+        return self.requested_volume_threads if self.volume_threaded else 1
 
     def to_dict(self) -> dict:
-        return {'threads': self.threads,
-                'volumeThreaded': self.volume_threaded,
-                'effectiveVolumeThreads':
-                    self.threads if self.volume_threaded else 1}
+        out = {'threads': self.threads,
+               'volumeThreaded': self.volume_threaded,
+               'effectiveVolumeThreads': self.effective_volume_threads}
+        for key, value in (('curveThreads', self.curve_threads),
+                           ('surfaceThreads', self.surface_threads),
+                           ('volumeThreads', self.volume_threads)):
+            if value:
+                out[key] = value
+        if self.reproducible:
+            out['reproducible'] = True
+        return out
 
 
 @dataclass(frozen=True)
@@ -1014,9 +1089,36 @@ class JobIntent:
     #: (`sizeField/useAsBackground`): {directory, octree, key, ...}. Empty
     #: unless the project switched it on, and then not written to the job.
     automatic_field: dict = field(default_factory=dict)
+    #: Plan 48 GM4 R1 (DP-4110). The ``.msh`` options the user chose, limited
+    #: to the six the runner's export part writes; empty means "as before".
+    msh_write: dict = field(default_factory=dict)
+    #: Plan 48 GM4 R1 (DP-4111). The import-unit pins when the user unlocked
+    #: them: ``{targetUnit, scaling, state}``. Empty while FoamMesh holds them.
+    unit_pins: dict = field(default_factory=dict)
+    #: Plan 48 GM7 (producer of ``intent['meshActions']``): the mesh actions a
+    #: job plays after its last pass, ``({'action': id, 'values': {...}}, ...)``.
+    mesh_actions: tuple = ()
+    #: Plan 49 SR5 (DP-5783). The surface roles and relations of this
+    #: revision's prepared patches (``core/gmsh/surface_roles``). Written only
+    #: when a surface is more than a plain external boundary, so a project
+    #: with no authored role derives the byte-identical job it always did,
+    #: and part of the digest, so a changed role makes the last run stale.
+    surface_intent: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         document = self._base_dict()
+        if self.surface_intent:
+            document['surfaceIntent'] = copy.deepcopy(
+                dict(self.surface_intent))
+        if self.msh_write or self.unit_pins:
+            document['export'] = dict(
+                document['export'],
+                **({'mshWrite': dict(self.msh_write)}
+                   if self.msh_write else {}),
+                **({'unitPins': dict(self.unit_pins)}
+                   if self.unit_pins else {}))
+        if self.mesh_actions:
+            document['meshActions'] = [dict(item) for item in self.mesh_actions]
         if self.options.rows:
             document['options'] = self.options.to_list()
         if self.native_fields.nodes:
@@ -1260,6 +1362,7 @@ def derive_algorithms(values: dict,
             f'unknown recombination algorithm {recombiner!r}; expected one of '
             f'{", ".join(sorted(RECOMBINATION_ALGORITHM))}')
     split = bool(values.get('splitQuadrangles', False))
+    fallback = bool(values.get('algorithmFallback', True))
     warnings: tuple = ()
     if cell_shape == 'hexahedral':
         # DP-628 (field audit 0924 gmsh-generate-export D5). See
@@ -1280,10 +1383,29 @@ def derive_algorithms(values: dict,
     # (derive_export). ``target_solver`` is accepted and ignored.
     return Algorithms(surface=surface, volume=volume, cell_shape=cell_shape,
                       recombine=recombine, recombination_algorithm=recombiner,
-                      fallback=bool(values.get('algorithmFallback', True)),
+                      fallback=fallback,
+                      max_retries=_max_retries(values, fallback),
                       split_quadrangles=split,
                       automatic_structuring=bool(automatic_structuring),
                       warnings=warnings)
+
+
+def _max_retries(values: dict, fallback: bool) -> int:
+    """``Mesh.MaxRetries`` (Plan 48 DP-2952). With no number stored -- a
+    values dict written before the field -- it is what the fallback box gave:
+    10 ticked, 0 unticked. A stored project gets that from migrateDocument."""
+    raw = values.get('maxRetries')
+    if raw is None or str(raw).strip() == '':
+        return 10 if fallback else 0
+    try:
+        number = int(float(str(raw).strip()))
+    except ValueError:
+        raise PlanDerivationError(
+            f'meshing retries {raw!r} is not a whole number') from None
+    if number < 0:
+        raise PlanDerivationError(
+            f'meshing retries {number} is below 0, the floor Gmsh has')
+    return number
 
 
 #: Plan 31 CP-08 item 7. The three answers to "the cut left a pocket inside
@@ -1415,7 +1537,17 @@ def derive_parallel(values: dict, algorithms: Algorithms | None = None,
     # said 1, so a project that never touched the control derived a job nobody
     # had asked for.
     default = int(_schema_default('gmsh', 'parallel', 'threads', fallback=1) or 1)
-    threads = int(dict(values or {}).get('threads', default) or default)
+    # Plan 48 DP-2952. 0 is Gmsh's own "automatic" (Mesh.MaxNumThreads*
+    # minimum is 0), so a typed 0 is kept as a request for automatic, not
+    # replaced by the default.
+    typed = dict(values or {}).get('threads', default)
+    threads = default if typed is None else int(typed)
+    if bool(dict(values or {}).get('reproducible')):
+        # Plan 48 ST (DP-4605). One thread, whatever the count typed or the
+        # execution policy would give: the point is the same mesh each run.
+        return Parallel(threads=1, volume_threaded=True, reproducible=True)
+    if threads == 0 and resource_policy is None:
+        resource_policy = {}
     if resource_policy is not None:
         # A saved thread count above the default is a request and is clamped;
         # the default is nobody having asked, and then the execution policy
@@ -1426,7 +1558,36 @@ def derive_parallel(values: dict, algorithms: Algorithms | None = None,
         raise PlanDerivationError(f'threads {threads} is below 1')
     volume_threaded = (algorithms is None
                        or algorithms.volume in THREADED_VOLUME_ALGORITHMS)
-    return Parallel(threads=threads, volume_threaded=volume_threaded)
+    stages = _stage_threads(values)
+    if str(dict(resource_policy or {}).get('mode') or '').split('.')[-1]             .lower() == 'serial':
+        # Mesh setup asked for a serial run: no stage threads.
+        stages = (0, 0, 0)
+    return Parallel(threads=threads, volume_threaded=volume_threaded,
+                    curve_threads=stages[0], surface_threads=stages[1],
+                    volume_threads=stages[2])
+
+
+def _stage_threads(values) -> tuple[int, int, int]:
+    """Plan 48 DP-2952. The curve, surface and volume counts; 0 (or none
+    stored) is automatic. Below 0 is refused: Gmsh's floor is 0."""
+    values = dict(values or {})
+    out = []
+    for key, words in (('curveThreads', 'curve'), ('surfaceThreads', 'surface'),
+                       ('volumeThreads', 'volume')):
+        raw = values.get(key)
+        if raw is None or str(raw).strip() == '':
+            out.append(0)
+            continue
+        try:
+            number = int(float(str(raw).strip()))
+        except ValueError:
+            raise PlanDerivationError(
+                f'{words} threads {raw!r} is not a whole number') from None
+        if number < 0:
+            raise PlanDerivationError(
+                f'{words} threads {number} is below 0 (0 is automatic)')
+        out.append(number)
+    return tuple(out)
 
 
 def derive_export(values: dict, target_solver: str = 'unselected',
@@ -1460,8 +1621,8 @@ def derive_export(values: dict, target_solver: str = 'unselected',
             f'element order {values.get("elementOrder")!r} is not a number')
     if order not in MESHER_ELEMENT_ORDERS:
         raise PlanDerivationError(
-            f'element order {order} is outside 1-3; Gmsh writes linear, '
-            'quadratic or cubic elements here')
+            f'element order {order} is outside 1-10; Gmsh sets orders '
+            '1 to 10')
     incomplete = bool(values.get('secondOrderIncomplete', False))
     straight_midsides = bool(values.get('secondOrderLinear', False))
     renumber = bool(values.get('renumber', False))
@@ -1648,15 +1809,92 @@ def derive_option_overrides(values) -> OptionOverrides:
     can still fix it and not after the mesher has run.
     """
     from .option_catalogue import (
-        OptionRefusal, overrides_from_text, resolve_overrides)
+        OptionRefusal, overrides_from_text, resolve_overrides,
+        with_startup_defaults)
 
     values = dict(values or {})
     try:
-        mapping = overrides_from_text(values.get('overrides'))
+        # Plan 48 DP-2956. The start-up defaults lie under the project's own
+        # values; the project's win.
+        mapping = with_startup_defaults(
+            overrides_from_text(values.get('overrides')))
         rows, warnings = resolve_overrides(mapping)
     except OptionRefusal as error:
         raise PlanDerivationError(f'Gmsh options: {error}') from None
     return OptionOverrides(rows=rows, warnings=warnings)
+
+
+#: The ``.msh`` options the runner's export part writes (``MshChoice``).
+MSH_WRITE_OPTIONS = ('Mesh.MshFileVersion', 'Mesh.Binary', 'Mesh.SaveAll',
+                     'Mesh.SaveParametric', 'Mesh.PartitionSplitMeshFiles',
+                     'Mesh.SaveElementTagType')
+
+
+def _stored_overrides(values) -> dict:
+    from .option_catalogue import overrides_from_text, with_startup_defaults
+    try:
+        return dict(with_startup_defaults(
+            overrides_from_text(dict(values or {}).get('overrides'))))
+    except Exception:                                        # noqa: BLE001
+        return {}                      # derive_option_overrides says why
+
+
+def _msh_write_choice(values) -> dict:
+    """Plan 48 GM4 R1 (DP-4110). The user's ``.msh`` options, as chosen."""
+    stored = _stored_overrides(values)
+    return {name: stored[name] for name in MSH_WRITE_OPTIONS if name in stored}
+
+
+def _unit_pin_request(values) -> dict:
+    """Plan 48 GM4 R1 (DP-4111). The unlocked unit pins, or ``{}``."""
+    from .export_writers import unit_pin_rows
+    rows = unit_pin_rows(_stored_overrides(values))
+    if not any(row['unlocked'] for row in rows):
+        return {}
+    unit, scaling = rows
+    return {'targetUnit': str(unit['value']), 'scaling': float(scaling['value']),
+            'state': unit['state']}
+
+
+#: The ids ``runner_parts/mesh.py`` plays after the last mesh pass.
+MESH_JOB_ACTIONS = (
+    'set_order', 'regularize', 'reverse_elements', 'reverse_entities',
+    'delete_elements', 'delete_entity_mesh', 'reclassify_subset',
+    'optimize_quad_topology', 'untangle_geometry')
+
+
+def derive_mesh_actions(values) -> tuple:
+    """Plan 48 GM7. The stored mesh actions, checked before a run.
+
+    ``values`` is a list of ``{'action': id, 'values': {...}}``, the JSON text
+    of one, or ``{'rows': ...}`` of either (the way the other stored lists
+    travel).
+    """
+    values = getattr(values, 'value', values)
+    if isinstance(values, dict):
+        values = values.get('rows')
+    if isinstance(values, str):
+        if not values.strip():
+            return ()
+        try:
+            values = json.loads(values)
+        except ValueError as error:
+            raise PlanDerivationError(
+                f'Gmsh mesh actions: not valid JSON: {error}') from None
+    if not values:
+        return ()
+    if not isinstance(values, (list, tuple)):
+        raise PlanDerivationError('Gmsh mesh actions: not a list')
+    rows = []
+    for item in values:
+        if (not isinstance(item, dict)
+                or item.get('action') not in MESH_JOB_ACTIONS):
+            raise PlanDerivationError(
+                f'Gmsh mesh action {item!r} is not one of '
+                + ', '.join(MESH_JOB_ACTIONS))
+        rows.append({'action': item['action'],
+                     'values': dict(item.get('values') or {})})
+    return tuple(rows)
 
 
 def derive_point_sizes(values) -> PointSizes:
@@ -1764,7 +2002,9 @@ def poly_mesh_blockers(algorithms: Algorithms,
             'unit box), a mesh that fails checkMesh with negative cell '
             'volumes. The mesh was made as asked and the native MSH is kept.')
     for name, _storage, value in (options.rows if options else ()):
-        if name in WRITER_OPTIONS:
+        # Plan 48 GM4 (D1): the version and the binary flag are the user's
+        # ``.msh``; the publisher reads its own hidden MSH 2.2 copy.
+        if name in WRITER_OPTIONS and name not in MSH_WRITE_OPTIONS:
             reasons.append(
                 f'no polyMesh was published: the option {name} was set to '
                 f'{value!r} from the option catalogue, and the polyMesh '
@@ -1913,12 +2153,12 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
         *native_fields.warnings, *point_sizes.warnings,
         *entity_controls.warnings, *structure.warnings,
     )
-    if parallel.threads > 1 and not parallel.volume_threaded:
+    if parallel.requested_volume_threads > 1 and not parallel.volume_threaded:
         # Silence here reads as "sixteen threads were used". They were not.
         warnings = (*warnings, (
             f'the {algorithms.volume} volume algorithm is single-threaded, so '
-            f'the requested {parallel.threads} threads apply to surface '
-            f'meshing only; choose hxt for a threaded volume pass'))
+            f'the requested {parallel.requested_volume_threads} threads apply '
+            f'to surface meshing only; choose hxt for a threaded volume pass'))
     return JobIntent(
         schema_version=JOB_SCHEMA_VERSION, sizing=sizing, algorithms=algorithms,
         parallel=parallel, healing=healing, quality=quality, layers=layers,
@@ -1928,4 +2168,7 @@ def derive_from_native(native: dict, *, bbox=None, metadata=None,
         export=export, warnings=warnings, options=options,
         native_fields=native_fields, point_sizes=point_sizes,
         entity_controls=entity_controls, structure=structure,
+        msh_write=_msh_write_choice(native.get('options')),
+        unit_pins=_unit_pin_request(native.get('options')),
+        mesh_actions=derive_mesh_actions(native.get('meshActions')),
         metadata=dict(metadata or {}))

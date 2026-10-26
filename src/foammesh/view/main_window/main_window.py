@@ -4,6 +4,7 @@
 import asyncio
 import logging
 import platform
+import threading
 import warnings
 from functools import partial
 
@@ -42,9 +43,10 @@ from foammesh.core.documentation import tutorial_url
 from foammesh.core.case import CaseConflictError, WorkflowMode
 from foammesh.core.shell import (
     ACTION_OBJECT_NAMES, ActionId, ActionPolicy, AppSnapshot, Capability,
-    ContentState, job_state_from_manager, mesh_quality_capability,
+    ContentState, JobState, job_state_from_manager, mesh_quality_capability,
     terminal_capability,
 )
+from foammesh.core.shell.action_policy import SAVE_WHILE_RUNNING
 from foammesh.core.mesh import (
     MeshInfoService, MeshRecoveryService, MeshRepairService,
     RepairOperation, RepairRequest,
@@ -52,6 +54,7 @@ from foammesh.core.mesh import (
 from foammesh.core.quality import MeshCheckService
 from foammesh.core.quality import discover_cell_set_files, sets_of_this_mesh
 from foammesh.rendering import layers_grown
+from foammesh.core.gmsh import quality as gmsh_quality
 
 #: The legend of the volume's exterior colouring in the viewport's stack.
 VOLUME_LEGEND_KEY = 'meshColour'
@@ -130,7 +133,7 @@ from .mesh_quality_tab import MeshQualityTab
 from foammesh.core.geometry.diagnostics.repair import (
     REPAIR_BANDS, TESSELLATED_ACTIONS, apply_action, write_surface,
 )
-from foammesh.view.facade_client import query, submit
+from foammesh.view.facade_client import FailedResult, query, submit
 from foammesh.view.outside_task import modal
 
 from .run_narration import describe_cancellation, describe_start
@@ -173,6 +176,24 @@ def holdBatchLock(ui, locked: bool) -> None:
     if locked:
         ui.actionUndo.setEnabled(False)
         ui.actionRedo.setEnabled(False)
+        # DP-5711. The File menu stays open during a batch; its entries are
+        # what is held, and Save says why it is off.
+        for action in fileMenuEntries(ui) or ():
+            action.setEnabled(False)
+        save = getattr(ui, 'actionSave', None)
+        if save is not None and hasattr(save, 'setToolTip'):
+            save.setToolTip(SAVE_WHILE_RUNNING)
+            save.setStatusTip(SAVE_WHILE_RUNNING)
+
+
+def fileMenuEntries(ui):
+    """The File menu's entries, separators aside; None for a stand-in menu
+    that cannot list them (DP-5711)."""
+    menu = getattr(ui, 'menuFile', None)
+    actions = getattr(menu, 'actions', None)
+    if not callable(actions):
+        return None
+    return [action for action in actions() if not action.isSeparator()]
 
 
 class _ChipClick(QObject):
@@ -465,6 +486,7 @@ class MainWindow(QMainWindow):
         # Plan 45 BOOT2. The rail (~0.25-0.35 s) is a stage of its own.
         self._constructionTurn()
         self._installViewportRail()
+        self._mountGmshTools()
         self._prepareSectionPopover()
         self._installClearAreaFloats()
         self._adoptPreviewNotice()
@@ -2817,6 +2839,26 @@ class MainWindow(QMainWindow):
         # the colour is still there would strand the reader.
         fidelity = (report is not None or self._fidelityPainted
                     or hasReference)
+        # Plan 48 GM12 (DP-4366). The one rule for the button, shared with
+        # the local API: a session reference or a CAD file enables it too,
+        # and what is missing is the tooltip when it is not.
+        native = hasMesh and MainWindow._nativeMeshFile(self) is not None
+        sessionReference = False
+        if native and not fidelity:
+            try:
+                sessionReference = MainWindow.gmshSessionReference(
+                    self) is not None
+            except Exception:                                 # noqa: BLE001
+                logger.debug('no Gmsh session reference', exc_info=True)
+        enabled, why = gmsh_quality.deviation_availability(
+            has_mesh=hasMesh, session_reference=sessionReference,
+            stored_report=report is not None,
+            geometry_reference=hasReference,
+            cad_reference=MainWindow._nativeCadReference(self) is not None)
+        fidelity = fidelity or enabled
+        if not enabled and native:
+            # The snappy route keeps its own sentence.
+            fidelityReason = self.tr(why)
         self._renderingTool.setInspectionActionsEnabled(
             fidelity, fidelityReason, features, featuresReason)
 
@@ -2828,6 +2870,17 @@ class MainWindow(QMainWindow):
         than the fidelity report -- and because a layer stage is a snappy
         thing that a Gmsh case will never have.
         """
+        native = MainWindow._nativeMeshFile(self) if hasMesh else None
+        if native is not None:
+            # Plan 48 GM12 (DP-4358). A Gmsh mesh is measured on the file when
+            # the entry is used; the gate only reads what was measured, and
+            # stays open until a measurement says there are no layer cells.
+            held = MainWindow._gmshLayerCached(self, native)
+            self._renderingTool.setLayerCoverageEnabled(
+                held is None or bool(held.rows),
+                self.tr('This mesh has no prism or hexahedral layer cells, '
+                        'so there is no coverage to show.'))
+            return
         coverage = (self.layerCoverage() if hasMesh
                     else view_modes.LayerCoverage())
         self._renderingTool.setLayerCoverageEnabled(
@@ -2836,6 +2889,69 @@ class MainWindow(QMainWindow):
                 'No boundary-layer run has been measured on this case, so '
                 'there is no coverage to show. Run the layer stage first.'))
 
+    def _gmshLayerCached(self, native):
+        """The layer coverage already measured for *native*, else None."""
+        held = getattr(self, '_gmshLayerHeld', None)
+        if held is None:
+            return None
+        try:
+            stamp = Path(native).stat().st_mtime_ns
+        except OSError:
+            return None
+        return held[2] if held[:2] == (str(native), stamp) else None
+
+    def gmshLayerCoverage(self, native=None) -> view_modes.LayerCoverage:
+        """Plan 48 GM12 (DP-4358). Layers counted on the Gmsh mesh file.
+
+        The rows are what ``layers_grown.gmsh_layer_coverage`` measures, in
+        the shape the snappy path hands the same viewport tools; a patch the
+        project record gave no request for reads its layers as grown.
+        """
+        native = native or MainWindow._nativeMeshFile(self)
+        if native is None:
+            return view_modes.LayerCoverage()
+        cached = MainWindow._gmshLayerCached(self, native)
+        if cached is not None:
+            return cached
+        try:
+            measured = layers_grown.gmsh_layer_coverage(
+                native, MainWindow._resultRoots(self))
+        except Exception:                                     # noqa: BLE001
+            logger.debug('no layer coverage on the Gmsh mesh', exc_info=True)
+            return view_modes.LayerCoverage()
+        rows = []
+        for row in measured.get('objects') or ():
+            full = getattr(row, 'full', None)
+            faces = int(getattr(row, 'faces', 0) or 0)
+            share = (100.0 * full / faces if full is not None and faces
+                     else 0.0)
+            rows.append(view_modes.LayerRow(
+                row.patch, float(row.layers),
+                int(row.requested) if row.requested_known else 0,
+                share, bool(row.frozen)))
+        coverage = view_modes.LayerCoverage(True, tuple(rows))
+        try:
+            self._gmshLayerHeld = (str(native), Path(native).stat().st_mtime_ns,
+                                   coverage)
+        except OSError:
+            pass
+        return coverage
+
+    def _nativeCadReference(self):
+        """Plan 48 GM12. The CAD file the Gmsh mesh on screen was made from,
+        from the project record, or None."""
+        native = MainWindow._nativeMeshFile(self)
+        if native is None:
+            return None
+        try:
+            from foammesh.core import provenance
+            found = provenance.cad_reference(provenance.find(
+                MainWindow._resultRoots(self), native))
+        except Exception:                                     # noqa: BLE001
+            return None
+        path = (found.value or {}).get('path') if found.is_measured else None
+        return path if path and Path(path).is_file() else None
+
     def layerCoverage(self) -> view_modes.LayerCoverage:
         """What the layer stage achieved, read through the facade.
 
@@ -2843,6 +2959,9 @@ class MainWindow(QMainWindow):
         has none: the answer "nobody measured" is the one the caller needs,
         and it is the same answer either way.
         """
+        if MainWindow._nativeMeshFile(self) is not None:
+            # Plan 48 GM12 (DP-4358). A Gmsh mesh: counted on the file.
+            return MainWindow.gmshLayerCoverage(self)
         try:
             result = query(app.facadeClient, 'mesh.layer_coverage')
         except (FacadeError, RuntimeError, OSError, ValueError, KeyError):
@@ -3201,6 +3320,11 @@ class MainWindow(QMainWindow):
         manager = self._meshManager
         if manager is None:
             return None
+        cad = MainWindow._nativeCadReference(self)
+        if cad is not None and MainWindow._liveDeviationOffThread():
+            # Plan 48 GM12 (DP-4366). A Gmsh mesh made from a CAD file is
+            # measured to the trimmed faces of that file, on the file.
+            return MainWindow._paintNativeDeviation(self, cad)
         reference = (geometry.referenceSurface()
                      if geometry is not None else None)
         source = self.tr('the loaded geometry')
@@ -3256,6 +3380,94 @@ class MainWindow(QMainWindow):
         cancel = getattr(self._meshManager, 'cancelLiveDeviation', None)
         if callable(cancel):
             cancel()
+
+    def _paintNativeDeviation(self, cad):
+        """Plan 48 GM12 (DP-4366). Measure the Gmsh mesh file to its CAD file in
+        a worker thread; ``_nativeDeviationMeasured`` paints the answer."""
+        import functools
+
+        native = MainWindow._nativeMeshFile(self)
+        if native is None:
+            return None
+        loop = asyncio.get_running_loop()
+        job = functools.partial(
+            gmsh_quality.surface_deviation, native, cad,
+            tolerance_mm=self._deviationTolerance() or None,
+            unit=self._caseLengthUnit())
+        source = self.tr('the CAD file {0}').format(Path(cad).name)
+        self._liveDeviationPending = True
+        task = asyncio.ensure_future(loop.run_in_executor(None, job))
+        task.add_done_callback(
+            lambda done: self._nativeDeviationMeasured(done, source))
+        self.statusBar().showMessage(self.tr(
+            'Measuring the deviation from {0}…').format(source), 60000)
+        return MainWindow.LIVE_DEVIATION_PENDING
+
+    def _nativeDeviationMeasured(self, task, source) -> None:
+        """Plan 48 GM12 (DP-4366). Draw ``surface_deviation`` in the shared
+        panel: on the patches whose faces match the elements, and always as
+        the readout."""
+        if not getattr(self, '_liveDeviationPending', False):
+            return
+        self._liveDeviationPending = False
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as error:                          # noqa: BLE001
+            logger.warning('the Gmsh deviation measurement failed: %s', error)
+            self._renderingTool.setInspectionActive('fidelity', False)
+            self.statusBar().showMessage(self.tr(
+                'The deviation could not be measured: {0}').format(error),
+                12000)
+            return
+        painted = MainWindow._paintNativeFields(self, result)
+        readout = gmsh_quality.deviation_readout(result)
+        if painted:
+            self._deviationPainted(painted, source)
+        else:
+            self._fidelityPainted = True
+            panel = getattr(self, '_deviationPanel', None)
+            if panel is not None:
+                panel.setReferenceName(source)
+            self._showDeviationReadout(readout)
+            self.statusBar().showMessage(self.tr(
+                'Deviation from {0}: {1}').format(
+                    source, readout.notice), 12000)
+        if self._fidelityPainted:
+            self._enterDeviationView()
+        self._renderingTool.setInspectionActive(
+            'fidelity', bool(self._fidelityPainted))
+        self._syncViewModeBox()
+
+    def _paintNativeFields(self, result) -> int:
+        """Colour each patch whose face count equals its element count."""
+        import numpy as np
+
+        manager = self._meshManager
+        paint = getattr(manager, '_paintDeviation', None)
+        if not callable(paint):
+            return 0
+        fields = {}
+        surfaces = {}
+        for actor_id in getattr(manager, '_patchIds', ()):
+            info = manager._actorInfos.get(actor_id)
+            data = info.dataSet() if info is not None else None
+            if data is None:
+                continue
+            surfaces[actor_id] = data
+            values = result['fields'].get(str(actor_id).rsplit(':', 1)[-1])
+            if values is not None and len(values) == data.GetNumberOfCells():
+                fields[actor_id] = (np.arange(len(values), dtype=np.int64),
+                                    np.asarray(values, dtype=np.float64))
+        if not fields:
+            return 0
+        readout = gmsh_quality.deviation_readout(result)
+        return paint(
+            fields, {name: 0 for name in surfaces}, 'live', signed=False,
+            tolerance=readout.tolerance, scale=readout.scale,
+            universe=[(name, name in fields, '') for name in surfaces],
+            ticked=set(fields), notice=readout.notice)
 
     def _liveDeviationMeasured(self, task, source) -> None:
         """DP-2741. The worker answered: paint, as the press would have."""
@@ -3349,11 +3561,16 @@ class MainWindow(QMainWindow):
             logger.debug('no Gmsh session reference', exc_info=True)
             return None
 
-    def _showDeviationReadout(self):
-        """DP-713. The legend, histogram and figures for the colouring."""
+    def _showDeviationReadout(self, readout=None):
+        """DP-713. The legend, histogram and figures for the colouring.
+
+        Plan 48 GM12: *readout* is given when a Gmsh measurement drew no patch
+        and the numbers are all there is to show.
+        """
         manager = self._meshManager
-        readout = getattr(manager, 'deviationReadout', None)
-        readout = readout() if readout is not None else None
+        if readout is None:
+            readout = getattr(manager, 'deviationReadout', None)
+            readout = readout() if readout is not None else None
         if readout is None:
             return
         self._hideDeviationReadout()
@@ -3731,15 +3948,51 @@ class MainWindow(QMainWindow):
             for name, chains in found.items() if chains}
 
     def _latestFidelityReport(self):
-        """The most recent stored fidelity report for this case, or None."""
-        root = self._captureManager.caseRoot()
-        if root is None:
+        """The most recent stored fidelity report for this case, or None.
+
+        Plan 48 GM12 (DP-4351). A Gmsh project keeps its reports in the
+        native store beside the mesh, so both roots are looked in and the
+        newer report wins.
+        """
+        roots = MainWindow._resultRoots(self)
+        if not roots:
             return None
         try:
-            return fidelity_report.latest(root)
+            from foammesh.core.gmsh import quality as gmsh_quality
+            return gmsh_quality.latest_report(roots)
         except Exception:
             logger.debug('no readable fidelity report', exc_info=True)
             return None
+
+    def _resultRoots(self) -> list:
+        """Plan 48 GM12. ``[case root, native store root]``, those that exist."""
+        roots = []
+        try:
+            case = self._captureManager.caseRoot()
+        except Exception:                                     # noqa: BLE001
+            case = None
+        if case is not None:
+            roots.append(case)
+        manager = getattr(self, '_meshManager', None)
+        store = getattr(manager, 'nativeStoreRoot', None)
+        try:
+            store = store() if callable(store) else None
+        except Exception:                                     # noqa: BLE001
+            store = None
+        if store is not None and all(
+                Path(store) != Path(root) for root in roots):
+            roots.append(store)
+        return roots
+
+    def _nativeMeshFile(self):
+        """Plan 48 GM12. The Gmsh ``.msh`` on screen, or None (a case mesh)."""
+        manager = getattr(self, '_meshManager', None)
+        getter = getattr(manager, 'nativePath', None)
+        try:
+            found = getter() if callable(getter) else None
+        except Exception:                                     # noqa: BLE001
+            found = None
+        return Path(found) if found else None
 
     def _highlightPoorCells(self):
         """Colour the worst tenth of the metric range, and uncolour it.
@@ -4611,6 +4864,8 @@ class MainWindow(QMainWindow):
 
         self._stepManager.batchStarted.connect(self._disableMenubar)
         self._stepManager.batchStopped.connect(self._enableMenubar)
+        # DP-5711. Moving to another row saves the case.
+        self._stepManager.routeEntered.connect(self._saveAtStepBoundary)
 
         self._closeTriggered.connect(self._closeProject)
         self._bindPolicyActions()
@@ -4633,6 +4888,12 @@ class MainWindow(QMainWindow):
 
     def _bindPolicyActions(self):
         """Bind every shell action once; policy decides whether it may run."""
+        # DP-5711. Every policy action carries its reason as a tooltip, and
+        # QMenu shows none unless told to: a greyed Save said nothing.
+        for menu_name in ('menuFile', 'menuEdit', 'menuMesh'):
+            menu = getattr(self._ui, menu_name, None)
+            if hasattr(menu, 'setToolTipsVisible'):
+                menu.setToolTipsVisible(True)
         self._policyActions = {
             action_id: getattr(self._ui, object_name)
             for action_id, object_name in ACTION_OBJECT_NAMES.items()
@@ -4823,7 +5084,7 @@ class MainWindow(QMainWindow):
             content=content,
             workflow=app.workflowResolution.workflow,
             dirty=app.project.isDirty,
-            job=job_state_from_manager(app.jobManager),
+            job=MainWindow._menuJobState(self),
             undo_available=history['can_undo'],
             redo_available=history['can_redo'],
             undo_label=history['undo_label'],
@@ -4832,6 +5093,21 @@ class MainWindow(QMainWindow):
             capabilities=capabilities,
             capability_reasons=capability_reasons,
         )
+
+    def _menuJobState(self):
+        """The job state the menus are judged by.
+
+        DP-5711. A batch (Run to end) is one run of several jobs, and between
+        two of them the job manager is briefly idle. The batch is writing the
+        case the whole time, so the menus treat it as one running mutation:
+        Save stays off for all of it and says why, rather than flickering on
+        between stages.
+        """
+        state = job_state_from_manager(app.jobManager)
+        if getattr(self, '_batchLocked', False) and state in (
+                JobState.IDLE, JobState.RUNNING_READ):
+            return JobState.RUNNING_MUTATION
+        return state
 
     @staticmethod
     def _repairUtilities(lookup=None):
@@ -4992,7 +5268,7 @@ class MainWindow(QMainWindow):
             parts.append(f'{cells:,} triangles')
         patches = payload.get('patches')
         if isinstance(patches, list) and patches:
-            parts.append(f'{len(patches)} patches')
+            parts.append(count_text(len(patches), 'patch', 'patches'))
         unit = payload.get('source_unit')
         if unit:
             parts.append(f'unit {unit}')
@@ -6760,6 +7036,18 @@ class MainWindow(QMainWindow):
 
     @qasync.asyncSlot()
     async def _actionSave(self):
+        await MainWindow.saveCase(self)
+
+    async def saveCase(self, *, ask=True):
+        """File > Save, as the menu runs it; says what became of it.
+
+        Plan 48 PA5. The menu asks the person about a case changed outside
+        FoamMesh (Reload, Save copy, Cancel). A caller that cannot be asked
+        (``ask=False``, the local API) gets the conflict back as
+        ``CaseConflictError`` and nothing is reloaded or copied.
+        Returns ``'saved'``, ``'not saved'`` (no case, or the page would not
+        save) or ``'conflict'`` (the person was asked and chose).
+        """
         if app.project is not None and await self._stepManager.saveCurrentPage():
             try:
                 # The facade owns the write, so save-time conflict detection has
@@ -6768,6 +7056,8 @@ class MainWindow(QMainWindow):
                 app.project.assertUnchanged()
                 await app.facadeClient.run('case.save')
             except CaseConflictError as error:
+                if not ask:
+                    raise
                 choice = await AsyncMessageBox().question(
                     self, self.tr('Case changed outside FoamMesh'),
                     self.tr('{0}\n\nYes: Reload case\nNo: Save copy\nCancel: Return without saving.').format(error),
@@ -6777,8 +7067,60 @@ class MainWindow(QMainWindow):
                     await self._reloadAfterConflict()
                 elif choice == QMessageBox.StandardButton.No:
                     await self._saveConflictCopy()
-                return
+                return 'conflict'
             self._updateMenuStates()
+            # DP-5711. Save is offered on a clean case too; say it was done.
+            self.statusBar().showMessage(self.tr('Case saved.'), 4000)
+            return 'saved'
+        return 'not saved'
+
+    def _saveAtStepBoundary(self):
+        """Save the case when the person moves to another row (DP-5711).
+
+        Finished stages were already kept as they finished (R182/R202), but
+        what was set on a row reached the disk only on File > Save, so a case
+        closed without it came back without those settings. Moving off a row
+        is the boundary: the case is saved there through the same `case.save`
+        File > Save uses, when something is unsaved and nothing is writing the
+        case. A case changed outside FoamMesh is not overwritten in silence;
+        the status line points at File > Save, which asks.
+        """
+        project = getattr(app, 'project', None)
+        if project is None or not project.isDirty:
+            return False
+        if getattr(self, '_stepBoundarySave', None) is not None:
+            return False
+        if MainWindow._menuJobState(self) is not JobState.IDLE:
+            return False
+        try:
+            if app.facadeClient.session().read_only:
+                return False
+        except Exception:                                    # noqa: BLE001
+            return False
+        try:
+            project.assertUnchanged()
+        except CaseConflictError:
+            self.statusBar().showMessage(self.tr(
+                'Not saved automatically: the case was changed outside '
+                'FoamMesh. Use File > Save to choose what to keep.'), 8000)
+            return False
+
+        def saved(result):
+            self._stepBoundarySave = None
+            if isinstance(result, FailedResult):
+                self.statusBar().showMessage(self.tr(
+                    'The case could not be saved automatically: {0}').format(
+                        result.message), 8000)
+            # A success says nothing on the status line, which may be telling
+            # the person something about the row they moved to; the title
+            # bar's unsaved mark going away says it.
+            self._updateMenuStates()
+
+        self._stepBoundarySave = True
+        task = submit(app.facadeClient, 'case.save', {}, then=saved)
+        if task is not None:
+            self._stepBoundarySave = task
+        return True
 
     async def _reloadAfterConflict(self):
         if app.project is None:
@@ -6942,8 +7284,22 @@ class MainWindow(QMainWindow):
     SHORTCUTS_ACTION = 'actionKeyboardShortcuts'
 
     def _sweepShortcuts(self, *_args):
-        """Pick up the Gmsh pages' keys once they exist (Plan 40 UXE1)."""
-        SHORTCUTS.sweep(self)
+        """Pick up the Gmsh pages' keys once they exist (Plan 40 UXE1).
+
+        Called on every focus change, and Qt moves the focus while a focused
+        widget is being destroyed: walking the window's children then wraps
+        half-destroyed objects and the process dies (DP-5736). So the sweep
+        runs on the next turn of the event loop, once per burst of changes,
+        from a timer the window owns (it dies with the window).
+        """
+        timer = getattr(self, '_shortcutSweepTimer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(lambda: SHORTCUTS.sweep(self))
+            self._shortcutSweepTimer = timer
+        timer.start()
 
     def _installShortcutsHelp(self):
         """Help > Keyboard shortcuts... (Plan 40 UXE1). F1 opens it as well."""
@@ -7212,7 +7568,29 @@ class MainWindow(QMainWindow):
 
     @qasync.asyncSlot()
     async def _saveAs(self, path):
-        if await self._stepManager.saveCurrentPage():
+        await MainWindow.saveStateAs(self, path)
+
+    async def saveStateAs(self, path, *, open_copy=None):
+        """File > Save as, as the menu runs it; says what became of it.
+
+        Plan 48 PA5. Written as the menu writes it: FoamMesh state only (the
+        native geometry and mesh files are not copied). With ``open_copy``
+        left out the person is shown the progress and asked whether to open
+        the copy. With ``open_copy`` True or False the question is answered
+        and no dialog is raised (the local API): a copy that cannot be
+        written raises ``OSError``/``ValueError`` with the reason the dialog
+        would give. Returns ``{'saved', 'path', 'opened'}``. Without the
+        dialog, Cancel is ``cancelSaveAs`` (the local API's
+        ``window.save_as.cancel``), polled between the copy's writes as the
+        dialog's Cancel is.
+        """
+        answered = open_copy is not None
+        if not await self._stepManager.saveCurrentPage():
+            return {'saved': False, 'path': str(path), 'opened': False}
+        progressDialog = None
+        cancelEvent = threading.Event()
+        self._saveAsCancel = cancelEvent
+        if not answered:
             # Plan 39 VI1 (F6b). Cancel is polled between the copy's writes, so a
             # cancelled Save as leaves no destination at all.
             progressDialog = ProgressDialog(
@@ -7222,35 +7600,64 @@ class MainWindow(QMainWindow):
 
             progressDialog.setLabelText(self.tr(
                 'Saving FoamMesh state only; native geometry and mesh files are not copied'))
-            try:
-                await asyncio.to_thread(
-                    app.project.saveStateAsCase, path,
-                    cancelled=progressDialog.isCanceled)
-            except StateSaveCancelled:
+        try:
+            await asyncio.to_thread(
+                app.project.saveStateAsCase, path,
+                cancelled=(progressDialog.isCanceled
+                           if progressDialog is not None else cancelEvent.is_set))
+        except StateSaveCancelled:
+            if progressDialog is not None:
                 progressDialog.close()
-                self.statusBar().showMessage(
-                    self.tr('Save as cancelled; nothing was written.'), 8000)
-                return
-            except (OSError, ValueError, FileExistsError) as error:
-                progressDialog.close()
-                text, details = messages.reasonOf(error, self.tr('The state could not be saved.'))
-                await AsyncMessageBox().warning(self, self.tr('Save state error'), text, detailedText=details)
-                return
+            self.statusBar().showMessage(
+                self.tr('Save as cancelled; nothing was written.'), 8000)
+            return {'saved': False, 'path': str(path), 'opened': False}
+        except (OSError, ValueError, FileExistsError) as error:
+            if answered:
+                raise
             progressDialog.close()
+            text, details = messages.reasonOf(error, self.tr('The state could not be saved.'))
+            await AsyncMessageBox().warning(self, self.tr('Save state error'), text, detailedText=details)
+            return {'saved': False, 'path': str(path), 'opened': False}
+        finally:
+            if self._saveAsCancel is cancelEvent:
+                self._saveAsCancel = None
+        if progressDialog is not None:
+            progressDialog.close()
+        if not answered:
             open_copy = await modal(
                 messages.question,
                 self, self.tr('State copy complete'),
                 self.tr('FoamMesh state was saved without native artifacts. Open it now?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
-            if open_copy == QMessageBox.StandardButton.Yes:
-                await self._openProject(str(path))
-            else:
-                self.statusBar().showMessage(
-                    self.tr('Saved FoamMesh state to {0}.').format(path), 8000)
+            open_copy = open_copy == QMessageBox.StandardButton.Yes
+        if open_copy:
+            await self._openProject(str(path))
+        else:
+            self.statusBar().showMessage(
+                self.tr('Saved FoamMesh state to {0}.').format(path), 8000)
+        return {'saved': True, 'path': str(path), 'opened': bool(open_copy)}
+
+    def cancelSaveAs(self) -> bool:
+        """Cancel the Save as that is running without its dialog, as the
+        dialog's Cancel does; whether one was running."""
+        event = getattr(self, '_saveAsCancel', None)
+        if event is None:
+            return False
+        event.set()
+        return True
 
     def _disableMenubar(self):
-        self._ui.menuFile.setEnabled(False)
+        # DP-5711. The File menu used to go grey as a whole, so during a run
+        # Save could not even be pointed at to learn why it was off. The menu
+        # now stays open and each of its entries is held off instead (the
+        # same lock: nothing in it can be chosen), and Save's tooltip says why.
+        entries = fileMenuEntries(self._ui)
+        if entries is None:
+            self._ui.menuFile.setEnabled(False)
+        elif not getattr(self, '_batchLocked', False):
+            self._batchFileHeld = [action for action in entries
+                                   if action.isEnabled()]
         self._ui.menuMesh.setEnabled(False)
         # DP-756. An undo under a running batch rewrites the case the batch
         # is still writing, so Edit goes too, and its keys with it.
@@ -7260,6 +7667,11 @@ class MainWindow(QMainWindow):
 
     def _enableMenubar(self):
         self._ui.menuFile.setEnabled(True)
+        # DP-5711. Give back what the batch held; the policy refresh below
+        # then settles the entries it owns (Save is offered again at once).
+        for action in getattr(self, '_batchFileHeld', None) or ():
+            action.setEnabled(True)
+        self._batchFileHeld = []
         self._ui.menuMesh.setEnabled(True)
         self._ui.menuEdit.setEnabled(True)
         self._batchLocked = False
@@ -7385,13 +7797,32 @@ class MainWindow(QMainWindow):
         if payload.get('operation') == 'mesh.workflow.unlock':
             self._cancelSectionJobs('unlock')
 
+    def _mountGmshTools(self):
+        # Plan 48 GM11b: the Gmsh tool dock, menus and keys (view/gmsh_tools).
+        from foammesh.view.gmsh_tools import mount
+        mount.mount(self)
+
+    def _printLoadNotes(self):
+        """DP-5712. Say in the Console what the load read differently."""
+        try:
+            notes = list(getattr(app.project.db(), 'loadNotes', ()) or ())
+        except Exception:  # noqa: BLE001 - never block opening a case
+            return
+        for note in notes:
+            MainWindow._appendConsole(self, str(note))
+
     def _projectOpened(self):
+        from foammesh.view.gmsh_tools import mount
+        mount.project_opened(self)
+        from foammesh.view.main_window import window_api
+        window_api.project_opened(self)
         self._recentFilesMenu.updateRecentest(app.project.path)
         # MEASURED 2026-09-03: the start-up prompt "Open a case or create a
         # new case to begin." stayed in the status bar through the whole
         # meshing route, because nothing ever cleared a message that has no
         # timeout. An open project is the answer to that prompt.
         self.statusBar().clearMessage()
+        MainWindow._printLoadNotes(self)
 
         # 10MB(=10,485,760=1024*1024*10)
         # Plan 39 VI14d. Written by a thread of its own: a record logged on this
@@ -7584,6 +8015,10 @@ class MainWindow(QMainWindow):
         return self._hasMeshOnDisk()
 
     def _projectClosed(self):
+        from foammesh.view.gmsh_tools import mount
+        mount.project_closed(self)
+        from foammesh.view.main_window import window_api
+        window_api.project_closed(self)
         bars = getattr(self, '_autosaveBars', None)
         if bars is not None:
             bars.dispose()

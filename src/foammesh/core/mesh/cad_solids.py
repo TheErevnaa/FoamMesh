@@ -413,6 +413,124 @@ def _entry_solids(entry: dict, with_surfaces: bool):
     return solids, open_regions, not_solids, surfaces, reasons
 
 
+def _assembled_solids(entries, result: CaseSolids,
+                      with_surfaces: bool) -> None:
+    """Bodies the Split tab left open on a face they share (DP-6056).
+
+    The split cuts an assembly of touching STL bodies into one entry per
+    body, each open where it meets the other, and one entry for the face
+    between them. Measured one at a time every one of them is open, and the
+    case "has no closed solids": detection fell back to the voxels, no region
+    could be applied on Gmsh, and the export wrote one region and no
+    interface -- while the run, which pairs such a face with the two bodies
+    it closes, meshed both. This asks the run's own rule
+    (``shell_topology.plan_interface_sheets``) of the open regions, with the
+    points welded by position across entries, and moves each body it closes
+    from ``open_regions`` to ``solids``; the face is then a boundary of both,
+    not a region.
+    """
+    from foammesh.core.geometry.domain_topology import _classifier
+
+    open_names = set(result.open_regions)
+    if len(open_names) < 3:
+        return
+    weld: dict = {}
+    coordinates: list = []
+    pieces: dict = {}
+    for entry in entries or ():
+        if occ_solids(entry) is not None:
+            continue
+        polydata = _surface(entry)
+        if polydata is None:
+            continue
+        regions = entry_regions(entry)
+        cells = _region_cells(entry, regions, polydata)
+        bounds = polydata.GetBounds()
+        scale = max(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                    bounds[5] - bounds[4]) or 1.0
+        for region in regions:
+            uuid = str(region.get('region_uuid') or '').strip()
+            name = str(region.get('name') or uuid)
+            ids = cells.get(uuid)
+            if not uuid or name not in open_names or ids is None                     or not len(ids):
+                continue
+            triangles = []
+            for value in ids:
+                point_ids = polydata.GetCell(int(value)).GetPointIds()
+                nodes = []
+                for index in range(point_ids.GetNumberOfIds()):
+                    point = polydata.GetPoint(point_ids.GetId(index))
+                    key = tuple(round(axis / scale, 9) for axis in point)
+                    if key not in weld:
+                        weld[key] = len(coordinates)
+                        coordinates.append(point)
+                    nodes.append(weld[key])
+                triangles.extend((nodes[0], nodes[step], nodes[step + 1])
+                                 for step in range(1, len(nodes) - 1))
+            pieces[uuid] = (name, str(entry.get('geometry_id')), triangles)
+    sheets = _classifier().plan_interface_sheets(
+        {uuid: piece[2] for uuid, piece in pieces.items()})
+    if not sheets:
+        return
+    bodies: dict = {}
+    for sheet, (first, second) in sorted(sheets.items()):
+        face = pieces[sheet][2]
+        bodies.setdefault(first, []).extend(face)
+        bodies.setdefault(second, []).extend(
+            (c, b, a) for a, b, c in face)
+    closed = set()
+    for uuid, extra in sorted(bodies.items()):
+        name, geometry_id, own = pieces[uuid]
+        shell = _welded_shell(coordinates, own + extra)
+        if shell is None:
+            continue
+        volume = shell_volume(shell)
+        if volume <= 0.0:
+            continue
+        result.solids.append(Solid(
+            uuid, name, geometry_id, float(volume),
+            tuple(float(value) for value in shell.GetBounds()),
+            MEASURED_SHELL))
+        if with_surfaces:
+            result.surfaces[uuid] = shell
+        closed.add(uuid)
+    for sheet, owners in sheets.items():
+        if set(owners) <= closed:
+            closed.add(sheet)
+    result.open_regions[:] = [
+        name for name in result.open_regions
+        if name not in {pieces[uuid][0] for uuid in closed}]
+
+
+def _welded_shell(coordinates, triangles):
+    """The triangles as a surface, or ``None`` unless every edge has two."""
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+
+    uses: dict = {}
+    for triangle in triangles:
+        for index in range(3):
+            one, other = triangle[index], triangle[(index + 1) % 3]
+            edge = (min(one, other), max(one, other))
+            uses[edge] = uses.get(edge, 0) + 1
+    if not uses or any(count != 2 for count in uses.values()):
+        return None
+    used: dict = {}
+    points = vtkPoints()
+    for triangle in triangles:
+        for node in triangle:
+            if node not in used:
+                used[node] = len(used)
+                points.InsertNextPoint(coordinates[node])
+    polys = vtkCellArray()
+    for triangle in triangles:
+        polys.InsertNextCell(3, [used[node] for node in triangle])
+    shell = vtkPolyData()
+    shell.SetPoints(points)
+    shell.SetPolys(polys)
+    return shell
+
+
 def case_solids(case_path=None, *, entries=None,
                 with_surfaces: bool = False) -> CaseSolids:
     """Every solid of the case's staged geometry, in import order.
@@ -441,8 +559,46 @@ def case_solids(case_path=None, *, entries=None,
         result.not_solids.extend(not_solids)
         result.not_solid_reasons.update(reasons)
         result.surfaces.update(surfaces)
+    if result.open_regions:
+        _assembled_solids(entries, result, with_surfaces)
+    result.solids = _distinct_names(result.solids, entries)
     result.elapsed = time.perf_counter() - began
     return result
+
+
+def _distinct_names(solids, entries) -> list:
+    """The solids, no two of them sharing a name.
+
+    DP-6069. A CAD file names its solid after its product, and two STEP files
+    written by the same tool both call theirs "Part 1": the regions table
+    then offered two regions of one name. A shared name takes the name of the
+    file the solid came from (``a``, or ``a Part 1`` where that file holds
+    several solids); a name still taken gets a number.
+    """
+    from collections import Counter
+    import dataclasses
+
+    shared = Counter(solid.name for solid in solids)
+    if all(count == 1 for count in shared.values()):
+        return solids
+    label = {str(entry.get('geometry_id')): str(entry.get('name') or '').strip()
+             for entry in entries or ()}
+    per_entry = Counter(solid.geometry_id for solid in solids)
+    taken = {solid.name for solid in solids if shared[solid.name] == 1}
+    out = []
+    for solid in solids:
+        name = solid.name
+        if shared[name] > 1:
+            file = label.get(solid.geometry_id) or ''
+            if file:
+                name = file if per_entry[solid.geometry_id] == 1 else f'{file} {name}'
+            base, number = name, 2
+            while name in taken:
+                name, number = f'{base} {number}', number + 1
+            solid = dataclasses.replace(solid, name=name)
+        taken.add(name)
+        out.append(solid)
+    return out
 
 
 # -- the typing ------------------------------------------------------------- #

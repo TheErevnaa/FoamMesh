@@ -98,6 +98,27 @@ QLabel#fieldUnit {
     color: {{foreground.sub}};
     font-size: {{type.small}}px;
 }
+/* DP-2874 (live). The reset arrow beside a rewritten field is a bare 16 px
+ * glyph. The tool button rule's 4px 6px padding, border and fill left a
+ * 2 px gap for the 12 px icon inside the fixed 16 px box, and the window
+ * drew a grey square with a dot in it. Hover and focus draw the outline. */
+QToolButton#fieldResetButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 0;
+    /* A sheet's min and max beat setFixedSize: the box is said here,
+     * 14 + 2 border = RESET_BUTTON_SIZE (16), or the row squeezes it. */
+    min-width: 14px;
+    max-width: 14px;
+    min-height: 14px;
+    max-height: 14px;
+}
+QToolButton#fieldResetButton:hover,
+QToolButton#fieldResetButton:focus {
+    border: 1px solid {{accent.default}};
+    padding: 0;
+}
 /* A card title that folds (`.grp > .t` with a chevron): the same 14px 600
  * title a group box carries, so a fold and a group read as one idiom. The
  * chevron is the button's own themed icon (widgets/folder_header.py). */

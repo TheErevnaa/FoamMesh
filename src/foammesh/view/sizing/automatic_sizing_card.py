@@ -561,6 +561,8 @@ class AutomaticSizingCard(QFrame):
     def apply(self) -> None:
         def done(result) -> None:
             payload = getattr(result, 'payload', None) or {}
+            # What the last Apply wrote and skipped, for a reader of the card.
+            self.last_apply = dict(payload)
             skipped = payload.get('skipped') or {}
             typed = sum(1 for why in skipped.values() if why == 'typed')
             ran = sum(1 for why in skipped.values() if why == 'stage_ran')

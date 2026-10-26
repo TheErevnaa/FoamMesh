@@ -19,7 +19,7 @@ from uuid import uuid4
 from .job import JobStatus
 from .process_control import kill_process_tree, new_process_group_kwargs
 from .wsl_wrapper import (
-    EXIT_PREFIX, HEARTBEAT_PREFIX, RUN_DIR_VARIABLE, RUN_ID_VARIABLE, RUN_PREFIX,
+    EXIT_PREFIX, HEARTBEAT_PREFIX, PEAK_PREFIX, RUN_DIR_VARIABLE, RUN_ID_VARIABLE, RUN_PREFIX,
 )
 from foammesh.core.project.events import Event
 from foammesh.core.quantities import agreeing, count_text
@@ -278,6 +278,8 @@ class _Transport:
         self.kept_waiting = 0
         self.run_line: dict | None = None
         self.exit_rc: int | None = None
+        #: Plan 48 PM. The wrapper's `FOAMMESH_PEAK` line, as parsed.
+        self.peak: dict | None = None
         self.tail: deque[str] = deque(maxlen=TAIL_LINES)
         self.run_recorded = False
 
@@ -294,6 +296,9 @@ class _Transport:
             fields = dict(item.split('=', 1) for item in stripped.split()[2:] if '=' in item)
             self.run_line = {'run_id': stripped.split()[1] if len(stripped.split()) > 1 else '',
                              **{key: _int_or_none(value) for key, value in fields.items()}}
+            return 'control', text
+        if stripped.startswith(PEAK_PREFIX):
+            self.peak = parse_peak_line(stripped)
             return 'control', text
         if stripped.startswith(EXIT_PREFIX):
             for item in stripped.split()[2:]:
@@ -312,6 +317,28 @@ class _Transport:
 
     def idle_seconds(self) -> float:
         return self.loop.time() - self.last_output
+
+
+def parse_peak_line(line: str) -> dict:
+    """``FOAMMESH_PEAK <id> kb=<n> measure=<how> reason=<why>`` -> the
+    peak memory the wrapper measured, in the shape a run manifest keeps."""
+    fields = dict(item.split('=', 1) for item in line.split()[2:] if '=' in item)
+    kilobytes = _int_or_none(fields.get('kb'))
+    measure = fields.get('measure') or 'unavailable'
+    if kilobytes is not None and kilobytes > 0 and measure != 'unavailable':
+        return {'peak_rss_bytes': kilobytes * 1024, 'measure': measure,
+                'source': '/usr/bin/time -f %M in the WSL wrapper'}
+    return {'measure': 'unavailable',
+            'reason': PEAK_REASONS.get(fields.get('reason') or '',
+                                       'the wrapper did not report a peak')}
+
+
+#: What the wrapper's reason codes mean.
+PEAK_REASONS = {
+    'no-usr-bin-time': 'this WSL distro has no /usr/bin/time',
+    'no-measure-file': 'the run ended before /usr/bin/time wrote its measure',
+    'unreadable-measure': '/usr/bin/time wrote a measure that is not a number',
+}
 
 
 def _int_or_none(value):
@@ -349,6 +376,11 @@ class JobResult:
     run_id: str | None = None
     run_state: str | None = None
     linux_rc: int | None = None
+    #: Plan 48 PM. The mesher's peak resident set, as the wrapper measured it:
+    #: ``{'peak_rss_bytes': n, 'measure': ..., 'source': ...}``, or
+    #: ``{'measure': 'unavailable', 'reason': ...}`` (a native launch, an old
+    #: distro). ``None`` only when no wrapper line was seen at all.
+    peak_memory: dict | None = None
 
     @property
     def reason(self) -> str:
@@ -378,6 +410,8 @@ class JobResult:
                 'run_id': self.run_id, 'run_state': self.run_state,
                 'linux_rc': self.linux_rc,
             })
+        if self.peak_memory is not None:
+            value['peak_memory'] = dict(self.peak_memory)
         return value
 
 
@@ -946,6 +980,10 @@ class JobManager:
                 status = JobStatus.FAILED
                 error = f'process exited with code {returncode}'
                 category = JobErrorCategory.PROCESS
+                from foammesh.core.run_result import read_progress_failure
+                why = read_progress_failure(request.log_path)
+                if why:
+                    error = f'{error}: {why}'
             else:
                 status = JobStatus.DONE
                 error = None
@@ -972,6 +1010,13 @@ class JobManager:
                             f"{count_text(cut, 'overlong output line')} "
                             f"{agreeing(cut, 'was', 'were')} cut at "
                             f'{LINE_LIMIT_BYTES // 1024} KiB')
+            peak_memory = transport.peak
+            if peak_memory is None:
+                peak_memory = {
+                    'measure': 'unavailable',
+                    'reason': ('the process ran natively on Windows; its peak '
+                               'memory is not measured' if not wrapped else
+                               'the wrapper reported no peak memory')}
             run_state = None
             if records is not None:
                 # `exited` needs the wrapper's acknowledgement, or a native
@@ -983,6 +1028,7 @@ class JobManager:
                     records, job_id, run_state,
                     outcome='ok' if status is JobStatus.DONE else 'failed',
                     rc=returncode, linux_rc=transport.exit_rc,
+                    peak_memory=peak_memory,
                     transport=transport_state, reason=decoded_exit.get('reason'),
                     signal=decoded_exit.get('signal'), tail=list(transport.tail))
             idle = {'limit_seconds': transport.idle_limit,
@@ -997,7 +1043,8 @@ class JobManager:
                 request.mutation, exit=decoded_exit, transport=transport_state,
                 idle=idle, tail=tuple(transport.tail),
                 run_id=job_id if identified else None,
-                run_state=run_state, linux_rc=transport.exit_rc)
+                run_state=run_state, linux_rc=transport.exit_rc,
+                peak_memory=peak_memory)
             self._retain(result)
             # DP-2717: the durable line is fsynced, so off the event loop.
             await asyncio.to_thread(self._persist_result, request.cwd, result)

@@ -6,6 +6,13 @@ lets one field read another.  This module is the data for that: the 29 types
 (M-02..M-20, M-22), their parameters with kind, default and manual text, and
 the checks a set of rows must pass before a run.
 
+Plan 48 GM8 completes the table against the Gmsh 4.15.2 source: the
+``Attractor`` name, the options ``BoundaryLayer.SizesList`` /
+``FanPointsSizesList`` / ``AnisoMax`` and ``IncludeEmbedded``, option kinds for
+a list of reals and for a path, several boundary-layer fields, deprecated
+options hidden, anisotropic types listed but greyed, and a size read from a
+data file (a stored reference on a ``PostView`` row).
+
 A *row* is one field the user made::
 
     {"name": "wall", "type": "Distance", "enabled": True, "background": False,
@@ -29,6 +36,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field, replace
 import json
 import math
+import os
+import re
 
 #: Measured on the shipped Gmsh 4.15.2 (``General.BuildOptions``, 2026-10-16);
 #: a runtime with another build replaces it with :func:`set_build_options`.
@@ -89,6 +98,13 @@ class FieldOption:
     unit: str = ''
     choices: tuple = ()
     required: bool = False
+    #: Plan 48 GM8. Gmsh's own dialog does not show an option it marks
+    #: deprecated; the row still accepts it (an old project keeps working).
+    hidden: bool = False
+    #: Plan 48 GM8. Gmsh's default is a fraction of the model size (the
+    #: finite-difference ``Delta`` is lc / 1e4, lc the bounding-box diagonal),
+    #: not a number: :func:`default_for` gives it for a known model.
+    model_scale: float = 0.0
 
     @property
     def dimension(self):
@@ -98,7 +114,14 @@ class FieldOption:
         return {'name': self.name, 'kind': self.kind, 'default': self.default,
                 'help': self.help, 'unit': self.unit,
                 'choices': [list(c) for c in self.choices],
-                'required': self.required}
+                'required': self.required, 'hidden': self.hidden,
+                'model_scale': self.model_scale}
+
+
+#: The option kinds. ``reals`` is a list of numbers (``FieldOptionListDouble``),
+#: ``ints`` a list of whole numbers that are not entity numbers, ``path`` a file
+#: the Gmsh runtime opens (chosen on Windows, translated for WSL).
+LIST_KINDS = ('entities', 'ints', 'reals')
 
 
 @dataclass(frozen=True)
@@ -127,6 +150,11 @@ class FieldType:
             if item.name == name:
                 return item
         return None
+
+    @property
+    def shown_options(self) -> tuple:
+        """The options the dialog lists: Gmsh's deprecated ones are hidden."""
+        return tuple(o for o in self.options if not o.hidden)
 
     def to_dict(self) -> dict:
         return {'gmsh': self.gmsh, 'title': self.title, 'family': self.family,
@@ -157,6 +185,27 @@ def _e(name, default, help, choices):
 
 def _ent(name, help):
     return FieldOption(name, 'entities', None, help)
+
+
+def _r(name, help, unit=''):
+    """A list of real numbers (Gmsh ``FieldOptionListDouble``)."""
+    return FieldOption(name, 'reals', None, help, unit)
+
+
+def _ints(name, help):
+    """A list of whole numbers that are not entity numbers."""
+    return FieldOption(name, 'ints', None, help)
+
+
+def _path(name, help, required=False):
+    """A file the Gmsh runtime opens."""
+    return FieldOption(name, 'path', None, help, '', (), required)
+
+
+def _delta(help='Finite-difference step.'):
+    """Gmsh's ``Delta``: the model size / 10000, not a fixed number."""
+    return FieldOption('Delta', 'float', None, help + ' Empty: the model size '
+                       '/ 10000, as Gmsh sets it.', 'm', model_scale=1.0e-4)
 
 
 def _in(help='The field this one reads.'):
@@ -237,6 +286,8 @@ _TYPES = (
          _f('VOut', _NONE, 'Size elsewhere.', 'm'),
          _b('IncludeBoundary', True, 'Also count the boundary of the listed '
             'entities as inside.'),
+         _b('IncludeEmbedded', True, 'Also count the entities embedded in '
+            'the listed ones as inside.'),
          _ent('PointsList', 'Points.'), _ent('CurvesList', 'Curves.'),
          _ent('SurfacesList', 'Surfaces.'), _ent('VolumesList', 'Volumes.'))),
     FieldType(
@@ -249,6 +300,16 @@ _TYPES = (
          _ent('SurfacesList', 'Surfaces the distance is measured from.'),
          _i('Sampling', 20, 'Points sampled on each curve or surface. Too '
             'few and the ramp is blocky on a curved face.'))),
+    FieldType(
+        'Attractor', 'Attractor (Distance, earlier name)', 'distance',
+        'The earlier name Gmsh gave the Distance field: it reads the same '
+        'points, curves and surfaces and gives the same distance. It is '
+        'kept so a project or script that says Attractor still loads; a new '
+        'field is better made as a Distance.',
+        (_ent('PointsList', 'Points the distance is measured from.'),
+         _ent('CurvesList', 'Curves the distance is measured from.'),
+         _ent('SurfacesList', 'Surfaces the distance is measured from.'),
+         _i('Sampling', 20, 'Points sampled on each curve or surface.'))),
     FieldType(
         'Threshold', 'Threshold', 'distance',
         'A size that ramps from SizeMin at DistMin to SizeMax at DistMax of '
@@ -280,32 +341,26 @@ _TYPES = (
         'Curvature', 'Curvature', 'operator',
         'The curvature of the field it reads, div(grad f / |grad f|), by '
         'finite differences of step Delta.',
-        (_in('Usually a Distance field.'),
-         _f('Delta', 0.00034641016151377546, 'Finite-difference step.',
-            'm'))),
+        (_in('Usually a Distance field.'), _delta())),
     FieldType(
         'Mean', 'Mean', 'operator',
         'The mean of the field it reads over a cube of half-side Delta.',
-        (_in(), _f('Delta', 0.00034641016151377546,
-                   'Half-side of the averaging cube.', 'm'))),
+        (_in(), _delta('Half-side of the averaging cube.'))),
     FieldType(
         'Gradient', 'Gradient', 'operator',
         'The finite-difference gradient of the field it reads.',
-        (_in(), _f('Delta', 0.00034641016151377546, 'Finite-difference step.',
-                   'm'),
+        (_in(), _delta(),
          _e('Kind', 3, 'Which component of the gradient to return.',
             ((0, 'X'), (1, 'Y'), (2, 'Z'), (3, 'Norm'))))),
     FieldType(
         'Laplacian', 'Laplacian', 'operator',
         'The finite-difference Laplacian of the field it reads.',
-        (_in(), _f('Delta', 0.00034641016151377546, 'Finite-difference step.',
-                   'm'))),
+        (_in(), _delta())),
     FieldType(
         'MaxEigenHessian', 'Max eigenvalue of the Hessian', 'operator',
         'The largest eigenvalue of the Hessian of the field it reads, with '
         'the gradients taken by finite differences of step Delta.',
-        (_in(), _f('Delta', 0.00034641016151377546, 'Finite-difference step.',
-                   'm'))),
+        (_in(), _delta())),
     FieldType(
         'Min', 'Min', 'operator',
         'The smallest of the listed fields at each point.',
@@ -320,6 +375,8 @@ _TYPES = (
         'returns no size.',
         (_in(), _b('IncludeBoundary', True, 'Also count the boundary of the '
                    'listed entities.'),
+         _b('IncludeEmbedded', True, 'Also count the entities embedded in '
+            'the listed ones.'),
          _ent('PointsList', 'Points.'), _ent('CurvesList', 'Curves.'),
          _ent('SurfacesList', 'Surfaces.'), _ent('VolumesList', 'Volumes.'))),
     FieldType(
@@ -365,8 +422,8 @@ _TYPES = (
         'fastest (z). Outside the grid it '
         'returns OutsideValue if SetOutsideValue is on, else the nearest '
         'value.',
-        (_s('FileName', 'Path of the grid file, as the Gmsh runtime sees it.',
-            'file', True),
+        (_path('FileName', 'The grid file. Choose it on this computer; it is '
+               'given to Gmsh by its name inside WSL.', True),
          _e('TextFormat', 0, 'Whether the values are binary or ASCII text.',
             ((0, 'Binary'), (1, 'ASCII'))),
          _b('SetOutsideValue', False, 'Return OutsideValue outside the grid.'),
@@ -376,8 +433,9 @@ _TYPES = (
         'The size is read from a post-processing view (for instance a size '
         'map written by an earlier mesh or by the size-field tool).',
         (_i('ViewTag', -1, 'Tag of the view (-1: use ViewIndex).'),
-         _i('ViewIndex', 1, 'Index of the view in the list of views.'),
-         _i('IView', 0, 'Earlier spelling of ViewIndex.'),
+         _i('ViewIndex', 0, 'Index of the view in the list of views.'),
+         FieldOption('IView', 'int', 0, 'Earlier spelling of ViewIndex.',
+                     hidden=True),
          _b('CropNegativeValues', True, 'Return no size where the view is '
             'negative, instead of the negative value.'),
          _b('UseClosest', True, 'Outside every element of the view, use the '
@@ -431,9 +489,16 @@ _TYPES = (
         (_ent('CurvesList', 'Curves the layer is grown from.'),
          _ent('PointsList', 'Points the layer is grown from.'),
          _ent('FanPointsList', 'Points a fan of layers is built around.'),
-         _ent('FanNodesList', 'Nodes a fan of layers is built around.'),
+         _ints('FanPointsSizesList', 'Number of elements in the fan, one '
+               'for each point of FanPointsList. Empty: the Layers page '
+               'value (Mesh.BoundaryLayerFanElements).'),
+         FieldOption('FanNodesList', 'entities', None,
+                     'The deprecated spelling of FanPointsList.',
+                     hidden=True),
          _ent('ExcludedSurfacesList', 'Surfaces the layer must not enter.'),
          _f('Size', 0.1, 'Size of the first layer.', 'm'),
+         _r('SizesList', 'Size of the first layer at each point, one number '
+            'per point of PointsList (overwrites Size when given).', 'm'),
          _f('SizeFar', 1.0, 'Size far from the layer.', 'm'),
          _f('Thickness', 0.01, 'Total thickness of the layer.', 'm'),
          _f('Ratio', 1.1, 'Growth ratio between layers.'),
@@ -442,7 +507,10 @@ _TYPES = (
          _b('IntersectMetrics', False, 'Intersect the metrics where layers '
             'meet.'),
          _i('BetaLaw', 0, 'Law of the angle blending.'),
-         _f('Beta', 1.01, 'Angle-blending parameter.'))),
+         _f('Beta', 1.01, 'Angle-blending parameter.'),
+         _f('AnisoMax', None, 'Threshold angle for creating a mesh fan in '
+            'the boundary layer. Empty: 1e10 in Gmsh, which builds none from '
+            'the angle.'))),
     FieldType(
         'AutomaticMeshSizeField', 'Automatic mesh size', 'other',
         'Gmsh\'s curvature, proximity and gradation field, built on an '
@@ -456,13 +524,15 @@ _TYPES = (
          _f('gradation', 1.1, 'Maximum growth ratio between neighbouring '
             'edges.'),
          _i('nPointsPerCircle', 20, 'Elements per circle of curvature.'),
-         _i('nPointsPerGap', 0, 'Layers of elements across a thin gap.'),
+         _i('nPointsPerGap', 4, 'Layers of elements across a thin gap. 4 '
+            'here, in the size-field tool and in the stored setting; 0 '
+            'switches gaps off.'),
          _b('smoothing', True, 'Smooth the sizes (Gmsh says this should '
             'always be on).'),
          _b('features', True, 'Also find the local feature size (thin '
             'channels).'),
-         _s('p4estFileToLoad', 'A saved size forest (p4est file) to read '
-            'instead of computing one.', kind='file')),
+         _path('p4estFileToLoad', 'A saved size forest (p4est file) to read '
+               'instead of computing one.')),
         needs_build='P4est',
         needs_reason='this Gmsh was built without the optional p4est '
                      'library, which the automatic size field needs (Gmsh '
@@ -502,6 +572,110 @@ def anisotropic_available(surface_algorithm: str = '',
                           volume_algorithm: str = '') -> bool:
     return (str(surface_algorithm or '').lower() in ANISOTROPIC_SURFACE
             or str(volume_algorithm or '').lower() in ANISOTROPIC_VOLUME)
+
+
+#: Plan 41 Q3, the one place the Sizing page may write words next to a size
+#: field (Plan 47 R7 keeps the rest to numbers): the user decided it.
+ANISOTROPIC_NOTE = ('changes the mesh only under the BAMG 2D algorithm or '
+                    'the MMG3D 3D algorithm; choose one of them on Sizing')
+
+
+def inactive_reason(kind, surface_algorithm: str = '',
+                    volume_algorithm: str = '') -> str:
+    """Why a field of this type will not run now, else ''.
+
+    Plan 48 GM8 (Q3). An anisotropic type is listed always and greyed with
+    this note while neither BAMG nor MMG3D is chosen; a row left behind by an
+    algorithm change stays in the table with the same note instead of the
+    whole set being refused. A build that cannot run a type says so the same
+    way (M-20).
+    """
+    if isinstance(kind, str):
+        kind = TYPES[kind]
+    if kind.refusal:
+        return kind.refusal
+    if kind.anisotropic and not anisotropic_available(
+            surface_algorithm, volume_algorithm):
+        return f'a {kind.gmsh} field {ANISOTROPIC_NOTE}'
+    return ''
+
+
+def listed_types(surface_algorithm: str = '', volume_algorithm: str = ''
+                 ) -> tuple:
+    """``(type, usable, note)`` for every type, in list order (Q3: greyed)."""
+    return tuple(
+        (item, not inactive_reason(item, surface_algorithm,
+                                   volume_algorithm),
+         inactive_reason(item, surface_algorithm, volume_algorithm))
+        for item in _TYPES)
+
+
+def default_for(option: FieldOption, diagonal=None):
+    """The default a control shows: Gmsh's, or the model-relative one.
+
+    ``Delta`` is the model size / 10000 (``lc / 1e4``, ``lc`` the bounding-box
+    diagonal): with the diagonal known the control shows that number.
+    """
+    if option.model_scale and diagonal:
+        try:
+            return float(diagonal) * option.model_scale
+        except (TypeError, ValueError):
+            return option.default
+    return option.default
+
+
+def model_diagonal(case_path) -> float | None:
+    """The diagonal of the project's prepared geometry, metres, or None."""
+    try:
+        from foammesh.core.facade.domain_operations import _prepared_bbox
+        from foammesh.core.geometry import PreparedGeometryStore
+        prepared = PreparedGeometryStore(case_path).current()
+        box = _prepared_bbox(prepared) if prepared is not None else None
+        value = float(box.diagonal) if box is not None else 0.0
+        if callable(getattr(box, 'diagonal', None)):
+            value = float(box.diagonal())
+        return value if value > 0 else None
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Paths (a file chosen on Windows, opened by Gmsh in WSL)
+# --------------------------------------------------------------------------- #
+
+_SEPARATOR = '[' + chr(92) * 2 + '/]'
+_DRIVE_PATH = re.compile('^([A-Za-z]):' + _SEPARATOR + '(.*)$')
+_WSL_SHARE = re.compile(
+    '^' + chr(92) * 4 + 'wsl(?:[.]localhost|[$])' + _SEPARATOR + '+[^'
+    + chr(92) * 2 + '/]+' + _SEPARATOR + '*(.*)$', re.IGNORECASE)
+
+_PATH_TRANSLATOR = None
+
+
+def set_path_translator(function) -> None:
+    """Use another Windows-to-runtime path rule (``None``: the WSL one)."""
+    global _PATH_TRANSLATOR
+    _PATH_TRANSLATOR = function
+
+
+def runtime_path(text) -> str:
+    """The name the Gmsh runtime (a WSL distribution) opens a file by.
+
+    A Windows drive path (``D:`` then folders) becomes ``/mnt/d/...``; a
+    ``wsl$`` or ``wsl.localhost`` share becomes the path inside the
+    distribution; a name that is already a POSIX path is left as it is.
+    """
+    text = str(text or '').strip()
+    if _PATH_TRANSLATOR is not None:
+        return str(_PATH_TRANSLATOR(text))
+    drive = _DRIVE_PATH.match(text)
+    if drive:
+        rest = drive.group(2).replace(chr(92), '/')
+        return f'/mnt/{drive.group(1).lower()}/{rest}'
+    share = _WSL_SHARE.match(text)
+    if share:
+        return '/' + share.group(1).replace(chr(92), '/')
+    return text
 
 
 # --------------------------------------------------------------------------- #
@@ -585,15 +759,25 @@ class FieldNode:
     lists: tuple = ()
     refs: tuple = ()
     ref_lists: tuple = ()
+    #: Plan 48 GM8. Lists of reals (``SizesList``).
+    reals: tuple = ()
+    #: Plan 48 GM8 (D6). The stored reference to size data a ``PostView``
+    #: field reads, with the file as the Gmsh runtime names it.
+    data: dict | None = None
 
     def to_dict(self) -> dict:
-        return {'name': self.name, 'type': self.gmsh,
-                'enabled': self.enabled, 'background': self.background,
-                'numbers': [list(i) for i in self.numbers],
-                'strings': [list(i) for i in self.strings],
-                'lists': [[n, list(v)] for n, v in self.lists],
-                'refs': [list(i) for i in self.refs],
-                'refLists': [[n, list(v)] for n, v in self.ref_lists]}
+        document = {'name': self.name, 'type': self.gmsh,
+                    'enabled': self.enabled, 'background': self.background,
+                    'numbers': [list(i) for i in self.numbers],
+                    'strings': [list(i) for i in self.strings],
+                    'lists': [[n, list(v)] for n, v in self.lists],
+                    'refs': [list(i) for i in self.refs],
+                    'refLists': [[n, list(v)] for n, v in self.ref_lists]}
+        if self.reals:
+            document['reals'] = [[n, list(v)] for n, v in self.reals]
+        if self.data:
+            document['data'] = dict(self.data)
+        return document
 
 
 @dataclass(frozen=True)
@@ -612,10 +796,52 @@ class NativeFields:
                      if n.background and n.enabled)
 
 
+def _real_list(option: FieldOption, value, owner: str) -> list:
+    if isinstance(value, str):
+        value = [part for part in value.replace(';', ',').replace(
+            ' ', ',').split(',') if part.strip()]
+    if not isinstance(value, (list, tuple)):
+        value = [value]
+    numbers = []
+    for item in value:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            raise FieldRefusal(
+                f'{owner}: {option.name} has {item!r}, which is not a '
+                'number') from None
+        if math.isnan(number) or math.isinf(number):
+            raise FieldRefusal(f'{owner}: {option.name} must be finite')
+        numbers.append(number)
+    return numbers
+
+
+def _int_list(option: FieldOption, value, owner: str) -> list:
+    numbers = _real_list(option, value, owner)
+    for number in numbers:
+        if number != int(number) or number < 0:
+            raise FieldRefusal(
+                f'{owner}: {option.name} needs whole numbers from 0 up, '
+                f'not {number:g}')
+    return [int(number) for number in numbers]
+
+
 def _split(row: dict, owner: str, strict: bool = True) -> FieldNode:
     kind = TYPES[row['type']]
     numbers, strings, lists, refs, ref_lists = [], [], [], [], []
+    reals = []
     params = dict(row.get('params') or {})
+    data = None
+    if row.get('data'):
+        if kind.gmsh != 'PostView':
+            raise FieldRefusal(
+                f'{owner}: only a PostView field reads size data; this is a '
+                f'{kind.gmsh} field')
+        data = size_data_node(row['data'], owner, strict)
+        # The loaded data decides the view; a tag typed beside it would
+        # name a view that is not there.
+        for name in ('ViewTag', 'ViewIndex', 'IView'):
+            params.pop(name, None)
     for name, value in params.items():
         option = kind.option(name)
         if option is None:
@@ -633,12 +859,25 @@ def _split(row: dict, owner: str, strict: bool = True) -> FieldNode:
                     f'{owner}: {name} {value!r} is not one of '
                     + ', '.join(f'{c[0]} ({c[1]})' for c in option.choices))
             numbers.append((name, number))
-        elif option.kind in ('string', 'expression', 'file'):
+        elif option.kind in ('string', 'expression'):
             text = str(value or '').strip()
             if text:
                 strings.append((name, text))
+        elif option.kind in ('path', 'file'):
+            text = str(value or '').strip()
+            if text:
+                # Chosen on Windows, opened by Gmsh in WSL (Plan 48 GM8).
+                strings.append((name, runtime_path(text)))
         elif option.kind == 'entities':
             lists.append((name, tuple(_entity_list(option, value, owner))))
+        elif option.kind == 'ints':
+            values = _int_list(option, value, owner)
+            if values:
+                lists.append((name, tuple(values)))
+        elif option.kind == 'reals':
+            values = _real_list(option, value, owner)
+            if values:
+                reals.append((name, tuple(values)))
         elif option.kind == 'field':
             target = str(value or '').strip()
             if target:
@@ -650,7 +889,14 @@ def _split(row: dict, owner: str, strict: bool = True) -> FieldNode:
                             if str(item).strip())
             if targets:
                 ref_lists.append((name, targets))
-    given = {n for n, *_ in (*numbers, *strings, *lists, *refs, *ref_lists)}
+    if row['type'] == AUTOMATIC_TYPE and 'nPointsPerGap' not in params:
+        # Plan 47 SZ2 (DP-2870, F12). Gmsh 4.15.2 leaves a new
+        # AutomaticMeshSizeField's nPointsPerGap uninitialised (32558 on one
+        # run, 32627 on the next), so a row that omits it is written with the
+        # one value the tool and the stored setting use.
+        numbers.append(('nPointsPerGap', 4))
+    given = {n for n, *_ in (*numbers, *strings, *lists, *refs, *ref_lists,
+                             *reals)}
     for option in kind.options:
         if strict and option.required and option.name not in given:
             raise FieldRefusal(
@@ -661,7 +907,8 @@ def _split(row: dict, owner: str, strict: bool = True) -> FieldNode:
         enabled=bool(row.get('enabled', True)),
         background=bool(row.get('background', False)),
         numbers=tuple(numbers), strings=tuple(strings), lists=tuple(lists),
-        refs=tuple(refs), ref_lists=tuple(ref_lists))
+        refs=tuple(refs), ref_lists=tuple(ref_lists), reals=tuple(reals),
+        data=data)
 
 
 def graph_edges(nodes) -> list[tuple[str, str]]:
@@ -761,10 +1008,16 @@ def validate(rows, *, surface_algorithm: str = '',
             continue
         if kind.anisotropic and not anisotropic_available(
                 surface_algorithm, volume_algorithm):
-            raise FieldRefusal(
-                f'{owner} is a {kind.gmsh} field, which changes the mesh only '
-                'under the BAMG 2D algorithm or the MMG3D 3D algorithm; '
-                'choose one of them on Sizing, or turn the field off')
+            # Plan 48 GM8 (Q3). The row stays in the table, greyed with the
+            # note, and the run goes on without it; the rest of the set is
+            # not refused for one field the algorithm cannot honour.
+            reason = inactive_reason(kind, surface_algorithm,
+                                     volume_algorithm)
+            skipped[row['name']] = reason
+            warnings.append(f'{owner} ({kind.gmsh}) is skipped: {reason}')
+            nodes.append(replace(_split(row, owner, strict=False),
+                                 enabled=False))
+            continue
         nodes.append(_split(row, owner))
 
     if skipped:
@@ -797,10 +1050,9 @@ def validate(rows, *, surface_algorithm: str = '',
             + ', '.join(repr(n.name) for n in anisotropic)
             + ' are anisotropic; combine them with a Min (anisotropic) or '
             'Intersection (anisotropic) field and make that the background')
-    if len(layer) > 1:
-        raise FieldRefusal('Gmsh takes one boundary-layer field; these are '
-                           'all marked: ' + ', '.join(
-                               repr(n.name) for n in layer))
+    # Plan 48 GM8. Gmsh takes several boundary-layer fields (Field.h
+    # addBoundaryLayerFieldId appends to a list): every one marked is
+    # given to setAsBoundaryLayer, none is refused for being the second.
     read = {t for e in graph_edges(nodes) for t in [e[1]]}
     for node in nodes:
         if node.enabled and not node.background and node.name not in read:
@@ -885,6 +1137,355 @@ def graph_layout(rows) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Size data from a .pos or .msh file (Plan 48 GM8, decision D6)
+# --------------------------------------------------------------------------- #
+#
+# A PostView field reads its size from a view. D6 lets the user load that view
+# from a .pos file or a .msh carrying $NodeData / $ElementData, as input for
+# meshing only (no drawing of results, no post-processing: Q6).
+#
+# What is stored with the project is a *reference*, never a Gmsh view tag
+# (tags are not stable between sessions): a copy of the file inside the
+# project, the dataset (view) name and its position in the file, the time
+# step, and the unit the file states. On every load the runtime reads the
+# copy, rebuilds the chosen dataset and step as a view of its own (list-based
+# data: re-meshing the project cannot destroy it) and gives the field that
+# view's tag. The reference lives on the PostView row (row['data']).
+
+#: Where the project keeps the copies, under the case folder.
+SIZE_DATA_FOLDER = ('gmsh', 'size_data')
+#: Length units a file may state, with the factor to metres (the metres rule).
+SIZE_DATA_UNITS = {'m': 1.0, 'cm': 0.01, 'mm': 0.001}
+#: auto converts to list-based data unless the file is too large; list always
+#: converts; hidden keeps the file's own mesh in a hidden model never meshed.
+SIZE_DATA_MODES = ('auto', 'list', 'hidden')
+#: Values above which auto uses the hidden model.
+SIZE_DATA_LIST_LIMIT = 4000000
+SIZE_DATA_SUFFIXES = ('.pos', '.msh')
+
+_NODES_OF = {'P': 1, 'L': 2, 'T': 3, 'Q': 4, 'S': 4, 'H': 8, 'I': 6, 'Y': 5}
+_COMPONENTS_OF = {'S': 1, 'V': 3, 'T': 9}
+_POS_VIEW = re.compile(r'View[ \t]*"([^"]*)"[ \t]*[{]')
+_POS_ELEMENT = re.compile(
+    r'^[ \t]*([SVT][PLTQSHIY])[ \t]*[(]([^)]*)[)][ \t]*[{]([^}]*)[}]', re.M)
+_POS_TIME = re.compile(r'TIME[ \t]*[{]([^}]*)[}]')
+
+
+def size_data_folder(case_path) -> str:
+    return os.path.join(str(case_path), *SIZE_DATA_FOLDER)
+
+
+def unit_factor(unit) -> float:
+    """Metres per unit of the file (mm is 0.001)."""
+    try:
+        return SIZE_DATA_UNITS[str(unit)]
+    except KeyError:
+        raise FieldRefusal(
+            f'size data unit {unit!r} is not one of '
+            + ', '.join(SIZE_DATA_UNITS)) from None
+
+
+def size_data_node(ref, owner: str, strict: bool = True) -> dict:
+    """Check a stored reference and give the runtime what it needs.
+
+    The file is named as the Gmsh runtime opens it. A reference whose copy
+    has gone from the project is refused with the way out; a switched-off
+    row (strict False) is not held to that.
+    """
+    if not isinstance(ref, dict):
+        raise FieldRefusal(f'{owner}: the size data reference is not a record')
+    file = str(ref.get('file') or '').strip()
+    if not file:
+        raise FieldRefusal(f'{owner}: the size data reference names no file')
+    unit = str(ref.get('unit') or 'm')
+    factor = unit_factor(unit)
+    mode = str(ref.get('mode') or 'auto')
+    if mode not in SIZE_DATA_MODES:
+        raise FieldRefusal(
+            f'{owner}: size data mode {mode!r} is not one of '
+            + ', '.join(SIZE_DATA_MODES))
+    try:
+        step = int(ref.get('step', 0))
+        index = int(ref.get('dataset_index', 0))
+    except (TypeError, ValueError):
+        raise FieldRefusal(
+            f'{owner}: the size data step and dataset must be whole '
+            'numbers') from None
+    if step < 0 or index < 0:
+        raise FieldRefusal(f'{owner}: the size data step and dataset count '
+                           'from 0')
+    if strict and not os.path.isfile(file):
+        raise FieldRefusal(
+            f'{owner}: the size data file {os.path.basename(file)!r} is '
+            'missing from the project; load the data again')
+    return {'name': str(ref.get('name') or ''),
+            'file': runtime_path(file), 'hostFile': file,
+            'dataset': str(ref.get('dataset') or ''), 'datasetIndex': index,
+            'step': step, 'unit': unit, 'factor': factor, 'mode': mode,
+            'limit': int(ref.get('limit') or SIZE_DATA_LIST_LIMIT),
+            'sha256': str(ref.get('sha256') or '')}
+
+
+def copy_size_data(source, case_path) -> dict:
+    """Copy a data file into the project; {file, source, sha256}.
+
+    The copy is named by the content, so loading the same file twice keeps
+    one copy and loading a changed file never overwrites the old one.
+    """
+    import hashlib
+    import shutil
+    source = os.fspath(source)
+    suffix = os.path.splitext(source)[1].lower()
+    if suffix not in SIZE_DATA_SUFFIXES:
+        raise FieldRefusal(
+            f'{os.path.basename(source)!r} is not a .pos or .msh file')
+    if not os.path.isfile(source):
+        raise FieldRefusal(f'there is no file {source!r}')
+    digest = hashlib.sha256()
+    with open(source, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(block)
+    sha = digest.hexdigest()
+    stem = re.sub(r'[^A-Za-z0-9_.-]+', '_',
+                  os.path.splitext(os.path.basename(source))[0]) or 'data'
+    folder = size_data_folder(case_path)
+    os.makedirs(folder, exist_ok=True)
+    target = os.path.join(folder, f'{stem}-{sha[:10]}{suffix}')
+    if not os.path.isfile(target):
+        shutil.copyfile(source, target)
+    return {'file': target, 'source': os.path.basename(source),
+            'sha256': sha,
+            'relative': '/'.join(SIZE_DATA_FOLDER) + '/'
+                        + os.path.basename(target)}
+
+
+def rebase_size_data(rows, case_path) -> list:
+    """Point every loaded-data reference at the copy inside *case_path*.
+
+    The reference keeps the copy's path inside the project as well as the
+    full path, so a project folder that was moved or copied still finds its
+    data. Call this with the case folder before ``validate``.
+    """
+    out = []
+    for row in rows or ():
+        ref = row.get('data')
+        if isinstance(ref, dict) and ref.get('relative'):
+            target = os.path.join(str(case_path),
+                                  *str(ref['relative']).split('/'))
+            if os.path.normcase(target) != os.path.normcase(
+                    str(ref.get('file') or '')):
+                row = dict(row, data=dict(ref, file=target))
+        out.append(row)
+    return out
+
+
+def _pos_datasets(text: str) -> list:
+    starts = list(_POS_VIEW.finditer(text))
+    found = []
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) \
+            else len(text)
+        body = text[match.end():end]
+        kinds: dict = {}
+        steps = 1
+        components = 0
+        for element in _POS_ELEMENT.finditer(body):
+            code = element.group(1)
+            kinds[code] = kinds.get(code, 0) + 1
+            if not components:
+                components = _COMPONENTS_OF[code[0]]
+                values = [v for v in element.group(3).split(',') if v.strip()]
+                width = _NODES_OF[code[1]] * components
+                steps = max(1, len(values) // width)
+        times = []
+        clock = _POS_TIME.search(body)
+        if clock:
+            for part in clock.group(1).split(','):
+                try:
+                    times.append(float(part))
+                except ValueError:
+                    pass
+        found.append({
+            'index': index, 'name': match.group(1), 'kind': 'list',
+            'components': components or 1,
+            'steps': [{'index': s, 'time': times[s] if s < len(times)
+                       else float(s)} for s in range(steps)],
+            'elements': sum(kinds.values()), 'element_types': kinds,
+            'scalar': components in (0, 1)})
+    return found
+
+
+def _msh_datasets(text: str) -> tuple:
+    lines = text.splitlines()
+    binary = False
+    version = ''
+    groups: dict = {}
+    order: list = []
+    at = 0
+    total = len(lines)
+    while at < total:
+        line = lines[at].strip()
+        at += 1
+        if line == '$MeshFormat' and at < total:
+            parts = lines[at].split()
+            version = parts[0] if parts else ''
+            binary = len(parts) > 1 and parts[1] == '1'
+        if line in ('$NodeData', '$ElementData', '$ElementNodeData'):
+            kind = line[1:]
+            try:
+                n_str = int(lines[at])
+                at += 1
+                strings = [lines[at + i].strip() for i in range(n_str)]
+                at += n_str
+                n_real = int(lines[at])
+                at += 1
+                reals = [float(lines[at + i]) for i in range(n_real)]
+                at += n_real
+                n_int = int(lines[at])
+                at += 1
+                ints = [int(lines[at + i]) for i in range(n_int)]
+                at += n_int
+            except (ValueError, IndexError):
+                continue
+            name = strings[0].strip('"') if strings else ''
+            step = ints[0] if ints else 0
+            components = ints[1] if len(ints) > 1 else 1
+            count = ints[2] if len(ints) > 2 else 0
+            key = (kind, name)
+            if key not in groups:
+                groups[key] = {'index': len(order), 'name': name,
+                               'kind': kind, 'components': components,
+                               'steps': [], 'elements': count,
+                               'scalar': components == 1}
+                order.append(key)
+            groups[key]['steps'].append(
+                {'index': step, 'time': reals[0] if reals else float(step)})
+            at += count
+    return [groups[key] for key in order], binary, version
+
+
+def scan_size_data(path) -> dict:
+    """What a data file holds: its datasets, their steps and components.
+
+    Reads the ASCII forms of .pos (list-based views) and .msh ($NodeData,
+    $ElementData, $ElementNodeData). A binary file is reported as such with
+    no datasets: the Gmsh session reads those (session.size_data_scan).
+    Nothing is guessed.
+    """
+    path = os.fspath(path)
+    suffix = os.path.splitext(path)[1].lower()
+    result = {'file': path, 'format': suffix.lstrip('.'), 'binary': False,
+              'datasets': [], 'error': ''}
+    if suffix not in SIZE_DATA_SUFFIXES:
+        result['error'] = (f'{os.path.basename(path)!r} is not a .pos or '
+                           '.msh file')
+        return result
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+    except OSError as error:
+        result['error'] = str(error)
+        return result
+    if b'\x00' in raw[:4096]:
+        result['binary'] = True
+        return result
+    text = raw.decode('utf-8', 'replace')
+    if suffix == '.pos':
+        result['datasets'] = _pos_datasets(text)
+    else:
+        datasets, binary, version = _msh_datasets(text)
+        result.update(datasets=datasets, binary=binary, version=version)
+    scalar = [d for d in result['datasets'] if d['scalar']]
+    if not result['binary'] and not result['datasets']:
+        result['error'] = 'the file holds no data view'
+    elif result['datasets'] and not scalar:
+        result['error'] = ('the file holds no scalar data; a size is one '
+                           'number per point')
+    return result
+
+
+def make_size_data_ref(copy: dict, dataset: dict, step: int = 0,
+                       unit: str = 'm', mode: str = 'auto',
+                       name: str = '') -> dict:
+    """The reference stored on the PostView row (see the section note)."""
+    unit_factor(unit)
+    if mode not in SIZE_DATA_MODES:
+        raise FieldRefusal(f'size data mode {mode!r} is not one of '
+                           + ', '.join(SIZE_DATA_MODES))
+    if not dataset.get('scalar', True):
+        raise FieldRefusal(
+            f'the dataset {dataset.get("name")!r} is not scalar; a size is '
+            'one number per point')
+    steps = [s['index'] for s in dataset.get('steps') or ()]
+    if steps and step not in steps:
+        raise FieldRefusal(
+            f'the dataset {dataset.get("name")!r} has no time step {step}; '
+            'it has ' + ', '.join(str(s) for s in steps))
+    return {'name': name or dataset.get('name') or 'sizeData',
+            'file': copy['file'], 'source': copy.get('source', ''),
+            'relative': copy.get('relative', ''),
+            'sha256': copy.get('sha256', ''),
+            'dataset': dataset.get('name', ''),
+            'dataset_index': int(dataset.get('index', 0)),
+            'step': int(step), 'unit': unit, 'mode': mode}
+
+
+def size_data_rows(rows) -> list:
+    """The PostView rows that read loaded data."""
+    return [r for r in rows or () if r.get('data')]
+
+
+def add_size_data_row(rows, ref: dict, name: str = '') -> tuple:
+    """(rows, the new row): a PostView field reading ref."""
+    rows = [dict(item, params=dict(item.get('params') or {}))
+            for item in (rows or ())]
+    names = {item.get('name') for item in rows}
+    base = name or re.sub(r'[^A-Za-z0-9_]+', '_',
+                          str(ref.get('name') or 'sizeData')) or 'sizeData'
+    chosen, number = base, 1
+    while chosen in names:
+        number += 1
+        chosen = f'{base}{number}'
+    row = new_row('PostView', chosen)
+    row['data'] = dict(ref)
+    rows.append(row)
+    return rows, row
+
+
+def remove_size_data(rows, name: str) -> list:
+    """Take the loaded data of the row name away; refuse while it is read.
+
+    Removing the row removes the reference. A row that another field reads
+    (an Octree over it, a Min of it) keeps the data in use, and the removal
+    is refused with the reader's name rather than leaving a field without a
+    view.
+    """
+    rows = [dict(item) for item in rows or ()]
+    target = next((r for r in rows if r.get('name') == name), None)
+    if target is None or not target.get('data'):
+        raise FieldRefusal(f'there is no loaded size data on {name!r}')
+    readers = []
+    for row in rows:
+        if row is target or row.get('type') not in TYPES:
+            continue
+        for option in TYPES[row['type']].options:
+            value = (row.get('params') or {}).get(option.name)
+            if option.kind == 'field' and value == name:
+                readers.append(row['name'])
+            elif option.kind == 'fields' and value:
+                names = ([p.strip() for p in value.split(',')]
+                         if isinstance(value, str) else value)
+                if name in names:
+                    readers.append(row['name'])
+    if readers:
+        raise FieldRefusal(
+            f'the size data on {name!r} is read by '
+            + ', '.join(repr(r) for r in readers)
+            + '; change those fields first')
+    return [r for r in rows if r is not target]
+
+
+# --------------------------------------------------------------------------- #
 # The Automatic sizing shortcut (M-20): the settings live in the row
 # --------------------------------------------------------------------------- #
 
@@ -919,6 +1520,7 @@ def with_automatic_row(rows) -> tuple[list, dict, bool]:
             for item in (rows or ())]
     found = automatic_row(rows)
     if found is not None:
+        _seed_automatic(found)
         return rows, found, False
     names = {item.get('name') for item in rows}
     name, number = AUTOMATIC_NAME, 1
@@ -926,8 +1528,28 @@ def with_automatic_row(rows) -> tuple[list, dict, bool]:
         number += 1
         name = f'{AUTOMATIC_NAME}{number}'
     created = new_row(AUTOMATIC_TYPE, name)
+    _seed_automatic(created)
     rows.append(created)
     return rows, created, True
+
+
+def _seed_automatic(row: dict) -> None:
+    """Write the tool's fallback where Gmsh's own default differs.
+
+    Plan 47 DP-2870. Measured on Gmsh 4.15.2: a native AutomaticMeshSizeField
+    left without ``nPointsPerGap`` reads 0 (gaps off), the tool reads 4. The
+    catalogue default is 4 (unified, Plan 47 SZ2); this only fills a row
+    whose catalogue default differs from the tool's fallback.
+    """
+    params = row.setdefault('params', {})
+    kind = TYPES[AUTOMATIC_TYPE]
+    for name, (_field_id, fallback) in AUTOMATIC_INPUTS.items():
+        option = kind.option(name)
+        if params.get(name) in (None, '') and option is not None                 and option.default is not None and option.default != fallback:
+            params[name] = fallback
+    # Plan 47 SZ2: the gap value is always on the row FoamMesh makes.
+    if params.get('nPointsPerGap') in (None, ''):
+        params['nPointsPerGap'] = AUTOMATIC_INPUTS['nPointsPerGap'][1]
 
 
 def automatic_patch(rows) -> dict:

@@ -16,12 +16,35 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import time
 
 from foammesh.core.engine.contracts import (
     TaskCardinality, TaskState, WorkflowDescriptor,
 )
 
 from .dynamic import COMPLETABLE, EngineWorkflowGraph
+
+
+#: DP-5727. The window walk wg_roles lost an Accept to ``[WinError 5] Access
+#: is denied`` swapping ``gmsh-tasks.json.tmp`` over ``gmsh-tasks.json``: the
+#: window reads the task state on other threads, and on Windows a file open
+#: for reading cannot be replaced for that instant. The hold is short, so the
+#: swap is retried for up to about two seconds before the denial is raised.
+_REPLACE_ATTEMPTS = 12
+_REPLACE_BACKOFF_SECONDS = 0.03
+
+
+def _replace_retrying(source: Path, destination: Path, *,
+                      sleep=time.sleep) -> None:
+    """``os.replace``, retried briefly while Windows refuses the swap."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
 
 #: v2 adds a per-task ``evidence`` map beside ``tasks``.
@@ -251,7 +274,7 @@ class EngineTaskStateStore:
             stream.write(json.dumps(document, indent=2, sort_keys=True) + '\n')
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, self.path)
+        _replace_retrying(temporary, self.path)
         return document
 
     # -- transitions ------------------------------------------------------- #
@@ -1048,7 +1071,7 @@ def _write_text_durably(path: Path, text: str) -> None:
         stream.write(text)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    _replace_retrying(temporary, path)
 
 
 def _write_json_durably(path: Path, document: dict) -> None:

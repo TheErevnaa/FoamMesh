@@ -21,13 +21,15 @@ from .errors import (AuthorizationRequiredError, CaseNotFoundError, OperationNot
 from .field_adapters import build_entity_adapters, coerce_for_apply, read_value, values_equal
 from .field_metadata import (MESH_FINGERPRINT, MESH_STAGE_ENGINE_STAGES, earliest_stage,
                              expand_fingerprints, stales)
-from .fields import REGISTRY as FIELD_REGISTRY
+from .fields import READ_ONLY_COLLECTIONS, REGISTRY as FIELD_REGISTRY
 from .operations import OperationKind, build_operation_registry
 from .presentation import PresentationOperations, PresentationState
 from .results import OperationResult
 from .session import CaseSession
 from .plans import PlanState, PlanStore
 from .vertical_slice import VerticalSliceOperations
+from .surface_intent_api import (pop_intent_fields, read_only_operation,
+                                 screen_cfd_type, screen_pair_coupling)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,66 @@ _SCOPED_COLLECTIONS = frozenset({
 
 #: The subset of those scoped to volume regions rather than surface groups.
 _REGION_SCOPED_COLLECTIONS = frozenset({'gmsh.volume_controls.controls'})
+
+
+#: Plan 49 SR3. The two forms a periodic pair is edited through; each
+#: edit is carried into its ``surfaceRelations`` record before it commits.
+_PERIODIC_FORM_COLLECTIONS = frozenset({'geometry.interface_pairs',
+                                        'gmsh.periodic_pairs.controls'})
+
+
+def _relate_periodic_edit(session, collection_id: str, data,
+                          source: str) -> None:
+    """Carry a periodic pair edit into its relation; refuse or measure it.
+
+    Plan 49 SR3 (DP-5830, DP-5833, DP-5834). See
+    ``core/geometry/periodic_relations.py``. A side that is already a region
+    interface, a baffle or a side of another pair is refused with the
+    surface, the reason and the remedy; the pair is measured on the prepared
+    geometry and the verdict stored on the relation.
+    """
+    if collection_id not in _PERIODIC_FORM_COLLECTIONS:
+        return
+    from foammesh.core.geometry import PreparedGeometryStore
+    from foammesh.core.geometry.periodic_relations import (
+        PeriodicSideConflict, relate_periodic_edit)
+    prepared = None
+    try:
+        current = PreparedGeometryStore(session.case_path).current()
+        prepared = current.to_dict() if current is not None else None
+    except (OSError, ValueError, TypeError):
+        prepared = None
+    try:
+        relate_periodic_edit(data.data(), source, prepared)
+    except PeriodicSideConflict as conflict:
+        details = conflict.conflict
+        raise ValidationFailedError(str(conflict), details={
+            'collection': collection_id,
+            'error': 'periodic_side_conflict',
+            'surface': details['surface'], 'pair': details['pair'],
+            'reason': details['reason'], 'remedy': details['remedy'],
+        }) from conflict
+
+
+def write_surface_edit(data, keys, edit) -> list:
+    """Plan 49 SR8. Write a role edit as the surface tab does; return the
+    surfaces it touched (their issues are read after the commit)."""
+    from .surface_intent_api import write
+    return list(write(data, keys, edit).affected)
+
+
+def _with_surface_issues(session, result, affected):
+    """Plan 49 SR8. Add ``surface_issues`` -- what the surface tab shows
+    under its controls after OK -- to a role edit's result."""
+    if affected is None:
+        return result
+    from foammesh.db import surface_authoring
+    from .surface_intent_api import issue_dicts
+    document = session.state.checkout().data()
+    payload = dict(result.payload)
+    payload['surface_issues'] = issue_dicts(
+        surface_authoring.all_issues(document, affected))
+    return replace(result, payload=payload)
 
 
 def _scope_is_unused(collection_id: str, normalized: dict) -> bool:
@@ -531,6 +593,26 @@ def _source(source: CommandSource) -> Source:
     }[source]
 
 
+def _stamp_change_set(session, before: int, value) -> None:
+    """DP-6052. Hand back the change set a command made, so it can be undone.
+
+    ``history.revert_change_set`` reverts by change-set id, but only
+    ``configuration.patch``, the working-copy commit and the Plan 49 surface
+    routes put that id in their answer; every other operation that commits
+    (``mesh.target_solver.set`` among them) answered with its transaction
+    alone, and a client had no id to revert it by. Every change set this
+    command added shares the command's correlation id, so the last one is
+    the command's. Only an edit is named: a revert's own undo records are
+    not something to revert (DP-6053).
+    """
+    added = [record for record in
+             list(getattr(session, 'change_sets', ()))[before:]
+             if record.get('kind') == 'edit']
+    payload = getattr(value, 'payload', None)
+    if added and isinstance(payload, dict) and not payload.get('change_set_id'):
+        payload['change_set_id'] = added[-1]['change_set_id']
+
+
 class FoamMeshFacade:
     #: Operations that must not wait behind the serialized write queue when
     #: the registry has nothing to say about them.
@@ -580,8 +662,12 @@ class FoamMeshFacade:
         self.presentation_ops = PresentationOperations()
         self.fields = FIELD_REGISTRY
         self.entities = build_entity_adapters(FIELD_REGISTRY.collections)
+        # Plan 49 SR8. A read-only collection publishes no create, patch or
+        # remove; asking for one is refused by name in `_execute_case`.
+        writable = tuple(collection_id for collection_id in self.entities
+                         if collection_id not in READ_ONLY_COLLECTIONS)
         self.operations = build_operation_registry(
-            FIELD_REGISTRY.json_schema(), tuple(self.entities),
+            FIELD_REGISTRY.json_schema(), writable,
             self.presentation_ops.operations())
         self.register('configuration.patch', self._patch)
         self.register('configuration.dry_run', self._dry_run)
@@ -594,7 +680,7 @@ class FoamMeshFacade:
         self.register('job.test.start', self.slice_operations.start_job)
         self.register('job.cancel', self.slice_operations.cancel_job)
         self.register('job.cancel_active', self._cancel_active_jobs)
-        for collection_id in self.entities:
+        for collection_id in writable:
             self.register(f'{collection_id}.create', self._make_collection_create(collection_id))
             self.register(f'{collection_id}.patch', self._make_collection_patch(collection_id))
             self.register(f'{collection_id}.remove', self._make_collection_remove(collection_id))
@@ -940,6 +1026,16 @@ class FoamMeshFacade:
         if not operation or operation.startswith('/'):
             raise ValueError('operation must be a stable dotted identifier')
         self._operations[operation] = handler
+        # DP-6081. An operation with no written schema tells a client what its
+        # handler reads, so the parameters can be discovered.
+        descriptor = self.operations.get(operation)
+        if descriptor is not None and not descriptor.parameters_schema:
+            from dataclasses import replace
+            from .parameter_inference import schema_for
+            inferred = schema_for(operation, handler)
+            if inferred:
+                self.operations._by_id[operation] = replace(
+                    descriptor, parameters_schema=inferred)
 
     async def execute(self, command: Command) -> OperationResult:
         if command.scope == 'application' or command.operation.startswith('application.'):
@@ -1018,6 +1114,11 @@ class FoamMeshFacade:
         try:
             handler = self._operations[command.operation]
         except KeyError as error:
+            # Plan 49 SR8. A write to a read-only collection is refused by
+            # name, with the operations that do write it.
+            named = read_only_operation(command.operation)
+            if named is not None:
+                raise named from error
             raise OperationNotFoundError('operation is not registered', details={
                 'operation': command.operation,
             }) from error
@@ -1050,12 +1151,14 @@ class FoamMeshFacade:
         async def invoke():
             session.assert_revision(command.expected_revision)
             session.set_event_context(command)
+            change_sets = len(getattr(session, 'change_sets', ()))
             try:
                 with session.monitor.measure(
                         'owner_loop_slice', context=command.operation):
                     value = handler(session, command)
                 if inspect.isawaitable(value):
                     value = await value
+                _stamp_change_set(session, change_sets, value)
                 with session.monitor.measure(
                         'owner_loop_slice',
                         context=f'{command.operation} (bookkeeping)'):
@@ -1094,12 +1197,14 @@ class FoamMeshFacade:
         session = self.case(command.case_id)
         session.assert_revision(command.expected_revision)
         session.set_event_context(command)
+        change_sets = len(getattr(session, 'change_sets', ()))
         try:
             value = self._operations[command.operation](session, command)
             if inspect.isawaitable(value):
                 if inspect.iscoroutine(value):
                     value.close()
                 raise RuntimeError(f'{command.operation} requires the async execute() path')
+            _stamp_change_set(session, change_sets, value)
             if command.is_human_gui_command and value.changed_fields:
                 self.plans.supersede_for_human_edit(
                     session, actor_id=command.actor.id, command_id=command.command_id)
@@ -1244,6 +1349,13 @@ class FoamMeshFacade:
             fields = command.parameters.get('fields') or {}
             self._precheck_band_fields(collection_id, fields)
             normalized = adapter.normalize_patch(fields) if fields else {}
+            # Plan 49 SR8. The role fields go through the surface tab's
+            # planner; read-only and retired fields are refused by name.
+            intent_edit = (pop_intent_fields(normalized)
+                           if collection_id == 'geometry.items' else None)
+            # DP-6008. The Interface pairs table makes cyclic pairs only.
+            screen_pair_coupling(collection_id, None, adapter.storage_path,
+                                 None, normalized, created=True)
             self._validate_collection_scope(
                 session, collection_id, normalized)
             self._stamp_surface_reference(session, collection_id, normalized)
@@ -1251,12 +1363,21 @@ class FoamMeshFacade:
             key, _element = data.addNewElement(adapter.storage_path)
             for relative_path, value in normalized.items():
                 data.setValue(f'{adapter.storage_path}/{key}/{relative_path}', value, relative_path)
+            surface_issues = None
+            if collection_id == 'geometry.items':
+                intent_edit = screen_cfd_type(data, key, normalized,
+                                              intent_edit, created=True)
+                if intent_edit is not None:
+                    surface_issues = write_surface_edit(data, [key],
+                                                        intent_edit)
             self._share_layer_relative_sizes(  # DP-595
                 collection_id, data, adapter.storage_path, key, normalized,
                 created=True)
             self._validate_collection_row(
                 collection_id, data, f'{adapter.storage_path}/{key}',
                 normalized)
+            _relate_periodic_edit(session, collection_id, data,
+                                  f'{adapter.storage_path}/{key}')
             refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=f'create {collection_id}', source=_source(command.source),
@@ -1265,7 +1386,8 @@ class FoamMeshFacade:
             # ended up under: a merge that found the allocated key already
             # taken moves the new element rather than refusing it.
             key = data.remappedKey(adapter.storage_path, key)
-            return self._collection_result(session, command, collection_id, key, transaction)
+            result = self._collection_result(session, command, collection_id, key, transaction)
+            return _with_surface_issues(session, result, surface_issues)
         return handler
 
     def _make_collection_patch(self, collection_id: str) -> Callable:
@@ -1280,21 +1402,36 @@ class FoamMeshFacade:
             self._precheck_band_fields(
                 collection_id, command.parameters.get('fields') or {})
             normalized = adapter.normalize_patch(command.parameters.get('fields') or {})
+            # Plan 49 SR8. As at create: the role fields go through the
+            # surface tab's planner, read-only and retired ones are refused.
+            intent_edit = (pop_intent_fields(normalized, key)
+                           if collection_id == 'geometry.items' else None)
+            screen_pair_coupling(collection_id, data, adapter.storage_path,
+                                 key, normalized, created=False)  # DP-6008
             self._validate_collection_scope(
                 session, collection_id, normalized)
             self._stamp_surface_reference(session, collection_id, normalized)
+            surface_issues = None
+            if collection_id == 'geometry.items':
+                intent_edit = screen_cfd_type(data, key, normalized,
+                                              intent_edit, created=False)
             for relative_path, value in normalized.items():
                 data.setValue(f'{adapter.storage_path}/{key}/{relative_path}', value, relative_path)
+            if intent_edit is not None:
+                surface_issues = write_surface_edit(data, [key], intent_edit)
             self._share_layer_relative_sizes(  # DP-595
                 collection_id, data, adapter.storage_path, key, normalized)
             self._validate_collection_row(
                 collection_id, data, f'{adapter.storage_path}/{key}',
                 normalized)
+            _relate_periodic_edit(session, collection_id, data,
+                                  f'{adapter.storage_path}/{key}')
             refuse_locked_edit(session, data)
             transaction = session.state.commit(
                 data, action=f'edit {collection_id}', source=_source(command.source),
                 target=f'{collection_id}/{key}', reason=f'actor={command.actor.id}')
-            return self._collection_result(session, command, collection_id, key, transaction)
+            result = self._collection_result(session, command, collection_id, key, transaction)
+            return _with_surface_issues(session, result, surface_issues)
         return handler
 
     @staticmethod
@@ -1389,6 +1526,20 @@ class FoamMeshFacade:
             # a row bound before the rule can still be renamed or unbound.
             if 'castellationGroup' in (normalized or {}):
                 FoamMeshFacade._validate_surface_group_binding(data, row_path)
+            # Plan 49 SR3 (DP-5833). A periodic side may not become a region
+            # interface, a baffle or an internal face while its pair names it.
+            if {'surfaceRole', 'cfdType'} & set(normalized or {}):
+                from foammesh.db.surface_intent import surface_role_conflict
+                conflict = surface_role_conflict(
+                    data.data(), row_path.rsplit('/', 1)[-1])
+                if conflict is not None:
+                    raise ValidationFailedError(conflict['message'], details={
+                        'collection': collection_id,
+                        'error': 'periodic_side_conflict',
+                        'surface': conflict['surface'],
+                        'pair': conflict['pair'],
+                        'reason': conflict['reason'],
+                        'remedy': conflict['remedy']})
             return
         # LY13-D1 (DP-2370..): what the legacy dialogs refused at entry.
         FoamMeshFacade._validate_group_name(collection_id, data, row_path,
@@ -1854,20 +2005,27 @@ class FoamMeshFacade:
         session.require_writable()
         if command.expected_revision is None:
             raise ValidationFailedError('revert requires expected_revision')
-        latest = session.latest_change_set()
+        # DP-6053. The latest change set still applied: a revert's own undo
+        # records are not edits, so the edit before it is next, as on the
+        # window's undo stack.
+        from .session import applied_edits
+        applied = applied_edits(getattr(session, 'change_sets', ()))
+        latest = applied[-1] if applied else None
         if latest is None or not change_set_id or latest['change_set_id'] != change_set_id:
+            newest = session.latest_change_set()
+            if (newest is not None and newest['change_set_id'] == change_set_id
+                    and newest['kind'] != 'edit'):
+                raise UndoNotAllowedError('change set is not a reversible edit', details={
+                    'kind': newest['kind']})
             raise UndoNotAllowedError('only the latest authored change set may be reverted', details={
                 'requested_change_set': change_set_id,
                 'latest_change_set': latest['change_set_id'] if latest else None,
             })
-        if latest['kind'] != 'edit':
-            raise UndoNotAllowedError('change set is not a reversible edit', details={
-                'kind': latest['kind']})
         # A confirmed plan may have applied several transactions; they form one
         # atomic undo group, so revert every trailing entry of the change set.
         count = 0
-        for record in reversed(session.change_sets):
-            if record['change_set_id'] != change_set_id or record['kind'] != 'edit':
+        for record in reversed(applied):
+            if record['change_set_id'] != change_set_id:
                 break
             count += 1
         transactions = []

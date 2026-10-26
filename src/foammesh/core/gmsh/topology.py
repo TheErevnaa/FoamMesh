@@ -26,6 +26,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from foammesh.db.configurations_schema import (
+    GMSH_IMPORT_LABEL_CODES as IMPORT_LABELS, gmshCode, gmshJobCode)
+
 CALCULATION_VERSION = 'gmsh.topology.v1'
 
 
@@ -53,7 +56,9 @@ class Healing:
     union_unify: bool = True
     boolean_tolerance: float = 0.0
     import_scaling: float = 1.0
-    import_labels: bool = True
+    #: Plan 48 D4 (DP-2952). ``Geometry.OCCImportLabels`` as Gmsh takes it,
+    #: one of :data:`IMPORT_LABELS` (0, 1, 2); it was on/off.
+    import_labels: int = 1
     occ_parallel: bool = False
     warnings: tuple[str, ...] = ()
     calculation_version: str = CALCULATION_VERSION
@@ -93,11 +98,18 @@ class Healing:
             'unionUnify': self.union_unify,
             'booleanTolerance': self.boolean_tolerance,
             'importScaling': self.import_scaling,
-            'importLabels': self.import_labels,
+            'importLabels': gmshJobCode(self.import_labels),
             'occParallel': self.occ_parallel,
             'warnings': list(self.warnings),
             'calculation_version': self.calculation_version,
         }
+
+
+def _import_labels(value) -> int:
+    try:
+        return gmshCode(value, IMPORT_LABELS, 1)
+    except ValueError as error:
+        raise TopologyError(f'import names and colours: {error}') from None
 
 
 def derive_healing(values: dict) -> Healing:
@@ -152,7 +164,7 @@ def derive_healing(values: dict) -> Healing:
         union_unify=bool(values.get('unionUnify', True)),
         boolean_tolerance=boolean_tolerance,
         import_scaling=_positive('importScaling', 1.0),
-        import_labels=bool(values.get('importLabels', True)),
+        import_labels=_import_labels(values.get('importLabels')),
         occ_parallel=bool(values.get('occParallel', False)),
         warnings=tuple(warnings))
     # Plan 31. The repair pass performs the repairs ticked on the page. With

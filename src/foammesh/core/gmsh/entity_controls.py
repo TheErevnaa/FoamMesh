@@ -174,6 +174,34 @@ def new_row(kind: str, name: str, dim: int | None = None) -> dict:
             'params': {p.name: p.default for p in spec.params}}
 
 
+def next_row_name(kind: str, rows) -> str:
+    """The name Add control gives a new row: ``<kind>1``, ``<kind>2``, ..."""
+    names = {r.get('name') for r in (rows or ())}
+    number = 1
+    while f'{kind}{number}' in names:
+        number += 1
+    return f'{kind}{number}'
+
+
+def catalogue() -> list[dict]:
+    """The kinds Add control offers, with every parameter's kind, default,
+    range and choices (Plan 48 PA2: what the panel draws, as data)."""
+    out = []
+    for kind in KINDS.values():
+        out.append({
+            'id': kind.id, 'title': kind.title, 'gmsh': kind.gmsh,
+            'dims': list(kind.dims), 'help': kind.help,
+            'min_tags': kind.min_tags,
+            'default_dim': kind.dims[-1],
+            'params': [{'name': p.name, 'kind': p.kind,
+                        'default': p.default, 'help': p.help,
+                        'low': p.low, 'high': p.high,
+                        'choices': [{'value': c[0], 'title': c[1]}
+                                    for c in p.choices]}
+                       for p in kind.params]})
+    return out
+
+
 def rows_from_text(text) -> list[dict]:
     text = str(getattr(text, 'value', text) or '').strip()
     if not text:

@@ -231,7 +231,7 @@ def preparation_with_topology(readiness: dict, preparation) -> dict:
 
 
 def ensure_prepared(store, *, producer: str, boundary_categories=None,
-                    fluid_seed=None):
+                    fluid_seed=None, surface_intent=None):
     """The current prepared revision, prepared with defaults if there is none.
 
     Returns ``None`` only when there is nothing to prepare. Every engine
@@ -252,7 +252,8 @@ def ensure_prepared(store, *, producer: str, boundary_categories=None,
         readiness, {**DEFAULT_PREPARATION, 'producer': producer})
     return store.materialize(
         preparation=preparation,
-        boundary_categories=boundary_categories, fluid_seed=fluid_seed)
+        boundary_categories=boundary_categories, fluid_seed=fluid_seed,
+        surface_intent=surface_intent)
 
 
 def domain_refusal(store, *, engine_id: str | None = None) -> str | None:
@@ -301,6 +302,13 @@ class PreparedGroup:
     face_order: int | None = None
     adjacent_patch_uuids: tuple[str, ...] = ()
     interface_patch_uuid: str = ''
+    # Plan 49 SR1. What the project says this patch's surface is -- role,
+    # purpose, mesh type, relations and their validation state -- as
+    # `surface_intent.prepared_surface_intent` joins it. Omitted where no
+    # surface was assessed, so a project with no authored intent prepares
+    # the same revision it always did; present, it is inside the group
+    # digest, so a changed intent is a different revision.
+    intent: dict | None = None
 
     def to_dict(self) -> dict:
         measured = {}
@@ -314,6 +322,8 @@ class PreparedGroup:
             measured['adjacent_patch_uuids'] = list(self.adjacent_patch_uuids)
         if self.interface_patch_uuid:
             measured['interface_patch_uuid'] = self.interface_patch_uuid
+        if self.intent is not None:
+            measured['intent'] = self.intent
         return {
             'patch_uuid': self.patch_uuid,
             'native_token': self.native_token,
@@ -380,12 +390,14 @@ class PreparedGeometryStore:
     def materialize(self, *, preparation: Mapping | None = None,
                     boundary_categories: Mapping[str, str] | None = None,
                     fluid_seed: Iterable[float] | None = None,
-                    transform: Iterable[float] | None = None) -> PreparedGeometryResult:
+                    transform: Iterable[float] | None = None,
+                    surface_intent: Mapping[str, Mapping] | None = None,
+                    ) -> PreparedGeometryResult:
         entries = self.source.entries()
         if not entries:
             raise PreparedGeometryError('no imported geometry is available to prepare')
         categories = dict(boundary_categories or {})
-        groups = self._groups(entries, categories)
+        groups = self._groups(entries, categories, surface_intent)
         # DP-419. The groups first, because a region publishes beside them:
         # a Gmsh model names its physical volumes and its physical surfaces in
         # one model, so a region that would take a name a patch already has
@@ -687,7 +699,10 @@ class PreparedGeometryStore:
         })
 
     @staticmethod
-    def _groups(entries: list[dict], categories: Mapping[str, str]) -> tuple[PreparedGroup, ...]:
+    def _groups(entries: list[dict], categories: Mapping[str, str],
+                intent: Mapping[str, Mapping] | None = None,
+                ) -> tuple[PreparedGroup, ...]:
+        intent = intent or {}
         groups = []
         for entry in _ordered_sources(entries):
             patches = entry.get('patches') or ({
@@ -731,6 +746,8 @@ class PreparedGeometryStore:
                         patch.get('adjacent_patch_uuids') or ()),
                     interface_patch_uuid=str(
                         patch.get('interface_patch_uuid') or ''),
+                    intent=(json.loads(json.dumps(intent[patch_uuid]))
+                            if intent.get(patch_uuid) is not None else None),
                 ))
         return _with_solver_names(groups)
 
@@ -827,7 +844,8 @@ class PreparedGeometryStore:
                         else int(item['face_order'])),
             adjacent_patch_uuids=tuple(
                 str(value) for value in item.get('adjacent_patch_uuids') or ()),
-            interface_patch_uuid=str(item.get('interface_patch_uuid') or ''))
+            interface_patch_uuid=str(item.get('interface_patch_uuid') or ''),
+            intent=item.get('intent'))
 
     @staticmethod
     def _region_from_dict(item: dict) -> PreparedRegion:

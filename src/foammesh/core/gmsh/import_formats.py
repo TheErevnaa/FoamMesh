@@ -71,7 +71,36 @@ FORMATS = (
     Format('.nii', 'NIfTI (Nii2mesh)', 'mesh',
            'an isosurface of the voxels, as a surface mesh'),
 )
-BY_EXTENSION = {item.extension: item for item in FORMATS}
+
+#: Plan 48 GM10. The readers Gmsh 4.15.2 has beyond the ones above (measured
+#: and listed from ``OpenFile.cpp``).  They are kept apart from ``FORMATS``,
+#: which the session's own table (``import_v1.KINDS``) mirrors one to one;
+#: these are read through ``session.read_file`` (``OpenRequest.operation``).
+READER_FORMATS = (
+    Format('.nas', 'Nastran bulk data', 'mesh',
+           'read by the Nastran BDF reader, as .bdf is'),
+    Format('.dat', 'Nastran, Actran or Samcef data', 'mesh',
+           'which reader runs is decided by the first bytes of the file, as '
+           'Gmsh does (see dat_flavour)'),
+    Format('.neu', 'Gambit neutral', 'mesh'),
+    Format('.p3d', 'Plot3D structured grid', 'mesh',
+           'every block becomes a structured quad or hex entity'),
+    Format('.diff', 'Diffpack mesh', 'mesh'),
+    Format('.wrl', 'VRML', 'tessellation', 'the IndexedFaceSet triangles'),
+    Format('.vrml', 'VRML', 'tessellation', 'the IndexedFaceSet triangles'),
+    Format('.iv', 'Open Inventor', 'tessellation',
+           'read by the VRML reader'),
+    Format('.geom', 'Geom triangulation', 'tessellation',
+           'triangles only; Gmsh refuses any other element'),
+    Format('.mmed', 'MED (mesh only)', 'mesh', 'read by the MED reader'),
+    Format('.rmed', 'MED (results)', 'mesh', 'read by the MED reader'),
+    Format('.vis', 'Gmsh visibility', 'visibility',
+           'a script of Hide / Show commands: it changes which entities '
+           'show, and adds none'),
+)
+READER_EXTENSIONS = frozenset(item.extension for item in READER_FORMATS)
+BY_EXTENSION = {item.extension: item
+                for item in (*FORMATS, *READER_FORMATS)}
 
 REFUSED = {
     '.inp': 'this Gmsh build (4.15.2) writes Abaqus INP but has no reader for '
@@ -79,7 +108,6 @@ REFUSED = {
     '.vtu': 'VTK XML is not read by Gmsh; save the mesh as legacy .vtk',
     '.vtp': 'VTK XML is not read by Gmsh; save the surface as STL or legacy '
             '.vtk',
-    '.dat': 'a .dat file is not one format; rename it to the format it holds',
 }
 
 
@@ -108,18 +136,56 @@ def refuse_open(path, mode: str) -> None:
             'import it there, or choose Merge to add it to this model')
 
 
+def is_gzip(path) -> bool:
+    """Whether *path* names a gzip file (Gmsh decompresses ``.gz`` first)."""
+    return Path(str(path)).name.lower().endswith('.gz')
+
+
 def extension(path) -> str:
+    """The format extension of *path*; ``.msh.gz`` is a ``.msh``."""
     name = Path(str(path)).name.lower()
-    if name.endswith('.nii.gz'):
-        return '.nii'
+    if name.endswith('.gz'):
+        name = name[:-3]
+        if not Path(name).suffix:
+            return '.gz'
     return Path(name).suffix
+
+
+#: What Gmsh looks at to choose the reader of a ``.dat`` file.
+_DAT_HEADERS = (('BEGIN ACTRAN', 'actran'), ('!', 'samcef'),
+                (';ECHO', 'samcef'), ('.NOE', 'samcef'))
+
+
+def dat_flavour(header) -> str:
+    """``actran``, ``samcef`` or ``nastran``: the reader Gmsh runs on a
+    ``.dat`` file whose first bytes are *header* (``OpenFile.cpp``: the
+    prefixes are tested in this order and anything else is Nastran)."""
+    if isinstance(header, bytes):
+        header = header.decode('latin-1', 'replace')
+    for prefix, flavour in _DAT_HEADERS:
+        if header.startswith(prefix):
+            return flavour
+    return 'nastran'
+
+
+def read_header(path, size: int = 128) -> str:
+    """The first bytes of *path* (decompressed when it is a ``.gz``)."""
+    import gzip
+
+    try:
+        opener = gzip.open if is_gzip(path) else open
+        with opener(str(path), 'rb') as handle:
+            return handle.read(size).decode('latin-1', 'replace')
+    except (OSError, EOFError) as error:
+        raise ImportRefusal(f'{path} cannot be read: {error}') from error
 
 
 def file_filter(mode: str = 'merge') -> str:
     """The open-file dialog's filter string for *mode*."""
-    names = open_extensions() if mode == 'open' else [
-        item.extension for item in FORMATS]
-    exts = ' '.join('*' + name for name in names)
+    names = list(open_extensions() if mode == 'open' else [
+        item.extension for item in FORMATS])
+    names += [item.extension for item in READER_FORMATS]
+    exts = ' '.join('*' + name for name in names) + ' *.gz'
     return 'Gmsh-readable files (%s);;All files (*)' % exts
 
 
@@ -127,6 +193,10 @@ def classify(path) -> Format:
     ext = extension(path)
     if ext in REFUSED:
         raise ImportRefusal(f'{ext} cannot be opened: {REFUSED[ext]}')
+    if ext == '.gz':
+        raise ImportRefusal(
+            'a .gz file is opened by what it holds: name it like '
+            'model.msh.gz so the format inside can be told')
     item = BY_EXTENSION.get(ext)
     if item is None:
         raise ImportRefusal(
@@ -143,6 +213,14 @@ class OpenRequest:
     unit: str = ''
     scaling: float = 1.0
     classify: dict | None = None
+    #: Plan 48 GM10. A reader the session's Open does not list, or a gzip
+    #: file, goes to ``session.read_file``; every other request keeps
+    #: ``session.open``.
+    reader: bool = False
+
+    @property
+    def operation(self) -> str:
+        return 'session.read_file' if self.reader else 'session.open'
 
     def kwargs(self) -> dict:
         out = {'mode': self.mode, 'unit': self.unit, 'scaling': self.scaling}
@@ -189,6 +267,9 @@ def plan_open(path, mode: str = 'open', *, unit: str = '', scaling=1.0,
     if not str(path).strip():
         raise ImportRefusal('choose a file')
     item = classify(path)
+    if item.extension == '.dat':
+        # no .dat is one format: Gmsh reads the first bytes to choose
+        dat_flavour(read_header(path))
     if unit not in dict(UNITS):
         raise ImportRefusal(
             f'unit {unit!r} is not accepted by Open CASCADE here; the '
@@ -215,10 +296,106 @@ def plan_open(path, mode: str = 'open', *, unit: str = '', scaling=1.0,
                 'read with Reclassify')
         classification = reclassify_arguments(classify_angle,
                                               **classify_options)
+    reader = item.extension in READER_EXTENSIONS or is_gzip(path)
     return OpenRequest(str(path), mode, item.kind, unit, scaling,
-                       classification)
+                       classification, reader)
 
 
 def scale_to_metres(unit: str, scaling: float = 1.0) -> float:
     """How many metres one model unit is after importing with *unit*."""
     return UNIT_FACTOR_TO_M[unit] / float(scaling)
+
+
+# --------------------------------------------------------------------------- #
+# File > Watch pattern (Plan 48 GM10)
+# --------------------------------------------------------------------------- #
+
+#: The menu entry's id in ``view/gmsh_tools/registry.py`` and the action it
+#: runs.  The window mounts the registry (GM11b); this module owns the logic.
+WATCH_ACTION_ID = 'gmsh.file.watch_pattern'
+WATCH_MENU_ID = 'gmsh.file.watch_pattern.menu'
+WATCH_INTERVAL_SECONDS = (0.2, 3600.0)
+
+
+def watch_scan(pattern: str, seen: dict | None = None) -> tuple:
+    """Files matching *pattern* that are new or changed since *seen*.
+
+    Gmsh's File > Watch pattern merges every file that matches a pattern when
+    it appears or is written again.  *seen* maps a path to its
+    ``(modified time, size)`` from the last scan (``None`` on the first scan,
+    which reports every match).  Returns ``(changed, seen)``: *changed* is a
+    list of ``(path, refusal)`` sorted by modified time then name, *refusal*
+    being ``''`` or the reason Merge would refuse that file; *seen* is the
+    table for the next scan.  A file that disappears is forgotten, so it is
+    reported again if it comes back.
+    """
+    import glob
+    import os
+
+    if not str(pattern).strip():
+        raise ImportRefusal('enter a file pattern such as results/*.pos')
+    previous = dict(seen or {})
+    current: dict = {}
+    for name in glob.glob(str(pattern)):
+        try:
+            info = os.stat(name)
+        except OSError:
+            continue
+        if not os.path.isfile(name):
+            continue
+        current[name] = (info.st_mtime_ns, info.st_size)
+    changed = sorted((name for name, mark in current.items()
+                      if previous.get(name) != mark),
+                     key=lambda name: (current[name][0], name))
+    report = []
+    for name in changed:
+        try:
+            classify(name)
+            refusal = ''
+        except ImportRefusal as error:
+            refusal = str(error)
+        report.append((name, refusal))
+    return report, current
+
+
+def check_watch_interval(seconds) -> float:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        raise ImportRefusal('the watch interval must be a number of '
+                            'seconds') from None
+    low, high = WATCH_INTERVAL_SECONDS
+    if not low <= value <= high:
+        raise ImportRefusal(
+            f'the watch interval must be between {low:g} and {high:g} '
+            'seconds')
+    return value
+
+
+def register_window_entries(handler=None) -> tuple:
+    """Register File > Watch pattern with the Gmsh tool registry.
+
+    Only the registry is touched (no Qt, no menu): the window's mount of the
+    registry (GM11b) builds the entry.  *handler* is what the entry runs
+    (it asks for the pattern and the interval, then calls
+    :func:`watch_scan` on a timer); with none, the entry is registered with a
+    handler that explains the window has to supply one.  Registering twice
+    returns the existing entries.
+    """
+    from foammesh.view.gmsh_tools import registry
+
+    def _unbound(*_args, **_kwargs):
+        raise ImportRefusal('Watch pattern needs the window to ask for the '
+                            'pattern and the interval')
+
+    for entry in registry.actions(None):
+        if entry.id == WATCH_ACTION_ID:
+            return (entry, next(m for m in registry.menu_items(None)
+                                if m.id == WATCH_MENU_ID))
+    action = registry.register_action(
+        WATCH_ACTION_ID, 'Watch pattern...', handler or _unbound,
+        tooltip='Merge the files that match a pattern whenever one appears '
+                'or is written again')
+    menu = registry.register_menu_item(WATCH_MENU_ID, 'File', WATCH_ACTION_ID,
+                                       order=450)
+    return action, menu

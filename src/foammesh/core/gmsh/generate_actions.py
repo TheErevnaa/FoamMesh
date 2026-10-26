@@ -98,6 +98,119 @@ class ActionRefusal(ValueError):
     """An action Gmsh (or the model's state) cannot do, with the reason."""
 
 
+# --------------------------------------------------------------------------- #
+# Plan 48 TL: one time limit for the calls that can hang on Gmsh 4.15.2.
+
+#: The start of every refusal that is Gmsh 4.15.2's own limit, not ours.
+LIMIT_TAG = 'Gmsh 4.15.2 limit'
+
+#: Seconds each kind of call may take before the session ends it. ``0``
+#: means no limit. The user changes them per call, or for the project
+#: (``GenerateController.set_time_limit``, ``gmsh.time_limits.set``).
+DEFAULT_LIMITS = {
+    'plugin': 300.0,        # CurvedBndDist never returns (DP-4309)
+    'cross_field': 600.0,   # computeCrossField (DP-4255)
+    'topology': 300.0,      # createTopology (DP-4256)
+    'reclassify': 300.0,    # Reclassify 2D, whole model or subset
+    'recombine3d': 900.0,   # Recombine3D hex-dominant meshing (DP-4217)
+}
+
+#: What each kind is called in the refusal.
+LIMIT_WHAT = {
+    'plugin': 'the plugin',
+    'cross_field': 'the cross field (Compute quad layout)',
+    'topology': 'createTopology',
+    'reclassify': 'Reclassify 2D',
+    'recombine3d': 'Recombine3D (hex-dominant meshing)',
+}
+
+#: The session operation that each kind guards (host-side limit kinds).
+OP_LIMIT_KIND = {
+    'session.plugin_run': 'plugin', 'session.plugin_edit': 'plugin',
+    'session.quad_layout': 'cross_field',
+    'session.create_topology': 'topology',
+    'session.reclassify': 'reclassify',
+    'session.reclassify_subset': 'reclassify',
+    'model.mesh.classifySurfaces': 'reclassify',
+}
+
+#: The Generate actions that run one of those calls, and the kind each uses.
+ACTION_LIMIT_KIND = {'reclassify_subset': 'reclassify',
+                     'reclassify': 'reclassify',
+                     'quad_layout': 'cross_field'}
+
+
+class TimeLimitRefusal(ActionRefusal):
+    """A call that did not return in its time limit; the session was
+    restarted from its log, so it is alive and the model is as it was."""
+
+    def __init__(self, what: str, seconds: float, restarted: str = ''):
+        self.what = what
+        self.seconds = float(seconds)
+        super().__init__(limit_text(what, seconds, restarted))
+
+
+def limit_text(what: str, seconds: float, restarted: str = '',
+               untouched: bool = False) -> str:
+    """The refusal text: ``Gmsh 4.15.2 limit: <what> did not return in <n> s``.
+
+    *untouched*: the work ran in a child process, which was stopped; the
+    session was never involved.
+    """
+    text = (f'{LIMIT_TAG}: {what} did not return in {float(seconds):g} s. '
+            'This is a limit of Gmsh 4.15.2, not of the model: the call was '
+            'stopped and ')
+    if untouched:
+        return text + ('the session was not affected. Raise the time limit '
+                       'to wait longer')
+    if restarted:
+        return text + ('the session could not be restarted (' + restarted
+                       + '); recover it before the next action')
+    return text + ('the session was restarted from its log with the model '
+                   'as it was. Raise the time limit to wait longer')
+
+
+def limit_for(kind: str, limits: dict | None = None) -> float:
+    """Seconds for *kind*: the project's value, else the default (0 = none)."""
+    if limits and kind in limits and limits[kind] is not None:
+        return float(limits[kind])
+    return float(DEFAULT_LIMITS[kind])
+
+
+def is_time_limit(error: BaseException) -> bool:
+    """True for a session that ended because a call passed its time limit."""
+    from .session import EXIT_TIMEOUT, GmshSessionCrashed
+
+    return (isinstance(error, GmshSessionCrashed)
+            and (error.returncode == EXIT_TIMEOUT
+                 or 'time limit' in str(error.reason)))
+
+
+def restart_after_limit(session) -> str:
+    """Restart *session* from its log; '' when it worked, else why not."""
+    rebuild = getattr(session, 'rebuild', None)
+    if rebuild is None:
+        return ''
+    try:
+        rebuild()
+    except Exception as error:                         # noqa: BLE001
+        return str(error)
+    return ''
+
+
+def call_with_limit(session, what: str, seconds, op: str, *args, **kwargs):
+    """``session.call(op, ...)`` under *seconds*; a call that passes it
+    raises :class:`TimeLimitRefusal` and the session is alive again."""
+    seconds = float(seconds or 0)
+    try:
+        return session.call(op, *args, timeout=seconds or None, **kwargs)
+    except Exception as error:                         # noqa: BLE001
+        if seconds and is_time_limit(error):
+            raise TimeLimitRefusal(
+                what, seconds, restart_after_limit(session)) from None
+        raise
+
+
 @dataclass(frozen=True)
 class Op:
     """One session operation: ``session.call(name, *args, **kwargs)``."""
@@ -143,12 +256,16 @@ class Stage:
     before: dict = field(default_factory=dict)
     after: dict = field(default_factory=dict)
     notes: tuple = ()
+    results: tuple = ()          #: what the session returned, per operation
 
     def as_dict(self) -> dict:
-        return {'action': self.action, 'title': self.title,
-                'seconds': round(self.seconds, 3), 'ok': self.ok,
-                'error': self.error, 'before': self.before,
-                'after': self.after, 'notes': list(self.notes)}
+        row = {'action': self.action, 'title': self.title,
+               'seconds': round(self.seconds, 3), 'ok': self.ok,
+               'error': self.error, 'before': self.before,
+               'after': self.after, 'notes': list(self.notes)}
+        if self.results:
+            row['results'] = list(self.results)
+        return row
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +386,18 @@ def _optimize(action, values):
     return ops, ()
 
 
+#: Gmsh's High-order tools window takes element orders 1 to 10.
+ORDER_RANGE = (1, 10)
+
+
 def _set_order(action, values):
-    order = _int(values, 'order', 2, 1, 3)
+    order = _int(values, 'order', 2, *ORDER_RANGE)
+    notes = ()
+    if order > 5:
+        notes = ('the cost grows steeply with the order: a 0.7-sized box '
+                 'has 203,651 nodes at order 10 and takes about 34 s',)
     return (_option_ops(HIGH_ORDER_OPTIONS, values, HIGH_ORDER_OPTIONS)
-            + [Op('model.mesh.setOrder', (order,))]), ()
+            + [Op('model.mesh.setOrder', (order,))]), notes
 
 
 def _refine(action, values):
@@ -392,6 +517,272 @@ def _visibility(action, values):
                {'recursive': bool(values.get('recursive', True))})], ()
 
 
+# -- Plan 48 GM7: the High-order tools, Reverse, Delete, Reclassify subset,
+# -- the Experimental items.
+
+#: The native High-order tools window (``highOrderToolsWindow.cpp``): which of
+#: its fields each algorithm leaves active (``chooseopti_cb``) and the range
+#: of each field.  The six patch fields of the window (strategy, weight,
+#: distance factor and the three adaptation values) are options only in
+#: FoamMesh's own Gmsh build (Plan 48 G15 patch, DP-5707); on the stock wheel
+#: the session refuses them with the reason.
+HIGH_ORDER_PATCH_OPTIONS = (
+    'Mesh.HighOrderStrategy', 'Mesh.HighOrderWeight',
+    'Mesh.HighOrderDistanceFactor', 'Mesh.HighOrderMaxAdaptBlob',
+    'Mesh.HighOrderAdaptBlobLayerFactor', 'Mesh.HighOrderAdaptBlobDistFactor')
+REGULARIZE_ALGORITHMS = (
+    ('optimization', 'Optimization', 'HighOrder', (
+        'Mesh.HighOrderThresholdMin', 'Mesh.HighOrderThresholdMax',
+        'Mesh.HighOrderNumLayers', 'Mesh.HighOrderFixBoundaryNodes',
+        'Mesh.HighOrderIterMax', 'Mesh.HighOrderPassMax',
+        'Mesh.HighOrderPrimSurfMesh', 'Mesh.HighOrderDistCAD')
+        + HIGH_ORDER_PATCH_OPTIONS),
+    ('elastic', 'Elastic analogy', 'HighOrderElastic', ()),
+    ('fast_curving', 'Fast curving', 'HighOrderFastCurving', (
+        'Mesh.HighOrderNumLayers', 'Mesh.HighOrderCurveOuterBL')),
+    # DP-4257: Fast curving with the thickness switch. FoamMesh's own build
+    # (gmsh-4.15.2-bl-curving.patch) reads Gmsh's own option
+    # Mesh.HighOrderFastCurvingNewAlgo for it, as the window does; the stock
+    # wheel declares the option and never reads it, so the session refuses it.
+    ('bl_curving', 'Boundary layer curving (experimental)',
+     'HighOrderFastCurving', (
+         'Mesh.HighOrderNumLayers', 'Mesh.HighOrderCurveOuterBL')),
+)
+REGULARIZE_RANGES = {
+    'Mesh.HighOrderThresholdMin': (0.0, 1.0),
+    'Mesh.HighOrderThresholdMax': (1.0, 10.0),
+    'Mesh.HighOrderNumLayers': (1, 250),
+    'Mesh.HighOrderIterMax': (1, 10000),
+    'Mesh.HighOrderPassMax': (1, 100),
+    'Mesh.HighOrderStrategy': (0, 2),
+    'Mesh.HighOrderDistanceFactor': (1, 20000),
+    'Mesh.HighOrderMaxAdaptBlob': (1, 100),
+    'Mesh.HighOrderAdaptBlobLayerFactor': (1, 100),
+    'Mesh.HighOrderAdaptBlobDistFactor': (1, 100),
+}
+REGULARIZE_OPTIONS = tuple(sorted({
+    name for _i, _t, _m, names in REGULARIZE_ALGORITHMS for name in names}))
+#: Fields of the native window with no Gmsh option behind them, and the value
+#: Gmsh's API runs with. Empty since the G15 patch (DP-5707): every field of
+#: the High-order tools window is an option of FoamMesh's Gmsh build.
+REGULARIZE_UNREACHABLE: dict = {}
+
+
+def element_tags(text) -> list:
+    """``"1, 5-9, 12"`` or ``[1, 2]`` as a list of element tags."""
+    if text in (None, '', [], ()):
+        return []
+    if isinstance(text, (list, tuple, set)):
+        tags = [int(t) for t in text]
+    else:
+        tags = []
+        for item in str(text).replace(';', ',').split(','):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                if '-' in item:
+                    low, high = item.split('-')
+                    low, high = int(low), int(high)
+                    if high < low or high - low > 5_000_000:
+                        raise ValueError
+                    tags.extend(range(low, high + 1))
+                else:
+                    tags.append(int(item))
+            except ValueError:
+                raise ActionRefusal(
+                    f'"{item}" is not an element tag or a range such as '
+                    '5-9') from None
+    if any(t <= 0 for t in tags):
+        raise ActionRefusal('element tags are positive numbers')
+    return tags
+
+
+def compress_tags(tags) -> str:
+    """``[1, 2, 3, 7]`` as ``"1-3, 7"``: element tags in the shortest text."""
+    ordered = sorted({int(t) for t in tags})
+    parts = []
+    start = previous = None
+    for tag in ordered:
+        if start is None:
+            start = previous = tag
+        elif tag == previous + 1:
+            previous = tag
+        else:
+            parts.append(f'{start}-{previous}' if previous > start
+                         else str(start))
+            start = previous = tag
+    if start is not None:
+        parts.append(f'{start}-{previous}' if previous > start
+                     else str(start))
+    return ', '.join(parts)
+
+
+def edge_pairs(value) -> list:
+    """``"4-9, 12-3"`` or ``[[4, 9]]`` as node pairs (an edge each)."""
+    if value in (None, '', [], ()):
+        return []
+    if isinstance(value, str):
+        pairs = []
+        for item in value.replace(';', ',').split(','):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                a, b = item.replace(':', '-').split('-')
+                pairs.append([int(a), int(b)])
+            except ValueError:
+                raise ActionRefusal(
+                    f'"{item}" is not an edge; write two node tags, for '
+                    'example 4-9') from None
+        return pairs
+    try:
+        return [[int(a), int(b)] for a, b in value]
+    except (TypeError, ValueError):
+        raise ActionRefusal('delete_edges is a list of node pairs') from None
+
+
+def _regularize(action, values):
+    chosen = values.get('algorithm', 'optimization')
+    row = next((r for r in REGULARIZE_ALGORITHMS if r[0] == chosen), None)
+    if row is None:
+        raise ActionRefusal(
+            f'"{chosen}" is not a regularisation; they are '
+            + ', '.join(r[0] for r in REGULARIZE_ALGORITHMS))
+    _id, title, method, active = row
+    if method is None:
+        raise ActionRefusal(
+            f'{title} is Fast curving with the thickness switch on, a call '
+            'the Gmsh 4.15.2 API does not make (the build hides its private '
+            'API); use Fast curving')
+    options = {}
+    for name in REGULARIZE_OPTIONS:
+        if name not in values or values[name] is None:
+            continue
+        if name not in active:
+            raise ActionRefusal(
+                f'{name} is not used by {title}; it takes '
+                + (', '.join(active) or 'no parameters'))
+        try:
+            parsed = catalogue.parse_value(name, values[name])
+        except catalogue.OptionRefusal as error:
+            raise ActionRefusal(str(error)) from None
+        low, high = REGULARIZE_RANGES.get(name, (None, None))
+        if low is not None and not low <= float(parsed) <= high:
+            raise ActionRefusal(f'{name} must be between {low:g} and '
+                                f'{high:g}')
+        options[name] = float(parsed)
+    ops = _option_ops(SCOPE_OPTIONS, values, SCOPE_OPTIONS)
+    ops.append(Op('session.regularize', (), {
+        'algorithm': chosen, 'options': options,
+        'force': bool(values.get('force', False)),
+        'niter': _int(values, 'niter', 1, 1, 1000),
+        'entities': dim_tags(values.get('entities'))}))
+    return ops, ('Gmsh optimises every high-order element of the mesh; the '
+                 'entities are not a filter of its optimisers',)
+
+
+def _need_elements(values, what):
+    tags = element_tags(values.get('elements'))
+    if not tags:
+        raise ActionRefusal(f'give the elements to {what}, as tags such as '
+                            '5-9, 12')
+    return tags
+
+
+def _need_entities(values, what):
+    entities = dim_tags(values.get('entities'))
+    if not entities:
+        raise ActionRefusal(f'give the curves, surfaces or volumes to '
+                            f'{what}, written dimension:tag')
+    if any(d == 0 for d, _ in entities):
+        raise ActionRefusal('points have no elements to ' + what)
+    return entities
+
+
+def _reverse_elements(action, values):
+    # mesh.reverseElements: Gmsh reverses the nodes of each named element
+    return [Op('model.mesh.reverseElements',
+               (_need_elements(values, 'reverse'),))], ()
+
+
+def _reverse_entities(action, values):
+    # mesh.reverse: Gmsh reverses every element of the named entities
+    return [Op('model.mesh.reverse',
+               (_need_entities(values, 'reverse'),))], ()
+
+
+def _delete_elements(action, values):
+    return [Op('session.remove_elements',
+               (_need_elements(values, 'delete'),))], (
+        'the nodes of a deleted element stay in the model',)
+
+
+def _delete_entity_mesh(action, values):
+    return [Op('session.delete_entity_mesh',
+               (_need_entities(values, 'delete the mesh of'),))], (
+        "Gmsh's clear call leaves a bounding entity alone without an error; "
+        'the elements are then removed directly, as native Gmsh does',)
+
+
+def _angle(values):
+    angle = float(values.get('angle', 40.0))
+    if not 0.0 < angle <= 180.0:
+        raise ActionRefusal('the threshold angle is in degrees, greater '
+                            'than 0 and at most 180')
+    return angle
+
+
+def _reclassify_subset(action, values):
+    angle = _angle(values)
+    drop = edge_pairs(values.get('delete_edges'))
+    return [Op('session.reclassify_subset', (), {
+        'angle': angle, 'elements': element_tags(values.get('elements')),
+        'entities': dim_tags(values.get('entities')),
+        'boundary': bool(values.get('boundary', True)),
+        'delete_edges': drop,
+        'create_geometry': bool(values.get('create_geometry', True)),
+        'export_discrete': bool(values.get('export_discrete', True)),
+        'hide_unselected': bool(values.get('hide_unselected', False))})], (
+        'with no subset and no edge taken out this is the Gmsh '
+        'Reclassify 2D call (classifySurfaces); with one, the surface mesh '
+        'is cut into patches along the edges above the angle and elements '
+        'outside the subset keep their surfaces, and the curves between the '
+        'patches are made (createTopology)',)
+
+
+def _reclassify_preview(action, values):
+    return [Op('session.reclassify_edges', (), {
+        'angle': _angle(values),
+        'elements': element_tags(values.get('elements')),
+        'boundary': bool(values.get('boundary', True))})], ()
+
+
+def _quad_layout(action, values):
+    try:
+        limit = float(values.get('timeout', DEFAULT_LIMITS['cross_field']))
+    except (TypeError, ValueError):
+        raise ActionRefusal('the time limit is a number of seconds') from None
+    if limit < 0:
+        raise ActionRefusal('the time limit is a number of seconds, 0 for '
+                            'none')
+    limit = limit or 86400.0
+    return [Op('session.quad_layout', (), {'limit': limit},
+               timeout=limit + 60.0)], (
+        'Gmsh 4.15.2 computes the cross field in a PETSc solve that ends in '
+        'an error or a crash on the models measured; it runs in a child '
+        'process so the session survives, and a failure is reported with '
+        'its exit code',)
+
+
+def _experimental(method):
+    def expand(action, values):
+        return [Op('model.mesh.optimize', (method,), {
+            'force': False, 'niter': _int(values, 'niter', 1, 1, 1000),
+            'dimTags': []})], ()
+    return expand
+
+
 ACTIONS: dict = {}
 
 
@@ -453,6 +844,41 @@ _register(
            'discrete entities.', 2, (),
            ('angle', 'curve_angle', 'boundary', 'reparametrization',
             'export_discrete'), _reclassify),
+    Action('regularize', 'Regularize', 'High-order tools',
+           "Optimise high-order elements: optimisation, elastic analogy or "
+           "fast curving, with the parameters of Gmsh's window.", 1,
+           REGULARIZE_OPTIONS, ('algorithm', 'niter', 'force', 'entities'),
+           _regularize),
+    Action('reverse_elements', 'Reverse elements', 'Reverse',
+           'Flip the orientation of the elements you name.', 1, (),
+           ('elements',), _reverse_elements),
+    Action('reverse_entities', 'Reverse curves, surfaces, volumes',
+           'Reverse', 'Flip the orientation of the mesh of the entities '
+           'you name.', 1, (), ('entities',), _reverse_entities),
+    Action('delete_elements', 'Delete elements', 'Delete',
+           'Remove the elements you name from the mesh.', 1, (),
+           ('elements',), _delete_elements),
+    Action('delete_entity_mesh', 'Delete curves, surfaces, volumes',
+           'Delete', 'Remove the mesh of the entities you name.', 1, (),
+           ('entities',), _delete_entity_mesh),
+    Action('reclassify_subset', 'Reclassify 2D (subset)', 'Mesh',
+           'Cut a subset of the surface mesh into patches by an angle '
+           'threshold, with edges you can take out.', 2, (),
+           ('angle', 'elements', 'entities', 'boundary', 'delete_edges',
+            'create_geometry', 'export_discrete', 'hide_unselected'),
+           _reclassify_subset),
+    Action('reclassify_preview', 'Reclassify 2D edges', 'Mesh',
+           'The edges the angle threshold would cut along.', 2, (),
+           ('angle', 'elements', 'boundary'), _reclassify_preview),
+    Action('quad_layout', 'Compute quad layout', 'Experimental',
+           'Compute the cross field the quad layout is built from.', 2, (),
+           ('timeout',), _quad_layout),
+    Action('optimize_quad_topology', 'Optimize quad topology',
+           'Experimental', 'Improve the topology of a quadrangle mesh.', 2,
+           (), ('niter',), _experimental('QuadQuasiStructured')),
+    Action('untangle_geometry', 'Untangle geometry', 'Experimental',
+           'Untangle inverted elements by moving nodes.', 2, (), ('niter',),
+           _experimental('UntangleMeshGeometry')),
     Action('only_visible', 'Mesh only visible', 'Mesh',
            'Make the next generate act on visible entities only.', -1, (),
            ('visible',), _only('Mesh.MeshOnlyVisible', 'visible')),
@@ -530,10 +956,24 @@ class Timeline:
         return [stage.as_dict() for stage in self.stages]
 
 
+def _op_what(operation: 'Op', kind: str) -> str:
+    if kind == 'plugin' and operation.args:
+        return f'the {operation.args[0]} plugin'
+    return LIMIT_WHAT[kind]
+
+
 def run(session, action_id: str, values: dict | None = None, *,
         timeline: Timeline | None = None, measure: bool = True,
-        timeout: float | None = None) -> Stage:
-    """Play an action on *session*; record and return its stage."""
+        timeout: float | None = None,
+        limits: dict | None = None) -> Stage:
+    """Play an action on *session*; record and return its stage.
+
+    Plan 48 TL. A call that Gmsh 4.15.2 can leave hanging (a plugin, the
+    cross field, createTopology, Reclassify 2D) runs under its time limit
+    (*limits*, else :data:`DEFAULT_LIMITS`); one that passes it ends the stage
+    with a refusal that names the limit, and the session is restarted from
+    its log.  *timeout* still bounds any other call.
+    """
     chosen = action(action_id)
     stage = Stage(chosen.id, chosen.title)
     try:
@@ -545,10 +985,33 @@ def run(session, action_id: str, values: dict | None = None, *,
         if reason:
             raise ActionRefusal(reason)
         started = time.monotonic()
+        results = []
         for operation in planned.ops:
             call_timeout = operation.timeout or timeout
-            session.call(operation.name, *operation.args,
-                         timeout=call_timeout, **operation.kwargs)
+            kind = OP_LIMIT_KIND.get(operation.name)
+            if kind is not None and not call_timeout:
+                call_timeout = limit_for(kind, limits) or None
+            try:
+                answer = session.call(operation.name, *operation.args,
+                                      timeout=call_timeout, **operation.kwargs)
+            except Exception as error:                 # noqa: BLE001
+                if call_timeout and is_time_limit(error):
+                    what = (_op_what(operation, kind) if kind
+                            else chosen.title)
+                    raise TimeLimitRefusal(
+                        what, call_timeout - (60.0 if kind == 'cross_field'
+                                              and operation.timeout else 0.0),
+                        restart_after_limit(session)) from None
+                raise
+            if (kind == 'cross_field' and isinstance(answer, dict)
+                    and answer.get('refused')):
+                answer = dict(answer, refused=_cross_field_refusal(
+                    str(answer['refused']), operation))
+            if isinstance(answer, dict) and answer:
+                results.append(answer)
+            if isinstance(answer, dict) and answer.get('refused'):
+                raise ActionRefusal(str(answer['refused']))
+        stage.results = tuple(results)
         stage.seconds = time.monotonic() - started
         stage.after = _summary(session.state())
         if measure:
@@ -564,7 +1027,184 @@ def run(session, action_id: str, values: dict | None = None, *,
     return stage
 
 
+def _cross_field_refusal(text: str, operation: 'Op') -> str:
+    """The child process's refusal, tagged as Gmsh's own limit."""
+    if text.startswith(LIMIT_TAG):
+        return text
+    if 'was not computed in' in text:
+        return limit_text(LIMIT_WHAT['cross_field'],
+                          float(operation.kwargs.get('limit') or 0),
+                          untouched=True)
+    return f'{LIMIT_TAG}: {text}'
+
+
 def _summary(state: dict) -> dict:
     return {'nodes': state.get('nodes', 0),
             'elements': dict(state.get('elements') or {}),
             'dims_meshed': list(state.get('dims_meshed') or [])}
+
+
+# --------------------------------------------------------------------------- #
+# Plan 48 GM7: the entries of Mesh > Experimental, the High-order tools,
+# Reverse, Delete and Reclassify in the Gmsh tool registry (the window's
+# mount, GM11b, builds the menu).
+
+MENU_ENTRIES = (
+    ('quad_layout', 'Mesh/Experimental', 100),
+    ('optimize_quad_topology', 'Mesh/Experimental', 110),
+    ('untangle_geometry', 'Mesh/Experimental', 120),
+    ('set_order', 'Mesh/High-order tools', 100),
+    ('regularize', 'Mesh/High-order tools', 110),
+    ('reverse_elements', 'Mesh/Reverse', 100),
+    ('reverse_entities', 'Mesh/Reverse', 110),
+    ('delete_elements', 'Mesh/Delete', 100),
+    ('delete_entity_mesh', 'Mesh/Delete', 110),
+    ('reclassify_subset', 'Mesh/Reclassify', 100),
+)
+MENU_PREFIX = 'gmsh.mesh.'
+
+
+def register_window_entries(handler=None) -> tuple:
+    """Register the Mesh menu entries of GM7 with the Gmsh tool registry.
+
+    *handler* is called with the action id when an entry is chosen (the
+    window opens the Generate panel on that action); with none, the entry is
+    registered with a handler that says the window has to supply one.
+    Entries already registered are left as they are.
+    """
+    from foammesh.view.gmsh_tools import registry
+
+    def unbound(action_id):
+        raise RuntimeError(
+            'the Mesh menu entries run in the window; no handler was given')
+
+    made = []
+    known = {entry.id for entry in registry.actions(None)}
+    for action_id, menu, order in MENU_ENTRIES:
+        entry_id = MENU_PREFIX + action_id
+        if entry_id in known:
+            continue
+        chosen = ACTIONS[action_id]
+
+        def run_it(_action_id=action_id):
+            return (handler or unbound)(_action_id)
+
+        made.append(registry.register_action(
+            entry_id, chosen.title, run_it, tooltip=chosen.help))
+        made.append(registry.register_menu_item(
+            entry_id + '.menu', menu, entry_id, order=order))
+    return tuple(made)
+
+
+# --------------------------------------------------------------------------- #
+# Plan 48 PA2: the form of each action, as data.  The Generate panel builds
+# its controls from these tables and the local API publishes the same ones, so
+# the window and a client cannot disagree on what an action takes.
+
+#: Gmsh's own keys for the Mesh module's first three buttons.
+SHORTCUTS = {'1': 'generate1d', '2': 'generate2d', '3': 'generate3d',
+             'F2': 'generate2d', 'F3': 'generate3d'}
+
+#: name -> (label, kind, default, extra)
+ARGUMENTS = {
+    'method': ('Method', 'choice', '',
+               [(title, method) for method, title, _ in OPTIMIZE_METHODS]),
+    'niter': ('Passes', 'int', 1, (1, 1000)),
+    'force': ('Also discrete entities', 'bool', False, None),
+    'entities': ('Entities (dimension:tag, ...)', 'text', '', None),
+    'order': ('Order', 'int', 2, ORDER_RANGE),
+    'steps': ('Times', 'int', 1, (1, 10)),
+    'parts': ('Partitions', 'int', 2, (1, 100000)),
+    'dim': ('Up to dimension', 'int', 3, (1, 3)),
+    'nodes': ('Nodes', 'bool', True, None),
+    'elements': ('Elements', 'bool', True, None),
+    'visible': ('Visible', 'bool', True, None),
+    'empty': ('Only empty', 'bool', True, None),
+    'recursive': ('With their boundaries', 'bool', True, None),
+    'angle': ('Angle (degrees)', 'text', '40', None),
+    'curve_angle': ('Curve angle (degrees)', 'text', '180', None),
+    'boundary': ('Boundary curves', 'bool', True, None),
+    'reparametrization': ('For reparametrization', 'bool', False, None),
+    'export_discrete': ('Export discrete', 'bool', True, None),
+    # Plan 48 GM7
+    'algorithm': ('Algorithm', 'choice', 'optimization',
+                  [(title, ident) for ident, title, _m, _o in
+                   REGULARIZE_ALGORITHMS]),
+    'timeout': ('Time limit (s)', 'text', '600', None),
+    'hide_unselected': ('Hide unselected', 'bool', False, None),
+    'create_geometry': ('Create parametrized discrete model', 'bool', True,
+                        None),
+    'delete_edges': ('Edges taken out (node-node, ...)', 'text', '', None),
+}
+for _name, (_label, _default) in REGULARIZE_UNREACHABLE.items():
+    ARGUMENTS[_name] = (_label, 'fixed', _default, None)
+
+#: Where an action's argument means something other than the table above:
+#: ``elements`` is a yes/no for Renumber and a list of tags for the actions
+#: that edit elements.
+ARGUMENT_OVERRIDES = {
+    (action_id, 'elements'): ('Elements (tags, e.g. 5-9, 12)', 'text', '',
+                              None)
+    for action_id in ('reverse_elements', 'delete_elements',
+                      'reclassify_subset', 'reclassify_preview')
+}
+#: Plan 48 PA2 (DP-4871). ``method`` is Optimize's list in the table above;
+#: Renumber takes Gmsh's three renumbering methods, RCMK first.
+ARGUMENT_OVERRIDES[('renumber', 'method')] = (
+    'Method', 'choice', RENUMBER_METHODS[0],
+    [(method, method) for method in RENUMBER_METHODS])
+
+#: The pick filter each entity argument starts with.
+PICK_FILTERS = ('Points', 'Curves', 'Surfaces', 'Volumes')
+#: Plan 48 PK (DP-4503). A list of elements can also be picked cell by cell
+#: in the mesh on screen; the answer is element tags, not entities.
+ELEMENT_PICK_FILTERS = PICK_FILTERS + ('Cells',)
+
+
+def argument_spec(action_id: str, name: str) -> tuple:
+    """``(label, kind, default, extra)`` of argument *name* of an action."""
+    return ARGUMENT_OVERRIDES.get((action_id, name)) or ARGUMENTS[name]
+
+
+def _extra_json(kind: str, extra):
+    if kind == 'int':
+        return {'low': extra[0], 'high': extra[1]}
+    if kind == 'choice':
+        return {'choices': [{'title': t, 'value': v} for t, v in extra]}
+    return {}
+
+
+def option_form(option) -> dict:
+    """What the panel shows for one Gmsh option of an action."""
+    row = {'name': option.name, 'label': option.label, 'kind': option.kind,
+           'default': option.default, 'help': option.help,
+           'unit': option.unit, 'is_length': bool(option.is_length),
+           'choices': [{'value': v, 'title': t} for v, t in option.choices]}
+    return row
+
+
+def form(action_id: str) -> dict:
+    """The controls of one action: the arguments and the ticked-to-send
+    options, with kind, default, range and choices (what the panel draws)."""
+    chosen = action(action_id)
+    arguments = []
+    for name in chosen.arguments:
+        label, kind, default, extra = argument_spec(chosen.id, name)
+        row = {'name': name, 'label': label, 'kind': kind,
+               'default': default, 'fixed': kind == 'fixed',
+               'pick_filters': (
+                   list(ELEMENT_PICK_FILTERS) if name == 'elements'
+                   else list(PICK_FILTERS)) if name in (
+                       'entities', 'elements') and kind == 'text' else []}
+        row.update(_extra_json(kind, extra))
+        arguments.append(row)
+    options = []
+    for name in chosen.options:
+        found = catalogue.get(name)
+        if found is None:
+            continue            # an option this Gmsh build lacks is not offered
+        options.append(option_form(found))
+    return {'id': chosen.id, 'title': chosen.title, 'group': chosen.group,
+            'help': chosen.help, 'needs_dimension': chosen.needs,
+            'shortcuts': [k for k, v in SHORTCUTS.items() if v == chosen.id],
+            'arguments': arguments, 'options': options}

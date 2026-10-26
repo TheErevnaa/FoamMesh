@@ -31,6 +31,7 @@ from foammesh.core.mesh.zone_names import cell_zone_word  # noqa: F401 - CHT2: o
 from .snappy_controls import (
     BACKGROUND_PATCH_GROUP, BOUNDARY_FACES, DEBUG_FLAGS, WRITE_FLAGS)
 from .target import FoamTarget, DEFAULT_TARGET, mesh_quality_controls
+from .surface_roles import SurfaceRoleRefusal
 
 
 #: CHT1. The characters ``word::valid`` refuses (OpenFOAM ``word.H``).
@@ -132,6 +133,41 @@ def group_manifest_path(case_dir) -> Path:
     reopening -- or invalidating -- the prepared revision.
     """
     return Path(case_dir) / 'foammesh' / 'geometry' / 'group-manifest.json'
+
+
+def staged_surface_plan(prepared_geometry) -> tuple[dict, ...]:
+    """The surface files :meth:`CaseBuilder.stage_tri_surfaces` would stage.
+
+    DP-6071. The same ``{name, file, groups, geometry_id}`` records, one per
+    prepared source with the groups imported from it, read off the prepared
+    revision (an object, or its ``to_dict`` mapping) without copying a file.
+    """
+    if isinstance(prepared_geometry, dict):
+        manifest = prepared_geometry.get('manifest') or {}
+        groups = (prepared_geometry.get('group_manifest') or {}).get(
+            'groups') or ()
+    else:
+        manifest = getattr(prepared_geometry, 'manifest', None) or {}
+        groups = (getattr(prepared_geometry, 'group_manifest', None)
+                  or {}).get('groups') or ()
+    by_geometry: dict[str, list[dict]] = {}
+    for group in groups:
+        if isinstance(group, dict):
+            by_geometry.setdefault(group.get('geometry_id'), []).append(
+                dict(group))
+    planned = []
+    for source in manifest.get('sources') or ():
+        if not isinstance(source, dict) or 'geometry_id' not in source:
+            continue
+        name = (source.get('surface_prepared_name')
+                or source.get('prepared_name') or '')
+        suffix = Path(str(name)).suffix.lower() or '.stl'
+        planned.append({
+            'name': f"surface_{source['geometry_id']}",
+            'file': f"surface_{source['geometry_id']}{suffix}",
+            'groups': tuple(by_geometry.get(source['geometry_id'], ())),
+            'geometry_id': source['geometry_id']})
+    return tuple(planned)
 
 
 class CaseBuilder:
@@ -265,8 +301,16 @@ class CaseBuilder:
             names = (
                 'name', 'gType', 'shape', 'cfdType', 'nonConformal',
                 'interRegion', 'point1', 'point2', 'radius') + extra
+            # Plan 49 SR4. The role a surface is written from, and its
+            # purpose and mesh type -- only where a row holds them, so a
+            # project that never stored a role keeps its fingerprint.
+            roles = ('surfaceRole', 'boundaryCategory', 'meshPatchType',
+                     'intentState')
             return {
-                str(key): {name: value.get(name) for name in names}
+                str(key): {
+                    **{name: value.get(name) for name in names},
+                    **{name: value.get(name) for name in roles
+                       if value.get(name) not in (None, '')}}
                 for key, value in geometry.items()
                 if isinstance(value, dict)
             }
@@ -286,6 +330,18 @@ class CaseBuilder:
         # by following its own prescribed order. Each stage now hashes only
         # the geometry fields it actually consumes.
         castellation_geometry = geometry_fields('castellationGroup')
+        # DP-5712. The feature-snap choice is hashed as the two switches it
+        # is written as -- the spelling snap was stored in before -- so a
+        # project that meshed before the choice existed keeps its snap
+        # fingerprint, and only a project whose dictionary changes (both
+        # switches on, which now opens as explicit) reads stale.
+        snap_section = dict(document.get('snap', {}) or {})
+        if 'featureSnapping' in snap_section:
+            from foammesh.db.configurations_schema import featureSnapSwitches
+            implicit, explicit = featureSnapSwitches(
+                snap_section.pop('featureSnapping'))
+            snap_section['implicitFeatureSnap'] = implicit
+            snap_section['explicitFeatureSnap'] = explicit
         layer_geometry = geometry_fields(
             'castellationGroup', 'layerGroup', 'slaveLayerGroup')
         # Plan 37 UF16. An exclude point changes which cells castellation
@@ -326,7 +382,7 @@ class CaseBuilder:
             },
             'snappyHexMesh': {
                 'castellation': castellation,
-                'snap': document.get('snap', {}),
+                'snap': snap_section,
                 'addLayers': document.get('addLayers', {}),
                 'meshQuality': document.get('meshQuality', {}),
                 'geometry': layer_geometry,
@@ -334,7 +390,7 @@ class CaseBuilder:
                 'surfaces': self.surfaces,
             },
             'snap': {
-                'snap': document.get('snap', {}),
+                'snap': snap_section,
                 'surfaces': self.surfaces,
             },
             'layers': {
@@ -373,6 +429,12 @@ class CaseBuilder:
             pieces = self._feature_piece_fingerprint()
             if pieces:
                 payloads[stage]['feature_pieces'] = pieces
+        if stage in ('castellation', 'snappyHexMesh'):
+            # Plan 49 SR4. A relation decides which surfaces are cut as
+            # zones, baffles or left out; only when there are any.
+            relations = document.get('surfaceRelations')
+            if relations:
+                payloads[stage]['surfaceRelations'] = relations
         if stage in ('blockMesh', 'castellation', 'snappyHexMesh'):
             # Plan 37 UF14. The farfield's shape, dimensions, transform and
             # role, and the geometry extent an auto centre follows -- the
@@ -977,6 +1039,20 @@ class CaseBuilder:
         permitted only when the cardinalities match exactly; ambiguous or
         orphaned assignments fail before dictionary generation.
         """
+        return {name: geometry for name, (_key, geometry)
+                in self._group_geometry_binding_rows().items()}
+
+    def _group_geometry_binding_keys(self) -> dict[str, str]:
+        """Plan 49 SR4: the geometry row key each prepared group is bound to.
+
+        The same binding as :meth:`_group_geometry_bindings`; the role a
+        surface has is stored on its row, so the writer needs the row's key,
+        not only the element.
+        """
+        return {name: str(key) for name, (key, _geometry)
+                in self._group_geometry_binding_rows().items()}
+
+    def _group_geometry_binding_rows(self) -> dict[str, tuple]:
         groups = list(self._prepared_groups())
         geometries = [
             (key, value) for key, value in self._elements('geometry').items()
@@ -1013,7 +1089,7 @@ class CaseBuilder:
             unique = {str(pair[0]): pair for pair in candidates}
             if len(unique) == 1:
                 key, geometry = next(iter(unique.values()))
-                bindings[group['solver_name']] = geometry
+                bindings[group['solver_name']] = (key, geometry)
                 used.add(key)
             else:
                 unmatched.append(group)
@@ -1029,7 +1105,7 @@ class CaseBuilder:
             for group, (key, geometry) in zip(
                     sorted(unmatched, key=lambda item: item['solver_name']),
                     sorted(remaining, key=lambda item: str(item[0]))):
-                bindings[group['solver_name']] = geometry
+                bindings[group['solver_name']] = (key, geometry)
                 used.add(key)
             unmatched = []
         if unmatched and geometries:
@@ -2096,38 +2172,182 @@ class CaseBuilder:
         return written
 
     def interface_pairs(self) -> list[dict]:
-        """The enabled ``interfacePairs`` rows, in group-manifest shape.
+        """The project's surface relations, in group-manifest shape.
 
-        F-13. The Geometry page's interface-pair editor had no consumer: the
-        rows lived in project state, the non-conformal reader
-        (``_apply_non_conformal_pairs``) looked for ``interface_pairs`` in the
-        group manifest, and nothing ever put them there, so a pair the user
-        authored changed nothing about the mesh. The scope tokens are prepared
-        ``patch_uuid`` values -- the facade validates them against the prepared
-        group manifest when the row is created -- which is exactly the key the
-        reader joins on.
+        F-13 put the ``interfacePairs`` rows into the group manifest so the
+        coupling readers found them. Plan 49 SR4: the one store of a coupling
+        is the SR1 relation (``surfaceRelations``); the legacy rows are
+        converted into relations on open, so the manifest now lists the
+        relations -- conformal, non-conformal and periodic (``cyclic``) --
+        each with its regions, state and transform. The scope tokens are the
+        prepared ``patch_uuid`` values, which is what the readers join on.
+        Never raises: a relation the route cannot build is refused when the
+        dictionaries are written, after this manifest says what was asked.
         """
+        from foammesh.db import surface_intent as model
+        from .surface_roles import relation_label, relation_transform
+
+        try:
+            intent = self._surface_intent()
+        except Exception:  # noqa: BLE001 - a manifest is written regardless
+            return []
+        uuids = self._bound_patch_uuids()
+        coupling = {model.CONFORMAL: 'conformal',
+                    model.NON_CONFORMAL: 'non_conformal',
+                    model.PERIODIC: 'cyclic'}
         pairs = []
-        for key, item in sorted(self._elements('interfacePairs').items(),
-                                key=lambda entry: str(entry[0])):
-            if not bool(self._item_value(item, 'enabled', True)):
+        for key, relation in sorted(intent.relations.items(),
+                                    key=lambda item: str(item[0])):
+            if not isinstance(relation, dict):
                 continue
-            master = str(self._item_value(item, 'masterScopeToken', '') or '')
-            slave = str(self._item_value(item, 'slaveScopeToken', '') or '')
-            if not master.strip() or not slave.strip():
-                continue
-            name = str(self._item_value(item, 'name', '') or '').strip()
+            kind = model._text(relation.get('kind'))
+            sides = {}
+            for side in ('owner', 'neighbour'):
+                row_key = relation.get(f'{side}Surface')
+                sides[side] = (
+                    uuids.get(str(row_key)) if row_key is not None else None
+                ) or model._text(relation.get(f'{side}PatchUuid'))
+            transform = relation_transform(relation)
             pairs.append({
-                'pair_id': name or str(key),
-                'name': name,
-                'coupling': str(
-                    self._item_value(item, 'coupling', 'conformal')),
-                'transform': str(
-                    self._item_value(item, 'transform', 'coincident')),
-                'master_scope_id': master.strip(),
-                'slave_scope_id': slave.strip(),
+                'pair_id': relation_label(relation, str(key)),
+                'name': model._text(relation.get('name')),
+                'relation_id': model._text(relation.get('relationId')),
+                'coupling': coupling.get(kind, kind),
+                'transform': transform['transform'],
+                'master_scope_id': sides['owner'],
+                'slave_scope_id': sides['neighbour'],
+                'shared_surface': model._flag(relation.get('sharedSurface')),
+                'owner_region': model._text(relation.get('ownerRegion')),
+                'neighbour_region': model._text(
+                    relation.get('neighbourRegion')),
+                'state': model._text(relation.get('state')),
+                'state_reason': model._text(relation.get('stateReason')),
+                **{name: value for name, value in transform.items()
+                   if name != 'transform'},
             })
         return pairs
+
+    def _bound_patch_uuids(self) -> dict[str, str]:
+        """``{geometry row key: prepared patch uuid}`` of the bound groups."""
+        try:
+            keys = self._group_geometry_binding_keys()
+        except Exception:  # noqa: BLE001 - an unbindable project binds none
+            return {}
+        by_name = {group['solver_name']: group
+                   for group in self._prepared_groups()}
+        return {key: str(by_name[name].get('patch_uuid') or '')
+                for name, key in keys.items() if name in by_name}
+
+    def couplings(self) -> list[dict]:
+        """The couplings the mesh needs after it is split into its regions.
+
+        Plan 49 SR4 (DP-5761, DP-5762, DP-5791). OpenFOAM 13 couples two
+        regions non-conformally, and joins a periodic pair on a snapped mesh,
+        only with ``createNonConformalCouples`` -- and only *after*
+        ``splitMeshRegions``, which drops every coupling made before it (SR0
+        probe 2). The mesher cannot run it, so the case records here, with
+        the names the dictionaries gave the patches, what the export must
+        couple; the export reads it from the group manifest. Engine-agnostic:
+        a route that publishes the same patch names can record the same list.
+
+        Only valid relations are listed; an invalid one is refused when the
+        dictionaries are written.
+        """
+        from foammesh.db import surface_intent as model
+        from .surface_roles import relation_label
+
+        try:
+            intent = self._surface_intent()
+            keys = self._group_geometry_binding_keys()
+        except Exception:  # noqa: BLE001
+            return []
+        names = {key: name for name, key in keys.items()}
+        result = []
+        for key, relation in sorted(intent.relations.items(),
+                                    key=lambda item: str(item[0])):
+            if not isinstance(relation, dict):
+                continue
+            if model._text(relation.get('state')) != model.VALID:
+                continue
+            kind = model._text(relation.get('kind'))
+            if kind != model.NON_CONFORMAL:
+                continue
+            owner = names.get(str(relation.get('ownerSurface')))
+            neighbour = names.get(str(relation.get('neighbourSurface')))
+            if not owner or not neighbour:
+                continue
+            record = {
+                'kind': 'non_conformal',
+                'name': foam_word(relation_label(relation, str(key))),
+                'relation_id': model._text(relation.get('relationId')),
+                'owner_patch': owner,
+                'neighbour_patch': neighbour,
+            }
+            # The owner side is cut as a baffle; the side snappy names
+            # ``<owner>_slave`` is the neighbour side, renamed after the
+            # split. The zone each side's region takes, where the
+            # relation names a body, says which side is which.
+            record['baffle_patch'] = f'{owner}_slave'
+            for side in ('owner', 'neighbour'):
+                volume_key = model.region_key(
+                    model._text(relation.get(f'{side}Region')))
+                volume = (None if volume_key is None else
+                          self._collection_item('geometry', volume_key))
+                zone = None
+                if volume is not None:
+                    try:
+                        zone = self._zone_name(volume)
+                    except ValueError:
+                        zone = None
+                record[f'{side}_zone'] = zone
+            result.append(record)
+        result.extend(self._periodic_couplings(intent))
+        return result
+
+    def _periodic_couplings(self, intent) -> list[dict]:
+        """The valid periodic pairs, read through SR3's adapter.
+
+        ``surface_intent.periodic_pairs`` is the one reader of periodic
+        intent, whichever form it was edited through; its sides are prepared
+        patch uuids, published here under the names the dictionaries gave
+        them. A pair that is not valid is refused when the dictionaries are
+        written (:meth:`_refuse_unbuildable_relations`), so only valid ones
+        are listed.
+        """
+        from foammesh.db import surface_intent as model
+
+        names = {str(group.get('patch_uuid') or ''): group['solver_name']
+                 for group in self._prepared_groups()
+                 if group.get('patch_uuid')}
+        result = []
+        for pair in model.periodic_pairs(intent.document):
+            if pair['state'] != model.VALID or pair['verification'] == 'failed':
+                continue
+            owner = names.get(pair['masterScopeToken'])
+            neighbour = names.get(pair['slaveScopeToken'])
+            if not owner or not neighbour:
+                continue
+            record = {'kind': 'periodic',
+                      'name': foam_word(pair['name'] or pair['relationId']),
+                      'relation_id': pair['relationId'],
+                      'owner_patch': owner, 'neighbour_patch': neighbour}
+            transform = model._GMSH_TRANSFORM.get(pair['transform'],
+                                                  pair['transform'])
+            if transform == 'translational':
+                record.update(transform='translational', separation=[
+                    float(pair['translation'][axis]) for axis in 'xyz'])
+            elif transform == 'rotational':
+                record.update(
+                    transform='rotational',
+                    rotationAxis=[float(pair['rotationAxis'][axis])
+                                  for axis in 'xyz'],
+                    rotationCentre=[float(pair['rotationCentre'][axis])
+                                    for axis in 'xyz'],
+                    rotationAngle=float(pair['rotationAngleDegrees']))
+            else:
+                record['transform'] = transform
+            result.append(record)
+        return result
 
     def _exclude_points(self) -> tuple[tuple[str, tuple], ...]:
         """Plan 37 UF16: ``(name, point)`` of every exclude point, in metres."""
@@ -2386,56 +2606,6 @@ class CaseBuilder:
         kind = self._item_value(volume, 'gType')
         return volume if kind == 'volume' else None
 
-    def _effective_cfd_type(self, geometry) -> tuple:
-        """What this surface is for, and the zone it belongs to if it is one.
-
-        DP-387. The CellZone radio in the geometry editor lives on the
-        *volume* (``volume_dialog.py:54-57``), because "the cells inside this
-        shape" is a question about a volume. The surfaces that bound an
-        imported volume are written ``cfdType: boundary`` at import and there
-        is no control anywhere that changes that -- ``SurfaceDialog`` offers
-        none, boundary and interface and nothing else
-        (``surface_dialog.py:50-52``). So the cell-zone branch below, which
-        reads the *bound surface's* own ``cfdType``, could not be reached from
-        the GUI by any sequence of clicks: MEASURED by building the project
-        shape the importer produces -- a ``triSurfaceMesh`` volume typed
-        ``cellZone`` with one boundary surface under it -- and generating the
-        dictionary, which came out byte-identical to the same project with the
-        volume typed ``none``. The radio wrote a value no writer read, and the
-        user's request for a cell zone became a plain patch with nothing said.
-
-        A surface that carries its own non-boundary type keeps it; that is the
-        interface and internal-face case and it is decided on the surface. A
-        plain boundary surface asks the volume it bounds, which is where the
-        only control that can answer sits. The returned second value is the
-        name the zone takes -- the volume's, because a volume with several
-        bounding surfaces is one zone and not one per surface.
-        """
-        cfd_type = str(self._item_value(geometry, 'cfdType', 'boundary'))
-        volume = self._owning_volume(geometry)
-        zoned = volume is not None and str(
-            self._item_value(volume, 'cfdType', 'none')) == 'cellZone'
-        if cfd_type == 'interface':
-            # DP-421/DP-422. An interface that bounds a zoned volume is the
-            # surface that *carves* that zone -- heatedDuct's
-            # ``fluidToMetal.stl`` -- so it needs the zone name here. An
-            # interface bounding nothing zoned is the ordinary baffle, and is
-            # unchanged.
-            return 'interface', (self._zone_name(volume) if zoned else None)
-        if cfd_type != 'boundary':
-            return cfd_type, None
-        if not zoned:
-            return cfd_type, None
-        if self._carved_by_an_interface(self._item_value(geometry, 'volume')):
-            # DP-421. The zone is already carved by the interface surface
-            # beside this one, so this surface is the body own outer wall and
-            # nothing else. Promoting it too would write that wall into an
-            # internal faceZone -- which is what every multiregion snappy mesh
-            # on disk did, publishing the six background faces and nothing a
-            # solver could put a condition on.
-            return 'boundary', None
-        return 'cellZone', self._zone_name(volume)
-
     def _zone_name(self, volume) -> str:
         """The cell zone a volume row stands for, checked as a word."""
         name = str(self._item_value(volume, 'name', '') or '')
@@ -2446,177 +2616,20 @@ class CaseBuilder:
                 f'punctuation other than _ and .')
         return cell_zone_word(name)     # CHT1: a digit-led name, made a word
 
-    def _carved_by_an_interface(self, volume_id) -> bool:
-        """Does a surface typed ``interface`` hang off this volume?
-
-        DP-421. That is the shape the geometry split produces and the one v13
-        writes in ``multiRegion/CHT/heatedDuct``: the interface carries the
-        zone keys, and the faces the body shares with nobody carry a patch.
-        Without an interface among its children a zoned volume is the ordinary
-        single-body case -- a porous or MRF region inside a larger domain --
-        where the whole closed surface is the zone boundary, and that reading
-        is left exactly as it was.
-
-        Asked by the volume's *key*, not by the element object: ``_elements``
-        rebuilds its dictionary on every call, so two lookups of the same row
-        are equal rows and not the same object, and an identity test here
-        silently answered "no" for every project.
-        """
-        if volume_id is None or str(volume_id) == '':
-            return False
-        wanted = str(volume_id)
-        for item in self._elements('geometry').values():
-            if str(self._item_value(item, 'gType', '')) != 'surface':
-                continue
-            owner = self._item_value(item, 'volume')
-            if owner is None or str(owner) != wanted:
-                continue
-            if str(self._item_value(item, 'cfdType', 'boundary')) == 'interface':
-                return True
-        return False
-
     def _refinement_surfaces(self) -> dict:
-        from foammesh.core.export.poly_mesh_writer import _foam_patch_type
-
         result: dict[str, dict] = {}
         bindings = self._group_geometry_bindings()
+        binding_keys = self._group_geometry_binding_keys()
+        intent = self._surface_intent()
+        self._refuse_unbuildable_relations(intent)
+        omitted = self._omitted_interface_sides(intent)
         for surface in self.surfaces:
-            groups = self._surface_groups(surface)
-            group_entries = {}
-            for group in groups:
-                geometry, refinement = self._surface_refinement(group, bindings)
-                minimum = maximum = 0
-                if refinement is not None:
-                    levels = self._item_element(refinement, 'surfaceRefinement')
-                    minimum = int(self._item_value(
-                        levels, 'minimumLevel', 0))
-                    maximum = int(self._item_value(
-                        levels, 'maximumLevel', minimum))
-                if minimum > maximum:
-                    # DP-575: OF13 refinementSurfaces.C refuses this at launch
-                    # ("Illegal level specification"); say it here, by name.
-                    name = self._item_value(refinement, 'groupName') or 'a surface group'
-                    raise ValueError(
-                        f'surface refinement group {name}: minimum level '
-                        f'{minimum} is above maximum level {maximum}')
-                entry: dict[str, object] = {'level': [minimum, maximum]}
-                # C31-08. Gap refinement, in Foundation 13's own terms. The
-                # case-wide `castellation/gapLevelIncrement` was already
-                # written into castellatedMeshControls, but v13 reads the same
-                # key again on each surface -- and again inside each `regions`
-                # entry -- and that per-surface value is the one a user needs:
-                # a narrow seal between two walls wants more levels than the
-                # farfield does. `refinementSurfaces.C:100-110, 160-168` reads
-                # it with `lookupOrDefault(..., gapLevelIncrement)`, so leaving
-                # it unset here is exactly "inherit the case value".
-                increment = self._item_value(refinement, 'gapLevelIncrement')
-                if increment is not None and str(increment).strip() != '':
-                    increment = int(increment)
-                    if increment < 0:
-                        raise ValueError(
-                            f'gap level increment for {group["solver_name"]} '
-                            f'must not be negative; Foundation 13 rejects a '
-                            f'negative levelincrement outright')
-                    entry['gapLevelIncrement'] = increment
-                # C31-11. Extra refinement where the surface meets the base
-                # grid at a shallow angle. ``refinementSurfaces.C:141`` reads
-                # it per surface with ``readIfPresent``, and
-                # ``snappyRefineDriver.C:1005`` hands it to the baffle removal
-                # pass. Unset leaves the key out, so v13 keeps its own
-                # ``-great`` sentinel and the pass does nothing.
-                self._add_perpendicular_angle(entry, refinement, group)
-                cfd_type, zone_name = self._effective_cfd_type(geometry)
-                if cfd_type == 'none':
-                    entry.update({
-                        'faceZone': group['solver_name'],
-                        'faceType': 'internal',
-                    })
-                elif cfd_type == 'interface':
-                    non_conformal = bool(
-                        self._item_value(geometry, 'nonConformal', False))
-                    inter_region = bool(
-                        self._item_value(geometry, 'interRegion', False))
-                    seed = (None if non_conformal or inter_region
-                            else self._interface_seed(geometry, refinement))
-                    if zone_name and seed is not None:
-                        # DP-421/DP-422, and the shape v13 writes for a
-                        # conjugate assembly. The interface is its own surface,
-                        # carrying the face zone under its *own* name -- not
-                        # once under each region name, which is DP-422 -- and
-                        # the cell zone it carves, seeded by a point inside
-                        # that region. No ``patchInfo``, and ``faceType`` left
-                        # at its default ``internal``: these faces are
-                        # internal, which is what makes the mesh conformal
-                        # across them.
-                        entry.update({
-                            'faceZone': group['solver_name'],
-                            'cellZone': zone_name,
-                        })
-                        entry.update(seed)
-                    else:
-                        entry.update({
-                            'faceZone': group['solver_name'],
-                            'faceType': (
-                                'boundary' if non_conformal or inter_region
-                                else 'baffle'),
-                            'patchInfo': {'type': 'patch'},
-                        })
-                elif cfd_type == 'cellZone':
-                    # A closed surface asked to become a cell zone. v13 needs
-                    # the zone name, the faces that bound it, and which side of
-                    # the surface the zone is on -- ``mode``, not the ESI
-                    # ``cellZoneInside``. Without this branch the surface fell
-                    # through to a plain patch and no zone was created at all,
-                    # so a porous or MRF region silently did not exist.
-                    entry.update({
-                        'cellZone': zone_name or group['solver_name'],
-                        'faceZone': group['solver_name'],
-                        'faceType': 'internal',
-                    })
-                    # C31-11. ``mode`` was hard-coded to ``inside``, so the
-                    # cell zone could only ever be the volume the surface
-                    # encloses. ``surfaceZonesInfo.C:34-40`` names four
-                    # algorithms and reads the choice at ``:70-82``; a jacket,
-                    # an annulus, or a zone seeded by a point inside an open
-                    # surface needs one of the other three.
-                    entry.update(self._zone_selection(refinement, group))
-                else:
-                    # R98. The prepared group already carries the boundary
-                    # category the user's naming produced -- wall, inlet,
-                    # outlet -- and this line threw it away, so every snappy
-                    # patch reached the solver as a plain `patch`. MEASURED
-                    # on venturi.stl: `wall_converging` and `wall_diverging`
-                    # were both written `type patch` into the exported
-                    # constant/polyMesh/boundary, while the app's own
-                    # quality/geometry/patch-identity.json recorded
-                    # `"category": "wall"` for each of them. In OpenFOAM a
-                    # wall and a patch are not interchangeable -- wall
-                    # functions, nut conditions and wall distance all key off
-                    # the type -- so a viscous run on that mesh is wrong and
-                    # nothing about the mesh looks wrong. The MED/Gmsh export
-                    # path has mapped categories to OpenFOAM types all along;
-                    # this is the same mapping, not a second one.
-                    entry['patchInfo'] = {
-                        'type': self._snappy_patch_type(group)}
-                # C31-11. ``patchInfo`` is handed straight to
-                # ``polyPatch::New`` (``meshRefinement.C:1947``), so this is
-                # the patch group the meshed patch joins.
-                self._add_patch_groups(entry, refinement, group)
-                # R141. One entry per solid the group covers, not one per
-                # group: a merged wall's second solid was reaching snappy with
-                # no refinement entry of its own, so `wall_bore` came out at
-                # base level (1,080 faces) against 9,708 for the refined
-                # `wall_shell` beside it.
-                for region in (group.get('source_regions') or
-                               (group['source_region'],)):
-                    group_entries[foam_word(region)] = dict(entry)
-            if len(group_entries) == 1:
-                result[surface['name']] = next(iter(group_entries.values()))
-            else:
-                result[surface['name']] = {
-                    'level': [0, 0],
-                    'regions': group_entries,
-                }
+            # Called on the class so ``self`` stays whatever was handed in:
+            # the same body serves the dry run (``surface_role_refusals``).
+            entry = CaseBuilder._surface_refinement_entry(
+                self, surface, bindings, binding_keys, intent, omitted)
+            if entry is not None:
+                result[surface['name']] = entry
         # Plan 31. The open primitives refine as surfaces, not as regions.
         result.update(self._open_primitive_refinement_surfaces())
         result.update(self._closed_primitive_refinement_surfaces())
@@ -2629,6 +2642,518 @@ class CaseBuilder:
             result[snappy_farfield.GEOMETRY_KEY] = (
                 snappy_farfield.refinement_entry())
         return result
+
+    def surface_role_refusals(self, prepared_geometry=None) -> list:
+        """Every :class:`SurfaceRoleRefusal` the dictionaries would meet.
+
+        DP-6071. The surface roles are lowered here exactly as
+        :meth:`_refinement_surfaces` lowers them for ``snappyHexMesh``, but
+        nothing is written: each refusal is collected instead of raised, so
+        the pre-flight (``surface_capabilities.gate``) and the stage report
+        name what the run would refuse, with the run's own reason and remedy.
+        *prepared_geometry* (the prepared revision, as an object or as its
+        mapping) gives the surface files the dictionaries would stage; without
+        it only the relations, which need no file, are judged. Anything other
+        than a surface-role refusal is left to the run that meets it.
+        """
+        if prepared_geometry is not None:
+            self.prepared_geometry = prepared_geometry
+            self.surfaces = staged_surface_plan(prepared_geometry)
+        refusals: list = []
+        try:
+            intent = self._surface_intent()
+        except SurfaceRoleRefusal as refusal:
+            return [refusal]
+        except Exception:  # noqa: BLE001 - not a surface-role answer
+            return []
+        try:
+            refusals.extend(self._unbuildable_relations(intent, warn=False))
+        except Exception:  # noqa: BLE001
+            pass
+        if prepared_geometry is None:
+            return refusals
+        try:
+            bindings = self._group_geometry_bindings()
+            binding_keys = self._group_geometry_binding_keys()
+            omitted = self._omitted_interface_sides(intent)
+        except Exception:  # noqa: BLE001 - the run says why, by itself
+            return refusals
+        for surface in self.surfaces:
+            try:
+                self._surface_refinement_entry(
+                    surface, bindings, binding_keys, intent, omitted)
+            except SurfaceRoleRefusal as refusal:
+                refusals.append(refusal)
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            self._closed_primitive_refinement_surfaces()
+        except SurfaceRoleRefusal as refusal:
+            refusals.append(refusal)
+        except Exception:  # noqa: BLE001
+            pass
+        return refusals
+
+    def _surface_refinement_entry(self, surface, bindings, binding_keys,
+                                  intent, omitted):
+        """The ``refinementSurfaces`` entry of one staged surface file, or
+        ``None`` when nothing of it is snapped (DP-6071: split out of
+        :meth:`_refinement_surfaces` so a dry pass can judge each file)."""
+        groups = self._surface_groups(surface)
+        group_entries = {}
+        for group in groups:
+            if binding_keys.get(group['solver_name']) in omitted:
+                # The neighbour side of a non-conformal interface: on
+                # snappy the owner side's baffle makes both patches, and
+                # a second surface on the same faces would compete for
+                # them. Only a surface of its own can be left out.
+                if len(groups) > 1:
+                    raise SurfaceRoleRefusal(
+                        group['solver_name'],
+                        'it is the neighbour side of a non-conformal '
+                        'interface and shares its surface file with '
+                        'other surfaces, so it cannot be left out of the '
+                        'snappyHexMesh surfaces on its own',
+                        'Import or split it as a surface of its own, or '
+                        'make the interface conformal.')
+                continue
+            geometry, refinement = self._surface_refinement(group, bindings)
+            minimum = maximum = 0
+            if refinement is not None:
+                levels = self._item_element(refinement, 'surfaceRefinement')
+                minimum = int(self._item_value(
+                    levels, 'minimumLevel', 0))
+                maximum = int(self._item_value(
+                    levels, 'maximumLevel', minimum))
+            if minimum > maximum:
+                # DP-575: OF13 refinementSurfaces.C refuses this at launch
+                # ("Illegal level specification"); say it here, by name.
+                name = self._item_value(refinement, 'groupName') or 'a surface group'
+                raise ValueError(
+                    f'surface refinement group {name}: minimum level '
+                    f'{minimum} is above maximum level {maximum}')
+            entry: dict[str, object] = {'level': [minimum, maximum]}
+            # C31-08. Gap refinement, in Foundation 13's own terms. The
+            # case-wide `castellation/gapLevelIncrement` was already
+            # written into castellatedMeshControls, but v13 reads the same
+            # key again on each surface -- and again inside each `regions`
+            # entry -- and that per-surface value is the one a user needs:
+            # a narrow seal between two walls wants more levels than the
+            # farfield does. `refinementSurfaces.C:100-110, 160-168` reads
+            # it with `lookupOrDefault(..., gapLevelIncrement)`, so leaving
+            # it unset here is exactly "inherit the case value".
+            increment = self._item_value(refinement, 'gapLevelIncrement')
+            if increment is not None and str(increment).strip() != '':
+                increment = int(increment)
+                if increment < 0:
+                    raise ValueError(
+                        f'gap level increment for {group["solver_name"]} '
+                        f'must not be negative; Foundation 13 rejects a '
+                        f'negative levelincrement outright')
+                entry['gapLevelIncrement'] = increment
+            # C31-11. Extra refinement where the surface meets the base
+            # grid at a shallow angle. ``refinementSurfaces.C:141`` reads
+            # it per surface with ``readIfPresent``, and
+            # ``snappyRefineDriver.C:1005`` hands it to the baffle removal
+            # pass. Unset leaves the key out, so v13 keeps its own
+            # ``-great`` sentinel and the pass does nothing.
+            self._add_perpendicular_angle(entry, refinement, group)
+            # Plan 49 SR4. What the faces become is the surface's role in
+            # the SR1 store, not its legacy ``cfdType`` or the two
+            # interface switches (DP-5760..5764, DP-5780..5791).
+            entry.update(self._lower_role(
+                group, geometry, refinement,
+                binding_keys.get(group['solver_name']), intent))
+            # C31-11. ``patchInfo`` is handed straight to
+            # ``polyPatch::New`` (``meshRefinement.C:1947``), so this is
+            # the patch group the meshed patch joins.
+            self._add_patch_groups(entry, refinement, group)
+            # R141. One entry per solid the group covers, not one per
+            # group: a merged wall's second solid was reaching snappy with
+            # no refinement entry of its own, so `wall_bore` came out at
+            # base level (1,080 faces) against 9,708 for the refined
+            # `wall_shell` beside it.
+            for region in (group.get('source_regions') or
+                           (group['source_region'],)):
+                group_entries[foam_word(region)] = dict(entry)
+        if not group_entries:
+            return None
+        if len(group_entries) == 1:
+            return next(iter(group_entries.values()))
+        return self._regions_entry(surface, group_entries)
+
+    # -- Plan 49 SR4: the surface roles, lowered to snappyHexMesh ---------- #
+
+    #: The ``refinementSurfaces`` keys OpenFOAM 13 reads per *surface* only
+    #: (``surfaceZonesInfo(surface, dict)``, ``refinementSurfaces.C:130``).
+    #: Inside a ``regions`` entry they are read by nothing (DP-5850).
+    _SURFACE_ONLY_KEYS = ('faceZone', 'cellZone', 'faceType', 'mode',
+                          'insidePoint', 'cellZoneInside')
+
+    def _surface_intent(self):
+        """The SR1 model of this project, with its periodic pairs measured.
+
+        Plan 49 SR3. A pair whose verdict is stale (the transform, a side or
+        the prepared geometry changed since it was measured) is measured
+        again on the prepared geometry before it is written, on the copy the
+        writer reads; the verdicts are remembered for this builder, so the
+        several readers of one generation measure each pair once.
+        """
+        from foammesh.core.geometry.periodic_relations import (
+            verify_periodic_relations)
+        from .surface_roles import effective_intent
+
+        intent = effective_intent(self.db)
+        relations = intent.relations
+        cache = self.__dict__.setdefault('_periodic_verdicts', {})
+        for relation in relations.values():
+            if isinstance(relation, dict) and                     str(relation.get('relationId') or '') in cache:
+                relation.update(cache[str(relation['relationId'])])
+        prepared = self.prepared_geometry
+        if prepared is not None and not isinstance(prepared, dict):
+            to_dict = getattr(prepared, 'to_dict', None)
+            prepared = to_dict() if callable(to_dict) else None
+        verify_periodic_relations(intent.document, prepared)
+        for relation in relations.values():
+            if isinstance(relation, dict) and relation.get('verificationKey'):
+                cache[str(relation.get('relationId') or '')] = {
+                    field: relation.get(field) for field in (
+                        'verification', 'verificationReason',
+                        'verificationKey')}
+        return intent
+
+    @staticmethod
+    def _surface_label(row, group) -> str:
+        name = ''
+        if isinstance(row, dict):
+            name = str(row.get('name') or '').strip()
+        return name or str(group.get('solver_name') or '?')
+
+    def _refuse_unbuildable_relations(self, intent) -> None:
+        """Refuse a relation the snappy route cannot build, before writing.
+
+        Plan 49 D7. An unresolved relation (a side deleted or replaced, the
+        regions not recorded, a periodic pair with no transform, a legacy
+        pair whose sides name no surface) blocks the run with the reason the
+        model recorded. A conformal relation between two *separate* surfaces
+        has no snappy construction: one mesh is cut by one surface, so the
+        contact is one shared surface (the Split interfaces shape) or a
+        non-conformal interface coupled after the region split.
+        """
+        for refusal in self._unbuildable_relations(intent):
+            raise refusal
+
+    def _unbuildable_relations(self, intent, *, warn: bool = True):
+        """Each relation refusal of :meth:`_refuse_unbuildable_relations`,
+        in its order (DP-6071: the dry pass collects them all)."""
+        from foammesh.db import surface_intent as model
+        from .surface_roles import relation_label
+
+        for key, relation in sorted(intent.relations.items(),
+                                    key=lambda item: str(item[0])):
+            if not isinstance(relation, dict):
+                continue
+            label = relation_label(relation, f'relation {key}')
+            kind = model._text(relation.get('kind'))
+            if model._text(relation.get('state')) == model.UNRESOLVED:
+                yield SurfaceRoleRefusal(
+                    label, model._text(relation.get('stateReason'))
+                    or 'the relation is unresolved',
+                    'Repair the relation: its two surfaces, its regions and '
+                    'its transform.', subject='Relation')
+                continue
+            if kind == model.CONFORMAL and not model._flag(
+                    relation.get('sharedSurface')):
+                yield SurfaceRoleRefusal(
+                    label, 'a conformal interface between two separate '
+                    'surfaces cannot be built: snappyHexMesh cuts one mesh, '
+                    'so a conformal contact is one surface shared by both '
+                    'regions',
+                    'Use one shared surface for the contact (Split '
+                    'interfaces makes it), or make the interface '
+                    'non-conformal.', subject='Relation')
+        # Plan 49 SR3/SR4 (DP-5791). The periodic pairs, read through their
+        # one adapter: a pair measured not to match under its transform is
+        # refused with the measurement; one that could not be measured is
+        # said, and coupled, since createNonConformalCouples checks it again.
+        for pair in model.periodic_pairs(intent.document):
+            label = pair['name'] or pair['relationId'] or 'periodic pair'
+            if pair['state'] != model.VALID:
+                yield SurfaceRoleRefusal(
+                    label, pair['stateReason'] or 'the pair is unresolved',
+                    'Repair the pair: its two sides and its transform.',
+                    subject='Periodic pair')
+                continue
+            if pair['verification'] == 'failed':
+                yield SurfaceRoleRefusal(
+                    label, 'its two sides do not match under its transform: '
+                    + (pair['verificationReason'] or 'measured on the '
+                       'prepared geometry'),
+                    'Correct the transform or the sides of the pair.',
+                    subject='Periodic pair')
+                continue
+            if warn and pair['verification'] == 'unverified':
+                self.warn(
+                    'periodic_pair_unverified',
+                    f'Periodic pair {label} was not measured '
+                    f'({pair["verificationReason"] or "no verdict"}); '
+                    'createNonConformalCouples checks the match when the '
+                    'export couples it.', field_id=pair['relationId'])
+
+    def _omitted_interface_sides(self, intent) -> set:
+        """Row keys of the non-conformal neighbour sides snappy leaves out."""
+        from foammesh.db import surface_intent as model
+
+        omitted = set()
+        for relation in intent.relations.values():
+            if not isinstance(relation, dict):
+                continue
+            if model._text(relation.get('kind')) != model.NON_CONFORMAL:
+                continue
+            if model._text(relation.get('state')) != model.VALID:
+                continue
+            neighbour = relation.get('neighbourSurface')
+            if neighbour is not None:
+                omitted.add(str(neighbour))
+        return omitted
+
+    @staticmethod
+    def _valid_relation(intent, key, kind):
+        from foammesh.db import surface_intent as model
+
+        for relation in intent.relations_of(key):
+            if (model._text(relation.get('kind')) == kind
+                    and model._text(relation.get('state')) == model.VALID):
+                return relation
+        return None
+
+    def _lower_role(self, group, geometry, refinement, key, intent) -> dict:
+        """The ``refinementSurfaces`` keys one group's role is written as.
+
+        ======================  ==========================================
+        role                    snappyHexMesh
+        ======================  ==========================================
+        external boundary       ``patchInfo { type <mesh patch type>; }``
+        internal face           ``faceZone``, ``faceType internal``
+        blocking baffle         ``faceZone``, ``faceType baffle``,
+                                ``patchInfo { type wall; }`` -- a wall pair
+        conformal interface     one shared surface carving the cell zone of
+                                one region: ``faceZone`` + ``cellZone``;
+                                the region split makes the mappedWall pair
+        non-conformal           owner side: ``faceZone``, ``faceType
+        interface               baffle``, ``patchInfo { type patch; }``;
+                                coupled after the region split by
+                                ``createNonConformalCouples`` (export)
+        ======================  ==========================================
+
+        Anything else is refused with the surface, the reason and the remedy.
+        """
+        from foammesh.db import surface_intent as model
+
+        row = intent.row(key)
+        label = self._surface_label(row, group)
+        if row is None:
+            # A prepared group with no configuration row: an external
+            # boundary of the purpose the preparation gave it.
+            return {'patchInfo': {'type': self._external_patch_type(
+                label, category=group.get('category'), patch_type=None,
+                inferred=True)}}
+        role = intent.role(key)
+        if role is None or intent.state(key) == model.UNRESOLVED:
+            raise SurfaceRoleRefusal(
+                label, intent.issue(key) or 'it has no role',
+                'Set it in the surface settings, then mesh again.')
+        name = group['solver_name']
+        if role == model.EXTERNAL:
+            # A purpose read from the name (at migration, or here for a row
+            # never assessed) is the one the preparation recorded on the
+            # group; an authored one is the row's own.
+            inferred = (intent.origin(key) != model.AUTHORED
+                        or str(key) in intent.assessed_here)
+            category = (group.get('category') if inferred else
+                        model._text(row.get('boundaryCategory'))
+                        or group.get('category'))
+            patch_type = None if inferred else model._text(
+                row.get('meshPatchType'))
+            return {'patchInfo': {'type': self._external_patch_type(
+                label, category=category, patch_type=patch_type,
+                inferred=inferred)}}
+        if role == model.INTERNAL:
+            return {'faceZone': name, 'faceType': 'internal'}
+        if role == model.BAFFLE:
+            # DP-5760/DP-5784. An impermeable sheet: both sides walls, no
+            # coupling of any kind (SR0 probe 3: zero flux through it).
+            return {'faceZone': name, 'faceType': 'baffle',
+                    'patchInfo': {'type': 'wall'}}
+        if role == model.CONFORMAL:
+            relation = self._valid_relation(intent, key, model.CONFORMAL)
+            if relation is None:
+                raise SurfaceRoleRefusal(
+                    label, 'a conformal region interface needs its relation',
+                    'Give the interface its two regions.')
+            return self._lower_conformal(
+                group, geometry, refinement, label, row, relation)
+        if role == model.NON_CONFORMAL:
+            relation = self._valid_relation(intent, key, model.NON_CONFORMAL)
+            if relation is None:
+                raise SurfaceRoleRefusal(
+                    label, 'a non-conformal region interface needs its '
+                    'relation', 'Give the interface its two sides and '
+                    'regions.')
+            # DP-5761/DP-5762. The owner side is cut as a baffle, so after
+            # the region split each region holds one side as a boundary
+            # patch; the export couples the two with
+            # createNonConformalCouples, owner and neighbour each named with
+            # their region.
+            return {'faceZone': name, 'faceType': 'baffle',
+                    'patchInfo': {'type': 'patch'}}
+        raise SurfaceRoleRefusal(
+            label, f'its role "{role}" is not one snappyHexMesh can build',
+            'Choose another role.')
+
+    def _lower_conformal(self, group, geometry, refinement, label, row,
+                         relation) -> dict:
+        """One shared surface carving the cell zone of the region it bounds.
+
+        DP-387 (a closed surface around a zone: ``mode inside``) and DP-421
+        (the open interface Split interfaces writes: ``mode insidePoint``
+        with the body's seed, ``faceType`` left internal and no
+        ``patchInfo``) are the two shapes; both are internal faces, which is
+        what makes the mesh conformal across them, and ``splitMeshRegions``
+        turns them into the coupled mappedWall pair.
+        """
+        from foammesh.db import surface_intent as model
+
+        name = group['solver_name']
+        volume_key = None
+        for side in ('ownerRegion', 'neighbourRegion'):
+            volume_key = model.region_key(model._text(relation.get(side)))
+            if volume_key is not None:
+                break
+        if volume_key is None and model.region_name(
+                relation.get('ownerRegion')) is not None:
+            # DP-6062. Sides named by the mesh's own regions (seeded on
+            # snappy) name no body; the zone carved is the body the
+            # interface row hangs off, which Split interfaces records as
+            # the one it encloses.
+            volume_key = model._text(row.get('volume')) or None
+        volume = (None if volume_key is None
+                  else self._collection_item('geometry', volume_key))
+        kind = None if volume is None else self._item_value(volume, 'gType')
+        if kind == 'surface' and str(self._enum_value(self._item_value(
+                volume, 'cfdType')) or '') == 'cellZone':
+            # A closed surface typed cell zone itself: the zone it encloses
+            # takes the surface's name, as it always did.
+            zone = name
+        elif kind == 'volume':
+            zone = self._zone_name(volume)
+        else:
+            raise SurfaceRoleRefusal(
+                label, 'neither region of its conformal relation is a body '
+                'whose cells the surface can zone',
+                'Record the body on one side of the interface as its region.')
+        mode = str(self._enum_value(self._item_value(
+            refinement, 'zoneMode', 'inside')) or 'inside')
+        # Which of the two shapes the surface is: an open interface (the
+        # Split interfaces row, or one authored as an interface) is seeded
+        # by a point inside the body; a closed zone boundary encloses it.
+        legacy = model._text(row.get('cfdType'))
+        carving = (legacy == 'interface'
+                   or model._text(row.get('intentOrigin')) == model.AUTHORED)
+        seed = None
+        if mode == 'inside' and carving:
+            seed = self._interface_seed(geometry, refinement, volume=volume)
+        if seed is not None:
+            return {'faceZone': name, 'cellZone': zone, **seed}
+        if legacy == 'interface' and mode == 'inside':
+            raise SurfaceRoleRefusal(
+                label, 'it is an open interface carving the cell zone of '
+                f'{zone}, and no point inside that body is recorded',
+                f'Give {zone} its inside point, then mesh again.')
+        entry = {'cellZone': zone, 'faceZone': name, 'faceType': 'internal'}
+        entry.update(self._zone_selection(refinement, group))
+        return entry
+
+    def _external_patch_type(self, label, *, category, patch_type,
+                             inferred) -> str:
+        """The mesh type of an external boundary, or a refusal.
+
+        DP-5764: the symmetry purpose is OpenFOAM ``symmetry``; a snapped
+        surface is never exactly planar and ``symmetryPlane`` refuses it (SR0
+        probe 5). DP-5786: ``empty`` and ``wedge`` describe a one-cell-thick
+        mesh snappyHexMesh never builds; they were replaced by ``wall`` with a
+        warning, which solved a different problem quietly. They are refused.
+        """
+        from .surface_roles import type_for_category
+
+        if inferred or not patch_type:
+            patch_type = type_for_category(category)
+        if patch_type in self._MESH_CONSTRAINED_PATCH_TYPES:
+            how = 'its purpose was read from its name, and ' if inferred else ''
+            article = 'an' if patch_type[0] in 'aeiou' else 'a'
+            raise SurfaceRoleRefusal(
+                label, f'{how}{article} {patch_type} patch needs a mesh one cell '
+                'thick (a 2-D slab or an axisymmetric wedge), and '
+                'snappyHexMesh builds a three-dimensional mesh',
+                'Mesh a 2-D or axisymmetric case on the Gmsh route, or give '
+                'the surface another purpose' + (
+                    ' (or rename it so its name does not start with '
+                    f'"{patch_type}")' if inferred else '') + '.')
+        if patch_type == 'symmetryPlane':
+            raise SurfaceRoleRefusal(
+                label, 'snappyHexMesh snaps the surface, so its faces are '
+                'never exactly planar and OpenFOAM refuses them as a '
+                'symmetryPlane',
+                'Use the symmetry type.')
+        if patch_type not in ('patch', 'wall', 'symmetry'):
+            raise SurfaceRoleRefusal(
+                label, f'"{patch_type}" is not a type an external boundary '
+                'can be given on snappyHexMesh',
+                'Use patch, wall or symmetry; a coupled type comes from a '
+                'periodic relation.')
+        return patch_type
+
+    def _regions_entry(self, surface, group_entries) -> dict:
+        """One staged surface holding several regions.
+
+        DP-5850. Zone keys are read per surface only, so a ``faceZone`` (or a
+        ``cellZone``, a ``faceType``, a ``mode``) written inside a ``regions``
+        entry was dropped by OpenFOAM without a word -- an internal face, a
+        baffle or a zone boundary that shares its file with other surfaces
+        became a plain patch. When every region of the surface carries the
+        same zone keys they are lifted to the surface, where they are read;
+        a surface whose regions want different ones is refused.
+        """
+        zoned = {region: {key: entry[key] for key in self._SURFACE_ONLY_KEYS
+                          if key in entry}
+                 for region, entry in group_entries.items()}
+        if not any(zoned.values()):
+            return {'level': [0, 0], 'regions': group_entries}
+        shapes = {json.dumps({key: value for key, value in keys.items()
+                              if key != 'faceZone'}, sort_keys=True)
+                  for keys in zoned.values()}
+        faces = {str(keys.get('faceZone')) for keys in zoned.values()}
+        lifted = dict(next(iter(zoned.values())))
+        if (all(zoned.values()) and len(shapes) == 1
+                and (len(faces) == 1 or 'cellZone' in lifted)):
+            if len(faces) > 1:
+                # One conformal zone boundary in several pieces: one face
+                # zone, named after the surface.
+                lifted['faceZone'] = foam_word(surface['name'])
+            regions = {region: {key: value for key, value in entry.items()
+                                if key not in self._SURFACE_ONLY_KEYS}
+                       for region, entry in group_entries.items()}
+            return {'level': [0, 0], **lifted, 'regions': regions}
+        named = sorted(region for region, keys in zoned.items() if keys)
+        raise SurfaceRoleRefusal(
+            ', '.join(named), f'it shares the surface file {surface["name"]} '
+            'with surfaces of another role, and snappyHexMesh reads face '
+            'zones, cell zones and baffles per surface file only, so its '
+            'role would be dropped',
+            'Split it into a surface of its own (import it as its own file; '
+            'Split interfaces only moves faces two bodies share, so it does '
+            'not separate a non-conformal side), or give every surface in '
+            'the file the same role.')
 
     #: DP-668. The modelled shapes whose ``<name>_surface`` row a surface
     #: refinement group can refine: each is registered in ``geometry{}`` as a
@@ -2688,7 +3213,9 @@ class CaseBuilder:
         user typed ``interface`` becomes a baffle, as an imported one does.
         """
         result: dict[str, dict] = {}
-        for _key, volume, surface, group in self._bound_closed_primitive_surfaces():
+        bound = list(self._bound_closed_primitive_surfaces())
+        intent = self._surface_intent() if bound else None
+        for _key, volume, surface, group in bound:
             volume_name = str(self._item_value(volume, 'name', f'volume_{_key}'))
             surface_name = str(self._item_value(surface, 'name', f'{volume_name}_surface'))
             group_name = self._item_value(group, 'groupName') or 'a surface group'
@@ -2708,13 +3235,16 @@ class CaseBuilder:
                         f'negative; Foundation 13 rejects a negative '
                         f'levelincrement outright')
                 entry['gapLevelIncrement'] = int(increment)
-            cfd_type = str(self._item_value(surface, 'cfdType', 'boundary'))
-            if cfd_type == 'interface':
+            # Plan 49 SR4. The shape surface's role, not its cfdType: a
+            # blocking baffle is a wall pair; an unassessed hand-ticked
+            # interface is refused like any other (DP-5760/DP-5784).
+            role = self._primitive_surface_role(intent, surface, surface_name)
+            if role == 'blockingBaffle':
                 entry.update({'faceZone': surface_name, 'faceType': 'baffle',
-                              'patchInfo': {'type': 'patch'}})
+                              'patchInfo': {'type': 'wall'}})
             else:
                 entry.update({'faceZone': surface_name, 'faceType': 'internal'})
-                if cfd_type == 'boundary':
+                if role == 'externalBoundary':
                     self.warn(
                         'refinement.primitive_surface.kept_internal',
                         f'Surface {surface_name} of the modelled '
@@ -2728,6 +3258,32 @@ class CaseBuilder:
                         severity='info')
             result[volume_name] = entry
         return result
+
+    def _primitive_surface_role(self, intent, surface, label) -> str:
+        """The SR1 role of a modelled shape's surface row, or a refusal."""
+        from foammesh.db import surface_intent as model
+
+        key = None
+        for candidate, row in intent.geometry.items():
+            if (model._is_surface(row) and str(row.get('name')) ==
+                    str(self._item_value(surface, 'name'))
+                    and model._text(row.get('shape')) ==
+                    str(self._item_value(surface, 'shape'))):
+                key = candidate
+                break
+        if key is None:
+            return model.EXTERNAL
+        role = intent.role(key)
+        if role is None or intent.state(key) == model.UNRESOLVED:
+            raise SurfaceRoleRefusal(
+                label, intent.issue(key) or 'it has no role',
+                'Choose its role in the surface settings, then mesh again.')
+        if role == model.NON_CONFORMAL:
+            raise SurfaceRoleRefusal(
+                label, 'the surface of a modelled box, sphere or cylinder '
+                'cannot be one side of a non-conformal interface',
+                'Model the contact as an imported surface.')
+        return role
 
     def _warn_primitive_surface_bindings(self) -> None:
         """Say so when a surface group is bound to a modelled shape's surface.
@@ -2851,7 +3407,7 @@ class CaseBuilder:
     #: only four this writer may emit.
     _ZONE_MODES = ('inside', 'outside', 'insidePoint', 'none')
 
-    def _interface_seed(self, geometry, refinement):
+    def _interface_seed(self, geometry, refinement, *, volume=None):
         """``mode insidePoint`` and the seed, for an interface that carves.
 
         DP-421. ``mode inside`` means "the volume this surface encloses", and
@@ -2872,7 +3428,8 @@ class CaseBuilder:
         that fact is what tells the two apart. Nothing that meshes today
         changes; only a project that records a seed gets the v13 shape.
         """
-        volume = self._owning_volume(geometry)
+        if volume is None:
+            volume = self._owning_volume(geometry)
         point = None
         if volume is not None and bool(
                 self._item_value(volume, 'zoneInsidePointSet', False)):
@@ -2935,48 +3492,6 @@ class CaseBuilder:
     #: cannot produce either, so neither type can ever be honoured here.
     _MESH_CONSTRAINED_PATCH_TYPES = ('wedge', 'empty')
 
-    def _snappy_patch_type(self, group) -> str:
-        """The OpenFOAM type this snappy region may safely declare.
-
-        The category behind it is *inferred from the patch name* -- the
-        leading word decides (``core/geometry/patches/ops.py``). That is a
-        fine way to reach `wall` or `inlet`, and a dangerous way to reach a
-        type whose contract is geometric.
-
-        MEASURED on the `wedge` fixture imported as STEP. The strict GUI
-        harness names imported surfaces `<model>_wall<n>`, so the seven walls
-        of that model came out `wedge_wall1 .. wedge_wall7`; the leading word
-        `wedge` is a category, so all seven were written
-        `patchInfo { type wedge; }`. snappyHexMesh died with SIGFPE inside
-        `Foam::wedgePolyPatch::calcGeometry` during feature refinement --
-        the wedge patch divides by an axis length that is zero for a wall
-        that is not half of an axisymmetric pair. Seven wedges cannot be a
-        pair in any case.
-
-        So a name may not select a mesh-constrained type. Such a region is
-        written `wall`, which is what these surfaces are, and the substitution
-        is warned about rather than made silently: a user who really wants an
-        axisymmetric sector needs blockMesh, not snappyHexMesh, and needs to
-        be told so.
-        """
-        from foammesh.core.export.poly_mesh_writer import _foam_patch_type
-
-        category = group.get('category')
-        patch_type = _foam_patch_type(category)
-        if patch_type not in self._MESH_CONSTRAINED_PATCH_TYPES:
-            return patch_type
-        name = str(group.get('solver_name') or group.get('name') or '?')
-        self.warn(
-            'snappy_patch_type_unmeshable',
-            f'{name} is named for the {patch_type} category, but '
-            f'snappyHexMesh cannot build a {patch_type} patch: that type '
-            f'describes a one-cell-thick mesh this pipeline never produces, '
-            f'and OpenFOAM aborts on it. It is written as a wall. Build an '
-            f'axisymmetric sector with blockMesh, or rename the surface so '
-            f'it does not lead with "{patch_type}".',
-            requested=patch_type, applied='wall')
-        return 'wall'
-
     def _record_layer_patch(self, name, layer, result, relative_modes,
                             frozen) -> None:
         """Place one patch into ``layers {}`` -- or deliberately leave it out.
@@ -3003,6 +3518,58 @@ class CaseBuilder:
             return
         relative_modes.add(values.pop('relativeSizes'))
         result[name] = values
+
+    @staticmethod
+    def baffle_patch_names(refinement_surfaces) -> tuple[str, ...]:
+        """The two patches of every surface snappy cuts as a baffle.
+
+        v13 names a baffle's patches after its face zone: ``<zone>`` and
+        ``<zone>_slave`` (snappyHexMesh.C, addFaceZones).
+        """
+        names: list[str] = []
+        for entry in (refinement_surfaces or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('faceType') != 'baffle' or not entry.get('faceZone'):
+                continue
+            zone = str(entry['faceZone'])
+            for name in (zone, f'{zone}_slave'):
+                if name not in names:
+                    names.append(name)
+        return tuple(names)
+
+    def _with_baffle_layer_entries(self, layer_surfaces, refinement_surfaces):
+        """Keep the layer stage from merging faces on a baffle's patches.
+
+        DP-6068. MEASURED on the sr9-snappy-baffle case (OpenFOAM 13, 15
+        processors): a blocking baffle ``plate`` with no layers asked for
+        anywhere still killed the layers stage with ``combineFaces``
+        "Multiple outside loops". addLayers merges coplanar faces on every
+        meshed patch before it adds anything (``mergePatchFacesUndo``), and
+        on a decomposed baffle -- two patches sharing every point, cut by
+        processor boundaries -- the merged face has more than one outer
+        loop. The same case ran serially, and in parallel with ``plate`` and
+        ``plate_slave`` given ``mergeFaces false`` it ran with and without 3
+        wall layers (45,625 and 66,844 cells). ``mergeFaces`` is read per
+        patch only from a patch's own ``layers`` entry, and that entry needs
+        ``nSurfaceLayers``, so each baffle patch gets one: the count the
+        person asked for (whichever key v13 would apply last), else 0.
+        """
+        baffles = self.baffle_patch_names(refinement_surfaces)
+        if not baffles:
+            return layer_surfaces
+        patterns = dict(getattr(self, '_layer_pattern_patches', {}) or {})
+        result = dict(layer_surfaces)
+        for name in baffles:
+            applied = None
+            for key, values in layer_surfaces.items():
+                if key == name or name in patterns.get(key, ()):
+                    applied = values            # v13: the last key wins
+            entry = dict(applied) if applied else {'nSurfaceLayers': 0}
+            entry['mergeFaces'] = False
+            result.pop(name, None)              # placed last, so it applies
+            result[name] = entry
+        return result
 
     def _layer_selects_by_pattern(self, layer) -> bool:
         """Whether this layer group names its patches by expression."""
@@ -4131,21 +4698,35 @@ class CaseBuilder:
             # C31-08. The companion switch to the span modes: it decides
             # whether the refinement a span asks for may reach past the span.
             'extendedRefinementSpan'))
+        # DP-5712. Feature snapping is one choice, written as the two
+        # snapControls switches with at most one of them true.
+        from foammesh.db.configurations_schema import (
+            featureSnapSwitches, isMultiRegionCase)
+        implicit, explicit = featureSnapSwitches(
+            self._v('snap/featureSnapping', 'explicit'))
+        # Read by the explicit snapper where regions or zones meet, and
+        # nowhere else; the page hides it everywhere else, so a value left
+        # stored from another setup is not written behind the user's back.
+        multi_region = bool(self._v('snap/multiRegionFeatureSnap', False))
+        applies = explicit and isMultiRegionCase(self.db)
+        if multi_region and not applies:
+            self.warn(
+                'snap.multi_region.inapplicable',
+                'Multi-region feature snapping was written off: it is read '
+                'by explicit feature snapping on a case with more than one '
+                'region or zone, and this setup is not one.',
+                field_id='meshing.snap.multi_region_feature_snap',
+                requested=True, applied=False, severity='info')
         snap_controls = {
-            'nSmoothPatch': self._v('snap/nSmoothPatch', '0'),
+            # DP-6076: the schema default, see configurations_schema.
+            'nSmoothPatch': self._v('snap/nSmoothPatch', '3'),
             'tolerance': self._v('snap/tolerance', '3'),
             'nSolveIter': self._v('snap/nSolveIter', '30'),
             'nRelaxIter': self._v('snap/nRelaxIter', '5'),
-            # F-41. Two keys in snapControls, two switches here. They used to
-            # be one enum written as its own complement, so "both on" -- what
-            # OpenFOAM 13 wants for an STL whose feature edges were extracted
-            # -- was unreachable, and so was "neither".
-            'implicitFeatureSnap':
-                bool(self._v('snap/implicitFeatureSnap', False)),
-            'explicitFeatureSnap':
-                bool(self._v('snap/explicitFeatureSnap', True)),
+            'implicitFeatureSnap': implicit,
+            'explicitFeatureSnap': explicit,
             'nFeatureSnapIter': self._v('snap/nFeatureSnapIter', '15'),
-            'multiRegionFeatureSnap': self._v('snap/multiRegionFeatureSnap', False),
+            'multiRegionFeatureSnap': multi_region and applies,
         }
         # C31-11. ``snapParameters.C:44-46`` reads this with
         # ``lookupOrDefault(..., true)``, so DEFAULT must leave it out rather
@@ -4210,7 +4791,8 @@ class CaseBuilder:
             default_ratio = 1.2
             default_minimum = 0.1
         add_layers = {
-            'layers': layer_surfaces,
+            'layers': self._with_baffle_layer_entries(
+                layer_surfaces, castellated.get('refinementSurfaces') or {}),
             'relativeSizes': getattr(
                 self, '_layer_relative_sizes', True),
             # v13 determines the layer specification from the two global
@@ -4518,6 +5100,8 @@ class CaseBuilder:
             'groups': [dict(group) for group in source.get('groups', ())],
             'regions': [dict(region) for region in source.get('regions', ())],
             'interface_pairs': self.interface_pairs(),
+            # Plan 49 SR4. What the export couples after the region split.
+            'couplings': self.couplings(),
             # Plan 31 CP-07 item 3. The background block's faces are published
             # alongside the prepared groups, each saying whether a person
             # named it and what they meant it to be. Without this the reader
@@ -5025,6 +5609,8 @@ def snappy_source_links() -> dict[str, tuple[str, ...]]:
             'castellation/refinementSurfaces/{id}/includedAngle',),
         'snappyHexMeshDict/castellatedMeshControls': (
             'castellation/*', 'geometry/{id}/castellationGroup',
+            'geometry/{id}/surfaceRole', 'geometry/{id}/boundaryCategory',
+            'geometry/{id}/meshPatchType', 'surfaceRelations/*',
             'geometry/{id}/cfdType', 'geometry/{id}/nonConformal',
             'geometry/{id}/interRegion'),
         'snappyHexMeshDict/snapControls': ('snap/*',),

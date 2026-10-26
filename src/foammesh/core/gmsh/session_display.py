@@ -27,8 +27,10 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 
 #: Gmsh's ``Mesh.*`` visibility toggle -> (Gmsh element family, dimension).
-#: ``Trihedra`` is Gmsh's legacy 3-node corner element; no Gmsh action of this
-#: application creates one, so the toggle exists and reports "none in this mesh".
+#: ``Trihedra`` is Gmsh's 4-node corner element (type 140, MSH_TRIH_4: the apex
+#: and the three nodes it points at). Few meshes hold one; the toggle reports
+#: "none in this mesh" for the rest, and ``gmsh_mesh_view`` draws the three
+#: edges of each one in ``Mesh.Color.Trihedra`` (Plan 48 TL, DP-4450).
 ELEMENT_KINDS = {
     'Lines': ('Line', 1),
     'Triangles': ('Triangle', 2), 'Quadrangles': ('Quadrangle', 2),
@@ -43,7 +45,10 @@ _FAMILY_OF_TYPE = {1: 'Line', 2: 'Triangle', 3: 'Quadrangle',
                    14: 'Pyramid', 15: 'Point', 16: 'Quadrangle',
                    17: 'Hexahedron', 18: 'Prism', 19: 'Pyramid',
                    21: 'Triangle', 23: 'Triangle', 25: 'Triangle',
-                   26: 'Line', 27: 'Line', 28: 'Line'}
+                   26: 'Line', 27: 'Line', 28: 'Line',
+                   # Plan 48 TL (DP-4450): MSH_TRIH_4, the four-node trihedron
+                   # (apex, then the three nodes it points at)
+                   140: 'Trihedron'}
 _KIND_OF_FAMILY = {family: kind for kind, (family, _d) in ELEMENT_KINDS.items()}
 
 
@@ -483,12 +488,17 @@ def colour_codes(arrays: MeshArrays, mode: int) -> np.ndarray:
     raise ValueError('colour mode must be 0..3')
 
 
-def colour_rgb(codes) -> np.ndarray:
+def colour_rgb(codes, carousel=None) -> np.ndarray:
     """RGB for each code; equal codes share a colour, order of appearance
-    does not matter (the sorted unique codes index the carousel)."""
+    does not matter (the sorted unique codes index the carousel).
+
+    *carousel* is a ``(n, 3)`` table (Plan 48 GM2:
+    :meth:`GmshDisplaySettings.carousel`, the ``Mesh.Color.Zero`` ..
+    ``Nineteen`` options); the built-in table is used when none is given."""
+    table = CAROUSEL if carousel is None else np.asarray(carousel, np.uint8)
     codes = np.asarray(codes)
     unique, inverse = np.unique(codes, return_inverse=True)
-    return CAROUSEL[inverse % len(CAROUSEL)]
+    return table[inverse % len(table)]
 
 
 def colour_legend_label(arrays: MeshArrays, mode: int, code: int,
@@ -1009,29 +1019,34 @@ def voronoi_segments(arrays: MeshArrays, tets) -> np.ndarray:
 def element_label_rows(arrays: MeshArrays, cells, label_type: int,
                        names=None) -> tuple:
     """``(positions (n, 3), texts)`` for the element labels of ``Mesh.LabelType``."""
+    # Plan 48 GM11a (DP-4454): the texts of one label type are built in bulk
+    # (numpy columns), not by a Python loop over the elements.
     cells = np.asarray(cells, dtype=np.int64)
     centre = arrays.centres()[cells]
     names = names or {}
-    texts = []
-    tag = arrays.column('gmshElementTag')[cells]
-    entity = arrays.column('gmshEntityTag')[cells]
-    dim = arrays.column('gmshEntityDim')[cells]
-    physical = arrays.column('gmshPhysical')[cells]
-    partition = arrays.column('gmshPartition')[cells]
-    for index in range(len(cells)):
-        if label_type == 0:
-            texts.append(str(int(tag[index])))
-        elif label_type == 1:
-            texts.append(f'{"PCSV"[int(dim[index])]}{int(entity[index])}')
-        elif label_type == 2:
-            code = int(physical[index])
-            texts.append(names.get(code) or (str(code) if code else '-'))
-        elif label_type == 3:
-            texts.append(str(int(partition[index])))
-        elif label_type == 4:
-            texts.append('%.4g, %.4g, %.4g' % tuple(centre[index]))
-        else:
-            raise ValueError('unknown label type')
+    if label_type == 0:
+        texts = arrays.column('gmshElementTag')[cells].astype(np.int64) \
+            .astype(str).tolist()
+    elif label_type == 1:
+        dim = arrays.column('gmshEntityDim')[cells].astype(np.int64)
+        entity = arrays.column('gmshEntityTag')[cells].astype(np.int64)
+        texts = np.char.add(np.array(list('PCSV'))[dim],
+                            entity.astype(str)).tolist()
+    elif label_type == 2:
+        codes, inverse = np.unique(
+            arrays.column('gmshPhysical')[cells].astype(np.int64),
+            return_inverse=True)
+        words = np.array([names.get(int(c)) or (str(int(c)) if c else '-')
+                          for c in codes], dtype=object)
+        texts = words[np.asarray(inverse).reshape(-1)].tolist() \
+            if len(codes) else []
+    elif label_type == 3:
+        texts = arrays.column('gmshPartition')[cells].astype(np.int64) \
+            .astype(str).tolist()
+    elif label_type == 4:
+        texts = ['%.4g, %.4g, %.4g' % tuple(row) for row in centre.tolist()]
+    else:
+        raise ValueError('unknown label type')
     return centre, texts
 
 
@@ -1043,9 +1058,10 @@ def node_label_rows(arrays: MeshArrays, cells, label_type: int) -> tuple:
         [arrays.nodes_of(int(c)) for c in cells])) if len(cells) else \
         np.zeros(0, dtype=np.int64)
     if label_type == 4:
-        texts = ['%.4g, %.4g, %.4g' % tuple(arrays.points[i]) for i in used]
+        texts = ['%.4g, %.4g, %.4g' % tuple(row)
+                 for row in arrays.points[used].tolist()]
     else:
-        texts = [str(int(i) + 1) for i in used]
+        texts = (used.astype(np.int64) + 1).astype(str).tolist()
     return arrays.points[used], texts
 
 
@@ -1248,3 +1264,371 @@ def export_view(render_window, path, fmt: str, *, scale: int = 1,
                                    font=font, hide=hide,
                                    transparent=transparent)
     return write(scene, path.with_suffix(suffix))
+
+
+# --------------------------------------------------------------------------- #
+# Plan 48 GM2: every display option of Gmsh, bound to a viewport control
+# --------------------------------------------------------------------------- #
+
+#: Options of Gmsh's own window that draw nothing (Plan 48 section 5.1, I8).
+#: Gmsh runs the double-click commands in its FLTK window (usually the ONELAB
+#: editor); FoamMesh's double-click is its own.  ``Mesh.CpuTime`` and the
+#: ``Mesh.Nb*`` counts are read-only status values, shown in Statistics.
+NOTHING_TO_DRAW = {
+    'Geometry.DoubleClickedPointCommand': 'runs in Gmsh\'s window (ONELAB)',
+    'Geometry.DoubleClickedCurveCommand': 'runs in Gmsh\'s window (ONELAB)',
+    'Geometry.DoubleClickedSurfaceCommand': 'runs in Gmsh\'s window (ONELAB)',
+    'Geometry.DoubleClickedVolumeCommand': 'runs in Gmsh\'s window (ONELAB)',
+    'Geometry.DoubleClickedEntityTag': 'set by Gmsh\'s double-click',
+    'Mesh.CpuTime': 'read-only status value, shown in Statistics',
+    'Mesh.NbNodes': 'read-only count, shown in Statistics',
+    'Mesh.NbTriangles': 'read-only count, shown in Statistics',
+    'Mesh.NbQuadrangles': 'read-only count, shown in Statistics',
+    'Mesh.NbTetrahedra': 'read-only count, shown in Statistics',
+    'Mesh.NbHexahedra': 'read-only count, shown in Statistics',
+    'Mesh.NbPrisms': 'read-only count, shown in Statistics',
+    'Mesh.NbPyramids': 'read-only count, shown in Statistics',
+    'Mesh.NbTrihedra': 'read-only count, shown in Statistics',
+}
+
+#: The Mesh.* display options that the Elements group already holds, by the
+#: :class:`DisplayOptions` field behind them.  They are bound to that control,
+#: not duplicated.
+_ELEMENTS_FIELD = {
+    'Mesh.Nodes': 'points', 'Mesh.Lines': 'lines',
+    'Mesh.SurfaceEdges': 'surface_edges', 'Mesh.SurfaceFaces': 'surface_faces',
+    'Mesh.VolumeEdges': 'volume_edges', 'Mesh.VolumeFaces': 'volume_faces',
+    'Mesh.DrawSkinOnly': 'draw_skin_only', 'Mesh.Explode': 'explode',
+    'Mesh.Light': 'light', 'Mesh.LightLines': 'light_lines',
+    'Mesh.LightTwoSide': 'light_two_side', 'Mesh.NodeType': 'point_type',
+    'Mesh.NodeSize': 'point_size', 'Mesh.LineWidth': 'line_width',
+    'Mesh.ColorCarousel': 'colour_mode', 'Mesh.NodeLabels': 'node_labels',
+    'Mesh.LabelType': 'label_type', 'Mesh.LabelSampling': 'label_sampling',
+    'Mesh.Normals': 'normals', 'Mesh.Tangents': 'tangents',
+    'Mesh.NumSubEdges': 'num_sub_edges',
+    'Mesh.LineLabels': 'element_labels', 'Mesh.SurfaceLabels': 'element_labels',
+    'Mesh.VolumeLabels': 'element_labels',
+}
+for _kind in ELEMENT_KINDS:
+    _ELEMENTS_FIELD['Mesh.' + _kind] = 'kinds'
+
+#: What VTK does for each family of options (the drawing is Plan 48 GM11a).
+_VTK = {
+    'visibility': 'actor visibility',
+    'size': 'point size / line width',
+    'type': 'sphere glyphs / tube filter',
+    'labels': 'label mapper',
+    'arrows': 'arrow glyphs',
+    'light': 'actor lighting',
+    'orphans': 'computed from the model topology, then coloured',
+    'marker': 'representation and glyphs at entity centres',
+    'offset': 'actor position',
+    'element filter': 'cell-type filter',
+    'dual': 'dual mesh computed, then drawn',
+    'normals': 'normals filter',
+    'clip': 'planes of the shared Section tool',
+    'colour': 'actor colour',
+    'carousel': 'lookup table for the entity / partition carousel',
+}
+
+
+def _vtk_family(name: str, kind: str) -> str:
+    label = name.split('.', 1)[1]
+    if kind == 'color':
+        return 'carousel' if label.startswith('Color.') and label[6:] in (
+            'Zero One Two Three Four Five Six Seven Eight Nine Ten Eleven '
+            'Twelve Thirteen Fourteen Fifteen Sixteen Seventeen Eighteen '
+            'Nineteen').split() else 'colour'
+    if label == 'Clip':
+        return 'clip'
+    if label.endswith('Labels') or label.startswith('Label'):
+        return 'labels'
+    if label in ('Points', 'Curves', 'Surfaces', 'Volumes'):
+        return 'visibility'
+    if label.endswith(('Size', 'Width', 'SelectSize', 'SelectWidth')):
+        return 'size'
+    if label.endswith('Type') and label != 'LabelType':
+        return 'marker' if label in ('SurfaceType', 'VolumeType') else 'type'
+    if label in ('Normals', 'Tangents'):
+        return 'arrows'
+    if label.startswith('Light'):
+        return 'light'
+    if label == 'HighlightOrphans':
+        return 'orphans'
+    if label.startswith('Offset'):
+        return 'offset'
+    if label == 'Dual':
+        return 'dual'
+    if label == 'SmoothNormals':
+        return 'normals'
+    return 'element filter'
+
+
+@dataclass(frozen=True)
+class DisplayBinding:
+    """One Gmsh display option and the FoamMesh control that owns it."""
+
+    option: str
+    kind: str                  # the catalogue kind
+    control: str               # the viewport control that holds the value
+    setting: str               # the key it is stored under
+    vtk: str                   # what VTK does with it (drawing: GM11a)
+    shared: bool = False       # held by an existing control, not a new one
+
+
+def _build_bindings() -> dict:
+    from . import option_catalogue as catalogue
+
+    out = {}
+    for option in catalogue.CATALOGUE.values():
+        if option.page != 'display' or option.name in NOTHING_TO_DRAW:
+            continue
+        name = option.name
+        group, label = name.split('.', 1)
+        family = _vtk_family(name, option.kind)
+        if option.kind == 'bitmask' and label == 'Clip':
+            control, shared = 'section/planes', True
+        elif name in _ELEMENTS_FIELD:
+            control, shared = 'elements/' + _ELEMENTS_FIELD[name], True
+        elif option.kind == 'color':
+            control, shared = 'display/colour/' + name, False
+        else:
+            control, shared = 'display/' + group.lower() + '/' + label, False
+        vtk = _VTK[family]
+        if control.startswith('elements/') and                 _ELEMENTS_FIELD.get(name) != 'kinds':
+            vtk = 'already drawn by the Elements group'
+        out[name] = DisplayBinding(name, option.kind, control,
+                                   'gmsh.display.' + name, vtk, shared)
+    return out
+
+
+#: Every Gmsh display option that draws something, by its Gmsh name.
+DISPLAY_BINDINGS = _build_bindings()
+
+
+def oc_get(name: str):
+    """The catalogue entry of a display option (the panel builds on it)."""
+    from . import option_catalogue as catalogue
+
+    return catalogue.get(name)
+
+
+#: Where the drawing settings are kept between runs.  A test replaces this
+#: with a ``(read, write)`` pair of plain functions.
+SETTINGS_KEY = 'gmshDisplay/settings'
+_STORE = None
+
+
+def _qsettings():
+    from PySide6.QtCore import QSettings
+
+    return QSettings('FoamMesh', 'FoamMesh')
+
+
+def load_saved_settings() -> 'GmshDisplaySettings':
+    """The drawing settings the user last kept (defaults when none)."""
+    try:
+        text = _STORE[0]() if _STORE else _qsettings().value(SETTINGS_KEY, '')
+    except Exception:                                   # noqa: BLE001
+        text = ''
+    return GmshDisplaySettings.from_json(text)
+
+
+def save_settings(settings: 'GmshDisplaySettings') -> bool:
+    """Keep *settings* for the next run; ``False`` if nothing could be written."""
+    try:
+        if _STORE:
+            _STORE[1](settings.to_json())
+        else:
+            _qsettings().setValue(SETTINGS_KEY, settings.to_json())
+    except Exception:                                   # noqa: BLE001
+        return False
+    return True
+
+
+def bindings_for(control: str) -> tuple:
+    """The options a viewport control holds."""
+    return tuple(b for b in DISPLAY_BINDINGS.values() if b.control == control)
+
+
+def clip_mask(planes) -> int:
+    """``Geometry.Clip`` / ``Mesh.Clip`` for the Section tool's planes: bit
+    ``i`` (value ``2**i``) is plane ``i`` switched on."""
+    return sum(1 << index for index, plane in enumerate(planes) if plane.on)
+
+
+def planes_with_mask(planes, mask) -> list:
+    """*planes* with each one switched on or off by the bits of *mask*; planes
+    the mask names beyond the list are added as default planes, so that every
+    set bit has a plane.  The plane equations are kept."""
+    mask = int(mask)
+    if mask < 0 or mask >= 1 << MAX_CLIP_PLANES:
+        raise ValueError(f'a clip mask is 0 to {(1 << MAX_CLIP_PLANES) - 1}: '
+                         'bit i is clipping plane i')
+    planes = list(planes)
+    while len(planes) < MAX_CLIP_PLANES and (mask >> len(planes)):
+        planes.append(ClipPlane(on=False))
+    return [replace(plane, on=bool(mask >> index & 1))
+            for index, plane in enumerate(planes)]
+
+
+class GmshDisplaySettings:
+    """The values of every bound display option, by Gmsh name.
+
+    Defaults are the catalogue's; a value is checked by the same validator the
+    Options panel uses, so a viewport control cannot hold what Gmsh would
+    refuse.  Only what differs from the default is stored
+    (:meth:`to_json`).  The 24 options of :class:`DisplayOptions` are mirrored
+    both ways (:meth:`display_options`, :meth:`take_display_options`) so that
+    the Elements group and this object cannot disagree.
+    """
+
+    def __init__(self, values=None):
+        from . import option_catalogue as catalogue
+
+        self._catalogue = catalogue
+        self._values: dict = {}
+        #: Plan 48 GM11a (DP-4456). Options the user touched, whatever the
+        #: value: a value equal to Gmsh's default is not stored in
+        #: ``_values`` (so it is not saved), but it still overrides the
+        #: Elements group's own defaults, which differ for four options.
+        self._held: set = set()
+        for name, raw in dict(values or {}).items():
+            self.set(name, raw)
+
+    # -- values ------------------------------------------------------------- #
+
+    def get(self, name: str):
+        if name not in DISPLAY_BINDINGS:
+            raise KeyError(f'{name} is not a display option that draws')
+        if name in self._values:
+            return self._values[name]
+        default = self._catalogue.get(name).default
+        return tuple(default) if isinstance(default, (list, tuple)) \
+            else default
+
+    def set(self, name: str, raw) -> None:
+        if name not in DISPLAY_BINDINGS:
+            reason = NOTHING_TO_DRAW.get(name)
+            raise ValueError(
+                f'{name} draws nothing in FoamMesh ({reason})' if reason
+                else f'{name} is not a display option')
+        value = self._catalogue.parse_value(name, raw)
+        option = self._catalogue.get(name)
+        self._held.add(name)
+        if self._catalogue.same_value(option, value, option.default):
+            self._values.pop(name, None)
+        else:
+            self._values[name] = value
+
+    def changed(self) -> dict:
+        return dict(self._values)
+
+    def held(self) -> frozenset:
+        """The options set at least once since the last reset, at any value."""
+        return frozenset(self._held)
+
+    def reset(self) -> None:
+        self._values.clear()
+        self._held.clear()
+
+    def colour(self, name: str) -> tuple:
+        """The colour option *name* as ``(r, g, b, a)``."""
+        value = self.get(name)
+        if DISPLAY_BINDINGS[name].kind != 'color':
+            raise ValueError(f'{name} is not a colour')
+        return tuple(int(v) for v in value)
+
+    def carousel(self) -> np.ndarray:
+        """``Mesh.Color.Zero`` .. ``Nineteen`` as a ``(20, 3)`` table, the
+        lookup table of the entity / partition colour modes."""
+        names = ('Zero One Two Three Four Five Six Seven Eight Nine Ten '
+                 'Eleven Twelve Thirteen Fourteen Fifteen Sixteen Seventeen '
+                 'Eighteen Nineteen').split()
+        return np.array([self.colour('Mesh.Color.' + word)[:3]
+                         for word in names], dtype=np.uint8)
+
+    # -- every value, as Gmsh holds it ---------------------------------------- #
+
+    def gmsh_options(self) -> dict:
+        """``{name: value}`` for every bound option, for ``options_apply``."""
+        return {name: self.get(name) for name in DISPLAY_BINDINGS}
+
+    # -- the Section tool ------------------------------------------------------ #
+
+    def take_planes(self, planes) -> None:
+        """Make ``Geometry.Clip`` / ``Mesh.Clip`` the section tool's planes."""
+        mask = clip_mask(planes)
+        self.set('Geometry.Clip', mask)
+        self.set('Mesh.Clip', mask)
+
+    def planes_for(self, planes, group: str = 'Mesh') -> list:
+        return planes_with_mask(planes, self.get(group + '.Clip'))
+
+    # -- the Elements group ----------------------------------------------------- #
+
+    def display_options(self, base: 'DisplayOptions | None' = None):
+        """The :class:`DisplayOptions` these values give (on top of *base*)."""
+        base = base or DisplayOptions()
+        changes = {}
+        kinds = list(base.kinds)
+        for name, field_name in _ELEMENTS_FIELD.items():
+            if name not in self._values and name not in self._held:
+                continue
+            value = self.get(name)
+            if field_name == 'kinds':
+                kind = name.split('.', 1)[1]
+                if value and kind not in kinds:
+                    kinds.append(kind)
+                if not value and kind in kinds:
+                    kinds.remove(kind)
+                changes['kinds'] = tuple(kinds)
+            elif field_name == 'element_labels':
+                changes['element_labels'] = bool(value) or \
+                    changes.get('element_labels', False)
+            elif isinstance(getattr(base, field_name), bool):
+                changes[field_name] = bool(value)
+            elif isinstance(getattr(base, field_name), int):
+                changes[field_name] = int(value)
+            else:
+                changes[field_name] = float(value)
+        return base.with_(**changes) if changes else base
+
+    def take_display_options(self, options: 'DisplayOptions') -> None:
+        """Hold the values the Elements group has."""
+        for name, value in options.gmsh_options().items():
+            if name in DISPLAY_BINDINGS and name in _ELEMENTS_FIELD:
+                self.set(name, value)
+
+    # -- persistence ---------------------------------------------------------- #
+
+    def to_json(self) -> str:
+        import json
+
+        return json.dumps(
+            {name: list(value) if isinstance(value, tuple) else value
+             for name, value in sorted(self._values.items())},
+            separators=(',', ':'))
+
+    @classmethod
+    def from_json(cls, text) -> 'GmshDisplaySettings':
+        """Read what :meth:`to_json` wrote; a name this build does not bind
+        is dropped (a setting from a newer or older release), never an
+        error."""
+        import json
+
+        settings = cls()
+        try:
+            stored = json.loads(str(text)) if text else {}
+        except ValueError:
+            return settings
+        if not isinstance(stored, dict):
+            return settings
+        for name, raw in stored.items():
+            try:
+                settings.set(name, raw)
+            except (ValueError, KeyError):
+                continue
+            except Exception:                           # noqa: BLE001
+                continue
+        return settings

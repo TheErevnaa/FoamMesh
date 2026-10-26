@@ -771,8 +771,11 @@ def _import_export_operations() -> list[OperationDescriptor]:
 def _presentation_operations(presentation_ids) -> list[OperationDescriptor]:
     # DP-224. The label a presentation operation is listed under
     # is a name on a screen, so the one rule spells it.
+    # Plan 48 PA1: the catalogue text says what each one does and takes.
+    from .presentation import PRESENTATION_SUMMARIES
     return [OperationDescriptor(operation, humanise_option(operation.rsplit('.', 1)[-1]),
-                                'presentation', ImpactClass.READ, result_type='presentation_state')
+                                'presentation', ImpactClass.READ, result_type='presentation_state',
+                                summary=PRESENTATION_SUMMARIES.get(operation, ''))
             for operation in presentation_ids]
 
 
@@ -844,5 +847,9 @@ def build_operation_registry(field_json_schema: dict, collection_ids,
                        + _workflow_operations() + _mesh_operations()
                        + _import_export_operations()
                        + _presentation_operations(presentation_ids)):
+        registry.register(descriptor)
+    # Plan 48 seam: routes declared in core/facade/plan48/<package>_routes.py.
+    from .plan48 import discover_descriptors
+    for descriptor in discover_descriptors():
         registry.register(descriptor)
     return registry

@@ -181,9 +181,7 @@ async def default_runner(request: SectionRequest, args: dict):
     except budget.OverBudget as refusal:
         return _Refused(
             'over_budget',
-            'The section was not computed: it needs about {0} and {1} is '
-            'free.'.format(budget.format_bytes(refusal.estimate.peak_bytes),
-                           budget.format_bytes(refusal.snapshot.budget)),
+            'The section was not computed: {0}.'.format(refusal.plain()),
             {'stage': 'admission', 'retained_previous': True})
     async with grant:
         return await local_worker.run_worker(
@@ -221,9 +219,7 @@ async def default_batch_runner(pairs) -> list:
     except budget.OverBudget as refusal:
         return [_Refused(
             'over_budget',
-            'The section was not computed: it needs about {0} and {1} is '
-            'free.'.format(budget.format_bytes(refusal.estimate.peak_bytes),
-                           budget.format_bytes(refusal.snapshot.budget)),
+            'The section was not computed: {0}.'.format(refusal.plain()),
             {'stage': 'admission', 'retained_previous': True})] * len(pairs)
     async with grant:
         outcome = await local_worker.run_worker(

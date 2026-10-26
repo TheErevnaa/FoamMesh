@@ -14,7 +14,7 @@ from typing import Optional
 import vtkmodules.vtkInteractionStyle
 # noinspection PyUnresolvedReferences
 import vtkmodules.vtkRenderingOpenGL2
-from PySide6.QtCore import QTimer, Qt, Signal, QObject
+from PySide6.QtCore import QRect, QTimer, Qt, Signal, QObject
 from PySide6.QtGui import (
     QColor, QLinearGradient, QMouseEvent, QPainter)
 from PySide6.QtWidgets import (
@@ -680,8 +680,11 @@ class MouseHandler(QObject):
 class HoldCover(QWidget):
     """UXB5 (N4). What the viewport shows while a hold dropped its paints.
 
-    The view's own background, top to bottom, and one line of text. It is
-    there so that a reload reads as "updating" and not as a fault.
+    The last frame the view drew, with a small "updating" pill over it, so a
+    tool's job (a section cut, a reload) does not blank the model and bring it
+    back (DP-2880). Without a frame to show (the view never drew, or reading
+    it back failed) it falls back to the view's own background, top to bottom,
+    with the line of text in the middle.
     """
 
     def __init__(self, parent=None):
@@ -692,7 +695,17 @@ class HoldCover(QWidget):
         self._bottom = QColor(209, 209, 209)
         self._radial = None
         self._text = ''
+        #: DP-2880. The view's last frame, or None.
+        self._frame = None
         self.hide()
+
+    def setFrame(self, image):
+        """Show *image* (a ``QImage`` of the view's last frame), or None."""
+        self._frame = image if image is not None and not image.isNull() else None
+        self.update()
+
+    def frame(self):
+        return self._frame
 
     def setColors(self, top, bottom):
         self._top, self._bottom = QColor(top), QColor(bottom)
@@ -734,6 +747,13 @@ class HoldCover(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        if self._frame is not None:
+            # DP-2880. The picture stays; only a pill says it is updating.
+            painter.drawImage(self.rect(), self._frame)
+            if self._text:
+                self._paintPill(painter)
+            painter.end()
+            return
         if self._radial is not None:
             # The very pixels the VTK background shows: the same texture.
             painter.drawImage(self.rect(), self._radialImage())
@@ -757,6 +777,19 @@ class HoldCover(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              self._text)
         painter.end()
+
+    def _paintPill(self, painter):
+        """The text in a small rounded pill at the top centre of the view."""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        metrics = painter.fontMetrics()
+        width = metrics.horizontalAdvance(self._text) + 24
+        height = metrics.height() + 10
+        pill = QRect((self.width() - width) // 2, 12, width, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(20, 22, 30, 170))
+        painter.drawRoundedRect(pill, height / 2, height / 2)
+        painter.setPen(QColor(255, 255, 255, 230))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, self._text)
 
 
 class ViewportPlaceholder(QFrame):
@@ -3058,10 +3091,48 @@ class RenderingWidget(QWidget):
             except (KeyError, AttributeError):
                 pass
         cover.setText(self.tr('Updating the view…'))
+        # DP-2880. The model stays on screen under the hold.
+        cover.setFrame(self._lastFrameImage())
         cover.setGeometry(self.rect())
         cover.show()
         cover.raise_()
         self._holdCoverWatch.start()
+
+    def _lastFrameImage(self):
+        """DP-2880. The frame on screen, as a ``QImage``, or None.
+
+        Read from the render window's display framebuffer (``front``), which
+        holds the last finished frame whatever the window system did to the
+        native surface since. Nothing is rendered: the job holding rendering
+        may be changing the scene's data, and only pixels are read. A frame
+        that is all black (the view never drew) is not worth showing.
+        """
+        window = self.renderWindow()
+        if window is None or self._inRender:
+            return None
+        try:
+            import numpy as np
+            from PySide6.QtGui import QImage
+            from vtkmodules.util.numpy_support import vtk_to_numpy
+            from vtkmodules.vtkCommonCore import vtkUnsignedCharArray
+            width, height = (int(v) for v in window.GetSize())
+            if width <= 0 or height <= 0:
+                return None
+            data = vtkUnsignedCharArray()
+            window.GetRGBACharPixelData(0, 0, width - 1, height - 1, 1, data)
+            pixels = vtk_to_numpy(data)
+            if pixels.size != width * height * 4:
+                return None
+            pixels = pixels.reshape(height, width, 4)[::-1]
+            if not pixels[..., :3].any():
+                return None
+            pixels = np.ascontiguousarray(pixels)
+            pixels[..., 3] = 255
+            return QImage(pixels.data, width, height, width * 4,
+                          QImage.Format.Format_RGBA8888).copy()
+        except Exception:                                   # noqa: BLE001
+            logger.debug('reading the last frame back', exc_info=True)
+            return None
 
     def _watchHoldCover(self):
         """DP-2705. The hold is over: take the cover down and draw.
@@ -3094,6 +3165,7 @@ class RenderingWidget(QWidget):
         if cover is None:
             return
         cover.hide()
+        cover.setFrame(None)
         # Below the view in the sibling order as well, so a native window
         # left mapped (or shown by anything else) cannot stay over it.
         cover.lower()

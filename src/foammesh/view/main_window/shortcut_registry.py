@@ -106,6 +106,16 @@ def _gmsh_commands() -> list:
     return made
 
 
+def _gmsh_tool_commands() -> list:
+    """The keys of the Gmsh tool dock (Plan 48 GM11b), one command each."""
+    import importlib
+
+    tool_keys = importlib.import_module('foammesh.view.gmsh_tools.tool_keys')
+    return [_c(tool_keys.COMMAND_PREFIX + key_id, f'Gmsh: {what}', GROUP_GMSH,
+               QKeySequence(key).toString(PORTABLE), GMSH)
+            for key, key_id, what in tool_keys.KEYS]
+
+
 def _build() -> tuple:
     rows = [
         _c('file.new', 'New project', GROUP_FILE, 'Ctrl+N'),
@@ -191,6 +201,7 @@ def _build() -> tuple:
            GROUP_GMSH, 'F3', GMSH),
     ]
     rows += _gmsh_commands()
+    rows += _gmsh_tool_commands()
     return tuple(rows)
 
 

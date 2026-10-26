@@ -100,9 +100,14 @@ class PublishReport:
     #: manifest wants the patch *names*; the provenance sidecar is built from
     #: this in-process instead (Plan 23 WP2).
     patch_records: tuple = ()
+    #: Plan 49 SR5. What the surface roles made of the mesh: the internal
+    #: face zones, the baffle pairs and the post-split couplings. Written to
+    #: the record only when there is something, so a publication with no
+    #: role reads as it always did.
+    surface_roles: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        document = {
             'points': self.points, 'cells': self.cells,
             'cellsByType': dict(self.cells_by_type),
             'boundaryFaces': self.boundary_faces,
@@ -111,14 +116,47 @@ class PublishReport:
             'patches': list(self.patches), 'regions': list(self.regions),
             'warnings': list(self.warnings), 'export': dict(self.export),
         }
+        if self.surface_roles:
+            document['surfaceRoles'] = dict(self.surface_roles)
+        return document
 
 
 # --------------------------------------------------------------------------- #
 # MSH 2.2 reading
 # --------------------------------------------------------------------------- #
 
+#: Plan 48 GM4 (D1). The Export choices decide the user's ``.msh``; OpenFOAM
+#: has its own hidden MSH 2.2 copy, written beside it as ``<name>.publisher.msh``
+#: with the options the polyMesh publisher and ``gmshToFoam`` need.
+PUBLISHER_COPY_SUFFIX = '.publisher.msh'
+
+
+def publisher_copy_path(msh_path: str | Path) -> Path:
+    """Where the hidden publisher copy of *msh_path* lives."""
+    path = Path(msh_path)
+    return path.with_name(path.stem + PUBLISHER_COPY_SUFFIX)
+
+
+def publisher_source(msh_path: str | Path) -> Path:
+    """The file the OpenFOAM publisher reads: the hidden copy when there is one."""
+    copy = publisher_copy_path(msh_path)
+    return copy if copy.is_file() and copy.stat().st_size else Path(msh_path)
+
+
+def _unreadable_here(head: bytes) -> str:
+    """Why this reader cannot take a file with this beginning, or ``''``."""
+    # Plan 48 FIX3 (DP-4112): MSH 1 and binary MSH 3.0 are read here now
+    # (:mod:`msh4`), so no file is turned away on its version alone.
+    return ''
+
+
 def read_msh(path: str | Path) -> MshDocument:
     """Read an MSH file: ASCII 2.2, or 4.x in ASCII or binary (GN15).
+
+    Plan 48 GM4: ASCII 3.0 and 4.0 are read too; Plan 48 FIX3 (DP-4112) adds
+    binary 3.0 and MSH 1. A file this reader cannot take is read from the
+    hidden publisher copy that sits beside it, when the run wrote one;
+    otherwise it is refused with the reason.
 
     Version 2.2 is what the runner writes: OpenFOAM 13's ``gmshToFoam`` cannot
     read 4.1 at all, and one format serving both the direct route and the
@@ -134,6 +172,22 @@ def read_msh(path: str | Path) -> MshDocument:
     except OSError as error:
         raise PublishError(f'mesh file could not be read: {error}') from error
     from foammesh.core.gmsh import msh4
+    why = _unreadable_here(head)
+    if why:
+        copy = publisher_copy_path(path)
+        if copy.is_file() and copy.stat().st_size:
+            return read_msh(copy)
+        raise PublishError(f'mesh file could not be read: {why}')
+    if head.startswith(b'$NOD'):
+        try:
+            points, node_ids, rows, names = msh4.read_msh1(path)
+        except msh4.Msh4Error as error:
+            raise PublishError(str(error)) from error
+        return MshDocument(
+            points=np.asarray(points, dtype=np.float64),
+            node_index={int(node): position
+                        for position, node in enumerate(node_ids.tolist())},
+            elements=rows, physical_names=names)
     if msh4.is_msh4(head):
         try:
             points, node_ids, rows, names = msh4.read_msh4(path)
@@ -984,7 +1038,12 @@ def patch_metadata_from(categories=None, periodic_pairs=(),
 # Publication
 # --------------------------------------------------------------------------- #
 
-def substitute_mesh_constrained(categories) -> tuple[dict, list]:
+#: The two categories that describe a mesh one cell thick (see
+#: ``layer_targets.MESH_CONSTRAINED_CATEGORIES``).
+CONSTRAINED = ('empty', 'wedge')
+
+
+def substitute_mesh_constrained(categories, declared=()) -> tuple[dict, list]:
     """Publish `wall` in place of a type the mesh would have to earn.
 
     DP-445. `wedge` and `empty` are not declarations, they are geometric
@@ -1004,12 +1063,19 @@ def substitute_mesh_constrained(categories) -> tuple[dict, list]:
     with SIGFPE inside `Foam::wedgePolyPatch::calcGeometry` on the same file;
     this path had no counterpart.
 
+    Plan 48 WG (DP-4215). A patch the 2D-case or wedge preset *declared*
+    (``declared``: names) is not a guess, so it is kept; :func:`check_mesh_
+    constrained` then refuses it if the mesh does not earn it.
+
     Returns the mapping to publish and the substitutions made, so the report
     can say what was taken away rather than take it away silently.
     """
     published = dict(categories or {})
+    declared = {str(name) for name in declared or ()}
     unmeshable = []
     for name, category in list(published.items()):
+        if str(name) in declared:
+            continue
         replacement = publishable_category(category)
         if replacement != category:
             published[name] = replacement
@@ -1017,19 +1083,283 @@ def substitute_mesh_constrained(categories) -> tuple[dict, list]:
     return published, unmeshable
 
 
+def _face_normals(points: np.ndarray, connectivity: np.ndarray):
+    """Area-weighted normals (Newell) of triangles and quadrilaterals."""
+    corners = points[connectivity]
+    following = np.roll(corners, -1, axis=1)
+    normals = np.stack([
+        ((corners[:, :, 1] - following[:, :, 1])
+         * (corners[:, :, 2] + following[:, :, 2])).sum(axis=1),
+        ((corners[:, :, 2] - following[:, :, 2])
+         * (corners[:, :, 0] + following[:, :, 0])).sum(axis=1),
+        ((corners[:, :, 0] - following[:, :, 0])
+         * (corners[:, :, 1] + following[:, :, 1])).sum(axis=1)], axis=1)
+    return normals, corners.mean(axis=1)
+
+
+def _owners_of(faces: dict, cell_blocks) -> dict:
+    """``{width: owning cell index per face}`` for the given boundary faces.
+
+    *faces* maps a width (3 or 4) to an ``(n, width)`` node array. A face is
+    matched to the one cell that has it (sorted node rows, one vectorised
+    sort per width), so the check scales with the mesh like the publisher.
+    """
+    owners = {}
+    for width, rows in faces.items():
+        wanted = np.sort(rows, axis=1)
+        cell_rows, cell_ids = [], []
+        base = 0
+        for block in cell_blocks:
+            for local in _FACES[block.cell_type]:
+                if len(local) != width:
+                    continue
+                cell_rows.append(np.sort(block.connectivity[:, list(local)],
+                                         axis=1))
+                cell_ids.append(np.arange(base, base + block.count))
+            base += block.count
+        owners[width] = np.full(len(rows), -1, dtype=np.int64)
+        if not cell_rows:
+            continue
+        everything = np.concatenate(cell_rows + [wanted])
+        ids = np.concatenate(cell_ids)
+        _unique, inverse = np.unique(everything, axis=0, return_inverse=True)
+        inverse = np.asarray(inverse).reshape(-1)
+        owner_of = np.full(int(inverse.max()) + 1, -1, dtype=np.int64)
+        owner_of[inverse[:len(ids)]] = ids
+        owners[width] = owner_of[inverse[len(ids):]]
+    return owners
+
+
+#: How close to parallel two face normals must be (1 - cosine) for the faces
+#: to count as one plane, and how far from a coordinate axis (1 - component)
+#: the centre plane of a wedge pair may lie. OpenFOAM's own checks are of the
+#: same order; a Gmsh mesh of a flat face is flat to rounding.
+_PLANAR_TOLERANCE = 1e-6
+
+
+def _constrained_refusal(names, category: str, reason: str) -> PublishError:
+    listed = ', '.join(repr(name) for name in names)
+    return PublishError(
+        f'{listed} {"is" if len(names) == 1 else "are"} to be published as '
+        f'{category}, and {category} describes a mesh one cell thick between '
+        f'two flat faces, which this mesh is not: {reason}. Build a '
+        f'{"2D case" if category == "empty" else "wedge"} from one surface '
+        '(Geometry → Presets) so the front and back are made that way, or '
+        'give the patch another category.')
+
+
+def check_mesh_constrained(mesh) -> None:
+    """Refuse an ``empty`` or ``wedge`` patch the mesh does not earn.
+
+    DP-445. These two types are geometric contracts, not labels: OpenFOAM
+    aborts (or silently solves a different problem) when the faces are not a
+    planar pair on a mesh one cell thick. The contract is checked on the mesh
+    about to be written:
+
+    * every patch of the type is flat (``wedge``: each patch is one plane;
+      ``empty``: all of them lie in two parallel planes);
+    * every cell that touches one has exactly two faces on them, one on each
+      side, so the mesh is one cell thick there;
+    * ``wedge``: exactly two patches, whose centre plane (the difference of
+      their normals) is a coordinate plane, the condition OpenFOAM checks.
+    """
+    constrained = {
+        int(patch_id): str(item.get('category') or '').lower()
+        for patch_id, item in mesh.patches.items()
+        if str(item.get('category') or '').lower() in CONSTRAINED}
+    if not constrained:
+        return
+    names = {pid: str(mesh.patches[pid].get('name') or pid)
+             for pid in constrained}
+    by_width: dict[int, list] = {}
+    pieces = []
+    for block in mesh.boundary_blocks:
+        mask = np.isin(block.patch_ids, list(constrained))
+        if not mask.any():
+            continue
+        rows = block.connectivity[mask]
+        width = rows.shape[1]
+        pieces.append((width, len(by_width.get(width, [])), rows,
+                       block.patch_ids[mask]))
+        by_width.setdefault(width, []).append(rows)
+    faces = {width: np.concatenate(parts) for width, parts in by_width.items()}
+    patch_of = {width: np.concatenate([
+        p[3] for p in pieces if p[0] == width]) for width in faces}
+    points = mesh.points
+    owners = _owners_of(faces, mesh.cell_blocks)
+    cell_centres = np.concatenate([
+        points[block.connectivity].mean(axis=1)
+        for block in mesh.cell_blocks])
+    unit, centre, sizes = {}, {}, {}
+    for width, rows in faces.items():
+        normals, middles = _face_normals(points, rows)
+        owner = owners[width]
+        if (owner < 0).any():
+            raise _constrained_refusal(
+                [names[int(pid)] for pid in sorted(constrained)],
+                constrained[sorted(constrained)[0]],
+                'a face of the patch belongs to no cell')
+        # outward from the cell that owns it, whatever order the file gave
+        outward = ((middles - cell_centres[owner]) * normals).sum(axis=1) < 0
+        normals[outward] *= -1.0
+        length = np.linalg.norm(normals, axis=1)
+        unit[width] = normals / np.maximum(length, 1e-300)[:, None]
+        centre[width] = middles
+        sizes[width] = length
+
+    for category in CONSTRAINED:
+        ids = sorted(pid for pid, cat in constrained.items()
+                     if cat == category)
+        if not ids:
+            continue
+        listed = [names[pid] for pid in ids]
+        # -- flat -------------------------------------------------------- #
+        directions = []
+        for pid in ids:
+            parts = [(unit[w][patch_of[w] == pid],
+                      centre[w][patch_of[w] == pid],
+                      sizes[w][patch_of[w] == pid]) for w in faces]
+            normal = np.concatenate([p[0] for p in parts])
+            middle = np.concatenate([p[1] for p in parts])
+            weight = np.concatenate([p[2] for p in parts])
+            mean = (normal * weight[:, None]).sum(axis=0)
+            mean /= max(np.linalg.norm(mean), 1e-300)
+            if category == 'wedge':
+                worst = float(np.min(normal @ mean))
+                if worst < 1.0 - _PLANAR_TOLERANCE:
+                    raise _constrained_refusal(
+                        [names[pid]], category,
+                        'its faces do not lie in one plane (they differ by '
+                        f'up to {math.degrees(math.acos(max(worst, -1.0))):.3g}'
+                        ' degrees)')
+                spread = float(np.abs((middle - middle[0]) @ mean).max())
+                extent = float(np.ptp(middle, axis=0).max()) or 1.0
+                if spread > 1e-5 * extent:
+                    raise _constrained_refusal(
+                        [names[pid]], category,
+                        'its faces are parallel but not in one plane (they '
+                        f'are up to {spread:.3g} apart)')
+            directions.append((pid, mean, normal, middle))
+        if category == 'empty':
+            axis = directions[0][2][0]
+            for pid, _mean, normal, middle in directions:
+                cosine = np.abs(normal @ axis)
+                if float(cosine.min()) < 1.0 - _PLANAR_TOLERANCE:
+                    raise _constrained_refusal(
+                        listed, category,
+                        'its faces do not lie in two parallel planes (a '
+                        'face is '
+                        f'{math.degrees(math.acos(float(cosine.min()))):.3g}'
+                        ' degrees off the others)')
+            offsets = np.concatenate([d[3] @ axis for d in directions])
+            extent = float(np.ptp(points, axis=0).max()) or 1.0
+            low, high = float(offsets.min()), float(offsets.max())
+            middle_cut = (low + high) / 2.0
+            lower = offsets[offsets < middle_cut]
+            upper = offsets[offsets >= middle_cut]
+            if (not lower.size or not upper.size
+                    or float(np.ptp(lower)) > 1e-5 * extent
+                    or float(np.ptp(upper)) > 1e-5 * extent
+                    or high - low <= 1e-9 * extent):
+                raise _constrained_refusal(
+                    listed, category,
+                    'its faces do not lie in exactly two parallel planes')
+        else:
+            if len(ids) != 2:
+                raise _constrained_refusal(
+                    listed, category,
+                    f'a wedge needs exactly two wedge patches (the two '
+                    f'sides of the sector) and there {"is" if len(ids) == 1 else "are"}'
+                    f' {len(ids)}')
+            first, second = directions[0][1], directions[1][1]
+            centre_normal = first - second
+            length = float(np.linalg.norm(centre_normal))
+            if length < 1e-9:
+                raise _constrained_refusal(
+                    listed, category,
+                    'the two patches face the same way, so they are not the '
+                    'two sides of a sector')
+            centre_normal /= length
+            if float(np.abs(centre_normal).max()) < 1.0 - 1e-4:
+                raise _constrained_refusal(
+                    listed, category,
+                    'the centre plane of the pair is not a coordinate plane '
+                    '(its normal is '
+                    f'({centre_normal[0]:.4g}, {centre_normal[1]:.4g}, '
+                    f'{centre_normal[2]:.4g})); OpenFOAM needs the sector '
+                    'symmetric about x=0, y=0 or z=0, which the wedge '
+                    'preset gives with "Symmetric about the picked plane"')
+
+        # -- one cell thick -------------------------------------------- #
+        cells, which = [], []
+        for width in faces:
+            mine = np.isin(patch_of[width], ids)
+            cells.append(owners[width][mine])
+            which.append(patch_of[width][mine])
+        cells = np.concatenate(cells)
+        which = np.concatenate(which)
+        counts = np.bincount(cells)
+        touching = np.flatnonzero(counts)
+        bad = touching[counts[touching] != 2]
+        if bad.size:
+            held = sorted({int(c) for c in counts[bad]})
+            raise _constrained_refusal(
+                listed, category,
+                f'{int(bad.size)} of the {int(touching.size)} cells that '
+                'touch it do not sit between a front face and a back face '
+                f'(they have {" or ".join(str(c) for c in held)} '
+                f'{"face" if held == [1] else "faces"} on it), so the mesh '
+                'is more than one cell thick there')
+        if category == 'wedge':
+            order = np.argsort(cells, kind='stable')
+            pair = which[order].reshape(-1, 2)
+            if (pair[:, 0] == pair[:, 1]).any():
+                raise _constrained_refusal(
+                    listed, category,
+                    'a cell has both of its faces on the same wedge patch, '
+                    'so the pair is not front and back')
+
+
 def publish(msh_path: str | Path, destination: str | Path, *,
             categories=None, periodic_pairs=(), region_metadata=None,
             identities=None, source_fingerprint: str = '',
             non_conformal_pairs=(),
-            extrusion: 'SectionExtrusion | None' = None) -> PublishReport:
-    """Read a Gmsh mesh and write ``constant/polyMesh`` at ``destination``."""
-    document = read_msh(msh_path)
+            extrusion: 'SectionExtrusion | None' = None,
+            declared=None, surface_roles=None) -> PublishReport:
+    """Read a Gmsh mesh and write ``constant/polyMesh`` at ``destination``.
+
+    Plan 48 GM4 (D1): when the run wrote a hidden publisher copy beside
+    *msh_path* the polyMesh is built from that, so the user's own ``.msh``
+    (any version, binary, SaveAll) never decides what OpenFOAM receives.
+
+    Plan 48 WG (DP-445, DP-4215). *declared* is ``{patch name: 'empty' |
+    'wedge'}``: the faces a 2D-case or wedge build said are the front and
+    back of the mesh. They are published as the type they name, and the
+    publisher refuses the mesh, saying why, when they are not a planar pair
+    one cell thick (:func:`check_mesh_constrained`). A name the geometry
+    merely led with is still published as a wall.
+    """
+    from .role_publication import (
+        RolePublicationError, apply_role_metadata, internal_face_zones,
+        non_conformal_couplings, role_publication, write_face_zones)
+
+    # Plan 49 SR5. The surface roles' types win over the prepared category,
+    # and an authored empty/wedge is declared (and so held to its contract).
+    roles = role_publication(surface_roles)
+    if roles:
+        categories = {**dict(categories or {}), **roles.categories}
+        declared = {**dict(declared or {}), **roles.declared}
+    document = read_msh(publisher_source(msh_path))
     # DP-445, and note where this sits: *above* the extrusion block. The
     # extrusion is the one legitimate producer of these types and writes its
     # two entries over this mapping a few lines below, so ordering alone
     # keeps a deliberate `wedge` apart from a guessed one and no provenance
     # flag has to be invented to carry the difference.
-    categories, unmeshable = substitute_mesh_constrained(categories)
+    declared = {str(name): str(category).strip().lower()
+                for name, category in dict(declared or {}).items()
+                if str(category).strip().lower() in CONSTRAINED}
+    categories, unmeshable = substitute_mesh_constrained(categories, declared)
+    categories.update(declared)
     if extrusion is not None:
         # The front and back categories are the extrusion's, not the prepared
         # geometry's: they are the two faces this code just made, and typing
@@ -1038,17 +1368,52 @@ def publish(msh_path: str | Path, destination: str | Path, *,
         # reason.
         categories[extrusion.front] = extrusion.category
         categories[extrusion.back] = extrusion.category
+    metadata = patch_metadata_from(
+        categories, periodic_pairs, identities, non_conformal_pairs)
+    if roles:
+        apply_role_metadata(metadata, roles)
     mesh, report = build_canonical(
         document,
-        patch_metadata=patch_metadata_from(
-            categories, periodic_pairs, identities, non_conformal_pairs),
+        patch_metadata=metadata,
         region_metadata=region_metadata,
         source_fingerprint=source_fingerprint or Path(msh_path).name,
         extrusion=extrusion)
+    check_mesh_constrained(mesh)
+    role_record: dict = {}
+    try:
+        zones = (internal_face_zones(mesh, document, roles.internal)
+                 if roles.internal else [])
+        couplings = non_conformal_couplings(mesh, roles.non_conformal)
+    except RolePublicationError as error:
+        raise PublishError(str(error)) from error
     try:
         written = FoamPolyMeshWriter().write(destination, mesh)
     except PolyMeshWriteError as error:
         raise PublishError(str(error)) from error
+    export = written.to_dict()
+    if zones:
+        poly_mesh = Path(export.get('destination') or destination)
+        write_face_zones(poly_mesh, zones)
+        export.setdefault('checksums', {})
+        if isinstance(export['checksums'], dict):
+            import hashlib
+            export['checksums']['faceZones'] = hashlib.sha256(
+                (poly_mesh / 'faceZones').read_bytes()).hexdigest()
+        export['face_zones'] = list(export.get('face_zones') or ()) + [
+            {'name': zone['name'], 'face_count': len(zone['labels']),
+             'regions': []} for zone in zones]
+        role_record['internalFaceZones'] = [
+            {'name': zone['name'], 'faces': len(zone['labels'])}
+            for zone in zones]
+    if roles.baffles:
+        role_record['baffles'] = [{'name': name, 'slave': slave}
+                                  for name, slave in roles.baffles]
+    if couplings:
+        role_record['couplings'] = couplings
+    if roles.patch_types or roles.declared:
+        role_record['patchTypes'] = {
+            name: roles.patch_types.get(name) or roles.categories[name]
+            for name in sorted(set(roles.patch_types) | set(roles.declared))}
     return PublishReport(
         points=report.points, cells=report.cells,
         cells_by_type=report.cells_by_type,
@@ -1065,7 +1430,8 @@ def publish(msh_path: str | Path, destination: str | Path, *,
             f'path sets these types on the two faces it makes — or rename '
             f'the surface so it does not lead with "{requested}".'
             for name, requested in unmeshable),
-        export=written.to_dict(), patch_records=report.patch_records)
+        export=export, patch_records=report.patch_records,
+        surface_roles=role_record)
 
 
 def canonical_from_msh(msh_path: str | Path, **kwargs) -> CanonicalMesh:

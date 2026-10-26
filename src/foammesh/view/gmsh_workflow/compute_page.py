@@ -6,6 +6,8 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QLabel, QPushButton
 
+from foammesh.core.facade.plan48 import pa3_routes
+
 from .base import GmshTaskPage
 from .session_tiers import SessionTiers
 
@@ -43,12 +45,25 @@ def sharedGenerateController(client):
     from foammesh.core.gmsh.generate_actions import ActionRefusal
     from foammesh.core.gmsh.option_catalogue import OVERRIDES_FIELD
     from foammesh.core.gmsh.session_generate import (
-        GenerateController, geometry_paths_from_prepared)
+        GenerateController, geometry_paths_from_prepared, page_intent_reader,
+        register_controller, registered_controller)
 
     try:
         case_path = client.case_path
     except Exception:                        # noqa: BLE001
         raise ActionRefusal('open a project first') from None
+    # Plan 48 DP-4007. The window and the local API share one controller (one
+    # Gmsh session) per project: the case session holds it. One the local API
+    # made first is adopted here, never replaced by a second.
+    try:
+        case_session = client.session()
+    except Exception:                        # noqa: BLE001 - no case session
+        case_session = None
+    if case_session is not None:
+        registered = registered_controller(case_session)
+        if registered is not None and _same_case(registered, case_path):
+            client._gmshGenerateController = registered
+            return registered
     controller = getattr(client, '_gmshGenerateController', None)
     if controller is not None:
         if _same_case(controller, case_path):
@@ -73,20 +88,21 @@ def sharedGenerateController(client):
         # Plan 41 GN6: the rows of the Size fields page, checked against
         # the algorithms chosen on Global sizing.
         from foammesh.core.gmsh import field_catalogue as catalogue
-        ids = (catalogue.FIELD_ID, 'gmsh.algorithms.surface',
-               'gmsh.algorithms.volume')
+        ids = (catalogue.FIELD_ID, 'gmsh.global_sizing.surface',
+               'gmsh.global_sizing.volume')
         try:
             values = client.field_values(ids)
         except Exception:                    # noqa: BLE001
             return []
         raw = {key: getattr(value, 'value', value)
                for key, value in values.items()}
-        rows = catalogue.rows_from_text(raw.get(catalogue.FIELD_ID))
+        rows = catalogue.rebase_size_data(
+            catalogue.rows_from_text(raw.get(catalogue.FIELD_ID)), case_path)
         return catalogue.validate(
             rows, surface_algorithm=str(
-                raw.get('gmsh.algorithms.surface') or ''),
+                raw.get('gmsh.global_sizing.surface') or ''),
             volume_algorithm=str(
-                raw.get('gmsh.algorithms.volume') or '')).to_list()
+                raw.get('gmsh.global_sizing.volume') or '')).to_list()
 
     def point_sizes():
         # Plan 41 GN7: the sizes at the points picked on the Size fields page.
@@ -133,7 +149,11 @@ def sharedGenerateController(client):
         case_path,
         geometry_paths=lambda: geometry_paths_from_prepared(case_path),
         overrides=overrides, fields=fields, point_sizes=point_sizes,
-        entities=entities, automatic=automatic)
+        entities=entities, automatic=automatic,
+        intent=(page_intent_reader(case_session)
+                if case_session is not None else None))
+    if case_session is not None:
+        register_controller(case_session, controller)
     try:
         client._gmshGenerateController = controller
     except Exception:                        # noqa: BLE001
@@ -194,6 +214,13 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         self.mountGenerateTier(layout)
         self.mountPluginsTier(layout)
         self.mountDisplayTier(layout)
+        # Plan 48 PA3: the local API reads this page and shows its mesh.
+        self._api = ComputePageApi(self)
+        session = pa3_routes.announce(self._client, 'compute', self._api)
+        if session is not None:
+            self.destroyed.connect(
+                lambda *_a, s=session, a=self._api: pa3_routes.unregister_panel(
+                    s, 'compute', a))
 
     # -- Plan 41 GN12: the Generate actions on the resident session ---------- #
 
@@ -252,6 +279,16 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         """Plan 41 GN20. A closed tier: Gmsh's plugins on the session mesh."""
         from .plugins_panel import GmshPluginsPanel
 
+        self._plugins = GmshPluginsPanel(
+            lambda: getattr(self, '_generateController', None),
+            self.entityViewport, self, client=self._client)
+        self._plugins.meshEdited.connect(self.refreshStatistics)
+        # Plan 48 DK: a section of the Gmsh tool dock while a window with the
+        # dock is around; a page built alone keeps the closed tier.
+        from foammesh.view.gmsh_tools import hosting
+        if hosting.mount(hosting.PLUGIN_VIEWS, self._plugins, owner=self):
+            self._pluginsHeader = None
+            return
         self._pluginsHeader = QPushButton(self.tr('Plugins'), self)
         self._pluginsHeader.setObjectName('gmshPluginsHeader')
         self._pluginsHeader.setCheckable(True)
@@ -260,10 +297,6 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
             "Run Gmsh's plugins (Skin, mesh volume, distance, cut plane and "
             'the others) with their options; the views they make are drawn '
             'in the viewport and a size field can read them.'))
-        self._plugins = GmshPluginsPanel(
-            lambda: getattr(self, '_generateController', None),
-            self.entityViewport, self, client=self._client)
-        self._plugins.meshEdited.connect(self.refreshStatistics)
         self._plugins.setVisible(False)
         self._pluginsHeader.toggled.connect(self._plugins.setVisible)
         layout.addWidget(self._pluginsHeader)
@@ -272,11 +305,10 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
     def mountDisplayTier(self, layout) -> None:
         """Gmsh's Visibility window and display options.
 
-        Plan 43 LY13 D11 (Plan 42 SG9): the panel lives in the side rail's
-        Display popover, on the shared surface, while the engine is Gmsh; every
-        control is the panel's own, none dropped. A page with no main window
-        around it (no Display popover to hang from) keeps the closed tier it
-        always had here.
+        Plan 48 DK (after Plan 43 LY13 D11): the panel is a section of the Gmsh
+        tool dock in the side rail; every control is the panel's own, none
+        dropped. A page with no main window around it (no dock to hang from)
+        keeps the closed tier it always had here.
         """
         from .display_panel import GmshDisplayPanel
 
@@ -291,12 +323,12 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         panel = self._displayPanel
         QTimer.singleShot(0, lambda: self._restoreRows(panel))
         panel.opened.connect(lambda: self._loadDisplayModel(True))
-        tool = self.sharedRotationTool()
-        mount = getattr(tool, 'mountGmshDisplay', None)
-        if callable(mount) and mount(panel):
+        self._connectDrawing(panel)
+        # Plan 48 DK: the panel is a section of the Gmsh tool dock (it was in
+        # the Show elements popover); a page with no dock keeps the tier.
+        from foammesh.view.gmsh_tools import hosting
+        if hosting.mount(hosting.VISIBILITY, panel, owner=self):
             self._displayHeader = None
-            self.destroyed.connect(
-                lambda *_a, t=tool, p=panel: t.unmountGmshDisplay(p))
             return
         self._displayHeader = QPushButton(
             self.tr('Visibility and display'), self)
@@ -338,6 +370,32 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         from foammesh.app import app
 
         return getattr(getattr(app, 'window', None), '_renderingTool', None)
+
+    def _connectDrawing(self, panel) -> None:
+        """Plan 48 GM11a (DP-4457). The Drawing tab's values reach the mesh
+        drawn by the Elements group and the geometry drawn by the entity view.
+
+        Called once when the panel is made, and again by every change; the
+        entity panel keeps the last values for a view it makes later.
+        """
+        def apply(*_args) -> None:
+            settings = panel.drawingSettings()
+            elements = self.sharedElements()
+            if elements is not None:
+                try:
+                    elements.setDrawingSettings(settings)
+                except Exception:                          # noqa: BLE001
+                    pass
+            planes = []
+            section = getattr(elements, '_section', None)
+            if section:
+                planes = list(section[1] or [])
+            entity = getattr(self, '_entityPanel', None)
+            if entity is not None:
+                entity.setDrawing(settings, planes)
+
+        panel.drawingChanged.connect(apply)
+        apply()
 
     def sharedElements(self):
         """Plan 42 SG9. The viewport's Elements group, shared by both engines."""
@@ -411,7 +469,6 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
 
     def refresh(self) -> None:
         super().refresh()
-        self.updateElementOrderCapability()
         if not hasattr(self, '_gateNote'):
             return
         for field_id in self.GATE_FIELDS:
@@ -423,7 +480,7 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
     def _onGateFieldChanged(self, *_args) -> None:
         self.updateGateNote()
 
-    # -- element order, per target solver ---------------------------------- #
+    # -- target solver ----------------------------------------------------- #
 
     def targetSolver(self) -> str:
         """Which solver this project is meshing for, as a plain token."""
@@ -433,52 +490,6 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
             return ''
         value = values.get('mesh.target_solver')
         return str(getattr(value, 'value', value) or '')
-
-    def elementOrderOptions(self):
-        """``(order, supported, reason)`` from the one capability table."""
-        from foammesh.core.gmsh.plan_derivation import element_order_options
-
-        return element_order_options(self.targetSolver())
-
-    def updateElementOrderCapability(self) -> None:
-        """Grey the orders this route cannot write, and say why.
-
-        The capability table in ``plan_derivation`` is the single answer; this
-        page renders it. Refusing here is what stops a user meshing for twenty
-        minutes at an order the target cannot read.
-        """
-        options = self.elementOrderOptions()
-        supported = [order for order, ok, _reason in options if ok]
-        refused = [(order, reason) for order, ok, reason in options if not ok]
-        self._orderRefusals = []
-        editor = self._editors.get(self.ELEMENT_ORDER_FIELD)
-        if editor is not None and supported:
-            widget = editor.editor
-            if not hasattr(self, '_orderTooltip'):
-                self._orderTooltip = widget.toolTip()
-            # The schema bounds stay as the schema wrote them -- they are what
-            # the field can hold, and every numeric editor is checked against
-            # them. What changes with the target is whether the control may be
-            # used at all: when only one order is on offer there is nothing to
-            # choose, so the control is greyed and pinned to it.
-            try:
-                current = int(editor.value())
-            except (TypeError, ValueError):
-                current = max(supported)
-            if current > max(supported):
-                # The page is taking the user's number away, so it says so in
-                # the note: a greyed control with a tooltip is not an answer to
-                # "where did my order 2 go".
-                editor.set_value(max(supported))
-                self._orderRefusals = [
-                    self.tr('Element order %d is not offered: %s')
-                    % (order, reason)
-                    for order, reason in refused if order == current]
-            widget.setEnabled(
-                not editor.descriptor.read_only and len(supported) > 1)
-            widget.setToolTip(refused[0][1] if refused else self._orderTooltip)
-        if hasattr(self, '_gateNote'):
-            self.updateGateNote()
 
     def gateValues(self) -> dict:
         """The gate as it stands on screen, editors first, then storage."""
@@ -513,11 +524,13 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
     def noteLines(self) -> list:
         """Everything this page has to say before a run, in one note.
 
-        The element-order refusals and the layer-gate conflict are both
-        pre-run warnings about the same button, so they share one block rather
-        than each claiming a label of their own.
+        The layer-gate conflict and the assembly refusal are pre-run warnings
+        about the same button, so they share one block rather than each
+        claiming a label of their own. (Plan 48 DP-3010: the capability table
+        allows every element order on every target, so there are no
+        element-order refusals to list.)
         """
-        lines = list(getattr(self, '_orderRefusals', ()))
+        lines = []
         # DP-115. This is the button the refused run is launched from, so the
         # pre-flight belongs here as well as on Boundary Layers -- the page
         # that holds the controls is not necessarily the page the user is
@@ -572,3 +585,48 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         # declares `run_stage` -- so the line above shuts a button no user can
         # see. This is the one that reaches "Run to end".
         self.runAllRefusalChanged.emit(refusal)
+
+
+class ComputePageApi:
+    """What the local API reads and does on the open Compute page (Plan 48
+    PA3); registered on the case session, called by ``pa3_routes``."""
+
+    def __init__(self, page: GmshComputePage):
+        self._page = page
+
+    @staticmethod
+    def _gui(function, *args):
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+        return on_gui_thread(function, *args)
+
+    def preflight(self) -> dict:
+        """The note the page shows above the run: refusal and gate conflict."""
+        def read():
+            page = self._page
+            page.updateGateNote()
+            lines = page.noteLines()
+            refusal = page.assemblyRefusal()
+            note = page._gateNote                       # noqa: SLF001
+            return {'lines': lines, 'refusal': refusal,
+                    'condemns_layers': page.gateCondemnsLayers(),
+                    'text': note.text(), 'shown': not note.isHidden(),
+                    'severity': 'error' if refusal else 'warning'}
+        return self._gui(read)
+
+    def show_session_mesh(self) -> dict:
+        """Put the session mesh in the viewport, as a finished stage does."""
+        def run():
+            from types import SimpleNamespace
+
+            page = self._page
+            controller = page.generateController()
+            state = controller.state()
+            stage = SimpleNamespace(ok=True, after={
+                'nodes': state.get('nodes', 0),
+                'elements': dict(state.get('elements') or {}),
+                'dims_meshed': list(state.get('dims_meshed') or [])})
+            page.showSessionMesh(stage)
+            return {'nodes': int(state.get('nodes', 0)),
+                    'elements': dict(state.get('elements') or {}),
+                    'shown': bool(state.get('nodes', 0))}
+        return self._gui(run)

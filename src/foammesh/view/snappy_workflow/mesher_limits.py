@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QScrollArea
 
 from foammesh.core.quality.policy import TIER_RELAXED, TIER_STRICT
 from foammesh.view.quality_tier_note import TierNote
+from foammesh.view.theming.metrics import NUMBER_FIELD_MAX_WIDTH
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
 
 
@@ -134,8 +135,11 @@ class MesherLimitsGroup(FieldGroupPage):
                 continue
             widest = max(widget.textFromValue(widget.minimum()),
                          widget.textFromValue(widget.maximum()), key=len)
-            widget.setMinimumWidth(
-                widget.fontMetrics().horizontalAdvance(widest) + 48)
+            # DP-2873. Never past the compact field width: a column of limits
+            # ends at one x like every other column of fields.
+            widget.setMinimumWidth(min(
+                widget.fontMetrics().horizontalAdvance(widest) + 48,
+                NUMBER_FIELD_MAX_WIDTH))
         scroll = self.findChild(QScrollArea)
         if scroll is not None:
             scroll.setHorizontalScrollBarPolicy(

@@ -145,6 +145,13 @@ class VerticalSliceOperations:
         cancelled_sections = cancel_registry.cancel_all()
         cancelled = (len(cancelled_budgets) + cancelled_jobs + cancelled_checks
                      + cancelled_sessions + cancelled_sections)
+        # DP-5743. A Gmsh Run to end between its jobs (preparing, publishing)
+        # holds a token instead; it is counted once, as the run it stops.
+        from foammesh.core.jobs import pipeline_cancel
+
+        pipeline = pipeline_cancel.cancel_all(session.case_path)
+        if not cancelled:
+            cancelled = pipeline['stopped']
         return OperationResult(
             'accepted', command.operation, session.revisions,
             payload={'cancelled': cancelled,
@@ -153,6 +160,9 @@ class VerticalSliceOperations:
                      'checks_cancelled': cancelled_checks,
                      'session_actions_cancelled': cancelled_sessions,
                      'sections_cancelled': cancelled_sections,
+                     'pipeline_cancelled': pipeline['stopped'],
+                     'pipeline_committing': bool(pipeline['committing']
+                                                 and not cancelled),
                      'recovery': ('managed_by_operation' if cancelled_jobs
                                   else 'not_required')})
 

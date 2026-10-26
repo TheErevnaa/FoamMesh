@@ -37,7 +37,15 @@ _OPT = 'gmshOptionsHeader'
 DISPLAY = 'gmshDisplayHeader'
 _DISP = DISPLAY
 _NO_POST = 'absent: no post-processing views'
-_NO_MODE = 'typed: no creation mode, points are typed'
+#: Plan 48 GM11b. Point placement (Gmsh's creation mode for a point) lives in
+#: the Gmsh tool dock; its x, y, z keys act only while it is placing points
+#: and the viewport has the keyboard, so a text box still gets its letters.
+_FREEZE = ('typed: a bare letter goes to a focused field; while the tool '
+           'dock is placing points and the viewport has the keyboard it '
+           'freezes this coordinate')
+_ONLY = ('typed: a bare letter goes to a focused field; while the tool '
+         'dock is placing points and the viewport has the keyboard it '
+         'moves only along this axis')
 
 #: ``(key, what Gmsh does, binding)``; *binding* is a tuple for a bound key
 #: and a reason string for an unbound one.
@@ -65,9 +73,9 @@ KEYS = (
     ('p', 'Go to post-processing module', _NO_POST),
     ('q', 'Abort selection', 'typed: Escape aborts a pick here'),
     ('s', 'Go to solver module', 'absent: no solver module'),
-    ('x', 'Freeze x in geometry creation mode', _NO_MODE),
-    ('y', 'Freeze y in geometry creation mode', _NO_MODE),
-    ('z', 'Freeze z in geometry creation mode', _NO_MODE),
+    ('x', 'Freeze x in geometry creation mode', _FREEZE),
+    ('y', 'Freeze y in geometry creation mode', _FREEZE),
+    ('z', 'Freeze z in geometry creation mode', _FREEZE),
     ('Shift+A', 'Bring all windows to front', 'absent: one window'),
     ('Shift+G', 'Show geometry options', (TIER, _GEO, _OPT)),
     ('Shift+M', 'Show mesh options', (TIER, 'gmsh.global_sizing', _OPT)),
@@ -77,9 +85,9 @@ KEYS = (
     ('Shift+U', 'Show post-processing view plugins',
      (TIER, _GEN, 'gmshPluginsHeader')),
     ('Shift+W', 'Show post-processing view options', _NO_POST),
-    ('Shift+X', 'Move only along x', _NO_MODE),
-    ('Shift+Y', 'Move only along y', _NO_MODE),
-    ('Shift+Z', 'Move only along z', _NO_MODE),
+    ('Shift+X', 'Move only along x', _ONLY),
+    ('Shift+Y', 'Move only along y', _ONLY),
+    ('Shift+Z', 'Move only along z', _ONLY),
     ('Shift+Escape', 'Enable full mouse selection',
      'taken: Escape is the window\'s'),
     ('Ctrl+D', 'Attach/detach menu', 'absent: no floating menu'),
@@ -103,17 +111,23 @@ KEYS = (
      'taken: Ctrl+Shift+C is the console'),
     ('Shift+Ctrl+H', 'Show current options', (TIER, _GEN, _OPT)),
     ('Shift+Ctrl+J', 'Save options as default',
-     'absent: options are kept with the project'),
-    ('Shift+Ctrl+M', 'Show manipulator window', 'absent: no manipulator'),
+     'taken: Ctrl+Shift+J keeps the display options as the defaults of '
+     'every new project (Gmsh tool dock)'),
+    ('Shift+Ctrl+M', 'Show manipulator window',
+     'taken: Ctrl+Shift+M opens the manipulator, the Camera tab of the '
+     'display panel (Gmsh tool dock)'),
     ('Shift+Ctrl+N', 'Show option window', (TIER, _GEN, _OPT)),
     ('Shift+Ctrl+O', 'Merge files', (TIER, _GEO, 'gmshImportHeader')),
     ('Shift+Ctrl+R', 'Open next-to-last opened file',
-     'absent: no recent-file list on the Gmsh route'),
+     'taken: Ctrl+Shift+R opens the next-to-last project of the Open recent list '
+     '(Gmsh tool dock)'),
     ('Shift+Ctrl+U', 'Show plugin window', (TIER, _GEN, 'gmshPluginsHeader')),
     ('Shift+Ctrl+V', 'Show visibility window', (TIER, _GEN, _DISP)),
     ('Alt+A', 'Loop through axes modes',
      'absent: the axes are the corner triad and the Origin button'),
-    ('Alt+B', 'Hide/show bounding boxes', 'absent: no bounding boxes'),
+    ('Alt+B', 'Hide/show bounding boxes',
+     'taken: Alt+B shows and hides the bounding boxes of the model '
+     'entities (Gmsh tool dock)'),
     ('Alt+C', 'Loop through colour schemes',
      'absent: the theme is chosen in Preferences'),
     ('Alt+E', 'Hide/show element outlines of views', _NO_POST),
@@ -147,7 +161,8 @@ KEYS = (
     ('Alt+Shift+Y', 'Set -Y view', (VIEW, '-y')),
     ('Alt+Shift+Z', 'Set -Z view', (VIEW, '-z')),
     ('Alt+Shift+1', 'Reset bounding box around visible entities',
-     'absent: no bounding boxes'),
+     'taken: Alt+Shift+1 fits the view to the visible entities (Gmsh '
+     'tool dock)'),
     ('Alt+Ctrl++1', 'Sync scale between viewports', 'absent: one viewport'),
 )
 
