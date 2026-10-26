@@ -49,7 +49,9 @@ OPERATION = 'mesh.preview'
 VOLUME_OPERATION = 'mesh.volume'
 OPERATIONS = (OPERATION, VOLUME_OPERATION)
 
-#: D7. The volume is read by default only below this many cells.
+#: D7. The least number of cells the volume is read by default below. The
+#: limit itself scales with the drawing device and the free RAM
+#: (``gpu_profile.auto_volume_max_cells``, DP-6083); this is its floor.
 VOLUME_AUTO_MAX_CELLS = 200_000
 #: Opening the volume's ``.vtu`` in the window holds about this many times
 #: its bytes (the reader's buffer and the grid it builds), checked against

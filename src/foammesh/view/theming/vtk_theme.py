@@ -137,6 +137,10 @@ def apply_triad_theme(cube, axes, tokens) -> None:
                  axes.GetZAxisTipProperty()), colours):
             shaft.SetColor(*colour)
             tip.SetColor(*colour)
+        for caption, colour in zip(
+                (axes.GetXAxisCaptionActor2D(), axes.GetYAxisCaptionActor2D(),
+                 axes.GetZAxisCaptionActor2D()), colours):
+            caption.GetCaptionTextProperty().SetColor(*colour)
 
 
 def watermark_opacity(tokens) -> float:

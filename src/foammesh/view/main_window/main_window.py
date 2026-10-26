@@ -2063,8 +2063,13 @@ class MainWindow(QMainWindow):
         zones = tuple(mesh.zoneIds())
         named = set(patches) | set(zones)
         volume = tuple(key for key in mesh.actorIds() if key not in named)
+        notice = mesh.previewNotice() if callable(
+            getattr(mesh, 'previewNotice', None)) else None
+        deferred = bool(not volume and isinstance(notice, dict)
+                        and 'load_volume' in (notice.get('actions') or ()))
         return view_modes.Scene(geometry=geometry, patches=patches,
-                                volume=volume, zones=zones)
+                                volume=volume, zones=zones,
+                                volume_deferred=deferred)
 
     def applyViewMode(self, modeId: str) -> bool:
         """Enter a view mode, or say in words why this case has no such view.

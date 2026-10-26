@@ -108,6 +108,9 @@ class Scene:
     patches: tuple[str, ...] = ()
     volume: tuple[str, ...] = ()
     zones: tuple[str, ...] = ()
+    #: DP-6083. The mesh has a volume that is not loaded yet: the viewport
+    #: shows its boundary surface and offers Load full volume.
+    volume_deferred: bool = False
 
     def mesh_parts(self) -> tuple[str, ...]:
         return tuple(self.patches) + tuple(self.volume) + tuple(self.zones)
@@ -147,6 +150,9 @@ _NO_MESH = no_mesh_yet('there are no cells to show. '
                        'Run the meshing workflow first.')
 _NO_PATCHES = ('This mesh has no named boundary patches, so there is no '
                'boundary mesh to show separately from the volume.')
+_VOLUME_DEFERRED = ('The volume of this mesh is not loaded: it has more cells than '
+                    'this PC shows automatically, so only its boundary surface '
+                    'is drawn. Press Load full volume in the viewport.')
 _NO_VOLUME = ('This result has no internal volume — it is a surface mesh, '
               'so there is nothing to cut open or fill.')
 
@@ -181,7 +187,8 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
         if not scene.mesh_parts():
             return ViewPlan(mode_id, unavailable=_NO_MESH)
         if not scene.volume:
-            return ViewPlan(mode_id, unavailable=_NO_VOLUME)
+            return ViewPlan(mode_id, unavailable=(
+                _VOLUME_DEFERRED if scene.volume_deferred else _NO_VOLUME))
         wanted = tuple(scene.volume) + tuple(scene.zones)
         visible, hidden = _split(scene, wanted)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
@@ -191,7 +198,8 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
         if not scene.mesh_parts():
             return ViewPlan(mode_id, unavailable=_NO_MESH)
         if not scene.volume:
-            return ViewPlan(mode_id, unavailable=_NO_VOLUME)
+            return ViewPlan(mode_id, unavailable=(
+                _VOLUME_DEFERRED if scene.volume_deferred else _NO_VOLUME))
         wanted = tuple(scene.volume) + tuple(scene.zones)
         visible, hidden = _split(scene, wanted)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE, section=True,
@@ -202,7 +210,8 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
     if not scene.mesh_parts():
         return ViewPlan(mode_id, unavailable=_NO_MESH)
     if not scene.volume:
-        return ViewPlan(mode_id, unavailable=_NO_VOLUME)
+        return ViewPlan(mode_id, unavailable=(
+                _VOLUME_DEFERRED if scene.volume_deferred else _NO_VOLUME))
     wanted = tuple(scene.volume) + tuple(scene.zones)
     visible, hidden = _split(scene, wanted)
     return ViewPlan(mode_id, visible, hidden, SURFACE, quality=True,

@@ -6,9 +6,9 @@ window built in stages, hidden. The user's decision (17 October 2026): show a
 FoamMesh splash with the logo within about a second of launch while the window
 builds; the main window looks the same once it appears.
 
-The splash is a picture, not a control: a frameless window with the logo, the
-application's name and version, and a "Starting" line, drawn in the light or
-dark theme's own colours. It never takes part in "last window closed" (closing
+The splash is a picture, not a control: a frameless window with the branded
+artwork (resources/branding/foammesh_splash.png, made by scripts/make_splash.py),
+the application's name and version and a "Starting" line painted over it. It never takes part in "last window closed" (closing
 it must not end the application), and :func:`show` gives back ``None`` -- no
 splash, the start goes on -- for anything but a real ``QApplication``.
 
@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import logging
 
-from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap
+from PySide6.QtCore import QRect, Qt, QUrl
+from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QPainter,
+                           QPixmap)
 from PySide6.QtWidgets import QApplication, QWidget
 
 from resources import resource
@@ -29,9 +30,18 @@ from resources import resource
 logger = logging.getLogger(__name__)
 
 #: The splash's size in device-independent pixels.
-WIDTH = 440
-HEIGHT = 260
-LOGO = 96
+WIDTH = 800
+HEIGHT = 400
+#: The Erevnaa mark beside "Developed by", and where it leads.
+MARK = 40
+#: The centre line of the credit block.
+CREDIT_X = 690
+LINK = 'https://www.erevnaa.com'
+LINK_TEXT = 'www.erevnaa.com'
+NAVY, BLUE, MUTED = '#013684', '#018BB6', '#5a6878'
+#: Where the name and the version sit on the artwork
+#: (scripts/make_splash.py draws the rest).
+NAME_X = 250
 
 #: The theme tokens the splash draws with, and the values used should the
 #: theme file be unreadable (they are the shipped light and dark values).
@@ -73,10 +83,6 @@ def colours(theme: str) -> dict[str, str]:
     return chosen
 
 
-def _read_logo(properties) -> QPixmap:
-    return QPixmap(str(resource.file(properties.logoResource)))
-
-
 class StartupSplash(QWidget):
     """The window shown while the main window is built. Draws, nothing else."""
 
@@ -91,7 +97,10 @@ class StartupSplash(QWidget):
         self.setAccessibleName(f'{properties.name} is starting')
         self.theme = theme
         self._colours = colours(theme)
-        self._logo = _read_logo(properties)
+        self._art = QPixmap(str(resource.file('branding/foammesh_splash.png')))
+        self._mark = QPixmap(str(resource.file('branding/erevnaa_mark.png')))
+        self._link = QRect()
+        self.setMouseTracking(True)
         self._name = properties.name
         self._version = f'Version {properties.version}'
         self.setFixedSize(WIDTH, HEIGHT)
@@ -102,36 +111,80 @@ class StartupSplash(QWidget):
                       area.y() + (area.height() - HEIGHT) // 2)
 
     def paintEvent(self, _event):
-        c = self._colours
         with QPainter(self) as painter:
             painter.setRenderHints(QPainter.RenderHint.Antialiasing
                                    | QPainter.RenderHint.SmoothPixmapTransform
                                    | QPainter.RenderHint.TextAntialiasing)
-            painter.fillRect(self.rect(), QColor(c['background.surface']))
-            # A thin accent band along the top, the border round the rest.
-            painter.fillRect(0, 0, WIDTH, 3, QColor(c['accent.default']))
-            painter.setPen(QColor(c['border.default']))
-            painter.drawRect(0, 0, WIDTH - 1, HEIGHT - 1)
-            if not self._logo.isNull():
-                painter.drawPixmap(QRect((WIDTH - LOGO) // 2, 36, LOGO, LOGO),
-                                   self._logo)
-            font = painter.font()
-            font.setPointSizeF(20.0)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.setPen(QColor(c['foreground.primary']))
-            painter.drawText(QRect(0, 142, WIDTH, 36),
-                             Qt.AlignmentFlag.AlignCenter, self._name)
-            font.setPointSizeF(9.5)
-            font.setBold(False)
-            painter.setFont(font)
-            painter.setPen(QColor(c['foreground.secondary']))
-            painter.drawText(QRect(0, 178, WIDTH, 20),
-                             Qt.AlignmentFlag.AlignCenter, self._version)
-            painter.setPen(QColor(c['foreground.muted']))
-            painter.drawText(QRect(16, HEIGHT - 32, WIDTH - 32, 20),
-                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                             'Starting\N{HORIZONTAL ELLIPSIS}')
+            if self._art.isNull():
+                painter.fillRect(self.rect(), QColor('#f4f6f9'))
+            else:
+                painter.drawPixmap(self.rect(), self._art)
+            self._link = paint_text(painter, self._name, self._version,
+                                    self._mark, None)
+
+    def mouseMoveEvent(self, event):
+        over = self._link.contains(event.position().toPoint())
+        self.setCursor(Qt.CursorShape.PointingHandCursor if over
+                       else Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if self._link.contains(event.position().toPoint()):
+            QDesktopServices.openUrl(QUrl(LINK))
+
+
+def paint_text(painter, name, version, mark, family) -> QRect:
+    """The name, version, "Starting..." and the credit; the link's rectangle.
+
+    Shared with ``scripts/make_splash.py --preview`` so the review copy is the
+    splash as it is drawn.
+    """
+    font = painter.font()
+    if family:
+        font.setFamily(family)
+    font.setPointSizeF(34.0)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QColor(NAVY))
+    painter.drawText(QRect(NAME_X, 108, 520, 60),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     name)
+    font.setPointSizeF(12.0)
+    font.setBold(False)
+    painter.setFont(font)
+    painter.setPen(QColor(BLUE))
+    painter.drawText(QRect(NAME_X, 170, 520, 28),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     version)
+    font.setPointSizeF(9.5)
+    painter.setFont(font)
+    painter.setPen(QColor(MUTED))
+    painter.drawText(QRect(40, 348, 300, 28),
+                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                     'Starting…')
+    # Credit: one centred block in the lower right, on three lines --
+    #   Developed by / <Erevnaa mark> / www.erevnaa.com
+    cx = CREDIT_X
+    lead = 'Developed by'
+    font.setPointSizeF(9.0)
+    painter.setFont(font)
+    lead_w = painter.fontMetrics().horizontalAdvance(lead)
+    painter.setPen(QColor(MUTED))
+    painter.drawText(QRect(cx - lead_w // 2 - 2, 300, lead_w + 4, 20),
+                     Qt.AlignmentFlag.AlignCenter, lead)
+    mark_rect = QRect(cx - MARK // 2, 322, MARK, MARK)
+    if mark is not None and not mark.isNull():
+        painter.drawPixmap(mark_rect, mark)
+    font.setPointSizeF(9.5)
+    font.setUnderline(True)
+    painter.setFont(font)
+    url_w = painter.fontMetrics().horizontalAdvance(LINK_TEXT)
+    link = QRect(cx - url_w // 2, 322 + MARK + 3, url_w, 22)
+    painter.setPen(QColor(BLUE))
+    painter.drawText(link, Qt.AlignmentFlag.AlignCenter, LINK_TEXT)
+    font.setUnderline(False)
+    painter.setFont(font)
+    # The mark is part of the link too.
+    return link.united(mark_rect)
 
 
 def show(application, properties, configured_theme: str | None = None):

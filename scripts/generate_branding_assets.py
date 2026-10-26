@@ -82,7 +82,7 @@ def main() -> int:
             'path': SOURCE.name,
             'sha256': _sha256(SOURCE),
             'size': list(Image.open(SOURCE).size),
-            'approval': 'approved_by_implementation_request_2026-07-13',
+            'approval': 'user chose the curved-mesh sheet, Erevnaa vertical ramp, no bezel (2026-10-26)',
         },
         'wordmark': {
             'status': 'approved',

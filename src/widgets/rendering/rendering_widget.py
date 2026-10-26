@@ -112,23 +112,27 @@ def _presetDirections(preset: str):
         raise ValueError(f'unknown view preset: {preset}') from error
 
 
-#: Plan 44 MF15 (F25, VV13). The orientation triad is a fixed 52 logical px
-#: square, 20 px right of the clear area's left edge and 22 px above its
-#: bottom (the console's top): the mockup's size, not a share of the window.
-#: It was a 0.2 share between 96 and 160 px in Plan 39 VI15.
-CORNER_SIZE = 52
+#: The orientation triad is a fixed 150 logical px square, 20 px right of the
+#: clear area's left edge and 22 px above its bottom (the console's top).
+#: User 2026-10-26: as large and as legible as FoamFlow's corner triad (the
+#: mockup's 52 px left X, Y and Z unreadable). The marker centres the origin
+#: (the arrows may point any way on screen), so the arms are about a third
+#: of this side.
+CORNER_SIZE = 150
 CORNER_LEFT = 20
 CORNER_BOTTOM = 22
 #: DP-2651. 2.4 drew 54 saturated pixels in the live render window (60 wanted;
 #: the offscreen test read 71); 3.4 draws about 76 live.
 TRIAD_AXIS_WIDTH = 3.4
-#: MF27. The corner axes run from the cube's centre to its faces.
-CORNER_AXES_LENGTH = (0.5, 0.5, 0.5)
+#: FoamFlow's look: the arrows run past the cube's faces, labels at the tips.
+CORNER_AXES_LENGTH = (1.0, 1.0, 1.0)
+#: The face-click cube is a small block at the arrows' root.
+CORNER_CUBE_SCALE = 0.6
 #: DP-2651. The axes run inside the cube, so an opaque face hid all but a
 #: stub of them (36 saturated pixels in the live read, the mockup draws three
 #: 16 px arms on top of its hexagon). The faces are translucent so the axes
 #: show through, as the mockup's lines do.
-TRIAD_FACE_OPACITY = 0.3
+TRIAD_FACE_OPACITY = 0.15
 #: Plan 45 B (P10). The world-origin triad's arms are this share of the
 #: model's SMALLEST non-zero bounding-box side.
 ORIGIN_ARM_SHARE = 0.4
@@ -154,6 +158,8 @@ def origin_arm_length(bounds) -> float:
 #: VTK's default caption is white and scales with the window (60 px letters
 #: at 1920 x 960, unreadable on the light ground).
 ORIGIN_LABEL_PX = 14
+#: The corner triad's X, Y and Z names.
+TRIAD_LABEL_PX = 15
 
 
 def facePresetAt(position) -> str | None:
@@ -3325,10 +3331,23 @@ class RenderingWidget(QWidget):
             return
         try:
             axes = vtkAxesActor()
-            axes.AxisLabelsOff()
+            # FoamFlow's look: arrowed axes that say X, Y and Z, each name
+            # in its axis's colour (the theme sets the colours).
+            axes.AxisLabelsOn()
             axes.PickableOff()
             axes.SetShaftTypeToLine()
-            axes.SetConeRadius(0.0)
+            axes.SetConeRadius(0.25)
+            axes.SetNormalizedLabelPosition(1.18, 1.18, 1.18)
+            for caption in (axes.GetXAxisCaptionActor2D(),
+                            axes.GetYAxisCaptionActor2D(),
+                            axes.GetZAxisCaptionActor2D()):
+                caption.GetTextActor().SetTextScaleModeToNone()
+                caption.BorderOff()
+                text = caption.GetCaptionTextProperty()
+                text.SetFontSize(TRIAD_LABEL_PX)
+                text.BoldOn()
+                text.ItalicOff()
+                text.ShadowOff()
             # MF27. The marker fits the assembly's bounds; unit axes ran a
             # half cube past the cube's faces, so the cube drew 22 px in the
             # 52 px corner (the mockup's is about 45). Axes from the centre
@@ -3363,6 +3382,7 @@ class RenderingWidget(QWidget):
                     prop.SetColor(*colour)
                     prop.SetOpacity(TRIAD_FACE_OPACITY)
             cube.GetCubeProperty().SetOpacity(TRIAD_FACE_OPACITY)
+            cube.SetScale(CORNER_CUBE_SCALE)
             assembly = vtkPropAssembly()
             assembly.AddPart(cube)
             assembly.AddPart(axes)
@@ -3452,7 +3472,7 @@ class RenderingWidget(QWidget):
         """Display point (render-window pixels) of a cube face's centre."""
         index = 'xyz'.index(preset[1])
         world = [0.0, 0.0, 0.0, 1.0]
-        world[index] = 0.5 if preset[0] == '+' else -0.5
+        world[index] = (0.5 if preset[0] == '+' else -0.5) * CORNER_CUBE_SCALE
         renderer = self._originAxes.GetRenderer()
         renderer.SetWorldPoint(*world)
         renderer.WorldToDisplay()

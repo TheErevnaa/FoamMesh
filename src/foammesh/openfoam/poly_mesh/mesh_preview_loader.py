@@ -14,7 +14,7 @@ from :mod:`foammesh.core.mesh.mesh_preview` run in a worker instead:
 2. the admission controller grants the one heavy worker slot, preview first
    (``PRIORITY_PREVIEW``), or refuses with both numbers;
 3. the worker writes the boundary surface -- and below
-   :data:`~foammesh.core.mesh.mesh_preview.VOLUME_AUTO_MAX_CELLS` cells, the
+   :func:`~foammesh.rendering.gpu_profile.auto_volume_max_cells` cells, the
    volume -- into ``<case>/foammesh/cache/``, under a Job Object cap;
 4. the sizes of those files are checked before any is opened, and then they
    are read on the VTK thread and deleted.
@@ -106,9 +106,9 @@ class MeshPreviewLoader(QObject):
         self.counts = counts
         cells = mesh_preview.estimated_cells(counts)
         mode = self._mode
+        limit = await asyncio.to_thread(gpu_profile.auto_volume_max_cells)
         if mode == AUTO:
-            mode = (VOLUME if cells is not None
-                    and cells <= mesh_preview.VOLUME_AUTO_MAX_CELLS
+            mode = (VOLUME if cells is not None and cells <= limit
                     else SURFACE)
         result = await self._build(mode, time, counts)
         if result is _RETRY_AS_SURFACE:
@@ -119,7 +119,7 @@ class MeshPreviewLoader(QObject):
                 self.tr('Preview not built: the worker refused the surface.'))
         if isinstance(result, dict) and self.shown == SURFACE and \
                 self.notice is None and cells is not None and \
-                cells > mesh_preview.VOLUME_AUTO_MAX_CELLS:
+                cells > limit:
             self.notice = {
                 'kind': 'surface',
                 'text': self.tr('Showing the boundary surface of a mesh of '

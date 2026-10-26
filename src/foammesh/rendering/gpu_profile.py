@@ -448,6 +448,48 @@ def preview_budget(budget: DisplayBudget | None = None,
     return int(triangles), int(limit)
 
 
+#: DP-6083. Share of the free RAM the volume read automatically may take: a
+#: card with its own memory leaves the RAM to the worker and the reader;
+#: integrated graphics, software and an unknown device draw out of that same
+#: RAM, so they are given half.
+AUTO_VOLUME_RAM_SHARE = {DISCRETE: 0.10}
+AUTO_VOLUME_RAM_SHARE_SHARED = 0.05
+#: The cell count the volume was read automatically below before it scaled.
+AUTO_VOLUME_MIN_CELLS = 200_000
+
+
+def auto_volume_max_cells(budget: DisplayBudget | None = None,
+                          available: int | None = None) -> int:
+    """Cells up to which a mesh is shown as its volume without being asked.
+
+    DP-6083 (user, 2026-10-26). It was a fixed 200,000, so a 293,281-cell
+    mesh opened as its boundary surface on every PC and Volume view then
+    refused. It now follows the memory of the device that draws the viewport
+    (the same rule as :func:`preview_budget`): the cells whose volume read
+    (``resource_budget`` ``mesh.volume``, per cell as the cut tool's offer
+    sizes it) takes :data:`AUTO_VOLUME_RAM_SHARE` of the free RAM -- a
+    discrete card's, or half that where the picture is drawn out of the RAM
+    (integrated, software, unknown). Never below
+    :data:`AUTO_VOLUME_MIN_CELLS`; when the RAM cannot be read it is that
+    floor. Above it the surface is shown with a Load full volume button, and
+    the admission may still refuse a volume the RAM cannot hold.
+    """
+    from foammesh.support import resource_budget
+
+    shown = budget if budget is not None else display_budget()
+    if available is None:
+        available = _free_ram()
+    available = max(0, int(available or 0))
+    if not available:
+        return AUTO_VOLUME_MIN_CELLS
+    share = AUTO_VOLUME_RAM_SHARE.get(shown.tier, AUTO_VOLUME_RAM_SHARE_SHARED)
+    fixed = resource_budget.estimate_peak_bytes('mesh.volume', {'cells': 0}).peak_bytes
+    per_cell = (resource_budget.estimate_peak_bytes(
+        'mesh.volume', {'cells': 1_000_000}).peak_bytes - fixed) / 1_000_000
+    cells = int((available * share - fixed) / max(1.0, per_cell))
+    return max(AUTO_VOLUME_MIN_CELLS, cells)
+
+
 def window_room(available: int | None = None) -> int | None:
     """Bytes of preview file the window can open with the RAM free now
     (:data:`PREVIEW_MEMORY_SHARE` of it), or None when it cannot be read --
