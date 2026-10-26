@@ -1,5 +1,29 @@
 # FoamMesh Release Notes
 
+## 1.1.4 — 2026-10-26
+
+- **The Gmsh route is a complete mesher, for OpenFOAM and SU2.** It runs on
+  FoamMesh's own Gmsh 4.15.2 build, copied into the WSL distribution that
+  already holds OpenFOAM. Options take the kinds and limits Gmsh gives them,
+  and your `.msh` is written in the version and encoding you picked.
+- **Surfaces have a purpose.** Each surface is an outer boundary, an internal
+  face, a baffle, or a conformal or non-conformal interface between regions,
+  and periodic pairs are checked for contact. The Edit surface dialog, the Run
+  refusal and the stage report give the same reason and remedy. Edit surface
+  says when a locked step is why it did nothing, and its notes are no longer
+  cut off.
+- **Geometry builder, sweeps, mesh actions, size fields and plugins** on the
+  Gmsh route, and the viewport draws every Gmsh display option.
+- **The local API.** An operation given a missing or mistyped parameter
+  answers a coded 400 that names it, never a bare 500. Operations without a
+  written schema now list the parameters they read.
+- **Medit (.mesh) export is retired**: Gmsh 4.15.2's writer crashes on some
+  meshes. Export .msh, .su2, VTK or polyMesh instead.
+- **Known issue.** When Windows draws FoamMesh on an integrated GPU while a
+  discrete one is present, Volume view can refuse a volume mesh with "no
+  internal volume". Set FoamMesh to High performance in Settings > System >
+  Display > Graphics, or use the discrete GPU's display as the main one.
+
 ## 1.1.3 — 2026-10-21
 
 - **The local API answers only trusted clients.** The access key in the
