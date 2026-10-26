@@ -439,7 +439,7 @@ class LayersStage:
 
         DP-6054. A periodic side is no wall: the flow leaves through it and
         comes back through its partner, whose mesh is copied onto it. A layer
-        grown on it lands on top of that copy. MEASURED (MCP pass, duct.step,
+        grown on it lands on top of that copy. MEASURED (API pass, duct.step,
         every eligible wall, a translation pair on the two ends): 2,408
         interior faces with both cells on one side, and the publish refused.
         Left bare, the side is rebuilt from the layer's rim like any patch
