@@ -6755,7 +6755,9 @@ runTimeModifiable true;
             terminal = shutil.which('wt.exe')
             if terminal:
                 argv.insert(0, terminal)
-                creationflags = 0
+                # A terminal the user is meant to see: not hidden like the
+                # app's working processes (foammesh.support.hidden_console).
+                creationflags = getattr(subprocess, 'DETACHED_PROCESS', 0)
             else:
                 creationflags = getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)
             process = subprocess.Popen(tuple(argv), cwd=session.case_path,
@@ -6766,7 +6768,9 @@ runTimeModifiable true;
             if terminal is None:
                 raise CapabilityUnavailableError(
                     'no supported terminal emulator is available')
-            process = subprocess.Popen((terminal,), cwd=session.case_path)
+            process = subprocess.Popen(
+                (terminal,), cwd=session.case_path,
+                creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
         return self._read_result(session, command, {
             'started': True, 'pid': process.pid,
             'profile_id': profile.profile_id,

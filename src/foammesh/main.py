@@ -288,6 +288,10 @@ async def warm_utility_help(capabilities, names=STARTUP_HELP_UTILITIES):
 
 
 def main():
+    # Every program FoamMesh starts (wsl.exe, Gmsh, checkMesh, ...) runs without
+    # its own black console window over the viewport.
+    from foammesh.support import hidden_console
+    hidden_console.install()
     self_test_path = _package_self_test_path(sys.argv[1:])
     if self_test_path is not None:
         report = run_package_self_test(self_test_path)
