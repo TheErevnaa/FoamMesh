@@ -1,5 +1,19 @@
 # FoamMesh Release Notes
 
+## 1.1.5 — 2026-10-28
+
+- **Region interfaces between three or more bodies.** Split interfaces now
+  names both bodies each shared wall joins, and gives each body a seed point
+  inside it. Before, a hot fluid / pipe wall / cold fluid stack was recorded
+  as pipe-to-surrounding twice, and the export refused the finished mesh.
+- **Each side of an interface is found in the mesh**, by name, by the solid
+  typed on the Gmsh route, or by the region seed inside it on snappy. A run
+  whose interface sides do not name two different regions is refused before
+  meshing, with the remedy.
+- **Known issue.** On the Gmsh route, a body split by angle can leave a
+  ring-shaped end face that Gmsh cannot mesh cleanly, and the run then stays
+  in "meshing 3D". Cancel it, and mesh the body without the angle split.
+
 ## 1.1.4 — 2026-10-26
 
 - **The Gmsh route is a complete mesher, for OpenFOAM and SU2.** It runs on
