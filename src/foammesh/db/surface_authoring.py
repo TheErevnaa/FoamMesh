@@ -157,12 +157,26 @@ def region_choices(document) -> list[tuple[str, str]]:
     volumes left the person ``wall`` and Surrounding for both interfaces.
     A mesh region whose name a cell-zone volume already offers is not
     offered twice.
+
+    A body Split interfaces cut is offered too, zone or not: it records a
+    point inside each body an interface joins, and names both as the
+    interface's sides. So is any body a relation already names, so the side
+    a relation holds is always one the editor can show.
     """
+    named = set()
+    for relation in ((document or {}).get('surfaceRelations') or {}).values():
+        if isinstance(relation, dict):
+            for side in ('ownerRegion', 'neighbourRegion'):
+                key = model.region_key(relation.get(side))
+                if key is not None:
+                    named.add(str(key))
     choices = []
     for key, row in model._sorted_items(_geometry(document)):
         if (isinstance(row, dict)
                 and model._text(row.get('gType')) == 'volume'
-                and model._text(row.get('cfdType')) == 'cellZone'):
+                and (model._text(row.get('cfdType')) == 'cellZone'
+                     or model._flag(row.get('zoneInsidePointSet'))
+                     or str(key) in named)):
             choices.append((model.region_ref(key),
                             model._text(row.get('name')) or str(key)))
     offered = {label for _ref, label in choices}

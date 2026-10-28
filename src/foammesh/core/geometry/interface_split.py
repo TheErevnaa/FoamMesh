@@ -436,21 +436,26 @@ def split_assembly(paths, *, labels=None, directory=None) -> dict:
             'inside': None,
             'insideShell': None,
         }
-        # The zone an interface carves is the smaller of the two bodies it
-        # separates. v13 names one region per interface and leaves the
-        # outermost as the remainder (`heatedDuct`'s Allrun does it with
-        # `splitMeshRegions -defaultRegionName fluid`), so the region named
-        # here is the one *enclosed*, never the one doing the enclosing.
-        enclosed = min((first, second), key=lambda item: abs(volumes.get(item, 0.0)))
-        point = interior_point(owned.get(enclosed, ()), coordinates,
-                               volume=volumes.get(enclosed))
-        entry['insideShell'] = enclosed
-        entry['inside'] = list(point) if point else None
-        if point is None:
-            record['warnings'].append(
-                f'no point strictly inside {enclosed!r} could be found, so '
-                f'the cell zone for {name!r} has no seed and must be given '
-                'one by hand')
+        # Both bodies are the interface's regions, and each gets a point
+        # strictly inside it. Which body is "enclosed" is not measured:
+        # comparing volumes picked the steel pipe for BOTH of a hot fluid /
+        # pipe / cold fluid stack's interfaces (the pipe is the smallest
+        # body), and named the other side only as "surrounding". The first
+        # body is the one whose zone the interface carves (``insideShell``);
+        # the record names the second as its partner.
+        entry['sides'] = []
+        for label in (first, second):
+            point = interior_point(owned.get(label, ()), coordinates,
+                                   volume=volumes.get(label))
+            entry['sides'].append(
+                {'shell': label, 'inside': list(point) if point else None})
+            if point is None:
+                record['warnings'].append(
+                    f'no point strictly inside {label!r} could be found, so '
+                    f'its side of {name!r} has no seed and must be given '
+                    'one by hand')
+        entry['insideShell'] = first
+        entry['inside'] = entry['sides'][0]['inside']
         if directory is not None:
             entry['path'] = write_stl(
                 Path(directory) / f'{name}.stl', name,

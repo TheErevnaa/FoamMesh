@@ -1231,13 +1231,14 @@ def gate_target(intent) -> str:
     return 'native'
 
 
-def surface_intent_gate(db, intent, prepared_geometry, geometry) -> None:
+def surface_intent_gate(db, intent, prepared_geometry, geometry,
+                        case_path=None) -> None:
     """Raise :class:`ExecutionError` when the surface intent blocks a run."""
     from foammesh.core.engine import surface_capabilities
     from .surface_roles import _prepared_mapping
     try:
         surface_capabilities.gate(
-            db, None, 'gmsh', gate_target(intent), stage='run',
+            db, case_path, 'gmsh', gate_target(intent), stage='run',
             prepared=_prepared_mapping(prepared_geometry),
             geometry=[str(item) for item in geometry or ()],
             dimensionality=getattr(getattr(intent, 'dimensionality', None),
@@ -1247,7 +1248,8 @@ def surface_intent_gate(db, intent, prepared_geometry, geometry) -> None:
                              details=refusal.details()) from refusal
 
 
-def check_job(db, intent, prepared_geometry, geometry) -> None:
+def check_job(db, intent, prepared_geometry, geometry,
+              case_path=None) -> None:
     """Refuse, before anything is written or imported, a job the runner
     would refuse (Plan 48 RR). ``write_job`` and ``session_job`` call it."""
     from foammesh.core.engine.registry import configured_target_solver
@@ -1257,7 +1259,9 @@ def check_job(db, intent, prepared_geometry, geometry) -> None:
     # surface or relation, an unmeasured or failed periodic pair, a role or
     # type this target cannot carry). The checks below stay as the route's
     # own second line.
-    surface_intent_gate(db, intent, prepared_geometry, geometry)
+    # DP-6084: the case path lets the gate read the geometry store, which
+    # says which typed solid each body a region interface names is.
+    surface_intent_gate(db, intent, prepared_geometry, geometry, case_path)
 
     # DP-52/DP-53. The runner refuses this, and it refuses it after WSL has
     # booted and the geometry has been imported -- MEASURED at 71 s on
@@ -1347,7 +1351,7 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         profile=profile, run_id=run_id)
     # Plan 48 RR (DP-4009). The refusals below are shared with the resident
     # session's job (``session_job``): one set of checks for both paths.
-    check_job(db, intent, prepared_geometry, geometry)
+    check_job(db, intent, prepared_geometry, geometry, case_path)
     if intent.export.mesh_format == 'su2' and 'su2' not in formats:
         # A second-order mesh only survives in Gmsh's own SU2 file, so the run
         # has to be given somewhere to write it.
@@ -1453,7 +1457,7 @@ def session_job(db, bbox, case_path, *, prepared_geometry=None,
         intent = derive_page_intent(
             db, bbox, case_path, prepared_geometry=prepared_geometry,
             profile=profile)
-    check_job(db, intent, prepared_geometry, geometry)
+    check_job(db, intent, prepared_geometry, geometry, case_path)
     job = build_job(
         intent, geometry=geometry, outputs={},
         prepared_geometry=prepared_geometry, profile=profile,

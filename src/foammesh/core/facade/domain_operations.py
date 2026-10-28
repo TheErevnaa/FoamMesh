@@ -7444,7 +7444,7 @@ runTimeModifiable true;
         Three edits, and each of them is a fact the snappy writer reads. The
         bodies that lost faces get their polydata replaced, or the tree and
         the viewport would go on showing a wall that is no longer theirs.
-        The enclosed body's volume is typed ``cellZone`` and given the seed,
+        The first body's volume is typed ``cellZone`` and given the seed,
         because ``surfaceZonesInfo.C:79-82`` makes the point mandatory under
         ``mode insidePoint`` and an interface -- enclosing nothing -- cannot
         be written any other way. And the interface itself becomes a surface
@@ -7497,19 +7497,48 @@ runTimeModifiable true;
                                               'rows': refreshed,
                                               'removed': removed}
 
+        sides_of: dict = {}
         for item in result['interfaces']:
-            enclosed = str(item.get('inside_geometry_id') or '')
-            volume = self._volume_of(data, enclosed)
-            if volume is None:
+            # Both bodies are the interface's regions. The first carves its
+            # zone with the interface and takes its seed; the second is named
+            # as the region on the other side, by its own volume, so the
+            # export never has to guess it ("surrounding" was a guess, and on
+            # three bodies it guessed wrong).
+            volumes = []
+            for side in item.get('sides') or ():
+                volume = self._volume_of(data, str(side.get('geometry_id') or ''))
+                if volume is None:
+                    raise PreconditionFailedError(
+                        'a body this interface joins has no volume in the '
+                        'project tree', details={
+                            'geometry_id': side.get('geometry_id'),
+                            'body': side.get('shell'),
+                            'interface': item['name']})
+                volumes.append(str(volume))
+            if len(volumes) != 2 or volumes[0] == volumes[1]:
                 raise PreconditionFailedError(
-                    'the body this interface encloses has no volume in the '
-                    'project tree', details={'geometry_id': enclosed,
-                                             'interface': item['name']})
+                    'an interface joins two bodies, and this one does not '
+                    'name two', details={'interface': item['name'],
+                                         'volumes': volumes})
+            volume = volumes[0]
             data.setValue(f'geometry/{volume}/cfdType', CFDType.CELL_ZONE.value)
             for axis, value in zip(('x', 'y', 'z'), item['inside_point']):
                 data.setValue(
                     f'geometry/{volume}/zoneInsidePoint/{axis}', float(value))
             data.setValue(f'geometry/{volume}/zoneInsidePointSet', True)
+            # The other body keeps its type; it is given its own point, so
+            # the side it is on is a body the editor offers and the export
+            # can find by the region seed inside it.
+            partner = (item.get('sides') or [{}, {}])[1]
+            if (partner.get('inside_point')
+                    and not data.getElement('geometry', volumes[1]).value(
+                        'zoneInsidePointSet')):
+                for axis, value in zip(('x', 'y', 'z'),
+                                       partner['inside_point']):
+                    data.setValue(f'geometry/{volumes[1]}/zoneInsidePoint/'
+                                  f'{axis}', float(value))
+                data.setValue(f'geometry/{volumes[1]}/zoneInsidePointSet',
+                              True)
 
             geometry_id = str(item['geometry_id'])
             rows = self._rows_for(manifest, geometry_id)
@@ -7535,7 +7564,8 @@ runTimeModifiable true;
                 added.append(str(data.addElement('geometry', surface)))
             summary['interfaces'].append({
                 'geometry_id': geometry_id, 'name': item['name'],
-                'volume': str(volume), 'added': added,
+                'volume': str(volume), 'partner_volume': volumes[1],
+                'added': added,
                 'inside_point': list(item['inside_point'])})
 
         session.state.commit(
@@ -7546,7 +7576,36 @@ runTimeModifiable true;
         for item in summary['interfaces']:
             item['added'] = [str(data.remappedKey('geometry', key))
                              for key in item['added']]
+        self._name_interface_sides(session, summary['interfaces'])
         return summary
+
+    @staticmethod
+    def _name_interface_sides(session: CaseSession, interfaces: list) -> None:
+        """Record each cut interface as a conformal region interface between
+        the two bodies it joins.
+
+        The same edit the surface roles tab makes when a person names both
+        regions by hand: one shared surface, its own body on one side and
+        the body it touches on the other.
+        """
+        from foammesh.core.facade import surface_intent_api as api
+        from foammesh.db import surface_authoring as authoring
+        from foammesh.db import surface_intent as model
+        from foammesh.core.project import Source
+
+        data = session.state.checkout()
+        for item in interfaces:
+            if not item['added']:
+                continue
+            edit = authoring.SurfaceEdit(
+                role=model.CONFORMAL, partner=authoring.SHARED,
+                own_region=model.region_ref(item['volume']),
+                partner_region=model.region_ref(item['partner_volume']))
+            api.write(data, item['added'], edit)
+        session.state.commit(
+            data, action='split interfaces: name both sides',
+            source=Source.GUI, target='surfaceRelations',
+            reason='; '.join(str(item['name']) for item in interfaces))
 
     @staticmethod
     def _refresh_polydata(data, keys: list, rows: list, pieces: dict) -> list:

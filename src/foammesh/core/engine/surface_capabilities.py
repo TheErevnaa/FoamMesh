@@ -264,7 +264,7 @@ STALE = 'stale_mesh'
 #: each part of it; the reason and remedy are the builder's.
 NOT_BUILDABLE = 'not_buildable'
 ISSUE_CODES = (UNRESOLVED, UNSUPPORTED, CONDITION, UNVERIFIED, FAILED,
-               CONFLICT, STALE, NOT_BUILDABLE)
+               CONFLICT, STALE, NOT_BUILDABLE, 'region_sides')
 
 
 @dataclass(frozen=True)
@@ -685,6 +685,86 @@ def build_issues(db, route, target, *, document=None, prepared=None,
     return issues
 
 
+#: An interface whose sides do not name two regions of the mesh.
+REGION_SIDES = 'region_sides'
+
+
+def region_side_issues(document, route, target, *, case_path=None,
+                       stage: str = 'run') -> list[IntentIssue]:
+    """Region interfaces whose two sides do not name two mesh regions.
+
+    The export couples a region interface by the regions on its sides
+    (``handoff`` ``relation_ambiguous``). With three regions or more, a side
+    that names no region of the mesh -- a body none of the regions holds, or
+    ``surrounding`` beside a region that has more than one interface --
+    leaves several pairs it could be, and that was found only after the
+    mesh had been built: MEASURED on a hot fluid / pipe / cold fluid stack,
+    whose cut interfaces both read ``pipe`` <-> ``surrounding``. This says it
+    before the run. With two regions there is one pair and nothing to ask.
+    """
+    from foammesh.core.geometry.body_regions import body_regions, side_region
+
+    regions = model.mesh_region_names(document)
+    relations = [(key, relation) for key, relation in
+                 model._sorted_items(document.get('surfaceRelations'))
+                 if isinstance(relation, dict)
+                 and model._text(relation.get('kind'))
+                 in (model.CONFORMAL, model.NON_CONFORMAL)
+                 and model._text(relation.get('state')) != model.UNRESOLVED]
+    if len(regions) < 2 or not relations:
+        return []
+    try:
+        bodies = body_regions(document, case_path)
+    except Exception:  # noqa: BLE001 - judged by name alone
+        bodies = {}
+    blocking = stage != 'edit'
+    resolved = []
+    for key, relation in relations:
+        sides = []
+        for side in ('ownerRegion', 'neighbourRegion'):
+            reference = model._text(relation.get(side))
+            sides.append((reference, side_region(document, reference,
+                                                 bodies)))
+        resolved.append((key, relation, sides))
+    interfaces_of: dict[str, int] = {}
+    for _key, _relation, sides in resolved:
+        for _reference, region in sides:
+            if region:
+                interfaces_of[region] = interfaces_of.get(region, 0) + 1
+    remedy = ('Name the region on each side of the interface in the '
+              'surface roles tab.')
+    issues: list[IntentIssue] = []
+    for key, relation, sides in resolved:
+        label = _relation_label(relation, key)
+        found = [region for _reference, region in sides]
+        reason = ''
+        if found[0] and found[0] == found[1]:
+            reason = f'both of its sides are in the region {found[0]}'
+        elif len(regions) > 2:
+            for (reference, region), other in zip(sides, reversed(found)):
+                if region:
+                    continue
+                if reference == model.SURROUNDING_REGION:
+                    if other and interfaces_of.get(other, 0) > 1:
+                        reason = (
+                            f'one side is "surrounding", and {other} meets '
+                            'more than one region, so the mesh cannot say '
+                            'which one it is')
+                elif reference:
+                    reason = (f'its side {reference} is in none of the '
+                              f'mesh regions ({", ".join(regions)})')
+                else:
+                    reason = 'one of its sides names no region'
+                if reason:
+                    break
+        if reason:
+            issue = IntentIssue(label, reason, remedy, route, target,
+                                REGION_SIDES, 'relation', blocking)
+            if issue not in issues:
+                issues.append(issue)
+    return issues
+
+
 def preflight(db, case_path, route, target, *, stage: str, prepared=None,
               geometry: Iterable = (), dimensionality: str | None = None,
               stale: bool = False) -> list[IntentIssue]:
@@ -705,6 +785,10 @@ def preflight(db, case_path, route, target, *, stage: str, prepared=None,
     document = measured_document(document, prepared)
     issues = validate(document, route, target, stage=stage, assessed=True,
                       geometry=geometry, dimensionality=dimensionality)
+    if (normalise_route(route), normalise_target(target, route))             not in ROUTE_REFUSALS:
+        issues.extend(issue for issue in region_side_issues(
+            document, route, target, case_path=case_path, stage=stage)
+            if issue not in issues)
     if stage in BUILD_STAGES:
         issues.extend(build_issues(
             db, route, target, document=document, prepared=prepared,
@@ -986,6 +1070,6 @@ __all__ = (
     'ISSUE_CODES', 'NOT_BUILDABLE',
     'SurfaceIntentRefused', 'blocking', 'build_issues', 'built_staleness',
     'capability', 'capability_table', 'check', 'gate', 'intent_digest',
-    'preflight', 'read_record',
+    'preflight', 'read_record', 'region_side_issues',
     'refusal_text', 'stage_report', 'stale_issue', 'validate',
     'write_built_record', 'write_exported_record')

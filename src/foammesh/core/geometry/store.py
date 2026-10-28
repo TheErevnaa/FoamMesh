@@ -1551,8 +1551,8 @@ class GeometryArtifactStore:
 
         Each body keeps a new revision holding only the faces it shares with
         nobody; each interface becomes a geometry of its own, named
-        ``<a>_to_<b>``, and carries the point inside the region it encloses
-        that ``mode insidePoint`` needs. A body that shares nothing is left
+        ``<a>_to_<b>``, and names both bodies as its sides, each with the
+        point inside it that ``mode insidePoint`` needs. A body that shares nothing is left
         untouched, which is the answer for the single-region models that are
         most of the catalogue. ``preview`` measures and writes nothing.
         """
@@ -1642,6 +1642,13 @@ class GeometryArtifactStore:
                       'inside_shell': item['insideShell'],
                       'inside_point': item['inside'],
                       'geometry_id': None}
+            # Both bodies are the interface's sides, each with the point
+            # inside it; the first is the one whose zone the interface carves.
+            joined['sides'] = [
+                {'shell': side['shell'], 'inside_point': side['inside'],
+                 'geometry_id': (by_label[side['shell']][1]['geometry_id']
+                                 if side['shell'] in by_label else None)}
+                for side in item.get('sides') or ()]
             if not preview and item.get('path'):
                 imported = self.import_file(item['path'])
                 joined['geometry_id'] = imported['geometry_id']

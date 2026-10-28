@@ -680,9 +680,13 @@ def _foam_word(name) -> str:
     return re.sub(r"""[\s"'/;{}]""", '', str(name)) or str(name)
 
 
-def _region_name_for(document, reference: str, regions: Iterable[str]) -> str:
+def _region_name_for(document, reference: str, regions: Iterable[str],
+                     bodies=None) -> str:
     """The exported region a relation's ``geometry:<key>`` side names, or
-    the one its ``region:<name>`` side is (DP-6062)."""
+    the one its ``region:<name>`` side is (DP-6062).
+
+    *bodies* is :func:`foammesh.core.geometry.body_regions.body_regions`:
+    a body whose name is not a region's is matched by the region it holds."""
     reference = _text(reference)
     regions = list(regions)
     if reference.startswith('region:'):
@@ -704,7 +708,8 @@ def _region_name_for(document, reference: str, regions: Iterable[str]) -> str:
                       re.sub(r'[^A-Za-z0-9_]', '_', name)):
         if candidate and candidate in regions:
             return candidate
-    return ''
+    found = (bodies or {}).get(reference[len('geometry:'):])
+    return found if found in regions else ''
 
 
 # --------------------------------------------------------------------------- #
@@ -868,8 +873,16 @@ def build_openfoam_document(case_root, *, source_case=None, db=None,
     _check_pairs(patches, by_region, fail)
 
     surfaces = _surfaces(identity, intent, patches, zones)
+    bodies = {}
+    if document and len(region_names) > 1:
+        from foammesh.core.geometry.body_regions import body_regions
+
+        try:
+            bodies = body_regions(document, source_case)
+        except Exception:  # noqa: BLE001 - matched by name alone, as before
+            bodies = {}
     relations = _relations(document, identity, couplings or [], patches,
-                           region_names)
+                           region_names, bodies)
     if document or identity is not None:
         _check_intent(surfaces, relations, patches, zones, by_region,
                       couplings or [], fail, warnings)
@@ -1040,7 +1053,7 @@ def _transform(relation) -> dict:
 
 
 def _relations(document, identity, couplings, patches,
-               region_names) -> list[dict]:
+               region_names, bodies=None) -> list[dict]:
     result = []
     for key, relation in sorted(
             ((document or {}).get('surfaceRelations') or {}).items(),
@@ -1058,7 +1071,8 @@ def _relations(document, identity, couplings, patches,
                 'displayName': _text(relation.get(f'{side}Label')),
                 'solverName': name,
                 'region': (_region_name_for(
-                    document, relation.get(f'{side}Region'), region_names)
+                    document, relation.get(f'{side}Region'), region_names,
+                    bodies)
                     or _text(relation.get(f'{side}Region'))),
             }
         result.append({
