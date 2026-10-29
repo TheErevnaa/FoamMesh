@@ -1,5 +1,17 @@
 # FoamMesh Release Notes
 
+## 1.1.6 — 2026-10-29
+
+- **Gmsh no longer stalls on long imported surfaces.** A long patch of an
+  imported STL -- a tube wall, or a body split by angle -- could be mapped so
+  stretched that Gmsh left invalid surface elements on it, and the run then
+  stayed in "meshing 3D" without finishing. The run now reads Gmsh's own
+  invalid-element report and remeshes the surface with each patch cut into
+  smaller pieces, keeping the first result with no cell under the quality
+  floor. Patch names are unchanged; the run log says which size was used.
+- The 1.1.5 known issue (Gmsh stays in "meshing 3D" on a body split by angle)
+  is fixed.
+
 ## 1.1.5 — 2026-10-28
 
 - **Region interfaces between three or more bodies.** Split interfaces now
