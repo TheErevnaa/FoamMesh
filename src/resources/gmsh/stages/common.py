@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import os as _os
 import sys as _sys
@@ -139,6 +140,48 @@ class SurfaceCrossing(MeshFailure):
         self.at = tuple(at)
         self.pairs = int(pairs)
         self.remeshed = bool(remeshed)
+
+
+class InvalidSurfaceMesh(MeshFailure):
+    """The surface pass left elements Gmsh itself calls invalid.
+
+    DP-6085. MEASURED on the hot fluid / pipe / cold fluid tubes split by
+    angle, Gmsh 4.15.2: Frontal-Delaunay fails on a 0.5 m tube patch of
+    7,680 triangles, MeshAdapt retries it and logs "88 elements remain
+    invalid in surface 18", and the volume pass handed that surface spins in
+    "Recovering boundary" at 100% CPU with no end. Raised between the two
+    passes so the volume mesher never sees it. ``surfaces`` maps a surface
+    tag to its invalid element count, ``patches`` names them, ``triangles``
+    is the largest number of imported triangles on one of them, and
+    ``remeshed`` is False when the imported facets were what was meshed.
+    """
+
+    def __init__(self, message, surfaces=None, patches=(), triangles=0,
+                 remeshed=True):
+        super().__init__(message)
+        self.surfaces = dict(surfaces or {})
+        self.patches = tuple(patches)
+        self.triangles = int(triangles)
+        self.remeshed = bool(remeshed)
+
+
+#: DP-6085. Gmsh's own words for a surface it could not mesh validly.
+INVALID_SURFACE_LOG = re.compile(
+    r'(\d+) elements? remains? invalid in surface (\d+)')
+
+
+def invalid_surface_counts(lines) -> dict:
+    """``{surface tag: invalid elements}`` from Gmsh log lines.
+
+    A surface met twice keeps the last count, because a later pass replaces
+    the mesh an earlier one left.
+    """
+    found: dict = {}
+    for line in lines or ():
+        match = INVALID_SURFACE_LOG.search(str(line))
+        if match:
+            found[int(match.group(2))] = int(match.group(1))
+    return {tag: count for tag, count in found.items() if count > 0}
 
 
 class Ledger:

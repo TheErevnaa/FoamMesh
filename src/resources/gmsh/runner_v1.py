@@ -58,8 +58,9 @@ try:
     import structure_v1
     import sizefield_consumer_v1
     from stages import (
-        StageRun, Ledger, LayerCollision, LayerFold, LayerLanding, MeshFailure,
-        SurfaceCrossing, TESTED_RECOMBINERS, _cavities, _successors_of)
+        StageRun, InvalidSurfaceMesh, Ledger, LayerCollision, LayerFold,
+        LayerLanding, MeshFailure, SurfaceCrossing, TESTED_RECOMBINERS,
+        _cavities, _successors_of, invalid_surface_counts)
 except ImportError:  # pragma: no cover - exercised only by the module loader
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from shell_topology import (
@@ -75,8 +76,9 @@ except ImportError:  # pragma: no cover - exercised only by the module loader
     import structure_v1
     import sizefield_consumer_v1
     from stages import (
-        StageRun, Ledger, LayerCollision, LayerFold, LayerLanding, MeshFailure,
-        SurfaceCrossing, TESTED_RECOMBINERS, _cavities, _successors_of)
+        StageRun, InvalidSurfaceMesh, Ledger, LayerCollision, LayerFold,
+        LayerLanding, MeshFailure, SurfaceCrossing, TESTED_RECOMBINERS,
+        _cavities, _successors_of, invalid_surface_counts)
 
 #: Plan 48 seam. One list of hooks per stage of a job, filled from the modules
 #: of ``runner_parts`` (see its docstring) so that an area adds its stage work
@@ -1403,6 +1405,13 @@ class GmshRun(StageRun):
                            applied=settled.reparametrize == reparametrize,
                            note='ask Gmsh to parametrise the classified '
                                 'patches as it cuts them')
+        # DP-6085. A retry after a surface pass Gmsh left invalid cuts every
+        # patch into pieces of at most this many triangles before each is
+        # parametrised; see :func:`execute_with_surface_fallback`.
+        patch_limit = int(healing.get('reparamMaxTriangles') or 0)
+        if patch_limit > 0 and settled.reparametrize:
+            self.set_number('Mesh.ReparamMaxTriangles', patch_limit,
+                            control='gmsh/healing/reparamMaxTriangles')
         gmsh.model.mesh.classifySurfaces(
             settled.angle * math.pi / 180.0, True, settled.reparametrize,
             math.pi / 2)
@@ -1433,6 +1442,10 @@ class GmshRun(StageRun):
             raise MeshFailure(
                 'the tessellated import produced no surfaces to mesh')
         owned_after = {tag: self._surface_triangles(tag) for tag in surfaces}
+        # DP-6085. How many imported triangles each patch was built from,
+        # which sizes the pieces a retry cuts a patch into.
+        self.patch_triangles = {int(tag): len(owned)
+                                for tag, owned in owned_after.items()}
         self.surface_origin = regroup_classified(owned_before, owned_after)
         # DP-2876. A piece of a shared face is traced to the body whose
         # winding it kept, and belongs to the other body as well: both of
@@ -4015,6 +4028,95 @@ class GmshRun(StageRun):
             self.refuse_empty_bipartite_recombination()
         run_stage_hooks('after_mesh_pass', self, dimension=dimension)
 
+    def log_lines(self) -> list:
+        """Every line Gmsh has logged in this run, or ``[]`` unread."""
+        if not getattr(self, 'logging', False):
+            return []
+        try:
+            return list(self.gmsh.logger.get())
+        except Exception:                                    # noqa: BLE001
+            return []
+
+    def log_mark(self) -> int:
+        return len(self.log_lines())
+
+    def refuse_invalid_surfaces(self, mark):
+        """Stop before the volume pass if the surface pass left invalid elements.
+
+        DP-6085. On a remesh of imported facets there is somewhere to go --
+        smaller patches, then the facets themselves -- so the run raises and
+        :func:`execute_with_surface_fallback` takes it there. A CAD surface
+        has no such rung, and is only reported: Gmsh's volume pass has meshed
+        CAD surfaces with a few invalid elements, and refusing those would
+        take away meshes that work.
+        """
+        found = invalid_surface_counts(self.log_lines()[mark:])
+        if not found:
+            return
+        names = []
+        for tag in sorted(found, key=lambda item: -found[item]):
+            try:
+                name = self.surface_patch_name(tag)[0]
+            except Exception:                                # noqa: BLE001
+                name = f'surface {tag}'
+            if name not in names:
+                names.append(name)
+        total = sum(found.values())
+        counts = getattr(self, 'patch_triangles', {}) or {}
+        triangles = max((counts.get(int(tag), 0) for tag in found), default=0)
+        message = (
+            f'the surface mesh Gmsh made is not valid: '
+            f'{count_text(total, "element")} on '
+            f'{count_text(len(found), "surface")} ({", ".join(names)}) '
+            f'{agreeing(total, "is", "are")} still inverted after Gmsh '
+            f'retried {agreeing(len(found), "it", "them")} with MeshAdapt, and '
+            f'a volume mesher handed such a surface can run without end')
+        self.statistics['invalidSurfaceElements'] = {
+            'surfaces': {str(tag): count for tag, count in found.items()},
+            'patches': names}
+        if self.kept_tessellation or not a_remesh_of_imported_facets(self.job):
+            self.warnings.append(message + '. The volume pass was run on it.')
+            return
+        raise InvalidSurfaceMesh(message + '.', surfaces=found, patches=names,
+                                 triangles=triangles,
+                                 remeshed=not self.kept_tessellation)
+
+    def report_invalid_volume_surfaces(self, mark):
+        """Read what the volume pass's own surface remesh left invalid.
+
+        DP-6085. MEASURED: with patches of at most 480 triangles the checked
+        surface pass was clean and the volume pass's remesh of it left 4
+        invalid elements, which became 4 cells under the publication floor.
+        On a remesh of imported facets that is a failed attempt like the
+        other, and the run moves to the next rung; on any other run the
+        volume exists and the quality census says whether it can be used.
+        """
+        found = invalid_surface_counts(self.log_lines()[mark:])
+        if not found:
+            return
+        total = sum(found.values())
+        self.statistics['invalidVolumeSurfaceElements'] = {
+            str(tag): count for tag, count in found.items()}
+        message = (
+            f'the volume pass remeshed the imported surfaces and left '
+            f'{count_text(total, "element")} on '
+            f'{count_text(len(found), "surface")} invalid')
+        if self.kept_tessellation or not a_remesh_of_imported_facets(self.job):
+            self.warnings.append(
+                message + '; the volume mesh was built on it, and its quality '
+                'figures are measured on the result.')
+            return
+        names = []
+        for tag in found:
+            try:
+                name = self.surface_patch_name(tag)[0]
+            except Exception:                                # noqa: BLE001
+                name = f'surface {tag}'
+            if name not in names:
+                names.append(name)
+        raise InvalidSurfaceMesh(message + f' ({", ".join(names)}).',
+                                 surfaces=found, patches=names)
+
     def refuse_empty_bipartite_recombination(self):
         """Say why a surface pass left no surface element, when it is option 4.
 
@@ -4069,16 +4171,26 @@ class GmshRun(StageRun):
         # DP-6054. A periodic side the layer rebuilt is made to correspond
         # between the passes; see :meth:`copy_periodic_surfaces`.
         copy = bool(dimension > 2 and self.periodic_copies)
+        # DP-6085. A remesh of imported facets is never handed to the volume
+        # pass with a surface Gmsh itself left invalid: on one it can spin
+        # without end instead of failing. Only such a job has a rung to go
+        # to (smaller patches, then the facets); any other run keeps its
+        # passes and has what the volume pass logs reported.
+        guard = bool(dimension > 2 and not self.kept_tessellation
+                     and a_remesh_of_imported_facets(self.job))
         try:
           # DP-446. Everything the mesher does is inside this block, which is
           # exactly the span that used to be silent.
           with self.meshing_heartbeat(dimension):
-            if split or fit or keep_surface or copy:
+            if split or fit or keep_surface or copy or guard:
                   # Two passes rather than one, because the split has to happen
                   # between them; see :meth:`split_quadrangles`. A section has no
                   # second pass, so for it the split is simply the last thing
                   # done to the surfaces -- the same call in the same place.
+                  mark = self.log_mark()
                   self.mesh_pass(2)
+                  if guard:
+                      self.refuse_invalid_surfaces(mark)
                   if split:
                       self.split_quadrangles()
                   if copy:
@@ -4092,12 +4204,24 @@ class GmshRun(StageRun):
                       # picture of a mesh that never existed.
                       self.write_surface_pass()
                   if dimension > 2:
+                      # DP-6085. MEASURED, Gmsh 4.15.2: a model whose
+                      # surfaces are all discrete (every STL import) does
+                      # not count them as meshed, so `generate(3)` meshes
+                      # them again from the same parametrisation, and
+                      # Mesh.MeshOnlyEmpty does not stop it. The pass
+                      # checked above is therefore a proxy for the one the
+                      # volume is built on; what that one logs is read too.
+                      mark = self.log_mark()
                       self.mesh_pass(dimension)
+                      self.report_invalid_volume_surfaces(mark)
                   if copy:
                       # DP-6066. The strips only once their stacks exist.
                       self.declare_periodic_strips()
             else:
+                  mark = self.log_mark()
                   self.mesh_pass(dimension)
+                  if dimension > 2:
+                      self.report_invalid_volume_surfaces(mark)
         except MeshFailure:
             raise
         except Exception as error:
@@ -6161,6 +6285,8 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
     unmeshable = None
     try:
         return execute_with_layer_fit(job, reporter, attempts)
+    except InvalidSurfaceMesh as error:
+        unmeshable = error
     except SurfaceCrossing as error:
         crossing = error
     except LayerCollision:
@@ -6197,6 +6323,13 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
             unmeshable = error
     if crossing is not None and not crossing.remeshed:
         raise crossing
+    if isinstance(unmeshable, InvalidSurfaceMesh):
+        if not a_remesh_of_imported_facets(job):
+            raise unmeshable
+        document = execute_with_smaller_patches(
+            job, reporter, attempts, unmeshable)
+        if document is not None:
+            return document
     reporter.emit('progress', 'mesh', 0.3,
                   'meshing the imported facets rather than a remesh of them')
     document = execute_with_layer_fit(
@@ -6216,6 +6349,97 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
         f'The mesh follows the imported facets exactly and the surface '
         f'sizing asked for did not shape it.'))
     return document
+
+
+#: DP-6085. The piece sizes, in imported triangles, a retry parametrises the
+#: patches in, tried in this order. MEASURED on the angle-split tube stack
+#: (worst patch 7,680 triangles), each checked on the surface pass and on the
+#: volume pass's own remesh of it: 500, 600 and 750 mesh clean (0 inverted,
+#: minimum SICN 0.12, 0.05, 0.11); 120, 240, 400, 480, 1,000 and 2,000 all
+#: leave invalid elements. Smaller is not better, so this is a short list of
+#: sizes that worked, not a sequence that shrinks.
+PATCH_LIMITS = (500, 750, 600)
+
+
+def smaller_patches_job(job, limit):
+    """A copy of the job whose patches are parametrised in smaller pieces."""
+    document = copy.deepcopy(job)
+    intent = document.setdefault('intent', {})
+    healing = intent.get('healing')
+    if not isinstance(healing, dict):
+        healing = {}
+        intent['healing'] = healing
+    healing['reparamMaxTriangles'] = int(limit)
+    return document
+
+
+def execute_with_smaller_patches(job, reporter, attempts, invalid):
+    """Remesh with every patch cut smaller; ``None`` if no size meshes.
+
+    DP-6085. Gmsh parametrises each classified patch as one piece. A long
+    tube -- 0.5 m by 75 mm round -- maps to a ring so stretched that the
+    surface mesher finds no triangle under its own points ("Triangle not
+    found for curvatures", thousands of times) and leaves elements inverted.
+    Cut into short pieces, each maps cleanly. Each size in
+    :data:`PATCH_LIMITS` is tried until one leaves no invalid element; a job
+    that already set the piece size has had this retry, and goes to the
+    facets.
+    """
+    healing = (job.get('intent') or {}).get('healing') or {}
+    if healing.get('reparamMaxTriangles'):
+        return None
+    tried, best = [], None
+    for limit in PATCH_LIMITS:
+        reporter.emit('progress', 'mesh', 0.3,
+                      f'remeshing the surface in patches of at most {limit} '
+                      f'triangles: '
+                      + ', '.join(invalid.patches or ('a patch',))
+                      + ' came out invalid')
+        try:
+            document = execute_with_layer_fit(
+                smaller_patches_job(job, limit), reporter, attempts)
+        except LayerCollision:
+            raise
+        except MeshFailure:
+            tried.append((limit, None))
+            continue
+        # MEASURED on cht-tube: pieces of 500 meshed both passes clean and
+        # left one cell of SICN 0.0001 under the 0.008 floor, which the
+        # publication refused. A size whose cells fall under the floor is
+        # kept only if no other size does better.
+        score = patch_retry_score(document)
+        if best is None or score < best[0]:
+            best = (score, limit, document, list(tried))
+        if score == (0, 0):
+            break
+        tried.append((limit, score))
+    if best is None:
+        return None
+    score, limit, document, before = best
+    earlier = ''
+    if before:
+        earlier = ' Tried first: ' + '; '.join(
+            f'pieces of at most {size} ('
+            + ('invalid surface elements remained' if result is None else
+               f'{count_text(result[0], "inverted cell")}, '
+               f'{count_text(result[1], "cell")} under the quality floor')
+            + ')' for size, result in before) + '.'
+    document.setdefault('warnings', []).insert(0, (
+        f'{invalid} The surface was therefore remeshed with every patch '
+        f'cut into pieces of at most {limit} imported triangles, each '
+        f'parametrised on its own, and neither the surface pass nor the '
+        f'volume pass left an invalid element on it.{earlier} The patch '
+        f'names are unchanged; the pieces add edges inside the patches '
+        f'that the mesh follows.'))
+    return document
+
+
+def patch_retry_score(document) -> tuple:
+    """``(inverted, under the floor)`` of a run's mesh; lower is better."""
+    quality = ((document or {}).get('statistics') or {}).get(
+        'achievedQuality') or {}
+    return (int(quality.get('inverted') or 0),
+            int(quality.get('below_threshold') or 0))
 
 
 #: DP-484. The surface algorithms tried, in order, when a layer column was

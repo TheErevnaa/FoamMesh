@@ -11,8 +11,9 @@ from __future__ import annotations
 
 from .build_follow import BuildFollowStage
 from .common import (
-    Ledger, LayerCollision, LayerFold, LayerLanding, MeshFailure,
-    SurfaceCrossing, TESTED_RECOMBINERS, _cavities, _successors_of)
+    InvalidSurfaceMesh, Ledger, LayerCollision, LayerFold, LayerLanding,
+    MeshFailure, SurfaceCrossing, TESTED_RECOMBINERS, _cavities,
+    _successors_of, invalid_surface_counts)
 from .controls import ControlsStage
 from .farfield import FarfieldStage
 from .geometry import GeometryStage
