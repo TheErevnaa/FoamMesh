@@ -27,6 +27,13 @@ from dataclasses import dataclass, field
 #: a thin ring of triangles near it, never a fifth of its faces.
 TOUCH_SHARE = 0.2
 
+#: Or the share of the smaller surface's *area* the touching triangles cover.
+#: MEASURED 2026-10-29 (1.1.7 MCP pass): two cubes imported as one skin
+#: surface each touch on one face of six -- 2 of 12 triangles, under
+#: TOUCH_SHARE -- and were not paired, though Split interfaces cuts them.
+#: An edge-only contact covers next to no area, so the ring stays out.
+TOUCH_AREA_SHARE = 0.05
+
 #: The tolerance as a share of the smaller surface's median triangle edge:
 #: wide enough for the chord sag of two separately faceted coaxial cylinders,
 #: far below any gap between two walls a mesh would resolve.
@@ -114,6 +121,14 @@ def _corner_keys(triangles) -> set:
     return keys
 
 
+def _areas(triangles):
+    import numpy as np
+
+    return 0.5 * np.linalg.norm(np.cross(
+        triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]),
+        axis=-1)
+
+
 def _median_edge(triangles) -> float:
     import numpy as np
 
@@ -150,13 +165,21 @@ def touching(walls: list[Wall]) -> list[Contact]:
                 continue
             distances = _distances(small.triangles.mean(axis=1),
                                    large.triangles)
-            share = float((distances <= tolerance).mean())
-            if share < TOUCH_SHARE:
+            on = distances <= tolerance
+            if not on.any():
                 continue
+            share = float(on.mean())
+            areas = _areas(small.triangles)
+            total = float(areas.sum())
+            area_share = float(areas[on].sum()) / total if total > 0 else 0.0
             for wall in (first, second):
                 if wall.key not in keys:
                     keys[wall.key] = _corner_keys(wall.triangles)
             shared = len(keys[first.key] & keys[second.key])
+            # Triangles both bodies draw at the same corners are a contact
+            # however small a share of the wall they are (a whole-body skin).
+            if shared == 0 and share < TOUCH_SHARE                     and area_share < TOUCH_AREA_SHARE:
+                continue
             contacts.append(Contact(
                 first.key, second.key, first.name, second.name, first.body,
                 second.body, shared, share, tolerance))
