@@ -3151,8 +3151,9 @@ class CaseBuilder:
             'zones, cell zones and baffles per surface file only, so its '
             'role would be dropped',
             'Split it into a surface of its own (import it as its own file; '
-            'Split interfaces only moves faces two bodies share, so it does '
-            'not separate a non-conformal side), or give every surface in '
+            'the Automatic conformal pairing only moves faces two bodies '
+            'share, so it does not separate a non-conformal side), or give '
+            'every surface in '
             'the file the same role.')
 
     #: DP-668. The modelled shapes whose ``<name>_surface`` row a surface

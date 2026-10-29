@@ -64,6 +64,7 @@ GEOMETRY_STEPS = {
     'geometry.patches.split': 'Split boundary',
     'geometry.patches.split_by_angle': 'Split boundaries by angle',
     'geometry.split_interfaces': 'Split interfaces',
+    'geometry.surface_intent.auto_pair': 'Pair touching walls',
     'geometry.cad.convert_to_surface': 'Convert CAD to surface',
 }
 

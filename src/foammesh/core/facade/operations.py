@@ -307,6 +307,31 @@ def _geometry_operations() -> list[OperationDescriptor]:
                             'Cut an assembly into its interfaces and outer skin',
                             'case', ImpactClass.MESH_MUTATION,
                             recovery='artifact_backup'),
+        OperationDescriptor(
+            'geometry.surface_intent.auto_pair',
+            'Pair touching walls automatically', 'case',
+            ImpactClass.MESH_MUTATION, recovery='artifact_backup',
+            summary='The Automatic choice of the surface dialog and Pair '
+                    'touching walls: find the surfaces of other bodies that '
+                    'touch geometry_ids (every surface when absent) and make '
+                    'each touching pair a region interface of surface_role. '
+                    'regionInterfaceConformal cuts the triangles both bodies '
+                    'share into one surface named <a>_to_<b> and pairs it '
+                    '(as geometry.split_interfaces); regionInterfaceNonConformal '
+                    'keeps both walls and pairs them, each body its own side. '
+                    'Walls that touch but share no triangles cannot be cut and '
+                    'are listed under skipped with the reason. preview '
+                    'measures and writes nothing.',
+            parameters_schema={
+                'type': 'object', 'additionalProperties': False,
+                'required': ['surface_role'],
+                'properties': {
+                    'surface_role': {'type': 'string', 'enum': [
+                        'regionInterfaceConformal',
+                        'regionInterfaceNonConformal']},
+                    'geometry_ids': {'type': 'array', 'items': {
+                        'type': ['string', 'integer']}},
+                    'preview': {'type': 'boolean'}}}),
         OperationDescriptor('quality.tolerance.get',
                             'Read the project fidelity tolerance', 'case',
                             ImpactClass.READ),

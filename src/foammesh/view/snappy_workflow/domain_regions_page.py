@@ -1998,12 +1998,14 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self.splitPromptText.setWordWrap(True)
         set_status(self.splitPromptText, 'warning')
         prompt.addWidget(self.splitPromptText)
+        # DP-6087: the cut is no longer a Geometry action of its own; this
+        # opens the Geometry step's Pair touching walls.
         self.splitButton = QPushButton(
-            self.tr('Split interfaces…'), self.splitPrompt)
-        self.splitButton.setObjectName('regionSplitInterfaces')
+            self.tr('Pair touching walls…'), self.splitPrompt)
+        self.splitButton.setObjectName('regionPairTouchingWalls')
         self.splitButton.setToolTip(self.tr(
-            'Open the Geometry step and cut each wall two bodies share into '
-            'an interface that couples their regions'))
+            'Open the Geometry step and pair each wall two bodies share as an '
+            'interface that couples their regions'))
         self.splitButton.clicked.connect(self._openSplitInterfaces)
         prompt.addWidget(self.splitButton, 0, Qt.AlignmentFlag.AlignLeft)
         self.splitPrompt.hide()
@@ -2236,9 +2238,9 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             # interface is made by cutting the shared walls.
             return self.tr(
                 'No inter-region interface is configured, and these regions '
-                'may share a boundary that nothing couples. Split interfaces '
-                'on the Geometry step cuts each wall two bodies share into an '
-                'interface that couples them.')
+                'may share a boundary that nothing couples. Pair touching '
+                'walls on the Geometry step makes each wall two bodies share '
+                'an interface that couples them.')
         return self.tr(
             'Only one region point is configured while an inter-region '
             'interface is configured on the Geometry step.')
@@ -2389,9 +2391,9 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             self.splitPromptText.setText(self.tr(
                 'The imported bodies share {0}: {1}. Seeded as they are, '
                 'each region is meshed on its own and nothing couples them '
-                'across those walls. Split interfaces cuts each shared wall '
-                'into an interface between the two regions. Nothing is '
-                'split until you do.').format(
+                'across those walls. Pair touching walls makes each shared '
+                'wall an interface between the two regions. Nothing is '
+                'paired until you do.').format(
                     count_text(len(names), 'wall'), ', '.join(names)))
         prompt.setVisible(bool(names))
         self._sayInterface()
@@ -2414,10 +2416,10 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         return self.splitPromptText.text()
 
     def _openSplitInterfaces(self) -> None:
-        """Go to the Geometry step and start its Split interfaces.
+        """Go to the Geometry step and open its Pair touching walls.
 
-        The cut is the Geometry step's own action, with its own preview and
-        confirmation; nothing is split from here. A Geometry step locked by
+        The pairing is the Geometry step's own action, with its own preview
+        and confirmation; nothing is paired from here. A Geometry step locked by
         Proceed is unlocked through its own question first (editing the
         geometry discards what was made after it), and the cut starts once
         the step is open again.
@@ -2433,14 +2435,14 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             page._editLockedGeometry()
             self._splitWhenUnlocked(page, attempts=40)
             return
-        page._splitInterfacesClicked()
+        page._showPairTouchingMenu()
 
     def _splitWhenUnlocked(self, page, attempts: int) -> None:
         """Start the cut once the step manager has unlocked the page."""
         from PySide6.QtCore import QTimer
 
         if not getattr(page, '_locked', False):
-            page._splitInterfacesClicked()
+            page._showPairTouchingMenu()
             return
         if attempts <= 0:
             return            # the user kept the geometry: nothing to cut

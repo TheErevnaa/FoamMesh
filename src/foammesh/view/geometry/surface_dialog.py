@@ -5,7 +5,7 @@ import qasync
 import copy
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QLabel
+from PySide6.QtWidgets import QComboBox, QDialog, QLabel
 
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.core.facade.errors import FacadeError, ValidationFailedError
@@ -32,6 +32,13 @@ ROLE_TEXT = (
     (intent.CONFORMAL, 'Region interface, conformal'),
     (intent.NON_CONFORMAL, 'Region interface, non-conformal'),
     (intent.BAFFLE, 'Blocking baffle'),
+)
+
+#: DP-6087. How an interface finds its other side.
+AUTOMATIC, MANUAL = 'automatic', 'manual'
+PAIRING_TEXT = (
+    (AUTOMATIC, 'Automatic: find the walls this surface touches'),
+    (MANUAL, 'Manual: choose the surfaces'),
 )
 
 PURPOSE_TEXT = {
@@ -90,6 +97,7 @@ class SurfaceDialog(QDialog):
                                    'until the mesh is published.'),
                     Qt.ItemDataRole.ToolTipRole)
         self._ui.intentIssue.hide()
+        self._mountPairing()
         #: The document the dialog opened on, for the live preview.
         self._document = None
         self._refusal = None
@@ -152,6 +160,9 @@ class SurfaceDialog(QDialog):
         # seconds on a cold machine, and a second OK in that window
         # submitted the same element twice.
         with commit_guard(self._ui.ok):
+            if self._automatic():
+                await self._acceptAutomatic()
+                return
             try:
                 # Plan 49 SR2. An edit the model cannot hold is refused
                 # before anything is written, the rename included.
@@ -211,8 +222,32 @@ class SurfaceDialog(QDialog):
                 # case. The dialog stays open, the entries kept, the reason shown.
                 inline_error.show(self, self.tr('Not saved: {0}').format(error))
 
+    async def _acceptAutomatic(self):
+        """Rename if asked, then pair the touching walls (DP-6087)."""
+        try:
+            if len(self._gIds) == 1:
+                current = app.facadeClient.checkout().getElement(
+                    'geometry', self._gIds[0])
+                if current is not None and \
+                        current.value('name') != self._ui.name.text():
+                    await app.facadeClient.run('geometry.rename', {
+                        'geometry_id': self._gIds[0],
+                        'name': self._ui.name.text()})
+            await app.facadeClient.run('geometry.surface_intent.auto_pair', {
+                'surface_role': self._role(),
+                'geometry_ids': self._keys()})
+        except CONFLICT_ERRORS as error:
+            await AsyncMessageBox().warning(
+                self, self.tr('Case changed'), self.tr(conflict_message(error)))
+            return
+        except FacadeError as error:
+            inline_error.show(self, self.tr('Not paired: {0}').format(error))
+            return
+        super().accept()
+
     def _connectSignalsSlots(self):
         self._ui.role.currentIndexChanged.connect(self._onRoleChanged)
+        self._pairing.currentIndexChanged.connect(self._onPairingChanged)
         self._ui.purpose.currentIndexChanged.connect(self._onPurposeChanged)
         self._ui.patchType.currentIndexChanged.connect(self._onIntentEdited)
         self._ui.partner.currentIndexChanged.connect(self._onPartnerChanged)
@@ -317,6 +352,100 @@ class SurfaceDialog(QDialog):
     def _keys(self):
         return [str(gId) for gId in self._gIds]
 
+    # -- DP-6087: Automatic or Manual pairing ----------------------------- #
+
+    def _mountPairing(self):
+        """Put the Automatic/Manual choice right under the role.
+
+        DP-6087 (user design, 2026-10-29). Split interfaces was a Geometry
+        tab button a person had to know to press first, and choosing the
+        other side by hand offered only the bodies already seeded. The choice
+        now sits where the interface type is chosen: Automatic measures which
+        walls of other bodies touch this one and pairs them (conformal: cut
+        into one shared surface; non-conformal: the two walls kept), Manual
+        is the partner and regions as before.
+        """
+        layout = self._ui.typeGroupLayout
+        self._pairingLabel = QLabel(self.tr('Pairing'), self._ui.typeGroup)
+        self._pairing = QComboBox(self._ui.typeGroup)
+        self._pairing.setObjectName('pairing')
+        for mode, text in PAIRING_TEXT:
+            self._pairing.addItem(self.tr(text), mode)
+        layout.insertRow(1, self._pairingLabel, self._pairing)
+        self._autoNote = QLabel(self._ui.typeGroup)
+        self._autoNote.setObjectName('autoPairNote')
+        self._autoNote.setWordWrap(True)
+        layout.insertRow(2, self._autoNote)
+        #: The last preview the facade answered, for OK and the tests.
+        self._autoPreview = None
+        self._previewToken = 0
+
+    def _automatic(self):
+        return (self._role() in intent.INTERFACE_ROLES
+                and self._pairing.currentData() == AUTOMATIC)
+
+    def _setRowVisible(self, widget, visible):
+        layout = self._ui.typeGroupLayout
+        row, _role = layout.getWidgetPosition(widget)
+        if row >= 0:
+            layout.setRowVisible(row, visible)
+
+    def _onPairingChanged(self, _index):
+        if self._loading:
+            return
+        self._touch('pairing')
+        self._updateRows()
+        self._onIntentEdited()
+
+    @qasync.asyncSlot()
+    async def _refreshAutoPreview(self):
+        """Say which walls Automatic would pair, before anything is written."""
+        self._previewToken += 1
+        token = self._previewToken
+        self._autoNote.setText(self.tr('Looking for the walls this surface '
+                                       'touches...'))
+        try:
+            result = await app.facadeClient.run(
+                'geometry.surface_intent.auto_pair', {
+                    'surface_role': self._role(),
+                    'geometry_ids': self._keys(), 'preview': True})
+        except FacadeError as error:
+            if token == self._previewToken:
+                self._autoPreview = None
+                self._autoNote.setText(str(error))
+                self._autoOk()
+            return
+        if token != self._previewToken:
+            return
+        self._autoPreview = dict(result.payload or {})
+        self._autoNote.setText(self._autoText(self._autoPreview))
+        self._autoOk()
+
+    def _autoText(self, payload):
+        lines = []
+        for item in payload.get('contacts') or ():
+            first, second = item.get('names') or ('', '')
+            if payload.get('surface_role') == intent.CONFORMAL:
+                lines.append(self.tr('{0} touches {1}: the shared triangles '
+                                     'become one interface surface.')
+                             .format(first, second))
+            else:
+                lines.append(self.tr('{0} touches {1}: the two are paired, '
+                                     'each body its own side.')
+                             .format(first, second))
+        for item in payload.get('skipped') or ():
+            lines.append(self.tr('Not paired: {0}. {1}').format(
+                item.get('reason'), item.get('remedy')))
+        if not lines:
+            lines.append(self.tr('No surface of another body touches this '
+                                 'one. Choose Manual to pair it by hand.'))
+        return '\n'.join(lines)
+
+    def _autoOk(self):
+        if self._editable:
+            self._ui.ok.setEnabled(
+                bool((self._autoPreview or {}).get('contacts')))
+
     def _loadIntent(self):
         """Fill the controls from the stored model, then show its issues.
 
@@ -347,6 +476,8 @@ class SurfaceDialog(QDialog):
                 key = self._keys()[0]
                 _relationKey, relation = authoring.interface_relation(
                     self._document, key)
+                self._setData(self._pairing,
+                              MANUAL if relation is not None else AUTOMATIC)
                 if relation is not None:
                     self._setData(self._ui.partner,
                                   authoring.partner_of(relation, key))
@@ -416,11 +547,26 @@ class SurfaceDialog(QDialog):
         """Show the controls the role uses, and only those."""
         role = self._role()
         external = role == intent.EXTERNAL
-        interface = role in intent.INTERFACE_ROLES and len(self._gIds) == 1
-        layout = self._ui.typeGroupLayout
-        for row, visible in ((1, external), (2, external), (3, interface),
-                             (4, interface), (5, interface)):
-            layout.setRowVisible(row, visible)
+        isInterface = role in intent.INTERFACE_ROLES
+        # Several surfaces at once are paired only automatically.
+        if isInterface and len(self._gIds) != 1:
+            loading, self._loading = self._loading, True
+            try:
+                self._setData(self._pairing, AUTOMATIC)
+            finally:
+                self._loading = loading
+        self._pairing.setEnabled(len(self._gIds) == 1)
+        automatic = self._automatic()
+        interface = isInterface and len(self._gIds) == 1 and not automatic
+        ui = self._ui
+        for widget, visible in ((ui.purpose, external),
+                                (ui.patchType, external),
+                                (self._pairing, isInterface),
+                                (self._autoNote, automatic),
+                                (ui.partner, interface),
+                                (ui.ownRegion, interface),
+                                (ui.partnerRegion, interface)):
+            self._setRowVisible(widget, visible)
         # One surface is both sides only of a conformal interface.
         shared = self._ui.partner.findData(authoring.SHARED)
         if shared >= 0:
@@ -509,6 +655,15 @@ class SurfaceDialog(QDialog):
             return
         self._touch('partner')
         partner = self._ui.partner.currentData()
+        if partner and self._pairing.currentData() != MANUAL:
+            # A partner chosen is a pairing made by hand.
+            self._loading = True
+            try:
+                self._setData(self._pairing, MANUAL)
+            finally:
+                self._loading = False
+            self._touch('pairing')
+            self._updateRows()
         if partner and 'partnerRegion' not in self._touched:
             region = (intent.SURROUNDING_REGION if partner == authoring.SHARED
                       else authoring.zone_region(self._document, partner))
@@ -528,6 +683,29 @@ class SurfaceDialog(QDialog):
         for name in ('patchType', 'ownRegion', 'partnerRegion'):
             if sender is getattr(self._ui, name):
                 self._touch(name)
+        if self._automatic():
+            # Nothing is planned by hand: the facade measures the contacts.
+            # The role itself may still be one the surface cannot take (a
+            # periodic side); that refusal stands in either mode.
+            try:
+                authoring.preview(self._document, self._keys(),
+                                  authoring.SurfaceEdit(role=self._role()))
+            except authoring.EditRefused as error:
+                self._refusal = str(error)
+                self._ui.intentIssue.setText(self._refusal)
+                self._ui.intentIssue.show()
+                self._fitToIssue()
+                self._autoNote.clear()
+                if self._editable:
+                    self._ui.ok.setEnabled(False)
+                return
+            self._refusal = None
+            self._showIssues(())
+            self._autoPreview = None
+            if self._editable:
+                self._ui.ok.setEnabled(False)
+            self._refreshAutoPreview()
+            return
         try:
             found = authoring.preview(self._document, self._keys(),
                                       self._edit())

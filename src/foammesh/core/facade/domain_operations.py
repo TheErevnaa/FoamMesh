@@ -1378,6 +1378,7 @@ class DomainOperations:
             'geometry.patches.split': self._geometry_patches_split,
             'geometry.patches.split_by_angle': self._geometry_patches_split_by_angle,
             'geometry.split_interfaces': self._geometry_split_interfaces,
+            'geometry.surface_intent.auto_pair': self._surface_intent_auto_pair,
             'geometry.cad.convert_to_surface': self._geometry_cad_convert_to_surface,
             'geometry.prepare.cancel': self._geometry_prepare_cancel,
             'geometry.prepared.create': self._geometry_prepared_create,
@@ -7496,6 +7497,11 @@ runTimeModifiable true;
             summary['bodies'][geometry_id] = {'refreshed': True,
                                               'rows': refreshed,
                                               'removed': removed}
+        summary['relations_removed'] = self._let_go_of_cut_relations(
+            data, {str(item) for body in result['bodies']
+                   for item in body.get('dropped_patch_uuids') or ()},
+            {key for body in summary['bodies'].values()
+             for key in body.get('removed') or ()})
 
         sides_of: dict = {}
         for item in result['interfaces']:
@@ -7578,6 +7584,282 @@ runTimeModifiable true;
                              for key in item['added']]
         self._name_interface_sides(session, summary['interfaces'])
         return summary
+
+    def _surface_intent_auto_pair(self, session: CaseSession,
+                                  command: Command) -> OperationResult:
+        """Pair the walls that touch, as the surface dialog's Automatic does.
+
+        DP-6087 (user design, 2026-10-29). Split interfaces was a button on
+        the Geometry tab that a person had to know to press before choosing
+        an interface; when they paired the touching walls by hand instead,
+        the regions offered were only "Surrounding" and the conformal pair
+        could never be built on snappy. The choice now lives where the
+        interface type is chosen: Automatic measures which surfaces of other
+        bodies touch (``core/geometry/touching_walls.py``) and
+
+        * conformal: cuts the triangles each touching pair of bodies shares
+          into one surface and pairs it, through the same cut as
+          ``geometry.split_interfaces`` (one body pair at a time, so only the
+          bodies this surface touches are cut);
+        * non-conformal: keeps both walls and pairs them, each body its own
+          side, exactly as the dialog's Manual choice writes it.
+
+        Walls that touch but share no triangles cannot be cut into one
+        surface; they are listed under ``skipped`` with the reason and the
+        remedy (non-conformal), never silently left alone.
+        """
+        from foammesh.core.facade import surface_intent_api as api
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.geometry import touching_walls
+        from foammesh.core.project import Source
+        from foammesh.db import surface_authoring as authoring
+        from foammesh.db import surface_intent as model
+
+        parameters = dict(command.parameters or {})
+        role = str(parameters.get('surface_role') or '')
+        if role not in model.INTERFACE_ROLES:
+            raise ValidationFailedError(
+                'surface_role is regionInterfaceConformal or '
+                'regionInterfaceNonConformal', details={
+                    'error': 'validation_failed', 'field': 'surface_role',
+                    'value': role})
+        chosen = parameters.get('geometry_ids') or []
+        if isinstance(chosen, (str, int)):
+            chosen = [chosen]
+        chosen = {str(key) for key in chosen}
+        preview = bool(parameters.get('preview', False))
+        if not preview:
+            session.require_writable()
+
+        data = session.state.checkout()
+        document = data.data()
+        geometry = document.get('geometry') or {}
+        for key in chosen:
+            if not model._is_surface(geometry.get(key)):
+                raise ValidationFailedError(
+                    f'geometry {key} is not a surface', details={
+                        'error': 'validation_failed', 'code': 'not_a_surface',
+                        'geometry_ids': sorted(chosen)})
+        walls = self._walls_by_body(session, geometry)
+        contacts = touching_walls.touching(walls)
+        if chosen and role == model.CONFORMAL:
+            # A body the cut has run over is no longer closed, and a second
+            # cut cannot tell it from the body it touches (MEASURED live
+            # 2026-10-29, the coaxial tubes: Hot|Pipe cut, then Pipe|Cold
+            # refused as one shell 'body1+body2'). So the cut takes every
+            # body joined to the chosen surfaces' by cuttable walls, once.
+            joined = {body for item in contacts if {item.a, item.b} & chosen
+                      for body in (item.a_body, item.b_body)}
+            grown = True
+            while grown:
+                grown = False
+                for item in contacts:
+                    pair = {item.a_body, item.b_body}
+                    if item.conformal and pair & joined                             and not pair <= joined:
+                        joined |= pair
+                        grown = True
+            contacts = [item for item in contacts
+                        if {item.a, item.b} & chosen
+                        or (item.conformal
+                            and {item.a_body, item.b_body} <= joined)]
+        elif chosen:
+            contacts = [item for item in contacts
+                        if {item.a, item.b} & chosen]
+
+        planned, skipped = [], []
+        sides_taken: dict = {}
+        for item in contacts:
+            entry = item.to_dict()
+            if role == model.CONFORMAL and not item.conformal:
+                skipped.append({**entry, 'reason': (
+                    f'{item.a_name} and {item.b_name} touch, but their '
+                    'triangles do not line up, so they cannot be cut into '
+                    'one shared surface'), 'remedy': (
+                    'Make this interface non-conformal, or re-import the '
+                    'two bodies meshed on the same triangles.')})
+                continue
+            if role == model.NON_CONFORMAL:
+                taken = [key for key in (item.a, item.b)
+                         if key in sides_taken
+                         or authoring.interface_relation(document, key)[1]
+                         is not None]
+                if taken:
+                    names = ', '.join(
+                        model._text(geometry[key].get('name')) for key in taken)
+                    skipped.append({**entry, 'reason': (
+                        f'{names} is already one side of an interface'),
+                        'remedy': 'Change that interface first.'})
+                    continue
+                for key in (item.a, item.b):
+                    sides_taken[key] = True
+            planned.append(entry)
+        payload = {'surface_role': role, 'contacts': planned,
+                   'skipped': skipped, 'preview': preview}
+        if preview:
+            return OperationResult('accepted', command.operation,
+                                   session.revisions, payload=payload)
+        if not planned:
+            what = ('a surface of another body touching it' if chosen
+                    else 'two bodies whose walls touch')
+            raise PreconditionFailedError(
+                f'nothing to pair: there is no {what}'
+                + (' that can be paired this way' if skipped else ''),
+                details={'error': 'nothing_touches', 'surface_role': role,
+                         'skipped': skipped})
+
+        if role == model.CONFORMAL:
+            store = GeometryArtifactStore(session.case_path)
+            bodies = sorted({body for entry in planned
+                             for body in entry['bodies']})
+            # One cut over every body at once: see the note above.
+            try:
+                result = store.split_interfaces(bodies)
+            except (OSError, ValueError) as error:
+                raise ValidationFailedError(str(error)) from error
+            cut = self._rows_from_the_cut(session, result)
+            self._invalidate_geometry_preparation(session)
+            session.state.bus.publish(
+                Event.ARTIFACT_GEOMETRY_CHANGED, operation=command.operation,
+                count=len(bodies))
+            payload['interfaces'] = list(cut.get('interfaces', ()))
+            payload['relations_removed'] = list(
+                cut.get('relations_removed', ()))
+        else:
+            volumes = {wall.key: wall.volume for wall in walls}
+
+            def region(key):
+                # A surface with no body row has no region to name; the
+                # surface's intent issue then asks for one.
+                return model.region_ref(volumes[key]) if volumes.get(key)                     else None
+
+            for entry in planned:
+                own, other = entry['surfaces']
+                api.write(data, [own], authoring.SurfaceEdit(
+                    role=model.NON_CONFORMAL, partner=other,
+                    own_region=region(own), partner_region=region(other)))
+            session.state.commit(
+                data, action='pair touching walls', source=Source.GUI,
+                target='surfaceRelations',
+                reason='; '.join('/'.join(entry['names'])
+                                 for entry in planned))
+        return OperationResult(
+            'accepted', command.operation, session.revisions,
+            invalidated_outputs=('mesh', 'quality'), payload=payload)
+
+    def _walls_by_body(self, session: CaseSession, geometry: dict) -> list:
+        """Each surface row with its triangles, the body it belongs to and
+        the volume that stands for that body."""
+        from foammesh.core.geometry import GeometryArtifactStore
+        from foammesh.core.geometry import touching_walls
+        from foammesh.core.geometry.patches.pieces import patch_polydata
+        from foammesh.db import surface_intent as model
+
+        artifacts = {str(entry.get('geometry_id')): entry.get('artifact')
+                     for entry in GeometryArtifactStore(
+                         session.case_path).entries()}
+        manifest = self._patch_rows(self._patch_editor(session))
+        walls = []
+        for geometry_id, artifact in artifacts.items():
+            rows = self._rows_for(manifest, geometry_id)
+            surfaces = {str(key): row for key, row in geometry.items()
+                        if model._is_surface(row)
+                        and str(row.get('geometryId') or '') == geometry_id}
+            if not artifact or not surfaces:
+                continue
+            if not rows:
+                rows = [{'name': model._text(row.get('name')),
+                         'geometry_id': geometry_id}
+                        for row in surfaces.values()][:1]
+            pieces = patch_polydata(artifact, rows)
+            by_uuid = {model._text(row.get('patchUuid')): key
+                       for key, row in surfaces.items()
+                       if model._text(row.get('patchUuid'))}
+            by_name = {model._text(row.get('name')): key
+                       for key, row in surfaces.items()}
+            for row in rows:
+                name = str(row.get('name'))
+                key = by_uuid.get(str(row.get('patch_uuid') or '')) \
+                    or by_name.get(name)
+                if key is None and len(rows) == 1 and len(surfaces) == 1:
+                    key = next(iter(surfaces))
+                if key is None or name not in pieces:
+                    continue
+                wall = touching_walls.Wall(
+                    key, model._text(surfaces[key].get('name')), geometry_id,
+                    touching_walls.triangles_of(pieces[name]))
+                wall.volume = model._text(surfaces[key].get('volume'))
+                walls.append(wall)
+        return walls
+
+    @staticmethod
+    def _let_go_of_cut_relations(data, dropped: set, removed: set) -> list:
+        """Remove the interfaces whose surfaces the cut emptied.
+
+        DP-6086. A person who paired two touching walls by hand (the cold
+        fluid's inner wall with the pipe's outer wall) and then split the
+        interfaces had both walls emptied into the new shared interface and
+        their rows removed, but the pair stayed, naming two surfaces that no
+        longer exist. Every snappy dictionary write was then refused on it,
+        "no surface carries its patch identity ... both sides are in the same
+        region", while the tree showed the new interface correctly paired.
+        The cut's own interface replaces such a pair, so the pair goes, and a
+        legacy interface pair it came from is switched off so opening the
+        project does not convert it again. A side the cut left standing (a
+        wall only partly shared) becomes a plain external boundary again.
+
+        Returns the names of the relations removed.
+        """
+        from foammesh.db import surface_authoring as authoring
+        from foammesh.db import surface_intent as model
+
+        if not dropped and not removed:
+            return []
+        document = data.data()
+        geometry = document.get('geometry') or {}
+        plan = authoring.EditPlan()
+        names = []
+
+        def gone(relation, prefix):
+            token = model._text(relation.get(f'{prefix}PatchUuid'))
+            key = model._text(relation.get(f'{prefix}Surface'))
+            return (token and token in dropped) or (key and key in removed)
+
+        for key, relation in model._sorted_items(
+                document.get('surfaceRelations')):
+            if not isinstance(relation, dict) \
+                    or model._text(relation.get('kind')) \
+                    not in model.INTERFACE_ROLES:
+                continue
+            sides = [prefix for prefix in ('owner', 'neighbour')
+                     if gone(relation, prefix)]
+            if not sides:
+                continue
+            plan.relation_removed.append(str(key))
+            names.append(model._text(relation.get('name'))
+                         or model._text(relation.get('ownerLabel')))
+            source = model._text(relation.get('legacySource'))
+            if source.startswith(f'{model.INTERFACE_PAIRS}/'):
+                plan.pairs_disabled.append(source.split('/', 1)[1])
+            for prefix in ('owner', 'neighbour'):
+                if prefix in sides:
+                    continue
+                kept = model._text(relation.get(f'{prefix}Surface'))
+                row = geometry.get(kept)
+                if kept and isinstance(row, dict) and model._text(
+                        row.get('surfaceRole')) in model.INTERFACE_ROLES:
+                    plan.rows[kept] = authoring._role_fields(
+                        document, kept, model.EXTERNAL, authoring.KEEP,
+                        authoring.KEEP)
+        for key, pair in model._sorted_items(
+                document.get(model.INTERFACE_PAIRS)):
+            if not isinstance(pair, dict) or str(key) in plan.pairs_disabled \
+                    or not model._flag(pair.get('enabled', True)):
+                continue
+            if {model._text(pair.get('masterScopeToken')),
+                    model._text(pair.get('slaveScopeToken'))} & dropped:
+                plan.pairs_disabled.append(str(key))
+        authoring.write_plan(data, plan)
+        return names
 
     @staticmethod
     def _name_interface_sides(session: CaseSession, interfaces: list) -> None:

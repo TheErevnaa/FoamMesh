@@ -160,8 +160,9 @@ def _table() -> dict:
                 False, 'a conformal interface between two separate surfaces '
                 'cannot be built: snappyHexMesh cuts one mesh, so a conformal '
                 'contact is one surface shared by both regions',
-                'Use one shared surface for the contact (Split interfaces '
-                'makes it), or make the interface non-conformal.'))
+                'Use one shared surface for the contact (Pairing: '
+                'Automatic in Edit surface cuts it), or make the interface '
+                'non-conformal.'))
         else:
             put(CONFORMAL_SEPARATE, route, target, conformal)
         # Non-conformal interface.

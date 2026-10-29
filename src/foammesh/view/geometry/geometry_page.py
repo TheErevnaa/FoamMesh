@@ -273,7 +273,7 @@ class GeometryPage(StepPage):
         self._advanced = None
         self._advancedFolder = None
         self._lockBanner = None
-        self._splitInterfaces = None
+        self._pairTouching = None
         #: Plan 44 MF20. The one row of secondary actions under Import / Add.
         self._toolLinks = None
         #: Plan 42 SG22 (Q1): Geometry > Convert CAD to surface.
@@ -364,7 +364,7 @@ class GeometryPage(StepPage):
         self._ensureBoundaryActions()
         self._ensureCadPanel()
         self._ensureInterfacePairPanel()
-        self._ensureSplitInterfacesButton()
+        self._ensurePairTouchingButton()
         self._ensureFarfieldButton()
         self._ensureConstructButton()
         self._ensureModelSize()
@@ -939,21 +939,18 @@ class GeometryPage(StepPage):
         finally:
             self._selectionEcho = False
 
-    def _ensureSplitInterfacesButton(self):
-        """Mount the control that cuts an assembly into the pieces v13 names.
+    def _ensurePairTouchingButton(self):
+        """Mount the link that pairs every pair of touching walls at once.
 
-        DP-421. A conjugate case is written as one surface per interface plus
-        one for the outer skin, each interface carrying its own face zone and
-        cell zone. Nothing on this page could produce that: an imported body
-        is one closed surface, and one closed surface can be typed one thing,
-        so two bodies sharing a wall came out as two cell zones each drawing
-        that wall for itself. The cut is the operation; this is the way to
-        reach it.
+        DP-6087 (user design, 2026-10-29). This row held Split interfaces,
+        a cut a person had to know to run before choosing an interface. The
+        pairing now lives with the interface role, in Edit surface
+        (Automatic or Manual); this link is the same Automatic for the whole
+        case: its menu asks conformal (the shared triangles cut into one
+        surface) or non-conformal (the two walls kept and paired).
 
-        It sits beside Import because that is where the assembly arrives and
-        the moment the question is worth asking. It is offered only when the
-        case holds more than one body, the cut having nothing to do
-        otherwise.
+        Offered only while the case holds more than one body: one body has
+        no wall of another to touch.
         """
         button = getattr(getattr(self, '_ui', None), 'import_', None)
         if button is None:
@@ -962,18 +959,32 @@ class GeometryPage(StepPage):
         layout = button.parentWidget().layout()
         if layout is None:
             return
-        if self._splitInterfaces is None:
-            from PySide6.QtWidgets import QPushButton
+        if self._pairTouching is None:
+            from foammesh.db import surface_intent as intent
 
-            self._splitInterfaces = QPushButton(
-                self.tr('Split interfaces'), button.parentWidget())
-            self._splitInterfaces.setObjectName('geometrySplitInterfaces')
-            self._splitInterfaces.setToolTip(self.tr(
-                'Cut the walls two bodies share away from the walls they do '
-                'not, so each shared wall becomes one interface'))
-            self._splitInterfaces.clicked.connect(self._splitInterfacesClicked)
-            self._mountToolLink(button, self._splitInterfaces, 3)
-        self._splitInterfaces.setVisible(self._bodyCount() > 1)
+            self._pairTouching = QPushButton(
+                self.tr('Pair touching walls'), button.parentWidget())
+            self._pairTouching.setObjectName('geometryPairTouchingWalls')
+            self._pairTouching.setToolTip(self.tr(
+                'Find the walls of different bodies that touch and pair each '
+                'as a region interface'))
+            menu = QMenu(self._pairTouching)
+            menu.setObjectName('geometryPairTouchingMenu')
+            for role, text, name in (
+                    (intent.CONFORMAL, 'Conformal: one shared surface…',
+                     'geometryPairConformal'),
+                    (intent.NON_CONFORMAL,
+                     'Non-conformal: keep both walls…',
+                     'geometryPairNonConformal')):
+                action = QAction(self.tr(text), menu)
+                action.setObjectName(name)
+                action.triggered.connect(
+                    lambda _checked=False, role=role:
+                    self._pairTouchingWallsClicked(role))
+                menu.addAction(action)
+            self._pairTouching.setMenu(menu)
+            self._mountToolLink(button, self._pairTouching, 3)
+        self._pairTouching.setVisible(self._bodyCount() > 1)
 
     #: Plan 44 MF20. An empty list is one line, not a 180 px blank rectangle.
     EMPTY_LIST_HEIGHT = 48
@@ -1049,7 +1060,7 @@ class GeometryPage(StepPage):
         """Plan 44 MF20. Put a secondary Geometry action in the link row.
 
         Import and Add are the page's two actions. Construct, Convert CAD,
-        Farfield and Split interfaces sit in one 20 px row of text links under
+        Farfield and Pair touching walls sit in one 20 px row of text links under
         them, so six buttons never share a row narrower than they are. The
         links are the same buttons, in the order *rank* gives.
         """
@@ -1491,48 +1502,59 @@ class GeometryPage(StepPage):
         except (OSError, ValueError):
             return 0
 
-    @qasync.asyncSlot()
-    async def _splitInterfacesClicked(self):
-        """Run the cut, then show the case the way the database now holds it.
+    def _showPairTouchingMenu(self):
+        """Open the link's conformal / non-conformal menu (regions page)."""
+        self._ensurePairTouchingButton()
+        if self._pairTouching is not None and self._pairTouching.isVisible():
+            self._pairTouching.showMenu()
 
-        The preview comes first because the cut writes a revision of every
-        body it touches, and a user is entitled to know what is about to
-        happen to a model they spent an afternoon assembling. A case whose
-        bodies share nothing says so and nothing is written.
+    @qasync.asyncSlot()
+    async def _pairTouchingWallsClicked(self, role):
+        """Pair the touching walls, then show the case as the database holds it.
+
+        The preview comes first: a conformal pairing cuts every body it
+        touches into a new revision, and a person is entitled to know what
+        is about to happen to a model they spent an afternoon assembling.
+        Walls that touch but cannot be paired this way are listed with why.
         """
         from foammesh.core.facade.errors import FacadeError
 
+        title = self.tr('Pair touching walls')
         try:
             preview = await app.facadeClient.run(
-                'geometry.split_interfaces', {'preview': True})
+                'geometry.surface_intent.auto_pair',
+                {'surface_role': role, 'preview': True})
         except FacadeError as ex:
-            await modal(
-                messages.warning,
-                self._widget, self.tr('Interface split failed'), str(ex))
+            await modal(messages.warning, self._widget,
+                        self.tr('Pairing failed'), str(ex))
             return
-        found = preview.payload.get('interfaces') or ()
+        found = preview.payload.get('contacts') or ()
+        skipped = preview.payload.get('skipped') or ()
+        notes = ''.join(
+            '\n\n' + self.tr('Not paired: {0}. {1}').format(
+                item.get('reason'), item.get('remedy')) for item in skipped)
         if not found:
             await AsyncMessageBox().information(
-                self._widget, self.tr('Split interfaces'),
-                self.tr('These bodies share no wall, so there is no interface '
-                        'to cut. Nothing was changed.'))
+                self._widget, title,
+                self.tr('No walls of different bodies touch in a way that '
+                        'can be paired like this. Nothing was changed.')
+                + notes)
             return
-        listed = ', '.join(str(item['name']) for item in found)
+        listed = ', '.join(' / '.join(item.get('names') or ())
+                           for item in found)
         confirmed = await AsyncMessageBox().confirm(
-            self._widget, self.tr('Split interfaces'),
-            self.tr('{0} found: {1}.\n\nEach body keeps a new '
-                    'revision holding only the walls it does not share, and '
-                    'each shared wall becomes a surface of its own. '
-                    'Continue?').format(count_text(len(found), 'interface'),
-                                        listed))
+            self._widget, title,
+            self.tr('{0}: {1}.').format(count_text(len(found), 'pair'),
+                                        listed) + notes + '\n\n'
+            + self.tr('Continue?'))
         if not confirmed:
             return
         try:
-            await app.facadeClient.run('geometry.split_interfaces', {})
+            await app.facadeClient.run('geometry.surface_intent.auto_pair',
+                                       {'surface_role': role})
         except FacadeError as ex:
-            await modal(
-                messages.warning,
-                self._widget, self.tr('Interface split failed'), str(ex))
+            await modal(messages.warning, self._widget,
+                        self.tr('Pairing failed'), str(ex))
             return
         self._reloadFromDatabase()
 
@@ -2093,12 +2115,11 @@ class GeometryPage(StepPage):
         # An import may have brought the first solid model into the case, and
         # the deflection controls exist only while there is one to re-facet.
         self._ensureCadPanel()
-        # CHT1. Split interfaces is offered while the case holds more than
-        # one body, and that count was read only when the page loaded -- on
-        # a new case, before anything was imported. MEASURED live: three
-        # bodies imported, the link hidden, and the only route to a coupled
-        # interface unreachable until the case was closed and reopened.
-        self._ensureSplitInterfacesButton()
+        # CHT1. Pair touching walls is offered while the case holds more
+        # than one body, and that count was read only when the page loaded --
+        # on a new case, before anything was imported. MEASURED live: three
+        # bodies imported, the link hidden until the case was reopened.
+        self._ensurePairTouchingButton()
         # Plan 37 UF1 (DP-1024). The boundary operations match tree rows
         # against the patch manifest they read. Read only when the page
         # loaded, that list knew nothing of what an import, a split dialog or
