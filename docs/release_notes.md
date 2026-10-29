@@ -1,5 +1,24 @@
 # FoamMesh Release Notes
 
+## 1.1.7 — 2026-10-29
+
+- **Region interfaces find the walls they touch.** In Edit surface, choosing
+  a region interface now offers **Pairing: Automatic** or **Manual**.
+  Automatic finds the walls of other bodies this surface touches and pairs
+  them: conformal cuts the shared triangles into one `<a>_to_<b>` surface,
+  non-conformal keeps both walls and pairs them, each body its own side. The
+  dialog says which walls it will pair, and why any cannot be, before
+  anything changes. Manual is the old choice of surfaces.
+- **Pair touching walls** replaces Split interfaces on the Geometry step. It
+  pairs every touching wall in the case at once, conformal or non-conformal,
+  after a preview.
+- Every body is now offered as an interface side, seeded or not (before, only
+  "Surrounding" could be chosen on a case with no region seeds yet).
+- Three or more bodies in a row (coaxial tubes) are cut in one step; the
+  second cut no longer fails with `missing parameter 'body1+body2'`.
+- Splitting a surface that was already paired drops the old pair instead of
+  leaving it pointing at a surface that no longer exists.
+
 ## 1.1.6 — 2026-10-29
 
 - **Gmsh no longer stalls on long imported surfaces.** A long patch of an
