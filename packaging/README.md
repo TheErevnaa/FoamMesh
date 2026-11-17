@@ -6,7 +6,11 @@ OS (no cross-compilation), so build Windows installers on Windows, etc.
 ## Prerequisites (per build machine)
 
 ```bash
-pip install -r requirements.txt
+# Windows: the locked environment (PyInstaller and the extras included):
+pixi install
+pixi shell
+# or, with pip:
+pip install -r requirements.txt -c constraints.txt
 pip install pyinstaller
 python convertUi.py          # generate resource_rc.py + *_ui.py (REQUIRED)
 python scripts/generate_build_metadata.py

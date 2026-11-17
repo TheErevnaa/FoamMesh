@@ -1,5 +1,19 @@
 # FoamMesh Release Notes
 
+## 1.1.9 — 2026-11-17
+
+- **Updated runtime.** FoamMesh now runs on Python 3.14 with Qt 6.11
+  (PySide6 6.11.1), VTK 9.6.2, NumPy 2.4 and HDF5 1.14. These are the same
+  versions FoamFlow uses, so the two apps share one set of libraries.
+- **Pixi environment.** A source checkout can be set up with
+  `pixi install` from the locked `pixi.toml` / `pixi.lock`;
+  `requirements.txt` and `constraints.txt` are generated from the same lock
+  for pip users.
+- On Windows, FoamMesh loads the system ICU library before Qt, so Qt 6.11
+  starts inside a conda or Pixi environment that has its own ICU.
+- Unused dependencies were removed (thermo, meshio, openpyxl, xmlschema,
+  tables, pyqtgraph, bidict).
+
 ## 1.1.8 — 2026-11-17
 
 - **Large meshes and long runs.** Mesher stages have no time limit by

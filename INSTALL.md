@@ -8,10 +8,21 @@ the extracted folder (Linux).
 
 ## From source
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required; releases are built and tested on 3.14.
+
+On Windows the locked environment is the simplest route ([Pixi](https://pixi.sh)):
 
 ```bash
-pip install -r requirements.txt
+pixi install            # Python 3.14 and every pinned dependency, incl. extras
+pixi shell
+python convertUi.py
+python -m foammesh.main
+```
+
+With pip instead:
+
+```bash
+pip install -r requirements.txt -c constraints.txt
 python convertUi.py     # builds Qt resources — required before first launch
 ./foammesh.sh           # or ./foammesh.ps1 on Windows
 ```

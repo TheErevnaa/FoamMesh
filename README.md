@@ -29,8 +29,12 @@ FoamMesh uses a `src/` layout. Put the source roots on the import path (the
 launchers do this for you) and build the Qt resources first.
 
 ```bash
-# 1. create/activate a virtual environment, then:
-pip install -r requirements.txt
+# 1. either (Windows) the locked Pixi environment (Python 3.14, the tested versions;
+#    https://pixi.sh), which also puts src and vendor on the path:
+pixi install
+pixi shell
+# or create/activate a virtual environment, then:
+pip install -r requirements.txt -c constraints.txt
 
 # 2. build Qt resources, .ui files, and translations (REQUIRED):
 python convertUi.py
