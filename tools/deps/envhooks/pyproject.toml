@@ -1,0 +1,13 @@
+# Interpreter-start hook for the Pixi env (see README.md here).
+# Built by the in-tree backend _build.py: no build requirements, so
+# `pixi install` builds it offline on any platform.
+[build-system]
+requires = []
+build-backend = "_build"
+backend-path = ["."]
+
+[project]
+name = "foammesh-envhooks"
+version = "1.0.0"
+description = "Startup hook for the FoamMesh Pixi env: loads Windows' own icuuc.dll before PyPI Qt"
+requires-python = ">=3.11"

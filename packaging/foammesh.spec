@@ -175,6 +175,16 @@ a = Analysis(
               'nbclient'],
     noarchive=False,
 )
+# PySide6 6.11+ (PyPI) links Windows' own unversioned icuuc.dll. A conda or
+# Pixi build env also has an unversioned icuuc.dll (conda-forge ICU), and
+# PyInstaller collects it into _internal, where the frozen app would find it
+# before System32's and Qt6Core would fail to load. conda's own libraries link
+# the versioned icuuc<NN>.dll, so the unversioned copy is dropped
+# (foammesh/support/win_icu.py also loads System32's before Qt).
+if sys.platform == 'win32':
+    a.binaries = [entry for entry in a.binaries
+                  if Path(entry[0]).name.lower() != 'icuuc.dll']
+
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
@@ -204,8 +214,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleDisplayName': 'FoamMesh',
             'CFBundleName': 'FoamMesh',
-            'CFBundleShortVersionString': '1.1.8',
-            'CFBundleVersion': '1.1.8',
+            'CFBundleShortVersionString': '1.1.9',
+            'CFBundleVersion': '1.1.9',
             'NSHighResolutionCapable': True,
         },
     )

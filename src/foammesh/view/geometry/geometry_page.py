@@ -241,8 +241,14 @@ class _LeftPageWatcher(QObject):
         widget.installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        if (obj is self._widget and event.type() == QEvent.Type.Hide
-                and not event.spontaneous() and self._widget.isHidden()):
+        # When the cyclic collector frees an orphaned page, it can clear this
+        # watcher's attributes before Qt destroys the widget. The widget's
+        # Hide during that teardown then arrives with no `_widget` set.
+        # PySide6 6.11 on Python 3.14 delivers it; nothing is left to act on.
+        widget = getattr(self, '_widget', None)
+        if (widget is not None and obj is widget
+                and event.type() == QEvent.Type.Hide
+                and not event.spontaneous() and widget.isHidden()):
             self._left()
         return False
 

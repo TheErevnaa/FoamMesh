@@ -74,6 +74,11 @@ if __name__ == '__main__':
     # settings are readable (it honours the Settings toggle), still before Qt
     # or VTK loads OpenGL.
 
+# Importing the package first pins the Qt binding and loads Windows' own ICU
+# (foammesh/__init__.py). A frozen build runs this file as a script, so the
+# package is not imported yet; it must be before qasync, which imports Qt.
+import foammesh  # noqa: E402,F401
+
 import qasync
 from PySide6.QtWidgets import QApplication
 

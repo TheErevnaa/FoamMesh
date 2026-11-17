@@ -4943,6 +4943,16 @@ class MainWindow(QMainWindow):
         self._bindPolicyActions()
 
     def _setRenderingEnabled(self, enabled):
+        # `app.renderingToggled` outlives the window (as DP-2103's selection
+        # service does). A window whose widgets are gone unsubscribes instead
+        # of writing into a deleted panel.
+        from shiboken6 import isValid
+        if not isValid(self) or not isValid(self._ui.displayControl):
+            try:
+                app.renderingToggled.disconnect(self._setRenderingEnabled)
+            except (KeyError, LookupError, RuntimeError, TypeError, ValueError):
+                pass
+            return
         self._displayControl.setEnabled(enabled)
         if self._geometryManager is None or self._meshManager is None:
             return

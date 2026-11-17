@@ -43,13 +43,12 @@ bundle from them.
 |-----------|-------------------|-----|
 | PySide6 (Qt for Python) | LGPL-3.0 / commercial | GUI toolkit |
 | VTK | BSD-3-Clause | 3D rendering, STL/geometry processing |
-| NumPy, pandas, matplotlib, pyqtgraph | BSD-style | numerics / plotting |
-| h5py, tables | BSD-style | HDF5 project storage |
+| NumPy, SciPy, pandas, matplotlib | BSD-style | numerics / plotting |
+| h5py | BSD-style | HDF5 project storage |
 | lxml | BSD-style | XML utilities used by `foammesh.support` |
 | qasync | BSD-2-Clause | asyncio + Qt event loop |
-| superqt, PySide6-QtAds | MIT / LGPL | extra Qt widgets / docking |
-| thermo | MIT | thermophysical data |
-| PyYAML, openpyxl, python-dateutil, bidict, filelock, psutil | misc permissive | utilities |
+| superqt, qtpy, PySide6-QtAds | MIT / LGPL | extra Qt widgets / docking |
+| PyYAML, python-dateutil, filelock, psutil | misc permissive | utilities |
 | posthog | MIT | optional analytics (OFF by default — no `_config.py` shipped) |
 
 ## Asset packs

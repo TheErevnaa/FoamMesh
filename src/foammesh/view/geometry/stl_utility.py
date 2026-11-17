@@ -7,7 +7,7 @@ from pathlib import Path
 
 from vtkmodules.vtkCommonCore import vtkIdTypeArray, vtkIdList, vtkIntArray
 from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray, vtkCell, vtkLine, vtkDataObject
-from vtkmodules.vtkFiltersCore import vtkAppendPolyData, vtkIdFilter, vtkFeatureEdges, \
+from vtkmodules.vtkFiltersCore import vtkAppendPolyData, vtkGenerateIds, vtkFeatureEdges, \
     vtkPolyDataEdgeConnectivityFilter, vtkThreshold, vtkCleanPolyData
 from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
 from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
@@ -238,7 +238,8 @@ class StlImporter:
     @staticmethod
     def _splitSolid(polyData, angle: float, minArea: float):
         """One solid's ``(regioned data, feature edges, region count)``."""
-        idFilter = vtkIdFilter()
+        # vtkGenerateIds is vtkIdFilter renamed (VTK 9.4); VTK 9.6 removed the old name.
+        idFilter = vtkGenerateIds()
         idFilter.SetInputData(polyData)
         idFilter.PointIdsOn()
         idFilter.CellIdsOff()

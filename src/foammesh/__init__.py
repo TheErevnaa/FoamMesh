@@ -31,3 +31,10 @@ if os.environ['QT_API'] != 'pyside6':
         f'{os.environ["QT_API"]!r}. Qt-abstraction libraries — qasync and '
         'qtpy among them — would follow that setting and load a second Qt '
         'into this process. Unset QT_API, or set it to pyside6.')
+
+# PySide6 6.11 and later (PyPI) link Windows' own icuuc.dll; in a conda or
+# Pixi env a conda-forge icuuc.dll is found first and Qt fails to load. Load
+# the system copy before anything imports Qt (support/win_icu.py).
+from foammesh.support.win_icu import preload_windows_icu as _preload_windows_icu  # noqa: E402
+
+_preload_windows_icu()

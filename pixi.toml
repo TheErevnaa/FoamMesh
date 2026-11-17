@@ -1,0 +1,103 @@
+# FoamMesh environment, managed by Pixi (https://pixi.sh).
+#   pixi install            # the environment ("default")
+#   pixi run gui            # launch the GUI
+#   pixi run gates          # the routine bookkeeping gates
+#   pixi run package        # PyInstaller build (dist/FoamMesh)
+#
+# FoamFlow (a separate application installed beside FoamMesh) uses the same
+# channel, the same Python and the same versions for every package the two
+# share, so both stacks stay close and free of conflicts. The comparison is
+# plans/DEPENDENCY_MATRIX_FOAMFLOW_2026-11-17.md.
+#
+# Version rule: n-1, as in FoamFlow. Each package takes the latest patch of the
+# newest series that is not the newest one and is at least 90 days old. A newer
+# or older version is used only where a reason is written next to it.
+#
+# requirements.txt, requirements-test.txt and constraints.txt are generated
+# from pixi.lock (pixi run gen-requirements) for pip users and CI.
+[workspace]
+name = "foammesh"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = "3.14.*"
+# Shared with FoamFlow: same series, same locked versions.
+filelock = "3.*"
+h5py = "3.15.*"
+matplotlib-base = "3.10.*"
+numpy = "2.4.*"
+pandas = "3.1.*"          # FoamFlow's exception (3.0 gives wrong moving averages); vendored PyFoam only
+psutil = "7.1.*"
+python-dateutil = "2.9.*"
+pyyaml = "6.0.*"
+qasync = "0.27.*"
+scipy = "1.17.*"
+# OpenBLAS, not MKL (FoamFlow: MKL -> tbb/hwloc crashed a plotting worker).
+libblas = { version = "*", build = "*openblas" }
+# Native libraries held at the builds FoamFlow's pixi.lock has, so the two
+# environments carry the same binaries (conda only; not in requirements*.txt).
+icu = "78.3.*"
+libaec = "1.1.7.*"
+libdeflate = "1.25.*"
+# FoamMesh only.
+qtpy = "2.4.*"
+superqt = "0.8.*"
+
+# From PyPI. PySide6-QtAds pins one exact PySide6 version. PyPI Qt (6.11+) on
+# Windows needs the System32 ICU loaded first: foammesh-envhooks (local,
+# tools/deps/envhooks) does it at every interpreter start of the env, and
+# foammesh.support.win_icu does it for pip installs and the packaged exe.
+[pypi-dependencies]
+lxml = "==6.0.4"
+posthog = "==7.38.6"
+PySide6-Essentials = "==6.11.1"   # exact version QtAds 5.0.0.2 requires
+PySide6-QtAds = "==5.0.0.2"
+vtk = "==9.6.2"
+foammesh-envhooks = { path = "tools/deps/envhooks", editable = false }  # not in requirements*.txt
+
+# The local API (`api` extra). Kept at the versions the API tests pass on:
+# FastAPI 0.163 / Starlette 1.x removed FastAPI.add_websocket_route.
+[feature.api.pypi-dependencies]
+fastapi = "==0.135.1"
+starlette = "==0.52.1"
+uvicorn = "==0.41.0"
+websockets = "==16.0"
+cryptography = "==46.0.7"
+cffi = "==2.0.0"
+pydantic = "==2.12.5"
+pydantic-core = "==2.41.5"
+
+# CAD import (STEP/IGES/BREP), the `cad` extra. conda-forge only (no PyPI
+# wheel). n-1: 7.9 (8.0 is the newest series). A build without VTK, so that
+# conda does not bring a second VTK beside PyPI's.
+[feature.cad.dependencies]
+pythonocc-core = { version = "7.9.*", build = "novtk*" }
+
+[feature.test.dependencies]
+pytest = "9.1.*"
+pytest-asyncio = "1.3.*"  # as FoamFlow; tests use @pytest.mark.asyncio (base had 1.4.0 unpinned)
+coverage = "7.17.2.*"   # FoamFlow's locked patch
+
+[feature.test.pypi-dependencies]
+httpx = "==0.28.1"
+pytest-qt = "==4.5.0"
+ruff = "==0.15.4"
+pre-commit = "==4.6.0"
+
+[feature.package.dependencies]
+pyinstaller = "6.21.*"
+
+# The app and its tests import from src/ and vendor/ (as pytest's pythonpath does).
+[target.win-64.activation.env]
+PYTHONPATH = "%PIXI_PROJECT_ROOT%/src;%PIXI_PROJECT_ROOT%/vendor"
+
+[tasks]
+gui = "python -m foammesh.main"
+gates = "python scripts/run_bookkeeping_gates.py -q"
+package = "pyinstaller --noconfirm packaging/foammesh.spec"
+# requirements*.txt / constraints.txt from pixi.lock (add --check to verify)
+gen-requirements = "python tools/deps/gen_requirements.py"
+
+[environments]
+default = { features = ["api", "cad", "test", "package"], solve-group = "default" }

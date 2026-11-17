@@ -33,7 +33,7 @@ def _prepare_dll_search() -> None:
 CAD_INSTALL_HINT = (
     'CAD import (STEP/IGES/BREP) requires OpenCASCADE. '
     'Install the supported binding with: '
-    'conda install -c conda-forge pythonocc-core=7.8.1.1'
+    'conda install -c conda-forge pythonocc-core=7.9.3'
 )
 
 
