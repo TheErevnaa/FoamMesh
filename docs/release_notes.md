@@ -1,5 +1,52 @@
 # FoamMesh Release Notes
 
+## 1.1.8 — 2026-11-17
+
+- **Large meshes and long runs.** Mesher stages have no time limit by
+  default, and the snappy cell limit is set by the memory you have rather
+  than a fixed 100 M cap; a limit that is reached is reported as a warning.
+  The memory check reads the WSL machine's own figures and no longer counts
+  its memory twice. A parallel Run to end gathers the mesh once, at the end,
+  and each stage's mesh is kept once, with recovery points pruned to the
+  latest.
+- **A smoother window.** Hover and pick, menu refreshes, disk reads,
+  local-API requests and WSL calls no longer run on the window's thread.
+  A 500-body import or close no longer freezes the window. Field edits
+  update the page in place instead of rebuilding it or reloading the mesh.
+  Opening and closing many projects in one session no longer grows the
+  window's memory.
+- **One Refinement row.** Surface features, Castellation and Snap are now
+  one Refinement row in the snappy workflow.
+- **snappy layers by first-layer height.** Layers can be sized by the height
+  of the first layer as well as by a relative thickness.
+- **Gmsh boundary layers.** Layers thin only where they fold, grow in every
+  volume asked for, and carry across where unlike layer stacks touch. A
+  layer that was asked for but not grown shows in the verdict. Patch names
+  follow the far-field cut and contact fusion, and a split face keeps its
+  name on both halves.
+- **Gmsh pick tool.** Select on release, Ctrl+click to toggle, Ctrl+drag box
+  select, click on empty space to clear, u or Backspace to undo, x and
+  Shift+x to hide and show, with a hover tip and numbered picks. Structured
+  meshing gains transfinite curve rows (elements per curve, law, coefficient,
+  reverse).
+- **Working-case format.** The working case is written as ASCII at 12 digits
+  or as binary, from one setting; every reader reads both, and Export
+  converts binary.
+- **Geometry and interfaces.** Overlapping closed bodies are reported before
+  Generate. A nested body typed solid is meshed as its own volume on the
+  Gmsh route. Interfaces are named after the tree's body names. Cyclic and
+  periodic pairs match within STL precision, and layer strips across a cyclic
+  pair are snapped onto each other. A Gmsh polyMesh no longer keeps edge
+  tetrahedra with two boundary faces, so a baffle duct passes checkMesh.
+- **Clearer messages.** A cancelled run says it was cancelled. Refusals name
+  the row, surface or layer group to change. Unlock says what it deletes
+  and what it keeps. A run started from anywhere shows on the run strip and
+  status bar.
+- The local API has a route for every window control added since 1.1.4,
+  including the footer and the viewport pointer.
+- **Known issue.** On the Gmsh route a layer stack that folds in one place
+  only can still lose layers there.
+
 ## 1.1.7 — 2026-10-29
 
 - **Region interfaces find the walls they touch.** In Edit surface, choosing
