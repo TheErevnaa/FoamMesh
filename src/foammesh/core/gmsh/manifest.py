@@ -435,7 +435,13 @@ class RunBuilder:
     @staticmethod
     def record_publication(manifest: RunManifest, payload: dict) -> RunManifest:
         manifest.document['publication'] = dict(payload)
-        manifest.document['status'] = 'published'
+        # DP-6471. A skipped publication published nothing: the run stays
+        # `succeeded` (it finished and wrote its mesh file), and the
+        # publication record says `skipped` and why. MEASURED: a recombined
+        # 2D run with no polyMesh read `run_status: published`.
+        manifest.document['status'] = (
+            'succeeded' if str(payload.get('status') or '') == 'skipped'
+            else 'published')
         manifest.write()
         return manifest
 

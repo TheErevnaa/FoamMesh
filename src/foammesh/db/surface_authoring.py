@@ -630,18 +630,22 @@ def issues(document, keys) -> list[Issue]:
     return found
 
 
-def capability_issues(document, keys) -> list[Issue]:
+def capability_issues(document, keys, assessed=None) -> list[Issue]:
     """Plan 49 SR7. What the configured route and target cannot build of
     surfaces *keys* -- the verdict the run and the export give, word for
     word (``core/engine/surface_capabilities``), shown while editing. The
-    draft is still saved (plan D7)."""
+    draft is still saved (plan D7). *assessed* is *document* already
+    assessed (``assessed_document``), for a caller asking about many
+    surfaces one at a time (DP-6500)."""
     from foammesh.core.engine import surface_capabilities as capabilities
     route, target = capabilities.route_target_of(document)
     if route not in capabilities.ROUTES:
         return []
     found = []
-    for issue in capabilities.validate(document, route, target, stage='edit',
-                                       keys=[str(key) for key in keys]):
+    for issue in capabilities.validate(
+            document if assessed is None else assessed, route, target,
+            stage='edit', keys=[str(key) for key in keys],
+            assessed=assessed is not None):
         if issue.code == capabilities.UNRESOLVED:
             continue        # :func:`issues` says those, with their remedy
         found.append(Issue(issue.subject, issue.reason.rstrip('. '),
@@ -649,9 +653,10 @@ def capability_issues(document, keys) -> list[Issue]:
     return found
 
 
-def all_issues(document, keys) -> list[Issue]:
+def all_issues(document, keys, assessed=None) -> list[Issue]:
     """The unresolved state and the capability verdict of *keys*."""
-    return issues(document, keys) + capability_issues(document, keys)
+    return issues(document, keys) + capability_issues(document, keys,
+                                                      assessed)
 
 
 def preview(document, keys, edit: SurfaceEdit) -> list[Issue]:

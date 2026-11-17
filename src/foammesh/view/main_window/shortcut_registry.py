@@ -408,9 +408,12 @@ class ShortcutRegistry:
         seen = _normalise_all(_target_keys(target))
         listed = self.default(command_id)
         wanted = listed[:1] if _is_shortcut(target) else listed
-        if seen != wanted:
+        if seen != wanted and (command_id, seen, listed) not in self.mismatches:
             self.mismatches.append((command_id, seen, listed))
-        self._live.setdefault(command_id, []).append(target)
+        # DP-6407. Dead targets were dropped only when the user rebound a
+        # key, so every closed page's shortcuts stayed (one a round).
+        self._live[command_id] = [t for t in self._live.get(command_id, [])
+                                  if _alive(t)] + [target]
         self._applyTo(command_id, target)
         return target
 

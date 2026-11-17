@@ -31,6 +31,15 @@ def project_feature_angle(client=None) -> float:
     try:
         if client is None or not client.has_case():
             return angles.DEFAULT_FEATURE_ANGLE
+        # Plan 50 (DP-6341). One value, read through the read-only view:
+        # the whole configuration took 20 s to build after a 500-surface
+        # import, on the GUI thread, for this one number.
+        view = getattr(client, 'view', None)
+        if view is not None:
+            try:
+                return angles.normalise(view('mesh').getValue('featureAngle'))
+            except (LookupError, KeyError, AttributeError):
+                pass
         return angles.project_angle(client.configuration())
     except Exception:                                        # noqa: BLE001
         return angles.DEFAULT_FEATURE_ANGLE

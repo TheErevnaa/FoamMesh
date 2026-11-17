@@ -1294,7 +1294,10 @@ def execute(job_dir: str, gmsh=None) -> dict:
     }
     if gmsh is None:
         import gmsh
-        gmsh.initialize()
+        # Plan 50 IP6 (DP-6250): no environment, none of the user's config
+        # files, as every Gmsh process FoamMesh starts.
+        import gmsh_startup_v1
+        gmsh_startup_v1.initialize(gmsh)
     try:
         raw_points, raw_tris, pieces = run_cvt_parts(gmsh, points, tris,
                                                       options)

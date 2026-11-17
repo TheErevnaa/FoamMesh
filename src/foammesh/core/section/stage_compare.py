@@ -30,6 +30,7 @@ a stage, as the tests do) or another ``batch_runner``.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 import time
@@ -43,6 +44,8 @@ from foammesh.core.gmsh import pass_snapshots
 from foammesh.core.jobs import stage_snapshots as snapshots
 from foammesh.core.section import section_colour
 from foammesh.core.section.section_jobs import SectionRequest
+
+logger = logging.getLogger(__name__)
 
 __all__ = ['CompareTarget', 'StageSection', 'CompareResult',
            'compare_targets', 'compare_requests', 'run_compare',
@@ -167,6 +170,13 @@ def compare_targets(case_path, stages=STAGES, revision: str | None = None, *,
             if holder else None
         folder = snapshots.stage_mesh_path(case, stage, holder) \
             if holder else None
+        if manifest is not None and manifest.get('layout') == snapshots.DECOMPOSED:
+            # Plan 50 IP17. Kept as processor cases and not gathered yet.
+            targets.append(CompareTarget(
+                stage, holder, reason=(
+                    f'the {stage} mesh is kept split across processors and '
+                    'has not been gathered.')))
+            continue
         if not holder or manifest is None or folder is None:
             targets.append(CompareTarget(
                 stage, holder, reason=_missing_reason(case, stage, revision)))
@@ -260,6 +270,37 @@ class CompareResult:
             shutil.rmtree(self.directory, ignore_errors=True)
 
 
+async def gather_kept(case_path, stages=STAGES, revision=None) -> list[str]:
+    """Gather each of *stages* a parallel run kept as processor cases.
+
+    Plan 50 IP17 (DP-6303). A parallel Run to end gathers once, at the end;
+    the stages before it are kept as their processor cases and gathered here,
+    the first time one is shown. A stage that cannot be gathered stays listed
+    unavailable with its reason, as a stage with no snapshot is. Returns the
+    stages gathered.
+    """
+    import asyncio
+
+    gathered = []
+    try:
+        resolved = await asyncio.to_thread(snapshots.resolve, case_path,
+                                           revision)
+    except (OSError, ValueError):
+        return gathered
+    for stage in stages:
+        if str(stage).startswith(pass_snapshots.PREFIX):
+            continue
+        holder = resolved.get(stage)
+        if not holder:
+            continue
+        try:
+            if await snapshots.gather_if_needed(case_path, stage, holder):
+                gathered.append(stage)
+        except Exception:                                   # noqa: BLE001
+            logger.warning('kept %s mesh not gathered', stage, exc_info=True)
+    return gathered
+
+
 async def run_compare(case_path, stages=STAGES, *, planes, mode, arrays=(),
                       active=0, generation=0, revision=None, runner=None,
                       scratch_root=None, verify=True, budgets=None,
@@ -274,6 +315,7 @@ async def run_compare(case_path, stages=STAGES, *, planes, mode, arrays=(),
     import asyncio
 
     started = clock()
+    await gather_kept(case_path, stages, revision)
     targets = await asyncio.to_thread(compare_targets, case_path, stages,
                                       revision, verify=verify)
     root = Path(scratch_root) if scratch_root else Path(

@@ -5,6 +5,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor
 
 from foammesh.support.simple_db.simple_db import Element
+from foammesh.support.weak_slot import weak_slot
 
 from foammesh.app import app
 from foammesh.db.configurations_schema import CFDType, GeometryType, Shape
@@ -113,6 +114,19 @@ def seedColour(verdict) -> str:
     return _SEED_FALLBACK_COLOURS.get(verdict, '#d9a21b')
 
 
+def _readConfiguration():
+    """A read-only look at the case configuration, copying nothing.
+
+    Plan 50 IP11 (DP-6342). ``checkout()`` deep-copies the whole document
+    twice and the geometry load took one per surface: 502 checkouts, 1,004
+    copies, for a 500-surface case. A client without ``view`` (a test
+    stand-in) still answers with its checkout.
+    """
+    client = app.facadeClient
+    view = getattr(client, 'view', None)
+    return view() if callable(view) else client.checkout()
+
+
 def _caseId():
     """The open case's id, or ``None`` (Plan 36 RP13 #7: the region volume
     jobs are tagged with it, and an answer for a closed case is dropped)."""
@@ -154,8 +168,11 @@ class GeometryManager(ActorManager):
         self._seedFade = SEED_PLACING_OPACITY
 
         self._displayControl.selectedActorsChanged.connect(self.selectedActorsChanged)
+        # DP-6407. A plain function: a manager is made per project opened,
+        # and PySide keeps a reference for good each time a signal is
+        # connected straight to the (plain-object) service's method.
         self.selectedActorsChanged.connect(
-            app.selectionService.viewport_picked)
+            weak_slot(app.selectionService.viewport_picked))
         app.selectionService.bind_renderer(self._applySelectionState)
 
     def highlightLocations(self, locations):
@@ -385,15 +402,23 @@ class GeometryManager(ActorManager):
         self._clearGeometry()
         self._visibility = True
 
-        geometries = app.facadeClient.checkout().getElements('geometry')
+        # Plan 50 IP11 (DP-6342). One uncopied read serves the list, every
+        # surface's stored polydata and the region seeds.
+        db = _readConfiguration()
+        geometries = db.getElements('geometry')
+        # DP-6497. Each body's surfaces, gathered in one pass (a scan of
+        # every row per body was quadratic in a 500-body import).
+        children = {}
+        for child_id, child in geometries.items():
+            children.setdefault(str(child.value('volume')), []).append(
+                str(child_id))
         entities = []
         for gId, geometry in geometries.items():
-            self._add(gId, geometry, geometries.get(geometry.value('volume')))
+            self._add(gId, geometry, geometries.get(geometry.value('volume')),
+                      db=db)
             geometry_type = geometry.value('gType')
             if geometry_type == GeometryType.VOLUME.value:
-                actor_ids = tuple(
-                    str(child_id) for child_id, child in geometries.items()
-                    if str(child.value('volume')) == str(gId))
+                actor_ids = tuple(children.get(str(gId), ()))
                 kind = SelectionKind.CLOSED_VOLUME
             else:
                 actor_ids = (str(gId),)
@@ -407,7 +432,7 @@ class GeometryManager(ActorManager):
         self._assignPalettes()
         # The seed markers come last so the glyph is sized from the model that
         # is actually loaded, not from an empty scene.
-        self.reloadRegions()
+        self.reloadRegions(db=db)
         self.fitDisplay()
 
     def suppressRegionMarker(self, region_id):
@@ -439,7 +464,7 @@ class GeometryManager(ActorManager):
         return _union(info.bounds() for info in self._actorInfos.values()
                       if not isinstance(info, RegionMarkerActor))
 
-    def reloadRegions(self):
+    def reloadRegions(self, db=None):
         """Rebuild the region seed markers from what the database now holds.
 
         Adding, moving or deleting a region used to change a card and nothing
@@ -459,8 +484,10 @@ class GeometryManager(ActorManager):
         measured = False
         # One checkout serves the seeds and the exclude points: a reload is
         # a read of the region side of the store, not two whole copies of it
-        # (DP-397 counts every checkout a refresh asks for).
-        db = app.facadeClient.checkout()
+        # (DP-397 counts every checkout a refresh asks for). Plan 50 IP11
+        # (DP-6342): and not a copy at all -- the reload only reads.
+        if db is None:
+            db = _readConfiguration()
         for region_id, region in db.getElements('region').items():
             try:
                 if region.value('gType') is not None:
@@ -573,7 +600,12 @@ class GeometryManager(ActorManager):
             boundingHex6 = db.getValue('baseGrid/boundingHex6') if db else None
         except Exception:                                     # noqa: BLE001
             boundingHex6 = None
-        return seed_components(surfaces, geometries, bounding_hex6=boundingHex6)
+        try:
+            relations = db.getElements('surfaceRelations') if db else None
+        except Exception:                                     # noqa: BLE001
+            relations = None
+        return seed_components(surfaces, geometries, bounding_hex6=boundingHex6,
+                               relations=relations)
 
     def seedClassifier(self):
         """The inside/outside test for the loaded geometry, built once.
@@ -849,7 +881,7 @@ class GeometryManager(ActorManager):
 
         ``working``: the labelling job is still running. ``space``: RP5's
         ``SpaceAt`` for the seed (``None`` unknown or off the domain).
-        ``name``: 'Fluid space N', by rank among the enclosed spaces.
+        ``name``: 'Space N', by rank among the enclosed spaces.
         ``inExtent``: the seed is within the model's own extent -- a core
         or a hole rather than beyond the surface. ``inCore``: DP-923, the
         seed is in outside space the surface wraps -- an open core, a bore,
@@ -1061,6 +1093,14 @@ class GeometryManager(ActorManager):
     def _applySelectionState(self, snapshot, entities):
         roles = {}
         hidden = set()
+        # DP-6117. A prepared group the case no longer holds is an orphan
+        # (its scope references say "Missing geometry"), but the surfaces it
+        # named are still there, each a valid entity of its own. MEASURED
+        # after "Edit geometry…" discarded the preparation: every surface
+        # of the CHT tubes drew in the invalid red.
+        live = {actor_id for stable_id, entity in entities.items()
+                if entity.status is SelectionStatus.VALID
+                for actor_id in (entity.geometry_ids or (stable_id,))}
         for stable_id, entity in entities.items():
             actor_ids = entity.geometry_ids or (stable_id,)
             if stable_id in snapshot.hidden_ids:
@@ -1068,6 +1108,8 @@ class GeometryManager(ActorManager):
             role = None
             if entity.status is SelectionStatus.ORPHAN:
                 role = 'invalid'
+                actor_ids = tuple(actor_id for actor_id in actor_ids
+                                  if actor_id not in live)
             elif entity.status is SelectionStatus.STALE:
                 role = 'stale'
             elif stable_id in snapshot.preview_ids:
@@ -1085,10 +1127,15 @@ class GeometryManager(ActorManager):
             if actor_id in self._actorInfos:
                 self._actorInfos[actor_id].setVisible(True)
         for actor_id, actor_info in self._actorInfos.items():
-            actor_info.setVisible(
-                actor_id not in hidden
-                and (self._regionMarkersShown
-                     or not isinstance(actor_info, RegionMarkerActor)))
+            if isinstance(actor_info, RegionMarkerActor):
+                actor_info.setVisible(actor_id not in hidden
+                                      and self._regionMarkersShown)
+            elif actor_id in hidden:
+                actor_info.setVisible(False)
+            # DP-6089. Any other part keeps the visibility it has: this ran
+            # on every selection change and set every part visible, so a
+            # face hidden with the viewport's right-click Hide came back on
+            # the next click anywhere in the viewport.
             actor_info.setHighlightRole(roles.get(actor_id))
         self._selectionHiddenActors = hidden
         self._displayControl.refreshView()
@@ -1170,15 +1217,19 @@ class GeometryManager(ActorManager):
             counts=tuple(baseGrid.float(f'numCells{axis}') for axis in 'XYZ'))
 
 
-    def _add(self, gId, geometry, volume):
+    def _add(self, gId, geometry, volume, db=None):
         if geometry.value('gType') == GeometryType.SURFACE.value:
-            self.add(GeometryActor(self._surfaceToPolyData(geometry, volume), gId, geometry.value('name')))
+            self.add(GeometryActor(self._surfaceToPolyData(geometry, volume, db=db),
+                                   gId, geometry.value('name')))
 
-    def _surfaceToPolyData(self, surface, volume=None):
+    def _surfaceToPolyData(self, surface, volume=None, db=None):
         shape = surface.value('shape')
 
         if shape == Shape.TRI_SURFACE_MESH.value:
-            polyData = app.facadeClient.checkout().geometryPolyData(surface.value('path'))
+            # Plan 50 IP11 (DP-6342). Was a whole checkout per surface.
+            if db is None:
+                db = _readConfiguration()
+            polyData = db.geometryPolyData(surface.value('path'))
         else:
             if shape == Shape.HEX.value:
                 polyData = hexPolyData(volume.vector('point1'), volume.vector('point2'))

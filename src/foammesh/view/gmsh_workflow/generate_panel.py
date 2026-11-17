@@ -210,6 +210,9 @@ class GmshGeneratePanel(QWidget):
         layout.addWidget(self._table)
         self._rebuildForm()
         self.registerApi()
+        # Plan 50 IP4: the tool dock connects this panel now, not by a poll.
+        from foammesh.view.gmsh_tools import panel_events
+        panel_events.announce(self)
 
     # -- the form ------------------------------------------------------------ #
 

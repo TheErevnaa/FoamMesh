@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from foammesh.core.export.poly_mesh_writer import (
-    FoamPolyMeshWriter, PolyMeshWriteError,
+    FoamPolyMeshWriter, PolyMeshWriteError, agglomerated_topology,
 )
 from foammesh.core.gmsh.layer_targets import (
     boundary_category, publishable_category,
@@ -75,12 +75,148 @@ class PublishError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
+class _Irregular(Exception):
+    """The array path met something only the row-at-a-time path reads
+    exactly as it always has; the caller falls back to that path."""
+
+
+class _NodeLookup:
+    """Node tag -> position in ``points``, for whole arrays of tags at once.
+
+    Built from the tags in file order; a tag given twice resolves to its last
+    position, as the ``{tag: position}`` dictionary always did. Dense (one
+    array slot per tag) when the tags are compact, a sorted search otherwise.
+    """
+
+    def __init__(self, tags: np.ndarray, positions: np.ndarray | None = None):
+        tags = np.asarray(tags, dtype=np.int64).reshape(-1)
+        if positions is None:
+            positions = np.arange(tags.size, dtype=np.int64)
+        positions = np.asarray(positions, dtype=np.int64).reshape(-1)
+        if tags.size:
+            # keep the last position of a repeated tag
+            reverse = tags[::-1]
+            unique, first = np.unique(reverse, return_index=True)
+            if unique.size != tags.size:
+                tags, positions = unique, positions[::-1][first]
+        self._dense = None
+        self._tags = self._positions = None
+        if tags.size and int(tags.min()) >= 0 and int(tags.max()) <= max(
+                4 * tags.size, tags.size + 1024):
+            self._dense = np.full(int(tags.max()) + 1, -1, dtype=np.int64)
+            self._dense[tags] = positions
+        else:
+            order = np.argsort(tags, kind='stable')
+            self._tags, self._positions = tags[order], positions[order]
+
+    def __call__(self, raw: np.ndarray) -> np.ndarray:
+        """Positions of the tags in *raw*; ``-1`` where a tag is undefined."""
+        raw = np.asarray(raw)
+        if self._dense is not None:
+            inside = (raw >= 0) & (raw < self._dense.size)
+            result = np.full(raw.shape, -1, dtype=np.int64)
+            result[inside] = self._dense[raw[inside]]
+            return result
+        if self._tags is None or not self._tags.size:
+            return np.full(raw.shape, -1, dtype=np.int64)
+        where = np.searchsorted(self._tags, raw)
+        where = np.minimum(where, self._tags.size - 1)
+        found = self._tags[where] == raw
+        return np.where(found, self._positions[where], -1)
+
+
 class MshDocument:
-    points: np.ndarray
-    node_index: dict
-    elements: list
-    physical_names: dict
+    """A parsed MSH file: nodes, elements, physical names.
+
+    Plan 50 IP14 (GM-1). The readers hand the elements over as
+    :class:`~foammesh.core.gmsh.msh4.ElementChunk` arrays -- one per run of
+    rows of one element type and node count, in file order -- rather than a
+    Python tuple an element, so a mesh is read in the memory of its arrays.
+    ``elements`` (``(type, physical, node tags)`` rows in file order) and
+    ``node_index`` (``{tag: position}``) are still offered, built on first
+    use, for the readers of single elements (viewport, fidelity, roles).
+
+    Built the old way, from ``elements`` rows and a ``node_index``
+    dictionary (the section extrusion and hand-written test meshes do), a
+    document is published exactly as it always was, row at a time.
+    """
+
+    def __init__(self, points, node_index=None, elements=None,
+                 physical_names=None, *, node_ids=None, chunks=None):
+        self.points = points
+        self.physical_names = {} if physical_names is None else physical_names
+        self._node_index = node_index
+        self._node_ids = (None if node_ids is None
+                          else np.asarray(node_ids, dtype=np.int64))
+        self._lookup = None
+        if chunks is None:
+            self._elements = list(elements or [])
+            self._chunks = None
+        else:
+            self._elements = None
+            self._chunks = list(chunks)
+
+    @property
+    def is_array(self) -> bool:
+        """Whether the elements came as arrays (from a reader)."""
+        return self._chunks is not None
+
+    @property
+    def chunks(self) -> list:
+        if self._chunks is None:
+            from foammesh.core.gmsh.msh4 import chunks_from_rows
+            self._chunks = chunks_from_rows(self._elements)
+        return self._chunks
+
+    @property
+    def elements(self) -> list:
+        if self._elements is None:
+            rows = []
+            for chunk in self._chunks:
+                element_type = int(chunk.element_type)
+                for physical, nodes in zip(chunk.physical.tolist(),
+                                           chunk.nodes.tolist()):
+                    rows.append((element_type, int(physical), nodes))
+            self._elements = rows
+        return self._elements
+
+    def iter_elements(self, types) -> 'list[tuple]':
+        """The ``(type, physical, node tags)`` rows of the given types only,
+        in file order, without building the rows of the others."""
+        types = set(types)
+        if self._chunks is None:
+            return [row for row in self._elements if row[0] in types]
+        rows = []
+        for chunk in self._chunks:
+            if int(chunk.element_type) not in types:
+                continue
+            element_type = int(chunk.element_type)
+            for physical, nodes in zip(chunk.physical.tolist(),
+                                       chunk.nodes.tolist()):
+                rows.append((element_type, int(physical), nodes))
+        return rows
+
+    @property
+    def node_index(self) -> dict:
+        if self._node_index is None:
+            ids = self._node_ids if self._node_ids is not None else ()
+            self._node_index = {
+                node: position
+                for position, node in enumerate(np.asarray(ids).tolist())}
+        return self._node_index
+
+    def lookup(self) -> _NodeLookup:
+        """Node tag -> position, for arrays of tags."""
+        if self._lookup is None:
+            if self._node_ids is not None:
+                self._lookup = _NodeLookup(self._node_ids)
+            else:
+                index = self.node_index
+                self._lookup = _NodeLookup(
+                    np.fromiter(index.keys(), dtype=np.int64, count=len(index)),
+                    np.fromiter(index.values(), dtype=np.int64,
+                                count=len(index)))
+        return self._lookup
 
 
 @dataclass(frozen=True)
@@ -185,9 +321,8 @@ def read_msh(path: str | Path) -> MshDocument:
             raise PublishError(str(error)) from error
         return MshDocument(
             points=np.asarray(points, dtype=np.float64),
-            node_index={int(node): position
-                        for position, node in enumerate(node_ids.tolist())},
-            elements=rows, physical_names=names)
+            node_ids=node_ids, chunks=msh4.chunks_from_rows(rows),
+            physical_names=names)
     if msh4.is_msh4(head):
         try:
             points, node_ids, rows, names = msh4.read_msh4(path)
@@ -195,68 +330,348 @@ def read_msh(path: str | Path) -> MshDocument:
             raise PublishError(str(error)) from error
         return MshDocument(
             points=np.asarray(points, dtype=np.float64),
-            node_index={int(node): position
-                        for position, node in enumerate(node_ids.tolist())},
-            elements=rows, physical_names=names)
+            node_ids=node_ids, chunks=msh4.chunks_from_rows(rows),
+            physical_names=names)
+    # Plan 50 IP14 (GM-1). The hidden publisher copy is ASCII 2.2, so this is
+    # the reader every OpenFOAM publication goes through. The node and
+    # element bodies are parsed as numbers in blocks, not a line at a time;
+    # a file the block reader cannot vouch for reading exactly as the line
+    # reader would (odd line breaks, tokens it does not expect, a count that
+    # does not match its section) is read by the line reader instead.
+    try:
+        return _read_msh22(path, _ArrayLines.open(path))
+    except _Irregular:
+        pass
     try:
         lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
     except OSError as error:
         raise PublishError(f'mesh file could not be read: {error}') from error
+    return _read_msh22(path, lines)
 
-    node_ids: list[int] = []
-    coordinates: list[tuple[float, float, float]] = []
-    elements: list[tuple[int, int, list[int]]] = []
+
+#: Plan 50 IP14. The block size of the 2.2 reader. Small enough that the
+#: text of one block, its tokens and its numbers are a few tens of MB at
+#: once whatever the file's size; the file itself is memory-mapped.
+_READ_CHUNK_BYTES = 1 << 23
+
+#: Bytes the block reader takes in a node or element body: digits, signs,
+#: the decimal point and exponent, blanks and line ends. Anything else (a
+#: ``nan``, a stray letter) sends the file to the line reader.
+_NUMBER_BYTES = frozenset(b'0123456789+-.eE \t\r\n')
+_INTEGER_BYTES = frozenset(b'0123456789+- \t\r\n')
+_BYTE_IS = {
+    name: np.isin(np.arange(256), np.frombuffer(bytes(sorted(allowed)),
+                                                dtype=np.uint8))
+    for name, allowed in (('number', _NUMBER_BYTES),
+                          ('integer', _INTEGER_BYTES),
+                          ('blank', frozenset(b' \t\r\n')))}
+#: Line breaks ``str.splitlines`` honours besides ``\n`` and ``\r\n``. A file
+#: holding one is split differently by a newline index, so it is read by
+#: the line reader (``\x85`` and U+2028/9 as their UTF-8 bytes).
+_OTHER_BREAKS = (b'\x0b', b'\x0c', b'\x1c', b'\x1d', b'\x1e',
+                 b'\xc2\x85', b'\xe2\x80\xa8', b'\xe2\x80\xa9')
+
+
+class _ArrayLines:
+    """The lines of a memory-mapped file, read one by one only when asked.
+
+    Stands in for ``text.splitlines()`` in :func:`_read_msh22`, which visits
+    the header lines one by one and hands the node and element bodies, by
+    line range, to the block parsers. Built only for files whose line breaks
+    are ``\\n`` or ``\\r\\n``, where splitting on ``\\n`` is what
+    ``splitlines`` does.
+    """
+
+    def __init__(self, data, starts: np.ndarray, ends: np.ndarray):
+        self.data = data
+        self.starts = starts
+        self.ends = ends
+
+    @classmethod
+    def open(cls, path: Path) -> '_ArrayLines':
+        import mmap
+
+        try:
+            with open(path, 'rb') as handle:
+                data = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError) as error:
+            raise _Irregular() from error
+        size = len(data)
+        for other in _OTHER_BREAKS:
+            if data.find(other) >= 0:
+                data.close()
+                raise _Irregular()
+        breaks = []
+        step = max(int(_READ_CHUNK_BYTES), 1)
+        for start in range(0, size, step):
+            block = data[start:start + step]
+            if block.count(b'\r') != block.count(b'\r\n'):
+                data.close()
+                raise _Irregular()
+            breaks.append(np.flatnonzero(
+                np.frombuffer(block, dtype=np.uint8) == 10) + start)
+            # a \r\n split across two blocks counts as a lone \r above
+            if block.endswith(b'\r'):
+                data.close()
+                raise _Irregular()
+        newline = (np.concatenate(breaks) if breaks
+                   else np.empty(0, dtype=np.int64))
+        starts = np.concatenate(([0], newline + 1)).astype(np.int64)
+        ends = np.concatenate((newline, [size])).astype(np.int64)
+        if starts[-1] >= size:
+            # the file ends with a line break: no empty line after it
+            starts, ends = starts[:-1], ends[:-1]
+        # a \r before the \n belongs to the break, not to the line
+        if ends.size:
+            last = np.frombuffer(data, dtype=np.uint8)
+            before = np.maximum(ends - 1, 0)
+            carriage = (ends > starts) & (last[before] == 13)
+            ends = ends - carriage
+            del last
+        return cls(data, starts, ends)
+
+    def __len__(self) -> int:
+        return int(self.starts.size)
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return [self[index] for index in range(*item.indices(len(self)))]
+        return self.data[int(self.starts[item]):int(self.ends[item])].decode(
+            'utf-8', 'replace')
+
+    def close(self) -> None:
+        try:
+            self.data.close()
+        except (BufferError, ValueError):
+            pass
+
+
+def _read_msh22(path: Path, lines) -> MshDocument:
+    """The 2.2 reader's walk through the file's sections.
+
+    *lines* is either the file's ``splitlines()`` (the line reader) or an
+    :class:`_ArrayLines` (the block reader); the walk, its refusals and its
+    messages are the same for both, and only the node and element bodies are
+    parsed differently.
+    """
+    blocks = isinstance(lines, _ArrayLines)
+    node_ids: list = []
+    coordinates: list = []
+    elements: list = []
+    chunks: list = []
     names: dict[tuple[int, int], str] = {}
     index, version_seen = 0, False
-
-    while index < len(lines):
-        line = lines[index].strip()
-        if line == '$MeshFormat':
-            version = lines[index + 1].split()[0] if index + 1 < len(lines) else ''
-            if not version.startswith('2.'):
-                raise PublishError(
-                    f'this reader implements MSH 2.2; the file declares '
-                    f'{version or "no"} version')
-            version_seen = True
-            index += 2
-        elif line == '$PhysicalNames':
-            count = int(lines[index + 1])
-            for row in lines[index + 2: index + 2 + count]:
-                parts = row.split(None, 2)
-                if len(parts) >= 3:
-                    names[(int(parts[0]), int(parts[1]))] = (
-                        parts[2].strip().strip('"'))
-            index += 2 + count
-        elif line == '$Nodes':
-            count = int(lines[index + 1])
-            for row in lines[index + 2: index + 2 + count]:
-                parts = row.split()
-                node_ids.append(int(parts[0]))
-                coordinates.append(
-                    (float(parts[1]), float(parts[2]), float(parts[3])))
-            index += 2 + count
-        elif line == '$Elements':
-            count = int(lines[index + 1])
-            for row in lines[index + 2: index + 2 + count]:
-                parts = [int(value) for value in row.split()]
-                if len(parts) < 3:
-                    continue
-                element_type, tag_count = parts[1], parts[2]
-                physical = parts[3] if tag_count >= 1 else 0
-                elements.append(
-                    (element_type, physical, parts[3 + tag_count:]))
-            index += 2 + count
-        else:
-            index += 1
+    try:
+        while index < len(lines):
+            line = lines[index].strip()
+            if line == '$MeshFormat':
+                version = (lines[index + 1].split()[0]
+                           if index + 1 < len(lines) else '')
+                if not version.startswith('2.'):
+                    raise PublishError(
+                        f'this reader implements MSH 2.2; the file declares '
+                        f'{version or "no"} version')
+                version_seen = True
+                index += 2
+            elif line == '$PhysicalNames':
+                count = int(lines[index + 1])
+                for row in lines[index + 2: index + 2 + count]:
+                    parts = row.split(None, 2)
+                    if len(parts) >= 3:
+                        names[(int(parts[0]), int(parts[1]))] = (
+                            parts[2].strip().strip('"'))
+                index += 2 + count
+            elif line == '$Nodes':
+                count = int(lines[index + 1])
+                if blocks:
+                    tags, values = _node_block(
+                        lines, index + 2, min(index + 2 + count, len(lines)))
+                    node_ids.append(tags)
+                    coordinates.append(values)
+                else:
+                    for row in lines[index + 2: index + 2 + count]:
+                        parts = row.split()
+                        node_ids.append(int(parts[0]))
+                        coordinates.append(
+                            (float(parts[1]), float(parts[2]),
+                             float(parts[3])))
+                index += 2 + count
+            elif line == '$Elements':
+                count = int(lines[index + 1])
+                if blocks:
+                    chunks.extend(_element_block(
+                        lines, index + 2, min(index + 2 + count, len(lines))))
+                else:
+                    for row in lines[index + 2: index + 2 + count]:
+                        parts = [int(value) for value in row.split()]
+                        if len(parts) < 3:
+                            continue
+                        element_type, tag_count = parts[1], parts[2]
+                        physical = parts[3] if tag_count >= 1 else 0
+                        elements.append(
+                            (element_type, physical, parts[3 + tag_count:]))
+                index += 2 + count
+            else:
+                index += 1
+    except PublishError:
+        if blocks:
+            lines.close()
+        raise
+    except (ValueError, IndexError) as error:
+        if blocks:
+            # the line reader raises this one, in its own words
+            lines.close()
+            raise _Irregular() from error
+        raise
+    if blocks:
+        lines.close()
 
     if not version_seen:
         raise PublishError('mesh file has no $MeshFormat section')
+    if blocks:
+        tags = (np.concatenate(node_ids) if node_ids
+                else np.empty(0, dtype=np.int64))
+        if not tags.size:
+            raise PublishError('mesh file contains no nodes')
+        points = (np.concatenate(coordinates) if coordinates
+                  else np.empty((0, 3)))
+        from foammesh.core.gmsh.msh4 import merge_chunks
+        return MshDocument(
+            points=np.ascontiguousarray(points, dtype=np.float64),
+            node_ids=tags, chunks=merge_chunks(chunks), physical_names=names)
     if not node_ids:
         raise PublishError('mesh file contains no nodes')
     return MshDocument(
         points=np.asarray(coordinates, dtype=np.float64),
         node_index={node: position for position, node in enumerate(node_ids)},
         elements=elements, physical_names=names)
+
+
+def _line_blocks(lines: _ArrayLines, first: int, stop: int):
+    """``(first line, stop line, bytes)`` blocks of lines ``first..stop-1``.
+
+    Each block ends at a line end; a line longer than the block size is a
+    block of its own.
+    """
+    if stop <= first:
+        return
+    step = max(int(_READ_CHUNK_BYTES), 1)
+    starts, ends = lines.starts, lines.ends
+    line = first
+    while line < stop:
+        limit = int(starts[line]) + step
+        last = int(np.searchsorted(starts, limit, side='left'))
+        last = max(min(last, stop), line + 1)
+        yield line, last, lines.data[int(starts[line]):int(ends[last - 1])]
+        line = last
+
+
+def _tokens_per_line(text: bytes, starts: np.ndarray, ends: np.ndarray,
+                     allowed: str) -> np.ndarray:
+    """How many blank-separated tokens each line of *text* holds.
+
+    *starts*/*ends* are the lines' byte bounds within *text*. Refuses
+    (:class:`_Irregular`) a byte outside the *allowed* class.
+    """
+    codes = np.frombuffer(text, dtype=np.uint8)
+    if not _BYTE_IS[allowed][codes].all():
+        raise _Irregular()
+    solid = ~_BYTE_IS['blank'][codes]
+    begins = solid.copy()
+    begins[1:] &= ~solid[:-1]
+    running = np.concatenate(([0], np.cumsum(begins, dtype=np.int64)))
+    return running[ends] - running[starts]
+
+
+def _parse_numbers(text: bytes, convert, dtype, expected: int):
+    """The blank-separated numbers of *text*, read by the line reader's own
+    ``int``/``float``, so every number is the one it would read.
+
+    ``np.fromstring`` was measured at 2.8 s for 16 MB of element lines here
+    (``int`` over the split tokens: 0.5 s) and parses through the C library,
+    not Python's ``float``; so it is not used.
+    """
+    tokens = text.split()
+    if len(tokens) != expected:
+        raise _Irregular()
+    try:
+        return tokens, np.fromiter(map(convert, tokens), dtype=dtype,
+                                   count=expected)
+    except (ValueError, OverflowError) as error:
+        raise _Irregular() from error
+
+
+def _node_block(lines: _ArrayLines, first: int, stop: int):
+    """Tags and coordinates of node lines ``first..stop-1``: ``tag x y z``."""
+    tags, values = [], []
+    for line, last, text in _line_blocks(lines, first, stop):
+        base = int(lines.starts[line])
+        starts = lines.starts[line:last] - base
+        ends = lines.ends[line:last] - base
+        counts = _tokens_per_line(text, starts, ends, 'number')
+        if (counts != 4).any():
+            raise _Irregular()
+        tokens, numbers = _parse_numbers(text, float, np.float64,
+                                         4 * (last - line))
+        try:
+            # the line reader reads the tag with int()
+            node = np.fromiter(map(int, tokens[0::4]), dtype=np.int64,
+                               count=last - line)
+        except (ValueError, OverflowError) as error:
+            raise _Irregular() from error
+        del tokens
+        tags.append(node)
+        values.append(numbers.reshape(-1, 4)[:, 1:4].copy())
+    if not tags:
+        return np.empty(0, dtype=np.int64), np.empty((0, 3))
+    return np.concatenate(tags), np.concatenate(values)
+
+
+def _element_block(lines: _ArrayLines, first: int, stop: int) -> list:
+    """Element chunks of element lines ``first..stop-1``.
+
+    A line is ``number type tagCount tags... nodes...``; a line of fewer than
+    three numbers is skipped, as the line reader skips it. The rows are cut
+    into chunks of one element type and one node count each, in file order.
+    """
+    from foammesh.core.gmsh.msh4 import ElementChunk
+
+    chunks = []
+    for line, last, text in _line_blocks(lines, first, stop):
+        base = int(lines.starts[line])
+        starts = lines.starts[line:last] - base
+        ends = lines.ends[line:last] - base
+        tokens = _tokens_per_line(text, starts, ends, 'integer')
+        _tokens, numbers = _parse_numbers(text, int, np.int64,
+                                          int(tokens.sum()))
+        del _tokens
+        offsets = np.concatenate(([0], np.cumsum(tokens)[:-1]))
+        kept = tokens >= 3
+        offsets, widths = offsets[kept], tokens[kept]
+        if not offsets.size:
+            continue
+        element_type = numbers[offsets + 1]
+        tag_count = numbers[offsets + 2]
+        if (tag_count < 0).any() or ((tag_count >= 1) & (widths < 4)).any():
+            raise _Irregular()
+        physical = np.where(tag_count >= 1,
+                            numbers[np.minimum(offsets + 3, numbers.size - 1)],
+                            0)
+        node_start = offsets + 3 + tag_count
+        node_count = np.maximum(offsets + widths - node_start, 0)
+        node_start = np.minimum(node_start, offsets + widths)
+        # runs of one (type, node count)
+        change = np.flatnonzero((element_type[1:] != element_type[:-1])
+                                | (node_count[1:] != node_count[:-1])) + 1
+        bounds = np.concatenate(([0], change, [offsets.size]))
+        for low, high in zip(bounds[:-1], bounds[1:]):
+            width = int(node_count[low])
+            take = node_start[low:high, None] + np.arange(width)[None, :]
+            chunks.append(ElementChunk(
+                int(element_type[low]), physical[low:high].astype(np.int64),
+                numbers[take] if width else np.empty((high - low, 0),
+                                                     dtype=np.int64)))
+    return chunks
 
 
 # --------------------------------------------------------------------------- #
@@ -609,9 +1024,9 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
     that did ask for one is refused if Gmsh handed it a volume mesh instead.
     """
     if extrusion is not None:
-        volumes = sum(1 for element_type, _physical, _nodes in document.elements
-                      if element_type in VOLUME_TYPES
-                      or element_type in _HIGHER_ORDER_VOLUME_TYPES)
+        volumes = sum(int(chunk.nodes.shape[0]) for chunk in document.chunks
+                      if chunk.element_type in VOLUME_TYPES
+                      or chunk.element_type in _HIGHER_ORDER_VOLUME_TYPES)
         if volumes:
             raise PublishError(
                 f'the job asked for a {extrusion.mode} mesh and Gmsh produced '
@@ -623,31 +1038,8 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
     else:
         extrusion_warnings = []
 
-    volume_rows: dict[CellType, list] = {}
-    volume_regions: dict[CellType, list] = {}
-    surface_rows: dict[CellType, list] = {}
-    surface_patches: dict[CellType, list] = {}
-    lookup = document.node_index
-
-    for element_type, physical, nodes in document.elements:
-        if element_type in VOLUME_TYPES:
-            kind, size = VOLUME_TYPES[element_type]
-            try:
-                volume_rows.setdefault(kind, []).append(
-                    [lookup[node] for node in nodes[:size]])
-            except KeyError as error:
-                raise PublishError(
-                    f'element references undefined node {error}') from error
-            volume_regions.setdefault(kind, []).append(physical)
-        elif element_type in SURFACE_TYPES:
-            kind, size = SURFACE_TYPES[element_type]
-            try:
-                surface_rows.setdefault(kind, []).append(
-                    [lookup[node] for node in nodes[:size]])
-            except KeyError as error:
-                raise PublishError(
-                    f'face references undefined node {error}') from error
-            surface_patches.setdefault(kind, []).append(physical)
+    volume_rows, volume_regions, surface_rows, surface_patches = (
+        _gathered_elements(document))
 
     if not volume_rows:
         # Plan 30 WP-07 (F-36). "No volume cells" was raised for any mesh this
@@ -657,9 +1049,10 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         # gone wrong. The census answers "of any order"; only when it finds
         # nothing at all is the original diagnosis the right one.
         higher_order = [
-            _HIGHER_ORDER_VOLUME_TYPES[element_type]
-            for element_type, _physical, _nodes in document.elements
-            if element_type in _HIGHER_ORDER_VOLUME_TYPES]
+            _HIGHER_ORDER_VOLUME_TYPES[chunk.element_type]
+            for chunk in document.chunks
+            if chunk.element_type in _HIGHER_ORDER_VOLUME_TYPES
+            for _row in range(chunk.nodes.shape[0])]
         if higher_order:
             orders = sorted(set(higher_order))
             plural = '' if len(higher_order) == 1 else 's'
@@ -682,9 +1075,17 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
             'usually means the CAD imported without solids')
 
     # Gmsh emits every CAD vertex as a node, referenced by nothing.
-    used = np.unique(np.concatenate([
-        np.asarray(rows, dtype=np.int64).ravel()
-        for rows in list(volume_rows.values()) + list(surface_rows.values())]))
+    # Plan 50 IP14: a mask of the positions in use, not a sort of every
+    # reference (the same sorted positions).
+    all_rows = [np.asarray(rows, dtype=np.int64)
+                for rows in list(volume_rows.values())
+                + list(surface_rows.values())]
+    in_use = np.zeros(document.points.shape[0], dtype=bool)
+    for rows in all_rows:
+        in_use[rows.ravel()] = True
+    del all_rows
+    used = np.flatnonzero(in_use).astype(np.int64)
+    del in_use
     remap = np.full(document.points.shape[0], -1, dtype=np.int64)
     remap[used] = np.arange(used.size, dtype=np.int64)
     points = document.points[used]
@@ -721,21 +1122,21 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
 
     # Boundary from cell ownership. See the module docstring: Gmsh's own
     # adjacency is stale after a geo-kernel extrusion and cannot be trusted.
-    face_use: dict[tuple, int] = {}
-    for block in cell_blocks:
-        for local in _FACES[block.cell_type]:
-            for row in block.connectivity[:, local]:
-                key = tuple(sorted(int(value) for value in row))
-                face_use[key] = face_use.get(key, 0) + 1
+    # Plan 50 IP14 (GM-1, DP-6260): the face-use count is one sort of the
+    # face keys per face size, not a dictionary entry a face; a surface face
+    # is kept when exactly one cell has it, and the boundary faces the cells
+    # expect are the keys exactly one cell has.
+    surface_connectivity = {
+        kind: remap[np.asarray(rows, dtype=np.int64)]
+        for kind, rows in surface_rows.items()}
+    single_use, expected = _single_use_faces(
+        cell_blocks, surface_connectivity, points.shape[0])
 
     boundary_blocks, dropped, next_face = [], 0, 0
-    for kind, rows in surface_rows.items():
-        connectivity = remap[np.asarray(rows, dtype=np.int64)]
+    for kind in surface_rows:
+        connectivity = surface_connectivity[kind]
         patch_ids = np.asarray(surface_patches[kind], dtype=np.int64)
-        keep = np.fromiter(
-            (face_use.get(tuple(sorted(int(value) for value in row)), 0) == 1
-             for row in connectivity),
-            dtype=bool, count=connectivity.shape[0])
+        keep = single_use[kind]
         dropped += int((~keep).sum())
         connectivity, patch_ids = connectivity[keep], patch_ids[keep]
         if not connectivity.shape[0]:
@@ -746,7 +1147,6 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
             patch_ids=patch_ids))
         next_face += connectivity.shape[0]
 
-    expected = sum(1 for count in face_use.values() if count == 1)
     if next_face > expected:
         # DP-462. More named faces than the mesh has boundary faces is not an
         # open mesh, it is the opposite: a face claimed by two physical
@@ -760,7 +1160,7 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         # rather than resolved: picking a winner would put a boundary
         # condition on a wall the user named twice without saying which name
         # the solver would see.
-        raise PublishError(_overlap_message(boundary_blocks, face_use,
+        raise PublishError(_overlap_message(boundary_blocks, None,
                                             document.physical_names,
                                             next_face - expected))
     if next_face < expected:
@@ -800,6 +1200,137 @@ def build_canonical(document: MshDocument, *, patch_metadata=None,
         warnings=tuple(warnings),
         patch_records=tuple(dict(item) for item in patches.values()))
     return mesh, report
+
+
+def _gathered_elements(document: MshDocument):
+    """The volume and surface elements of *document*, by canonical cell type
+    in order of first appearance: node positions, physical tags.
+
+    Plan 50 IP14 (GM-1). A document read from a file is gathered a chunk at a
+    time, as arrays; one built from rows (or holding an element with fewer
+    nodes than its type has) goes through the row loop it always went
+    through. Both refuse the same first undefined node with the same words.
+    """
+    if document.is_array:
+        try:
+            return _gathered_chunks(document)
+        except _Irregular:
+            pass
+    volume_rows: dict[CellType, list] = {}
+    volume_regions: dict[CellType, list] = {}
+    surface_rows: dict[CellType, list] = {}
+    surface_patches: dict[CellType, list] = {}
+    lookup = document.node_index
+
+    for element_type, physical, nodes in document.elements:
+        if element_type in VOLUME_TYPES:
+            kind, size = VOLUME_TYPES[element_type]
+            try:
+                volume_rows.setdefault(kind, []).append(
+                    [lookup[node] for node in nodes[:size]])
+            except KeyError as error:
+                raise PublishError(
+                    f'element references undefined node {error}') from error
+            volume_regions.setdefault(kind, []).append(physical)
+        elif element_type in SURFACE_TYPES:
+            kind, size = SURFACE_TYPES[element_type]
+            try:
+                surface_rows.setdefault(kind, []).append(
+                    [lookup[node] for node in nodes[:size]])
+            except KeyError as error:
+                raise PublishError(
+                    f'face references undefined node {error}') from error
+            surface_patches.setdefault(kind, []).append(physical)
+    return volume_rows, volume_regions, surface_rows, surface_patches
+
+
+def _gathered_chunks(document: MshDocument):
+    lookup = document.lookup()
+    parts: dict = {}
+    order: list = []
+    for chunk in document.chunks:
+        element_type = int(chunk.element_type)
+        if element_type in VOLUME_TYPES:
+            (kind, size), what, volume = (VOLUME_TYPES[element_type],
+                                          'element', True)
+        elif element_type in SURFACE_TYPES:
+            (kind, size), what, volume = (SURFACE_TYPES[element_type],
+                                          'face', False)
+        else:
+            continue
+        if chunk.nodes.shape[1] < size:
+            raise _Irregular()
+        if not chunk.nodes.shape[0]:
+            continue
+        positions = lookup(chunk.nodes[:, :size])
+        missing = positions < 0
+        if missing.any():
+            row = int(np.flatnonzero(missing.any(axis=1))[0])
+            column = int(np.flatnonzero(missing[row])[0])
+            raise PublishError(f'{what} references undefined node '
+                               f'{int(chunk.nodes[row, column])}')
+        key = (volume, kind)
+        if key not in parts:
+            parts[key] = ([], [])
+            order.append(key)
+        parts[key][0].append(positions)
+        parts[key][1].append(np.asarray(chunk.physical, dtype=np.int64))
+    gathered = ({}, {}, {}, {})
+    for volume, kind in order:
+        rows, tags = parts.pop((volume, kind))
+        rows = rows[0] if len(rows) == 1 else np.concatenate(rows)
+        tags = tags[0] if len(tags) == 1 else np.concatenate(tags)
+        slot = 0 if volume else 2
+        gathered[slot][kind] = rows
+        gathered[slot + 1][kind] = tags
+    return gathered
+
+
+def _single_use_faces(cell_blocks, surface_connectivity: dict,
+                      point_count: int) -> tuple[dict, int]:
+    """Which surface faces exactly one cell has, and how many face keys
+    exactly one cell has (the boundary faces the cells expect).
+
+    A face is its sorted node positions; a triangle and a quadrilateral are
+    never the same face.
+    """
+    from foammesh.core.mesh.connectivity import row_groups
+
+    dtype = np.int32 if point_count < 2 ** 31 - 1 else np.int64
+    single = {kind: np.zeros(rows.shape[0], dtype=bool)
+              for kind, rows in surface_connectivity.items()}
+    expected = 0
+    for width in (3, 4):
+        cell_keys = [
+            np.sort(block.connectivity[:, list(local)].astype(dtype), axis=1)
+            for block in cell_blocks
+            for local in _FACES[block.cell_type] if len(local) == width]
+        surfaces = [(kind, rows) for kind, rows in surface_connectivity.items()
+                    if rows.ndim == 2 and rows.shape[1] == width
+                    and rows.shape[0]]
+        cell_count = sum(item.shape[0] for item in cell_keys)
+        if not cell_count:
+            continue
+        keys = np.concatenate(
+            cell_keys + [np.sort(rows.astype(dtype), axis=1)
+                         for _kind, rows in surfaces])
+        del cell_keys
+        groups = row_groups(keys)
+        del keys
+        group = groups.inverse()
+        del groups
+        cells_in_group = np.bincount(group[:cell_count])
+        expected += int((cells_in_group == 1).sum())
+        start = cell_count
+        for kind, rows in surfaces:
+            stop = start + rows.shape[0]
+            in_group = group[start:stop]
+            inside = in_group < cells_in_group.size
+            keep = np.zeros(rows.shape[0], dtype=bool)
+            keep[inside] = cells_in_group[in_group[inside]] == 1
+            single[kind] = keep
+            start = stop
+    return single, expected
 
 
 def _overlap_message(boundary_blocks, face_use, physical_names,
@@ -1340,8 +1871,8 @@ def publish(msh_path: str | Path, destination: str | Path, *,
     merely led with is still published as a wall.
     """
     from .role_publication import (
-        RolePublicationError, apply_role_metadata, internal_face_zones,
-        non_conformal_couplings, role_publication, write_face_zones)
+        RolePublicationError, apply_role_metadata, internal_face_keys,
+        internal_face_zones, non_conformal_couplings, role_publication, write_face_zones)
 
     # Plan 49 SR5. The surface roles' types win over the prepared category,
     # and an authored empty/wedge is declared (and so held to its contract).
@@ -1381,13 +1912,21 @@ def publish(msh_path: str | Path, destination: str | Path, *,
     check_mesh_constrained(mesh)
     role_record: dict = {}
     try:
-        zones = (internal_face_zones(mesh, document, roles.internal)
+        # DP-6131. The edge cells are merged here, before the role faces are
+        # labelled, so the labels are the written face numbers; the faces a
+        # role labels are the ones a merge may not remove.
+        topology = agglomerated_topology(mesh, protected_keys=(
+            internal_face_keys(mesh, document, roles.internal)
+            if roles.internal else ()))
+        zones = (internal_face_zones(mesh, document, roles.internal, topology)
                  if roles.internal else [])
-        couplings = non_conformal_couplings(mesh, roles.non_conformal)
+        couplings = non_conformal_couplings(
+            mesh, roles.non_conformal, topology)
     except RolePublicationError as error:
         raise PublishError(str(error)) from error
     try:
-        written = FoamPolyMeshWriter().write(destination, mesh)
+        written = FoamPolyMeshWriter().write(
+            destination, mesh, topology=topology)
     except PolyMeshWriteError as error:
         raise PublishError(str(error)) from error
     export = written.to_dict()

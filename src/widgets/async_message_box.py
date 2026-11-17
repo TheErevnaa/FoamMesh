@@ -3,6 +3,8 @@
 
 import asyncio
 
+from widgets.async_dialog import openLater
+
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QBoxLayout, QDialog, QDialogButtonBox, QFormLayout, QLabel, QMessageBox, QSizePolicy,
@@ -272,6 +274,10 @@ class AsyncMessageBox:
 # functions through ``from widgets import async_message_box as messages`` and
 # never construct or call ``QMessageBox`` themselves (the census gate in
 # ``test_plan40_ux0_gui_first_class_gates_open.py`` fails on a direct call).
+# Plan 50 IP19: a decision no longer blocks either. It still takes the window
+# (application-modal), but it is shown with ``show()`` and answered through a
+# callback (``ask``/``askQuestion``) or awaited (``askAsync``/``questionAsync``),
+# so no nested event loop runs.
 # --------------------------------------------------------------------------- #
 
 _OK = QMessageBox.StandardButton.Ok
@@ -298,23 +304,10 @@ _KIND = {QMessageBox.Icon.Information: 'information', QMessageBox.Icon.Warning: 
 _STATIC = {kind: getattr(QMessageBox, kind) for kind in _KIND.values()}
 
 
-def decide(icon, parent, title, text, buttons, defaultButton=_NO_BUTTON):
-    """A decision in the sheet look: it blocks until the user answers.
-
-    Plan 44 MF26. What ``QMessageBox.question`` and its siblings did, built
-    here so the box is a sheet: the same buttons, the same default (the given
-    one, else the first accept button), application-modal (UXC7: a decision
-    takes the window), and the button pressed returned as a
-    ``StandardButton`` (Cancel when the box closes without one).
-
-    The class's static call stays the seam a decision is answered through:
-    when ``QMessageBox.question`` (or a sibling) is not the one Qt ships --
-    the unit tests answer the box that way -- it is asked instead.
-    """
-    kind = _KIND.get(icon)
-    answer = getattr(QMessageBox, kind) if kind else None
-    if kind and answer is not _STATIC[kind]:
-        return answer(parent, title, text, buttons, defaultButton)
+def _decisionBox(icon, parent, title, text, buttons, defaultButton):
+    """The sheet box a decision is asked in: the same buttons as Qt's static,
+    the given default (else the first accept button), application-modal
+    (UXC7: a decision takes the window)."""
     mbox = SheetMessageBox(icon, title, text, _NO_BUTTON, parent)
     mbox.setWindowModality(Qt.WindowModality.ApplicationModal)
     wanted = QMessageBox.StandardButton(buttons).value
@@ -333,11 +326,134 @@ def decide(icon, parent, title, text, buttons, defaultButton=_NO_BUTTON):
              and mbox.buttonRole(button) == QMessageBox.ButtonRole.AcceptRole)
                 or (default != _NO_BUTTON and standard == default)):
             mbox.setDefaultButton(button)
-    if mbox.exec() == -1:
-        return QMessageBox.StandardButton.Cancel
-    clicked = mbox.clickedButton()
-    return (QMessageBox.StandardButton.Cancel if clicked is None
-            else mbox.standardButton(clicked))
+    return mbox
+
+
+_decisionBoxes = set()   # an open decision is kept alive until it is answered
+
+
+def ask(icon, parent, title, text, buttons, defaultButton=_NO_BUTTON, *, then,
+        _given=None):
+    """A decision in the sheet look, asked without a nested event loop.
+
+    Plan 50 IP19 (ST-1, DP-6360). What ``decide`` did with ``exec()``: the box
+    is shown application-modal with ``show()`` and this returns at once;
+    ``then(button)`` gets the ``StandardButton`` pressed (Cancel when the box
+    closes without one). Plan 44 MF26: the box is a sheet.
+
+    The class's static call stays the seam a decision is answered through:
+    when ``QMessageBox.question`` (or a sibling) is not the one Qt ships --
+    the unit tests answer the box that way -- it is asked instead and
+    ``then`` is called at once.
+    """
+    kind = _KIND.get(icon)
+    # This module's own functions are the seam the app's tests answer
+    # decisions through (``monkeypatch.setattr(messages, 'question', ...)``).
+    # *_given* is what the caller itself passed, so the stand-in sees the
+    # same arguments the blocking call used to.
+    mine = globals().get(kind) if kind else None
+    if mine is not None and mine is not _SHIPPED.get(kind):
+        then(mine(*(_given or (parent, title, text, buttons, defaultButton))))
+        return None
+    answer = getattr(QMessageBox, kind) if kind else None
+    if kind and answer is not _STATIC[kind]:
+        then(answer(parent, title, text, buttons, defaultButton))
+        return None
+    mbox = _decisionBox(icon, parent, title, text, buttons, defaultButton)
+    return openBox(mbox, lambda clicked: then(
+        QMessageBox.StandardButton.Cancel if clicked is None
+        else mbox.standardButton(clicked)))
+
+
+def openBox(mbox, then):
+    """Show a box that built its own buttons; ``then(clickedButton or None)``.
+
+    Application-modal unless the box says otherwise, with no nested loop.
+    A test that answers the box through a patched ``exec`` is asked instead.
+    """
+    from widgets.async_dialog import _answeredByTest
+    if _answeredByTest(mbox):
+        mbox.exec()
+        then(mbox.clickedButton())
+        return mbox
+    _decisionBoxes.add(mbox)
+    if mbox.windowModality() == Qt.WindowModality.NonModal:
+        mbox.setWindowModality(Qt.WindowModality.ApplicationModal)
+
+    def finished(_result):
+        _decisionBoxes.discard(mbox)
+        then(mbox.clickedButton())
+
+    mbox.finished.connect(finished)
+    mbox.show()
+    return mbox
+
+
+def askAsync(icon, parent, title, text, buttons, defaultButton=_NO_BUTTON):
+    """``await`` form of :func:`ask`: the ``StandardButton`` pressed."""
+    future = asyncio.get_running_loop().create_future()
+
+    def answered(button):
+        if not future.done():
+            future.set_result(button)
+
+    openLater(future, lambda: ask(icon, parent, title, text, buttons,
+                                  defaultButton, then=answered))
+    return future
+
+
+def openBoxAsync(mbox):
+    """``await`` form of :func:`openBox`: the clicked button, or None."""
+    future = asyncio.get_running_loop().create_future()
+
+    def answered(button):
+        if not future.done():
+            future.set_result(button)
+
+    openLater(future, lambda: openBox(mbox, answered))
+    return future
+
+
+_YES_NO = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+
+
+def askQuestion(parent, title, text, *choice, then):
+    """A question, answered through ``then(button)``; never a nested loop.
+
+    *choice* is ``[buttons[, defaultButton]]``: Yes | No and no default
+    button unless given.
+    """
+    buttons, defaultButton = (tuple(choice) + (_YES_NO, _NO_BUTTON)[len(choice):])[:2]
+    return ask(QMessageBox.Icon.Question, parent, title, text, buttons, defaultButton,
+               then=then, _given=(parent, title, text) + tuple(choice))
+
+
+def questionAsync(parent, title, text, *choice):
+    """``await`` a question: the ``StandardButton`` pressed."""
+    future = asyncio.get_running_loop().create_future()
+
+    def answered(button):
+        if not future.done():
+            future.set_result(button)
+
+    openLater(future, lambda: askQuestion(parent, title, text, *choice,
+                                          then=answered))
+    return future
+
+
+def question(parent, title, text, buttons=_YES_NO, defaultButton=_NO_BUTTON):
+    """The seam a test answers a question through; never called by the app.
+
+    Plan 50 IP19. ``question`` used to block in a nested event loop and return
+    the button. The app now asks with :func:`askQuestion` or
+    :func:`questionAsync`; a test that replaces this function with one
+    returning a button has every question answered by it, at once. The
+    shipped function refuses, so a forgotten blocking call fails loudly
+    instead of hanging a task (the gate in
+    ``test_plan50_ip19_no_nested_event_loop_in_the_gui.py`` also forbids it).
+    """
+    raise TypeError('messages.question would block; use askQuestion(then=) '
+                    'or await questionAsync()')
 
 
 def showNotice(icon, parent, title, text, *, informativeText='', detailedText=''):
@@ -356,29 +472,38 @@ def showNotice(icon, parent, title, text, *, informativeText='', detailedText=''
     return _OK
 
 
-def information(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON):
+def _noticeOrAsk(icon, parent, title, text, buttons, defaultButton, then):
     if isNotice(buttons):
-        return showNotice(QMessageBox.Icon.Information, parent, title, text)
-    return decide(QMessageBox.Icon.Information, parent, title, text, buttons, defaultButton)
+        result = showNotice(icon, parent, title, text)
+        if then is not None:
+            then(result)
+        return result
+    if then is None:
+        # Plan 50 IP19: a box with a choice is answered through ``then``;
+        # returning the answer here would need a nested event loop.
+        raise TypeError('a box offering a choice needs then=; see async_message_box.ask')
+    return ask(icon, parent, title, text, buttons, defaultButton, then=then)
 
 
-def warning(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON):
-    if isNotice(buttons):
-        return showNotice(QMessageBox.Icon.Warning, parent, title, text)
-    return decide(QMessageBox.Icon.Warning, parent, title, text, buttons, defaultButton)
+def information(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON, *, then=None):
+    return _noticeOrAsk(QMessageBox.Icon.Information, parent, title, text, buttons,
+                        defaultButton, then)
 
 
-def critical(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON):
-    if isNotice(buttons):
-        return showNotice(QMessageBox.Icon.Critical, parent, title, text)
-    return decide(QMessageBox.Icon.Critical, parent, title, text, buttons, defaultButton)
+def warning(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON, *, then=None):
+    return _noticeOrAsk(QMessageBox.Icon.Warning, parent, title, text, buttons,
+                        defaultButton, then)
 
 
-def question(parent, title, text,
-             buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-             defaultButton=_NO_BUTTON):
-    """A decision: it blocks until the user answers."""
-    return decide(QMessageBox.Icon.Question, parent, title, text, buttons, defaultButton)
+def critical(parent, title, text, buttons=_OK, defaultButton=_NO_BUTTON, *, then=None):
+    return _noticeOrAsk(QMessageBox.Icon.Critical, parent, title, text, buttons,
+                        defaultButton, then)
+
+
+#: This module's own functions as shipped; one a test replaced answers
+#: :func:`ask` at once (Plan 50 IP19).
+_SHIPPED = {'question': question, 'information': information,
+            'warning': warning, 'critical': critical}
 
 
 def reasonOf(error, what: str):

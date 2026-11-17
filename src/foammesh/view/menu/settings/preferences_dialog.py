@@ -33,6 +33,7 @@ from foammesh.view.theming.metrics import (
     CompactDoubleSpinBox, CompactSpinBox, unit_cell,
 )
 from foammesh.view.theming.theme_manager import ThemeMode
+from foammesh.support.tasks import spawn
 
 _BUDGET_LABELS = {
     BudgetPolicy.ABORT: 'Stop the check',
@@ -456,8 +457,8 @@ class PreferencesDialog(QDialog):
         from foammesh.support import local_api
         api = local_api.current()
         if api is not None and api.active != wanted:
-            import asyncio
-            asyncio.ensure_future(api.start() if wanted else api.stop())
+            spawn(api.start() if wanted else api.stop(),
+                  what='Switching the local API')
 
     def _privacyPage(self, privacy) -> QWidget:
         page = QWidget()

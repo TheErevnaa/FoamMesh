@@ -38,7 +38,7 @@ from pathlib import Path
 from foammesh.core.jobs import stage_snapshots as snapshots
 from foammesh.core.project import Event
 
-from .errors import UndoNotAllowedError
+from .errors import PreconditionFailedError, UndoNotAllowedError
 
 logger = logging.getLogger(__name__)
 
@@ -205,12 +205,22 @@ async def step(session, direction: str, count: int,
             break
         if companion:
             try:
+                action = companion.get(direction) or {}
+                if (companion.get('kind', 'stage') == 'stage'
+                        and action.get('stage')):
+                    # Plan 50 IP17. A stage a parallel run kept as processor
+                    # cases is gathered before it is put back.
+                    await snapshots.gather_if_needed(
+                        session.case_path, action['stage'],
+                        action.get('revision'))
                 await asyncio.to_thread(_apply, session, companion, direction)
-            except (snapshots.SnapshotError, StepRefused) as error:
+            except (snapshots.SnapshotError, StepRefused,
+                    PreconditionFailedError) as error:
+                reason = (getattr(error, 'details', None) or {}).get('error')                     if isinstance(error, PreconditionFailedError)                     else error.code
                 raise UndoNotAllowedError(
                     f'{label!r} cannot be '
                     f'{"undone" if direction == "undo" else "redone"}: {error}',
-                    details={'reason': error.code, 'label': label}) from error
+                    details={'reason': reason, 'label': label}) from error
             kinds.add(companion.get('kind', 'stage'))
         if direction == 'undo':
             session.state.undo(stage_applied=bool(companion))

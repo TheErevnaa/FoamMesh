@@ -283,6 +283,51 @@ class LockChip(QWidget):
         self.chip.setIcon(svg_icon(template, _token(name, fallback)))
 
 
+def unlock_summary_lines(preview: dict, name: str, size_text) -> list:
+    """The head of an unlock confirmation: what goes, what reopens, what stays.
+
+    DP-6124. MEASURED live 2026-11-01 on the CHT tubes: a Geometry unlock
+    said "every later step starts over, as for new geometry" and listed
+    `foammesh/geometry` as deleted, while the page above it said later steps
+    keep their values -- and after Yes the import, the split, the patch names
+    and every later step's values were all still there. The unlock rebuilds
+    the task states, which hold no value, and discards the prepared geometry;
+    the preview marks the geometry folder "kept as it is". Both confirmations
+    read these lines, so they say the same as the chip and the page.
+    *size_text* turns a byte count into words.
+    """
+    tr = lambda text: QCoreApplication.translate('LockChip', text)  # noqa: E731
+    titles = [str(t) for t in (preview.get('titles') or preview.get('scope')
+                               or ()) if t]
+    if preview.get('resets_values'):
+        lines = [tr('Unlocking "{0}" deletes the mesh and the quality '
+                    'results, and Preparation must be run again. Every later '
+                    'step keeps its values but goes back to not '
+                    'done:').format(name)]
+    else:
+        lines = [tr('Unlocking "{0}" deletes the mesh and the quality '
+                    'results. Later steps keep their values but go back to '
+                    'not done:').format(name)]
+    lines += [f'  • {title}' for title in titles]
+    artifacts = [item for item in preview.get('artifacts') or ()
+                 if isinstance(item, dict)]
+    kept = [item for item in artifacts
+            if str(item.get('becomes') or '').startswith('kept')]
+    deleted = [item for item in artifacts if item not in kept]
+    if deleted:
+        lines.append('')
+        lines.append(tr('Deleted from the case, and gone from the viewport:'))
+        lines += [f'  • {item.get("path")} ({size_text(item.get("bytes"))})'
+                  for item in deleted]
+        lines.append(tr('Nothing is re-meshed until you run a step again.'))
+    if kept:
+        lines.append('')
+        lines.append(tr('Kept as it is (copied too, for the restore):'))
+        lines += [f'  • {item.get("path")} ({size_text(item.get("bytes"))})'
+                  for item in kept]
+    return lines
+
+
 def unlock_ask_text(preview: dict, task_id: str = '') -> tuple:
     """``(short, whole)`` for the ask line, from ``mesh.workflow.unlock_preview``.
 
@@ -299,10 +344,12 @@ def unlock_ask_text(preview: dict, task_id: str = '') -> tuple:
     listed = ', '.join(later)
     tr = lambda text: QCoreApplication.translate('LockChip', text)  # noqa: E731
     if preview.get('resets_values'):
-        short = tr('Deletes the mesh, restarts all later steps') if meshed \
-            else tr('Restarts all later steps')
-        whole = tr('Unlock "{0}"? Every later step starts over, as for new '
-                   'geometry.').format(name)
+        # DP-6124: the task states restart, the values do not.
+        short = tr('Deletes the mesh; all later steps go back to not done') \
+            if meshed else tr('All later steps go back to not done')
+        whole = tr('Unlock "{0}"? Every later step keeps its values but goes '
+                   'back to not done, and Preparation must be run '
+                   'again.').format(name)
         if meshed:
             whole += ' ' + tr('The mesh and the quality results are deleted.')
         return short, whole

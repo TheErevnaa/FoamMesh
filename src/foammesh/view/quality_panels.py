@@ -5,7 +5,6 @@ page imported them from there; both engines mount them from here now.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from PySide6.QtCore import Qt
@@ -17,6 +16,7 @@ from foammesh.core.quality.policy import TIER_REPORT
 from foammesh.view.quality_tier_note import TierNote
 from foammesh.view.widgets.folded_note import FoldedNote
 from foammesh.view.workflow_controls.field_group_page import FieldGroupPage
+from foammesh.support.tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +247,7 @@ class CheckHighlightsPanel(QGroupBox):
         wanted = item.checkState() == Qt.CheckState.Checked
         coroutine = self.setShown(name, wanted)
         try:
-            asyncio.ensure_future(coroutine)
+            spawn(coroutine, what='Showing the quality cells')
         except RuntimeError:
             coroutine.close()
             self._refuse(name, self.tr('no event loop is running'))

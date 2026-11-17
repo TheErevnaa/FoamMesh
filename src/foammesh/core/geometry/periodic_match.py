@@ -165,7 +165,7 @@ def _area(triangles) -> float:
 
 
 def _gaps(source, target, values, inverse=False):
-    """``(source→target gap, target→source gap)`` under the transform."""
+    """``(source to target gap, target to source gap)`` under the transform."""
     moved_source = transform_points(source.reshape(-1, 3), values,
                                     inverse).reshape(source.shape)
     forward = float(_distances(_samples(moved_source), target).max())

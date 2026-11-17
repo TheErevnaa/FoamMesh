@@ -316,6 +316,11 @@ class GmshSizeFieldsPage(GmshTaskPage):
         # not from the catalogue, so it is the one list the panel cannot
         # rebuild for itself when the geometry is prepared again.
         self.surface_panel.set_choices('surface_id', self.surfaceChoices())
+        # DP-6135. The table was drawn by `super().refresh()` from the names
+        # the previous case left in the panel, so a row of the second case
+        # opened in one sitting read `cyclic_side_a`, a boundary of the first.
+        # Draw it again now the names are the open case's.
+        self.surface_panel.refresh()
         self._sayHowFieldsCombine()
         self._moveProseBehindHelp()
 

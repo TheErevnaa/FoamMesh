@@ -112,7 +112,7 @@ def _cmd_mesh(args) -> int:
     if rc != 0:
         return rc
     cores = int(getattr(args, 'cores', 1))
-    timeout = float(getattr(args, 'timeout', 3600))
+    timeout = float(getattr(args, 'timeout', 0))
     result = _execute(args.out, 'workflow.run_pipeline', {
         'mode': 'parallel' if cores > 1 else 'serial',
         'cores': cores,
@@ -464,8 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_mesh.add_argument('-o', '--out', required=True, help='output case directory')
     p_mesh.add_argument('--cores', type=int, default=1,
                         help='OpenFOAM MPI ranks (default: serial)')
-    p_mesh.add_argument('--timeout', type=float, default=3600,
-                        help='per-node timeout in seconds')
+    p_mesh.add_argument('--timeout', type=float, default=0,
+                        help='per-node timeout in seconds (default 0: no limit)')
     p_mesh.add_argument(
         '--require-runtime', action='store_true',
         help='compatibility flag; runtime success is always required')

@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
-from .connectivity import boundary_keys, build_face_topology, signed_cell_volumes
+from .connectivity import (
+    boundary_keys, build_face_topology, signed_cell_volumes, unique_rows,
+)
 from .model import CanonicalMesh
 
 
@@ -56,8 +58,12 @@ def validate_mesh(mesh: CanonicalMesh, *, volume_tolerance: float = 1.0e-18,
     if any(issue.code == 'node_index_out_of_range' for issue in issues):
         return _report(mesh, issues, None)
 
-    referenced = np.unique(np.concatenate([value.ravel() for value in all_connectivity]))
-    unreferenced = np.setdiff1d(np.arange(mesh.point_count), referenced, assume_unique=True)
+    # Plan 50 IP14: a mark per point, rather than a sort of every corner of
+    # every cell; the indices were checked in range just above.
+    referenced = np.zeros(mesh.point_count, dtype=bool)
+    for value in all_connectivity:
+        referenced[value.ravel()] = True
+    unreferenced = np.flatnonzero(~referenced)
     if unreferenced.size:
         issues.append(MeshIssue(
             'unreferenced_nodes', 'error', int(unreferenced.size),
@@ -95,7 +101,7 @@ def validate_mesh(mesh: CanonicalMesh, *, volume_tolerance: float = 1.0e-18,
             'volume faces are owned by more than two cells'))
     supplied = boundary_keys(mesh)
     if supplied.size:
-        supplied_unique, supplied_counts = np.unique(supplied, axis=0, return_counts=True)
+        supplied_unique, supplied_counts = unique_rows(supplied, return_counts=True)
     else:
         supplied_unique = np.empty((0, 4), np.int64)
         supplied_counts = np.empty(0, np.int64)
@@ -132,7 +138,7 @@ def _duplicate_point_counts(mesh):
     duplicate_groups = np.flatnonzero(counts > 1)
     if not len(duplicate_groups):
         return 0, 0
-    protected = set()
+    protected = np.zeros(len(points), dtype=bool)
     for block in mesh.boundary_blocks:
         patch_ids = getattr(block, 'patch_ids', None)
         if patch_ids is None:
@@ -146,15 +152,15 @@ def _duplicate_point_counts(mesh):
                     'non_conformal', 'baffle'):
                 continue
             rows = block.connectivity[patch_ids == patch_id]
-            protected.update(int(value) for value in rows.ravel())
-    invalid = intentional = 0
-    for group in duplicate_groups:
-        members = np.flatnonzero(inverse == group)
-        count = len(members) - 1
-        if all(int(value) in protected for value in members):
-            intentional += count
-        else:
-            invalid += count
+            protected[rows.ravel()] = True
+    # Plan 50 IP14: a group is intentional when none of its points is
+    # unprotected -- counted for every group at once, rather than a scan of
+    # all the points for each group.
+    inverse = np.asarray(inverse).reshape(-1)
+    unprotected = np.bincount(inverse[~protected], minlength=len(counts))
+    surplus = counts[duplicate_groups] - 1
+    intentional = int(surplus[unprotected[duplicate_groups] == 0].sum())
+    invalid = int(surplus[unprotected[duplicate_groups] > 0].sum())
     return invalid, intentional
 
 
@@ -164,7 +170,7 @@ def _row_difference(left, right):
     if not len(right):
         return len(left)
     joined = np.concatenate((left, right))
-    _, inverse, counts = np.unique(joined, axis=0, return_inverse=True, return_counts=True)
+    _, inverse, counts = unique_rows(joined, return_inverse=True, return_counts=True)
     return int(np.count_nonzero(counts[inverse[:len(left)]] == 1))
 
 

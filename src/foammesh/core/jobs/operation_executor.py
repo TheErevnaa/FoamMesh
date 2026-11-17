@@ -298,10 +298,14 @@ class OperationExecutor:
                         f'recorded, so the previous mesh cannot be restored: {error}')
             else:
                 try:
-                    self._move_record(run_records, job, 'restoring')
+                    # DP-6481. A run record is fsynced: written off the loop.
+                    await self._to_thread(
+                        self._move_record, run_records, job, 'restoring')
                     await self._to_thread(self.recovery.restore, session.case_path, recovery_point)
                     recovery_status = 'restored'
-                    self._move_record(run_records, job, 'closed', resolution='restored')
+                    await self._to_thread(
+                        self._move_record, run_records, job, 'closed',
+                        resolution='restored')
                     session.state.bus.publish(
                         Event.ARTIFACT_RESTORED, operation=spec.operation,
                         recovery_id=recovery_point.recovery_id, job_id=job.job_id)
@@ -316,13 +320,18 @@ class OperationExecutor:
                                   error=f'{job.error or "operation failed"}; recovery failed: {error}',
                                   error_category=JobErrorCategory.RECOVERY)
         if job.run_state == 'exited' and recovery_status != 'failed':
-            self._move_record(
-                run_records, job, 'closed',
+            # DP-6481. MEASURED live: up to 4.9 s of fsync on the GUI thread.
+            await self._to_thread(
+                self._move_record, run_records, job, 'closed',
                 resolution='finished' if job.status is JobStatus.DONE else 'failed')
         if job.run_state is not None and run_records is not None:
             record = await self._to_thread(run_records.load, job.run_id or job.job_id)
             if record is not None and record.get('state') != job.run_state:
                 job = replace(job, run_state=record.get('state'))
+        if recovery_point is not None and recovery_status in ('available', 'restored'):
+            # Plan 50 IP16 (DP-6301). This run's point is now the newest
+            # restorable one, or was just used: the older ones go.
+            await self._prune_recovery(session.case_path)
 
         # DP-2717: the refined result's durable line is written off the loop.
         recorder = getattr(self.jobs, 'record_result_async', None)
@@ -416,13 +425,21 @@ class OperationExecutor:
         request = JobRequest(name=spec.operation, argv=tuple(str(item) for item in spec.argv),
                              cwd=cwd, mutation=spec.mutation)
         refusal = getattr(self.jobs, 'record_refusal', None)
+        # Plan 50 CX3 (DP-6205). The refusal says which run holds the case
+        # and the act that clears it, in its message and in its exit.
+        # DP-6487. Said once, as "not started", with any path last; the held
+        # runs by id stay in ``held`` and ``hint``.
+        message = verdict.refusal()
         if refusal is None:
-            raise RuntimeError(verdict.message)
-        job = refusal(request, verdict.message, exit={
-            'kind': 'recovery_pending', 'reason': verdict.message, 'signal': '',
-            'actions': ['stop_old_run', 'retry'], 'hint': '',
+            raise RuntimeError(message)
+        job = refusal(request, message, exit={
+            'kind': 'recovery_pending', 'reason': message, 'signal': '',
+            'actions': list(dict.fromkeys(
+                [*verdict.actions(), 'stop_old_run', 'retry'])),
+            'hint': verdict.advice(),
             'read_only': verdict.read_only,
-            'runs': [record.get('run_id') for record in verdict.records]})
+            'runs': [record.get('run_id') for record in verdict.records],
+            'held': verdict.held()})
         session.state.bus.publish(
             Event.OPERATION_FAILED, operation=spec.operation, job_id=job.job_id,
             result=job.to_dict(), recovery_status='pending', history_entry_id=None)
@@ -545,8 +562,43 @@ class OperationExecutor:
         mesh = session.case_path / 'constant' / 'polyMesh'
         if not (spec.mutation and spec.recover_mesh and mesh.is_dir()):
             return None
-        return await self._to_thread(
-            self.recovery.snapshot, session.case_path, operation=spec.operation)
+        return await self._to_thread(self._recovery_point, session.case_path,
+                                     spec.operation)
+
+    def _recovery_point(self, case_path, operation: str) -> MeshRecoveryPoint:
+        """Plan 50 IP16 (DP-6300). The mesh a run starts from, kept once.
+
+        When the live mesh is a copy of a kept stage snapshot -- the input
+        of every staged snappy run but the base grid -- the point names that
+        snapshot instead of copying and hashing the mesh a second time.
+        """
+        from . import stage_snapshots
+        reference = getattr(self.recovery, 'snapshot_reference', None)
+        if reference is not None:
+            try:
+                kept = stage_snapshots.live_kept_stage(case_path)
+                point = (reference(case_path, operation=operation,
+                                   revision=kept[0], stage=kept[1])
+                         if kept else None)
+                if point is not None:
+                    return point
+            except (OSError, ValueError):
+                import logging
+                logging.getLogger(__name__).debug(
+                    'no reference recovery point', exc_info=True)
+        return self.recovery.snapshot(case_path, operation=operation)
+
+    async def _prune_recovery(self, case_path) -> None:
+        """DP-6301. Keep only the recovery points someone can still use."""
+        prune = getattr(self.recovery, 'prune', None)
+        if prune is None:
+            return
+        try:
+            await self._to_thread(prune, case_path)
+        except Exception:  # noqa: BLE001 - housekeeping never fails a run
+            import logging
+            logging.getLogger(__name__).warning(
+                'old recovery points could not be pruned', exc_info=True)
 
     @staticmethod
     async def _mesh_fingerprint(case_path: Path) -> str | None:

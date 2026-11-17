@@ -120,6 +120,36 @@ class GmshPeriodicPage(GmshTaskPage):
         self.arrow = PeriodicArrowView(self)
         layout.addWidget(self.arrow)
         self.panel.table.itemSelectionChanged.connect(self.refreshArrow)
+        # The local API reaches the arrow through the case session.
+        self._arrowApi = PeriodicArrowApi(self)
+        self.registerArrowApi()
+
+    def registerArrowApi(self) -> bool:
+        """Tell the case session this page is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import ag_gmsh_routes
+        return ag_gmsh_routes.attach(
+            self, ag_gmsh_routes.PERIODIC_ATTRIBUTE, self._arrowApi,
+            self._client)
+
+    def selectPair(self, row) -> bool:
+        """Select a pair in the table (a click on its row): by name, key or
+        row number. The arrow follows the selection."""
+        rows = self.panel.rows()
+        index = -1
+        if isinstance(row, int) and not isinstance(row, bool):
+            index = row if 0 <= row < len(rows) else -1
+        else:
+            for position, item in enumerate(rows):
+                if str(row) in (str(item.get('name')),
+                                str(item.get('__key__'))):
+                    index = position
+                    break
+        if index < 0:
+            return False
+        self.panel.table.clearSelection()
+        self.panel.table.selectRow(index)
+        self.refreshArrow()
+        return True
 
     def refreshArrow(self) -> None:
         row = None
@@ -150,6 +180,8 @@ class GmshPeriodicPage(GmshTaskPage):
         self._moveProseBehindHelp()
         if hasattr(self, 'arrow'):
             self.refreshArrow()
+        if hasattr(self, '_arrowApi'):
+            self.registerArrowApi()
 
     def _moveProseBehindHelp(self) -> None:
         """The transform sentence, said through the help control DP-230 built."""
@@ -158,3 +190,47 @@ class GmshPeriodicPage(GmshTaskPage):
             described = (described + ' ' + self.TRANSFORM_NOTE).strip()
             self._description.setText(described)
         self._help.setDetail(described, self._prerequisites.text())
+
+
+def _plain(value):
+    """*value* as JSON: the arrow is a dataclass, tuples are lists."""
+    if hasattr(value, 'to_dict'):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+class PeriodicArrowApi:
+    """The Periodic page's pair arrow, for the local API.
+
+    ``core/facade/plan48/ag_gmsh_routes.py`` calls it; it runs on the GUI
+    thread and refuses with ``ValueError(reason)``.
+    """
+
+    def __init__(self, page):
+        self._page = page
+
+    def arrow(self, row=None) -> dict:
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+
+        def run():
+            page = self._page
+            if row is not None and not page.selectPair(row):
+                names = [str(item.get('name') or item.get('__key__'))
+                         for item in page.panel.rows()]
+                raise ValueError(
+                    'there is no periodic pair %r; the pairs are: %s'
+                    % (row, ', '.join(names) or 'none'))
+            key = page.panel.selected_key()
+            name = None
+            for item in page.panel.rows():
+                if key is not None and item.get('__key__') == key:
+                    name = item.get('name')
+                    break
+            return {'row': name, 'key': key,
+                    'info': _plain(page.arrow.info()),
+                    'note': page.arrow.noteText()}
+        return on_gui(run)

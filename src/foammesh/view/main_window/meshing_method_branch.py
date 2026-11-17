@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QMenu
 from foammesh.core.engine.contracts import TaskState
 from foammesh.db.configurations_schema import Step
 from .navigation_view import BASE_LABEL_ROLE, TOKEN_ROLE, WorkflowRowState
+from widgets.async_dialog import popupMenu
 
 
 #: Token for the Mesh setup node itself. The string is unchanged from when the
@@ -52,6 +53,13 @@ LEGACY_TOKEN_ALIASES = {
     # fields row was open reopens on the row that now holds them.
     TASK_TOKEN_PREFIX + 'gmsh.size_fields':
         TASK_TOKEN_PREFIX + 'gmsh.global_sizing',
+    # Plan 50 IP25 (DP-6380). Surface features, Castellation and Snap are
+    # one row, `Refinement`; a case saved on the Castellation or the Snap row
+    # reopens on the row that now holds their settings.
+    TASK_TOKEN_PREFIX + 'snappy.castellation':
+        TASK_TOKEN_PREFIX + 'snappy.surface_features',
+    TASK_TOKEN_PREFIX + 'snappy.snap':
+        TASK_TOKEN_PREFIX + 'snappy.surface_features',
 }
 
 #: Tasks whose settings are hosted on another row's page, so they get no outline
@@ -79,9 +87,14 @@ ROW_TASKS: dict[str, dict[str, tuple[str, ...]]] = {
         'snappy.domain_regions': ('snappy.domain_regions',
                                   'common.reference_readiness'),
         'snappy.base_grid': ('snappy.base_grid',),
-        'snappy.surface_features': ('snappy.surface_features',),
-        'snappy.castellation': ('snappy.castellation',),
-        'snappy.snap': ('snappy.snap', 'snappy.fidelity_snap'),
+        # Plan 50 IP25 (D1, D2; DP-6380). One row, `Refinement`: the feature
+        # angle, the refinement tables and the snap settings answer one
+        # question -- how the background grid becomes a body-fitted mesh --
+        # and the decisions are all on the first two. The press extracts the
+        # features, castellates, snaps and measures the snap, in that order.
+        'snappy.surface_features': ('snappy.surface_features',
+                                    'snappy.castellation', 'snappy.snap',
+                                    'snappy.fidelity_snap'),
         'snappy.layers': ('snappy.layers',),
         'snappy.qa': ('snappy.qa', 'common.fidelity',
                       'common.resolution', 'common.summary'),
@@ -134,15 +147,9 @@ PROCEED_LABELS: dict[str, dict[str, tuple[str, str]]] = {
             'Generate grid & Proceed',
             'Runs blockMesh, then opens the next step'),
         'snappy.surface_features': (
-            'Extract features & Proceed',
-            'Runs surface feature extraction, then opens the next step'),
-        'snappy.castellation': (
-            'Castellate & Proceed',
-            'Runs the castellation pass, then opens the next step'),
-        'snappy.snap': (
-            'Snap & Proceed',
-            'Runs the snap pass and measures snap fidelity, then opens the '
-            'next step'),
+            'Refine & Proceed',
+            'Extracts the feature edges, runs the castellation and the snap '
+            'passes and measures snap fidelity, then opens the next step'),
         'snappy.layers': (
             'Apply layers & Proceed',
             'Runs the layer addition pass, then opens the next step'),
@@ -633,6 +640,18 @@ class MeshingMethodBranch(QObject):
             # worst news is now read by rank rather than by one name, and
             # only the paint moves -- the member keeps its own state in the
             # graph, which is where the evidence for it lives.
+            # Plan 50 IP25 (DP-6382). A row is done only when every task its
+            # press settles is: with Surface features, Castellation and Snap
+            # on one row, a finished feature extraction under a castellation
+            # that has not run painted the whole row ticked. The row reads
+            # configured (or running) until its last required task finishes;
+            # an optional member nobody used does not hold it back (DP-5744).
+            if graph is not None and state in self.FINISHED_STATES:
+                waiting = self._unfinishedMember(engine_id, task_id, graph)
+                if waiting is TaskState.RUNNING:
+                    row_state = WorkflowRowState.RUNNING
+                elif waiting is not None:
+                    row_state = WorkflowRowState.CONFIGURED
             if graph is not None and row_state is not WorkflowRowState.LOCKED:
                 rank = ROW_STATE_FOLD_RANK.get(row_state, 0)
                 for member in row_tasks(engine_id, task_id)[1:]:
@@ -757,7 +776,7 @@ class MeshingMethodBranch(QObject):
             if callback is not None:
                 action.triggered.connect(lambda _checked=False, cb=callback: cb())
         menu.setToolTipsVisible(True)
-        menu.exec(global_position)
+        popupMenu(menu, global_position)  # Plan 50 IP19: no nested loop
         return menu
 
     def _onRibbonMenu(self, token, global_position) -> None:
@@ -896,6 +915,36 @@ class MeshingMethodBranch(QObject):
         TaskState.PASSED, TaskState.WARNING, TaskState.COMPLETED,
         TaskState.WAIVED, TaskState.SKIPPED})
 
+    def _optionalTasks(self) -> frozenset:
+        """The task ids the workflow lets a run leave out."""
+        tasks = getattr(self._branch, 'workflow_tasks', ()) or ()
+        return frozenset(
+            str(task.get('task_id') or '') for task in tasks
+            if task.get('optional')
+            or str(task.get('cardinality') or '').endswith('optional'))
+
+    def _unfinishedMember(self, engine_id: str, task_id: str, graph):
+        """The state of the first required member of ``task_id``'s row that
+        has not finished, or ``None`` when every one has.
+
+        Plan 50 IP25 (DP-6382). A member that failed, went stale or warned is
+        not "unfinished" here: that news is the fold's, and it outranks this.
+        An optional member is skipped (DP-5744).
+        """
+        optional = self._optionalTasks()
+        for member in row_tasks(engine_id, task_id)[1:]:
+            if member in optional:
+                continue
+            try:
+                member_state = graph.state(member)
+            except Exception:                                # noqa: BLE001
+                continue
+            if (member_state in self.FINISHED_STATES
+                    or member_state in FOLDED_MEMBER_STATES):
+                continue
+            return member_state
+        return None
+
     def _rowFinished(self, token: str) -> bool:
         """Whether the row ``token`` is finished, read as the outline paints it.
 
@@ -905,6 +954,10 @@ class MeshingMethodBranch(QObject):
         -- does not hold the row back: DP-5711 asked every member, and a
         ticked Sizing row with untouched optional members reopened the case
         on Preparation.
+
+        Plan 50 IP25 (DP-6382). And every required member is finished too: a
+        Refinement row whose features are extracted and whose castellation
+        never ran is not done, so a reopened case continues on it.
         """
         graph = getattr(self._branch, 'graph', None)
         if graph is None or not token.startswith(TASK_TOKEN_PREFIX):
@@ -915,9 +968,10 @@ class MeshingMethodBranch(QObject):
         try:
             if graph.state(task_id) not in self.FINISHED_STATES:
                 return False
-            return not any(graph.state(member) in (TaskState.FAILED,
-                                                   TaskState.STALE)
-                           for member in members if member != task_id)
+            if any(graph.state(member) in (TaskState.FAILED, TaskState.STALE)
+                   for member in members if member != task_id):
+                return False
+            return self._unfinishedMember(engine_id, task_id, graph) is None
         except Exception:                                    # noqa: BLE001
             return False
 

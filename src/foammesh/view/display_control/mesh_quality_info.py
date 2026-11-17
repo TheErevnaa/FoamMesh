@@ -21,6 +21,7 @@ from foammesh.view.main_window.main_window_ui import Ui_MainWindow
 from foammesh.support import colour_standard
 from widgets.rendering.rendering_widget import RenderingWidget
 from foammesh.view.theming.vtk_theme import apply_scalar_bar_theme
+from foammesh.support.tasks import spawn
 
 
 
@@ -96,6 +97,9 @@ class MeshQualityInfo(QObject):
 
         self._legend = None
         self._computing = False
+        #: DP-6466. What was asked for while a measurement was running, to be
+        #: answered when it lands (each under its own `_guarded`).
+        self._laterResumes: list = []
         #: Who to tell when the colouring goes on or comes off. The viewport
         #: toolbar has to follow the picture rather than the press: a
         #: measurement that arrives seconds later is what actually paints.
@@ -529,17 +533,35 @@ class MeshQualityInfo(QObject):
         if not self._hasMesh():
             return False
         if self._computing:
+            # DP-6466. "Already measuring" used to end here and the request
+            # was thrown away: Worst cells pressed just after leaving the
+            # Quality view was accepted as pending and never coloured,
+            # because the one resume the measurement held was the Quality
+            # view's, abandoned when it was left. The request is kept, under
+            # its own guard, and answered when the numbers land.
+            self._laterResumes.append(self._guarded(resume))
             return True
         self._computing = True
+        # A measurement that failed or was cancelled resumed nothing; what
+        # was kept for it is not answered by this one.
+        later = self._laterResumes = []
         # VIEW-06. The guard goes on here, where the request is made, so
         # every caller that needs a field it does not have gets it -- there
         # is no second place to forget.
-        resume = self._guarded(resume)
-        # `create_task`, the same call the verdict strip's scheduler uses. An
+        first = self._guarded(resume)
+
+        def resume():
+            first()
+            kept = list(later)
+            later.clear()
+            for one in kept:
+                one()
+        # A task (Plan 50 IP19: held and reported by `spawn`), as the verdict
+        # strip's scheduler starts one. An
         # `@asyncSlot` here would be the more obvious spelling and in this
         # environment it has silently scheduled nothing at all -- the strip sat
         # dormant over a live mesh for exactly that reason.
-        asyncio.create_task(self._computeFields(resume))
+        spawn(self._computeFields(resume), what='Measuring mesh quality')
         return True
 
     async def _computeFields(self, resume):

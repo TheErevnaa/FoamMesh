@@ -1,6 +1,6 @@
 """Plan 49 SR8 local-API routes: the surface tab and the role model.
 
-A plain remote control for the window's own controls (AGENTS.md):
+A plain remote control for the window's own controls:
 
 * ``geometry.surface_intent.read`` -- what the surface tab and the pair
   tables show: each surface's role, purpose, mesh type, origin, state, issue,

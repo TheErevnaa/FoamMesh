@@ -117,15 +117,15 @@ class ActionHandle:
         event = {'done': 'JOB_FINISHED', 'failed': 'JOB_FAILED',
                  'cancelled': 'JOB_CANCELLED'}[outcome]
         self._emit(event, outcome=outcome, message=message)
-        try:
-            from foammesh.core.jobs import run_listing
-            run_listing.write_entry(
-                self.case_path, engine_id=self.engine_id,
-                kind='session-action', name=self.name, status=outcome,
-                started_at=self.started_at, ended_at=_iso(),
-                message=message, run_id=self.job_id, seconds=round(seconds, 3))
-        except OSError:
-            pass
+        # DP-6479. The panels end an action on the GUI thread, and writing
+        # the entry there held the window 24 s on a busy disk (measured
+        # live). It is queued for the run list's own writer thread.
+        from foammesh.core.jobs import run_listing
+        run_listing.write_entry_soon(
+            self.case_path, engine_id=self.engine_id,
+            kind='session-action', name=self.name, status=outcome,
+            started_at=self.started_at, ended_at=_iso(),
+            message=message, run_id=self.job_id, seconds=round(seconds, 3))
         return outcome
 
 

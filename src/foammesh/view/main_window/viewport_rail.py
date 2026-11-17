@@ -47,6 +47,7 @@ from foammesh.view.theming.metrics import (
     FORM_MARGIN, GAP, GAP_TIGHT, MARGIN_TIGHT)
 from foammesh.view.theming.status_colors import (
     OVERLAY_KINDS, style_floating_panel, style_overlay_panel)
+from widgets.async_dialog import popupMenu
 
 #: Plan 44 MF13 (mockup M:139-165): a 34 px rail of 26 px tiles with 16 px
 #: glyphs, padding 10 0, radius 6, 18 x 1 separators.
@@ -1249,10 +1250,10 @@ class ViewportRail(QObject):
 
     def _customiseAt(self, point):
         menu = self.customiseMenu(self._bar)
-        menu.exec(self._bar.mapToGlobal(point))
+        popupMenu(menu, self._bar.mapToGlobal(point))   # Plan 50 IP19
 
     def showCustomiseMenu(self, global_point):
-        self.customiseMenu(self._view).exec(global_point)
+        popupMenu(self.customiseMenu(self._view), global_point)
 
     # -- events ------------------------------------------------------------- #
 

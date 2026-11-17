@@ -890,12 +890,15 @@ class RegionVolumes(QObject):
         return self._editedSpace
 
     def spaceName(self, label) -> str | None:
-        """'Fluid space N' by rank among the enclosed spaces, largest first."""
+        """'Space N' by rank among the enclosed spaces, largest first.
+
+        DP-6112: not 'Fluid space' -- a solid region's seed is in one too.
+        """
         if self._field is None or not label:
             return None
         for rank, space in enumerate(self._field.enclosed, start=1):
             if space.id == label:
-                return f'Fluid space {rank}'
+                return f'Space {rank}'
         return 'the space outside'
 
     # -- RP7: the spaces "how many fluid regions?" proposes ---------------- #

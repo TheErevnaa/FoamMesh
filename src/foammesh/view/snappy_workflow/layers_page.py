@@ -40,15 +40,11 @@ from .layer_pattern_preview import (
 )
 
 
-#: DP-2402. Legacy `STAGED_MESH_ADVISORY`, said on the guided route: layers run
-#: on their own restart from the mesh on disk and cannot apply the quality
-#: control one combined run does (measured on the reference curved pipe: the
-#: staged result reported concave cells where the batch pipeline reported
-#: "Mesh OK").
-STAGED_MESH_ADVISORY = (
-    'This mesh was built stage by stage, which is intended for tuning '
-    'settings. For the mesh you hand to a solver, finish with Run to end so '
-    'every phase runs in one qualified snappyHexMesh pass.')
+# Plan 50 IP8 (DP-6233). The DP-2402 staged-mesh advisory is gone. It told a
+# stage-by-stage user to finish with Run to end "so every phase runs in one
+# snappyHexMesh pass", but Run to end has run castellation, snap and layers as
+# separate calls since DP-1234 (measured: the same cells either way), so there
+# is no such pass to finish with and the advice can never be true.
 
 #: DP-2403. Legacy completion wording, kept: snappyHexMesh exits successfully
 #: even when it rejected every layer, so the page says what the mesh got.
@@ -60,17 +56,17 @@ PARTIAL_LAYERS_HEADING = (
 _RAN_STATES = ('passed', 'warning', 'completed')
 
 
-def result_notes(coverage, state: str, locked: bool = False) -> tuple[str, str]:
-    """``(partial, staged)`` sentences for the layers just grown, or blanks.
+def result_notes(coverage, state: str, locked: bool = False) -> str:
+    """What the layers just grown fell short of, or a blank.
 
     *coverage* is the ``mesh.layer_coverage`` payload. Nothing is said before
     the stage has run (an unmeasured or reopened step has no result to
-    qualify) and a complete, combined-pass result says nothing.
+    qualify) and a complete result says nothing, however it was run.
     """
     if not isinstance(coverage, dict) or not coverage.get('measured', True)             or not coverage.get('patches'):
-        return '', ''
+        return ''
     if state not in _RAN_STATES and not locked:
-        return '', ''
+        return ''
     from foammesh.core.quality import layer_shortfall_line
     from foammesh.core.quality.layer_report import NOT_GROWN_REMEDY
 
@@ -83,28 +79,21 @@ def result_notes(coverage, state: str, locked: bool = False) -> tuple[str, str]:
         partial = PARTIAL_LAYERS_HEADING + '\n- ' + '\n- '.join(body)
         if 'not grown' in line:
             partial += '\n' + NOT_GROWN_REMEDY
-    staged = STAGED_MESH_ADVISORY if coverage.get('staged') else ''
-    return partial, staged
+    return partial
 
 
-#: Plan 44 FX2. The folded line of the staged-mesh advisory.
-STAGED_MESH_SUMMARY = ('Built stage by stage: finish with Run to end for the '
-                       'mesh you hand to a solver.')
-
-
-def result_summaries(partial: str, staged: str) -> tuple[str, str]:
-    """``(partial, staged)`` one-line summaries of :func:`result_notes`.
+def result_summaries(partial: str) -> str:
+    """The one-line summary of :func:`result_notes`.
 
     Plan 44 FX2. Folded, the shortfall leads with what fell short (the
-    patches and their counts) rather than with the heading, and the
-    advisory with what to do; the line opens to both notes in full.
+    patches and their counts) rather than with the heading; the line opens
+    to the note in full.
     """
-    partial_line = ''
-    if partial:
-        bodies = [line[2:].strip() for line in partial.splitlines()
-                  if line.startswith('- ')]
-        partial_line = '; '.join(bodies)
-    return partial_line, (STAGED_MESH_SUMMARY if staged else '')
+    if not partial:
+        return ''
+    bodies = [line[2:].strip() for line in partial.splitlines()
+              if line.startswith('- ')]
+    return '; '.join(bodies)
 
 
 #: Plan 37 UF2 (DP-1028). Whether this case has had its default group.
@@ -317,6 +306,18 @@ class SnappyLayersPage(SnappyTaskPage):
     task_id_default = 'snappy.layers'
     run_stage = 'layers'
 
+    #: Plan 50 IP27 (SN-9, DP-6393). The optional case-wide first-layer
+    #: height: the mode, then the three values it writes for every growing
+    #: patch (shown only while the mode asks for them). Not in the task's
+    #: descriptor `fields=`, so the workflow digest -- and saved progress --
+    #: stays as it was.
+    extra_field_ids = (
+        'meshing.layers.first_layer_mode',
+        'meshing.layers.first_layer_height',
+        'meshing.layers.first_layer_expansion_ratio',
+        'meshing.layers.first_layer_count',
+    )
+
     #: Plan 33 OF-07. MEASURED at a 560 px settings column: twelve columns in
     #: 494 px of table scrolled 806 px sideways, so more of every row was
     #: behind the bar than in front of it, and the bar moved the header with
@@ -432,10 +433,6 @@ class SnappyLayersPage(SnappyTaskPage):
         self._partialNote.setWordWrap(True)
         self._partialNote.setProperty('foammeshStatus', 'warning')
         self._partialNote.setVisible(False)
-        self._stagedNote = self._resultNotes.add(FoldedNote())
-        self._stagedNote.setObjectName('snappyLayerStagedNote')
-        self._stagedNote.setWordWrap(True)
-        self._stagedNote.setVisible(False)
         layout.insertWidget(2, self._resultNotes)
 
         # Plan 41 GN25c. Layers thicker than the gap they grow into, said
@@ -573,6 +570,10 @@ class SnappyLayersPage(SnappyTaskPage):
             return
         if self.panel.rows() or not self.layersEnabled():
             return
+        # DP-6493. The case, not only the rows the panel last drew: a group
+        # made over the local API is in the case before the panel reads it.
+        if self.panel._read_rows():
+            return
         if case_was_defaulted(self._client):
             return
         targets = self.defaultTargets()
@@ -635,17 +636,12 @@ class SnappyLayersPage(SnappyTaskPage):
             coverage = query(self._client, 'mesh.layer_coverage').payload
         except Exception:                        # noqa: BLE001 - advisory only
             coverage = None
-        partial, staged = result_notes(
+        partial = result_notes(
             coverage, self.task_state()[0], self.isResultLocked())
-        for label, text in ((self._partialNote, partial),
-                            (self._stagedNote, staged)):
-            label.setText(text)
-            label.setVisible(bool(text))
-        # Plan 44 FX2. What each folded note says on its one line.
-        partial_summary, staged_summary = result_summaries(partial, staged)
-        for label, summary in ((self._partialNote, partial_summary),
-                               (self._stagedNote, staged_summary)):
-            label.setSummary(summary)
+        self._partialNote.setText(partial)
+        self._partialNote.setVisible(bool(partial))
+        # Plan 44 FX2. What the folded note says on its one line.
+        self._partialNote.setSummary(result_summaries(partial))
         self._resultNotes.sync()
 
     def aligned_forms(self):

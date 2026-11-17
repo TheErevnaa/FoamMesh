@@ -96,6 +96,32 @@ class LayerStacksPanel(QWidget):
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
         self.reload()
+        # The local API reaches this panel through the case session.
+        self._api = LayerStacksApi(self)
+        self.registerApi()
+
+    # -- the local API ------------------------------------------------------ #
+
+    def api(self):
+        return self._api
+
+    def registerApi(self) -> bool:
+        """Tell the case session this panel is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import ag_gmsh_routes
+        return ag_gmsh_routes.attach(
+            self, ag_gmsh_routes.LAYER_STACKS_ATTRIBUTE, self._api,
+            self._client)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.registerApi()
+
+    def previewShown(self) -> bool:
+        return self._preview.isChecked()
+
+    def drawnCount(self) -> int:
+        """How many ghost prisms the preview has in the viewport."""
+        return len(self._ghosts)
 
     # -- state -------------------------------------------------------------- #
 
@@ -323,3 +349,35 @@ class LayerStacksPanel(QWidget):
             except Exception:                            # noqa: BLE001
                 pass
         self._ghosts = []
+
+
+class LayerStacksApi:
+    """What the Layers per patch panel does for the local API.
+
+    Methods run on the GUI thread; ``core/facade/plan48/ag_gmsh_routes.py``
+    calls them.
+    """
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def _read(self) -> dict:
+        panel = self._panel
+        return {'rows': panel.rows(), 'status': panel.status(),
+                'dirty': panel.is_dirty, 'preview': panel.previewShown(),
+                'drawn': panel.drawnCount()}
+
+    def state(self) -> dict:
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+        return on_gui(self._read)
+
+    def set_preview(self, shown: bool) -> dict:
+        """Tick or clear Preview layers, as a click on the box does."""
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+
+        def run():
+            self._panel._preview.setChecked(bool(shown))
+            answer = self._read()
+            return {'shown': answer['preview'], 'drawn': answer['drawn'],
+                    'status': answer['status']}
+        return on_gui(run)

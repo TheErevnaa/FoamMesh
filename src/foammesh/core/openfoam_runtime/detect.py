@@ -95,10 +95,12 @@ class DetectedRuntime:
 def _run(argv: Sequence[str], timeout: float) -> tuple[int, bytes]:
     environment = dict(os.environ, WSL_UTF8='1')
     flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    # Plan 50 IP22 (DP-6404): the reads after a timeout's kill are bounded,
+    # so a WSL relay holding the pipes cannot hold the worker.
+    from foammesh.support.wsl_executor import run_bounded
     try:
-        completed = subprocess.run(
-            list(argv), capture_output=True, timeout=timeout,
-            env=environment, creationflags=flags)
+        completed = run_bounded(argv, timeout=timeout, env=environment,
+                                creationflags=flags)
     except (OSError, subprocess.SubprocessError):
         return -1, b''
     return completed.returncode, completed.stdout

@@ -52,6 +52,7 @@ EXACT_NAMES: dict[str, str] = {
     # The decomposition libraries OpenFOAM can be pointed at.
     'metis': 'METIS',
     'kahip': 'KaHIP',
+    'ptscotch': 'PT-Scotch',
     # Dimensionality, which nobody writes out in words.
     'two_d': '2D',
     'three_d': '3D',

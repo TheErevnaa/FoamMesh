@@ -32,9 +32,48 @@ from foammesh.core.shell import CapabilityRegistry
 from foammesh.core.selection import SelectionService
 from foammesh.support import gc_policy
 from resources import resource
+from foammesh.support.tasks import spawn
 
 if TYPE_CHECKING:
     from foammesh.settings.app_settings import AppSettings
+
+
+async def _on_own_thread(function, *args):
+    """Run ``function(*args)`` on a thread of its own and await its answer.
+
+    DP-6480. ``asyncio.to_thread`` queues on the loop's shared pool (ten
+    workers), which start-up fills with WSL and disk probes; a case open
+    must not wait in that queue. An answer that arrives after the awaiting
+    task was cancelled is closed, if it can be.
+    """
+    import asyncio
+    import threading
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def settle(result, error):
+        if future.cancelled():
+            close = getattr(result, 'close', None)
+            if callable(close):
+                close()
+        elif error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)
+
+    def run():
+        try:
+            result, error = function(*args), None
+        except BaseException as caught:              # noqa: BLE001
+            result, error = None, caught
+        try:
+            loop.call_soon_threadsafe(settle, result, error)
+        except RuntimeError:
+            pass                                     # the loop is gone
+
+    threading.Thread(target=run, name='foammesh-case-open', daemon=True).start()
+    return await future
 
 
 class App(QObject):
@@ -253,7 +292,9 @@ class App(QObject):
         if forget is not None:
             forget()
         try:
-            await asyncio.to_thread(self._capabilities.utility, 'mpirun')
+            # DP-6456: a WSL round trip, so on the WSL executor (DP-6403).
+            from foammesh.support import wsl_executor
+            await wsl_executor.run_wsl(self._capabilities.utility, 'mpirun')
         except Exception:  # noqa: BLE001 - the next question asks again
             logging.getLogger(__name__).warning(
                 'capability re-probe after WSL recovery failed', exc_info=True)
@@ -287,7 +328,8 @@ class App(QObject):
         import asyncio
         if self._settings is None or self._settings.hasOpenFoamRuntime():
             return None
-        found = await asyncio.to_thread(self.findOpenFoamRuntime)
+        from foammesh.support import wsl_executor   # DP-6456 (DP-6403)
+        found = await wsl_executor.run_wsl(self.findOpenFoamRuntime)
         if found is not None:
             self.useOpenFoamRuntime(found)
         return found
@@ -415,10 +457,21 @@ class App(QObject):
 
     def isScratchCase(self) -> bool:
         """Whether the open case still lives in the temporary directory."""
+        if self._project is None:
+            return False
         from foammesh.core.case import is_scratch_case
+        from foammesh.core.case.scratch import scratch_root
 
-        return (self._project is not None
-                and is_scratch_case(self._project.path))
+        # DP-6468. Asked on every menu and title refresh, and the answer
+        # resolves two folders on disk: on the GUI thread that was a 7 s
+        # stall on a busy disk (measured live). The open case's folder does
+        # not move while it is open, so the answer is kept for the folder.
+        key = (str(self._project.path), str(scratch_root()))
+        kept = getattr(self, '_scratchVerdict', None)
+        if kept is None or kept[0] != key:
+            kept = self._scratchVerdict = (
+                key, is_scratch_case(self._project.path))
+        return kept[1]
 
     def openProject(self, path):
         assert(self._project is None)
@@ -441,21 +494,81 @@ class App(QObject):
 
     def openCase(self, path):
         """Open a native in-place FoamMesh or OpenFOAM case."""
+        path, classification = self._classifyForOpen(path)
+        return self._adoptOpenedCase(path, classification)
+
+    async def openCaseAsync(self, path):
+        """:meth:`openCase` with the event journal set up off the GUI thread.
+
+        DP-6480. MEASURED (2026-11-11, live, another program keeping the disk
+        busy): opening a case held the window 20.2 s, and 2.5-2.7 s three
+        more times, in the journal's SQLite set-up. The journal is plain
+        SQLite with its own locks and a connection per call, so it is set up
+        on a worker once the case is open and locked, before the project is
+        handed to the window -- the window never sees a case without its
+        journal. A journal that cannot be opened fails the open as before,
+        at the same point.
+        """
+        import asyncio
+
+        # The local API's case routes wait while this runs (see
+        # FoamMeshFacade.hold_while_opening), as they waited behind the
+        # event loop the synchronous open held.
+        release = self._facade.hold_while_opening()
+        try:
+            path, classification = self._classifyForOpen(path)
+            if classification.kind not in self._OPENABLE:
+                return self._adoptOpenedCase(path, classification)
+            try:
+                project = self._projectManager.openInPlaceCase(path)
+            except Exception as error:
+                self._events.publish(Event.PROJECT_ERROR, case_id=str(path), error=str(error))
+                self.closeProject()
+                raise
+            journal = failure = None
+            try:
+                # A thread of its own, not the loop's shared pool: at start-up
+                # that pool is busy with WSL and disk probes, and the open
+                # must not queue behind them.
+                journal = await _on_own_thread(
+                    CaseSession.prepare_journal, project.storagePath)
+            except asyncio.CancelledError:
+                project.close()
+                raise
+            except Exception as error:  # noqa: BLE001 - raised below, where the attach is
+                failure = error
+            return self._adoptOpenedCase(path, classification, project=project,
+                                         journal=journal, failure=failure)
+        finally:
+            release()
+
+    _OPENABLE = frozenset({
+        CaseKind.EMPTY, CaseKind.OPENFOAM_CASE,
+        CaseKind.RAW_POLY_MESH_CASE, CaseKind.FOAMMESH_CASE})
+
+    def _classifyForOpen(self, path):
         assert self._project is None
         path = Path(path).resolve()
         self._events.publish(Event.PROJECT_OPENING, case_id=str(path), path=str(path))
-        classification = self._projectManager.classifyCase(path)
-        if classification.kind in {
-                CaseKind.EMPTY, CaseKind.OPENFOAM_CASE,
-                CaseKind.RAW_POLY_MESH_CASE, CaseKind.FOAMMESH_CASE}:
+        return path, self._projectManager.classifyCase(path)
+
+    def _adoptOpenedCase(self, path, classification, *, project=None,
+                         journal=None, failure=None):
+        """Make the case the open one; ``project``/``journal`` as already
+        opened off the GUI thread by :meth:`openCaseAsync` (DP-6480), and
+        ``failure`` the journal's own, raised where it always was."""
+        if classification.kind in self._OPENABLE:
             try:
-                self._project = self._projectManager.openInPlaceCase(path)
+                self._project = (project if project is not None
+                                 else self._projectManager.openInPlaceCase(path))
                 self._settings.updateRecents(self._project.path)
                 self._fileSystem = FileSystem(self._project.path, case_root=self._project.path)
                 self._fileSystem.ensureFoamFile()
                 self._refreshWorkflowResolution()
                 self._project.acceptExternalChanges()
-                self._attachFacadeSession()
+                if failure is not None:
+                    raise failure
+                self._attachFacadeSession(journal=journal)
                 display_unit.adopt_from_case(self._project.path)
                 self._events.publish(Event.PROJECT_OPENED, case_id=str(path), path=str(path))
                 return self._project
@@ -518,7 +631,7 @@ class App(QObject):
             except Exception:  # noqa: BLE001 - the executor's gate still guards runs
                 logger.exception('run-record sweep failed for %s', case_path)
         try:
-            asyncio.get_running_loop().create_task(sweep())
+            spawn(sweep(), what='Sweeping old run records')
         except RuntimeError:
             import threading
 

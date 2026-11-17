@@ -10,7 +10,9 @@ The bundle holds:
 
 * the application logs (``~/.FoamMesh/logs``): ``foammesh.log`` and its
   rotations, ``faulthandler*.log``, ``native.*.log``, ``lifecycle.log``,
-  ``watchdog.log``, ``vtk.log`` and the session records;
+  ``watchdog.log`` and its rotations (``watchdog.log.1`` .. ``.N``, when
+  there are any; Plan 50 DP-6426), ``vtk.log`` and the session records --
+  every file in that folder, newest first;
 * the newest crash and hang dumps, from the crash helper's folder and from
   Windows Error Reporting's (``%LOCALAPPDATA%\\CrashDumps\\FoamMesh.exe.*``);
 * the open case's ``foammesh/logs`` and a *listing* of every ``polyMesh``

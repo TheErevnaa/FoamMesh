@@ -65,10 +65,11 @@ class InterfacePairPanel(ChildControlPanel):
 
     def surfaceInterfaceText(self) -> str:
         return self.tr(
-            'This table makes periodic (cyclic) pairs. A conformal or '
-            'non-conformal interface is set on the surface: open it and '
-            'choose its Role and Partner. Rows saved before are kept as '
-            'they were; their interfaces are on the surfaces.')
+            'This table makes periodic (cyclic) pairs only. A conformal or '
+            'non-conformal region interface is set on the surface: Edit '
+            'surface, Region interface, then Pairing Automatic (FoamMesh '
+            'finds the walls it touches) or Manual. Rows saved before are '
+            'kept as they were; their interfaces are on the surfaces.')
 
     def couplingChoices(self) -> list:
         """The coupling picker: cyclic, with the two retired ones shown
@@ -97,7 +98,8 @@ class InterfacePairPanel(ChildControlPanel):
             text = self.tr(
                 'This interface was saved before interfaces moved to the '
                 'surfaces. It is kept as it was. To change it, open either '
-                'surface and choose its Role and Partner.')
+                'surface (Edit surface) and set its Region interface and '
+                'Pairing.')
             if self._inline:
                 self._tell(title, text)
             else:
@@ -257,20 +259,23 @@ class InterfacePairPanel(ChildControlPanel):
         return text
 
     def _validated_child_values(self):
-        values = super()._validated_child_values()
-        if values is None:
-            return None
+        return super()._validated_child_values()
+
+    def _confirmChildValues(self, values, then):
+        """Plan 50 IP19: a pair that would ask is asked without a nested loop."""
         check = self.contactCheck(values)
         if not check['would_ask']:
-            return values
+            then(values)
+            return
         title = (self.tr('Transform does not map')
                  if check.get('periodic') is not None
                  else self.tr('Faces do not touch'))
-        answer = messages.question(
+        messages.askQuestion(
             self, title, check['question'],
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return values if answer == QMessageBox.StandardButton.Yes else None
+            QMessageBox.StandardButton.No,
+            then=lambda answer: then(values)
+            if answer == QMessageBox.StandardButton.Yes else None)
 
     def _face_names(self) -> dict:
         manifest = group_manifest_of(self.preparedGeometry())

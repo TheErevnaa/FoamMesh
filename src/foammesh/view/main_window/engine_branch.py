@@ -16,8 +16,10 @@ import logging
 
 import hashlib
 import json
+import weakref
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from shiboken6 import isValid
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QMenu, QMessageBox, QPushButton, QStackedWidget, QToolButton,
@@ -32,10 +34,11 @@ from foammesh.view.widgets.folded_note import FoldedNote
 from foammesh.core.workflow.dynamic import EngineWorkflowGraph
 from foammesh.view.gmsh_workflow import GMSH_TASK_PAGES
 from foammesh.view.snappy_workflow import SNAPPY_TASK_PAGES
-from foammesh.view.facade_client import query, submit
+from foammesh.view.facade_client import NoOpenCaseError, query, submit
 from foammesh.view.outside_task import modal
+from foammesh.view.workflow_controls.lock_chip import unlock_summary_lines
 
-from .run_narration import describe_result, newest_log
+from .run_narration import cell_limit_warnings, describe_result, newest_log
 from widgets import async_message_box as messages
 
 
@@ -183,6 +186,24 @@ def _reload_page_keeping_edits(page) -> None:
     reload()
 
 
+def _newest_gmsh_section(engine_id: str, case_root):
+    """The newest Gmsh run's result when it is a section drawn from its own
+    file, else ``None`` (the case root is drawn as before). DP-6482.
+
+    A disk read of the run manifests: called off the GUI thread.
+    """
+    if engine_id != 'gmsh' or not case_root:
+        return None
+    from foammesh.core.run_result import GMSH_MSH, case_results
+
+    results = case_results(case_root)
+    newest = results[0] if results else None
+    if (newest is not None and newest.section
+            and newest.artifact_format == GMSH_MSH and newest.drawable):
+        return newest
+    return None
+
+
 class _LazyPages(dict):
     """The task pages of one branch, built when first asked for.
 
@@ -308,6 +329,9 @@ class EngineBranchView(QWidget):
     #: changed under them; each is re-read, keeping its edits, when it opens.
     _staleBodies: frozenset = frozenset()
     _derivedRefreshQueued = False
+    #: DP-6271. Pages whose status line has not been re-read since the graph
+    #: last moved; each re-reads it when it opens.
+    _staleStatus: frozenset = frozenset()
 
     #: Plan 32 §7.3. Mirrors `MeshingMethodBranch.lockBypass`, which is the
     #: only thing that ever writes it, so both doors into a task page answer
@@ -326,6 +350,10 @@ class EngineBranchView(QWidget):
     #: labels the mesh that unlock kept as the previous result; empty once
     #: the label is down.
     _historicalScope: tuple = ()
+    #: Plan 50 IP25 (DP-6381). ``hosted task -> host task``: a task whose
+    #: page another task's page carries (Castellation and Snap, on the
+    #: Refinement page). The hosted page is still filed under its own id.
+    _hostOf: dict = {}
 
     def __init__(self, facade_client, parent=None):
         super().__init__(parent)
@@ -543,7 +571,9 @@ class EngineBranchView(QWidget):
         self._pageSpecs.clear()
         self._pages.clear()
         self._staleBodies = frozenset()
+        self._staleStatus = frozenset()
         self._order.clear()
+        self._hostOf = {}
 
         page_classes = BRANCH_PAGES.get(engine_id, {})
         self._graph = self._build_graph(engine_id)
@@ -566,6 +596,13 @@ class EngineBranchView(QWidget):
             item = QListWidgetItem(self._label(task, task_id), self.tasks)
             item.setData(Qt.ItemDataRole.UserRole, task_id)
             item.setToolTip(task.get('description') or '')
+        # Plan 50 IP25 (DP-6381). A page that carries other tasks' pages
+        # says so; those tasks keep their place here and are built with it.
+        for task_id in self._order:
+            for hosted in getattr(self._pageSpecs[task_id][0],
+                                  'hosted_task_ids', ()) or ():
+                if hosted in self._pageSpecs:
+                    self._hostOf[hosted] = task_id
         self._apply_states()
         empty = not self._order
         self._empty.setVisible(empty)
@@ -589,6 +626,16 @@ class EngineBranchView(QWidget):
 
     def _buildPage(self, task_id: str) -> QWidget:
         """Build the page for ``task_id`` now and put it in its place."""
+        host = self._hostOf.get(task_id)
+        if host is not None:
+            # Plan 50 IP25 (DP-6381). Built by the page that carries it; its
+            # slot in the stack keeps the placeholder, because the page is on
+            # screen inside its host's.
+            self._pages._need(host)
+            if task_id in self._pages._pending:
+                raise RuntimeError(
+                    f'the {host} page did not carry the {task_id} page')
+            return dict.get(self._pages, task_id)
         page_class, engine_id = self._pageSpecs[task_id]
         self._pages._pending.discard(task_id)
         try:
@@ -615,9 +662,45 @@ class EngineBranchView(QWidget):
             except Exception:                                # noqa: BLE001
                 logger.exception('the %s page could not show its lock', task_id)
         self._staleBodies = self._staleBodies - {task_id}
+        self._adoptHosted(page)
         if task_id == self._run_all_task_id():
             self._gradeRunAll()
         return page
+
+    def _adoptHosted(self, page) -> None:
+        """File the pages ``page`` carries under their own task ids.
+
+        Plan 50 IP25 (DP-6381). Each is wired as a page of its own -- its
+        updates, runs, unlocks and refusals reach the branch exactly as they
+        did when it had a row -- and told its own task's lock.
+        """
+        hosted = getattr(page, 'hostedPages', None)
+        if not callable(hosted):
+            return
+        for task_id, embedded in hosted().items():
+            if task_id not in self._pageSpecs:
+                continue
+            self._pages._pending.discard(task_id)
+            self._wirePage(embedded)
+            dict.__setitem__(self._pages, task_id, embedded)
+            setter = getattr(embedded, 'setResultLocked', None)
+            if callable(setter):
+                try:
+                    setter(task_id in self._resultLocked)
+                except Exception:                            # noqa: BLE001
+                    logger.exception('the %s page could not show its lock',
+                                     task_id)
+            self._staleBodies = self._staleBodies - {task_id}
+        stop_after = getattr(page, 'stopAfterRequested', None)
+        if stop_after is not None:
+            stop_after.connect(self.stopAfter)
+        stage_mesh = getattr(page, 'stageMeshRequested', None)
+        if stage_mesh is not None:
+            stage_mesh.connect(self.showStageMesh)
+
+    def hostTask(self, task_id: str) -> str:
+        """The task whose page shows ``task_id``'s settings (itself if none)."""
+        return self._hostOf.get(task_id, task_id)
 
     def _buildNextPage(self) -> None:
         """Plan 45. One more page per event-loop turn until all exist."""
@@ -644,12 +727,20 @@ class EngineBranchView(QWidget):
             page = page_class(self._client, self, engine_id=engine_id)
         except TypeError:
             page = page_class(self._client, self)
+        self._wirePage(page)
+        return page
+
+    def _wirePage(self, page) -> None:
+        """Connect a task page's requests to the branch."""
         # R155. `updateRequested` no longer maps straight to `accept`:
         # see _on_task_updated. A run-gated task refuses `accept`, and the
         # refusal used to vanish into the bare except below.
         update_signal = getattr(page, 'updateRequested', None)
         if update_signal is not None:
             update_signal.connect(self._on_task_updated)
+        proposal_signal = getattr(page, 'proposalStored', None)
+        if proposal_signal is not None:
+            proposal_signal.connect(self._on_proposal_stored)
         # R134. A page that records a setting no run has to judge asks
         # for CONFIGURED rather than the tick, so the outline can show
         # the half-filled glyph R94 added for exactly that case.
@@ -678,7 +769,6 @@ class EngineBranchView(QWidget):
         refusal_signal = getattr(page, 'runAllRefusalChanged', None)
         if refusal_signal is not None:
             refusal_signal.connect(lambda _text='': self._gradeRunAll())
-        return page
 
     def _run_all_task_id(self) -> str:
         """The task the whole-pipeline run is recorded against."""
@@ -1120,6 +1210,10 @@ class EngineBranchView(QWidget):
         self._checkNotice.setVisible(bool(text))
         self._checkCancel.setVisible(bool(self._checking))
 
+    #: DP-6407. (view, its unsubscribe functions) for every check
+    #: subscription, so a closed view's is dropped by the next one.
+    _checkLeaves: list = []
+
     def _subscribeToChecks(self) -> None:
         """Repaint when a background check lands (Plan 35 CR2)."""
         subscribe = getattr(self._client, 'subscribe', None)
@@ -1133,16 +1227,47 @@ class EngineBranchView(QWidget):
             return
         from foammesh.core.project import Event
 
+        # DP-6407. The session (and its bus) can outlive this view: a strong
+        # closure kept every closed project's branch view. Hold the view
+        # weakly; the first event after it goes leaves the bus. (A lambda on
+        # ``destroyed`` was itself kept by PySide, one a round.)
+        view = weakref.ref(self)
+        leave = []
+
         def landed(*_args, **_kwargs):
             # Delivered from the loop; repaint from the Qt queue.
-            QTimer.singleShot(0, self._checksLanded)
+            owner = view()
+            if owner is None or not isValid(owner):
+                for unsubscribe in leave:
+                    unsubscribe()
+                leave.clear()
+                return
+            QTimer.singleShot(0, owner._checksLanded)
 
         try:
-            subscribe(Event.ARTIFACT_QUALITY_CHANGED, landed)
+            unsubscribe = subscribe(Event.ARTIFACT_QUALITY_CHANGED, landed)
         except Exception:                                    # noqa: BLE001
             logger.debug('check results will show on the next refresh',
                          exc_info=True)
             return
+        if callable(unsubscribe):
+            leave.append(unsubscribe)
+            # The bus is the application's (``app._events``), shared by every
+            # session and view, and no event may come before the next
+            # subscribe: closed views leave it now, and a view that lives on
+            # into the next project leaves its old subscription (one closure
+            # a round in the live soak, trace-20a).
+            kept = []
+            for held, gone in EngineBranchView._checkLeaves:
+                owner = held()
+                if owner is None or owner is self or not isValid(owner):
+                    for unsub in gone:
+                        unsub()
+                    gone.clear()
+                else:
+                    kept.append((held, gone))
+            kept.append((view, leave))
+            EngineBranchView._checkLeaves = kept
         self._checkSubscription = session
 
     def _checksLanded(self) -> None:
@@ -1187,6 +1312,8 @@ class EngineBranchView(QWidget):
         skipped and named, as `_refresh_page_status` does (DP-142)."""
         try:
             _reload_page_keeping_edits(page)
+        except NoOpenCaseError:
+            return                                           # DP-6521
         except Exception:                                    # noqa: BLE001
             logger.exception('the %s page could not re-read the case; it '
                              'keeps what it showed', task_id)
@@ -1198,12 +1325,18 @@ class EngineBranchView(QWidget):
             return
         try:
             derived()
+        except NoOpenCaseError:
+            return                                           # DP-6521
         except Exception:                                    # noqa: BLE001
             logger.exception('a page could not recompute its derived values')
 
     def _open_page(self, task_id: str, page) -> None:
         """DP-1221. A page opens on the case as it is now: re-read if the
-        case changed while it was away, its estimate recomputed if not."""
+        case changed while it was away, its estimate recomputed if not.
+        DP-6271: and its status line re-read if the graph moved meanwhile."""
+        if task_id in self._staleStatus:
+            self._staleStatus = self._staleStatus - {task_id}
+            self._reread_status(task_id, page)
         if task_id in self._staleBodies:
             self._staleBodies = self._staleBodies - {task_id}
             self._reread_body(task_id, page)
@@ -1291,16 +1424,59 @@ class EngineBranchView(QWidget):
         anywhere said so. The page is still skipped -- it is still not worth
         a broken branch -- but now it says which page and why.
         """
+        # DP-6271. Only the page on screen (and the pages it carries) re-reads
+        # now; the others are marked and re-read when they open, as their
+        # bodies are (DP-1221). Every field commit moves the graph, and
+        # re-reading all built pages, three times a refresh, held the GUI
+        # thread ~550 ms with a 2.59 M-cell mesh on screen (MEASURED live,
+        # window leg `large`, 2026-11-12): ~13 status reads a pass, each a
+        # task-page query of ~15 ms.
+        shown = self._shownTaskIds()
+        stale = set(self._staleStatus)
         for task_id, page in _built_pages(self):
-            refresh = getattr(page, 'refresh_status', None)
-            if callable(refresh):
-                try:
-                    refresh()
-                except Exception:                            # noqa: BLE001
-                    logger.exception(
-                        'the %s page could not re-read its status; the rest '
-                        'of the branch was refreshed without it', task_id)
+            if shown is not None and task_id not in shown:
+                stale.add(task_id)
+                continue
+            stale.discard(task_id)
+            self._reread_status(task_id, page)
+        self._staleStatus = frozenset(stale)
         self._gradeRunAll()
+
+    def _shownTaskIds(self):
+        """The tasks whose pages are on screen: the current page and the
+        pages it carries (DP-6381). ``None`` when this view has no stack (the
+        stand-ins the unit tests build): every page counts as shown."""
+        stack = getattr(self, 'stack', None)
+        if stack is None:
+            return None
+        try:
+            on_screen = [(task_id, page) for task_id, page in _built_pages(self)
+                         if page is stack.currentWidget()]
+        except RuntimeError:
+            return set()
+        shown = set()
+        for task_id, page in on_screen:
+            shown.add(task_id)
+            shown.update(self._hostedOf(page))
+        return shown
+
+    def _reread_status(self, task_id: str, page) -> None:
+        """One page's status re-read; a page that raises is skipped and
+        named (DP-142)."""
+        refresh = getattr(page, 'refresh_status', None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except NoOpenCaseError:
+            # DP-6521. MEASURED in the Step 6 open/close soak: a refresh
+            # queued before File > Close ran after it, and every built page
+            # logged a traceback. With no case open there is nothing to read.
+            return
+        except Exception:                                    # noqa: BLE001
+            logger.exception(
+                'the %s page could not re-read its status; the rest '
+                'of the branch was refreshed without it', task_id)
 
     def _on_task_updated(self, task_id: str) -> None:
         """Record settings that were saved without a run (R134/R155).
@@ -1320,6 +1496,23 @@ class EngineBranchView(QWidget):
         run_gated = bool(self.task_info(task_id).get('run_gated'))
         self._on_task_transition(
             task_id, 'configure' if run_gated else 'accept', after_save=True)
+
+    def _on_proposal_stored(self, task_id: str) -> None:
+        """Record a proposal a page stored of its own accord (DP-6118).
+
+        MEASURED live 2026-11-01 on the CHT tubes: Mesh setup -> Gmsh ->
+        Proceed, and before any Gmsh page was opened a modal said `Your
+        settings were saved. Layers is not marked done yet, because Sizing
+        has still to be completed.` Nobody had saved anything: the Layers
+        page, built in the background, proposed one volume's walls for the
+        three-volume assembly (DP-2875) and stored them. The transition is
+        recorded as for a save; a lock on it is the expected state of a step
+        nobody has reached, so it is not announced.
+        """
+        run_gated = bool(self.task_info(task_id).get('run_gated'))
+        self._on_task_transition(
+            task_id, 'configure' if run_gated else 'accept', after_save=True,
+            announce=False)
 
     def _locked_sentence(self, task_id: str) -> str:
         """What a user must do before this task can be marked done.
@@ -1346,7 +1539,8 @@ class EngineBranchView(QWidget):
             'completed.').format(title, names)
 
     def _on_task_transition(self, task_id: str, transition: str, *,
-                            after_save: bool = False) -> None:
+                            after_save: bool = False,
+                            announce: bool = True) -> None:
         """Record the §5.17 lifecycle transition through the facade.
 
         C31-12: scheduled, not blocking. The transition rebuilds the graph and
@@ -1386,7 +1580,8 @@ class EngineBranchView(QWidget):
             accepted = False
             try:
                 accepted = self._transition_recorded(
-                    task_id, result, after_save=after_save)
+                    task_id, result, after_save=after_save,
+                    announce=announce)
             finally:
                 settle(accepted)
 
@@ -1435,7 +1630,8 @@ class EngineBranchView(QWidget):
             accepted = accepted and all(result is True for result in results)
 
     def _transition_recorded(self, task_id: str, result, *,
-                             after_save: bool = False) -> bool:
+                             after_save: bool = False,
+                             announce: bool = True) -> bool:
         """Repaint on the facade's answer, and say whether it took it."""
         accepted = getattr(result, 'status', 'accepted') == 'accepted'
         if not accepted:
@@ -1456,7 +1652,11 @@ class EngineBranchView(QWidget):
             # gmsh.boundary_layers` told the user their save had failed
             # when it had not, named the task they were already looking
             # at rather than the one holding it, and offered no way on.
-            if after_save and 'locked by prerequisites' in message:
+            if (after_save and not announce
+                    and 'locked by prerequisites' in message):
+                logger.info('%s: a proposal was stored; the task stays '
+                            'locked: %s', task_id, message)
+            elif after_save and 'locked by prerequisites' in message:
                 messages.warning(
                     self, self.tr('Settings saved'),
                     self.tr('Your settings were saved. ')
@@ -1649,12 +1849,21 @@ class EngineBranchView(QWidget):
                 # serial or parallel and on how many workers, and offers the
                 # log. Both were in this payload already; the only place the
                 # split had ever been visible was the processor* directories.
+                # DP-6483. The sentence says "See the Console": put it there.
+                console = self._console()
+                for warning in (cell_limit_warnings(payload)
+                                if console is not None else ()):
+                    console.append(self.tr('Refinement: %s') % warning)
                 self._report_run(describe_result(payload),
                                  log=newest_log(payload))
             elif self._was_cancelled(payload):
                 self._report_cancelled_stage(self.tr('The run'))
             else:
-                self._report_run(describe_result(payload, failed=True),
+                from .run_follower import refused_before_start
+                # DP-6487. A refused run reads "not started", not "failed".
+                self._report_run(str(payload.get('reason') or '').strip()
+                                 if refused_before_start(payload) else
+                                 describe_result(payload, failed=True),
                                  failed=True, log=newest_log(payload))
                 self._warn_failure(
                     self.tr('Mesh run'), payload, result,
@@ -1855,6 +2064,61 @@ class EngineBranchView(QWidget):
     def is_accepted(self, task_id: str) -> bool:
         return self.task_state(task_id) in self.ACCEPTED_STATES
 
+    @staticmethod
+    def _hostedOf(page) -> dict:
+        hosted = getattr(page, 'hostedPages', None)
+        return hosted() if callable(hosted) else {}
+
+    # -- Plan 50 IP25 (DP-6383): stop after castellation ------------------- #
+
+    def stopAfter(self, task_id: str) -> None:
+        """Run the row's stages up to ``task_id`` and stop there."""
+        try:
+            self._stop_after_task = asyncio.ensure_future(
+                self.stop_after_async(task_id))
+        except RuntimeError:
+            logger.warning('no event loop to run up to %s', task_id)
+
+    async def stop_after_async(self, task_id: str) -> bool:
+        """Run each stage of ``task_id``'s row in order, up to and including
+        it, and stop: *Stop after castellation* leaves the castellated mesh
+        in the case and on screen, before the snap.
+
+        A stage before the target that is already accepted is not run again
+        (the feature edges extracted once stay extracted); the target always
+        runs. A stage that fails ends the walk, and the answer is False.
+        """
+        from .meshing_method_branch import owning_row, row_tasks
+
+        row = owning_row(self._engine_id, task_id) or task_id
+        members = list(row_tasks(self._engine_id, row) or (row,))
+        if task_id not in members:
+            members = [task_id]
+        for member in members[:members.index(task_id) + 1]:
+            if member != task_id and self.is_accepted(member):
+                continue
+            page = self._pages.get(member)
+            stage = getattr(page, 'run_stage', None) or ''
+            if not stage:
+                continue
+            if not await self.run_stage_async(member, stage):
+                return False
+        return True
+
+    def showStageMesh(self, stage: str, root: str) -> None:
+        """Draw the kept mesh of ``stage`` (a stage snapshot) from ``root``."""
+        from foammesh.app import app
+
+        manager = getattr(getattr(app, 'window', None), 'meshManager', None)
+        if manager is None or not root:
+            return
+        label = self.tr('Castellation') if stage == 'castellation' else stage
+        try:
+            self._reload_task = asyncio.ensure_future(
+                manager.load(0, root=root, stage=label))
+        except RuntimeError:
+            logger.warning('no event loop to draw the %s mesh', stage)
+
     def is_runnable(self, task_id: str) -> bool:
         if self._graph is None:
             return False
@@ -2015,6 +2279,10 @@ class EngineBranchView(QWidget):
         cause = str(payload.get('cause') or '').strip()
         text = (self.tr('%s failed.') % stage + '\n\n' + cause
                 if stage and cause else reason)
+        from .run_follower import refused_before_start
+        if refused_before_start(payload):
+            # DP-6487. Nothing started: the refusal's sentence, once.
+            text = reason
         console = self._console()
         if console is not None:
             write = getattr(console, 'appendError', None) or console.append
@@ -2144,7 +2412,8 @@ class EngineBranchView(QWidget):
                             '{1}').format(stage, unpublished), payload),
                     failed=True)
             elif (revision or payload.get('region_warnings')
-                  or payload.get('layer_warnings')):
+                  or payload.get('layer_warnings')
+                  or cell_limit_warnings(payload)):
                 message = self.tr('%s completed.') % stage
                 if revision:
                     message += ' ' + self.revisionText(revision)
@@ -2322,7 +2591,19 @@ class EngineBranchView(QWidget):
         from foammesh.app import app
 
         try:
-            await manager.load(0)
+            # DP-6482. A Gmsh section that published no polyMesh (a
+            # recombined one never does) is drawn from its own file; reading
+            # the case root after "Publish again" drew nothing, or an older
+            # run's mesh.
+            section = await asyncio.to_thread(
+                _newest_gmsh_section, getattr(self, '_engine_id', ''),
+                getattr(getattr(app, 'facadeClient', None), 'case_root', ''))
+            if section is None:
+                await manager.load(0)
+            else:
+                problem = await manager.loadResult(section)
+                if problem:
+                    raise RuntimeError(problem)
         except Exception as error:                          # noqa: BLE001
             logger.warning('could not draw the mesh that was just written',
                            exc_info=True)
@@ -2348,7 +2629,9 @@ class EngineBranchView(QWidget):
         # layers; the legacy completion box said what the mesh received.
         layers = [str(item) for item in (payload or {}).get(
             'layer_warnings') or () if str(item).strip()]
-        if not warnings and not layers:
+        # DP-6483. A stage stopped at Max global cells travels the same road.
+        limits = cell_limit_warnings(payload)
+        if not warnings and not layers and not limits:
             return message
         console = self._console()
         if console is not None:
@@ -2356,7 +2639,9 @@ class EngineBranchView(QWidget):
                 console.append(self.tr('Regions: %s') % warning)
             for warning in layers:
                 console.append(self.tr('Layers: %s') % warning)
-        return ' '.join([message] + warnings + layers)
+            for warning in limits:
+                console.append(self.tr('Refinement: %s') % warning)
+        return ' '.join([message] + warnings + layers + limits)
 
     def _report_run(self, message: str, *, failed: bool = False,
                     log: str = '') -> None:
@@ -2434,13 +2719,14 @@ class EngineBranchView(QWidget):
             except Exception:                                # noqa: BLE001
                 logger.exception('the %s page could not show its lock', task_id)
 
-    def _confirm(self, title: str, text: str) -> bool:
-        """Ask before discarding work. Tests replace this."""
-        answer = messages.question(
+    def _confirm(self, title: str, text: str, then) -> None:
+        """Ask before discarding work; ``then(True)`` on Yes. Tests replace
+        this. Plan 50 IP19: asked without a nested event loop."""
+        messages.askQuestion(
             self, title, text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Yes
+            QMessageBox.StandardButton.Cancel,
+            then=lambda answer: then(answer == QMessageBox.StandardButton.Yes))
 
     def _warn(self, title: str, text: str) -> None:
         """Say why nothing happened. Tests replace this."""
@@ -2460,26 +2746,9 @@ class EngineBranchView(QWidget):
         """What the unlock confirmation says: tasks, artifacts, disk cost."""
         titles = list(preview.get('titles') or preview.get('scope') or ())
         name = titles[0] if titles else preview.get('task_id')
-        # Plan 43 LY9, section 2: the words of the decision.
-        if preview.get('resets_values'):
-            lines = [self.tr('Unlocking "{0}" deletes the mesh and the quality '
-                             'results, and every later step starts over, as '
-                             'for new geometry:').format(name)]
-        else:
-            lines = [self.tr('Unlocking "{0}" deletes the mesh and the quality '
-                             'results. Later steps keep their values but go '
-                             'back to not done:').format(name)]
-        lines += [f'  • {title}' for title in titles]
-        artifacts = list(preview.get('artifacts') or ())
-        if artifacts:
-            lines.append('')
-            lines.append(self.tr('Deleted from the case, and gone from the '
-                                 'viewport:'))
-            for artifact in artifacts:
-                lines.append(f'  • {artifact.get("path")} '
-                             f'({self._bytes(artifact.get("bytes"))})')
-            lines.append(self.tr('Nothing is re-meshed until you run a step '
-                                 'again.'))
+        # Plan 43 LY9, section 2: the words of the decision (DP-6124: the
+        # same words as the lock chip's, with the kept files apart).
+        lines = unlock_summary_lines(preview, name, self._bytes)
         lines.append('')
         lines.append(self.tr('A copy is kept so that "Restore previous mesh '
                              'and settings" can put everything back: {0} of '
@@ -2735,9 +3004,15 @@ class EngineBranchView(QWidget):
                 'reserve_bytes': reserve}, self.tr('Unlocking'),
                 copy=self.tr('the copy of the current mesh kept for undo')))
             return False
-        if not confirmed and not self._confirm(
-                title, self.unlockConfirmation(preview)):
-            return False
+        if not confirmed:
+            # Plan 50 IP19: a Yes asks again with the answer given, so the
+            # unlock reads a fresh preview once the box closes.
+            result = []
+            self._confirm(title, self.unlockConfirmation(preview),
+                          lambda yes: result.append(
+                              bool(yes) and self.requestUnlock(
+                                  task_id, confirmed=True)))
+            return result[0] if result else True
         baseline = self._skipBaseline()
         # Plan 37 I2. Read before the unlock lands: the label names the
         # latest publication the mesh on screen belongs to -- the newest
@@ -2838,7 +3113,7 @@ class EngineBranchView(QWidget):
                                  'kept at the unlock.'))
         return '\n'.join(lines)
 
-    def requestUndoUnlock(self) -> bool:
+    def requestUndoUnlock(self, *, confirmed: bool = False) -> bool:
         """Put back what the last unlock discarded, after asking."""
         title = self.tr('Restore previous mesh and settings')
         preview = self.undoAvailable()
@@ -2847,8 +3122,13 @@ class EngineBranchView(QWidget):
                 'There is no unlock to undo: a run since the last unlock '
                 'replaced the restore point, or nothing was unlocked.'))
             return False
-        if not self._confirm(title, self.undoConfirmation(preview)):
-            return False
+        if not confirmed:
+            result = []  # Plan 50 IP19, as requestUnlock
+            self._confirm(title, self.undoConfirmation(preview),
+                          lambda yes: result.append(
+                              bool(yes) and self.requestUndoUnlock(
+                                  confirmed=True)))
+            return result[0] if result else True
         baseline = self._skipBaseline()
 
         def landed(result) -> None:
@@ -2937,6 +3217,8 @@ class EngineBranchView(QWidget):
     def select(self, task_id: str) -> bool:
         if task_id not in self._pages:
             return False
+        # Plan 50 IP25 (DP-6381). A hosted task is shown on its host's page.
+        task_id = self.hostTask(task_id)
         if self.selectRefusal(task_id):
             return False
         self.tasks.setCurrentRow(self._order.index(task_id))
@@ -2946,10 +3228,17 @@ class EngineBranchView(QWidget):
         if row < 0 or row >= len(self._order):
             return
         task_id = self._order[row]
+        host = self._hostOf.get(task_id)
+        if host is not None and host in self._order:
+            # Plan 50 IP25 (DP-6381). The hosted task's slot holds no page.
+            self.tasks.setCurrentRow(self._order.index(host))
+            return
         page = self._pages.get(task_id)      # built now if it is not yet
         self.stack.setCurrentIndex(row)
         if page is not None:
             self._open_page(task_id, page)
+            for hosted_id, hosted in self._hostedOf(page).items():
+                self._open_page(hosted_id, hosted)
         self._updateHeading()
         self._gradeRunAll()
         self.taskSelected.emit(self._order[row])

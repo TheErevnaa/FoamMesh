@@ -23,6 +23,7 @@ from PySide6.QtGui import QGuiApplication, QImage, QPainter
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QHBoxLayout, QLineEdit, QPushButton, QWidget)
+from widgets.async_dialog import getSaveFileName, openDialog
 
 COPY_SCALE = 2
 SCALES = (1, 2, 4)
@@ -132,11 +133,11 @@ class SaveViewDialog(QDialog):
         form.addRow(buttons)
 
     def _browse(self):
-        path, _filter = QFileDialog.getSaveFileName(
+        # Plan 50 IP19: no nested event loop.
+        getSaveFileName(
             self, self.tr('Save view as'), self._path.text(),
-            self.tr('PNG image (*.png)'))
-        if path:
-            self._path.setText(path)
+            self.tr('PNG image (*.png)'),
+            then=lambda path, _filter: path and self._path.setText(path))
 
     def setPath(self, path: str) -> None:
         self._path.setText(str(path))
@@ -150,7 +151,9 @@ class SaveViewDialog(QDialog):
 
 
 def saveViewAs(view, parent=None, *, directory: str = '') -> str | None:
-    """Ask, then write. Returns the path written, or None.
+    """Ask, then write. Returns the path written, or None (also while the
+    dialog is open: Plan 50 IP19 opens it without a nested event loop, and
+    the write follows the answer).
 
     Plan 43 LY15. *Save view as…* is the snapshot popover now, with the
     options of this dialog and the other five formats; the dialog below is
@@ -162,10 +165,15 @@ def saveViewAs(view, parent=None, *, directory: str = '') -> str | None:
         show()
         return None
     dialog = SaveViewDialog(parent, directory=directory)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return None
-    options = dialog.options()
-    path = options.pop('path')
-    if not path:
-        return None
-    return path if saveView(view, path, **options) else None
+    written = []
+
+    def answered(result):
+        if result != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        path = options.pop('path')
+        if path and saveView(view, path, **options):
+            written.append(path)
+
+    openDialog(dialog, answered)
+    return written[0] if written else None

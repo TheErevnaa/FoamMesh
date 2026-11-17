@@ -271,6 +271,9 @@ class HelpPane(QFrame):
     def setOpen(self, opened: bool) -> None:
         self._toggle.setChecked(bool(opened))
 
+    def name_text(self) -> str:
+        return self._name.text()
+
     def explanation_text(self) -> str:
         return self._explanation.text()
 

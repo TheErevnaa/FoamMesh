@@ -16,6 +16,7 @@ if _HERE not in _sys.path:
 from quantities import count_text
 
 from .common import (MeshFailure)
+from . import face_history
 
 
 class GeometryStage:
@@ -61,8 +62,10 @@ class GeometryStage:
                 dimension = 2 if kind == 'surface' else 3
                 listings = self._listing_tags(
                     tags, shared if kind == 'surface' else {})
+                numbers = self._listing_numbers(
+                    record, len(listings) if kind == 'surface' else -1)
                 for local, owned in enumerate(listings):
-                    identity = f'{source_id}:{kind}:{local}'
+                    identity = f'{source_id}:{kind}:{numbers[local]}'                         if numbers else f'{source_id}:{kind}:{local}'
                     self.entity_tags[identity] = {
                         'kind': kind, 'dim': dimension, 'tags': list(owned)}
                     entities.append({'entity_id': identity, 'kind': kind,
@@ -118,6 +121,26 @@ class GeometryStage:
         if not shared or declared - len(shared) != found:
             return {}
         return shared
+
+    @staticmethod
+    def _listing_numbers(record, listings) -> list:
+        """The number each surface listing of a source goes by, in file order.
+
+        DP-6122. MEASURED live 2026-11-01 on the CHT tubes split at their
+        shared walls: the hot body's file kept `face1` and `face2` (the
+        inlet and the outlet) once `face0` became the interface, and the
+        identities, numbered by position, called them `:surface:0` and
+        `:surface:1`. `hot_inlet` was published on the outlet, `hot_outlet`
+        on a pipe end, and `cold_inlet` and `pipe_end_z0` on nothing. Empty
+        -- position stands -- when the job carries no numbering or one that
+        does not count the listings Gmsh made.
+        """
+        numbers = (record or {}).get('surface_indices') or ()
+        try:
+            numbers = [int(item) for item in numbers]
+        except (TypeError, ValueError):
+            return []
+        return numbers if len(numbers) == listings else []
 
     @staticmethod
     def _listing_tags(tags, shared) -> list:
@@ -263,7 +286,9 @@ class GeometryStage:
                     float('%.8e' % float(mass)))
         return signatures
 
-    def _follow_duplicate_fusion(self, before: dict, owners=None) -> dict:
+    def _follow_duplicate_fusion(self, before: dict, owners=None,
+                                 mapped=None, operation='duplicate-fusion'
+                                 ) -> dict:
         """Point each identity the fusion consumed at the face that replaced it.
 
         DP-410. ``removeAllDuplicates`` fuses two coincident faces into one,
@@ -283,6 +308,13 @@ class GeometryStage:
         A dropped tag that matches no survivor, or more than one, is left
         consumed: that is the case this cannot read, and guessing it would
         put a user's patch name on a face chosen by arithmetic.
+
+        Plan 50 IP29 (DP-6324). *mapped* is ``{face before: [faces after]}``
+        from the Boolean's own map. A face it covers follows its children,
+        all of them: a face split in two keeps its identity on both halves,
+        which the signature (neither half has the whole face's centre or
+        area) could not give. Only a face it does not cover is matched by
+        signature, and ``statistics['faceIdentity']`` counts both.
         """
         dimensions = tuple(sorted({dimension for dimension, _tag in before}))
         after = self._entity_signatures(dimensions)
@@ -297,7 +329,26 @@ class GeometryStage:
         successors = {dimension: {tag: [tag] for dim, tag in after
                                   if dim == dimension}
                       for dimension in dimensions}
+        present = {tag for dim, tag in after if dim == 2}
+        followed = set()
+        by_map = by_fallback = unmatched = 0
+        moved_by_map = False
+        for tag, children in sorted((mapped or {}).items()):
+            children = sorted({int(c) for c in children if int(c) in present})
+            if (2, int(tag)) not in before or not children \
+                    or 2 not in successors:
+                continue
+            followed.add(int(tag))
+            if children == [int(tag)]:
+                continue
+            successors[2][int(tag)] = children
+            moved_by_map = True
+            by_map += 1
+            if (2, int(tag)) not in after and len(children) == 1:
+                self.duplicate_face_successors[int(tag)] = children[0]
         for dimension, tag in sorted(set(before) - set(after)):
+            if dimension == 2 and int(tag) in followed:
+                continue
             candidates = by_signature.get(before[(dimension, tag)]) or []
             if len(candidates) > 1 and dimension == 2 and owners:
                 # DP-5880 (Plan 49 SR5). A face kept apart from its twin has
@@ -311,6 +362,8 @@ class GeometryStage:
                 candidates = [key for key in candidates
                               if wanted & set(self._face_volumes(key[1]))]
             if len(candidates) != 1:
+                if dimension == 2:
+                    unmatched += 1
                 self.ledger.record(
                     f'duplicateFusion:{tag}', tag, None, applied=False,
                     note=('the fusion consumed this entity and '
@@ -322,10 +375,17 @@ class GeometryStage:
             survivor = candidates[0][1]
             successors[dimension][tag] = [survivor]
             if dimension == 2:
+                by_fallback += 1
                 self.duplicate_face_successors[int(tag)] = int(survivor)
             else:
                 self.duplicate_volume_successors[int(tag)] = int(survivor)
-        if self.duplicate_face_successors or self.duplicate_volume_successors:
+        if 2 in dimensions:
+            face_history.record(
+                getattr(self, 'statistics', None), operation, by_map=by_map,
+                by_fallback=by_fallback, unmatched=unmatched,
+                map_used=mapped is not None)
+        if self.duplicate_face_successors or self.duplicate_volume_successors \
+                or moved_by_map:
             for dimension in dimensions:
                 self.retarget_entities('duplicate-fusion',
                                        successors[dimension],
@@ -543,16 +603,41 @@ class GeometryStage:
         owners = {int(tag): set(self._face_volumes(tag))
                   for _dim, tag in gmsh.model.getEntities(2)}
         renamed: dict[int, int] = {}
+        # Plan 50 IP29 (DP-6324). Every face's tags now, followed through
+        # each fragment by its map; ``None`` once a fragment could not give
+        # one, and the fusion is then followed by signature alone.
+        lineage = ({int(tag): [int(tag)] for _dim, tag in
+                    gmsh.model.getEntities(2)}
+                   if face_history.FACE_HISTORY_BOOLEANS else None)
         for first, second in sorted(fuse_volumes):
             first = renamed.get(first, first)
             second = renamed.get(second, second)
-            _out, out_map = gmsh.model.occ.fragment([(3, first)],
-                                                    [(3, second)])
-            for (_dim, old), children in zip(((3, first), (3, second)),
-                                             out_map or ()):
+            pair = [(3, first), (3, second)]
+            faces = []
+            if lineage is not None:
+                try:
+                    faces = [(2, f) for f in
+                             face_history.boundary_faces(gmsh, pair)]
+                except Exception:                        # noqa: BLE001
+                    lineage, faces = None, []
+            try:
+                _out, out_map = gmsh.model.occ.fragment(pair[:1],
+                                                        pair[1:] + faces)
+            except Exception:                            # noqa: BLE001
+                if not faces:
+                    raise
+                # The kernel refused the faces as inputs: the plain fragment,
+                # and the fusion followed by signature as before IP29.
+                lineage, faces = None, []
+                _out, out_map = gmsh.model.occ.fragment(pair[:1], pair[1:])
+            for (_dim, old), children in zip(pair, out_map or ()):
                 volumes = [int(tag) for dim, tag in children if int(dim) == 3]
                 if len(volumes) == 1 and volumes[0] != old:
                     renamed[old] = volumes[0]
+            if lineage is not None:
+                lineage = face_history.follow(
+                    lineage, face_history.children_by_input(
+                        out_map, pair + faces, 2))
             gmsh.model.occ.synchronize()
         after = len(gmsh.model.getEntities(2))
 
@@ -563,7 +648,9 @@ class GeometryStage:
 
         self._follow_duplicate_fusion(
             signatures, owners={face: {successor(volume) for volume in found}
-                                for face, found in owners.items()})
+                                for face, found in owners.items()},
+            **({} if lineage is None else
+               {'mapped': lineage, 'operation': 'contact-fusion'}))
         if after != before:
             self.duplicate_faces_fused = before - after
         self._record_selective_fusion(nonconformal, before - after)
@@ -688,7 +775,10 @@ class GeometryStage:
                     'route meshes a planar section and extrudes it into '
                     'exactly one cell of '
                     'thickness, so a solid cannot be its input: supply the '
-                    'section face, or mesh in three dimensions.')
+                    'section face, or mesh in three dimensions. A section built in the '
+                    'geometry builder over an imported solid is replayed from '
+                    'that solid: build the section first, then set the mesh '
+                    'mode to two-dimensional or axisymmetric.')
             if not surfaces:
                 raise MeshFailure(
                     f'the job asked for a {mode} mesh and the import produced '

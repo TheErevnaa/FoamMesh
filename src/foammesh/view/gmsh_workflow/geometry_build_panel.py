@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import threading
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -60,6 +60,39 @@ class _Bridge(QObject):
     rolesFound = Signal(object)
 
 
+def typed_entities(text: str, dim=None) -> list:
+    """[dimension, tag] pairs from a typed list (DP-6165).
+
+    ``1, 2`` where the field has one dimension; ``2:5, 3:1`` (dimension:tag)
+    always, and the only form where the field takes any dimension.
+    """
+    tr = QCoreApplication.translate
+    out = []
+    for part in text.replace(',', ' ').split():
+        given, _, tag = part.rpartition(':')
+        try:
+            tag = int(tag)
+            given = int(given) if given else None
+        except ValueError:
+            raise ValueError(tr('GmshGeometryBuildPanel',
+                                'tags are whole numbers: %s') % text)
+        if given is None and dim is None:
+            raise ValueError(tr(
+                'GmshGeometryBuildPanel',
+                'this field takes points, curves, surfaces or volumes: '
+                'type dimension:tag, as 2:5, 3:1'))
+        if given is not None and dim is not None and given != int(dim):
+            raise ValueError(tr(
+                'GmshGeometryBuildPanel',
+                'this field takes dimension %d only: %s') % (int(dim), part))
+        if given is not None and not 0 <= given <= 3:
+            raise ValueError(tr('GmshGeometryBuildPanel',
+                                'a dimension is 0, 1, 2 or 3: %s') % part)
+        if tag > 0:
+            out.append((int(dim) if given is None else given, tag))
+    return out
+
+
 class _EntityField(QWidget):
     """Pick / chips / Clear for one entity-list field."""
 
@@ -82,9 +115,32 @@ class _EntityField(QWidget):
         self._clear = QPushButton(self.tr('Clear'), self)
         self._clear.setObjectName('gmshBuildClear_' + spec.name)
         self._clear.clicked.connect(lambda: self.set(()))
+        # DP-6165. Tags can be typed as well as picked.
+        self._typed = QLineEdit(self)
+        self._typed.setObjectName('gmshBuildTyped_' + spec.name)
+        # A field that takes any dimension needs it typed with each tag.
+        self._typed.setPlaceholderText(
+            self.tr('or type tags: 1, 2') if spec.dim is not None
+            else self.tr('or type dimension:tag: 2:5, 3:1'))
+        self._typed.setAccessibleName(self.tr('Type %s tags') % spec.title)
+        self._typed.setMinimumWidth(0)
+        self._typed.editingFinished.connect(self._fromTyped)
         row.addWidget(self._button)
         row.addWidget(self._chips, 1)
+        row.addWidget(self._typed)
         row.addWidget(self._clear)
+
+    def _fromTyped(self) -> None:
+        text = self._typed.text().strip()
+        if not text:
+            return
+        try:
+            picked = typed_entities(text, self.spec.dim)
+        except ValueError as error:
+            self._chips.setText(str(error))
+            return
+        self.set(picked)
+        self._typed.clear()
 
     def set(self, picked) -> None:
         self.value = tuple(tuple(e) for e in picked)
@@ -305,6 +361,9 @@ class GmshGeometryBuildPanel(QWidget):
             self.destroyed.connect(
                 lambda *_a, s=session, a=self._api: pa3_routes.unregister_panel(
                     s, 'build', a))
+        # Plan 50 IP4: the tool dock connects this panel now, not by a poll.
+        from foammesh.view.gmsh_tools import panel_events
+        panel_events.announce(self)
 
     # -- the form ----------------------------------------------------------- #
 
@@ -431,12 +490,19 @@ class GmshGeometryBuildPanel(QWidget):
             built = [s for s in builder.steps if s.op_id != 'parameter']
             if built:
                 if confirmed is None:
+                    # Plan 50 IP19. Asked without a nested event loop: the
+                    # answer calls this again. Until it comes the kernel is
+                    # unchanged, so the caller shows the current one.
                     from widgets import async_message_box
-                    confirmed = async_message_box.question(
+                    result = []
+                    async_message_box.askQuestion(
                         self, self.tr('Change the geometry kernel'),
                         self.tr(checkpoints.describe_kernel_change(
                             builder, kernel)) + '\n\n'
-                        + self.tr('Change it?')) == QMessageBox.Yes
+                        + self.tr('Change it?'),
+                        then=lambda answer: result.append(self.setKernel(
+                            kernel, confirmed=answer == QMessageBox.Yes)))
+                    return result[0] if result else False
                 if not confirmed:
                     self._say(self.tr('The geometry kernel was not changed.'))
                     return False

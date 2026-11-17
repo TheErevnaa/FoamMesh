@@ -316,8 +316,10 @@ FIELD_HELP: dict[str, str] = {
         'split, such as 2 2 1 for four parts. Empty lets FoamMesh '
         'choose from the core count.'),
     'mesh.execution.decomposition_method': (
-        'How the domain is cut into parts for a parallel run. Scotch '
-        'balances the parts without any further input.'),
+        'How the domain is cut into parts for a parallel run in Parallel '
+        'mode. Scotch balances the parts without any further input. '
+        'Automatic mode picks the rank count itself and always cuts with '
+        'Scotch, so this choice is read only in Parallel mode.'),
     'mesh.execution.decomposition_order': (
         'The order of the axes a hierarchical split cuts along. Cutting '
         'the longest direction first usually gives the fewest '

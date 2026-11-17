@@ -45,6 +45,7 @@ from foammesh.view.theming.status_colors import apply_value_swatch
 from foammesh.view.workflow_controls.length_box import ModelLengthBox
 from foammesh.core.gmsh import session_display as sd
 from foammesh.core.gmsh.session_entities import EntityRecord
+from widgets import async_dialog
 
 
 class _Bridge(QObject):
@@ -276,11 +277,15 @@ class GmshDisplayPanel(QWidget):
 
     def _pickColour(self, name, button) -> None:
         current = self._drawing.colour(name)
-        chosen = QColorDialog.getColor(QColor(*current[:3]), self)
-        if chosen.isValid():
-            self._drawingSet(name, [chosen.red(), chosen.green(),
-                                    chosen.blue(), current[3]])
-            self._paintSwatch(button, self._drawing.get(name))
+
+        def picked(chosen):
+            if chosen.isValid():
+                self._drawingSet(name, [chosen.red(), chosen.green(),
+                                        chosen.blue(), current[3]])
+                self._paintSwatch(button, self._drawing.get(name))
+
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getColor(QColor(*current[:3]), self, then=picked)
 
     def _drawingSet(self, name, value) -> bool:
         try:

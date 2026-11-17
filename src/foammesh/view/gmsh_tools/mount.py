@@ -18,12 +18,13 @@ What it does, once per window:
 from __future__ import annotations
 
 import logging
+import weakref
 
 from PySide6.QtCore import QObject, QTimer
 
 from foammesh.view.gmsh_tools import (
     build_setup, console_actions, dialogs, engine_switch, recent_files,
-    panels_api, registry, tool_keys, tools_api,
+    panel_events, panels_api, registry, tool_keys, tools_api,
 )
 from foammesh.view.gmsh_tools.dock import GmshToolDock
 from foammesh.view.gmsh_tools.menus import MenuEntries
@@ -119,7 +120,11 @@ def _case_session(client):
 class GmshToolsMount(QObject):
     """Everything the dock puts in one window."""
 
-    POLL_MS = 1500
+    #: Plan 50 IP4: how long to wait, attempt by attempt, for an announced
+    #: panel to be placed in the window before it is given up (a panel that
+    #: is never placed in this window is not this window's).  Bounded: no
+    #: timer runs once these are spent.
+    PLACE_RETRY_MS = (0, 250, 1000)
 
     def __init__(self, window, engine=None):
         super().__init__(window)
@@ -146,9 +151,13 @@ class GmshToolsMount(QObject):
         self._recentMenu = self._addRecentMenu()
         console_actions.install(window.consoleView)
         self._connected: list = []
-        self._poll = QTimer(self)
-        self._poll.setInterval(self.POLL_MS)
-        self._poll.timeout.connect(self.connect_panels)
+        # Plan 50 IP4 (DP-6270): no standing poll.  A panel announces itself
+        # when it is built (panel_events) and is connected then; the whole
+        # window is searched only when the route turns to Gmsh or a case
+        # opens, for panels built before that.
+        self._pending: list = []
+        self._pendingScheduled = False
+        panel_events.events().created.connect(self._panelCreated)
         engine_switch.follow(self.engine, self.gate)
 
     # -- the providers ----------------------------------------------------- #
@@ -236,20 +245,21 @@ class GmshToolsMount(QObject):
             from foammesh.view.gmsh_workflow.cvt_panel import CvtRemeshPanel
         except ImportError:
             return 0
+        return sum(self._giveCvt(panel)
+                   for panel in self.window.findChildren(CvtRemeshPanel))
+
+    def _giveCvt(self, panel) -> int:
         from foammesh.view.gmsh_workflow.shared_pick import SharedPick
 
-        given = 0
+        if getattr(panel, '_gm11bContext', False):
+            return 0
         view = self.window._ui.renderingView
-        for panel in self.window.findChildren(CvtRemeshPanel):
-            if getattr(panel, '_gm11bContext', False):
-                continue
-            panel.set_context(
-                controller=self.controller, viewport=lambda: view,
-                picker=SharedPick('gmsh.cvt_remesh', parent=panel))
-            panel.meshEdited.connect(self._after_build)
-            panel._gm11bContext = True
-            given += 1
-        return given
+        panel.set_context(
+            controller=self.controller, viewport=lambda: view,
+            picker=SharedPick('gmsh.cvt_remesh', parent=panel))
+        panel.meshEdited.connect(self._after_build)
+        panel._gm11bContext = True
+        return 1
 
     def _links(self) -> dict:
         from foammesh.view.gmsh_workflow import command_entries as entries
@@ -295,36 +305,34 @@ class GmshToolsMount(QObject):
             'save_defaults': self.save_display_defaults,
         }
 
+    # Plan 50 IP19. Each asks without a nested event loop and acts when the
+    # person answers; an answer given at once still comes back to the caller.
+
+    def _act(self, ask, act) -> dict | None:
+        result = []
+
+        def answered(answer):
+            if answer is None:
+                return
+            try:
+                result.append(act(answer))
+            except ValueError as error:
+                self.dock._say(str(error))
+
+        ask(self.window, then=answered)
+        return result[0] if result else None
+
     def ask_watch(self) -> dict | None:
-        answer = dialogs.ask_watch(self.window)
-        if answer is None:
-            return None
-        try:
-            return self.actions.watch_start(*answer)
-        except ValueError as error:
-            self.dock._say(str(error))
-            return None
+        return self._act(dialogs.ask_watch,
+                         lambda answer: self.actions.watch_start(*answer))
 
     def ask_save_picture(self) -> dict | None:
-        answer = dialogs.ask_picture(self.window)
-        if answer is None:
-            return None
-        path, format_id = answer
-        try:
-            return self.actions.save_image(path, format_id, {})
-        except ValueError as error:
-            self.dock._say(str(error))
-            return None
+        return self._act(dialogs.ask_picture,
+                         lambda answer: self.actions.save_image(*answer, {}))
 
     def ask_record(self) -> dict | None:
-        path = dialogs.ask_movie(self.window)
-        if path is None:
-            return None
-        try:
-            return self.actions.record_movie(path, {})
-        except ValueError as error:
-            self.dock._say(str(error))
-            return None
+        return self._act(dialogs.ask_movie,
+                         lambda path: self.actions.record_movie(path, {}))
 
     def open_generate_action(self, action_id: str) -> bool:
         """A Mesh menu entry: the Generate panel, on that action."""
@@ -433,15 +441,18 @@ class GmshToolsMount(QObject):
             shortcut.setEnabled(self.on_gmsh)
         if self.on_gmsh:
             self.connect_panels()
-            self._poll.start()
         else:
-            self._poll.stop()
+            self._pending.clear()
             self.dock.stop_placement()
 
     # -- the panels with something to draw --------------------------------- #
 
     def connect_panels(self) -> int:
-        """Connect the previewing panels once they exist; the new count."""
+        """Connect every previewing panel the window holds; the new count.
+
+        A whole-window search, run once when the route turns to Gmsh and
+        when a case opens.  Panels built after that announce themselves
+        (:meth:`_panelCreated`)."""
         from foammesh.view.gmsh_workflow.generate_panel import (
             GmshGeneratePanel)
         from foammesh.view.gmsh_workflow.geometry_build_panel import (
@@ -454,10 +465,91 @@ class GmshToolsMount(QObject):
                       + window.findChildren(StructurePanel))
         found += self.dock.connect_previews(*previewing)
         for panel in window.findChildren(GmshGeneratePanel):
-            if not any(panel is held for held in self._connected):
-                panel.stageFinished.connect(self._stage_finished)
-                self._connected.append(panel)
-                found += 1
+            found += self._connectGenerate(panel)
+        return found
+
+    def connect_panel(self, panel) -> int:
+        """Connect the one *panel*, by its kind; the new count."""
+        from foammesh.view.gmsh_workflow.generate_panel import (
+            GmshGeneratePanel)
+        from foammesh.view.gmsh_workflow.geometry_build_panel import (
+            GmshGeometryBuildPanel)
+        from foammesh.view.gmsh_workflow.structure_panel import StructurePanel
+
+        if isinstance(panel, (GmshGeometryBuildPanel, StructurePanel)):
+            return self.dock.connect_previews(panel)
+        if isinstance(panel, GmshGeneratePanel):
+            return self._connectGenerate(panel)
+        try:
+            from foammesh.view.gmsh_workflow.cvt_panel import CvtRemeshPanel
+        except ImportError:
+            return 0
+        if isinstance(panel, CvtRemeshPanel):
+            return self._giveCvt(panel)
+        return 0
+
+    def _connectGenerate(self, panel) -> int:
+        # DP-6407. Held weakly: the mount lives with the window, so a strong
+        # list kept every closed case's generate panel, and through it the
+        # whole Gmsh compute page, alive after File > Close.
+        held = [ref for ref in self._connected if ref() is not None]
+        self._connected = held
+        if any(ref() is panel for ref in held):
+            return 0
+        panel.stageFinished.connect(self._stage_finished)
+        self._connected.append(weakref.ref(panel))
+        return 1
+
+    def _inWindow(self, panel) -> bool:
+        node = panel
+        while node is not None:
+            if node is self.window:
+                return True
+            node = node.parent()
+        return False
+
+    def _panelCreated(self, panel) -> None:
+        """A panel was built: connect it once it sits in this window.
+
+        The constructor announces before its page is placed, so the panel
+        is looked at on the next turn of the loop, and again at most
+        ``len(PLACE_RETRY_MS)`` times in all; then it is dropped (it belongs
+        to another window, or to none).  Off the Gmsh route nothing is
+        kept: turning to Gmsh searches the window."""
+        if not self.on_gmsh:
+            return
+        self._pending.append([panel, 0])
+        self._schedulePending(self.PLACE_RETRY_MS[0])
+
+    def _schedulePending(self, delay_ms: int) -> None:
+        if self._pendingScheduled:
+            return
+        self._pendingScheduled = True
+        QTimer.singleShot(delay_ms, self, self._connectPending)
+
+    def _connectPending(self) -> int:
+        from shiboken6 import isValid
+
+        self._pendingScheduled = False
+        if not self.on_gmsh:
+            self._pending = []
+            return 0
+        found = 0
+        waiting = []
+        for row in self._pending:
+            panel = row[0]
+            if not isValid(panel):
+                continue
+            if self._inWindow(panel):
+                found += self.connect_panel(panel)
+                continue
+            row[1] += 1
+            if row[1] < len(self.PLACE_RETRY_MS):
+                waiting.append(row)
+        self._pending = waiting
+        if waiting:
+            self._schedulePending(
+                min(self.PLACE_RETRY_MS[r[1]] for r in waiting))
         return found
 
     def _stage_finished(self, stage) -> None:

@@ -190,7 +190,8 @@ class NewProjectWidget(QWidget):
         # nobody could see. The hidden half is gone from the form.
 
         self._ui.projectName.setValidator(
-            QRegularExpressionValidator(QRegularExpression(r'[^\s\\/:*?"<>|][^\\/:*?"<>|]*')))
+            QRegularExpressionValidator(QRegularExpression(r'[^\s\\/:*?"<>|][^\\/:*?"<>|]*'),
+                                        self._ui.projectName))  # DP-6407
 
         # R17. The field that names the folder the case lands in was too
         # narrow to show it: the form gave it whatever was left after the

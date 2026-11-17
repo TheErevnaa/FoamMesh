@@ -87,7 +87,13 @@ PRESENTATION_SUMMARIES = {
         'The section tool: enabled, mode (slice, cut_cells = slab, clip, '
         'clip_whole_cells), plane, origin, normal, flip, combine, cell_rule, '
         'solo, lock, drag_axis, step_choice, step, sheet_opacity, '
-        'handle_visible (the H key) and nudge (PgUp/PgDn, Shift = fine). '
+        'handle_visible (the H key) and nudge (PgUp/PgDn, Shift = fine); '
+        'plane_enabled and sheet_visible (the tick and the sheet button of '
+        'the plane row, for plane or the active plane), colour_scale (whole, '
+        'cut, fixed: the Scale combo), rescale (Rescale to cut), keep '
+        '(larger, smaller: Keep larger / Keep smaller, answered with the '
+        'sides of the planes once set) and compare {stages, action: compare '
+        'or clear}. '
         'Answers what the section panel shows.'),
     'presentation.deviation.read': (
         'Read the deviation panel without changing it: the source sentence, '
@@ -108,6 +114,11 @@ SECTION_COMBINE = ('common', 'remove_common', 'each')
 SECTION_CELL_RULES = ('any', 'centroid', 'entire')
 SECTION_DRAG_AXES = ('free', 'x', 'y', 'z', 'normal')
 SECTION_STEP_CHOICES = ('cell', 'typed')
+#: Plan 48 AG. The section panel's Scale combo (``pieces.ScalePolicy``), the
+#: Keep larger / smaller buttons (``pieces.Prefer``) and Compare / Clear.
+SECTION_COLOUR_SCALES = ('whole', 'cut', 'fixed')
+SECTION_KEEPS = ('larger', 'smaller')
+SECTION_COMPARE_ACTIONS = ('compare', 'clear')
 
 
 def _point(value, what: str):
@@ -713,14 +724,19 @@ class PresentationOperations:
         if 'normal' in changed and not any(changed['normal']):
             raise ValidationFailedError('normal must not be zero')
         # Plan 48 PA1. The rest of the section panel.
-        for name in ('flip', 'lock', 'handle_visible'):
+        for name in ('flip', 'lock', 'handle_visible',
+                     # Plan 48 AG.
+                     'plane_enabled', 'sheet_visible'):
             value = _flag(parameters, name)
             if value is not None:
                 changed[name] = value
         for name, allowed in (('combine', SECTION_COMBINE),
                               ('cell_rule', SECTION_CELL_RULES),
                               ('drag_axis', SECTION_DRAG_AXES),
-                              ('step_choice', SECTION_STEP_CHOICES)):
+                              ('step_choice', SECTION_STEP_CHOICES),
+                              # Plan 48 AG.
+                              ('colour_scale', SECTION_COLOUR_SCALES),
+                              ('keep', SECTION_KEEPS)):
             value = parameters.get(name)
             if value is not None:
                 if value not in allowed:
@@ -763,6 +779,33 @@ class PresentationOperations:
             changed['nudge'] = {'direction': nudge['direction'],
                                 'fine': bool(nudge.get('fine', False)),
                                 'times': times}
+        # Plan 48 AG. Rescale to cut is a press: true, or left out.
+        rescale = parameters.get('rescale')
+        if rescale is not None:
+            if rescale is not True:
+                raise ValidationFailedError('rescale is true or left out',
+                                            details={'rescale': rescale})
+            changed['rescale'] = True
+        compare = parameters.get('compare')
+        if compare is not None:
+            stages = compare.get('stages') if isinstance(compare, dict) else None
+            action = (compare.get('action', 'compare')
+                      if isinstance(compare, dict) else None)
+            if (not isinstance(compare, dict)
+                    or set(compare) - {'stages', 'action'}
+                    or action not in SECTION_COMPARE_ACTIONS
+                    or (stages is not None and not (
+                        isinstance(stages, list)
+                        and all(isinstance(s, str) and s for s in stages)))
+                    or (action == 'compare' and not stages)):
+                raise ValidationFailedError(
+                    'compare is {stages: [stage, ...], action: compare or '
+                    'clear}; compare needs a stage',
+                    details={'compare': compare,
+                             'actions': list(SECTION_COMPARE_ACTIONS)})
+            changed['compare'] = {'action': action,
+                                  **({'stages': list(stages)}
+                                     if stages is not None else {})}
         if enabled is False and changed:
             raise ValidationFailedError(
                 'a section taken down takes no mode, origin or normal')
@@ -770,12 +813,15 @@ class PresentationOperations:
             raise ValidationFailedError(
                 'give enabled, mode, origin, normal, flip, combine, '
                 'cell_rule, solo, lock, drag_axis, step_choice, step, '
-                'sheet_opacity, handle_visible, plane or nudge')
+                'sheet_opacity, handle_visible, plane, nudge, plane_enabled, '
+                'sheet_visible, colour_scale, rescale, keep or compare')
         wanted = True if enabled is None else enabled
         changed['enabled'] = wanted
         state.inspection['section'] = wanted
         # the actions are not state the view keeps
-        kept = {k: v for k, v in changed.items() if k not in ('flip', 'nudge')}
+        kept = {k: v for k, v in changed.items()
+                if k not in ('flip', 'nudge', 'rescale', 'keep', 'compare',
+                             'plane_enabled', 'sheet_visible')}
         state.section = ({**state.section, **kept} if wanted
                          else {'enabled': False})
         return {'section': changed}

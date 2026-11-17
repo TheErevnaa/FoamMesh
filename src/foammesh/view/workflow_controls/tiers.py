@@ -79,6 +79,23 @@ def expert_visibility() -> ExpertVisibility:
     return _VISIBILITY
 
 
+class _BoxFollower(QObject):
+    """Keeps one page's *Show expert settings* box in step with the switch."""
+
+    def __init__(self, box: QCheckBox, visibility: 'ExpertVisibility'):
+        super().__init__(box)
+        self.setObjectName('showExpertSettingsFollower')
+        visibility.changed.connect(self.follow)
+
+    def follow(self, shown: bool) -> None:
+        box = self.parent()
+        if box is None or box.isChecked() == shown:
+            return
+        blocked = box.blockSignals(True)
+        box.setChecked(shown)
+        box.blockSignals(blocked)
+
+
 def make_expert_toggle(parent=None) -> QCheckBox:
     """The *Show expert settings* checkbox, kept in step with the switch."""
     from PySide6.QtCore import QCoreApplication
@@ -92,19 +109,11 @@ def make_expert_toggle(parent=None) -> QCheckBox:
     box.setChecked(visibility.shown())
     box.toggled.connect(visibility.setShown)
 
-    def follow(shown):
-        # The switch outlives every page; a page's box goes with its page.
-        # The connection is a plain function, which Qt does not drop when
-        # the box is destroyed, so the first change after that drops it.
-        from shiboken6 import isValid
-        if not isValid(box):
-            visibility.changed.disconnect(follow)
-            return
-        if box.isChecked() != shown:
-            blocked = box.blockSignals(True)
-            box.setChecked(shown)
-            box.blockSignals(blocked)
-    visibility.changed.connect(follow)
+    # DP-6407. The switch outlives every page. A plain-function connection
+    # kept each closed page's (deleted) box and its closure until the switch
+    # next changed; a receiver parented to the box goes with it, and Qt drops
+    # the connection then.
+    _BoxFollower(box, visibility)
     return box
 
 

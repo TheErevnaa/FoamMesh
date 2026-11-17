@@ -1,7 +1,6 @@
 """Persistent, headless geometry artifacts and diagnostics."""
 from __future__ import annotations
 
-import copy
 import dataclasses
 import hashlib
 import json
@@ -394,6 +393,200 @@ def _excuse_enclosed_seeds(reports, entries, carried, engine) -> list[dict]:
     return result
 
 
+#: DP-6109: content fingerprint -> that artifact's open edges.
+_OPEN_EDGE_CACHE: dict = {}
+
+
+def _open_edges(entry) -> frozenset:
+    """The edges *entry*'s surface uses once, each as its two end points."""
+    try:
+        fingerprint = GeometryArtifactStore.entry_fingerprint(entry)
+    except (OSError, KeyError, TypeError):
+        return frozenset()
+    cached = _OPEN_EDGE_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    from vtkmodules.vtkFiltersCore import vtkFeatureEdges
+
+    polydata = import_surface(entry['artifact']).surfaces[0].polydata
+    edges = vtkFeatureEdges()
+    edges.SetInputData(polydata)
+    edges.BoundaryEdgesOn()
+    edges.FeatureEdgesOff()
+    edges.NonManifoldEdgesOff()
+    edges.ManifoldEdgesOff()
+    edges.Update()
+    output = edges.GetOutput()
+    points = output.GetPoints()
+    found = set()
+    for cell in range(output.GetNumberOfCells()):
+        ids = output.GetCell(cell).GetPointIds()
+        if ids.GetNumberOfIds() != 2:
+            continue
+        ends = (tuple(round(value, 7) for value in points.GetPoint(ids.GetId(0))),
+                tuple(round(value, 7) for value in points.GetPoint(ids.GetId(1))))
+        found.add(frozenset(ends))
+    value = frozenset(found)
+    if len(_OPEN_EDGE_CACHE) >= _FINGERPRINT_CACHE_LIMIT:
+        _OPEN_EDGE_CACHE.clear()
+    _OPEN_EDGE_CACHE[fingerprint] = value
+    return value
+
+
+def _flag_overlapping_bodies(reports, entries, carried, engine) -> list[dict]:
+    """DP-6133. Two closed bodies that share volume are a fault of the pair.
+
+    Each geometry is graded alone, so a cylinder standing in a channel with
+    its caps flush to the floor and roof came out as two clean geometries and
+    only the volume mesher found out ("the surface mesh crosses itself").
+    The pair is named on both, with the repair, before anything is generated.
+    Touching bodies and a body strictly inside another are not reported.
+    """
+    from .body_overlap import entry_label, overlapping_pairs
+    from .diagnostics.checks import Finding, Severity
+    from .diagnostics.readiness import classify
+
+    known = {item['geometry_id']: item for item in list(carried) + list(reports)}
+    bodies, labels = {}, {}
+    for entry in entries:
+        seen = known.get(entry['geometry_id']) or entry
+        if not (seen.get('diagnostics') or {}).get('watertight'):
+            continue
+        if len(entry.get('regions') or ()) > 1 or entry.get('cad_artifact'):
+            continue
+        try:
+            fingerprint = GeometryArtifactStore.entry_fingerprint(entry)
+            bodies[entry['geometry_id']] = (
+                fingerprint, import_surface(entry['artifact']).surfaces[0].polydata)
+        except (OSError, KeyError, TypeError, IndexError, ValueError):
+            continue
+        labels[entry['geometry_id']] = entry_label(entry)
+    if len(bodies) < 2:
+        return reports
+    key = tuple(sorted((identity, fp) for identity, (fp, _poly) in bodies.items()))
+    pairs = _OVERLAP_CACHE.get(key)
+    if pairs is None:
+        pairs = overlapping_pairs({identity: poly for identity, (_fp, poly)
+                                   in bodies.items()})
+        if len(_OVERLAP_CACHE) > 16:
+            _OVERLAP_CACHE.clear()
+        _OVERLAP_CACHE[key] = pairs
+    if not pairs:
+        return reports
+    partners: dict = {}
+    for one, other in pairs:
+        partners.setdefault(one, []).append(other)
+        partners.setdefault(other, []).append(one)
+    result = []
+    for report in reports:
+        mine = partners.get(report['geometry_id'])
+        if not mine:
+            result.append(report)
+            continue
+        names = ', '.join(sorted(labels[item] for item in mine))
+        finding = Finding(
+            'overlapping_bodies', len(mine), Severity.ERROR,
+            f'{labels[report["geometry_id"]]} occupies the same space as '
+            f'{names}; the mesher cannot join shells that pass through each '
+            'other. Cut the one body out of the other, or shorten it so the '
+            'two only touch or one lies wholly inside.',
+            engine_impact={
+                'gmsh': 'The surface mesh crosses itself and the volume mesh is refused.',
+                'snappy': 'The overlapping part is meshed twice or left out.'},
+            details={'with': sorted(mine)})
+        diagnostics = report.get('diagnostics') or {}
+        findings = list(diagnostics.get('findings') or [])
+        findings.append(dataclasses.asdict(finding)
+                        | {'severity': finding.severity.value})
+        objects = [Finding(
+            item['kind'], int(item.get('count') or 0), Severity(item['severity']),
+            item.get('message', ''),
+            tuple(tuple(point) for point in item.get('locations') or ()),
+            item.get('characteristic_size'), item.get('characteristic_unit'),
+            tuple(item.get('repairable_by') or ()), item.get('engine_impact'),
+            item.get('evaluated', True), item.get('details')) for item in findings]
+        readiness = classify(objects, cell_count=int(report.get('cells') or 1),
+                             engine=engine)
+        result.append({**report, 'diagnostics': {
+            **diagnostics, 'findings': findings,
+            'readiness': readiness.to_dict(),
+            'score': score_for(objects,
+                               watertight=bool(diagnostics.get('watertight')))}})
+    return result
+
+
+#: DP-6133: the fingerprints of the bodies compared -> the pairs that overlap.
+_OVERLAP_CACHE: dict = {}
+
+
+def _excuse_cut_seams(reports, entries, engine) -> list[dict]:
+    """DP-6109. An edge another geometry of the case closes is a seam, not a hole.
+
+    MEASURED live on the CHT tubes: after Automatic conformal pairing each
+    body keeps only the faces it shares with nobody -- the hot fluid its two
+    end caps -- and its walls become ``hot_fluid_to_pipe_solid``, a geometry
+    of its own. Graded alone, every one of the five was "open" and the
+    Preparation page offered to fill the holes, which would have capped the
+    hot fluid's inlet and outlet a second time. The surfaces close together:
+    every open edge of one is an open edge of another. An entry whose open
+    edges are all closed that way has its ``open_edges`` and
+    ``surface_not_closed`` findings excused; any edge left over still counts.
+    """
+    from .diagnostics.checks import Finding, Severity
+    from .diagnostics.readiness import classify
+
+    kinds = {'open_edges', 'surface_not_closed'}
+
+    def is_open(report):
+        return any(item.get('kind') in kinds and item.get('count')
+                   and item.get('severity') != Severity.INFO.value
+                   for item in (report.get('diagnostics') or {}).get(
+                       'findings') or ())
+
+    if len(entries) < 2 or not any(is_open(report) for report in reports):
+        return reports
+    try:
+        edges = {entry['geometry_id']: _open_edges(entry) for entry in entries
+                 if not entry.get('cad_artifact')
+                 and not GeometryArtifactStore.missing_artifacts(
+                     entry, keys=('artifact',))}
+    except Exception:  # an unreadable artifact grades as it was
+        return reports
+    result = []
+    for report in reports:
+        own = edges.get(report['geometry_id'])
+        others = set()
+        for key, value in edges.items():
+            if key != report['geometry_id']:
+                others |= value
+        if not is_open(report) or not own or not own <= others:
+            result.append(report)
+            continue
+        diagnostics = report.get('diagnostics') or {}
+        graded = [dict(item, count=0, severity=Severity.INFO.value,
+                       repairable_by=[], evaluated=False,
+                       message=('Open only where another surface of the case '
+                                'continues it (an interface cut): closed '
+                                'together.'))
+                  if item.get('kind') in kinds else item
+                  for item in diagnostics.get('findings') or ()]
+        objects = [Finding(
+            item['kind'], int(item.get('count') or 0),
+            Severity(item['severity']), item.get('message', ''),
+            tuple(tuple(point) for point in item.get('locations') or ()),
+            item.get('characteristic_size'), item.get('characteristic_unit'),
+            tuple(item.get('repairable_by') or ()),
+            item.get('engine_impact'), item.get('evaluated', True),
+            item.get('details')) for item in graded]
+        readiness = classify(objects, cell_count=int(report.get('cells') or 1),
+                             engine=engine)
+        result.append({**report, 'diagnostics': {
+            **diagnostics, 'findings': graded,
+            'readiness': readiness.to_dict(),
+            'score': score_for(objects, watertight=True)}})
+    return result
+
+
 #: DP-2717: manifest path -> ((path, identity, size, mtime), parsed document).
 _DOCUMENT_CACHE: dict = {}
 #: DP-2717: ((path, identity, size, mtime), ...) -> content fingerprint.
@@ -443,12 +636,15 @@ class GeometryArtifactStore:
             return {}
         key = (os.path.normcase(os.path.abspath(self.manifest_path)),
                stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        # Plan 50 (DP-6341). The text is kept and parsed again for each
+        # reader, which gives each its own copy as ``deepcopy`` did, at well
+        # under half the cost (500 surfaces: 3 ms against 8 ms a read).
         cached = _DOCUMENT_CACHE.get(key[0])
         if cached is not None and cached[0] == key:
-            return copy.deepcopy(cached[1])
-        document = json.loads(self.manifest_path.read_text(encoding='utf-8'))
-        _DOCUMENT_CACHE[key[0]] = (key, copy.deepcopy(document))
-        return document
+            return json.loads(cached[1])
+        text = self.manifest_path.read_text(encoding='utf-8')
+        _DOCUMENT_CACHE[key[0]] = (key, text)
+        return json.loads(text)
 
     def removed_entries(self) -> list[dict]:
         """Entries the user removed and an undo may still bring back (DP-1211)."""
@@ -1148,8 +1344,11 @@ class GeometryArtifactStore:
         # DP-660. Graded after the cache, not stored in it: whether a body is
         # enclosed depends on the other geometries, which the per-entry
         # fingerprint cannot see.
-        return _excuse_enclosed_seeds(
-            reports, self.entries(), list(carried), engine)
+        active_entries = self.entries()
+        return _flag_overlapping_bodies(_excuse_cut_seams(
+            _excuse_enclosed_seeds(
+                reports, active_entries, list(carried), engine),
+            active_entries, engine), active_entries, list(carried), engine)
 
     def _cached_readiness(self, target_cell_size: float | None,
                           engine: str | None) -> dict[str, dict]:
@@ -1390,7 +1589,7 @@ class GeometryArtifactStore:
         return created
 
     def split_by_angle(self, geometry_id: str, *, angle_deg=None,
-                       min_area_fraction: float = 0.0,
+                       min_area_fraction=None,
                        preview: bool = False) -> dict:
         """Cut a tessellated surface into boundaries along its feature edges.
 
@@ -1417,6 +1616,12 @@ class GeometryArtifactStore:
         entries = self.entries()
         index, entry = self._entry(entries, geometry_id)
         angle = DEFAULT_FEATURE_ANGLE_DEG if angle_deg is None else angle_deg
+        if min_area_fraction is None:
+            # DP-6094. A re-split that names no smallest piece keeps the one
+            # the last split (the import's) was made with, so the two cuts
+            # of one file agree.
+            min_area_fraction = float(
+                (entry.get('last_split') or {}).get('min_area_fraction') or 0.0)
         polydata = self._polydata(entry)
         # R107/R108. A multi-solid STL already says where its boundaries are.
         # Splitting across those solids merged `wall_converging` and
@@ -1535,7 +1740,8 @@ class GeometryArtifactStore:
                 'files_written': [] if preview else [
                     item['file'] for item in converted]}
 
-    def split_interfaces(self, geometry_ids=None, *, preview: bool = False) -> dict:
+    def split_interfaces(self, geometry_ids=None, *, preview: bool = False,
+                         names: dict | None = None) -> dict:
         """Cut an assembly's shared walls away from the walls it shares with nobody.
 
         DP-421. OpenFOAM 13 writes a conjugate assembly as one surface per
@@ -1555,6 +1761,11 @@ class GeometryArtifactStore:
         point inside it that ``mode insidePoint`` needs. A body that shares nothing is left
         untouched, which is the answer for the single-region models that are
         most of the catalogue. ``preview`` measures and writes nothing.
+
+        *names* maps a geometry id to the name the project tree gives its
+        body (DP-6106): a person who named the bodies ``hot_fluid`` and
+        ``pipe_solid`` gets ``hot_fluid_to_pipe_solid``, not names made from
+        the files they were imported from.
         """
         from .interface_split import split_assembly
 
@@ -1568,7 +1779,8 @@ class GeometryArtifactStore:
                 'an interface is a wall two bodies share, so the cut needs at '
                 'least two geometries; this case has '
                 f'{len(chosen)}')
-        labels = self._interface_labels([entry for _index, entry in chosen])
+        labels = self._interface_labels(
+            [entry for _index, entry in chosen], names)
         staging = None
         if not preview:
             staging = self.root / '_interface_split'
@@ -1657,7 +1869,33 @@ class GeometryArtifactStore:
                 joined['inside_geometry_id'] = (
                     enclosed[1]['geometry_id'] if enclosed else None)
             result['interfaces'].append(joined)
+        if not preview:
+            self._mark_interfaces(result['interfaces'])
         return result
+
+    def _mark_interfaces(self, interfaces: list) -> None:
+        """Say on each interface's entry which bodies it lies between.
+
+        DP-6121. MEASURED live 2026-11-01 on the CHT tubes: an interface is
+        imported like any file, and the preparation gave every entry without
+        regions a fluid region of its own, so the three-body assembly
+        prepared five regions -- `hot_fluid_to_pipe_solid` and
+        `cold_fluid_to_pipe_solid` among them, each a sheet that bounds no
+        volume. The mark is what the preparation leaves them out by.
+        """
+        marks = {str(item['geometry_id']): {
+                     'name': item['name'],
+                     'between': [side['geometry_id']
+                                 for side in item.get('sides') or ()]}
+                 for item in interfaces if item.get('geometry_id')}
+        if not marks:
+            return
+        entries = self.entries()
+        for entry in entries:
+            mark = marks.get(str(entry.get('geometry_id')))
+            if mark is not None:
+                entry['interface_of'] = mark
+        self._save(entries)
 
     @staticmethod
     def _kept_solid_records(entry: dict, solids: list) -> tuple:
@@ -1711,7 +1949,8 @@ class GeometryArtifactStore:
         return names, records, dropped
 
     @staticmethod
-    def _interface_labels(entries: list[dict]) -> list[str]:
+    def _interface_labels(entries: list[dict],
+                          names: dict | None = None) -> list[str]:
         """One word per geometry, distinct, for the pieces to be named after.
 
         The names end up in ``<a>_to_<b>``, in a solid block, in a face zone
@@ -1719,13 +1958,21 @@ class GeometryArtifactStore:
         they have to tell two bodies apart. A name that is neither is
         replaced rather than refused: the cut is worth more than the label,
         and the entry keeps its own name whatever this says.
+
+        DP-6106. A name that starts with a digit loses only its leading
+        digits: ``01_hot_fluid_r10mm_L500mm`` was thrown away whole for
+        ``body1``, numbered in geometry-id order, so the interfaces of the
+        CHT tubes read ``body1_to_body2`` with ``body1`` the COLD fluid,
+        MEASURED live 2026-10-31.
         """
         labels: list[str] = []
         for position, entry in enumerate(entries, 1):
-            name = str(entry.get('name') or '').strip()
+            name = str((names or {}).get(str(entry.get('geometry_id')))
+                       or entry.get('name') or '').strip()
             cleaned = ''.join(
                 character if character.isalnum() or character == '_' else '_'
                 for character in name).strip('_')
+            cleaned = cleaned.lstrip('0123456789_')
             if not cleaned or not cleaned[0].isalpha():
                 cleaned = f'body{position}'
             if cleaned in labels:

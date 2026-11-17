@@ -140,8 +140,8 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
     runs every pipeline split so each finished stage can be kept and a stopped
     run resumed from it; only enforcing qualification pauses, so the split
     route is asked for without the pause in report-only. In MPI the split
-    route gathers Castellation too (``reconstructCastellation``), so it reaches
-    the case root and can be kept before Snap overwrites the processor cases.
+    route gathers once, at the end (Plan 50 IP17): Castellation and Snap are
+    kept as their processor cases and gathered on demand.
     """
     if pause_at_snap is None:
         pause_at_snap = split_at_snap
@@ -210,28 +210,28 @@ def openfoam_meshing_dag(case_path: str | Path, allocation: ResourceAllocation,
                 ('reconstructPar', '-constant', '-case', str(case)),
                 case, ('checkMesh',), mutates_mesh=True, publishes_mesh=True),
         ))
+    # Plan 50 IP17 (DP-6303). One gather, at the end. Castellation and Snap
+    # used to be gathered (``reconstructCastellation``, ``reconstructSnap``)
+    # only so each could be kept; they are kept as their processor cases now
+    # and gathered when something reads them. Only an enforcing run, whose
+    # snap pause measures the snapped boundary in the case root (GF1), still
+    # gathers Snap mid-run. That gather writes the case root and leaves
+    # `processor*/` untouched, so Layers continues on the decomposed meshes.
+    snap_gather = ((ExecutionNode(
+        'reconstructSnap', ('reconstructPar', '-constant', '-case', str(case)),
+        case, ('snap',), pauses_after=True),) if pause_at_snap else ())
+    after_snap = 'reconstructSnap' if pause_at_snap else 'snap'
     return dag(*serial, *(
         decompose,
         ExecutionNode('castellation', parallel_snappy, case, ('decomposePar',),
                       mutates_mesh=True),
-        # DP-1234. Gathered so the castellated mesh can be kept: Snap
-        # overwrites it in the processor cases, and a run stopped in Snap
-        # resumes from this rather than from the base grid.
-        ExecutionNode('reconstructCastellation',
-                      ('reconstructPar', '-constant', '-case', str(case)),
-                      case, ('castellation',)),
-        ExecutionNode('snap', parallel_snappy, case,
-                      ('reconstructCastellation',), mutates_mesh=True),
-        # GF1 measures a reconstructed boundary, so MPI has to reconstruct
-        # mid-run. This writes the case-root mesh and leaves `processor*/`
-        # untouched, so the layers phase continues on the decomposed meshes.
-        ExecutionNode('reconstructSnap',
-                      ('reconstructPar', '-constant', '-case', str(case)),
-                      case, ('snap',), pauses_after=pause_at_snap),
-        *((ExecutionNode('layers', parallel_snappy, case, ('reconstructSnap',),
+        ExecutionNode('snap', parallel_snappy, case, ('castellation',),
+                      mutates_mesh=True),
+        *snap_gather,
+        *((ExecutionNode('layers', parallel_snappy, case, (after_snap,),
                          mutates_mesh=True),) if layers else ()),
         ExecutionNode('checkMesh', check_argv(True), case,
-                      ('layers' if layers else 'reconstructSnap',)),
+                      ('layers' if layers else after_snap,)),
         ExecutionNode(
             'reconstructPar',
             ('reconstructPar', '-constant', '-case', str(case)),

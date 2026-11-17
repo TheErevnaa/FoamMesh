@@ -44,6 +44,11 @@ class MethodCapability:
     needs_coefficients: bool
     #: Why it is not authorable, in the user's terms. Empty when it is.
     note: str = ''
+    #: Offered only once the runtime has reported its library (Plan 50 IP17).
+    #: The other library methods are offered before the probe answers so a
+    #: cold runtime does not close the page; this one is not, because it is
+    #: never the default and most builds do not carry it.
+    probed_only: bool = False
 
 
 #: Every method ``decomposeParDict`` accepts, in one place.
@@ -63,6 +68,11 @@ REGISTRY: tuple[MethodCapability, ...] = (
         'metis', True, 'libmetisDecomp.so', False),
     MethodCapability(
         'kahip', True, 'libkahipDecomp.so', False),
+    # Plan 50 IP17 (DP-6304). Scotch in parallel. decomposePar splits the
+    # case with scotch; snappyHexMesh's own load balancing between its
+    # phases then redistributes with PT-Scotch (OpenFOAM's `distributor`).
+    MethodCapability(
+        'ptscotch', True, 'libptscotchDecomp.so', False, probed_only=True),
     MethodCapability(
         'structured', False, None, False,
         'decomposes a mesh in layers off a named patch, which needs a patch '
@@ -262,6 +272,14 @@ def build(ranks: int, *, method: str = 'scotch', order: str = 'xyz',
             f'{", ".join(METHODS)}')
 
     document: dict = {'numberOfSubdomains': ranks, 'method': name}
+    if name == 'ptscotch':
+        # PT-Scotch partitions a mesh already spread over ranks, so the
+        # initial split is scotch's and PT-Scotch is the distributor the
+        # parallel snappyHexMesh balances with. `method` is the older name
+        # of `decomposer` and stays for a reader that knows only it.
+        document = {'numberOfSubdomains': ranks, 'method': 'scotch',
+                    'decomposer': 'scotch', 'distributor': 'ptscotch',
+                    'libs': ['"libptscotchDecomp.so"']}
     if name in NEEDS_COEFFICIENTS:
         counts = parse_cells(cells, ranks)
         chosen = str(getattr(order, 'value', order) or 'xyz').split('.')[-1]
@@ -325,6 +343,12 @@ def selectable(libraries=None) -> tuple[MethodChoice, ...]:
     for item in REGISTRY:
         if not item.authorable:
             choices.append(MethodChoice(item.name, False, item.note))
+            continue
+        if libraries is None and item.probed_only:
+            choices.append(MethodChoice(
+                item.name, False,
+                f'offered once the selected OpenFOAM runtime reports '
+                f'{item.library}'))
             continue
         if item.library is None or libraries is None:
             choices.append(MethodChoice(item.name, True))

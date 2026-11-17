@@ -38,6 +38,7 @@ from foammesh.openfoam.system.create_zones_dict import CreateZonesDict, surfaceF
 from foammesh.settings.local_settings import LocalSettings
 from foammesh.core.gmsh.manifest import accepted_run_layout
 from foammesh.openfoam import decomposition
+from foammesh.openfoam.working_format import ascii_fixups, working_case_binary
 
 
 @dataclass(frozen=True)
@@ -172,7 +173,7 @@ def _refuseLegacyInterfaces(exported, regions, db) -> None:
             raise RuntimeError(
                 f'Surface {name}: it is an interface ticked by hand, and its '
                 f'two sides are in {", ".join(where)} as patches with no '
-                'coupling -- the export no longer joins them into a cyclic '
+                'coupling — the export no longer joins them into a cyclic '
                 'pair, which let flow through the sheet. Choose what it is '
                 '(a blocking baffle, a region interface with its two regions, '
                 'or one side of a periodic pair), mesh again, then export.')
@@ -287,9 +288,37 @@ def _exportLayout(session) -> _ExportLayout:
         declared = _ExportLayout(
             int(parallel.np()) if parallel.isParallelOn() else 1)
     pieces = _mesh_pieces(session.case_path)
+    if (pieces > 1 and recorded and not recorded.get('decomposed')
+            and _pieces_predate_case_mesh(session.case_path)):
+        # DP-6123. MEASURED live 2026-11-01 on the CHT tubes: a serial Gmsh
+        # run published `constant/polyMesh` beside the fifteen processor
+        # cases a snappy run had left an hour before, the count read fifteen
+        # and the export checked the snappy pieces' zones -- "the mesh has no
+        # cell zone for pipe_solid" -- over a Gmsh mesh that had all three.
+        # Pieces older than the mesh the accepted serial run wrote are an
+        # earlier run's.
+        return declared
     if pieces and pieces != declared.np():
         return _ExportLayout(pieces, declared.run_id, 'mesh-on-disk')
     return declared
+
+
+def _mesh_written_at(directory) -> float:
+    """When the mesh under *directory* (``constant`` or a time) was written."""
+    mesh = Path(directory) / Directory.POLY_MESH_DIRECTORY_NAME
+    times = [(mesh / name).stat().st_mtime for name in ('owner', 'faces')
+             if (mesh / name).is_file()]
+    return max(times) if times else 0.0
+
+
+def _pieces_predate_case_mesh(case_path) -> bool:
+    """Whether the processor cases were written before the case's own mesh."""
+    case_root = _case_root(case_path)
+    serial = _mesh_at(case_root)
+    first = _mesh_at(case_root / 'processor0')
+    if serial is None or first is None:
+        return False
+    return _mesh_written_at(first) < _mesh_written_at(serial)
 
 
 #: Every export event this module and its siblings write is recorded under
@@ -666,6 +695,59 @@ class AuthoredExportService:
                 session, 'createZones', ('-region', name),
                 cwd=exported.caseRoot(), on_line=on_line)
 
+    async def _convertToAscii(self, session, exported, regions, progress,
+                              on_line, parallel=None):
+        """Rewrite a binary exported mesh as ASCII; nothing when it is ASCII.
+
+        Plan 50 IP15 (DP-6424). The working case may be written ``binary``
+        (``openfoam/working_format.py``), and every export step above moves
+        its files into the destination as they are. FoamFlow and every case
+        exported so far read ASCII, so a binary mesh is converted here, in
+        the destination, by OpenFOAM's own ``foamFormatConvert`` -- the
+        destination's ``controlDict`` names no ``writeFormat``, so it writes
+        ASCII, OpenFOAM's default -- and never copied as it is. An ASCII
+        mesh launches nothing: its export is the copy it always was.
+
+        What ``foamFormatConvert`` does not rewrite is finished here:
+        ``boundary`` is text already and keeps only its header's
+        ``format binary`` word, and a plain ``labelList`` the utility leaves
+        (``cellLevel``, ``pointLevel``) is written out the way OpenFOAM writes
+        one in ASCII. Anything still binary after that refuses the export by
+        name -- before the hand-off manifest checksums it.
+
+        A parallel export keeps its processor cases beside the reconstructed
+        mesh; they are converted too, by the same utility run ``-parallel``.
+        """
+        from foammesh.openfoam.working_format import binary_meshes
+        case_root = Path(exported.caseRoot())
+        constant = Path(exported.constantPath())
+        processors = [path / Directory.CONSTANT_DIRECTORY_NAME
+                      for path in sorted(case_root.glob('processor*'))
+                      if path.is_dir()]
+        serial = bool(binary_meshes(constant))
+        pieces = any(binary_meshes(path) for path in processors)
+        if not serial and not pieces:
+            return
+        progress('Converting the mesh to ASCII')
+        arguments = ('-allRegions',) if len(regions) > 1 else ()
+        if serial:
+            await self._run(session, 'foamFormatConvert', arguments,
+                            cwd=case_root, on_line=on_line)
+        if pieces and parallel is not None and parallel.isParallelOn():
+            await self._run(session, 'foamFormatConvert', arguments,
+                            cwd=case_root, parallel=parallel,
+                            on_line=on_line)
+        left = [path for root in (constant, *processors)
+                for path in ascii_fixups(root)]
+        if left:
+            names = ', '.join(
+                str(path.relative_to(Path(exported.caseRoot())))
+                for path in left)
+            raise RuntimeError(
+                f'foamFormatConvert ran but the exported mesh is still binary '
+                f'in {names}; the export is refused rather than written in a '
+                'format FoamFlow and the earlier exports do not use.')
+
     async def _coupleAfterSplit(self, session, exported, regions,
                                 couplings, progress, on_line):
         """Couple the recorded region interfaces and periodic pairs.
@@ -742,6 +824,8 @@ class AuthoredExportService:
         zones.build(surfaces)
         self._requireReachableDestination(destination, (
             *(('reconstructPar',) if parallel.isParallelOn() else ()),
+            *(('foamFormatConvert',) if working_case_binary(case_root)
+              else ()),
             *(('createZones',) if zones.isBuilt() else ()),
             *(('createNonConformalCouples',) if couplings else ()),
             *(('extrudeMesh', 'collapseEdges') if options is not None else ())))
@@ -815,6 +899,11 @@ class AuthoredExportService:
         else:
             shutil.move(output_path / Directory.POLY_MESH_DIRECTORY_NAME,
                         exported.polyMeshPath())
+
+        # Plan 50 IP15 (DP-6424): a binary working case is converted, not
+        # copied, before any later step reads or rewrites the exported mesh.
+        await self._convertToAscii(session, exported, regions, progress,
+                                   on_line, parallel)
 
         await self._createCellZones(
             session, file_system, exported, zones, surfaces, regions,

@@ -92,8 +92,14 @@ class DesktopHost:
             import uvicorn
         except ImportError as error:  # pragma: no cover
             raise RuntimeError('desktop API requires the FoamMesh api dependencies') from error
+        # DP-6495. uvicorn's default log_config runs logging.config.dictConfig,
+        # which closes every handler that exists -- the application log
+        # (foammesh.log) and the console stream among them -- so nothing was
+        # logged for the rest of a session with the local API on. Without a
+        # log_config uvicorn only sets its own loggers' level.
         self._server = uvicorn.Server(uvicorn.Config(
-            self.build_app(), host=self.host, port=self.port, loop='asyncio', log_level='warning'))
+            self.build_app(), host=self.host, port=self.port, loop='asyncio', log_level='warning',
+            log_config=None))
         self._serve_task = asyncio.create_task(self._server.serve(), name='foammesh-desktop-api')
         while not self._server.started:
             if self._serve_task.done():

@@ -43,6 +43,36 @@ _DISPOSITION = {
     NOTHING: 'no mesh for this run',
 }
 
+
+
+def _finished_at(payload: dict) -> str:
+    """When the run finished, from what its result already carries."""
+    for source in (payload, payload.get('job'), payload.get('run_manifest'),
+                   payload.get('mesh_state')):
+        if isinstance(source, dict) and source.get('finished_at'):
+            return str(source['finished_at'])
+    jobs = payload.get('jobs')
+    if isinstance(jobs, list) and jobs and isinstance(jobs[-1], dict):
+        return str(jobs[-1].get('finished_at') or '')
+    return ''
+
+
+def _when_text(stamp: str) -> str:
+    """``at 13:00`` today, ``at 13:00 on 2 Jan 2026`` another day, in
+    local time; ``''`` when *stamp* cannot be read."""
+    from datetime import datetime
+
+    try:
+        moment = datetime.fromisoformat(str(stamp).strip().replace(
+            'Z', '+00:00'))
+    except ValueError:
+        return ''
+    local = moment.astimezone()
+    text = f'at {local:%H:%M}'
+    if local.date() != datetime.now().astimezone().date():
+        text += f' on {local.day} {local:%b %Y}'
+    return text
+
 # -- artifact identity (Plan 31 section 4.2, CP-02) ------------------------- #
 #
 # C31-03. A result used to be identified by "whatever is at
@@ -432,6 +462,30 @@ def _surface_path(payload: dict, run_path) -> str:
     return ''
 
 
+def _meshes_a_section(run_path) -> bool:
+    """Whether the run's job asked for a 2D or axisymmetric section.
+
+    DP-6482. The run's own job is asked, not the file: a volume run whose
+    file holds only faces is a failure the viewport says out loud (DP-133),
+    and only a run that asked for a section is read as one. No job, or one
+    that cannot be read, is not a section.
+    """
+    import json
+
+    if not run_path:
+        return False
+    try:
+        job = json.loads((Path(run_path) / 'job.json').read_text(
+            encoding='utf-8'))
+    except (OSError, ValueError):
+        return False
+    intent = job.get('intent') if isinstance(job, dict) else None
+    dimensionality = (intent.get('dimensionality')
+                      if isinstance(intent, dict) else None)
+    return bool(isinstance(dimensionality, dict)
+                and dimensionality.get('planar'))
+
+
 def _cell_count(payload: dict) -> int:
     """How many cells the *run* reported, before anything was drawn."""
     manifest = payload.get('run_manifest') or {}
@@ -478,6 +532,14 @@ class RunResultHandle:
     #: Empty for a section, for a run that wrote none, and for snappy, which
     #: shows its stages as it goes and has never needed this.
     surface_path: str = ''
+    #: DP-6482. The run meshed a 2D or axisymmetric section, so its native
+    #: file holds faces and no volume, and those faces are its cells. Read
+    #: from the run's own job, the same field the run's census reads.
+    section: bool = False
+    #: DP-6490. When the run finished (ISO 8601, as its job or manifest
+    #: records it), so the line can name the run by when it ran rather than
+    #: by its id. Empty when the record does not say.
+    finished_at: str = ''
 
     # -- producing side ---------------------------------------------------- #
 
@@ -505,6 +567,8 @@ class RunResultHandle:
                      engine: str = '') -> 'RunResultHandle':
         """Read one run's handle off the payload its operation returned."""
         payload = dict(payload or {})
+        # DP-6490. When the run finished, so the card can name it in words.
+        finished_at = _finished_at(payload)
         case = Path(case_path)
         mesh_state = payload.get('mesh_state') or {}
         engine_id = str(payload.get('engine') or mesh_state.get('engine_id')
@@ -524,6 +588,7 @@ class RunResultHandle:
         root_mesh = case / 'constant' / 'polyMesh'
         if verdict == NOTHING:
             return cls(run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
                        cell_count=_cell_count(payload),
                        surface_path=surface)
         if engine_id != 'gmsh':
@@ -540,6 +605,7 @@ class RunResultHandle:
             # defect that has nothing to do with it.
             return cls(
                 run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
                 artifact_path=str(root_mesh),
                 fingerprint=(str(mesh_state.get('fingerprint') or '')
                              or fingerprint_of(root_mesh)),
@@ -557,6 +623,7 @@ class RunResultHandle:
         if published:
             return cls(
                 run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
                 artifact_path=str(Path(published) / 'constant' / 'polyMesh'),
                 fingerprint=fingerprint_of(
                     Path(published) / 'constant' / 'polyMesh'),
@@ -573,11 +640,12 @@ class RunResultHandle:
         if artifact and Path(artifact).is_file():
             return cls(
                 run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
                 artifact_path=str(artifact),
                 fingerprint=str(payload.get('artifact_fingerprint') or ''),
                 cell_count=_cell_count(payload), case_root='',
                 artifact_format=GMSH_MSH, content_id=_content_id(payload),
-                surface_path=surface)
+                surface_path=surface, section=_meshes_a_section(run_path))
         # No native file to read -- but a step may have staged a polyMesh
         # inside the run directory. That is a labelled derivative *under the
         # run*, not a publication.
@@ -585,6 +653,7 @@ class RunResultHandle:
         if staged:
             return cls(
                 run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
                 artifact_path=str(Path(staged) / 'constant' / 'polyMesh'),
                 fingerprint=str(payload.get('artifact_fingerprint') or ''),
                 cell_count=_cell_count(payload), case_root=str(staged),
@@ -592,11 +661,13 @@ class RunResultHandle:
                 content_id=_content_id(payload), surface_path=surface)
         return cls(
             run_id=run_id, engine=engine_id, verdict=verdict,
+                finished_at=finished_at,
             artifact_path=str(artifact or ''),
             fingerprint=str(payload.get('artifact_fingerprint') or ''),
             cell_count=_cell_count(payload), case_root='',
             artifact_format=GMSH_MSH if artifact else '',
-            content_id=_content_id(payload), surface_path=surface)
+            content_id=_content_id(payload), surface_path=surface,
+            section=_meshes_a_section(run_path) if artifact else False)
 
     # -- what the viewport asks it ----------------------------------------- #
 
@@ -656,14 +727,36 @@ class RunResultHandle:
             artifact_path=self.surface_path,
             fingerprint=fingerprint_of(self.surface_path),
             verdict=self.verdict, cell_count=0, case_root='',
-            artifact_format=GMSH_SURFACE_MSH, artifact_role=NATIVE)
+            artifact_format=GMSH_SURFACE_MSH, artifact_role=NATIVE,
+            finished_at=self.finished_at)
+
+    def run_name(self) -> str:
+        """DP-6490. The run in words: what meshed it and when it finished.
+
+        MEASURED live (Plan 50, w-diag): the card read "19,317 cells /
+        1ec51716d8d243fca3206c4a50d5d8ea · accepted · polyMesh". An id is
+        for the log and the records; a person tells runs apart by what ran
+        and when. Empty for a mesh no run of ours made.
+        """
+        if not (self.run_id or self.engine):
+            return ''
+        # DP-6490: the mesher's name as a person knows it, from the one rule
+        # (DP-226).
+        from foammesh.core.naming import EXACT_NAMES
+        engine = EXACT_NAMES.get(str(self.engine).lower(), self.engine)
+        name = f'Meshed with {engine}' if engine else 'Meshed in FoamMesh'
+        when = _when_text(self.finished_at)
+        return f'{name} {when}' if when else name
 
     def describe(self) -> str:
         """The line the viewport header shows above the picture."""
         disposition = _DISPOSITION.get(self.verdict, self.verdict)
-        parts = [self.run_id or self.engine or 'run', disposition]
+        name = self.run_name()
+        # DP-6490. A labelled mesh no run claims is not given the word "run".
         if self.label:
-            parts.insert(0, self.label)
+            parts = [self.label] + ([name] if name else []) + [disposition]
+        else:
+            parts = [name or 'run', disposition]
         if not self.produced_a_mesh:
             return ' · '.join(parts)
         if self.cell_count:

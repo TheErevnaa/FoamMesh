@@ -299,6 +299,9 @@ class StructurePanel(QWidget):
             self.destroyed.connect(
                 lambda *_a, s=session, a=self._api: pa3_routes.unregister_panel(
                     s, 'structure', a))
+        # Plan 50 IP4: the tool dock connects this panel now, not by a poll.
+        from foammesh.view.gmsh_tools import panel_events
+        panel_events.announce(self)
 
     # -- the FieldGroupPage-shaped surface a task page adopts --------------- #
 
@@ -463,6 +466,12 @@ class StructurePanel(QWidget):
         pick.clicked.connect(
             lambda _c=False, r=row, k=key, f=filter_name: self._requestPick(
                 r, k, f))
+        show = QPushButton(self.tr('Show'), host)
+        show.setObjectName('gmshStructureShow_' + key)
+        show.setToolTip(self.tr('Light these in the viewport'))
+        show.clicked.connect(
+            lambda _c=False, r=row, k=key, f=filter_name: self._showTags(
+                r, k, f))
         clear = QPushButton(self.tr('Clear'), host)
         clear.setObjectName('gmshStructureClear_' + key)
         clear.clicked.connect(
@@ -470,6 +479,7 @@ class StructurePanel(QWidget):
                 e.clear(), self._set_tags_text(r, k, '')))
         box.addWidget(edit, 1)
         box.addWidget(pick)
+        box.addWidget(show)
         box.addWidget(clear)
         return host
 
@@ -492,10 +502,10 @@ class StructurePanel(QWidget):
                 lambda _i, r=row, c=combo: self._set_dim(r, c.currentData()))
             self._form.addRow(self.tr('Entities are'), combo)
         dim = int(row.get('dim', kind.dims[-1]))
+        noun = {1: 'Curves', 2: 'Surfaces'}.get(dim, 'Volumes')
         self._form.addRow(
-            self.tr('Surfaces') if dim == 2 else self.tr('Volumes'),
-            self._tagRow(row, 'tags', 'Surfaces' if dim == 2 else 'Volumes',
-                         self.tr('Entity tags')))
+            self.tr(noun), self._tagRow(row, 'tags', noun,
+                                        self.tr('Entity tags')))
         if any(kind.corners):
             self._form.addRow(
                 self.tr('Corner points'),
@@ -576,6 +586,37 @@ class StructurePanel(QWidget):
             return
         self._say(self.tr('Pick %s in the viewport; Enter accepts.')
                   % filter_name.lower())
+
+    def _showTags(self, row, key, filter_name) -> None:
+        """DP-6159. Light the row's stored tags in the viewport, so what was
+        picked can be looked at again after the pick has ended."""
+        picker = (self._entityPanel.picker()
+                  if self._entityPanel is not None else None)
+        if picker is None:
+            self._say(self.tr('Show the model first; there is nothing to '
+                              'light yet.'))
+            return
+        dim = {'Points': 0, 'Curves': 1, 'Surfaces': 2}.get(filter_name, 3)
+        picker.preview([(dim, int(t)) for t in row.get(key) or []])
+
+    def showRowTags(self, index: int, key: str) -> None:
+        """The Show button beside a row's tags or corner points, for row
+        *index* (key ``tags`` or ``corners``)."""
+        row = self._rows[index]
+        if key == 'corners':
+            filter_name = 'Points'
+        else:
+            kind = catalogue.KINDS[row['kind']]
+            dim = int(row.get('dim', kind.dims[-1]))
+            filter_name = {1: 'Curves', 2: 'Surfaces'}.get(dim, 'Volumes')
+        self._showTags(row, key, filter_name)
+
+    def litTags(self) -> list:
+        """What a Show lit in the viewport, as [dimension, tag] pairs."""
+        picker = (self._entityPanel.picker()
+                  if self._entityPanel is not None else None)
+        lit = getattr(picker, 'last_accepted', None) or ()
+        return [[int(d), int(t)] for d, t in lit]
 
     def _onPicked(self, chosen) -> None:
         target, self._target = self._target, None
@@ -886,6 +927,31 @@ class StructureApi:
                         recombine=True) -> dict:
         """The row the panel keeps after Make structured (DP-5738)."""
         return self._panel.keep_structured(dim, tags, corner_angle, recombine)
+
+    def show_tags(self, row, key: str) -> dict:
+        """A row's Show button: light its tags (or corner points) in the
+        viewport. *row* is the row's name or number."""
+        from foammesh.view.gmsh_tools.window_actions import on_gui_thread
+
+        if key not in ('tags', 'corners'):
+            raise ValueError('key is tags or corners')
+
+        def press():
+            panel = self._panel
+            names = [r.get('name') for r in panel._rows]   # noqa: SLF001
+            if isinstance(row, bool):
+                index = -1
+            elif isinstance(row, int):
+                index = row
+            else:
+                index = names.index(row) if row in names else -1
+            if not 0 <= index < len(names):
+                raise ValueError(f'no structure row {row!r}; the rows are '
+                                 f'{names}')
+            panel.showRowTags(index, key)
+            return {'row': names[index], 'key': key,
+                    'lit': panel.litTags(), 'status': panel.status()}
+        return on_gui_thread(press)
 
     def show_result(self, what: str, result) -> str:
         """The panel shows a result as after its own button; the status

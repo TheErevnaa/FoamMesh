@@ -58,16 +58,23 @@ def format_measurements(measurements: dict | None) -> str:
     Deliberately spells the bounding box out per axis: the whole point is to
     let the user say "this one is the flat face at z=0", which a volume figure
     would not answer.
+
+    DP-6115. The polydata is in metres; the line is in the project display
+    unit, named, as every other length on screen is.
     """
     if not measurements:
         return ''
+    from foammesh.core import display_unit
 
-    bounds = measurements['bounds']
+    unit = display_unit.current()
+    scale = display_unit.metres_per_unit()
+    bounds = [value / scale for value in measurements['bounds']]
     box = ', '.join(
-        '{0}: {1:.4g} to {2:.4g}'.format(axis, bounds[2 * i], bounds[2 * i + 1])
+        '{0}: {1:.4g} to {2:.4g} {3}'.format(
+            axis, bounds[2 * i], bounds[2 * i + 1], unit)
         for i, axis in enumerate(('X', 'Y', 'Z')))
-    return '{0} facets, area {1:.4g}, {2}'.format(
-        measurements['facets'], measurements['area'], box)
+    return '{0} facets, area {1:.4g} {2}², {3}'.format(
+        measurements['facets'], measurements['area'] / scale ** 2, unit, box)
 
 
 def union_bounds(boxes) -> tuple | None:

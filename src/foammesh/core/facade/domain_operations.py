@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -29,7 +30,7 @@ from foammesh.core.jobs import ExpectedArtifact, OperationContext, OperationSpec
 from foammesh.openfoam.decomposition import DecompositionSettings
 from foammesh.core.project import Event
 from foammesh.core.mesh import detection_record  # RP13 #3
-from foammesh.core.quantities import aligned, count_text
+from foammesh.core.quantities import agreeing, aligned, count_text
 
 from .commands import Actor, ActorKind, Command, CommandSource
 from .errors import (CapabilityUnavailableError, CheckOverBudgetError,
@@ -62,6 +63,14 @@ def _to_payload(value) -> dict:
 
 
 
+#: Plan 50 IP2 (SN-1, DP-6230). The default time limit of a mesher run --
+#: blockMesh, surfaceFeatures, every snappyHexMesh phase, decomposePar,
+#: reconstructPar, checkMesh, refineMesh and the Gmsh run -- when the caller
+#: sends no ``timeout_seconds``: none. A fixed hour was a hidden cell cap; the
+#: 30-minute silence prompt and the WSL heartbeat still watch a live run.
+MESHER_STAGE_TIMEOUT = None
+
+
 def _stage_timeout(parameters, default):
     """The seconds a run may take; ``None`` is no limit. Plan 37 #7.
 
@@ -74,6 +83,26 @@ def _stage_timeout(parameters, default):
         return None
     value = float(value)
     return None if value <= 0 else value
+
+
+async def _cell_limit_warning(execution, db=None) -> str | None:
+    """Plan 50 IP3 (DP-6231): what a finished snappyHexMesh run said about
+    reaching a cell limit, or ``None``. Read off the loop: a cut output means
+    the whole log is read. *db*'s stored ``maxGlobalCells`` says whether the
+    limit was the user's own number or the one derived from memory."""
+    job = getattr(execution, 'job', None)
+    if job is None or not execution.succeeded:
+        return None
+    from foammesh.core.mesh.run_progress import snappy_job_limit_warning
+
+    stored = None
+    if db is not None:
+        try:
+            stored = db.getValue('castellation/maxGlobalCells')
+        except Exception:                                   # noqa: BLE001
+            logger.warning('maxGlobalCells could not be read for the cell '
+                           'limit warning', exc_info=True)
+    return await asyncio.to_thread(snappy_job_limit_warning, job, stored)
 
 
 def _gmsh_runner_path():
@@ -673,6 +702,19 @@ def checked_boundary_gap(verdict) -> str:
             'with the surfaces named')
 
 
+def _document_view(session) -> Mapping:
+    """The case document read-only and uncopied; the configuration otherwise.
+
+    Plan 50 (DP-6341). ``session.configuration()`` round-trips the whole
+    document through YAML once per revision; a check that walks a few
+    collections reads the live document through a frozen view instead.
+    """
+    view = getattr(getattr(session, 'state', None), 'view', None)
+    if callable(view):
+        return view().data()
+    return session.configuration()
+
+
 def non_conformal_couples(manifest: Mapping) -> tuple[dict, ...]:
     """The patch pairs a group manifest asks to be coupled non-conformally.
 
@@ -831,41 +873,9 @@ def _resource_policy(configuration: dict) -> dict:
     }
 
 
-def _ensure_openfoam_control_dict(case_path: Path) -> tuple[Path, bool]:
-    """Create the minimal Foundation-v13 Time database for a mesh-only case.
-
-    An engine-first project legitimately has no solver dictionaries before its
-    first mesh is published.  ``checkMesh`` still requires ``controlDict`` to
-    construct the OpenFOAM Time database, so publication owns this small,
-    deterministic bootstrap dictionary.
-    """
-    from foammesh.openfoam.dict_format import format_dictionary_file
-    case_path = Path(case_path)
-    destination = case_path / 'system' / 'controlDict'
-    if destination.is_file():
-        return destination, False
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    text = format_dictionary_file('controlDict', {
-        'application': 'checkMesh',
-        'startFrom': 'startTime',
-        'startTime': 0,
-        'stopAt': 'endTime',
-        'endTime': 1,
-        'deltaT': 1,
-        'writeControl': 'timeStep',
-        'writeInterval': 1,
-        'purgeWrite': 0,
-        'writeFormat': 'ascii',
-        'writePrecision': 8,
-        'writeCompression': 'off',
-        'timeFormat': 'general',
-        'timePrecision': 6,
-        'runTimeModifiable': True,
-    })
-    temporary = destination.with_suffix('.tmp')
-    temporary.write_text(text, encoding='utf-8')
-    temporary.replace(destination)
-    return destination, True
+# Plan 50 IP15 (DP-6420). ``_ensure_openfoam_control_dict`` stood here: a
+# second copy of the working case's write format that nothing called. The one
+# setting is ``foammesh.openfoam.working_format``.
 
 
 def _unit_bbox_for_pipeline():
@@ -1170,6 +1180,16 @@ def _ensure_prepared_geometry(session, *, producer: str,
 #: DP-1230. Which case-root mesh the processor cases were split from;
 #: see `DomainOperations._stale_decomposition`.
 DECOMPOSITION_RECORD = 'foammesh/decomposition.json'
+
+
+#: DP-6465. Set while the snappy launch gate runs its seed checks, after it
+#: has labelled the fluid spaces off the loop. The checks are synchronous and
+#: used to wait for a labelling that was not cached on the thread that called
+#: them, which in the desktop is the GUI thread; inside the gate a field that
+#: is not cached now means the labelling ran over its budget, and the check
+#: goes on without it.
+_GATE_SPACES_LABELLED = contextvars.ContextVar(
+    'foammesh_gate_spaces_labelled', default=False)
 
 
 class DomainOperations:
@@ -1897,6 +1917,13 @@ class DomainOperations:
                 return float(box.diagonal)
             except (TypeError, ValueError):
                 pass
+        # DP-6507. The store records each surface's bounds; their union is the
+        # diagonal. Assembling the surfaces read every artifact and merged
+        # them on the owner loop: a 500-body import held the GUI thread over
+        # 160 s here, in a read of the tolerance (surfaces500 rerun, 645499f2).
+        diagonal = _stored_diagonal(session.case_path)
+        if diagonal is not None:
+            return diagonal
         try:
             surface = self._assembled_surface(session)
         except Exception:                                   # noqa: BLE001
@@ -2377,11 +2404,92 @@ class DomainOperations:
         """
         warnings = self._derivation_warnings(session, engine_id)
         for source in (self._boundary_coverage_warnings(session),
-                       self._run_warnings(session, engine_id)):
+                       self._run_warnings(session, engine_id),
+                       self._coupling_export_notes(session, engine_id),
+                       self._unlinked_refinement_notes(session)):
             for task_id, texts in source.items():
                 warnings[task_id] = (list(warnings.get(task_id) or ())
                                      + list(texts))
         return warnings
+
+    @staticmethod
+    def _unlinked_refinement_notes(session: CaseSession) -> dict:
+        """Live finding D1: a refinement row bound to no surface did nothing.
+
+        A surface or volume refinement row reaches the mesh only through the
+        ``castellation_group`` of a geometry item. A row whose ``group_name``
+        was typed but never bound refined nothing, and the mesh came out as
+        coarse as before with no word of why.
+        """
+        try:
+            # Plan 50 (DP-6341). Read through the uncopied view: MEASURED
+            # live, building the whole configuration for these three
+            # collections held the GUI thread 2 s after a 500-surface import.
+            configuration = _document_view(session)
+            geometry = configuration.get('geometry') or {}
+            bound = {str(item.get('castellationGroup'))
+                     for item in geometry.values()
+                     if isinstance(item, Mapping)
+                     and item.get('castellationGroup') not in (None, '')}
+            castellation = configuration.get('castellation') or {}
+            loose = []
+            for collection in ('refinementSurfaces', 'refinementVolumes'):
+                for key, row in (castellation.get(collection) or {}).items():
+                    if str(key) not in bound and isinstance(row, Mapping):
+                        loose.append(str(row.get('groupName') or key))
+            held = {str(item.get(field))
+                    for item in geometry.values() if isinstance(item, Mapping)
+                    for field in ('layerGroup', 'slaveLayerGroup')
+                    if item.get(field) not in (None, '')}
+            loose_layers = [str(row.get('groupName') or key) for key, row in
+                            ((configuration.get('addLayers') or {})
+                             .get('layers') or {}).items()
+                            if str(key) not in held and isinstance(row, Mapping)]
+        except Exception:                                    # noqa: BLE001
+            return {}
+        notes = {}
+        if loose:
+            notes['snappy.castellation'] = [
+                agreeing(len(loose), 'Refinement row') + ' '
+                + ', '.join(sorted(loose)) + ' '
+                + agreeing(len(loose), 'is', 'are') + ' '
+                'bound to no surface, so '
+                + agreeing(len(loose), 'it', 'they') + ' can refine nothing. Set the '
+                'Refinement group of a surface (castellation_group) to '
+                'the row.']
+        if loose_layers:
+            notes['snappy.layers'] = [
+                agreeing(len(loose_layers), 'Layer group') + ' '
+                + ', '.join(sorted(loose_layers)) + ' '
+                + agreeing(len(loose_layers), 'is', 'are') + ' '
+                'bound to no surface, so '
+                + agreeing(len(loose_layers), 'it', 'they') + ' can grow no layers. Set the '
+                'Layer group of a surface (layer_group) to the row.']
+        return notes
+
+
+    @staticmethod
+    def _coupling_export_notes(session: CaseSession, engine_id: str) -> dict:
+        """Live finding: a snappy mesh shows plain walls where a pair was set.
+
+        snappyHexMesh meshes the two faces as walls; the cyclic or periodic
+        pair is made at Export (createNonConformalCouples). Nothing said so,
+        and the run's mesh looked as if the pair had been dropped.
+        """
+        try:
+            from foammesh.core.import_export.couplings import (
+                pairs_left_for_export)
+            count = pairs_left_for_export(session.case_path)
+        except Exception:                                    # noqa: BLE001
+            return {}
+        if not count:
+            return {}
+        return {'common.export': [
+            f'{count_text(count, "cyclic or periodic pair")} '
+            f'{agreeing(count, "is", "are")} set. The mesh holds '
+            'those faces as plain walls; the '
+            f'{agreeing(count, "pair is", "pairs are")} joined when you '
+            'export.']}
 
     @staticmethod
     def _run_warnings(session: CaseSession, engine_id: str) -> dict:
@@ -3059,22 +3167,44 @@ class DomainOperations:
                 # that is what the undo copy kept -- an undo then put back a
                 # mesh no stage had produced. The result is gathered first,
                 # so the copy is of the mesh the run made.
-                try:
-                    await self._ensure_reconstructed(session, command)
-                    gather = {'gathered': True}
-                except PreconditionFailedError as error:
-                    # The unlock still goes ahead; the copy is then of the
-                    # case root as it stands and the processor cases (with
-                    # their pending marker) are left alone, so an undo puts
-                    # the case back exactly as it was.
-                    gather = {'gathered': False, 'message': str(error)}
+                #
+                # Plan 50 CX2 (DP-6204). Only a complete, finished set the
+                # marker describes is gathered. After a cancelled run the
+                # marker could describe a half-removed set; gathering that
+                # wrote a broken mesh into the root. Such a set is not a
+                # result: the unlock below discards it.
+                complete = await asyncio.to_thread(
+                    self._pending_result_complete, session.case_path)
+                if not complete:
+                    gather = {'gathered': False, 'reason': 'incomplete',
+                              'message': 'the processor folders are not the '
+                                         'complete result of a finished '
+                                         'stage; they are discarded, not '
+                                         'gathered'}
+                else:
+                    try:
+                        await self._ensure_reconstructed(session, command)
+                        gather = {'gathered': True}
+                    except PreconditionFailedError as error:
+                        # The unlock still goes ahead and, as for any unlock
+                        # now, takes the decomposition out of the case (Plan
+                        # 50 CX2): left, the next reader gathered it back over
+                        # the root the unlock had emptied. This set is the
+                        # stage's published result, so it is moved into the
+                        # undo folder, not deleted: undo puts it back with the
+                        # root before the gather, and the case it restores is
+                        # the one its task states describe.
+                        gather = {'gathered': False, 'reason': 'gather_failed',
+                                  'message': str(error)}
             try:
                 result = await asyncio.to_thread(
                     unlock_transaction.unlock, session.case_path, store, task_id,
                     settings_text=settings_text,
                     expected_revision=(None if expected is None else int(expected)),
                     capture_surfaces=lambda directory: self._write_surfaces(
-                        surfaces, directory))
+                        surfaces, directory),
+                    keep_decomposition=bool(
+                        gather and gather.get('reason') == 'gather_failed'))
             except unlock_transaction.UnlockError as error:
                 raise self._unlock_refused(error) from None
             session.state.bus.publish(
@@ -3597,9 +3727,26 @@ class DomainOperations:
             # design; asking it to refused every section not prepared by hand.
             require_domain=not _meshes_a_section(session.state.db))
         if prepared is None:
-            raise PreconditionFailedError(
-                'import geometry before running Gmsh; there is nothing to '
-                'prepare or mesh')
+            # DP-6151. A model made wholly on the Edit geometry page has
+            # nothing to import. The run still needs a prepared source to
+            # hang its names and scopes on, so it is given a built-in seed
+            # solid, and the runner clears the seed before the build is
+            # replayed (job['builder_seed']).
+            from foammesh.core.gmsh.execution import (
+                geometry_build_steps, seed_builder_only_case)
+            if not geometry_build_steps(session.case_path):
+                raise PreconditionFailedError(
+                    'nothing to mesh: import geometry, or build a model on '
+                    'the Edit geometry page, before running Gmsh.')
+            await asyncio.to_thread(seed_builder_only_case,
+                                    session.case_path)
+            prepared = await asyncio.to_thread(
+                _ensure_prepared_geometry, session,
+                producer='mesh.gmsh.run', require_domain=False)
+            if prepared is None:
+                raise PreconditionFailedError(
+                    'the built-in seed solid could not be prepared; import '
+                    'any solid and build on it instead')
         token.check()
 
         # Plan 33 W-G1 (FIELD-06, CURVE-04). Every enabled control that names
@@ -3648,7 +3795,8 @@ class DomainOperations:
         spec = OperationSpec(
             operation=command.operation,
             argv=launch.argv, cwd=session.case_path,
-            timeout=_stage_timeout(command.parameters, 3600),
+            timeout=_stage_timeout(command.parameters,
+                                   MESHER_STAGE_TIMEOUT),
             max_output_bytes=8 * 1024 * 1024,
             log_path=layout.log,
             cleanup_argv=launch.cleanup_argv,
@@ -4080,6 +4228,18 @@ class DomainOperations:
         if target == 'su2':
             return ('the SU2 route reads the mesh file Gmsh wrote, so no '
                     'polyMesh was published for it')
+        # DP-6471. The export's own refusal is the why: "no polyMesh was
+        # published for this run" alone did not say the surfaces had been
+        # recombined, so the run read as though OpenFOAM had a mesh.
+        refusals = [str(text).strip() for text in
+                    export_settings.get('polyMeshRefusals') or ()
+                    if str(text).strip()]
+        if refusals:
+            prefix = 'no polyMesh was published: '
+            why = ' '.join(text[len(prefix):] if text.startswith(prefix)
+                           else text for text in refusals)
+            return ('the mesh file was written, and no polyMesh was '
+                    'published for OpenFOAM: ' + why)
         return ('no polyMesh was published for this run; the native Gmsh mesh '
                 'is the result')
 
@@ -4184,6 +4344,51 @@ class DomainOperations:
         return await self._finish_gmsh_run(
             session, command, record, self._prepared_for_run(session, report),
             payload, accepted=accepted)
+
+    async def _gmsh_publish_stage(self, session: CaseSession,
+                                  command: Command,
+                                  engine=None) -> OperationResult:
+        """Publish the newest Gmsh run's mesh again, with the code as it is now.
+
+        DP-6134. The run is not meshed again: its mesh.msh is read, the
+        polyMesh written, coupled and checked -- the tail every Gmsh run ends
+        with (:meth:`_finish_gmsh_run`).
+        """
+        from foammesh.core.gmsh.manifest import (
+            ManifestError, RunBuilder, RunManifest, list_runs,
+        )
+        from foammesh.core.quality import binding
+
+        session.require_writable()
+        # A run row with no engine recorded is this engine's: only it ever
+        # wrote rows without one. The engine is asked for its id (F-14).
+        if engine is None:
+            from foammesh.core.engine.gmsh import GmshMeshingEngine as engine
+        own = str(engine.engine_id)
+        candidates = [row for row in list_runs(session.case_path)
+                      if row.get('run_id')
+                      and str(row.get('engine_id') or own) == own]
+        record = None
+        for row in reversed(candidates):
+            try:
+                found = RunManifest.read(
+                    RunBuilder(session.case_path).root(str(row['run_id'])))
+            except (ManifestError, OSError, ValueError):
+                continue
+            if found.layout.mesh.is_file():
+                record = found
+                break
+        if record is None:
+            raise PreconditionFailedError(
+                'no Gmsh run has built a mesh yet, so there is nothing to '
+                'publish; generate the mesh first')
+        report = binding.run_report(session.case_path, record.run_id) or {}
+        stored = dict(record.document.get('quality_verdict') or {})
+        payload = {'run_id': record.run_id, 'engine_id': 'gmsh',
+                   'quality_verdict': stored, 'republished': True}
+        return await self._finish_gmsh_run(
+            session, command, record, self._prepared_for_run(session, report),
+            payload, accepted=bool(stored.get('accepted', True)))
 
     def _prepared_for_run(self, session: CaseSession, report: dict):
         """The prepared revision *this run* was meshed from.
@@ -4813,6 +5018,16 @@ class DomainOperations:
                    and task.engine_stage in ('compute', 'surfaceFeatures')
                    for task in written.ordered_tasks()):
                 return
+            # DP-6116. A parallel stage left its mesh in the processor cases,
+            # so the case root still holds the stage before it: MEASURED on
+            # the CHT tubes, Castellation read 3,920 (the base grid) and
+            # Layers 179.4k (the snap). The strip is kept by the gather
+            # instead, which reads the seconds parked here.
+            if not from_snapshot and self._gather_pending(
+                    Path(session.case_path)):
+                stage_strip.forget(session.case_path, engine_id, task_id)
+                self._park_strip_seconds(Path(session.case_path), seconds)
+                return
             folder = None
             if from_snapshot:
                 stage = next((name for name, task in
@@ -4820,6 +5035,12 @@ class DomainOperations:
                               if task == task_id), None)
                 folder = (snapshots.stage_mesh_path(session.case_path, stage)
                           if stage else None)
+                if (folder is None and stage
+                        and snapshots.is_decomposed(session.case_path, stage)):
+                    # Plan 50 IP17. Kept as processor cases: the case root
+                    # is not its mesh, so no strip until it is gathered.
+                    stage_strip.forget(session.case_path, engine_id, task_id)
+                    return
             if folder is None:
                 folder = Path(session.case_path) / 'constant' / 'polyMesh'
             counts = stage_strip.mesh_counts(folder)
@@ -4904,6 +5125,15 @@ class DomainOperations:
             recorded = dict(recorded, staled_checks=list(staled))
         return recorded
 
+    @staticmethod
+    def _refused_before_start(payload: Mapping) -> bool:
+        """DP-6487. Whether the run was refused by the recovery gate before
+        any process started (its job's exit kind is ``recovery_pending``)."""
+        job = payload.get('job') if isinstance(payload, Mapping) else None
+        exit_ = job.get('exit') if isinstance(job, Mapping) else None
+        return isinstance(exit_, Mapping) and str(
+            exit_.get('kind') or '') == 'recovery_pending'
+
     def _record_stage_run_failure(self, session: CaseSession, command: Command,
                                   task_id: str | None) -> dict | None:
         """Record that the stage this task stands for has just failed (R92).
@@ -4954,7 +5184,40 @@ class DomainOperations:
             logger.warning('checkMesh outputs were not kept: %s', error)
             return None
 
-    def _persist_pipeline_check(self, session: CaseSession, execution) -> dict | None:
+    _CONTEXT_NOT_READ = object()
+
+    async def _pipeline_check_off_loop(self, session: CaseSession,
+                                       execution) -> dict | None:
+        """DP-6464: file the pipeline's check without holding the window.
+
+        The check reads the whole mesh: cell centres for the thin-region
+        measure, a fingerprint of the polyMesh for the report. On the loop
+        that froze the window for 2.5 to 4 s after every run to end (measured
+        live on 301,183 cells) and grows with the cell count. What the
+        database must answer is read here, on the loop; the mesh work goes to
+        a worker thread, as ``mesh.check`` has done since DP-2717; the event
+        that makes the window re-read the verdict is published back here.
+        """
+        if execution is None or not execution.succeeded:
+            return None
+        retained_context = self._retained_region_context(session)
+        report = await asyncio.to_thread(
+            self._persist_pipeline_check, session, execution,
+            retained_context, False)
+        if report is not None:
+            self._publish_pipeline_check(session, execution)
+        return report
+
+    @staticmethod
+    def _publish_pipeline_check(session: CaseSession, execution) -> None:
+        session.state.bus.publish(
+            Event.ARTIFACT_QUALITY_CHANGED, operation='workflow.run_pipeline',
+            job_id=getattr(execution.job, 'job_id', None), artifacts=[],
+            quality='checkMesh')
+
+    def _persist_pipeline_check(self, session: CaseSession, execution,
+                                retained_context=_CONTEXT_NOT_READ,
+                                publish: bool = True) -> dict | None:
         """Store the checkMesh a pipeline run produced, as ``mesh.check`` would.
 
         The pipeline always ends in a checkMesh node, and until now its output
@@ -4963,13 +5226,18 @@ class DomainOperations:
         after a complete mesh and the quality tab was empty. The parsed
         report is written to the same ``quality/latest.json`` with the same
         schema, and the same artifact event tells the GUI to re-read it.
+
+        DP-6464. Called with a ``retained_context`` already read and
+        ``publish`` off, it touches neither the database nor the event bus,
+        so `_pipeline_check_off_loop` can run it on a worker thread.
         """
         if execution is None or not execution.succeeded:
             return None
         from foammesh.core.quality import MeshCheckService, parse_checkmesh
 
         job = execution.job
-        retained_context = self._retained_region_context(session)
+        if retained_context is self._CONTEXT_NOT_READ:
+            retained_context = self._retained_region_context(session)
         try:
             parsed = parse_checkmesh(str(getattr(job, 'output', '') or ''))
             self._apply_retained_regions(retained_context, parsed)
@@ -4987,9 +5255,8 @@ class DomainOperations:
         self._collect_check_artifacts(
             session, tuple(getattr(job, 'argv', ()) or ()), report,
             started_at=self._mesh_written_at(session.case_path))
-        session.state.bus.publish(
-            Event.ARTIFACT_QUALITY_CHANGED, operation='workflow.run_pipeline',
-            job_id=getattr(job, 'job_id', None), artifacts=[], quality='checkMesh')
+        if publish:
+            self._publish_pipeline_check(session, execution)
         return report.to_dict()
 
     def _advance_pipeline_gates(self, session: CaseSession, command: Command,
@@ -6255,19 +6522,37 @@ runTimeModifiable true;
     def _require_mesh(session: CaseSession) -> Path:
         poly_mesh = session.case_path / 'constant' / 'polyMesh'
         if not (poly_mesh / 'points').exists() and not (poly_mesh / 'faces').exists():
-            raise PreconditionFailedError('the case has no polyMesh', details={
-                'case_path': str(session.case_path)})
+            raise PreconditionFailedError(
+                'the case has no polyMesh' + DomainOperations._second_order_hint(
+                    session), details={'case_path': str(session.case_path)})
         return poly_mesh
 
+    @staticmethod
+    def _second_order_hint(session: CaseSession) -> str:
+        """Live finding D5: say why a published second-order run left no polyMesh."""
+        try:
+            order = int(session.state.db.getValue('gmsh/output/elementOrder')
+                        or 1)
+        except Exception:                                    # noqa: BLE001
+            return ''
+        if order > 1:
+            return (': the Gmsh mesh is second order and polyMesh is a '
+                    'first-order format, so only the native MSH exists; set '
+                    'the element order to 1 for an OpenFOAM mesh')
+        return ''
+
     #: Which mesh each single-file export is written from, and the reader
-    #: on ``ImportExportService`` that finds it. ``vtk`` and ``gmsh`` are
-    #: absent because they read the published polyMesh directly. Plan 31
-    #: DP-15.
+    #: on ``ImportExportService`` that finds it. Plan 31 DP-15.
+    #: DP-6473. ``vtk`` and ``gmsh`` are written from the accepted run's
+    #: ``mesh.msh`` when there is no polyMesh (an SU2-target Gmsh run
+    #: publishes none), so they are satisfied by it too.
     _EXPORT_SOURCES = {
         'su2': ('native_su2_artifact', 'mesh.su2'),
         'med': ('native_msh_artifact', 'mesh.msh'),
         'unv': ('native_msh_artifact', 'mesh.msh'),
         'cgns': ('native_msh_artifact', 'mesh.msh'),
+        'gmsh': ('native_msh_artifact', 'mesh.msh'),
+        'vtk': ('native_msh_artifact', 'mesh.msh'),
     }
 
     @classmethod
@@ -6287,11 +6572,10 @@ runTimeModifiable true;
         the GUI showed the refusal inside a progress dialog, so the campaign
         recorded only the window's title.
 
-        Which mesh is needed depends on the format. ``vtk`` and ``gmsh`` read
-        the published polyMesh directly -- ``load_case_dataset`` and
-        ``load_case_blocks`` open it -- and still demand one. ``su2`` is
-        copied from the accepted run's ``mesh.su2``, and ``med``, ``unv`` and
-        ``cgns`` are converted from its ``mesh.msh``; each of those is
+        Which mesh is needed depends on the format. ``su2`` is copied from
+        the accepted run's ``mesh.su2``; ``med``, ``unv`` and ``cgns`` are
+        converted from its ``mesh.msh``, and (DP-6473) ``gmsh`` copies it and
+        ``vtk`` reads it when no polyMesh was published; each of those is
         satisfied by the artifact its exporter actually reads, asked for
         through the same reader the exporter asks with.
 
@@ -6313,8 +6597,10 @@ runTimeModifiable true;
             return poly_mesh
         reader, filename = cls._EXPORT_SOURCES.get(entry_id, ('', ''))
         if not reader:
-            raise PreconditionFailedError('the case has no polyMesh', details={
-                'case_path': str(session.case_path), 'entry_id': entry_id})
+            raise PreconditionFailedError(
+                'the case has no polyMesh' + cls._second_order_hint(session),
+                details={'case_path': str(session.case_path),
+                         'entry_id': entry_id})
         from foammesh.core.import_export.service import ImportExportService
 
         artifact = getattr(ImportExportService, reader)(session.case_path)
@@ -7283,8 +7569,8 @@ runTimeModifiable true;
         return self._geometry_patch_edit(
             session, command, lambda editor: editor.split(patch_uuid))
 
-    def _geometry_patches_split_by_angle(self, session: CaseSession,
-                                         command: Command) -> OperationResult:
+    async def _geometry_patches_split_by_angle(self, session: CaseSession,
+                                               command: Command) -> OperationResult:
         """Cut a tessellated surface into boundaries along its feature edges.
 
         Plan 28 WP7. The other patch edits rearrange sub-surfaces that
@@ -7317,10 +7603,13 @@ runTimeModifiable true;
                         'geometry_ids': [item['geometry_id'] for item in candidates]})
             geometry_id = candidates[0]['geometry_id']
         try:
-            result = store.split_by_angle(
+            # DP-6093. The cut reads, measures and writes the whole surface;
+            # on the Qt thread it froze the window for as long as it ran.
+            result = await asyncio.to_thread(
+                store.split_by_angle,
                 geometry_id,
                 angle_deg=command.parameters.get('angle_deg'),
-                min_area_fraction=command.parameters.get('min_area_fraction') or 0.0,
+                min_area_fraction=command.parameters.get('min_area_fraction'),
                 preview=preview)
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
@@ -7344,8 +7633,8 @@ runTimeModifiable true;
                      'split': report, 'patches': rows,
                      'geometry_rows': reconciled})
 
-    def _geometry_cad_convert_to_surface(self, session: CaseSession,
-                                         command: Command) -> OperationResult:
+    async def _geometry_cad_convert_to_surface(self, session: CaseSession,
+                                               command: Command) -> OperationResult:
         """Turn the chosen solid-model sources into surface files, on request.
 
         Plan 42 SG22 Q1. Gmsh refuses a case that mixes CAD with surfaces
@@ -7364,7 +7653,9 @@ runTimeModifiable true;
         before = self._patch_rows(self._patch_editor(session))
         ids = command.parameters.get('geometry_ids') or None
         try:
-            result = store.convert_cad_to_surface(
+            # DP-6093. Faceting a solid model is seconds of work: a worker.
+            result = await asyncio.to_thread(
+                store.convert_cad_to_surface,
                 ids, tessellation=command.parameters.get('tessellation'),
                 preview=preview)
         except KeyError as error:
@@ -7416,8 +7707,10 @@ runTimeModifiable true;
             session.require_writable()
         store = GeometryArtifactStore(session.case_path)
         geometry_ids = command.parameters.get('geometry_ids') or None
+        names = self._body_names(session.state.checkout().data())
         try:
-            result = store.split_interfaces(geometry_ids, preview=preview)
+            result = store.split_interfaces(geometry_ids, preview=preview,
+                                            names=names)
         except KeyError as error:
             raise PreconditionFailedError('geometry artifact does not exist', details={
                 'geometry_id': str(error.args[0])}) from error
@@ -7585,8 +7878,8 @@ runTimeModifiable true;
         self._name_interface_sides(session, summary['interfaces'])
         return summary
 
-    def _surface_intent_auto_pair(self, session: CaseSession,
-                                  command: Command) -> OperationResult:
+    async def _surface_intent_auto_pair(self, session: CaseSession,
+                                        command: Command) -> OperationResult:
         """Pair the walls that touch, as the surface dialog's Automatic does.
 
         DP-6087 (user design, 2026-10-29). Split interfaces was a button on
@@ -7630,6 +7923,12 @@ runTimeModifiable true;
         preview = bool(parameters.get('preview', False))
         if not preview:
             session.require_writable()
+        if not preview and role == model.CONFORMAL:
+            # DP-6095. The conformal pair cuts the geometry artifacts, as
+            # geometry.split_interfaces does, so a locked geometry refuses it
+            # the same way; the non-conformal pair writes relations only.
+            from .facade import refuse_locked_items
+            refuse_locked_items(session, 'geometry', operation=command.operation)
 
         data = session.state.checkout()
         document = data.data()
@@ -7640,8 +7939,16 @@ runTimeModifiable true;
                     f'geometry {key} is not a surface', details={
                         'error': 'validation_failed', 'code': 'not_a_surface',
                         'geometry_ids': sorted(chosen)})
-        walls = self._walls_by_body(session, geometry)
-        contacts = touching_walls.touching(walls)
+        # DP-6089. Reading the walls and measuring which touch took 21 s on
+        # the CHT tubes, on the GUI thread: the window froze under the
+        # dialog's Automatic preview and again under its OK. Both read files
+        # and arrays only, so they go to a worker and the window keeps drawing.
+
+        def measure():
+            walls = self._walls_by_body(session, geometry)
+            return walls, touching_walls.touching(walls)
+
+        walls, contacts = await asyncio.to_thread(measure)
         if chosen and role == model.CONFORMAL:
             # A body the cut has run over is no longer closed, and a second
             # cut cannot tell it from the body it touches (MEASURED live
@@ -7655,7 +7962,8 @@ runTimeModifiable true;
                 grown = False
                 for item in contacts:
                     pair = {item.a_body, item.b_body}
-                    if item.conformal and pair & joined                             and not pair <= joined:
+                    if (item.conformal and pair & joined
+                            and not pair <= joined):
                         joined |= pair
                         grown = True
             contacts = [item for item in contacts
@@ -7713,7 +8021,9 @@ runTimeModifiable true;
                              for body in entry['bodies']})
             # One cut over every body at once: see the note above.
             try:
-                result = store.split_interfaces(bodies)
+                result = await asyncio.to_thread(
+                    store.split_interfaces, bodies,
+                    names=self._body_names(document))
             except (OSError, ValueError) as error:
                 raise ValidationFailedError(str(error)) from error
             cut = self._rows_from_the_cut(session, result)
@@ -7730,7 +8040,8 @@ runTimeModifiable true;
             def region(key):
                 # A surface with no body row has no region to name; the
                 # surface's intent issue then asks for one.
-                return model.region_ref(volumes[key]) if volumes.get(key)                     else None
+                return (model.region_ref(volumes[key]) if volumes.get(key)
+                        else None)
 
             for entry in planned:
                 own, other = entry['surfaces']
@@ -7921,6 +8232,25 @@ runTimeModifiable true;
                           data.addGeometryPolyData(pieces[name]))
             moved.append(key)
         return moved
+
+    @staticmethod
+    def _body_names(document: dict) -> dict:
+        """Geometry id -> the name the project tree gives its body.
+
+        DP-6106. The interfaces the cut makes are named after their bodies,
+        and the body's name is the one on its volume row, which is the one
+        a person edits; the manifest keeps the imported file's name.
+        """
+        geometry = document.get('geometry') or {}
+        names = {}
+        for row in geometry.values():
+            if not isinstance(row, dict) or str(row.get('gType')) != 'surface':
+                continue
+            geometry_id = str(row.get('geometryId') or '')
+            volume = geometry.get(str(row.get('volume') or ''))
+            if geometry_id and isinstance(volume, dict) and volume.get('name'):
+                names.setdefault(geometry_id, str(volume['name']))
+        return names
 
     @staticmethod
     def _volume_of(data, geometry_id: str):
@@ -8588,7 +8918,9 @@ runTimeModifiable true;
         except (FileNotFoundError, ValueError, KeyError):
             can_return = False  # no external-mesh provenance recorded yet
         from foammesh.core.geometry import GeometryArtifactStore
-        preparation = session.configuration().get('geometryPreparation', {})
+        # Plan 50 (DP-6341): one section, read without building the whole
+        # configuration.
+        preparation = _document_view(session).get('geometryPreparation') or {}
         decision = preparation.get('decision', 'undecided')
         if hasattr(decision, 'value'):
             decision = decision.value
@@ -8687,10 +9019,20 @@ runTimeModifiable true;
                 session, engine.engine_id,
                 configured_target_solver(session.state.db),
                 stage='dictionaries')
+        from foammesh.core.gmsh.execution import ExecutionError
         try:
             manifest = await asyncio.to_thread(
                 engine.generate_config, session.state.db, bbox, session.case_path,
                 prepared)
+        except ExecutionError as error:
+            # DP-6522. The Gmsh job writer refuses with its own error (no
+            # prepared CAD revision, a surface intent it cannot build); it
+            # reached the client as a bare 500. The run pipeline already
+            # answers it as a validation failure with its details.
+            raise ValidationFailedError(
+                'dictionaries could not be generated: {0}'.format(error),
+                details={'engine': engine.engine_id,
+                         **(getattr(error, 'details', None) or {})}) from error
         except (KeyError, OSError, TypeError, ValueError) as error:
             # R170. The case builder refuses to write a dictionary it cannot
             # bind, and said so with a plain ValueError. The GUI catches
@@ -8724,8 +9066,8 @@ runTimeModifiable true;
             raise PreconditionFailedError(str(error)) from error
         return self._read_result(session, command, payload)
 
-    def _workflow_reset_stage(self, session: CaseSession,
-                              command: Command) -> OperationResult:
+    async def _workflow_reset_stage(self, session: CaseSession,
+                                    command: Command) -> OperationResult:
         """Undo a mesh stage so it can be run again (R85).
 
         Every snappy stage writes the same ``constant/polyMesh``, so "a mesh
@@ -8758,6 +9100,7 @@ runTimeModifiable true;
                 'the configured meshing method cannot reset a stage')
         case_root = (session.case_path if (session.case_path / 'constant').is_dir()
                      else session.case_path / 'case')
+        await self._gather_reset_input(session, stage)
         try:
             payload = reset(case_root, stage)
         except ValueError as error:
@@ -8776,6 +9119,25 @@ runTimeModifiable true;
 
         return self._read_result(session, command, payload)
 
+    async def _gather_reset_input(self, session: CaseSession,
+                                  stage: str) -> None:
+        """Gather the kept stage a reset puts back, if a parallel run kept it
+        as processor cases (Plan 50 IP17). Never fails the reset: a stage
+        that cannot be gathered is not put back, and the next run of *stage*
+        replays its input then."""
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        predecessor = snapshots.PREDECESSOR.get(stage)
+        if not predecessor:
+            return
+        try:
+            holder = snapshots.resolve(session.case_path).get(predecessor)
+            if holder:
+                await self._gather_kept_stage(session, predecessor, holder)
+        except (FacadeError, snapshots.SnapshotError, OSError):
+            logger.warning('the kept %s mesh was not gathered for the reset',
+                           predecessor, exc_info=True)
+
     async def _workflow_run_stage(self, session: CaseSession, command: Command) -> OperationResult:
         session.require_writable()
         stage = command.parameters.get('stage')
@@ -8790,9 +9152,43 @@ runTimeModifiable true;
         except ValueError as error:
             raise ValidationFailedError(
                 'unknown meshing stage', details={'stage': stage}) from error
+        if definition.stage in getattr(engine, 'in_process_stages', ()):
+            # DP-6134. `gmsh-publish` names no program: Gmsh publishes inside
+            # this process, from the run's own mesh.msh. Probing it as an
+            # executable made *Publish again* say it "was not found".
+            return await self._gmsh_publish_stage(session, command,
+                                                  engine=engine)
+        # DP-6505. A stage run is several steps (runtime probes, the seed
+        # gate, surface features, the input replay, the split, the stage's
+        # own job). Between two of them no job is running, and a Cancel that
+        # came then answered "cancelled: 0" while the stage ran on to the
+        # end (MEASURED, window leg `api-run`, stage-cancelled, 2026-11-12).
+        # The run holds the case's cancel token, as a Gmsh Run to end does
+        # (DP-5743), and checks it between its steps.
+        from foammesh.core.jobs import pipeline_cancel
+
+        token = pipeline_cancel.start(session.case_path)
+        try:
+            return await self._workflow_run_stage_steps(
+                session, command, engine, definition, stage, token)
+        except pipeline_cancel.PipelineCancelled as error:
+            raise _stage_run_cancelled(stage) from error
+        except Exception as error:
+            if token.cancelled and not _is_run_cancelled(error):
+                # A step the Cancel stopped fails in its own words; the
+                # user asked for a stop, and that is what it was.
+                raise _stage_run_cancelled(stage) from error
+            raise
+        finally:
+            pipeline_cancel.finish(token)
+
+    async def _workflow_run_stage_steps(self, session: CaseSession,
+                                        command: Command, engine, definition,
+                                        stage, token) -> OperationResult:
         # DP-354. Before anything on this path asks the runtime a question.
         await self._warm_utility_probes()
         await self._warm_meshing_host()
+        token.check()
         feature_payload = None
         seed_warnings: list[str] = []
         if definition.stage in {'castellation', 'snappyHexMesh'}:
@@ -8802,16 +9198,22 @@ runTimeModifiable true;
             # Snappy consumes ``.eMesh`` edges that only ``surfaceFeatures``
             # produces. Extract them on demand so a single staged stage is
             # runnable on a fresh case and after a batch pipeline run alike.
+            token.check()
             feature_payload = await self._ensure_surface_features(
                 session, command, engine)
+            token.check()
             self._require_current_surface_features(session)
         # Plan 37 UF5. An edited stage never runs on its own previous output:
         # the stage it reads from is put back first, from its kept snapshot,
         # or regenerated from the nearest one that is kept.
         replay = await self._replay_stage_input(
             session, command, engine, definition)
+        token.check()
         execution, payload = await self._run_stage_definition(
             session, command, engine, definition)
+        # The stage's job has ended and changed the case: a Cancel from here
+        # on can no longer leave the case as it was, and says so.
+        token.committing = True
         if replay:
             payload['replay'] = replay
         if feature_payload is not None:
@@ -8867,7 +9269,10 @@ runTimeModifiable true;
             # staleness defects are about a state that is merely out of date;
             # this one was wrong in the user's favour, immediately after the
             # app had told them something went wrong.
-            payload['task_state'] = self._record_stage_run_failure(
+            # DP-6487. A run the recovery gate refused never started, so the
+            # step keeps the state it had; the key stays, holding None.
+            payload['task_state'] = None if self._refused_before_start(
+                payload) else self._record_stage_run_failure(
                 session, command, getattr(definition, 'task_id', None))
             job = payload.get('job') or {}
             if str(job.get('status') or '') != 'cancelled':
@@ -8931,6 +9336,13 @@ runTimeModifiable true;
                    'executable': str(argv[0]) if argv else ''}
         token = snapshots.cancel_token(session.case_path)
         previous = snapshots.active(session.case_path)
+        predecessor = snapshots.PREDECESSOR.get(stage)
+        if predecessor and snapshots.is_decomposed(session.case_path,
+                                                   predecessor):
+            # Plan 50 IP17. The stage before was kept as processor cases this
+            # run, so ``active.json`` still names the one before that.
+            previous = self._decomposed_history_previous(
+                session.case_path, stage)
         try:
             captured = await asyncio.to_thread(
                 snapshots.capture, session.case_path, stage,
@@ -8952,8 +9364,65 @@ runTimeModifiable true;
             'digest', 'copy_seconds', 'verify_seconds', 'reason',
             'consequence') if key in captured}
 
+    async def _capture_decomposed_stage(self, session: CaseSession, engine,
+                                        stage: str, ranks: int,
+                                        execution=None) -> dict | None:
+        """Keep a parallel stage as its processor cases (Plan 50 IP17).
+
+        DP-6303. A parallel Run to end gathers once, at the end; the stages
+        before it are kept here without a gather and gathered when something
+        reads them (:meth:`_gather_kept_stage`). Nonessential, like
+        :meth:`_capture_stage_snapshot`: a stage that cannot be kept is
+        reported and never fails the run.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        if not self._keeps_stage_snapshots(engine, stage):
+            return None
+        job = getattr(execution, 'job', None)
+        argv = tuple(getattr(job, 'argv', ()) or ())
+        runtime = {'utility': 'snappyHexMesh',
+                   'executable': str(argv[0]) if argv else ''}
+        token = snapshots.cancel_token(session.case_path)
+        # The undo history steps from the stage this one read: the kept
+        # stage before it in this run, not the case root.
+        previous = self._decomposed_history_previous(session.case_path, stage)
+        try:
+            captured = await asyncio.to_thread(
+                snapshots.capture_decomposed, session.case_path, stage,
+                ranks=int(ranks), engine_id=getattr(engine, 'engine_id', ''),
+                runtime=runtime, cancel=token)
+        except snapshots.SnapshotError as error:
+            return {'captured': False, 'stage': stage, 'reason': error.code,
+                    'message': str(error)}
+        except OSError as error:
+            logger.warning('stage snapshot of %s not kept', stage, exc_info=True)
+            return {'captured': False, 'stage': stage, 'reason': 'io_error',
+                    'message': str(error)}
+        finally:
+            snapshots.release_token(session.case_path, token)
+        if captured.get('captured'):
+            self._record_stage_history(session, engine, stage, captured,
+                                       previous, cells=captured.get('cells'))
+        return {key: captured.get(key) for key in (
+            'captured', 'skipped', 'stage', 'revision', 'path', 'bytes',
+            'digest', 'copy_seconds', 'verify_seconds', 'reason',
+            'consequence', 'layout') if key in captured}
+
+    @staticmethod
+    def _decomposed_history_previous(case_path, stage: str) -> dict | None:
+        """The kept snapshot *stage* read, as ``active.json`` would name it."""
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        predecessor = snapshots.PREDECESSOR.get(stage)
+        holder = snapshots.resolve(case_path).get(predecessor)             if predecessor else None
+        if holder:
+            return {'revision': holder, 'stage': predecessor}
+        return snapshots.active(case_path)
+
     def _record_stage_history(self, session: CaseSession, engine, stage: str,
-                              captured: dict, previous: dict | None) -> None:
+                              captured: dict, previous: dict | None, *,
+                              cells: int | None = None) -> None:
         """UXD7: the run is a step in the one undo history. Never fails it."""
         from . import stage_history
         from foammesh.core.workflow.task_state_store import EngineTaskStateStore
@@ -8962,7 +9431,7 @@ runTimeModifiable true;
                 session.case_path, engine.workflow_descriptor())
             stage_history.record_stage_run(
                 session, store, stage, captured, previous,
-                self._polymesh_cell_count(
+                cells if cells is not None else self._polymesh_cell_count(
                     Path(session.case_path) / 'constant' / 'polyMesh'))
         except Exception:  # noqa: BLE001 - history is a convenience
             logger.warning('stage run of %s not added to the history', stage,
@@ -9078,10 +9547,83 @@ runTimeModifiable true;
         for later in order[order.index(key):]:
             shutil.rmtree(root / later, ignore_errors=True)
 
+    async def _gather_kept_stage(self, session: CaseSession, stage: str,
+                                 revision: str) -> dict | None:
+        """Gather a stage kept as processor cases, where it is kept (IP17).
+
+        Plan 50 IP17 (DP-6303). ``reconstructPar -constant -case <snapshot>``
+        runs in the snapshot folder -- the case root and the live processor
+        cases are not touched -- and the gathered mesh, read back against the
+        processor cell count, becomes the kept stage. ``None`` when it was
+        already gathered. A failed gather raises
+        :class:`PreconditionFailedError` (``reconstruct_failed``) and leaves
+        the snapshot decomposed, so the next reader tries again.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        case = Path(session.case_path)
+        locks = self.__dict__.setdefault('_kept_gather_locks', {})
+        lock = locks.setdefault((str(case), stage, revision), asyncio.Lock())
+        async with lock:
+            if not snapshots.is_decomposed(case, stage, revision):
+                return None
+            check = await asyncio.to_thread(
+                snapshots.verify, case, stage, revision)
+            if not check.get('ok'):
+                raise PreconditionFailedError(
+                    f'the kept {stage} mesh is damaged and cannot be gathered',
+                    details={'error': 'snapshot_damaged', 'check': check})
+            folder = snapshots.stages_root(case) / revision / stage
+            gathered = folder / 'constant' / 'polyMesh'
+            if gathered.exists():
+                await asyncio.to_thread(shutil.rmtree, gathered, True)
+            # No time limit, as a stage has none (Plan 50 IP2).
+            command = Command('workflow.gather_kept_stage',
+                              str(getattr(session, 'case_id', '') or ''),
+                              parameters={'timeout_seconds': None})
+            execution = await self._run_openfoam_utility(
+                session, command, 'reconstructPar',
+                ('-constant', '-case', str(folder)), cwd=folder,
+                mutation=False)
+            if not execution.succeeded:
+                await asyncio.to_thread(shutil.rmtree, gathered, True)
+                raise PreconditionFailedError(
+                    f'the kept {stage} mesh could not be gathered',
+                    details={'error': 'reconstruct_failed', 'stage': stage,
+                             'revision': revision})
+            try:
+                adopted = await asyncio.to_thread(
+                    snapshots.adopt_gathered, case, stage, revision)
+            except snapshots.SnapshotError as error:
+                raise PreconditionFailedError(str(error), details=dict(
+                    error.details, error='reconstruct_incomplete',
+                    stage=stage, revision=revision)) from error
+            return {'stage': stage, 'revision': revision,
+                    'digest': adopted.get('digest'),
+                    'execution': execution.to_payload()}
+
+    def _register_kept_gatherer(self, session: CaseSession) -> None:
+        """Let the readers of kept stages outside the facade gather (IP17).
+
+        Undo of a stage run (:mod:`.stage_history`) and Compare stages
+        (:mod:`foammesh.core.section.stage_compare`) read kept stages by path;
+        a stage kept as processor cases is gathered for them through this.
+        """
+        from foammesh.core.jobs import stage_snapshots as snapshots
+
+        async def gather(stage: str, revision: str) -> None:
+            await self._gather_kept_stage(session, stage, revision)
+
+        snapshots.register_gatherer(session.case_path, gather)
+
     async def _restore_stage_snapshot(self, session: CaseSession,
                                       source: dict) -> None:
         from foammesh.core.jobs import stage_snapshots as snapshots
 
+        # Plan 50 IP17. A stage a parallel run kept as processor cases is
+        # gathered where it is kept before it is put back.
+        await self._gather_kept_stage(session, source['stage'],
+                                      source['revision'])
         token = snapshots.cancel_token(session.case_path)
         try:
             await asyncio.to_thread(
@@ -9100,7 +9642,7 @@ runTimeModifiable true;
         # "Initial mesh : cells:3230", not the base grid's 1000), so a raised
         # refinement level refined nothing. A gather still pending for them
         # would write that old mesh back over the restored root.
-        self._discard_decomposition(session.case_path)
+        await self._discard_off_loop(session.case_path)
         (session.case_path / self.PENDING_GATHER).unlink(missing_ok=True)
 
     async def _replay_stage_input(self, session: CaseSession, command: Command,
@@ -9214,6 +9756,9 @@ runTimeModifiable true;
             cause = cause or exit_reason
         cause = cause or str(job.get('error') or '').strip()
         reason = f'{stage} failed: {cause}' if cause else f'{stage} failed'
+        if kind == 'recovery_pending' and exit_reason:
+            # DP-6487. The stage never started: the gate's sentence says so.
+            reason = cause = exit_reason
         failure = {'reason': reason, 'cause': cause, 'details': details,
                    'log': log}
         if kind and kind not in {'ok', 'exit'}:
@@ -9453,6 +9998,30 @@ runTimeModifiable true;
     def _gather_pending(cls, case_path: Path) -> bool:
         return (case_path / cls.PENDING_GATHER).is_file()
 
+    def _record_gathered_strip(self, session: CaseSession, command: Command,
+                               stage: str, seconds) -> None:
+        """DP-6116. The gathered step's strip, now the root holds its mesh."""
+        from foammesh.core.jobs.stage_snapshots import STAGE_TASKS
+
+        task_id = STAGE_TASKS.get(stage)
+        if task_id:
+            self._record_stage_strip(session, command, task_id,
+                                     seconds=seconds)
+
+    @classmethod
+    def _park_strip_seconds(cls, case_path: Path, seconds) -> None:
+        """DP-6116. The run's seconds, kept on the marker for the gather's
+        strip. Nonessential: a strip without them still counts the mesh."""
+        if seconds is None:
+            return
+        marker = case_path / cls.PENDING_GATHER
+        try:
+            pending = json.loads(marker.read_text(encoding='utf-8'))
+            pending['seconds'] = float(seconds)
+            marker.write_text(json.dumps(pending, indent=2), encoding='utf-8')
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+
     #: Where the case-root mesh waits while the processor cases are gathered
     #: over it. See `_ensure_reconstructed` for why it has to wait anywhere.
     PARKED_ROOT_MESH = 'constant/polyMesh.before-gather'
@@ -9497,19 +10066,129 @@ runTimeModifiable true;
         return total if seen else None
 
     @staticmethod
-    def _discard_decomposition(case_path: Path) -> None:
-        """Remove processor cases whose mesh has been superseded."""
-        from foammesh.support.utils import rmtree
-        for processor in case_path.glob('processor[0-9]*'):
-            rmtree(processor)
-        # DP-1230. What they were split from goes with them.
-        try:
-            (Path(case_path) / DECOMPOSITION_RECORD).unlink(missing_ok=True)
-        except OSError:
-            pass
+    def _discard_decomposition(case_path: Path) -> dict:
+        """Remove processor cases whose mesh has been superseded.
+
+        DP-1230: what they were split from goes with them, and so does a
+        result still waiting in them to be gathered. Plan 50 CX1 (DP-6200):
+        never raises -- ``{'removed': [...], 'held': [...]}``, *held* naming
+        the folders Windows would not let go of yet; the next clean-up
+        removes them.
+        """
+        from foammesh.core.jobs.run_records import discard_decomposition
+        return discard_decomposition(case_path)
+
+    async def _discard_off_loop(self, case_path: Path) -> dict:
+        """:meth:`_discard_decomposition` on a worker thread (Plan 50 CX1).
+
+        The owner loop is the GUI thread: renames retried while Windows
+        holds a folder, and the deletes, are not done on it.
+        """
+        return await asyncio.to_thread(self._discard_decomposition, case_path)
 
     #: DP-1230. Which case-root mesh the processor cases were split from.
     DECOMPOSITION_RECORD = DECOMPOSITION_RECORD
+
+    @classmethod
+    def _pending_result_complete(cls, case_path: Path) -> bool:
+        """Are the processor cases the complete, finished result the
+        pending-gather marker describes (Plan 50 CX2, DP-6204)?
+
+        Every rank the marker names is there, no other is, each holds a
+        whole polyMesh, and no run of the case is unresolved (a writer that
+        is not confirmed gone may still be writing them).
+        """
+        from foammesh.core.jobs.run_records import RunRecordStore
+        case_path = Path(case_path)
+        try:
+            pending = json.loads((case_path / cls.PENDING_GATHER).read_text(
+                encoding='utf-8'))
+            ranks = int(pending.get('ranks') or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+        if ranks < 1 or not pending.get('stage'):
+            return False
+        present = {path.name for path in case_path.glob('processor[0-9]*')}
+        if present != {f'processor{rank}' for rank in range(ranks)}:
+            return False
+        required = ('points', 'faces', 'owner', 'neighbour', 'boundary')
+        if not all((case_path / f'processor{rank}' / 'constant' / 'polyMesh'
+                    / name).is_file()
+                   for rank in range(ranks) for name in required):
+            return False
+        try:
+            return not RunRecordStore(case_path).open_records()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _writer_confirmed_gone(case_path: Path, execution) -> bool:
+        """Has the failed run's writer been confirmed gone (Plan 50 CX1)?
+
+        ``exited`` (or ``closed``) is the wrapper's own acknowledgement that
+        its process group is empty; a run with no record ran natively and
+        has exited. Otherwise the wrapper's Linux mirror is read -- it may
+        have said so after the transport was lost. Nothing else is asked:
+        the recovery gate resolves a run this cannot confirm.
+        """
+        job = getattr(execution, 'job', None)
+        state = getattr(job, 'run_state', None)
+        if state in (None, 'exited', 'closed'):
+            return True
+        from foammesh.core.jobs.run_records import (
+            RunRecordStore, mirror_confirms_dead)
+        run_id = getattr(job, 'run_id', None) or getattr(job, 'job_id', None)
+        if not run_id:
+            return False
+        try:
+            return mirror_confirms_dead(
+                RunRecordStore(case_path).linux_record(str(run_id)))
+        except OSError:
+            return False
+
+    def _settle_failed_parallel_run(self, session: CaseSession, execution,
+                                    payload: dict) -> None:
+        """Plan 35 D8, Plan 50 CX1: clear a failed parallel run's processor cases.
+
+        They are neither the old mesh nor a new one, and the next run would
+        start off them. DP-6200: this used to raise ``PermissionError`` out
+        of the run when Windows refused the rename of one folder, with the
+        pending-gather marker -- unlinked after the discard -- left behind
+        describing a half-removed set. The marker and the decomposition
+        record are settled first now; the folders go only once the writer
+        is confirmed gone, and a folder that cannot be removed yet is named
+        in the result (``held_processor_directories``) and removed by the
+        next clean-up -- the next run, an unlock or the recovery gate.
+        """
+        from foammesh.core.jobs.run_records import (
+            DECOMPOSITION_RECORD as RECORD, PENDING_GATHER)
+        case = Path(session.case_path)
+        names = sorted(path.name for path in case.glob('processor[0-9]*')
+                       if path.is_dir())
+        if not self._writer_confirmed_gone(case, execution):
+            for parts in (PENDING_GATHER, RECORD):
+                try:
+                    case.joinpath(*parts).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if names:
+                payload['held_processor_directories'] = names
+                payload['discard_deferred'] = 'writer_not_confirmed_stopped'
+                payload['discard_note'] = (
+                    f'the {len(names)} processor directories of the stopped '
+                    'parallel run are removed once its processes are '
+                    'confirmed stopped')
+            return
+        outcome = self._discard_decomposition(case)
+        if names:
+            payload['discarded_decomposition'] = names
+            note = (f'the {len(names)} processor directories of the failed '
+                    'parallel run were deleted')
+            if outcome['held']:
+                payload['held_processor_directories'] = outcome['held']
+                note = (f'{note}, except {", ".join(outcome["held"])}: still '
+                        'in use, removed by the next run or unlock')
+            payload['discard_note'] = note
 
     @classmethod
     def _record_decomposition(cls, case_path: Path, ranks: int) -> None:
@@ -9696,10 +10375,11 @@ runTimeModifiable true;
             rmtree(parked)
         marker = case_path / self.PENDING_GATHER
         try:
-            gathered_stage = json.loads(
-                marker.read_text(encoding='utf-8')).get('stage') or 'parallel'
+            pending = json.loads(marker.read_text(encoding='utf-8'))
+            gathered_stage = pending.get('stage') or 'parallel'
+            parked_seconds = pending.get('seconds')
         except (OSError, ValueError, AttributeError):
-            gathered_stage = 'parallel'
+            gathered_stage, parked_seconds = 'parallel', None
         marker.unlink(missing_ok=True)
         # DP-1230. The root now holds what the processor cases hold.
         self._record_decomposition(
@@ -9712,6 +10392,8 @@ runTimeModifiable true;
         from foammesh.core.case import record_generated_mesh
         record_generated_mesh(case_path, provenance={
             'generated_by': f'reconstructPar:{gathered_stage}'})
+        self._record_gathered_strip(session, command, gathered_stage,
+                                    parked_seconds)
         payload = execution.to_payload()
         payload['trace'] = await self._traced(session, 'reconstruct')
         if gathered_stage != 'parallel':
@@ -9756,14 +10438,31 @@ runTimeModifiable true;
             # would be picked up by mpirun as if they were this run's, and
             # ones split from another root mesh would be meshed in its place
             # (DP-1230). Remove them and decompose the live root.
-            self._discard_decomposition(case_root)
-            (case_root / self.PENDING_GATHER).unlink(missing_ok=True)
+            held = (await self._discard_off_loop(case_root))['held']
+            if held:
+                # Plan 50 CX1 (DP-6200). What an earlier cancelled run left
+                # is removed here; a folder Windows still holds is named
+                # rather than handed to decomposePar half removed.
+                raise PreconditionFailedError(
+                    'the processor folders of an earlier run are still in '
+                    'use and could not be removed yet: ' + ', '.join(held)
+                    + '. Wait a moment and run again.',
+                    details={'error': 'decomposition_held', 'held': held,
+                             'actions': ['retry']})
         engine.write_parallel_config(session.state.db, case_root, ranks)
         execution = await self._run_openfoam_utility(
             session, command, 'decomposePar',
             ('-case', str(case_root), '-force'),
             cwd=case_root, mutation=True)
         if not execution.succeeded:
+            job = execution.to_payload().get('job') or {}
+            if str(job.get('status') or '') == 'cancelled':
+                # DP-6498. The user stopped the run while the case was being
+                # split: that is a cancel, not a case that cannot be split.
+                raise PreconditionFailedError(
+                    'the run was cancelled before it finished',
+                    details={'error': 'run_cancelled', 'cancelled': True,
+                             'utility': 'decomposePar', 'ranks': ranks})
             raise PreconditionFailedError(
                 'the case could not be decomposed for parallel meshing',
                 details={'error': 'decompose_failed', 'ranks': ranks})
@@ -9835,7 +10534,7 @@ runTimeModifiable true;
             # output (or a later stage's), and the input it starts from has
             # just been put back. Gathering it now would write that output
             # over the input.
-            self._discard_decomposition(session.case_path)
+            await self._discard_off_loop(session.case_path)
             (session.case_path / self.PENDING_GATHER).unlink(missing_ok=True)
         if ranks == 1 and self._gather_pending(session.case_path):
             # A serial phase reads the case root, so an earlier decomposed
@@ -9843,13 +10542,13 @@ runTimeModifiable true;
             # mesh this phase is about to supersede; leaving them would let a
             # later parallel phase pick up a stale decomposition.
             await self._ensure_reconstructed(session, command)
-            self._discard_decomposition(session.case_path)
+            await self._discard_off_loop(session.case_path)
         elif (ranks == 1 and definition.utility != 'surfaceFeatures'
               and any(session.case_path.glob('processor[0-9]*'))):
             # DP-1201. A parallel stage is now gathered as soon as it ends,
             # and its processor cases are kept for the next parallel stage.
             # A serial stage supersedes them just the same.
-            self._discard_decomposition(session.case_path)
+            await self._discard_off_loop(session.case_path)
         if ranks > 1:
             await self._utilities_ready(
                 ('decomposePar', 'reconstructPar', 'mpirun'))
@@ -9930,7 +10629,16 @@ runTimeModifiable true;
             ) if ranks > 1 else (),
             ranks=ranks,
         ), on_line=command.parameters.get('on_line'))
+        # Plan 50 IP3 (DP-6231). A stage that stopped refining at a cell
+        # limit warns: the warning reaches the result and the task.
+        limit_warning = await _cell_limit_warning(execution, session.state.db)
+        if limit_warning:
+            import dataclasses
+            execution = dataclasses.replace(
+                execution, warnings=(*execution.warnings, limit_warning))
         payload = execution.to_payload()
+        if limit_warning:
+            payload['cell_limit_warning'] = limit_warning
         payload.update({
             'stage': definition.stage, 'utility': definition.utility,
             'engine': engine.engine_id,
@@ -9941,22 +10649,10 @@ runTimeModifiable true;
             payload['oversubscribed'] = True
             payload['launch_warnings'] = [launch_warning]
         if ranks > 1 and not execution.succeeded:
-            # Plan 35 D8. A failed parallel run leaves processor cases that
-            # are neither the old mesh nor a new one; the next run would
-            # start off them. They go, and the failure says so.
-            removed = sorted(path.name for path in
-                             session.case_path.glob('processor[0-9]*') if path.is_dir())
-            self._discard_decomposition(session.case_path)
-            try:
-                (session.case_path / 'foammesh' / 'pending-gather.json').unlink(
-                    missing_ok=True)
-            except OSError:
-                pass
-            if removed:
-                payload['discarded_decomposition'] = removed
-                payload['discard_note'] = (
-                    f'the {len(removed)} processor directories of the failed '
-                    'parallel run were deleted')
+            # Plan 50 CX1. File work only, and it may wait for Windows to let
+            # go of a folder: a worker thread does it, not the owner loop.
+            await asyncio.to_thread(
+                self._settle_failed_parallel_run, session, execution, payload)
         if decomposition:
             payload['decomposition'] = decomposition
         if ranks > 1 and execution.succeeded:
@@ -10159,13 +10855,43 @@ runTimeModifiable true;
         is the one line that connects the two -- the projection itself lives
         in ``core/gmsh/layers.py`` beside the request it is held against.
         """
-        from foammesh.core.gmsh.layers import achieved_coverage
+        from foammesh.core.gmsh.layers import run_coverage
 
-        document = achieved_coverage(
-            (getattr(record, 'document', None) or {}).get('statistics') or {})
-        if document.get('patches'):
+        # Plan 50 IP7 (DP-6252). Every run replaces the file: a layer that
+        # was asked for and not grown writes a `not grown` row per patch, so
+        # the verdict (DP-664) hears of it, and a run that asked for none
+        # removes the previous run's file rather than leaving it to speak
+        # for a mesh it does not describe.
+        layers_intent = None
+        layout = getattr(record, 'layout', None)
+        job_file = getattr(layout, 'job', None)
+        if job_file is not None:
+            import json as _json
+            try:
+                job = _json.loads(Path(job_file).read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                job = {}
+            except (OSError, ValueError) as error:
+                logger.warning('the layer request of run %s could not be '
+                               'read: %s', getattr(record, 'run_id', ''),
+                               error)
+                job = {}
+            layers_intent = ((job.get('intent') or {}).get('layers')
+                             if isinstance(job, dict) else None)
+        document = run_coverage(
+            (getattr(record, 'document', None) or {}).get('statistics') or {},
+            layers_intent)
+        if document:
             cls._write_layer_coverage(session, document)
             return document
+        path = Path(session.case_path) / cls.LAYER_COVERAGE_PATH
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            logger.warning('the previous layer coverage could not be '
+                           'removed: %s', error)
         return {}
 
     def _mesh_layer_coverage(self, session: CaseSession,
@@ -10287,10 +11013,11 @@ runTimeModifiable true;
         * ``blockMesh`` after its node, on every route;
         * the serial split route (one ``snappyHexMesh`` per phase, each
           overwriting the case root): each phase after its node;
-        * the MPI split route: Castellation after ``reconstructCastellation``
-          (DP-1234 added that gather), Snap after ``reconstructSnap``, and
-          Layers after the final ``reconstructPar`` (before any interface
-          couple rewrites the mesh).
+        * the MPI split route (Plan 50 IP17): Castellation after its own node,
+          kept as the processor cases; Snap likewise, or after
+          ``reconstructSnap`` when an enforcing run gathers it mid-run; and
+          the last stage after the final ``reconstructPar`` (before any
+          interface couple rewrites the mesh).
 
         Not kept, by design: the combined route's three phases -- one
         invocation, so only its finished mesh exists; it is kept whole as
@@ -10307,12 +11034,18 @@ runTimeModifiable true;
             keeps.update({phase: phase for phase in
                           ('castellation', 'snap', 'layers') if phase in ids})
             return keeps
-        if 'reconstructCastellation' in ids:
-            keeps['reconstructCastellation'] = 'castellation'
-        if 'reconstructSnap' in ids:
-            keeps['reconstructSnap'] = 'snap'
-        if 'layers' in ids and 'reconstructPar' in ids:
-            keeps['reconstructPar'] = 'layers'
+        # Plan 50 IP17 (DP-6303). The MPI route gathers once, at the end:
+        # Castellation (and Snap, unless a mid-run gather puts it in the case
+        # root) is kept as its processor cases after its own node, and the
+        # last stage after the final gather.
+        if 'castellation' in ids:
+            keeps['castellation'] = 'castellation'
+        last = 'layers' if 'layers' in ids else 'snap'
+        if 'snap' in ids and last != 'snap':
+            keeps['reconstructSnap' if 'reconstructSnap' in ids
+                  else 'snap'] = 'snap'
+        if 'reconstructPar' in ids and last in ids:
+            keeps['reconstructPar'] = last
         return keeps
 
     #: DP-1236. What a stopped or failed pipeline run left to resume from.
@@ -10400,7 +11133,7 @@ runTimeModifiable true;
             logger.warning('could not record where the run stopped',
                            exc_info=True)
 
-    def _keep_interrupted_run(self, session: CaseSession, command: Command,
+    async def _keep_interrupted_run(self, session: CaseSession, command: Command,
                               record, failed_node: str, stopped: bool,
                               stage_snapshots, resumed) -> dict:
         """Record what a stopped or failed pipeline run finished (DP-1236).
@@ -10439,8 +11172,8 @@ runTimeModifiable true;
                     snapshots.STAGE_TASKS[item['stage']],
                     from_snapshot=True) is not None:
                 recorded.append(item['stage'])
-        if any(session.case_path.glob('processor[0-9]*')):
-            self._discard_decomposition(session.case_path)
+        # Plan 50 CX1 (DP-6201). The records first: the clean-up below used
+        # to raise before where the run stopped was written.
         if kept:
             self._write_pipeline_resume(session.case_path, {
                 'run_id': self._run_manifest_id(record),
@@ -10448,9 +11181,46 @@ runTimeModifiable true;
                 'kept': kept, 'at': datetime.now(timezone.utc).isoformat()})
         else:
             self._clear_pipeline_resume(session.case_path)
-        return {'kept_stages': [item['stage'] for item in kept],
-                'recorded': recorded,
-                'resume': self._pipeline_resume_point(session, command)}
+        held = []
+        if (any(session.case_path.glob('processor[0-9]*'))
+                or self._gather_pending(session.case_path)):
+            held = (await self._discard_off_loop(session.case_path))['held']
+        answer = {'kept_stages': [item['stage'] for item in kept],
+                  'recorded': recorded,
+                  'resume': self._pipeline_resume_point(session, command)}
+        if held:
+            answer['held_processor_directories'] = held
+        return answer
+
+    async def _discard_finished_decomposition(self, session: CaseSession,
+                                              dag) -> dict:
+        """Remove a finished parallel run's processor cases (DP-6305).
+
+        Only after a run whose last gather (``reconstructPar``) ran and was
+        verified -- the caller reaches this only then -- and never for a
+        serial run. ``{}`` when nothing was removed, else
+        ``{'discarded_decomposition': [...]}`` and, for folders Windows still
+        held, ``{'held_processor_directories': [...]}``, removed by the next
+        clean-up. Never raises.
+        """
+        case = Path(session.case_path)
+        nodes = [getattr(node, 'node_id', '') for node in dag.nodes]
+        if 'reconstructPar' not in nodes or self._gather_pending(case):
+            return {}
+        if not any(path.is_dir() for path in case.glob('processor[0-9]*')):
+            return {}
+        try:
+            outcome = await self._discard_off_loop(case)
+        except Exception:                                   # noqa: BLE001
+            logger.warning('the processor cases of the finished run were '
+                           'not removed', exc_info=True)
+            return {}
+        answer = {}
+        if outcome.get('removed'):
+            answer['discarded_decomposition'] = list(outcome['removed'])
+        if outcome.get('held'):
+            answer['held_processor_directories'] = list(outcome['held'])
+        return answer
 
     def _pipeline_resume_point(self, session: CaseSession, command: Command,
                                *, engine=None) -> dict:
@@ -10546,7 +11316,8 @@ runTimeModifiable true;
         try:
             return await self._snappy_pipeline(session, command, run_log)
         finally:
-            run_log.close()
+            # DP-6481. Closing waits for the queued lines to reach the disk.
+            await asyncio.to_thread(run_log.close)
 
     def _snappy_run_job(self, record, run_log, started_at: str, *,
                         status: str, returncode=None, error=None) -> dict:
@@ -10778,7 +11549,7 @@ runTimeModifiable true;
                      for item in resumed['kept']}[from_stage]))
             if snapshots.live_mesh_is(session.case_path, from_stage,
                                       resumed['revision']):
-                self._discard_decomposition(session.case_path)
+                await self._discard_off_loop(session.case_path)
                 (session.case_path / self.PENDING_GATHER).unlink(
                     missing_ok=True)
             else:
@@ -10792,8 +11563,10 @@ runTimeModifiable true;
         # a run manifest for every run and snappy wrote none, so the Runs
         # surface could only ever show half a case's history -- which is why
         # it filtered to the Gmsh rows and called that the list.
-        record = self._open_run_manifest(
-            session, engine_id='snappy',
+        # DP-6481. Creating the run directory is a disk wait (MEASURED live:
+        # a 23.1 s mkdir on the GUI thread); the run waits, the window not.
+        record = await asyncio.to_thread(
+            self._open_run_manifest, session, engine_id='snappy',
             job={'job_digest': dag.digest if hasattr(dag, 'digest') else '',
                  'dag': dag.to_dict(), 'allocation': allocation.to_dict(),
                  # DP-678. The CPU cap beside the ranks it resolved to.
@@ -10808,7 +11581,12 @@ runTimeModifiable true;
             '+00:00', 'Z')
         if record is not None:
             from foammesh.core.jobs.run_log import RUN_LOG_NAME
-            if run_log.open(record.layout.root / RUN_LOG_NAME) is not None:
+
+            def name_the_log():
+                # DP-6481. Opening the log and rewriting the manifest wait on
+                # the disk: on a worker, not the event loop.
+                if run_log.open(record.layout.root / RUN_LOG_NAME) is None:
+                    return
                 record.document['job_id'] = self._run_manifest_id(record)
                 record.document['log_path'] = str(run_log.path)
                 try:
@@ -10816,9 +11594,12 @@ runTimeModifiable true;
                 except OSError:
                     logger.warning('the run manifest could not name its log',
                                    exc_info=True)
+            await asyncio.to_thread(name_the_log)
         on_line = run_log.tee(command.parameters.get('on_line'))
         checkpoints = []
         executions = []
+        #: Plan 50 IP3 (DP-6231). A node that stopped refining at a limit.
+        limit_warnings = []
         check_execution = None
         layers_payload = None
         keeps = self._pipeline_stage_keeps(dag.nodes)
@@ -10853,7 +11634,8 @@ runTimeModifiable true;
                         operation=f'workflow.pipeline.{node.node_id}',
                         argv=launch.argv, cwd=node.cwd,
                         mutation=node.mutates_mesh,
-                        timeout=_stage_timeout(command.parameters, 3600),
+                        timeout=_stage_timeout(command.parameters,
+                                   MESHER_STAGE_TIMEOUT),
                         max_output_bytes=10 * 1024 * 1024,
                         recover_mesh=node.mutates_mesh,
                         cleanup_argv=launch.cleanup_argv),
@@ -10866,6 +11648,9 @@ runTimeModifiable true;
                 session.case_path, parked, execution.succeeded)
                 if gathers else '')
             executions.append(execution.to_payload())
+            limit_warning = await _cell_limit_warning(execution, session.state.db)
+            if limit_warning and limit_warning not in limit_warnings:
+                limit_warnings.append(limit_warning)
             stage_job = executions[-1].get('job') or {}
             run_log.write('<== {0}: {1} (job {2}, log {3})'.format(
                 node.node_id, stage_job.get('status'),
@@ -10901,7 +11686,7 @@ runTimeModifiable true;
                 # kept is recorded done, the interrupted node alone was rolled
                 # back (the executor's recovery point, or the parked root),
                 # and the run can be resumed from the last of them.
-                interrupted = self._keep_interrupted_run(
+                interrupted = await self._keep_interrupted_run(
                     session, command, record, node.node_id, stopped,
                     stage_snapshots, resumed)
                 return OperationResult(
@@ -10918,6 +11703,10 @@ runTimeModifiable true;
                              'kept_stages': interrupted['kept_stages'],
                              'recorded_stages': interrupted['recorded'],
                              'resume': interrupted['resume'],
+                             **({'held_processor_directories':
+                                 interrupted['held_processor_directories']}
+                                if interrupted.get('held_processor_directories')
+                                else {}),
                              **({'resumed': resumed} if resumed else {}),
                              'run_id': self._run_manifest_id(record),
                              **self._snappy_run_job(
@@ -10944,7 +11733,13 @@ runTimeModifiable true;
                 # this, and a blocked run will name its fingerprint.
                 checkpoints.append(self._save_snap_checkpoint(
                     session, run_id=str(execution.to_payload().get('job_id') or '')))
-            if node.node_id in keeps:
+            if node.node_id in keeps and '-parallel' in node.argv:
+                # Plan 50 IP17 (DP-6303). The stage's result is the processor
+                # cases; they are kept as they are and gathered on demand.
+                stage_snapshots.append(await self._capture_decomposed_stage(
+                    session, engine, keeps[node.node_id],
+                    allocation.effective_ranks, execution))
+            elif node.node_id in keeps:
                 # DP-1202. The case root holds this stage's own result now and
                 # the next node is about to overwrite it.
                 stage_snapshots.append(await self._capture_stage_snapshot(
@@ -10999,7 +11794,8 @@ runTimeModifiable true;
         snapshot = engine.snapshot_run_config(session.case_path)
         stage_state = engine.mark_pipeline_run(
             session.state.db, session.case_path)
-        quality_report = self._persist_pipeline_check(session, check_execution)
+        quality_report = await self._pipeline_check_off_loop(
+            session, check_execution)
         # VI14 (LIVEV). The stage route writes foammesh/quality/layer-
         # coverage.json from the layers log; the pipeline route never did, so
         # after a run to end the file (and the Layers grown colouring that
@@ -11021,10 +11817,17 @@ runTimeModifiable true;
                 quality_verdict.get('verdict'),
                 quality_verdict.get('reason') or '').strip(),)
             if not_clean else ())
+        # Plan 50 IP3 (DP-6231). A cell limit snappy reached is the
+        # castellation task's warning, beside the checkMesh verdict's.
+        warned_tasks = (('snappy.qa',) if not_clean else ()) + (
+            ('snappy.castellation',) if limit_warnings else ())
+        if not warned_tasks:
+            warned_tasks = ('snappy.qa',)
         try:
             recorded = self._record_engine_run_success(
-                session, command, warning=not_clean,
-                warning_for=('snappy.qa',), reasons=qa_warning,
+                session, command, warning=not_clean or bool(limit_warnings),
+                warning_for=warned_tasks,
+                reasons=qa_warning + tuple(limit_warnings),
                 exclude=('snappy.layers',) if layers_skipped else ())
         except FacadeError:
             # The mesh is on disk and published; a tree that cannot be told
@@ -11032,9 +11835,9 @@ runTimeModifiable true;
             # of the run.
             recorded = None
         if recorded is not None:
-            recorded['warning'] = not_clean
-            recorded['warning_for'] = ['snappy.qa']
-            recorded['warning_reasons'] = list(qa_warning)
+            recorded['warning'] = not_clean or bool(limit_warnings)
+            recorded['warning_for'] = list(warned_tasks)
+            recorded['warning_reasons'] = list(qa_warning) + limit_warnings
             # DP-2815: which run the gates belong to, so a reopen can tell
             # whether they ran.
             recorded['pipeline_run_id'] = str(
@@ -11054,6 +11857,15 @@ runTimeModifiable true;
             stage_snapshots.append(stage_snapshot)
         # DP-1236. A finished mesh leaves nothing to resume.
         self._clear_pipeline_resume(session.case_path)
+        # Plan 50 IP17 (DP-6305). The final gather was read back against the
+        # processor cell count (a failed or unverified one returned above),
+        # and every stage of the run is kept apart from them, so the
+        # processor cases are a second copy of the finished mesh nothing
+        # reads: stage replay, showing a stage, unlock/undo and resume read
+        # the kept stages or the case root. They are removed with the
+        # decomposition record and the pending-gather marker.
+        decomposition_cleanup = await self._discard_finished_decomposition(
+            session, dag)
         self._close_run_manifest(
             record, status='succeeded',
             publication={'status': 'published',
@@ -11064,9 +11876,12 @@ runTimeModifiable true;
         return OperationResult(
             'accepted', command.operation, session.revisions,
             invalidated_outputs=('quality', 'exports'),
-            warnings=tuple(seed_warnings) + launch_warnings,
+            warnings=(tuple(seed_warnings) + launch_warnings
+                      + tuple(limit_warnings)),
             payload={'allocation': allocation.to_dict(), 'dag': dag.to_dict(),
                      **({'oversubscribed': True} if launch_warnings else {}),
+                     **({'cell_limit_warnings': list(limit_warnings)}
+                        if limit_warnings else {}),
                      **self._region_warnings_payload(seed_warnings),
                      'run_manifest': record.document if record else {},
                      'stage_snapshot': stage_snapshot,
@@ -11074,6 +11889,7 @@ runTimeModifiable true;
                                          if kept is not None],
                      'executions': executions,
                      **({'resumed': resumed} if resumed else {}),
+                     **decomposition_cleanup,
                      'qualification_mode': mode.value,
                      'checkpoints': checkpoints,
                      **self._snappy_run_job(record, run_log, run_started,
@@ -11219,6 +12035,8 @@ runTimeModifiable true;
         options = self._fluid_space_options(session, base_cell)
         try:
             field = fluid_regions.cached_detection(surfaces, box, **options)
+            if field is None and _GATE_SPACES_LABELLED.get():
+                return None     # DP-6465: the gate labelled; over budget
             if field is None:
                 field = fluid_regions.detect_blocking(
                     surfaces, box, timeout=self.SUGGEST_DETECTION_SECONDS,
@@ -12486,6 +13304,8 @@ runTimeModifiable true;
         field = fluid_regions.cached_detection(surfaces, box, **options)
         if field is not None:
             return field
+        if _GATE_SPACES_LABELLED.get():
+            return None         # DP-6465: the gate labelled; over budget
         try:
             return fluid_regions.detect_blocking(
                 surfaces, box, timeout=self.SEED_SPACE_SECONDS, **options)
@@ -12590,6 +13410,8 @@ runTimeModifiable true;
         cached = fluid_regions.cached_detection(surfaces, box, **options)
         if cached is not None:
             return cached
+        if _GATE_SPACES_LABELLED.get():
+            return None         # DP-6465: the gate labelled; over budget
         seconds = fluid_regions.RECHECK_SECONDS
         deadline = time.monotonic() + seconds
         try:
@@ -12717,22 +13539,72 @@ runTimeModifiable true;
         ``payload['region_warnings']``.
         """
         excludes = self._exclude_point_rows(session)
-        adopted = self._default_fluid_region(session)
-        # Plan 37 UF18: an exclude point is judged against the labelled
-        # domain even with one region, so the field is primed for it too.
-        await self._prime_seed_spaces(session, force=bool(excludes))
-        warnings = list(self._validate_fluid_seed(
-            session, allow_region_clash=allow_region_clash) or ())
-        if adopted:
-            warnings.insert(0, adopted)
-        if excludes:
-            warnings.extend(self._exclude_point_gate(session, excludes))
-        warnings.extend(self._farfield_seed_gate(session, excludes))
-        # Plan 37 #1 / #2: a flush box under an outside seed, seeds on both
-        # sides of one closed surface, External on a duct -- said, not refused.
-        warnings.extend(self._placement_seed_gate(session))
+        # DP-6465: every check below reads the labelled fluid spaces, and a
+        # check that found none cached waited for the labelling on this
+        # thread. They are labelled off it first, here and in
+        # `_prime_seed_spaces`, and the checks answer from memory.
+        await self._prime_gate_spaces(session)
+        labelled = _GATE_SPACES_LABELLED.set(True)
+        try:
+            adopted = self._default_fluid_region(session)
+            # Plan 37 UF18: an exclude point is judged against the labelled
+            # domain even with one region, so the field is primed for it too.
+            await self._prime_seed_spaces(session, force=bool(excludes))
+            warnings = list(self._validate_fluid_seed(
+                session, allow_region_clash=allow_region_clash) or ())
+            if adopted:
+                warnings.insert(0, adopted)
+            if excludes:
+                warnings.extend(self._exclude_point_gate(session, excludes))
+            warnings.extend(self._farfield_seed_gate(session, excludes))
+            # Plan 37 #1 / #2: a flush box under an outside seed, seeds on
+            # both sides of one closed surface, External on a duct -- said,
+            # not refused.
+            warnings.extend(self._placement_seed_gate(session))
+        finally:
+            _GATE_SPACES_LABELLED.reset(labelled)
         self._record_retained_estimate(session, excludes)
         return warnings
+
+    async def _prime_gate_spaces(self, session: CaseSession) -> None:
+        """DP-6465: label the fluid spaces for the launch gate, off the loop.
+
+        `_prime_seed_spaces` labels them only for two regions or an exclude
+        point, the cases Plan 36 and UF18 judged. Since then a case with no
+        region takes its default fluid region from the labelled spaces
+        (UXA1) and a case with one is judged for where its seed sits (Plan
+        37 #1 / #2), and both asked synchronously: `detect_blocking` hands
+        the work to the VTK worker and waits for it on the calling thread.
+        Pressed from the window, Run held the GUI through that wait (12.2 s
+        measured live with the checks after it). The labelling is awaited
+        here instead, within the budget the checks gave it; one that runs
+        over leaves no field and the checks go on without it, as before.
+        """
+        import time
+
+        from foammesh.core.mesh import fluid_regions
+        from foammesh.support.vtk_threads import vtk_run_in_thread
+
+        try:
+            regions = session.state.db.getElements('region')
+            if regions and (len(regions) >= 2
+                            or self._exclude_point_rows(session)):
+                return      # `_prime_seed_spaces` labels these, unbounded
+            inputs = self._fluid_space_inputs(session)
+        except Exception:  # noqa: BLE001 - the gate reports what is wrong
+            return
+        if inputs is None:
+            return
+        surfaces, _geometry_bounds, box, base_cell = inputs
+        deadline = time.monotonic() + max(self.SEED_SPACE_SECONDS,
+                                          self.SUGGEST_DETECTION_SECONDS)
+        try:
+            await vtk_run_in_thread(
+                fluid_regions.run_detection, surfaces, box,
+                cancelled=lambda: time.monotonic() > deadline,
+                **self._fluid_space_options(session, base_cell))
+        except Exception:  # noqa: BLE001 - over budget or unlabellable: the
+            return         # checks go on without the field
 
     def _default_walls_group(self, session: CaseSession,
                              prepared=None) -> bool:
@@ -13877,7 +14749,8 @@ runTimeModifiable true;
             session, OperationSpec(
                 operation=command.operation, argv=argv,
                 cwd=session.case_path, mutation=True,
-                timeout=_stage_timeout(command.parameters, 3600),
+                timeout=_stage_timeout(command.parameters,
+                                   MESHER_STAGE_TIMEOUT),
                 max_output_bytes=4 * 1024 * 1024,
                 log_path=session.case_path / 'foammesh' / 'logs'
                 / 'refineMesh.log',
@@ -13981,7 +14854,8 @@ runTimeModifiable true;
             operation=command.operation,
             argv=launch.argv,
             cwd=session.case_path,
-            timeout=_stage_timeout(command.parameters, 900),
+            timeout=_stage_timeout(command.parameters,
+                                   MESHER_STAGE_TIMEOUT),
             max_output_bytes=4 * 1024 * 1024,
             expected_artifacts=(ExpectedArtifact(
                 report_path, kind='quality-report',
@@ -16338,11 +17212,38 @@ runTimeModifiable true;
                 'error': 'handoff_check_failed',
                 'handoff': error.result.summary()}) from error
         except (OSError, ValueError, RuntimeError) as error:
-            raise ValidationFailedError(str(error)) from error
+            raise ValidationFailedError(
+                self._su2_target_openfoam_refusal(session) or str(error)
+            ) from error
         payload = dict(payload or {})
         self._record_export_intent(session, 'openfoam', destination)
         payload['qualification'] = qualification
         return self._read_result(session, command, payload)
+
+    @staticmethod
+    def _su2_target_openfoam_refusal(session: CaseSession) -> str:
+        """Why an OpenFOAM export of an SU2-target case has nothing to hand
+        over, or ``''`` when that is not the reason.
+
+        DP-6473. MEASURED (walk ``g-su2``): the refusal read "nothing to
+        export: no mesh was found in a time directory or in
+        constant/polyMesh", which does not say that the SU2 target is why
+        (Plan 28: an SU2 run publishes no polyMesh by design).
+        """
+        mesh = Path(session.case_path) / 'constant' / 'polyMesh'
+        if (mesh / 'points').exists() or (mesh / 'faces').exists():
+            return ''
+        try:
+            from foammesh.core.engine.registry import configured_target_solver
+            target = configured_target_solver(session.state.db)
+        except Exception:                                    # noqa: BLE001
+            return ''
+        if target != 'su2':
+            return ''
+        return ('this case is meshed for SU2, and a run for SU2 publishes no '
+                'OpenFOAM mesh (constant/polyMesh); export its mesh as SU2, '
+                'MSH or VTU, or choose OpenFOAM as the target solver and mesh '
+                'the case again')
 
 
 #: The check-task table at module level, for the callers that never hold a
@@ -16591,3 +17492,48 @@ def _settle_pipeline_run(case_path, run_id: str) -> None:
     except OSError:
         logger.warning('could not note the settled pipeline gates',
                        exc_info=True)
+
+
+def _is_run_cancelled(error) -> bool:
+    details = getattr(error, 'details', None) or {}
+    return isinstance(details, dict) and details.get('cancelled') is True
+
+
+def _stage_run_cancelled(stage):
+    """DP-6505. The error a cancelled stage run ends with (as DP-6498)."""
+    return PreconditionFailedError(
+        'the run was cancelled before it finished',
+        details={'error': 'run_cancelled', 'cancelled': True,
+                 'stage': stage})
+
+
+def _stored_diagonal(case_path):
+    """DP-6507. The diagonal of the union of the store's recorded bounds, or
+    ``None`` when any entry records none (the caller then reads the surfaces)."""
+    from foammesh.core.geometry import GeometryArtifactStore
+    from foammesh.core.geometry.bbox import BBox
+
+    try:
+        entries = GeometryArtifactStore(case_path).entries()
+    except Exception:                                       # noqa: BLE001
+        return None
+    lows, highs = [], []
+    for entry in entries:
+        bounds = entry.get('bbox') if isinstance(entry, dict) else None
+        try:
+            if bounds is None or len(bounds) != 6:
+                return None
+            x0, x1, y0, y1, z0, z1 = (float(value) for value in bounds)
+        except (TypeError, ValueError):
+            return None
+        lows.append((x0, y0, z0))
+        highs.append((x1, y1, z1))
+    if not lows:
+        return None
+    try:
+        box = BBox.from_bounds([min(p[0] for p in lows), max(p[0] for p in highs),
+                                min(p[1] for p in lows), max(p[1] for p in highs),
+                                min(p[2] for p in lows), max(p[2] for p in highs)])
+        return float(box.diagonal)
+    except (TypeError, ValueError):
+        return None

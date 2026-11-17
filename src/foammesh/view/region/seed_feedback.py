@@ -15,7 +15,7 @@ open it:
 * and says the same thing in words, on a status line under the coordinates.
 
 Plan 36 RP10. A screen reader hears where the seed is and what it will mesh,
-as an accessible description ("x 0.08, y 0, z 0.25 metres. Inside Fluid space
+as an accessible description ("x 0.08, y 0, z 0.25 metres. Inside Space
 1, 0.0100 cubic metres."). It is written when a placement finishes -- a drag
 released, a nudge, a typed value -- and not on every frame of a drag, which
 would be read out as noise.
@@ -284,7 +284,7 @@ class SeedFeedback(QLabel):
         if space is None or not space.label:
             return
         if not space.outside and verdict == 'inside':
-            name = state.get('name') or self.tr('the fluid space')
+            name = state.get('name') or self.tr('the space')
             self.setText(self.tr(SPACE_MESSAGES['inside']).format(
                 name=name, volume=_volume(space.volume)))
             self._spaceText = self.tr(SPOKEN_SPACE).format(

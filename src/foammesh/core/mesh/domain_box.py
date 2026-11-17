@@ -295,6 +295,17 @@ def domain_box(db, case_path=None, geometry_bounds=None, *,
                      else builder.farfield_block(bounds))
         if enclosing is not None:
             bounds = tuple(float(value) for value in enclosing)
+        # Plan 50 IP26 (DP-6234). A target-size block is padded to whole
+        # cubic cells, by the writer's own rule -- and (DP-6425) given its
+        # one-cell default clearance round closed geometry at standoff 0.
+        if builder is not None:
+            from foammesh.core.geometry import BBox
+            try:
+                bounds = tuple(float(value) for value in
+                               builder.cubic_bounds(
+                                   BBox(*bounds), standoff=margin).to_tuple())
+            except ValueError:
+                pass            # a target the writer refuses; it says why
         return DomainBox(bounds, GEOMETRY, scale)
     if case_path is not None:
         return written_domain_box(case_path)

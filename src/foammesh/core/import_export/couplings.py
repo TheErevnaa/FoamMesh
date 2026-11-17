@@ -64,6 +64,19 @@ def recorded_couplings(case_path) -> list[dict]:
     return snappy or gmsh
 
 
+def pairs_left_for_export(case_path) -> int:
+    """How many pairs the snappyHexMesh mesh holds as plain walls until Export.
+
+    snappy records its pairs in the case group manifest and the export joins
+    them; the mesh itself shows two walls. Gmsh builds its pairs in the mesh,
+    so for a Gmsh-published mesh there is nothing left for Export to join.
+    """
+    from foammesh.openfoam.case_builder import group_manifest_path
+    if _publishing_engine(case_path) == 'gmsh':
+        return 0
+    return len(_manifest_couplings(group_manifest_path(case_path)))
+
+
 def _manifest_couplings(path) -> list[dict]:
     if not path.is_file():
         return []

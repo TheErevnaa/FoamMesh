@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 import json
+import logging
 import re
 import uuid
 
@@ -18,7 +19,8 @@ from foammesh.core.engine.base import StageRun
 
 from .manifest import RunBuilder, RunLayout
 from .plan_derivation import (
-    JobIntent, companion_export_formats, derive_from_native,
+    HEXAHEDRAL_ON_CURVES, JobIntent, companion_export_formats,
+    derive_from_native,
 )
 
 JOB_SCHEMA_VERSION = 1
@@ -39,6 +41,67 @@ class ExecutionError(RuntimeError):
         self.details = dict(details or {})
 
 
+logger = logging.getLogger(__name__)
+
+#: Plan 50 IP23 (DP-6253). What reading a configuration raises when the list
+#: or the field is simply not there: ``KeyError`` from a dict and simple_db,
+#: and simple_db's own ``LookupError``. Anything else is a read that failed.
+_ABSENT = (LookupError,)
+
+
+def _unreadable(what: str, error: BaseException) -> ExecutionError:
+    """Log a failed read and make it the job preparation's refusal."""
+    logger.warning('the %s could not be read: %s: %s', what,
+                   type(error).__name__, error)
+    return ExecutionError(
+        f'the {what} could not be read from the project, so the Gmsh job '
+        f'was not written: {type(error).__name__}: {error}')
+
+
+def _configuration_rows(db, path: str, what: str) -> dict:
+    """The rows of list *path*; ``{}`` only when the project has none.
+
+    DP-6253. ``data()`` is read first (the whole document, no copy), then
+    ``getElements``; an absent list is empty, a read that fails is raised
+    as an :class:`ExecutionError` naming *what*.
+    """
+    rows = None
+    content = getattr(db, 'data', None)
+    if callable(content):
+        try:
+            document = content() or {}
+            rows = document.get(path) if '/' not in path else None
+        except _ABSENT:
+            rows = None
+        except Exception as error:                  # noqa: BLE001 - re-raised
+            raise _unreadable(what, error) from error
+    if isinstance(rows, dict):
+        return rows
+    getter = getattr(db, 'getElements', None)
+    if getter is None:
+        return {}
+    try:
+        return dict(getter(path) or {})
+    except _ABSENT:
+        return {}
+    except Exception as error:                      # noqa: BLE001 - re-raised
+        raise _unreadable(what, error) from error
+
+
+def _row_field(row, key, default, what: str):
+    """One field of a configuration row; *default* only when it is absent."""
+    if isinstance(row, dict):
+        value = row.get(key, default)
+    else:
+        try:
+            value = row.value(key)
+        except _ABSENT:
+            return default
+        except Exception as error:                  # noqa: BLE001 - re-raised
+            raise _unreadable(what, error) from error
+    return getattr(value, 'value', value)
+
+
 def assembly_layer_refusal(volumes: int) -> str:
     """Word for word what ``runner_v1`` says, said before the run starts.
 
@@ -47,14 +110,34 @@ def assembly_layer_refusal(volumes: int) -> str:
     `test_the_seam_refuses_in_the_words_the_runner_would_have_used`
     reconstructs the runner's copy from its source and compares the two, so
     the pair cannot drift into two explanations of one refusal.
+
+    Plan 50 IP28 (DP-6437). The runner grows layers in every volume a
+    selection names, so a selection spanning volumes is no longer refused.
+    What is still refused is a selection made only of faces two volumes
+    share: nothing says which side the layer is for. *volumes* is how many
+    volumes those faces all bound.
     """
-    return (f'boundary layers are not supported on a {volumes}'
-            '-volume assembly unless every patch they grow on bounds '
-            'one and the same volume: the layer is carved out of a '
-            'single core, and a selection spanning more than one '
-            'leaves neither side closed. Name the patches of one '
-            'volume, mesh this geometry without layers, or split it '
-            'into one job per volume.')
+    return ('the boundary layer was asked for on surfaces that bound '
+            f'{volumes} volumes and on nothing else, so there '
+            'is no way to tell which side of the interface it belongs '
+            'on. Name a patch that bounds only the volume the layer '
+            'is for as well.')
+
+
+def holed_volume_layer_refusal(volumes: int) -> str:
+    """A selection over several volumes, one of which has a hole.
+
+    Plan 50 IP28 (DP-6437). The runner grows layers in several volumes at
+    once only where each is bounded by one shell, and refuses otherwise
+    naming the volume (``stages/layers.py``). Before the run the volume
+    cannot be named -- the topology records the void but not which domain
+    holds it -- so this is the runner's sentence with the name left out.
+    """
+    return (f'boundary layers were asked for in {volumes} volumes at once, '
+            'and one of them has a hole in it (its boundary is more than one '
+            'shell): layers are grown in several volumes at once only where '
+            'each is bounded by one shell. Name the patches of one volume '
+            'alone.')
 
 
 def nothing_chosen_layer_refusal() -> str:
@@ -407,31 +490,13 @@ def interface_pair_rows(db) -> list[dict]:
     from the face the two solids share. The runner acts on none of these; it
     is given them so it can say, pair by pair, what the mesh did there.
     """
-    rows = None
-    content = getattr(db, 'data', None)
-    if callable(content):
-        try:
-            rows = (content() or {}).get('interfacePairs')
-        except Exception:
-            rows = None
-    if not isinstance(rows, dict):
-        getter = getattr(db, 'getElements', None)
-        if getter is None:
-            return []
-        try:
-            rows = dict(getter('interfacePairs'))
-        except Exception:
-            return []
+    # Plan 50 IP23 (DP-6253). Any error used to read as "no pairs", so a
+    # project whose pairs could not be read meshed as one that had none.
+    what = 'interface pairs'
+    rows = _configuration_rows(db, 'interfacePairs', what)
 
     def field(row, key, default=None):
-        if isinstance(row, dict):
-            value = row.get(key, default)
-        else:
-            try:
-                value = row.value(key)
-            except Exception:
-                return default
-        return getattr(value, 'value', value)
+        return _row_field(row, key, default, what)
 
     pairs = []
     for key, row in sorted((rows or {}).items(), key=lambda item: str(item[0])):
@@ -499,7 +564,28 @@ def seed_point(prepared_geometry):
     return seed if len(seed) == 3 else None
 
 
-def shell_roles(prepared_geometry) -> dict:
+def typed_solid_regions(db) -> set:
+    """Prepared region UUIDs the user typed solid and left included.
+
+    The prepared manifest keeps the type a region was imported with; applying
+    "how many regions?" types the volume control instead, so the runner could
+    not tell a solid nested in the fluid from a hole (G10).
+    """
+    getter = getattr(db, 'getElements', None)
+    if getter is None:
+        return set()
+    try:
+        rows = dict(getter('gmsh/volumeControls') or {})
+    except Exception:  # noqa: BLE001 - a case without the list
+        return set()
+    from foammesh.core.mesh.cad_solids import typing_of
+
+    return {token for token, item in typing_of(rows).items()
+            if item.get('included', True)
+            and str(item.get('type') or '').lower() == 'solid'}
+
+
+def shell_roles(prepared_geometry, solid_regions=()) -> dict:
     """Staged file stem -> the role its shell was declared to have.
 
     Only geometries that say something appear here: the runner infers a role
@@ -520,6 +606,17 @@ def shell_roles(prepared_geometry) -> dict:
         if not role or not name:
             continue
         roles[Path(name).stem] = role
+    # A source whose every region the user typed solid is a body, not a hole.
+    by_source: dict[str, list[str]] = {}
+    for region in _group_manifest(prepared_geometry).get('regions') or ():
+        if isinstance(region, dict) and region.get('included', True):
+            by_source.setdefault(str(region.get('geometry_id') or ''),
+                                 []).append(
+                str(region.get('region_uuid') or ''))
+    for source, tokens in by_source.items():
+        if (source and source not in roles and tokens
+                and all(token in set(solid_regions) for token in tokens)):
+            roles[source] = 'solid'
     return roles
 
 
@@ -593,31 +690,13 @@ def region_display_names(db) -> dict:
     every volume the tree composed rather than read -- simply is not here, and
     the region keeps the name it always had.
     """
-    rows = None
-    content = getattr(db, 'data', None)
-    if callable(content):
-        try:
-            rows = (content() or {}).get('geometry')
-        except Exception:
-            rows = None
-    if not isinstance(rows, dict):
-        getter = getattr(db, 'getElements', None)
-        if getter is None:
-            return {}
-        try:
-            rows = dict(getter('geometry'))
-        except Exception:
-            return {}
+    # Plan 50 IP23 (DP-6253). Any error used to read as "no volume rows",
+    # so the zones published under the importer's names and nothing said why.
+    what = 'volume rows of the project tree'
+    rows = _configuration_rows(db, 'geometry', what)
 
     def field(row, key):
-        if isinstance(row, dict):
-            value = row.get(key)
-        else:
-            try:
-                value = row.value(key)
-            except Exception:
-                return ''
-        return str(getattr(value, 'value', value) or '').strip()
+        return str(_row_field(row, key, '', what) or '').strip()
 
     names: dict[str, str] = {}
     for row in (rows or {}).values():
@@ -649,8 +728,12 @@ def typed_region_names(db) -> dict:
         return {}
     try:
         rows = dict(getter('gmsh/volumeControls') or {})
-    except Exception:  # noqa: BLE001 - a case without the list
+    except _ABSENT:  # a case without the list
         return {}
+    except Exception as error:                      # noqa: BLE001 - re-raised
+        # Plan 50 IP23 (DP-6253): unreadable is not absent.
+        raise _unreadable('region names of the volume controls',
+                          error) from error
     from foammesh.core.mesh.cad_solids import typing_of
 
     names: dict[str, str] = {}
@@ -860,14 +943,16 @@ def source_identity_records(prepared_geometry) -> list[dict]:
     shared = shared_surface_aliases(prepared_geometry)
     confidence: dict[str, float] = {}
     counted: dict[str, int] = {}
+    numbered: dict[str, set] = {}
     for group in groups:
         source_id = _source_of(group)
         if not source_id:
             continue
         value = float((group or {}).get('mapping_confidence', 1.0) or 0.0)
         confidence[source_id] = min(confidence.get(source_id, 1.0), value)
-        counted[source_id] = counted.get(source_id, 0) + len(
-            group_surface_indices(group))
+        indices = group_surface_indices(group)
+        counted[source_id] = counted.get(source_id, 0) + len(indices)
+        numbered.setdefault(source_id, set()).update(indices)
     records = []
     for index, record in enumerate(manifest.get('sources') or ()):
         if not isinstance(record, dict):
@@ -887,6 +972,12 @@ def source_identity_records(prepared_geometry) -> list[dict]:
             'shared_surfaces': {
                 str(alias): int(first) for alias, first in sorted(
                     (shared.get(source_id) or {}).items())},
+            # DP-6122. The number each listing of the file goes by, in file
+            # order. A body the interface split cut keeps its solids' own
+            # numbers -- `face1`, `face2` once `face0` became the interface --
+            # and the runner, which numbered listings by position, gave
+            # `face1`'s name to the second listing.
+            'surface_indices': sorted(numbered.get(source_id) or ()),
         })
     return records
 
@@ -1088,7 +1179,7 @@ def surface_names(prepared_geometry) -> dict:
 def build_job(intent: JobIntent, *, geometry, outputs: dict,
               prepared_geometry=None, run_id: str = '',
               profile=None, surface_output=None,
-              region_names: dict | None = None,
+              region_names: dict | None = None, solid_regions=(),
               interface_pairs=(), execution: dict | None = None) -> dict:
     """Assemble the immutable job the runner consumes.
 
@@ -1147,7 +1238,7 @@ def build_job(intent: JobIntent, *, geometry, outputs: dict,
         # domain and a declared role overrides what nesting would infer.
         # Absent means "infer", which is what every job carried until now.
         'seedPoint': seed_point(prepared_geometry),
-        'shellRoles': shell_roles(prepared_geometry),
+        'shellRoles': shell_roles(prepared_geometry, solid_regions),
         # DP-548. Every enabled interface pair the user authored, so the
         # result can say what became of each one.
         'interfacePairs': [dict(pair) for pair in interface_pairs or ()],
@@ -1198,6 +1289,7 @@ def derive_page_intent(db, bbox, case_path, *, prepared_geometry=None,
     both call this, so a control on a page has one meaning whichever way the
     mesh is made. Nothing here depends on which path is asking.
     """
+    from foammesh.core.engine.gmsh import execution_policy
     from foammesh.core.engine.registry import configured_target_solver
 
     intent = derive_from_native(
@@ -1208,13 +1300,26 @@ def derive_page_intent(db, bbox, case_path, *, prepared_geometry=None,
         # Gmsh tag that is belongs to the revision being written, not to the
         # saved row.
         prepared_geometry=prepared_geometry,
+        # DP-6469. The thread count comes from Mesh setup's execution policy,
+        # as the Sizing page says it does. Without it the stored default of 1
+        # reached Gmsh on every run the window, the local API or the session
+        # started, while the page said "Mesh setup (4 threads)".
+        resource_policy=execution_policy(db),
         metadata={'engine_id': 'gmsh', 'run_id': run_id})
     # Plan 49 SR5 (DP-5783). The surface roles and relations of the patches
     # this revision prepared, in the intent so the digest covers them.
-    from .surface_roles import lowered_surface_intent
+    from .surface_roles import lowered_surface_intent, window_surface_names
     block = lowered_surface_intent(db, prepared_geometry)
     if block:
         intent = replace(intent, surface_intent=block)
+    # DP-6472. A layer set on the name the window shows (the tree's
+    # `left_surface`) reaches the surface the run imports (`left`); the job
+    # carries the imported names only.
+    if intent.layers.patches or intent.layers.stacks:
+        renamed = intent.layers.named_as_imported(
+            window_surface_names(db, prepared_geometry))
+        if renamed != intent.layers:
+            intent = replace(intent, layers=renamed)
     # Plan 41 GN25f. The automatic size field as the background field: a
     # field that is switched on and cannot be used refuses here, with the
     # reason, rather than meshing without it.
@@ -1334,6 +1439,54 @@ def check_job(db, intent, prepared_geometry, geometry,
         raise ExecutionError(refusal)
 
 
+def _hexahedra_are_swept(steps, intent) -> bool:
+    """True when the hexahedra come from a sweep with layers or a structured
+    row rather than from subdividing tetrahedra (DP-6146)."""
+    for step in steps or ():
+        params = step.get('params') or {}
+        if params.get('layers') or params.get('layer_counts'):
+            return True
+    return any(getattr(op, 'enabled', True)
+               and op.kind in ('transfiniteVolume', 'transfiniteAutomatic')
+               for op in getattr(intent.structure, 'ops', ()))
+
+
+BUILDER_SEED_MARK = 'foammesh/builder_seed.json'
+_SEED_PATH = (Path(__file__).resolve().parents[3] / 'resources' / 'gmsh'
+              / 'builder_seed.step')
+
+
+def seed_builder_only_case(case_path) -> None:
+    """Import the built-in seed solid into a case that has only a build.
+
+    DP-6151. The seed is a throw-away box: the runner removes everything the
+    import made before the build is replayed (``job['builder_seed']``), so
+    the model is what the person built and nothing else."""
+    from foammesh.core.geometry import GeometryArtifactStore
+
+    case_path = Path(case_path)
+    seed = _SEED_PATH
+    GeometryArtifactStore(case_path).import_file(seed)
+    mark = case_path / BUILDER_SEED_MARK
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text('{"seed": "builder_seed.step"}', encoding='utf-8')
+
+
+def _only_the_seed(case_path, geometry) -> bool:
+    """True when the one source the run imports is the built-in seed, so a
+    case that later imports real geometry is never cleared (DP-6151)."""
+    if not (Path(case_path) / BUILDER_SEED_MARK).exists() or not geometry:
+        return False
+    seed = _SEED_PATH
+    try:
+        import hashlib
+        want = hashlib.sha256(seed.read_bytes()).hexdigest()
+        return all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == want
+                   for p in geometry)
+    except (OSError, ValueError):
+        return False
+
+
 def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
               run_id: str = '', formats=('msh',)) -> dict:
     """Derive and persist one run's job. Returns the created run manifest."""
@@ -1375,14 +1528,22 @@ def write_job(db, bbox, case_path, *, prepared_geometry=None, profile=None,
         surface_output=layout.surface,
         # DP-419. What the user called each body, where the tree knows.
         region_names=region_display_names(db),
+        solid_regions=typed_solid_regions(db),
         interface_pairs=job_interface_pairs(db, intent),
         execution=_execution_record(db, intent.parallel.threads))
     # Plan 48 GM5 (DP-4165). What the window's Geometry builder made, so a
     # batch run rebuilds it on the runner's `geometry` stage.
     steps = geometry_build_steps(case_path)
     warnings = list(intent.warnings)
+    if _hexahedra_are_swept(steps, intent):
+        # DP-6146. The caution is about hexahedra made by subdividing
+        # tetrahedra; a sweep with layers or a transfinite volume makes them
+        # directly, so on those meshes the sentence was untrue.
+        warnings = [w for w in warnings if w != HEXAHEDRAL_ON_CURVES]
     if steps:
         job['geometry_build'] = steps
+        if _only_the_seed(case_path, geometry):
+            job['builder_seed'] = True
         with_build_roles(job, case_path)
         note = build_replaced_layer_note(case_path, intent)
         if note:
@@ -1462,6 +1623,7 @@ def session_job(db, bbox, case_path, *, prepared_geometry=None,
         intent, geometry=geometry, outputs={},
         prepared_geometry=prepared_geometry, profile=profile,
         region_names=region_display_names(db),
+        solid_regions=typed_solid_regions(db),
         interface_pairs=job_interface_pairs(db, intent),
         execution=_execution_record(db, intent.parallel.threads))
     return with_build_roles(job, case_path)
@@ -1713,7 +1875,8 @@ def grade_layer_selection(selected, owners) -> tuple:
 
 #: The two states :func:`grade_layer_selection` returns for a selection the
 #: runner will not grow layers on.
-REFUSED_LAYER_GRADES = ('shared', 'spanning')
+#: Plan 50 IP28 (DP-6437): a spanning selection is grown volume by volume.
+REFUSED_LAYER_GRADES = ('shared',)
 
 
 def shells_by_source(topology) -> dict:
@@ -1840,22 +2003,37 @@ def layer_selection_refusal(prepared_geometry, enabled, patches,
     """
     if not enabled:
         return ''
+    if _grows_on_nothing(patch_mode, patches):
+        return nothing_chosen_layer_refusal()
     volumes, counted_by = prepared_volume_count(prepared_geometry)
-    if counted_by == 'unknown' or volumes <= 1:
-        return (nothing_chosen_layer_refusal()
-                if _grows_on_nothing(patch_mode, patches) else '')
-    if not patches:
-        return assembly_layer_refusal(volumes)
-    named = {str(name).strip() for name in patches}
-    if named & sources_that_span_volumes(prepared_geometry):
-        return assembly_layer_refusal(volumes)
-    # DP-365. The same question asked of the patches a source actually owns,
-    # for the imports whose patch names are not the source's own name.
-    if selection_covers_a_spanning_source(prepared_geometry, named):
-        return assembly_layer_refusal(volumes)
+    if counted_by == 'unknown' or volumes <= 1 or not patches:
+        # Plan 50 IP28 (DP-6437). An assembly with every eligible wall, a
+        # selection spanning volumes, or one covering a source with several
+        # shells is grown volume by volume by the runner: a wall two layered
+        # volumes share is left bare and named there, not refused here.
+        return ''
     owners = regions_by_patch(prepared_regions(_group_manifest(prepared_geometry)))
-    state, _common = grade_layer_selection(patches, owners)
-    return assembly_layer_refusal(volumes) if state in REFUSED_LAYER_GRADES else ''
+    state, common = grade_layer_selection(patches, owners)
+    if state in REFUSED_LAYER_GRADES:
+        return assembly_layer_refusal(len(common))
+    # Plan 50 IP28 (DP-6437). Grown in both volumes of a two-volume model
+    # that records a void: the void is a hole in one of the two, and the
+    # runner refuses a holed volume when several are layered. With more
+    # volumes the void may sit in one that grows nothing, so it is left to
+    # the runner rather than refused on a guess.
+    named = set(patches)
+    spans = (state == 'spanning'
+             or bool(named & sources_that_span_volumes(prepared_geometry))
+             or selection_covers_a_spanning_source(prepared_geometry, named))
+    if spans and volumes == 2 and _recorded_voids(prepared_geometry):
+        return holed_volume_layer_refusal(volumes)
+    return ''
+
+
+def _recorded_voids(prepared_geometry) -> bool:
+    topology = (prepared_manifest(prepared_geometry).get('preparation')
+                or {}).get('topology') or {}
+    return any(str(shell).strip() for shell in topology.get('voids') or ())
 
 
 def _grows_on_nothing(patch_mode, patches) -> bool:

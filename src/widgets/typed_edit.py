@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QLineEdit
 class FloatEdit(QLineEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setValidator(QDoubleValidator())
+        self.setValidator(QDoubleValidator(self))  # DP-6407: goes with the box
 
     def validate(self, name: str, low: Optional[float] = None,
                  high: Optional[float] = None, lowInclusive=True, highInclusive=True):
@@ -23,16 +23,16 @@ class FloatEdit(QLineEdit):
 class IdentifierEdit(QLineEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[A-Za-z][A-Za-z0-9_.]*')))
+        self.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[A-Za-z][A-Za-z0-9_.]*'), self))
 
 
 class MonitorNameEdit(QLineEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[A-Za-z_][A-Za-z0-9_.-]*')))
+        self.setValidator(QRegularExpressionValidator(QRegularExpression(r'^[A-Za-z_][A-Za-z0-9_.-]*'), self))
 
 
 class IntEdit(QLineEdit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.setValidator(QIntValidator())
+        self.setValidator(QIntValidator(self))

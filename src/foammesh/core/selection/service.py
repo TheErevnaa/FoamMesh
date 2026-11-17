@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import weakref
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterable
@@ -121,22 +123,70 @@ class SelectionSnapshot:
 
 
 class SelectionSignal:
-    """Small dependency-free signal used by core and straightforward tests."""
+    """Small dependency-free signal used by core and straightforward tests.
+
+    DP-6407. The service lives as long as the app, so a strong reference to a
+    bound method kept every row panel that subscribed -- and through it the
+    whole task page, its forms and editors -- alive after File > Close:
+    ~7,000 Python objects and the wrappers of ~2,900 deleted widgets a round
+    in the live soak. A bound method is held weakly, and a listener whose Qt
+    object has been deleted is dropped, so subscribing does not keep a page.
+    Plain functions and lambdas are still held strongly: nothing else owns
+    them.
+    """
 
     def __init__(self):
-        self._listeners: list[Callable] = []
+        self._listeners: list = []
+
+    @staticmethod
+    def _entry(listener: Callable):
+        if getattr(listener, '__self__', None) is not None and hasattr(listener, '__func__'):
+            return weakref.WeakMethod(listener)
+        return listener
+
+    @staticmethod
+    def _resolve(entry):
+        """The callable, or None once its owner is gone (or its widget deleted)."""
+        listener = entry() if isinstance(entry, weakref.WeakMethod) else entry
+        if listener is None:
+            return None
+        owner = getattr(listener, '__self__', None)
+        if owner is not None and _deleted_qt_object(owner):
+            return None
+        return listener
+
+    def _live(self) -> list[Callable]:
+        live, kept = [], []
+        for entry in self._listeners:
+            listener = self._resolve(entry)
+            if listener is not None:
+                live.append(listener)
+                kept.append(entry)
+        self._listeners = kept
+        return live
 
     def connect(self, listener: Callable) -> None:
-        if listener not in self._listeners:
-            self._listeners.append(listener)
+        if listener not in self._live():
+            self._listeners.append(self._entry(listener))
 
     def disconnect(self, listener: Callable) -> None:
-        if listener in self._listeners:
-            self._listeners.remove(listener)
+        self._listeners = [entry for entry in self._listeners
+                           if self._resolve(entry) not in (None, listener)]
 
     def emit(self, *args) -> None:
-        for listener in tuple(self._listeners):
+        for listener in self._live():
             listener(*args)
+
+
+def _deleted_qt_object(owner) -> bool:
+    """True for a Qt wrapper whose C++ object is gone (shiboken, if loaded)."""
+    shiboken = sys.modules.get('shiboken6')
+    if shiboken is None:
+        return False
+    try:
+        return isinstance(owner, shiboken.Shiboken.Object) and not shiboken.isValid(owner)
+    except Exception:                                       # noqa: BLE001
+        return False
 
 
 class SelectionService:
@@ -270,16 +320,42 @@ class SelectionService:
     @property
     def pick_source(self):
         """The object behind the driver (the picker's panel), or None."""
-        return self._pick_source
+        if self._driver() is None:
+            return None
+        source = self._pick_source
+        return source() if isinstance(source, weakref.ref) else source
 
     def set_pick_driver(self, driver: Callable | None, source=None) -> None:
         """Register the picker that serves requests; ``driver(request)``
-        returns True when it started, False (after ``refuse``) when not."""
-        self._pick_driver = driver
-        self._pick_source = source if driver is not None else None
+        returns True when it started, False (after ``refuse``) when not.
+
+        DP-6407. The service outlives every page: a bound-method driver and
+        its source are held weakly, so a closed project's picker panel (and
+        its page) is not kept, and a deleted picker counts as no picker.
+        """
+        if driver is None:
+            self._pick_driver = None
+            self._pick_source = None
+            return
+        self._pick_driver = SelectionSignal._entry(driver)
+        try:
+            self._pick_source = (weakref.ref(source) if source is not None
+                                 else None)
+        except TypeError:
+            self._pick_source = source
+
+    def _driver(self) -> Callable | None:
+        """The live driver, or None (dropped once its owner is gone)."""
+        if self._pick_driver is None:
+            return None
+        driver = SelectionSignal._resolve(self._pick_driver)
+        if driver is None:
+            self._pick_driver = None
+            self._pick_source = None
+        return driver
 
     def has_pick_driver(self) -> bool:
-        return self._pick_driver is not None
+        return self._driver() is not None
 
     @property
     def active_pick(self):
@@ -320,7 +396,8 @@ class SelectionService:
                 '%s cannot be picked with the %s engine here.'
                 % (', '.join(missing), engine))
             return False
-        if self._pick_driver is None:
+        driver = self._driver()
+        if driver is None:
             self._pick_reason = (
                 'There is no viewport to pick in; open the Geometry step '
                 'first.')
@@ -330,7 +407,7 @@ class SelectionService:
         self._pick = request
         started = False
         try:
-            started = bool(self._pick_driver(request))
+            started = bool(driver(request))
         finally:
             if not started:
                 self._pick = None

@@ -90,6 +90,7 @@ from analytics import Analytics
 from analytics.events import EVENT_LOOP_ERROR
 
 from foammesh.support.deferred_log import DeferredHandler
+from foammesh.support import wsl_executor
 from foammesh.support import (
     crash_helper, lifecycle, loop_executor, qt_messages, safe_mode, watchdog)
 from foammesh.view import startup_splash
@@ -281,7 +282,8 @@ async def warm_utility_help(capabilities, names=STARTUP_HELP_UTILITIES):
     """Fetch and cache each utility's help off the GUI thread; failures are retried on use."""
     for name in names:
         try:
-            await asyncio.to_thread(capabilities.help, name)
+            # DP-6456: `<utility> -help` runs in WSL (DP-6403 executor).
+            await wsl_executor.run_wsl(capabilities.help, name)
         except Exception:                                   # noqa: BLE001
             # The dialog asks again when it opens (DP-693 caches only answers).
             continue
@@ -356,6 +358,9 @@ def main():
     appearance.prepare_application(appearance.Appearance.from_settings(settings))
     application = QApplication(sys.argv)
     disable_combo_animation()
+    # DP-6120: the wheel scrolls a settings column, not the box under it.
+    from foammesh.view import wheel_guard
+    wheel_guard.install(application)
     application.setWindowIcon(meshAppProperties.icon())
     application.lastWindowClosed.connect(
         lambda: lifecycle.record('Qt lastWindowClosed'))
@@ -482,7 +487,8 @@ def main():
                 'main', f'Using {found.describe()}.'), 10000)
         # Plan 35 CR6: probe at start and every minute while idle, off-thread.
         app.startWslHealth()
-        mpi = await asyncio.to_thread(app.capabilities.utility, 'mpirun')
+        # DP-6456: a WSL round trip, so on the WSL executor (DP-6403).
+        mpi = await wsl_executor.run_wsl(app.capabilities.utility, 'mpirun')
         if not mpi.available:
             message = QApplication.translate(
                 'main',

@@ -890,6 +890,44 @@ class MeshQualityTab(QWidget):
         return str(self._selection_combo.currentData()
                    or self._selection_combo.currentText())
 
+    def selection_state(self) -> dict:
+        """The saved-selection row as shown (Plan 48 AG): the name box, the
+        list (name, the text shown, the other-mesh note), the chosen one,
+        and whether Save, Show and Delete can be pressed."""
+        combo = self._selection_combo
+        items = [{'name': str(combo.itemData(i)), 'text': combo.itemText(i),
+                  'note': str(combo.itemData(
+                      i, Qt.ItemDataRole.ToolTipRole) or '')}
+                 for i in range(combo.count())]
+        return {'name_text': self._selection_name.text(),
+                'selections': items,
+                'current': self._selection_name_chosen() if items else '',
+                'listed_cells': len(self.listed_tags()),
+                'save_enabled': self._selection_save.isEnabled(),
+                'show_enabled': self._selection_show.isEnabled(),
+                'delete_enabled': self._selection_delete.isEnabled()}
+
+    def choose_selection(self, name: str) -> None:
+        """Choose ``name`` in the saved-selection list, as the reader does."""
+        index = self._selection_combo.findData(str(name))
+        if index < 0:
+            raise ValueError(f'there is no saved selection named "{name}"')
+        self._selection_combo.setCurrentIndex(index)
+
+    def press_selection(self, button: str, name: str = '') -> None:
+        """Type ``name`` and press Save, or choose ``name`` and press Show or
+        Delete: the buttons' own clicks."""
+        if button == 'save':
+            self._selection_name.setText(str(name))
+            widget = self._selection_save
+        else:
+            self.choose_selection(name)
+            widget = {'show': self._selection_show,
+                      'delete': self._selection_delete}[button]
+        if not widget.isEnabled():
+            raise ValueError(f'{widget.text()} is not available now')
+        widget.click()
+
     def _on_save_selection(self) -> None:
         self.saveSelectionRequested.emit(self._selection_name.text(),
                                          self.listed_tags())

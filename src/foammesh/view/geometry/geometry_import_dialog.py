@@ -80,6 +80,7 @@ class ImportDialog(QDialog):
         #: DP-1182. The box of each chosen surface file, in file units, read
         #: once when the files are chosen and re-scaled on a unit change.
         self._measured = {}
+        self._suggested = None
         self._sizeLabel = QLabel(self)
         self._sizeLabel.setObjectName('modelSize')
         self._sizeLabel.setWordWrap(True)
@@ -127,6 +128,7 @@ class ImportDialog(QDialog):
     def _connectSignalsSlots(self):
         self._ui.select.clicked.connect(self._openFileDialog)
         self._ui.unit.currentIndexChanged.connect(self._showSize)
+        self._ui.unit.currentIndexChanged.connect(self._refreshHint)
 
     def _openFileDialog(self):
         self._dialog = QFileDialog(self, self.tr('Select geometry file'), app.settings.getRecentImportDirectory(), 'Geometry (*.stl *.obj *.step *.stp *.iges *.igs *.brep);;Surface (*.stl *.obj);;CAD (*.step *.stp *.iges *.igs *.brep)')
@@ -218,6 +220,7 @@ class ImportDialog(QDialog):
         one control instead of discovering the mistake three steps later in a
         refinement level that makes no sense.
         """
+        self._suggested = None
         paths = self.files()
         selfDescribing = all(
             path.suffix.lower() in SELF_DESCRIBING for path in paths)
@@ -239,6 +242,7 @@ class ImportDialog(QDialog):
             self._ui.unitHint.setText('')
             return
         suggestion = suggest_unit(diagonal)
+        self._suggested = (suggestion, diagonal)
         if suggestion.unit in UNIT_TO_M:
             index = self._ui.unit.findData(suggestion.unit)
             if index >= 0:
@@ -246,6 +250,30 @@ class ImportDialog(QDialog):
         self._ui.unitHint.setText(
             suggestion.message if suggestion.confident
             else self.tr('{0} Please check.').format(suggestion.message))
+
+    def _refreshHint(self, *_args):
+        """DP-6125. The hint follows the unit now chosen, not the guess.
+
+        It went on saying "read as millimetres" after the user picked metres,
+        which made the line beside the control contradict the control.
+        """
+        held = getattr(self, '_suggested', None)
+        if held is None:
+            return
+        suggestion, diagonal = held
+        chosen = self._ui.unit.currentData()
+        if chosen == suggestion.unit or chosen not in UNIT_TO_M:
+            return
+        self._ui.unitHint.setText(self.tr(
+            'Diagonal {0} read as {1}. FoamMesh guessed {2}; check which '
+            'is right.').format(
+                format_length_in(diagonal, chosen), chosen, suggestion.unit))
+
+
+def format_length_in(raw_diagonal, unit) -> str:
+    """*raw_diagonal* (file units) written in metres for the unit *unit*."""
+    from foammesh.core.geometry.units import _length_text
+    return _length_text(raw_diagonal * UNIT_TO_M.get(unit, 1.0))
 
 
 def _fileBounds(path):

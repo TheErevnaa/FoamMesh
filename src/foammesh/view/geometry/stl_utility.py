@@ -13,6 +13,7 @@ from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
 from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 from vtkmodules.vtkFiltersVerdict import vtkCellSizeFilter
 from vtkmodules.vtkIOGeometry import vtkSTLReader, vtkOBJReader
+from vtkmodules.util.numpy_support import vtk_to_numpy
 
 
 class StringIndex:
@@ -152,15 +153,91 @@ class StlImporter:
         return pieces
 
     def split(self, angle: float, minArea: float):
+        """Cut every solid at *angle* into pieces; ``(segments, data, edges)``.
+
+        DP-6105. The solids used to be appended and cut as one surface. The
+        feature-edge filter merges coincident points, so on bodies that share
+        a wall (the CHT tubes: the pipe's r10 rim lies on the hot fluid's
+        points, the cold annulus's r12 rim on the pipe's) a rim's barrier
+        edges were mapped back onto the OTHER body's points and the annular
+        end caps grew into the walls: 7 pieces where the files hold 3, 4 and
+        4, MEASURED 2026-10-31. Each solid is cut on its own now, so a piece
+        never crosses a solid, and *minArea* stays a fraction of the whole.
+        """
+        totalArea = sum(self._area(solid.polyData) for solid in self._solids)
         appendFilter = vtkAppendPolyData()
-
+        appendEdges = vtkAppendPolyData()
+        offset = 0
         for solid in self._solids:
-            appendFilter.AddInputData(solid.polyData)
-
+            area = self._area(solid.polyData)
+            if area <= 0:
+                continue
+            regioned, edges, count = self._splitSolid(
+                solid.polyData, angle, min(1.0, minArea * totalArea / area))
+            regions = vtk_to_numpy(regioned.GetCellData().GetArray('RegionId'))
+            regions += offset
+            offset += count
+            appendFilter.AddInputData(regioned)
+            appendEdges.AddInputData(edges)
         appendFilter.Update()
+        appendEdges.Update()
+        regionedData = appendFilter.GetOutput()
+        edges = appendEdges.GetOutput()
 
-        polyData: vtkPolyData = appendFilter.GetOutput()
+        self._surfaceList.clear()
+        segments = []
+        numRegions = offset
+        for rid in range(0, numRegions):
+            t = vtkThreshold()
+            t.SetInputData(regionedData)
+            t.SetLowerThreshold(rid - 0.5)
+            t.SetUpperThreshold(rid + 0.5)
+            t.SetThresholdFunction(vtkThreshold.THRESHOLD_BETWEEN)
+            t.SetInputArrayToProcess(0, 0, 0, vtkDataObject.FIELD_ASSOCIATION_CELLS, 'RegionId')
+            t.Update()
 
+            # Output of vtkThreshold filter is Unstructured Grid
+            # Convert it to vtkPolyData by vtkGeometryFilter
+            geometry = vtkGeometryFilter()
+            geometry.SetInputData(t.GetOutput())
+            geometry.Update()
+
+            polyData: vtkPolyData = geometry.GetOutput()
+            if polyData.GetNumberOfCells() == 0:
+                continue
+
+            fIndex = polyData.GetCellData().GetAbstractArray("fIndex").GetValue(0)
+            fName = self._stringIndices.getString(fIndex)
+
+            sIndex = polyData.GetCellData().GetAbstractArray("sIndex").GetValue(0)
+            sName = self._stringIndices.getString(sIndex)
+
+            area = polyData.GetCellData().GetAbstractArray("CellRegionArea").GetValue(0)
+
+            surface = StlSurface(polyData, fName, sName, sIndex)
+            self._surfaceList.append(surface)
+
+            segments.append((rid, (area / totalArea) * 100))
+
+        return segments, regionedData, edges
+
+    @staticmethod
+    def _area(polyData) -> float:
+        if polyData.GetNumberOfCells() == 0:
+            return 0.0
+        sizes = vtkCellSizeFilter()
+        sizes.SetInputData(polyData)
+        sizes.ComputeVertexCountOff()
+        sizes.ComputeLengthOff()
+        sizes.ComputeVolumeOff()
+        sizes.ComputeAreaOn()
+        sizes.Update()
+        return float(vtk_to_numpy(
+            sizes.GetOutput().GetCellData().GetArray('Area')).sum())
+
+    @staticmethod
+    def _splitSolid(polyData, angle: float, minArea: float):
+        """One solid's ``(regioned data, feature edges, region count)``."""
         idFilter = vtkIdFilter()
         idFilter.SetInputData(polyData)
         idFilter.PointIdsOn()
@@ -216,44 +293,7 @@ class StlImporter:
 
         regionedData = conn.GetOutput()
         regionedData.GetPointData().RemoveArray("pointId")
-
-        self._surfaceList.clear()
-        segments = []
-        totalArea = conn.GetTotalArea()
-        numRegions = conn.GetNumberOfExtractedRegions()
-        for rid in range(0, numRegions):
-            t = vtkThreshold()
-            t.SetInputData(regionedData)
-            t.SetLowerThreshold(rid - 0.5)
-            t.SetUpperThreshold(rid + 0.5)
-            t.SetThresholdFunction(vtkThreshold.THRESHOLD_BETWEEN)
-            t.SetInputArrayToProcess(0, 0, 0, vtkDataObject.FIELD_ASSOCIATION_CELLS, 'RegionId')
-            t.Update()
-
-            # Output of vtkThreshold filter is Unstructured Grid
-            # Convert it to vtkPolyData by vtkGeometryFilter
-            geometry = vtkGeometryFilter()
-            geometry.SetInputData(t.GetOutput())
-            geometry.Update()
-
-            polyData: vtkPolyData = geometry.GetOutput()
-            if polyData.GetNumberOfCells() == 0:
-                continue
-
-            fIndex = polyData.GetCellData().GetAbstractArray("fIndex").GetValue(0)
-            fName = self._stringIndices.getString(fIndex)
-
-            sIndex = polyData.GetCellData().GetAbstractArray("sIndex").GetValue(0)
-            sName = self._stringIndices.getString(sIndex)
-
-            area = polyData.GetCellData().GetAbstractArray("CellRegionArea").GetValue(0)
-
-            surface = StlSurface(polyData, fName, sName, sIndex)
-            self._surfaceList.append(surface)
-
-            segments.append((rid, (area / totalArea) * 100))
-
-        return segments, regionedData, edges
+        return regionedData, edges, conn.GetNumberOfExtractedRegions()
 
     def _loadOBJFile(self, path: Path, sanitizeName):
         reader = vtkOBJReader()

@@ -33,6 +33,7 @@ from foammesh.core.gmsh.option_catalogue import (
 from foammesh.core.gmsh.export_service import ExportRefused, MeshExporter
 from foammesh.view.combo_items import item_enabled, set_item_enabled
 from foammesh.view.theming.metrics import apply_form_metrics
+from widgets import async_dialog
 from widgets.fit_to_text import FlowLayout
 
 #: Version choices the .msh writer takes (Mesh.MshFileVersion is a float).
@@ -87,7 +88,11 @@ class GmshWriterPanel(QWidget):
         #: Accepted-run source loads nothing. ``confirm(sentence) -> bool``
         #: asks before a model the session holds is replaced.
         self._runMesh = run_mesh
-        self._confirm = confirm or self._askReplace
+        # Plan 50 IP19. The confirm answers through a callback, so the
+        # default box opens without a nested event loop; an injected
+        # ``confirm(sentence) -> bool`` answers at once.
+        self._confirm = ((lambda sentence, then: then(confirm(sentence)))
+                         if confirm else self._askReplace)
         self._loading = False
         self._loadProblem = ''
         self._declined = None
@@ -461,9 +466,10 @@ class GmshWriterPanel(QWidget):
     def loading(self) -> bool:
         return self._loading
 
-    def _askReplace(self, sentence: str) -> bool:
+    def _askReplace(self, sentence: str, then) -> None:
+        """``then(True)`` when the person chose Replace (Plan 50 IP19)."""
         from PySide6.QtWidgets import QMessageBox
-        from widgets.async_message_box import box as messageBox
+        from widgets.async_message_box import box as messageBox, openBox
         # The one helper module builds the box; the buttons are this panel's.
         box = messageBox(self)
         box.setObjectName('gmshRunMeshReplaceDialog')
@@ -477,8 +483,7 @@ class GmshWriterPanel(QWidget):
                              QMessageBox.ButtonRole.RejectRole)
         keep.setObjectName('gmshRunMeshKeep')
         box.setDefaultButton(keep)
-        box.exec()
-        return box.clickedButton() is replace
+        openBox(box, lambda clicked: then(clicked is replace))
 
     def loadRunMesh(self) -> bool:
         """Open the accepted run's mesh in the session, off the GUI thread.
@@ -509,7 +514,25 @@ class GmshWriterPanel(QWidget):
             self.refresh()
             return False
         sentence = rm.question(controller, run)
-        if sentence and not self._confirm(sentence):
+        if not sentence:
+            return self._startRunMeshLoad(run, controller, True)
+        if getattr(self, '_askingReplace', False):
+            return False            # the box is open; one question at a time
+        self._askingReplace = True
+        result = []
+
+        def answered(replace):
+            self._askingReplace = False
+            result.append(self._startRunMeshLoad(run, controller, replace))
+
+        self._confirm(sentence, answered)
+        return result[0] if result else False
+
+    def _startRunMeshLoad(self, run, controller, replace) -> bool:
+        from foammesh.core.gmsh import run_mesh as rm
+        if self._loading:
+            return False
+        if not replace:
             self._declined = run.key
             self.setSource(SOURCE_MODEL)
             self._result.setText(self.tr(
@@ -638,23 +661,27 @@ class GmshWriterPanel(QWidget):
 
     def _choosePath(self) -> None:
         item = writers.writer(self.writerId())
+
+        def chosen(path, _filter=None):
+            if path:
+                self._path.setText(path)
+
+        # Plan 50 IP19: no nested event loop.
         if item.kind == writers.FOAM:
-            chosen = QFileDialog.getExistingDirectory(
+            async_dialog.getExistingDirectory(
                 self, self.tr('Folder for the OpenFOAM case'),
-                self._path.text())
+                self._path.text(), then=chosen)
         else:
-            chosen, _ = QFileDialog.getSaveFileName(
+            async_dialog.getSaveFileName(
                 self, self.tr('Write mesh'), self._path.text(),
-                f'{item.label} (*{item.suffix})' if item.suffix else '')
-        if chosen:
-            self._path.setText(chosen)
+                f'{item.label} (*{item.suffix})' if item.suffix else '',
+                then=chosen)
 
     def _chooseOptionsFile(self) -> None:
-        chosen, _ = QFileDialog.getSaveFileName(
+        async_dialog.getSaveFileName(
             self, self.tr('Save the options of this export'), '',
-            'Gmsh options (*.opt)')
-        if chosen:
-            self.saveOptionsTo(chosen)
+            'Gmsh options (*.opt)',
+            then=lambda chosen, _filter: chosen and self.saveOptionsTo(chosen))
 
     def saveOptionsTo(self, path) -> bool:
         """Write the options set for this writer as a Gmsh ``.opt`` file."""

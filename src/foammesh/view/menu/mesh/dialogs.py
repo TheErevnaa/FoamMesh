@@ -18,6 +18,7 @@ from foammesh.core.mesh.transform import parse_scale
 from foammesh.core.quality import QualityReport
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
 from widgets import async_message_box as messages
+from widgets import async_dialog
 
 
 def _readonly_text(text: str) -> QPlainTextEdit:
@@ -103,9 +104,12 @@ class MeshInfoDialog(QDialog):
         return table
 
     def _save(self):
-        path, selected_filter = QFileDialog.getSaveFileName(
+        # Plan 50 IP19: no nested event loop; written once answered.
+        async_dialog.getSaveFileName(
             self, self.tr('Save mesh report'), str(self._info.case_path / 'mesh-info.json'),
-            self.tr('JSON report (*.json);;CSV report (*.csv)'))
+            self.tr('JSON report (*.json);;CSV report (*.csv)'), then=self._saveTo)
+
+    def _saveTo(self, path, selected_filter):
         if not path:
             return
         if not Path(path).suffix:
@@ -293,11 +297,14 @@ class TransformDialog(QDialog):
                            todo=self.tr('Correct it and try again.'),
                            exception=error, title=self.windowTitle())
             return
-        if self.request().has_negative_scale and messages.warning(
-                self, self.windowTitle(),
-                self.tr('Negative scale mirrors the mesh. Continue?'),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-        ) != QMessageBox.StandardButton.Yes:
+        if not self.request().has_negative_scale:
+            self.accept()
             return
-        self.accept()
+        # Plan 50 IP19: asked without a nested event loop.
+        messages.ask(
+            QMessageBox.Icon.Warning, self, self.windowTitle(),
+            self.tr('Negative scale mirrors the mesh. Continue?'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+            then=lambda answer: answer == QMessageBox.StandardButton.Yes
+            and self.accept())

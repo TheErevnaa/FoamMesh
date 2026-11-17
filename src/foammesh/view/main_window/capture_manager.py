@@ -122,7 +122,9 @@ class CaptureManager(QObject):
         written = self._writeSnapshot(path, opts, includes)
         if written is None:
             self.snapshotMessage = self.tr(
-                'The viewport is not drawing, so there is nothing to save.')
+                'The viewport is not drawing, so there is nothing to save. '
+                'A large mesh that has just loaded is still being drawn: '
+                'wait a few seconds and take the snapshot again.')
             return None
         size = self._pixelSize(opts)
         record = self.buildRecord(Path(written).name)

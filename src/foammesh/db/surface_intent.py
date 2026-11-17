@@ -732,7 +732,7 @@ def _record(document, items, notes) -> None:
         for item in items:
             if item['kind'] == 'unresolved':
                 notes.append(f'Surfaces: {item["surface"] or item["target"]} '
-                             f'-- {item["reason"]} {item.get("remedy", "")}'
+                             f'— {item["reason"]} {item.get("remedy", "")}'
                              .strip())
 
 

@@ -21,7 +21,7 @@ FORMAT_VERSION = 1
 #: ``layout_backup`` for one release and the standard layout opens.
 LAYOUT_VERSION = 2
 SHEET_MINIMUM = 280
-SHEET_MAXIMUM = 560
+SHEET_MAXIMUM = 960
 RECENT_PROJECTS_NUMBER = 50
 
 
@@ -595,8 +595,10 @@ class AppSettings:
                 SettingKey.OPENFOAM_WSL_USER, 'foamuser'),
             'bashrc': self._get(
                 SettingKey.OPENFOAM_BASHRC, '/opt/openfoam13/etc/bashrc'),
+            # Plan 50 IP2 (DP-6230): no limit unless the user sets one. An
+            # hour was a hidden cell cap on a large far field.
             'stage_timeout': int(self._get(
-                SettingKey.OPENFOAM_STAGE_TIMEOUT, 3600)),
+                SettingKey.OPENFOAM_STAGE_TIMEOUT, 0)),
         }
 
     def hasOpenFoamRuntime(self) -> bool:
@@ -605,7 +607,7 @@ class AppSettings:
 
     def updateOpenFoamRuntime(self, *, profile_id: str, wsl_distro: str,
                               wsl_user: str, bashrc: str,
-                              stage_timeout: int = 3600):
+                              stage_timeout: int = 0):
         # Plan 37 #7. 0 is "no limit": a far field of millions of cells can
         # castellate for longer than any fixed limit, and the product never
         # refuses on size -- so the user may take the limit away.

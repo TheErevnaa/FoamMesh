@@ -311,8 +311,8 @@ def _geometry_operations() -> list[OperationDescriptor]:
             'geometry.surface_intent.auto_pair',
             'Pair touching walls automatically', 'case',
             ImpactClass.MESH_MUTATION, recovery='artifact_backup',
-            summary='The Automatic choice of the surface dialog and Pair '
-                    'touching walls: find the surfaces of other bodies that '
+            summary='The Automatic choice of the surface dialog: find the '
+                    'surfaces of other bodies that '
                     'touch geometry_ids (every surface when absent) and make '
                     'each touching pair a region interface of surface_role. '
                     'regionInterfaceConformal cuts the triangles both bodies '

@@ -270,10 +270,21 @@ class WslHealthBar(_Bar):
 
     def setState(self, snapshot: dict) -> None:
         state = snapshot.get('state')
+        distribution = snapshot.get('distribution') or 'WSL'
+        if snapshot.get('waiting_for_start'):
+            # DP-6463. A run or Retry connection is waiting for a runtime
+            # that may be starting: say so, rather than show nothing.
+            self._text.setText(self.tr(
+                'The OpenFOAM runtime ({0}) is slow to answer and may be '
+                'starting. Waiting up to {1} s for it.').format(
+                    distribution,
+                    format(float(snapshot.get('start_wait_seconds') or 0), 'g')))
+            self._busy(True)
+            self.show()
+            return
         if state != UNREACHABLE:
             self.hide()
             return
-        distribution = snapshot.get('distribution') or 'WSL'
         reason = str(snapshot.get('reason') or '').rstrip('.')
         self._text.setText(self.tr(
             'The OpenFOAM runtime ({0}) is not answering{1}. Runs cannot start '

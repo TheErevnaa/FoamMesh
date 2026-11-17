@@ -357,8 +357,14 @@ class GmshEntityPanel(QWidget):
         if self._queued is not None:
             self._queued = None
             self.beginPick()
+        elif self._queuedPick is not False:
+            filter_name, self._queuedPick = self._queuedPick, False
+            self.pickFor(filter_name)
 
     _drawing = None
+    #: DP-6161. A pick asked for before the model was shown waits for it
+    #: (``False``: none waiting; else the filter name or ``None``).
+    _queuedPick = False
 
     def setDrawing(self, settings, planes=None) -> None:
         """Plan 48 GM11a (DP-4457). Draw the geometry by the Gmsh
@@ -443,9 +449,11 @@ class GmshEntityPanel(QWidget):
         not shown yet.  The result arrives as :attr:`pickAccepted`.
         """
         if self._picker is None:
-            self._refuse(self.tr('Show the model first; there is nothing to '
-                                 'pick yet.'))
-            return False
+            # DP-6161. Asking for a pick shows the model; the pick starts
+            # when it has loaded.
+            self._queuedPick = filter_name
+            self.showModel()
+            return True
         if filter_name in self._filterButtons:
             self.setFilter(filter_name)
         self.beginPick()

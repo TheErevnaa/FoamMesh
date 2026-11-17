@@ -1,6 +1,7 @@
 """Gmsh workflow page: gmsh.compute."""
 from __future__ import annotations
 
+import weakref
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
@@ -416,8 +417,15 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         if elements is None:
             return
 
+        # The group outlives this page (DP-6407): hold the page weakly so a
+        # closed project's page is not kept alive by the hand-over.
+        page = weakref.ref(self)
+
         def handover():
-            controller = self.generateController()
+            owner = page()
+            if owner is None:
+                return ''
+            controller = owner.generateController()
             if controller is None:
                 return ''
             directory = (Path(controller.case_path) / 'foammesh' / 'gmsh'
@@ -474,7 +482,7 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         for field_id in self.GATE_FIELDS:
             editor = self._editors.get(field_id)
             if editor is not None:
-                editor.valueChanged.connect(self._onGateFieldChanged)
+                editor.connectOnce(self._onGateFieldChanged)  # DP-6343
         self.updateGateNote()
 
     def _onGateFieldChanged(self, *_args) -> None:
@@ -560,7 +568,7 @@ class GmshComputePage(SessionTiers, GmshTaskPage):
         return self.tr(
             'Boundary layers are enabled and this gate rejects every element '
             'below the sicn limit. A thin prism scores low on sicn by '
-            'construction: measured on venturi.stl, a four-layer stack put '
+            'construction: on a measured test case a four-layer stack put '
             '20.4% of elements below the default 0.1 and a gentler stack made '
             'it worse (41.7%), while the same case without layers passed. '
             'Set a Share of cells allowed below it or a Number of cells '

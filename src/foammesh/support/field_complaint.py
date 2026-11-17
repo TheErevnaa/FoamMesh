@@ -55,6 +55,12 @@ def list_clause() -> str:
     return _tr('must be a list')
 
 
+def group_clause() -> str:
+    """What is wrong when one value is stored where a group of named values
+    belongs (a point's x, y and z, or the rows of a list). DP-6474."""
+    return _tr('must be a group of named values, not a single value')
+
+
 def length_clause(size) -> str:
     return _tr('must have {} values').format(size)
 

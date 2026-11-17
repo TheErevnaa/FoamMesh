@@ -240,7 +240,7 @@ _NO_TURN = format(0, 'd')
 
 def _field(width=72):
     edit = QLineEdit()
-    edit.setValidator(QDoubleValidator())
+    edit.setValidator(QDoubleValidator(edit))   # DP-6407: goes with the box
     edit.setMaximumWidth(width)
     edit.setAlignment(Qt.AlignmentFlag.AlignRight)
     return edit
@@ -1889,6 +1889,19 @@ class SectionPanel(QWidget):
             'step_m': float(step or 0.0), 'step_source': source,
             'sheet_opacity': self.sheetOpacity(),
             'handle_visible': bool(plane.handle_visible),
+            # Plan 48 AG. Each plane row's tick and sheet button, the Scale
+            # combo and the Compare stages group.
+            'enabled_plane_indexes': [index for index, state
+                                      in enumerate(self._planes)
+                                      if state.enabled],
+            'sheet_visible': bool(plane.surface_visible),
+            'sheet_planes': self.sheetIndexes(),
+            'colour_scale': self.scalePolicy().value,
+            'compare_offered': list(self._activeCompareBoxes()),
+            'compare_stages': self.compareStages(),
+            'compare_results': self.compareResults(),
+            'compare_legend': self.compareLegend(),
+            'compare_stale': self.isCompareStale(),
             'status': self.sectionStatus()}
 
     def setSectionBusy(self, busy: bool):
@@ -2004,6 +2017,10 @@ class SectionPanel(QWidget):
 
     def _connectSignalsSlots(self):
         self._modeBox.currentIndexChanged.connect(self._emitChanged)
+        # Keep larger/smaller and the whole-cell rule depend on the mode:
+        # a Slice left them live, and a press did nothing.
+        self._modeBox.currentIndexChanged.connect(
+            lambda *_args: self._syncPieces())
         self._combineBox.currentIndexChanged.connect(self._emitChanged)
         self._ruleBox.currentIndexChanged.connect(self._emitChanged)
         self._curvesBox.toggled.connect(self._emitChanged)

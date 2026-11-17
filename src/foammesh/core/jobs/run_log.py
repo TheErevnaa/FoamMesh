@@ -15,6 +15,7 @@ goes, as a Gmsh run's can.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,24 @@ def active(path) -> bool:
 
 
 class RunLog:
-    """Append-only text log; never fatal (a run is not failed by its log)."""
+    """Append-only text log; never fatal (a run is not failed by its log).
+
+    DP-6481. ``write`` is called for every line a stage prints, on the
+    event loop, and a write waited up to 13.1 s for a busy disk there
+    (MEASURED live). Lines are queued and written, in order, by a writer
+    thread of the log's own; ``flush`` waits for them, and ``close`` flushes
+    first, so a log that has been closed is whole.
+    """
+
+    #: How long the writer waits for another line before it lets go.
+    IDLE_SECONDS = 2.0
 
     def __init__(self) -> None:
         self.path: Path | None = None
         self._file = None
+        self._queue: list[tuple[object, str]] = []
+        self._ready = threading.Condition()
+        self._writer: threading.Thread | None = None
 
     def open(self, path) -> Path | None:
         self.close()
@@ -63,10 +77,40 @@ class RunLog:
     def write(self, text: str) -> None:
         if self._file is None:
             return
-        try:
-            self._file.write(str(text).rstrip('\r\n') + '\n')
-        except (OSError, ValueError):
-            logger.debug('the run log could not be written', exc_info=True)
+        line = str(text).rstrip('\r\n') + '\n'
+        with self._ready:
+            self._queue.append((self._file, line))
+            if self._writer is None:
+                self._writer = threading.Thread(
+                    target=self._drain, daemon=False, name='foammesh-run-log')
+                self._writer.start()
+            else:
+                self._ready.notify_all()
+
+    def _drain(self) -> None:
+        while True:
+            with self._ready:
+                if not self._queue:
+                    self._ready.wait(self.IDLE_SECONDS)
+                if not self._queue:
+                    self._writer = None
+                    self._ready.notify_all()
+                    return
+                batch = list(self._queue)
+            for handle, line in batch:
+                try:
+                    handle.write(line)
+                except (OSError, ValueError):
+                    logger.debug('the run log could not be written',
+                                 exc_info=True)
+            with self._ready:
+                del self._queue[:len(batch)]
+                self._ready.notify_all()
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Wait until every line written so far is in the file."""
+        with self._ready:
+            return self._ready.wait_for(lambda: not self._queue, timeout)
 
     def tee(self, on_line=None):
         """An ``on_line`` callback that writes the line here, then hands it
@@ -77,6 +121,7 @@ class RunLog:
         return line
 
     def close(self) -> None:
+        self.flush()
         handle, self._file = self._file, None
         if self.path is not None:
             _ACTIVE.discard(_key(self.path))

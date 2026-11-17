@@ -3,12 +3,35 @@
 
 from enum import IntEnum, auto
 
-from PySide6.QtCore import QCoreApplication
-from PySide6.QtWidgets import QTreeWidgetItem, QLabel, QWidget, QHBoxLayout
+from PySide6.QtCore import QCoreApplication, QRectF, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import QTreeWidgetItem
 
 from foammesh.rendering.actor_info import ActorInfo, ActorType
-from foammesh.view.theming.metrics import FORM_MARGIN
-from foammesh.view.theming.status_colors import apply_color_swatch
+
+#: Plan 50 (DP-6341). One icon per colour, shared by every row that shows it.
+_SWATCH_ICONS: dict = {}
+_SWATCH_SIZE = 14
+
+
+def swatch_icon(color) -> QIcon:
+    """A small rounded square in ``color``, or an empty icon for None."""
+    if color is None:
+        return QIcon()
+    key = QColor(color).name(QColor.NameFormat.HexArgb)
+    icon = _SWATCH_ICONS.get(key)
+    if icon is None:
+        pixmap = QPixmap(_SWATCH_SIZE, _SWATCH_SIZE)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor(0, 0, 0, 60))
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(QRectF(0.5, 0.5, _SWATCH_SIZE - 1, _SWATCH_SIZE - 1),
+                                3, 3)
+        painter.end()
+        icon = _SWATCH_ICONS[key] = QIcon(pixmap)
+    return icon
 
 
 class Column(IntEnum):
@@ -33,7 +56,12 @@ class DisplayItem(QTreeWidgetItem):
 
     def __init__(self, actorInfo: ActorInfo):
         super().__init__()
-        self._colorWidget = QLabel()
+        # Plan 50 (DP-6341). The swatch is the row's icon in the colour
+        # column. It was a styled QLabel in a QWidget per row, set with
+        # ``setItemWidget``: MEASURED live, 500 surfaces spent 0.9 s of the
+        # load building, styling and re-polishing those widgets.
+        self._swatchColor = None
+        self._swatchKey = False
 
         self._actorInfo = actorInfo
         self.setText(Column.NAME_COLUMN, actorInfo.name())
@@ -43,15 +71,6 @@ class DisplayItem(QTreeWidgetItem):
         # self._updateVisibleIcon()
 
         self._connectSignalsSlots()
-
-    def setupColorWidget(self, parent):
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(FORM_MARGIN, 0, FORM_MARGIN, 0)
-        layout.addWidget(self._colorWidget)
-        # self._colorWidget.setFrameShape(QFrame.Shape.Box)
-        self._colorWidget.setMinimumSize(16, 16)
-        parent.setItemWidget(self, Column.COLOR_COLUMN, widget)
 
     def setActorVisible(self, visible):
         # Hidden parts show an empty swatch, so the tree says what is drawn.
@@ -72,14 +91,19 @@ class DisplayItem(QTreeWidgetItem):
     def actorInfo(self):
         return self._actorInfo
 
-    def colorWidget(self):
-        return self._colorWidget
+    def swatchColor(self):
+        """The colour the row's swatch shows, or None when it is empty."""
+        return self._swatchColor
 
     def _updateColorColumn(self):
-        if self._actorInfo.isVisible():
-            apply_color_swatch(self._colorWidget, self._actorInfo.color())
-        else:
-            apply_color_swatch(self._colorWidget, None)
+        color = self._actorInfo.color() if self._actorInfo.isVisible() else None
+        color = QColor(color) if color is not None else None
+        key = None if color is None else color.name(QColor.NameFormat.HexArgb)
+        if key == self._swatchKey:
+            return
+        self._swatchKey = key
+        self._swatchColor = color
+        self.setIcon(Column.COLOR_COLUMN, swatch_icon(color))
 
     def _updateName(self, name):
         self.setText(Column.NAME_COLUMN, name)

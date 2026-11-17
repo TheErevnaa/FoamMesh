@@ -60,6 +60,10 @@ class ProjectState:
         """Return an editable copy to mutate before committing."""
         return self._db.checkout(path)
 
+    def view(self, path: str = ''):
+        """Return a read-only, uncopied look at the document (Plan 50 IP11)."""
+        return self._db.view(path)
+
     # ----- the single write path ------------------------------------------
     def commit(self, data, *, action: str, source: Source = Source.GUI,
                target: str | None = None, reason: str = '',
@@ -217,10 +221,39 @@ class ProjectState:
         # `_restore`. MEASURED on the reference fixture -- 4.832 ms to
         # serialise against 0.112 ms to copy, and that dump was ~80% of the
         # facade's owner-loop budget on every committed change.
-        return self._db.snapshot()
+        #
+        # DP-6108. The document names each surface's polydata by key, and the
+        # polydata lives beside it in the db's file store, which the document
+        # copy does not hold. A commit that dropped a surface's polydata (the
+        # conformal pair empties the walls it cuts) was undone into rows naming
+        # polydata that was gone: the scene refresh died on ``None.GetBounds``
+        # and the viewport went blank, MEASURED live 2026-10-31. The store is
+        # copied one level down; the VTK objects are shared, as ``checkout``
+        # shares them, because an edit replaces a polydata and never mutates it.
+        files = getattr(self._db, '_files', None)
+        if files is None:
+            return self._db.snapshot()
+        return _Snapshot(self._db.snapshot(),
+                         {group: dict(entries)
+                          for group, entries in files.items()})
 
     def _restore(self, snapshot) -> None:
         # In-session snapshots always use the current exact schema, so there
         # is nothing to re-validate: this content was valid when it was taken
         # and copying does not change it.
+        if isinstance(snapshot, _Snapshot):
+            self._db.restore(snapshot.document)
+            self._db._files = {group: dict(entries)
+                               for group, entries in snapshot.files.items()}
+            return
         self._db.restore(snapshot)
+
+
+class _Snapshot:
+    """An undo step's document with the geometry polydata it names (DP-6108)."""
+
+    __slots__ = ('document', 'files')
+
+    def __init__(self, document, files):
+        self.document = document
+        self.files = files

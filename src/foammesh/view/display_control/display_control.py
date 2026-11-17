@@ -19,6 +19,7 @@ from foammesh.view.theming.metrics import GAP
 from .display_item import DisplayItem, Column
 from .cut_tool import CutTool, sceneBounds
 from .section_panel import CutType
+from widgets.async_dialog import popupMenu
 
 
 def countedPartIds(items) -> list:
@@ -103,7 +104,8 @@ class ContextMenu(QMenu):
         self._surfaceEdgeDisplayAction.setChecked(properties.displayMode == DisplayMode.SURFACE_EDGE)
         self._noCutAction.setChecked(properties.cutEnabled is False)
 
-        self.exec(pos)
+        # Plan 50 IP19: shown without a nested event loop.
+        popupMenu(self, pos)
 
     def _connectSignalsSlots(self):
         self._opacityDialog.accepted.connect(lambda: self.opacitySelected.emit(self._opacityDialog.opacity()))
@@ -228,7 +230,6 @@ class DisplayControl(QObject):
                 self._list.addTopLevelItem(item)
             else:
                 parent.addChild(item)
-            item.setupColorWidget(self._list)
 
         for prop in actorInfo.renderProps():
             self._view.addActor(prop)
@@ -327,6 +328,23 @@ class DisplayControl(QObject):
             self._view.removeActor(prop)
         item.setHidden(True)
         self.__dict__.get('_broughtInByMode', set()).discard(actorInfo.id())
+
+    def reveal(self, actorInfo) -> bool:
+        """Put back in the scene a part `hide` took out; whether it was.
+
+        Plan 50 IP1. `add` does the same for an actor it already holds, and
+        hands the actor its own data again on the way (``setDataSet``),
+        which re-runs every pipeline of the model for nothing; this only
+        puts the props back.
+        """
+        item = self._items.get(actorInfo.id())
+        if item is None or not item.isHidden():
+            return False
+        for prop in item.actorInfo().renderProps():
+            self._view.addActor(prop)
+        item.setHidden(False)
+        self.partsChanged.emit()
+        return True
 
     def isShown(self, actorInfo) -> bool:
         """Whether ``actorInfo`` is in the scene: added and not `hide`-den."""

@@ -6,7 +6,6 @@ process tree through the manager; the widget itself never touches processes.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -15,6 +14,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from foammesh.core.project import Event
 from foammesh.view.theming.metrics import FORM_MARGIN
+from foammesh.support.tasks import spawn
 
 
 @dataclass
@@ -197,7 +197,7 @@ class JobProgressWidget(QWidget):
             return
         self._tracker.on_cancel_requested(job_id)
         self._refresh()
-        asyncio.create_task(self._cancel_anywhere(job_id))
+        spawn(self._cancel_anywhere(job_id), what='Cancelling the job')
 
     async def _cancel_anywhere(self, job_id):
         """Cancel whether the work is a subprocess or in-process diagnostics.

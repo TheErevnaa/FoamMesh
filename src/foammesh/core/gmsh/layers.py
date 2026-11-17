@@ -113,6 +113,35 @@ class BoundaryLayers:
                 return stack
         return None
 
+    def named_as_imported(self, names: dict) -> 'BoundaryLayers':
+        """This plan with each patch named as the run imports it.
+
+        DP-6472. *names* maps a name the window shows (the geometry tree's
+        ``left_surface``) to the name the job imports that surface under
+        (``left``). A name not in it is kept as given, so a name nothing
+        stands for still reaches the runner and is refused there with the
+        list of what was imported. Order is kept; a surface named twice, once
+        each way, is one patch.
+        """
+        if not names:
+            return self
+        patches, seen = [], set()
+        for name in self.patches:
+            name = names.get(name, name)
+            if name not in seen:
+                seen.add(name)
+                patches.append(name)
+        stacks, held = [], set()
+        for stack in self.stacks:
+            patch = names.get(stack['patch'], stack['patch'])
+            if patch in held:
+                continue
+            held.add(patch)
+            stacks.append({**stack, 'patch': patch})
+        from dataclasses import replace
+
+        return replace(self, patches=tuple(patches), stacks=tuple(stacks))
+
     def to_dict(self) -> dict:
         # The GN10 keys only when the job uses them: a job with one element
         # per layer and no per-patch stack is the job it was before GN10, and
@@ -475,8 +504,165 @@ def achieved_coverage(statistics: dict) -> dict:
                 f'{name}: the layer grew on {columns} of {total_faces} faces; '
                 'the near-wall spacing jumps where the stack stops.')
 
+    # Plan 50 IP28. A wall that was asked for and left bare while the rest
+    # grew (``notGrownByPatch``) is a ``not grown`` row with its request and
+    # its reason, never a row that reads as a wall nobody asked for.
+    left = record.get('notGrownByPatch')
+    if isinstance(left, dict):
+        held = {row.patch: index for index, row in enumerate(rows)}
+        for name in sorted(left):
+            entry = left[name] if isinstance(left[name], dict) else {}
+            row = PatchLayerCoverage(
+                patch=str(name),
+                faces=rows[held[name]].faces if name in held else 0,
+                layers=0.0, thickness=0.0, coverage_pct=0.0,
+                requested_layers=(_layer_count(entry.get('requestedLayers'))
+                                  or requested_layers or None))
+            if name in held:
+                rows[held[name]] = row
+            else:
+                rows.append(row)
+            sentence = _DROP_REASONS.get(str(entry.get('reason') or '')) or (
+                'the boundary layer that was requested was not grown')
+            warnings.append(f'{name}: {sentence}.')
+
     report = LayerReport(rows)
     document = report.to_dict()
     document['notes'] = list(report.notes) + notes
     document['warnings'] = list(report.warnings) + warnings
+    return document
+
+
+#: Plan 50 IP7 (DP-6252). The row a "not grown" coverage document carries
+#: when the run could not say which walls the layer had been asked for.
+EVERY_WALL = 'every ticked wall'
+
+#: Why a requested layer was not grown, as the runner records it.
+_DROP_REASONS = {
+    'dropped_after_landing': (
+        'the boundary layer was dropped: the stack this wall carries before '
+        'it folds is too thin for the mesh above it to rest on, so the mesh '
+        'was built without a layer'),
+    'geometry_build_replaced_patches': (
+        'the boundary layer was not grown: the geometry build replaced the '
+        'walls it was asked for'),
+    'geometry_build_one_cell_thick': (
+        'the boundary layer was not grown: the geometry build made the mesh '
+        'one cell thick and no ticked wall meets those faces'),
+    'no_layer_cells': (
+        'the boundary layer was requested but the mesh holds no layer cells'),
+    # Plan 50 IP28 (DP-6439, DP-6437): one wall left bare, the others grown.
+    'ends_on_curved_patch': (
+        'the boundary layer was not grown: it would end on a patch that '
+        'grows none and is not flat, and the opening a layer leaves can only '
+        'be closed with a flat face'),
+    'shared_by_two_layered_volumes': (
+        'the boundary layer was not grown: this wall lies between two '
+        'volumes that both grow layers, and Gmsh cannot grow a layer on a '
+        'wall two layered volumes share'),
+    'interface_side_unknown': (
+        'the boundary layer was not grown: this wall lies between two '
+        'volumes and no other ticked wall says which side it is for'),
+}
+
+
+def _layer_count(value) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def run_coverage(statistics: dict, layers_intent: dict | None = None) -> dict:
+    """The coverage document one Gmsh run leaves, or ``{}`` for none.
+
+    Plan 50 IP7 (DP-6252). :func:`achieved_coverage` reads only what the run
+    measured, so a run that was asked for a layer and grew none -- the runner
+    dropped it after the landing check (DP-81), the geometry build replaced
+    or flattened the walls (DP-5716/5717), or the mesh simply holds no layer
+    cells -- produced no document, the old file stayed, and the quality
+    verdict (DP-664) never heard that the layer was missing. Whenever a layer
+    was requested this returns a document; one that was not grown carries a
+    ``not grown`` row per requested patch, with the request, so
+    ``apply_layer_coverage`` worsens the verdict and names the walls.
+
+    *layers_intent* is the job's ``intent.layers`` (``None`` when the job
+    could not be read: then only the run's own records say a layer was
+    asked for).
+    """
+    from foammesh.core.quality.layer_report import (
+        LayerReport,
+        PatchLayerCoverage,
+    )
+
+    statistics = statistics if isinstance(statistics, dict) else {}
+    intent = layers_intent if isinstance(layers_intent, dict) else {}
+    measured = achieved_coverage(statistics)
+    if measured.get('patches'):
+        return measured
+
+    record = statistics.get('layers')
+    record = record if isinstance(record, dict) else {}
+    landing = record.get('droppedAfterLanding')
+    landing = landing if isinstance(landing, dict) else None
+    dropped = statistics.get('layersDropped')
+    dropped = dropped if isinstance(dropped, dict) else None
+    achieved = record.get('achieved')
+    no_cells = (isinstance(achieved, dict)
+                and not achieved.get('byPatch')
+                and not achieved.get('cells'))
+    requested = bool(intent.get('enabled') or intent.get('requestedEnabled')
+                     or landing or dropped or no_cells)
+    if not requested:
+        return {}
+    if record and not (landing or dropped or no_cells):
+        # Grown, and the measurement did not come back: nothing is known
+        # about any patch, and "not grown" would be a guess.
+        return {'patches': [], 'failed_patches': [], 'frozen_patches': [],
+                'notes': [], 'grown': None, 'reason': 'not_measured',
+                'warnings': ['the boundary layer this run grew could not be '
+                             'measured per patch']}
+
+    if landing is not None:
+        reason, source = 'dropped_after_landing', landing
+        names = list(landing.get('patches') or ())
+    elif dropped is not None:
+        reason, source = str(dropped.get('reason') or 'dropped'), dropped
+        names = list(dropped.get('requestedPatches')
+                     or (dropped.get('patches')
+                         if reason == 'geometry_build_replaced_patches'
+                         else ()) or ())
+    else:
+        reason, source = 'no_layer_cells', record
+        names = list(record.get('patches') or ())
+    if not names:
+        names = list(intent.get('patches') or ())
+        names += [row.get('patch') for row in (intent.get('stacks') or ())
+                  if isinstance(row, dict) and row.get('patch')]
+    names = sorted({str(name).strip() for name in names
+                    if str(name or '').strip()}) or [EVERY_WALL]
+
+    by_patch = source.get('requestedByPatch') or record.get(
+        'requestedByPatch') or {}
+    default = (_layer_count(source.get('requestedLayers'))
+               or _layer_count(record.get('requestedLayers'))
+               or _layer_count(intent.get('layerCount')))
+    rows = []
+    for name in names:
+        asked = by_patch.get(name) if isinstance(by_patch, dict) else None
+        count = (_layer_count((asked or {}).get('layers'))
+                 if isinstance(asked, dict) else 0) or default
+        rows.append(PatchLayerCoverage(
+            patch=name, faces=0, layers=0.0, thickness=0.0,
+            coverage_pct=0.0, requested_layers=count or None))
+
+    report = LayerReport(rows)
+    document = report.to_dict()
+    sentence = _DROP_REASONS.get(reason) or (
+        'the boundary layer that was requested was not grown')
+    note = str(source.get('note') or '').strip()
+    document['grown'] = False
+    document['reason'] = reason
+    document['warnings'] = [
+        f'{name}: {sentence}.' for name in names] + ([note] if note else [])
     return document

@@ -6,6 +6,7 @@ import logging
 import platform
 import threading
 import warnings
+import weakref
 from functools import partial
 
 import qasync
@@ -38,6 +39,7 @@ from widgets.progress_dialog import ProgressDialog, closeProgressWindowsOf
 from foammesh.db.project import StateSaveCancelled
 
 from foammesh.app import app
+from foammesh.view.configuration_read import case_configuration
 from foammesh.core.facade import FacadeError
 from foammesh.core.documentation import tutorial_url
 from foammesh.core.case import CaseConflictError, WorkflowMode
@@ -139,6 +141,8 @@ from foammesh.view.outside_task import modal
 from .run_narration import describe_cancellation, describe_start
 from .run_status_strip import RunStatusStrip
 from widgets import async_message_box as messages
+from foammesh.support.tasks import set_reporter as set_task_reporter, spawn
+from widgets import async_dialog as dialogs
 
 
 logger = logging.getLogger(__name__)
@@ -210,6 +214,16 @@ class _ChipClick(QObject):
             if not isinstance(child, QPushButton):
                 self.clicked.emit()
         return False
+
+
+#: Plan 50 IP9 (DP-6271). The events whose refresh reads the mesh again
+#: unconditionally: they announce that the mesh itself was replaced (a stage,
+#: a publish, an import or convert, an unlock that restored the mesh, a
+#: recovery restore). Every other scene or history event only asks the mesh
+#: manager to reload, and its guard returns at once when the request and the
+#: polyMesh files are those of the mesh on screen -- so a committed field no
+#: longer re-reads a mesh it did not touch.
+MESH_REPLACING_EVENTS = (Event.ARTIFACT_MESH_CHANGED, Event.ARTIFACT_RESTORED)
 
 
 class MainWindow(QMainWindow):
@@ -429,6 +443,19 @@ class MainWindow(QMainWindow):
         # (id, name) pairs of the renames seen since the last flush.
         self._projectRefreshWide = False
         self._projectRefreshRenames = []
+        # Plan 50 IP9 (DP-6271). Set when a pending refresh holds an event
+        # that replaced the mesh; the flush then reads it again whatever the
+        # mesh manager's same-mesh guard would say.
+        self._projectRefreshForcesMesh = False
+        # Plan 50 IP13 (DP-6272). The menus' disk facts, read off the GUI
+        # thread: the cache, the facts an event made stale, the count of
+        # such events (a probe overtaken by one reads again), the last
+        # terminal answer, and whether a probe is out.
+        self._menuDisk = None
+        self._menuDiskStaleKeys = set()
+        self._menuDiskEpoch = 0
+        self._menuTerminal = None
+        self._menuDiskProbing = False
         self._capabilityWarmPending = False
         self._capabilityProbeFailure = None
         self._capabilityWanted = set()
@@ -446,6 +473,12 @@ class MainWindow(QMainWindow):
             app.events, app.jobManager,
             lambda: self.showOutputTab('console'), self)
         self.statusBar().addPermanentWidget(self._jobProgress)
+        # Plan 50 IP19 (DP-6361). Work started and not awaited that dies says
+        # so here, on the status line, as well as in the log.
+        # Held weakly: the reporter outlives a window a test closes.
+        window = weakref.ref(self)
+        set_task_reporter(lambda sentence: window() is not None
+                          and MainWindow._reportLostTask(window(), sentence))
         # Plan 35 CR6. Up only while the WSL runtime is unreachable:
         # [Retry connection] [Restart WSL runtime] [Open diagnostics].
         self._wslHealthBar = self._installWslHealthBar()
@@ -1377,18 +1410,24 @@ class MainWindow(QMainWindow):
         if manager is None:
             return
         if action == 'retry':
-            asyncio.create_task(manager.retryPreview())
+            spawn(manager.retryPreview(), what='Retrying the preview')
         elif action == 'load_volume':
-            asyncio.create_task(manager.loadFullVolume())
-        elif action == 'build_anyway' and self._confirmBuildPreviewAnyway():
-            asyncio.create_task(manager.buildPreviewAnyway())
+            spawn(manager.loadFullVolume(), what='Loading the full volume')
+        elif action == 'build_anyway':
+            self._confirmBuildPreviewAnyway(
+                lambda yes: yes and spawn(manager.buildPreviewAnyway(),
+                                          what='Building the preview'))
 
-    def _confirmBuildPreviewAnyway(self) -> bool:
-        """"Build anyway" warns first: the worker may take most of the memory."""
+    def _confirmBuildPreviewAnyway(self, then) -> None:
+        """"Build anyway" warns first: the worker may take most of the memory.
+
+        ``then(True)`` on Yes (Plan 50 IP19: asked without a nested loop).
+        """
         from foammesh.support import resource_budget
 
         total, _available = resource_budget.physical_memory()
-        confirmed = messages.warning(
+        messages.ask(
+            QMessageBox.Icon.Warning,
             self, self.tr('Build the preview anyway?'),
             self.tr('The preview worker will be allowed up to {0} (90% of '
                     'this computer\'s memory). Other programs may slow down '
@@ -1397,8 +1436,8 @@ class MainWindow(QMainWindow):
                     'risk.').format(resource_budget.format_bytes(
                         int(total * 0.9))),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        return confirmed == QMessageBox.StandardButton.Yes
+            QMessageBox.StandardButton.No,
+            then=lambda answer: then(answer == QMessageBox.StandardButton.Yes))
 
     def _adoptPreviewNotice(self):
         """Plan 43 LY7. The preview notice (Try again, Build anyway, Load
@@ -1952,11 +1991,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 self.tr('Open a case before saving a view.'), 5000)
             return
-        name, accepted = QInputDialog.getText(
-            self, self.tr('Save current view'), self.tr('Name this view'))
-        if not accepted or not name.strip():
-            return
-        self.saveNamedView(name)
+        # Plan 50 IP19: no nested event loop.
+        dialogs.getText(
+            self, self.tr('Save current view'), self.tr('Name this view'),
+            then=lambda name, accepted: accepted and name.strip()
+            and self.saveNamedView(name))
 
     def saveNamedView(self, name: str) -> bool:
         """DP-2765. Save the view on screen as ``name``: what *Save current
@@ -2069,7 +2108,9 @@ class MainWindow(QMainWindow):
                         and 'load_volume' in (notice.get('actions') or ()))
         return view_modes.Scene(geometry=geometry, patches=patches,
                                 volume=volume, zones=zones,
-                                volume_deferred=deferred)
+                                volume_deferred=deferred,
+                                base_grid=bool(getattr(mesh, 'isBaseGrid',
+                                                       lambda: False)()))
 
     def applyViewMode(self, modeId: str) -> bool:
         """Enter a view mode, or say in words why this case has no such view.
@@ -2489,7 +2530,7 @@ class MainWindow(QMainWindow):
         load = getattr(manager, 'load', None)
         if callable(load):
             try:
-                asyncio.ensure_future(load(0))
+                spawn(load(0), what='Loading the mesh')
             except Exception:                                # noqa: BLE001
                 logger.debug('the restored mesh could not be drawn',
                              exc_info=True)
@@ -2548,7 +2589,8 @@ class MainWindow(QMainWindow):
             log=strip.logPath())
         return True
 
-    def offerPreviousResult(self, message: str, handle) -> bool:
+    def offerPreviousResult(self, message: str, handle, *,
+                            failed: bool = True) -> bool:
         """Say a run left no mesh, and name the one the case still has.
 
         CP-02. A run that produced nothing used to leave the previous mesh on
@@ -2557,11 +2599,14 @@ class MainWindow(QMainWindow):
         route back to the mesh the case still holds is not. So the earlier
         accepted result is named here and drawn only when asked for, and when
         it is drawn it is labelled as the earlier run's, not this one's.
+
+        DP-6462. *failed* is False for a run the user cancelled: the strip
+        says so in its plain state, not the failed one.
         """
         strip = getattr(self, '_runStatusStrip', None)
         if handle is None or strip is None:
             self._offeredResult = None
-            self.showRunStatus(message, failed=True)
+            self.showRunStatus(message, failed=failed)
             return False
         self._offeredResult = handle
         self._historicalResult = None
@@ -2611,8 +2656,11 @@ class MainWindow(QMainWindow):
         resolution = getattr(app, 'workflowResolution', None)
         stale = getattr(resolution, 'artifact_state', None) is ArtifactState.STALE
         handle = None
+        # DP-6478. Both questions are disk reads (MEASURED live: 17.3 s in a
+        # `stat` of `_hasMeshOnDisk` on the GUI thread); a worker asks them.
         try:
-            handle = result_on_open(app.project.path, root_mesh_stale=stale)
+            handle = await asyncio.to_thread(
+                result_on_open, app.project.path, root_mesh_stale=stale)
         except OSError:
             logger.debug('stored results could not be read', exc_info=True)
         if handle is not None:
@@ -2624,9 +2672,16 @@ class MainWindow(QMainWindow):
             return ''
         # A mesh this resolver cannot name -- multi-region, a time directory,
         # or one the user pointed the case at. Still a mesh, still drawn.
-        if self._shouldDrawMeshOnOpen():
+        if await asyncio.to_thread(self._shouldDrawMeshOnOpen):
             await self._meshManager.load(0)
         return ''
+
+    def _reportLostTask(self, sentence: str) -> None:
+        """A fire-and-forget task died (Plan 50 IP19): say so for 15 s."""
+        try:
+            self.statusBar().showMessage(sentence, 15000)
+        except RuntimeError:
+            pass                # the window is already gone
 
     def showRunStatus(self, message: str, *, failed: bool = False,
                       log: str = '') -> None:
@@ -3047,7 +3102,7 @@ class MainWindow(QMainWindow):
             asyncio.get_running_loop()
         except RuntimeError:
             return bool(asyncio.run(work))
-        asyncio.ensure_future(work)
+        spawn(work, what='Colouring the volume')
         return True
 
     async def _paintVolume(self, key: str) -> bool:
@@ -3896,8 +3951,9 @@ class MainWindow(QMainWindow):
                 self._renderingTool.setInspectionActive('features', True)
                 self.statusBar().showMessage(self.tr(
                     "Finding the boundary's feature edges…"), 9000)
-                asyncio.create_task(MainWindow._drawBoundaryFeaturesLater(
-                    self, job, key, data, angle))
+                spawn(MainWindow._drawBoundaryFeaturesLater(
+                    self, job, key, data, angle),
+                    what='Finding the feature edges')
                 return
         MainWindow._showBoundaryFeatures(
             self, boundary_feature_edges.extract_edges(data, angle), key,
@@ -4742,7 +4798,18 @@ class MainWindow(QMainWindow):
             # itself and returns that Task. Wrapping it in create_task raises
             # TypeError ("a coroutine was expected"), which silently broke
             # every `foammesh <case>` launch.
-            self._openProject(str(initial_case))
+            # DP-6480. The local API starts while this open is still under
+            # way (its journal is set up on a worker); its case routes wait
+            # from now until the open has settled, so a client that pairs
+            # finds the case the window was started on.
+            hold = getattr(getattr(app, 'facade', None),
+                           'hold_while_opening', None)
+            if hold is not None:
+                self._releaseStartupOpen = hold()
+            opening = self._openProject(str(initial_case))
+            release = self.__dict__.get('_releaseStartupOpen')
+            if release is not None and hasattr(opening, 'add_done_callback'):
+                opening.add_done_callback(lambda _done: release())
 
     def _setupShortcuts(self):
         self._ui.actionNew.setShortcut('Ctrl+N')
@@ -4883,7 +4950,7 @@ class MainWindow(QMainWindow):
             self._renderingTool.enable()
             self._geometryManager.show()
             if app.workflowResolution.workflow is WorkflowMode.MESH_EXTERNAL:
-                asyncio.create_task(self._meshManager.load(0))
+                spawn(self._meshManager.load(0), what='Loading the mesh')
                 return
             self._stepManager.currentPage().updateMesh()    # This call meshManger.load()
         else:
@@ -4999,11 +5066,18 @@ class MainWindow(QMainWindow):
         except OSError:
             return False
 
-    def _actionSnapshot(self):
-        global_capabilities = frozenset()
-        if app.project is None:
-            return AppSnapshot(capabilities=global_capabilities)
-        content = ContentState.EMPTY
+    def _diskFacts(self, path, engine) -> dict:
+        """The part of the menu state that is read from the disk.
+
+        Plan 50 IP13 (DP-6272). Called live by ``_actionSnapshot()`` and on
+        a worker thread for the menus (``_menuDiskFacts``); it touches no Qt.
+        ``surface_files`` is ``None`` when ``constant/triSurface`` could not
+        be listed, which the snapshot reads as the OSError it used to be.
+        """
+        from foammesh.core.facade.mesh_presence import has_engine_mesh
+
+        facts = {'content_ok': True, 'has_mesh': False,
+                 'surface_files': False}
         try:
             # The engine is asked in the words it answers in. Both probes
             # this line used to hold -- `classify_case(...).has_mesh` and
@@ -5014,14 +5088,47 @@ class MainWindow(QMainWindow):
             # been produced in this case yet` on the quality page, because
             # this answer was `False` and `refreshMeshVerdict` clears both
             # quality surfaces unless it is `True`.
-            from foammesh.core.facade.mesh_presence import has_engine_mesh
-            has_mesh = (has_engine_mesh(app.project.path,
-                                        configured_engine(app))
-                        or self._hasMeshOnDisk())
-            geometry_root = app.project.path / 'constant' / 'triSurface'
-            has_geometry = (app.db.elementCount('geometry') > 0 or
-                            (geometry_root.is_dir() and any(
-                                item.is_file() for item in geometry_root.iterdir())))
+            facts['has_mesh'] = bool(has_engine_mesh(path, engine)
+                                     or self._hasMeshOnDisk())
+        except OSError:
+            facts['content_ok'] = False
+        try:
+            geometry_root = path / 'constant' / 'triSurface'
+            facts['surface_files'] = (geometry_root.is_dir() and any(
+                item.is_file() for item in geometry_root.iterdir()))
+        except OSError:
+            facts['surface_files'] = None
+        facts['terminal'] = terminal_capability()
+        facts['recovery'] = MeshRecoveryService().has_available(path)
+        return facts
+
+    def _actionSnapshot(self, cached: bool = False):
+        """What the action policy judges the menus by.
+
+        Plan 50 IP13. ``cached`` (the menus) takes the disk facts from
+        ``_menuDiskFacts`` -- read on a worker thread, and absent while not
+        yet known -- instead of probing on the GUI thread. Without it the
+        disk is read live, which is what ``refreshMeshVerdict`` (R116) and
+        the repair action need.
+        """
+        global_capabilities = frozenset()
+        if app.project is None:
+            return AppSnapshot(capabilities=global_capabilities)
+        if cached:
+            disk = self._menuDiskFacts()
+        else:
+            disk = MainWindow._diskFacts(self, app.project.path,
+                                         configured_engine(app))
+        content = ContentState.EMPTY
+        try:
+            if not disk['content_ok']:
+                raise OSError('the case could not be read')
+            has_mesh = disk['has_mesh']
+            has_geometry = case_configuration(app).elementCount('geometry') > 0
+            if not has_geometry:
+                if disk['surface_files'] is None:
+                    raise OSError('constant/triSurface could not be read')
+                has_geometry = disk['surface_files']
             if has_mesh and has_geometry:
                 content = ContentState.GEOMETRY_AND_MESH
             elif has_mesh:
@@ -5052,7 +5159,7 @@ class MainWindow(QMainWindow):
             capability_reasons[ActionId.MESH_QUALITY.value] = quality_reason
             capability_reasons[
                 ActionId.SETTINGS_MESH_QUALITY.value] = quality_reason
-        terminal_available, terminal_reason = terminal_capability()
+        terminal_available, terminal_reason = disk['terminal']
         if terminal_available:
             capabilities = capabilities | frozenset({ActionId.TERMINAL_HERE.value})
         else:
@@ -5078,7 +5185,7 @@ class MainWindow(QMainWindow):
             capability_reasons[ActionId.MESH_REPAIR.value] = (
                 check_mesh.reason if check_mesh.transient else
                 'No supported mesh repair utility was found in the configured environment')
-        if MeshRecoveryService().has_available(app.project.path):
+        if disk['recovery']:
             capabilities = capabilities | frozenset({ActionId.MESH_RESTORE.value})
         else:
             capability_reasons[ActionId.MESH_RESTORE.value] = (
@@ -5098,6 +5205,161 @@ class MainWindow(QMainWindow):
             capabilities=capabilities,
             capability_reasons=capability_reasons,
         )
+
+    # -- Plan 50 IP13 (DP-6272): the disk half of the menu state, cached ----- #
+
+    #: Facts an event may have changed and which are then treated as absent
+    #: until read again. A transaction or a geometry event can move
+    #: triSurface files but cannot remove a mesh (every removal is an
+    #: operation that publishes ARTIFACT_MESH_CHANGED), so it re-reads only
+    #: that; every other subscribed event re-reads the mesh facts too.
+    _MENU_DISK_ALL = frozenset({'content_ok', 'has_mesh', 'surface_files',
+                                'recovery'})
+    _MENU_DISK_SURFACE_ONLY = frozenset({'surface_files'})
+
+    #: What the menu assumes about a fact it does not know: nothing the disk
+    #: would have to grant. Every action gated on these is shown disabled
+    #: (with its "not found" reason) for the one worker-thread hop it takes
+    #: to learn otherwise -- never enabled on a precondition that has gone.
+    _MENU_DISK_UNKNOWN = {'content_ok': True, 'has_mesh': False,
+                          'surface_files': False, 'recovery': False}
+
+    def _menuDiskKey(self):
+        return (str(app.project.path), str(configured_engine(app) or ''))
+
+    def _menuDiskFacts(self) -> dict:
+        """The disk facts for the menus, from the cache; never read here.
+
+        A miss (none yet, another case or engine, or facts an event made
+        stale) starts one probe on a worker thread and answers with
+        ``_MENU_DISK_UNKNOWN`` for what it does not know. The terminal
+        answer (``shutil.which``) does not depend on the case, so the last
+        one is kept across a miss; before the first it reads as being
+        checked.
+        """
+        key = self._menuDiskKey()
+        held = getattr(self, '_menuDisk', None)
+        stale = getattr(self, '_menuDiskStaleKeys', set())
+        if held is not None and held.get('key') != key:
+            held = None
+        if held is None or stale:
+            self._startMenuDiskProbe()
+        facts = dict(self._MENU_DISK_UNKNOWN)
+        if held is not None:
+            facts.update({name: held[name] for name in self._MENU_DISK_ALL
+                          if name not in stale and name in held})
+        facts['terminal'] = getattr(self, '_menuTerminal', None) or (
+            False, self.tr('Checking for a terminal…'))
+        return facts
+
+    def _startMenuDiskProbe(self) -> None:
+        """Read the disk facts off the GUI thread (once at a time).
+
+        Each pass notes the invalidation count and the case it read for; an
+        answer overtaken by an event, or by another case, is read again
+        rather than kept. The menus are repainted when it lands.
+        """
+        if getattr(self, '_menuDiskProbing', False):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return              # no loop, no window to repaint either
+        self._menuDiskProbing = True
+
+        async def probe():
+            landed = False
+            try:
+                while app.project is not None:
+                    epoch = getattr(self, '_menuDiskEpoch', 0)
+                    key = self._menuDiskKey()
+                    failed = False
+                    try:
+                        facts = await asyncio.to_thread(
+                            MainWindow._diskFacts, self, Path(key[0]),
+                            key[1])
+                    except Exception:                    # noqa: BLE001
+                        logger.debug('menu disk probe failed',
+                                     exc_info=True)
+                        facts = dict(self._MENU_DISK_UNKNOWN)
+                        failed = True
+                    if app.project is None:
+                        break
+                    if (epoch != getattr(self, '_menuDiskEpoch', 0)
+                            or key != self._menuDiskKey()):
+                        continue
+                    if 'terminal' in facts:
+                        self._menuTerminal = facts['terminal']
+                    self._menuDisk = dict(facts, key=key)
+                    self._menuDiskStaleKeys = set()
+                    landed = not failed
+                    break
+            finally:
+                self._menuDiskProbing = False
+            try:
+                self._scheduleMenuRefresh()
+                if landed:
+                    # DP-6478. The verdict drawn from the cache is redrawn
+                    # if what the disk said differs.
+                    MainWindow._verdictAfterProbe(self)
+            except RuntimeError:
+                pass            # the window closed while the probe was out
+
+        spawn(probe(), what='Reading the disk facts')
+
+    def _menuDiskEvent(self, *_args, **payload) -> None:
+        """An event that may have changed what the disk says (IP13)."""
+        event = payload.get('event')
+        changed = (self._MENU_DISK_SURFACE_ONLY
+                   if event in (Event.TRANSACTION_APPLIED,
+                                Event.ARTIFACT_GEOMETRY_CHANGED)
+                   else self._MENU_DISK_ALL)
+        self._menuDiskEpoch = getattr(self, '_menuDiskEpoch', 0) + 1
+        self._menuDiskStaleKeys = (
+            set(getattr(self, '_menuDiskStaleKeys', set())) | set(changed))
+        self._scheduleMenuRefresh()
+
+    def _knownMeshOnDisk(self):
+        """The cache's answer to "is there a mesh on disk"; ``None`` while
+        it is not known (none yet, another case, or made stale)."""
+        held = getattr(self, '_menuDisk', None)
+        if (held is None or 'has_mesh' not in held
+                or held.get('key') != self._menuDiskKey()
+                or 'has_mesh' in getattr(self, '_menuDiskStaleKeys', set())):
+            return None
+        return bool(held.get('content_ok', True) and held['has_mesh'])
+
+    def _meshOnDiskForVerdict(self, probed: bool = False):
+        """Whether the quality surfaces stand over a mesh (DP-6478).
+
+        MEASURED live: ``refreshMeshVerdict`` read this from the disk on the
+        GUI thread through ``_actionSnapshot()`` and held the window 3.1 s
+        and 12.1 s (a ``stat`` in the time-directory sweep) while another
+        program kept the disk busy. The answer now comes from the cache the
+        menus use (IP13), and every call asks the worker for a fresh read;
+        when that read lands with an answer other than the one the verdict
+        was drawn from, the verdict is drawn again -- so it never goes on
+        claiming a mesh the disk no longer holds. ``None``: not known yet.
+        """
+        known = MainWindow._knownMeshOnDisk(self)
+        if not probed or known is None:
+            self._verdictProbeWanted = True
+            # A read already out may predate what prompted this one; the
+            # probe loop reads again when the count moved.
+            self._menuDiskEpoch = getattr(self, '_menuDiskEpoch', 0) + 1
+            self._startMenuDiskProbe()
+        self._verdictHasMesh = known
+        return known
+
+    def _verdictAfterProbe(self) -> None:
+        """A disk read the verdict asked for has landed (DP-6478)."""
+        if not getattr(self, '_verdictProbeWanted', False):
+            return
+        self._verdictProbeWanted = False
+        fresh = MainWindow._knownMeshOnDisk(self)
+        if fresh is not None and fresh != getattr(self, '_verdictHasMesh', None):
+            spawn(self.refreshMeshVerdict(probed=True),
+                  what='Checking the mesh verdict')
 
     def _menuJobState(self):
         """The job state the menus are judged by.
@@ -5207,7 +5469,7 @@ class MainWindow(QMainWindow):
                 # The window closed while the probe was out.
                 pass
 
-        asyncio.ensure_future(warm())
+        spawn(warm(), what='Probing the runtime')
 
     def _capabilitiesReprobed(self, *_args, **_kwargs):
         """A re-probe is the one thing that makes a failed probe worth redoing."""
@@ -5303,6 +5565,11 @@ class MainWindow(QMainWindow):
             MainWindow._appendConsole(self, MainWindow.importSummary(payload))
         source = getattr(getattr(command, 'source', None), 'value',
                          getattr(command, 'source', None))
+        if source == 'rest':
+            MainWindow._rebaselineAfterApiWrite(self, command)
+        if source == 'rest' and operation == MainWindow.API_STAGE_OPERATION:
+            self._apiStageRunEnded(command, result)
+            return
         if source != 'rest' or operation not in self.API_RUN_OPERATIONS:
             return
         stepManager = getattr(self, '_stepManager', None)
@@ -5320,6 +5587,87 @@ class MainWindow(QMainWindow):
             await show(result)
 
         self._trackMeshDraw(draw())
+
+    def _rebaselineAfterApiWrite(self, command):
+        """DP-6492. A write sent over the local API is FoamMesh's own write.
+
+        The window's own commands re-take the case snapshot after each write
+        (`DesktopFacadeClient.run`); a command sent over the API reaches the
+        facade without that client. MEASURED live (Plan 50, s2-cell-limit):
+        after a run and a `case.save` over the API, moving to another step
+        said the case "was changed outside FoamMesh". A read writes nothing,
+        and re-taking the snapshot after one could only hide a real outside
+        change, so reads and presentation commands are left alone. Off the
+        GUI thread, as the window's own re-take is (DP-2712).
+        """
+        if getattr(command, 'scope', 'case') == 'presentation':
+            return
+        client = getattr(app, 'facadeClient', None)
+        is_query = getattr(client, '_is_query', None)
+        project = getattr(app, 'project', None)
+        accept = getattr(project, 'acceptExternalChanges', None)
+        if not callable(is_query) or not callable(accept):
+            return
+        if is_query(getattr(command, 'operation', '')):
+            return
+        try:
+            spawn(asyncio.to_thread(accept),
+                  what='Recording the case as FoamMesh left it')
+        except RuntimeError:
+            logger.debug('no loop to record the case snapshot on')
+
+    #: DP-6488. A single stage run: drawn the way the window's own stage
+    #: run draws it (``EngineBranchView._reload_mesh``), not as a pipeline.
+    API_STAGE_OPERATION = 'workflow.run_stage'
+
+    def _apiStageRunEnded(self, command, result):
+        """DP-6488. A stage run sent over the local API, shown when it ends.
+
+        MEASURED live (Plan 50, w-basegrid-ext): after `workflow.run_stage`
+        blockMesh or castellation over the API the header named the cells
+        and the viewport kept the geometry. The window's own "Run this step"
+        and "Run & Proceed" hand over the verdict and load the case mesh;
+        the refresh the run's mesh event schedules only re-reads a mesh that
+        was already on screen. This does what the window's own stage run
+        does, for the same stages: an accepted stage that writes a mesh.
+        """
+        if getattr(result, 'status', '') != 'accepted':
+            return
+        parameters = getattr(command, 'parameters', None) or {}
+        if str(parameters.get('stage') or '') in ('', 'checkMesh'):
+            return
+        payload = getattr(result, 'payload', None)
+        payload = payload if isinstance(payload, dict) else {}
+        verdict = payload.get('quality_verdict')
+        show = getattr(self, 'showMeshVerdict', None)
+        if verdict and callable(show):
+            show(dict(verdict, run_id=str(payload.get('run_id') or '')))
+        self._trackMeshDraw(self._drawApiStageMesh())
+
+    async def _drawApiStageMesh(self):
+        # The draw is the window's own work, not the API command's.
+        try:
+            app.facadeClient.session().clear_event_context()
+        except (AttributeError, RuntimeError):
+            pass
+        # Plan 37 I2, as the window's own run: what is drawn next is this
+        # run's result, not an unlocked step's retained output.
+        clear = getattr(self, 'clearHistoricalResult', None)
+        if callable(clear):
+            clear(False)
+        manager = getattr(self, '_meshManager', None)
+        if manager is None:
+            return
+        try:
+            await manager.load(0)
+        except Exception as error:                          # noqa: BLE001
+            logger.warning('could not draw the mesh that was just written',
+                           exc_info=True)
+            statusbar = getattr(getattr(self, '_ui', None), 'statusbar', None)
+            if statusbar is not None:
+                statusbar.showMessage(
+                    self.tr('The mesh was written but could not be drawn: %s')
+                    % error, 10000)
 
     def _trackMeshDraw(self, coroutine):
         """Run a mesh draw, kept until it ends so `meshSettled` can wait."""
@@ -5361,11 +5709,19 @@ class MainWindow(QMainWindow):
             except Exception:                            # noqa: BLE001
                 logger.exception('could not show geometry imported over the API')
 
-        asyncio.ensure_future(adopt())
+        spawn(adopt(), what='Showing the imported geometry')
+
+    def _noteMeshReplaced(self, payload) -> None:
+        """Plan 50 IP9: an event in ``MESH_REPLACING_EVENTS`` forces the
+        flush's mesh reload past the same-mesh guard."""
+        if isinstance(payload, dict) and \
+                payload.get('event') in MESH_REPLACING_EVENTS:
+            self._projectRefreshForcesMesh = True
 
     def _scheduleProjectRefresh(self, *_args, **kwargs):
         """Coalesce artifact/history events into one truthful scene refresh."""
         self._scheduleMenuRefresh()
+        self._noteMeshReplaced(kwargs)
         self._noteRefreshCause(kwargs)
         if self._projectRefreshPending:
             return
@@ -5440,12 +5796,15 @@ class MainWindow(QMainWindow):
         and must leave an unapplied edit where the user typed it.
         """
         self._projectRefreshRepaintsForms = True
+        self._noteMeshReplaced(_kwargs)
         self._scheduleProjectRefresh()
 
     def _flushProjectRefresh(self):
         self._projectRefreshPending = False
         repaintsForms = self._projectRefreshRepaintsForms
         self._projectRefreshRepaintsForms = False
+        forcesMesh = getattr(self, '_projectRefreshForcesMesh', False)
+        self._projectRefreshForcesMesh = False
         wide = self._projectRefreshWide or not self._projectRefreshRenames
         renames = self._projectRefreshRenames
         self._projectRefreshWide = False
@@ -5463,7 +5822,10 @@ class MainWindow(QMainWindow):
                 self._geometryManager.applyToDisplay()
         self._stepManager.load(preserveCurrentPage=not repaintsForms)
         if self._meshManager is not None:
-            asyncio.create_task(self._meshManager.reload())
+            # Plan 50 IP9. Guarded unless an event replaced the mesh: a
+            # reload of the mesh on screen returns without reading it.
+            spawn(self._meshManager.reload(force=forcesMesh),
+                  what='Reloading the mesh')
         self.refreshMeshVerdictSoon()
 
     # -- WP3: the verdict strip and its tab ------------------------------- #
@@ -5650,9 +6012,9 @@ class MainWindow(QMainWindow):
         One implementation, one scheduler, and every entry point uses one of
         the two rather than guessing which calling convention applies.
         """
-        asyncio.create_task(self.refreshMeshVerdict())
+        spawn(self.refreshMeshVerdict(), what='Checking the mesh verdict')
 
-    async def refreshMeshVerdict(self) -> None:
+    async def refreshMeshVerdict(self, *, probed: bool = False) -> None:
         """Publish whatever quality is already known about the loaded mesh.
 
         The quality surfaces used to be filled by exactly one path -- accepting
@@ -5661,13 +6023,21 @@ class MainWindow(QMainWindow):
         drawn on screen and a stored report that said `warning`. `quality.report`
         is a READ of that persisted report, so this costs nothing and is the
         difference between a surface that is empty and one that is honest.
+
+        ``probed``: called again because the disk was just read (DP-6478).
         """
         if app.project is None or not hasattr(self, '_outputTabs'):
             return
         # "Not checked" is only honest about a mesh that exists. Said about an
         # empty case it invites the user to run checkMesh on nothing, so the
         # dormant no-mesh line stands until there is something to measure.
-        if not self._actionSnapshot().has_mesh:
+        # DP-6478. Whether there is one is read from the disk-facts cache,
+        # never from the disk here; an unknown answer leaves the surfaces as
+        # they are until the worker's read lands and calls this again.
+        has_mesh = self._meshOnDiskForVerdict(probed)
+        if has_mesh is None:
+            return
+        if not has_mesh:
             self.clearMeshVerdict()
             return
 
@@ -5751,14 +6121,20 @@ class MainWindow(QMainWindow):
         """
         if not verdict:
             return
-        confirmed = messages.question(
+        # Plan 50 IP19 (DP-6360). Each question opens without a nested event
+        # loop and the next step follows its answer.
+        messages.askQuestion(
             self, self.tr('Accept this mesh?'),
             self.tr('This mesh did not meet its quality limits:\n\n%s\n\n'
                     'Accepting it records the decision against this mesh. The '
                     'record lapses if the mesh or the limits change.')
             % str(verdict.get('reason') or ''),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
+            QMessageBox.StandardButton.No,
+            then=lambda confirmed: MainWindow._askMeshJustification(
+                self, verdict, confirmed))
+
+    def _askMeshJustification(self, verdict: dict, confirmed) -> None:
         if confirmed != QMessageBox.StandardButton.Yes:
             return
         # R124. The waiver used to store the app's own failure sentence played
@@ -5772,15 +6148,19 @@ class MainWindow(QMainWindow):
         # that does not wrap: MEASURED here, a typed paragraph became one
         # long line behind a horizontal scrollbar showing its tail. The
         # sentence above promises a reviewer will read this.
-        reason = JustificationDialog.ask(
+        def written(reason):
+            if not reason:
+                return
+            spawn(self._runAcceptedMesh(
+                reason, str(verdict.get('run_id') or '')),
+                what='Running the accepted mesh')
+
+        JustificationDialog.ask(
             self, self.tr('Why is this mesh acceptable?'),
             self.tr('Explain why this mesh may be used despite failing its '
                     'quality limits. This is recorded against the mesh and is '
-                    'what a reviewer will read.'))
-        if not reason:
-            return
-        asyncio.create_task(self._runAcceptedMesh(
-            reason, str(verdict.get('run_id') or '')))
+                    'what a reviewer will read.'),
+            then=written)
 
     async def _runAcceptedMesh(self, reason: str = '',
                                run_id: str = '') -> None:
@@ -5907,7 +6287,8 @@ class MainWindow(QMainWindow):
                 % error, 10000)
 
     def _updateMenuStates(self):
-        snapshot = self._actionSnapshot()
+        # Plan 50 IP13: the disk half comes from the worker-thread cache.
+        snapshot = self._actionSnapshot(cached=True)
         for action_id, presentation in self._actionPolicy.evaluate(snapshot).items():
             action = self._policyActions.get(action_id)
             if action is None:
@@ -6217,8 +6598,8 @@ class MainWindow(QMainWindow):
             fields_present = self._caseHasResultFields(app.project.path)
             field_support = '-rotateFields' in help_result.output
             if fields_present and operation != 'rotate':
-                proceed = await modal(
-                    messages.warning,
+                proceed = await messages.askAsync(
+                    QMessageBox.Icon.Warning,
                     self, self.tr('Existing result fields'),
                     self.tr('This case contains result fields. The selected transform changes mesh points '
                             'but does not transform those fields. Continue?'),
@@ -6360,8 +6741,7 @@ class MainWindow(QMainWindow):
                 self.tr('No configured mesh repair utility is available for this case.'), 6000)
             return
         labels = [operation.label for operation in operations]
-        selected, accepted = await modal(
-            QInputDialog.getItem,
+        selected, accepted = await dialogs.getItemAsync(
             self, self.tr('Mesh repair'), self.tr('Repair operation'), labels, 0, False)
         if not accepted:
             return
@@ -6369,19 +6749,16 @@ class MainWindow(QMainWindow):
         cell_set = None
         subset_destination = None
         if operation is RepairOperation.SUBSET_CELLS:
-            cell_set, accepted = await modal(
-                QInputDialog.getText,
+            cell_set, accepted = await dialogs.getTextAsync(
                 self, self.tr('Subset mesh'), self.tr('Existing cell-set name'))
             if not accepted:
                 return
-            parent = await modal(
-                QFileDialog.getExistingDirectory,
+            parent = await dialogs.getExistingDirectoryAsync(
                 self, self.tr('Select parent for subset case'), app.settings.getRecentLocation(),
                 QFileDialog.Option.ShowDirsOnly)
             if not parent:
                 return
-            name, accepted = await modal(
-                QInputDialog.getText,
+            name, accepted = await dialogs.getTextAsync(
                 self, self.tr('Subset mesh'), self.tr('New subset case directory name'),
                 text=f'{app.project.name()}-subset')
             if not accepted or not name.strip():
@@ -6402,8 +6779,7 @@ class MainWindow(QMainWindow):
             warning += self.tr('\nConfiguration: {0}').format(preview.configuration_path)
         if operation is RepairOperation.SUBSET_CELLS:
             warning = self.tr('This destructive operation runs only in a new copied case.')
-        confirmation = await modal(
-            messages.question,
+        confirmation = await messages.questionAsync(
             self, self.tr('Run mesh repair'), warning,
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
@@ -6499,8 +6875,7 @@ class MainWindow(QMainWindow):
             self._updateMenuStates()
             return
         payload = points[-1]
-        confirmation = await modal(
-            messages.question,
+        confirmation = await messages.questionAsync(
             self, self.tr('Restore previous mesh'),
             self.tr('Replace the current mesh with the recovery copy saved before '
                     '"{0}" ({1})?\nThis is an artifact restore, not Undo; the '
@@ -6537,8 +6912,7 @@ class MainWindow(QMainWindow):
                 self.tr('No imported surface geometry is available for repair.'), 6000)
             return
         labels = [f"{geometry.value('name')} [{g_id}]" for g_id, geometry in surfaces.items()]
-        selected, accepted = await modal(
-            QInputDialog.getItem,
+        selected, accepted = await dialogs.getItemAsync(
             self, self.tr('Geometry repair'), self.tr('Surface'), labels, 0, False)
         if not accepted:
             return
@@ -6552,8 +6926,7 @@ class MainWindow(QMainWindow):
         labels = [
             f'{name}  —  {REPAIR_BANDS[TESSELLATED_ACTIONS[name].band][0]}'
             for name in operations]
-        operation_label, accepted = await modal(
-            QInputDialog.getItem,
+        operation_label, accepted = await dialogs.getItemAsync(
             self, self.tr('Geometry repair'), self.tr('Operation'),
             labels, 0, False)
         if not accepted:
@@ -6561,8 +6934,7 @@ class MainWindow(QMainWindow):
         operation = operations[labels.index(operation_label)]
         hole_size = 1e6
         if operation == 'tess.fill_holes':
-            hole_size, accepted = await modal(
-                QInputDialog.getDouble,
+            hole_size, accepted = await dialogs.getDoubleAsync(
                 self, self.tr('Fill surface holes'),
                 self.tr('Maximum hole size (m)'),
                 1e6, 1e-12, 1e18, 6)
@@ -6590,8 +6962,7 @@ class MainWindow(QMainWindow):
                 after_counts.get('non_manifold_edges', 0),
                 before_counts.get('duplicate_points', 0),
                 after_counts.get('duplicate_points', 0))
-        choice = await modal(
-            messages.question,
+        choice = await messages.questionAsync(
             self, self.tr('Geometry repair preview'), summary,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No |
             QMessageBox.StandardButton.Cancel,
@@ -6599,8 +6970,7 @@ class MainWindow(QMainWindow):
         if choice == QMessageBox.StandardButton.Cancel:
             return
         if choice == QMessageBox.StandardButton.No:
-            path, _ = await modal(
-                QFileDialog.getSaveFileName,
+            path, _ = await dialogs.getSaveFileNameAsync(
                 self, self.tr('Save repaired geometry copy'),
                 str(app.project.path / f"{surfaces[g_id].value('name')}-repaired.stl"),
                 self.tr('STL surface (*.stl);;OBJ surface (*.obj)'))
@@ -6643,13 +7013,11 @@ class MainWindow(QMainWindow):
             return
 
         fmt = ConverterFormat(entry.entry_id)
-        source, _ = await modal(
-            QFileDialog.getOpenFileName,
+        source, _ = await dialogs.getOpenFileNameAsync(
             self, self.tr('Select {0}').format(fmt.label), app.settings.getRecentLocation(), fmt.file_filter())
         if not source:
             return
-        confirmation = await modal(
-            messages.question,
+        confirmation = await messages.questionAsync(
             self, self.tr('Convert and replace mesh'),
             self.tr('Convert this file into the current case? The current mesh will be retained as a recovery copy.'),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
@@ -6713,8 +7081,7 @@ class MainWindow(QMainWindow):
         }
 
     async def _loadNativeMeshFromCase(self):
-        source = await modal(
-            QFileDialog.getExistingDirectory,
+        source = await dialogs.getExistingDirectoryAsync(
             self, self.tr('Select OpenFOAM mesh case'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not source:
@@ -6752,14 +7119,12 @@ class MainWindow(QMainWindow):
         self._updateMenuStates()
 
     async def _importNativeMeshIntoCopy(self, source):
-        parent = await modal(
-            QFileDialog.getExistingDirectory,
+        parent = await dialogs.getExistingDirectoryAsync(
             self, self.tr('Select parent for new case copy'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
-        name, accepted = await modal(
-            QInputDialog.getText,
+        name, accepted = await dialogs.getTextAsync(
             self, self.tr('Import into new case copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-imported')
         if not accepted or not name.strip():
@@ -6772,8 +7137,7 @@ class MainWindow(QMainWindow):
             text, details = messages.reasonOf(error, self.tr('The mesh could not be imported.'))
             await AsyncMessageBox().warning(self, self.tr('Mesh import error'), text, detailedText=details)
             return
-        open_copy = await modal(
-            messages.question,
+        open_copy = await messages.questionAsync(
             self, self.tr('Import complete'),
             self.tr('Imported the mesh into {0}. Open that case now?').format(
                 result.payload['target_case']),
@@ -6794,14 +7158,12 @@ class MainWindow(QMainWindow):
             await self._relocateScratchCase()
             return
         await app.facadeClient.run('case.save')
-        parent = await modal(
-            QFileDialog.getExistingDirectory,
+        parent = await dialogs.getExistingDirectoryAsync(
             self, self.tr('Select copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return
-        name, accepted = await modal(
-            QInputDialog.getText,
+        name, accepted = await dialogs.getTextAsync(
             self, self.tr('Save project as'), self.tr('New case directory name'),
             text=f'{app.project.name()}-copy')
         if not accepted or not name.strip():
@@ -6813,8 +7175,7 @@ class MainWindow(QMainWindow):
             text, details = messages.reasonOf(error, self.tr('The case could not be copied.'))
             await AsyncMessageBox().warning(self, self.tr('Copy error'), text, detailedText=details)
             return
-        open_copy = await modal(
-            messages.question,
+        open_copy = await messages.questionAsync(
             self, self.tr('Copy complete'), self.tr('Open the copied case now?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -6911,14 +7272,12 @@ class MainWindow(QMainWindow):
                     'keep it before {0}.').format(what))
 
     async def _saveConflictCopy(self):
-        parent = await modal(
-            QFileDialog.getExistingDirectory,
+        parent = await dialogs.getExistingDirectoryAsync(
             self, self.tr('Select save copy parent directory'), app.settings.getRecentLocation(),
             QFileDialog.Option.ShowDirsOnly)
         if not parent:
             return False
-        name, accepted = await modal(
-            QInputDialog.getText,
+        name, accepted = await dialogs.getTextAsync(
             self, self.tr('Save copy'), self.tr('New case directory name'),
             text=f'{app.project.name()}-conflict-copy')
         if not accepted or not name.strip():
@@ -7023,11 +7382,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.tr('Recent cases cleared.'), 3000)
 
     def _actionNew(self):
-        path = QFileDialog.getExistingDirectory(
+        # Plan 50 IP19: no nested event loop.
+        dialogs.getExistingDirectory(
             self, self.tr('Select empty case directory'), app.settings.getRecentLocation(),
-            QFileDialog.Option.ShowDirsOnly)
-        if path:
-            self._createInPlaceCase(Path(path))
+            QFileDialog.Option.ShowDirsOnly,
+            then=lambda path: path and self._createInPlaceCase(Path(path)))
 
     def _actionOpen(self):
         self._dialog = QFileDialog(self, self.tr('Select project directory'), app.settings.getRecentLocation())
@@ -7107,7 +7466,7 @@ class MainWindow(QMainWindow):
         except CaseConflictError:
             self.statusBar().showMessage(self.tr(
                 'Not saved automatically: the case was changed outside '
-                'FoamMesh. Use File > Save to choose what to keep.'), 8000)
+                'FoamMesh. Use File → Save to choose what to keep.'), 8000)
             return False
 
         def saved(result):
@@ -7135,7 +7494,7 @@ class MainWindow(QMainWindow):
         self._projectClosed()
         self._clear()
         try:
-            app.openCase(path)
+            await MainWindow._openCaseOffGuiThread(self, path)
             self._projectOpened()
         except (OSError, ValueError, Timeout) as error:
             text, details = messages.reasonOf(error, self.tr('The case could not be reloaded.'))
@@ -7539,6 +7898,27 @@ class MainWindow(QMainWindow):
         if path:
             await self._createInPlaceCase(path)
 
+    async def _openCaseOffGuiThread(self, path):
+        """Open the case with its event journal set up off the GUI thread.
+
+        DP-6480. MEASURED live: the journal's SQLite set-up held the window
+        20.2 s on opening a case while another program kept the disk busy.
+        An application object without ``openCaseAsync`` (a stand-in) opens
+        it as before.
+        """
+        try:
+            opening = getattr(app, 'openCaseAsync', None)
+            if opening is None:
+                return app.openCase(path)
+            return await opening(path)
+        finally:
+            # The start-up hold on the local API's case routes (see `start`)
+            # ends once the case is open or has failed to open -- not after
+            # the error box, which waits for the person.
+            release = self.__dict__.pop('_releaseStartupOpen', None)
+            if release is not None:
+                release()
+
     @qasync.asyncSlot()
     async def _openProject(self, file):
         if not await self._closeProject():
@@ -7547,7 +7927,7 @@ class MainWindow(QMainWindow):
 
         path = Path(file)
         try:
-            app.openCase(path)
+            await MainWindow._openCaseOffGuiThread(self, path)
             self._recentFilesMenu.addRecentest(app.project.path)
             self._projectOpened()
         except FileNotFoundError:
@@ -7565,11 +7945,31 @@ class MainWindow(QMainWindow):
             await AsyncMessageBox().warning(self, self.tr('Project open error'),
                                                 self.tr('{0} is already open in another program.').format(path.name))
         except ValidationError as e:
-            await AsyncMessageBox().warning(self, self.tr('Project open error'),
-                                                self.tr('Configuration error: {0} — {1}.').format(e.path, e.name))
+            # DP-6475. This said "Configuration error: <path> — <name>." in a
+            # box only, and nothing at all reached the status line, the
+            # Console or the log -- so a case named on the command line that
+            # could not be read left the window at "No case open" with no
+            # word why. The sentence names the case and the field.
+            sentence = getattr(e, 'sentence', None)
+            if not sentence:
+                toMessage = getattr(e, 'toMessage', None)
+                sentence = self.tr('The case in {0} cannot be opened: {1}').format(
+                    path, toMessage() if callable(toMessage) else e)
+            MainWindow._sayCaseNotOpened(self, sentence)
+            await AsyncMessageBox().warning(
+                self, self.tr('Project open error'), sentence)
         except ValueError as error:
+            MainWindow._sayCaseNotOpened(self, str(error))
             await AsyncMessageBox().warning(
                 self, self.tr('Project open error'), str(error))
+
+    def _sayCaseNotOpened(self, sentence: str):
+        """DP-6475. Where a person looks when a case did not open: the status
+        line, the Console and the log. The box that follows is not modal and
+        may sit behind the window, so it is not the only word."""
+        logger.warning('Case not opened: %s', sentence)
+        self.statusBar().showMessage(sentence)
+        MainWindow._appendConsole(self, sentence)
 
     @qasync.asyncSlot()
     async def _saveAs(self, path):
@@ -7629,8 +8029,7 @@ class MainWindow(QMainWindow):
         if progressDialog is not None:
             progressDialog.close()
         if not answered:
-            open_copy = await modal(
-                messages.question,
+            open_copy = await messages.questionAsync(
                 self, self.tr('State copy complete'),
                 self.tr('FoamMesh state was saved without native artifacts. Open it now?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -7777,6 +8176,10 @@ class MainWindow(QMainWindow):
                 # call was asked to close no longer exists. Close that.
                 return await self._closeProject(toQuit, saveChanges)
 
+        # DP-6479. A run-list entry still queued for its writer thread is
+        # on disk before the case it belongs to is let go.
+        from foammesh.core.jobs import run_listing
+        await asyncio.to_thread(run_listing.flush, 60)
         app.closeProject()
         self._projectClosed()
         self._clear()
@@ -7861,6 +8264,20 @@ class MainWindow(QMainWindow):
             app.events.subscribe(event, self._scheduleMenuRefresh)
             for event in menu_events
         ] + [
+            # Plan 50 IP13 (DP-6272). The menus read the disk from a cache
+            # filled off the GUI thread; these are the events after which
+            # what it holds may no longer be true.
+            app.events.subscribe(event, self._menuDiskEvent)
+            for event in (
+                Event.TRANSACTION_APPLIED, Event.ARTIFACT_GEOMETRY_CHANGED,
+                Event.ARTIFACT_MESH_CHANGED, Event.ARTIFACT_RESTORED,
+                Event.UNDONE, Event.REDONE, Event.OPERATION_SUCCEEDED,
+                Event.OPERATION_FAILED, Event.OPERATION_RECOVERED,
+                Event.JOB_FINISHED, Event.JOB_FAILED, Event.JOB_CANCELLED,
+                Event.ARTIFACT_STALE, Event.WORKFLOW_MODE_CHANGED,
+                Event.ARTIFACT_QUALITY_CHANGED,
+            )
+        ] + [
             # A re-probe is what changes a capability answer; the rest of the
             # menu events only change what the answer is being used for.
             app.events.subscribe(
@@ -7914,6 +8331,11 @@ class MainWindow(QMainWindow):
             self._projectEventUnsubscribes.append(
                 app.facadeClient.session().observe_commands(
                     self._commandEnded))
+            # DP-6454. A meshing run shows on the run strip and the status
+            # bar whoever started it; a run a page started is the page's.
+            from .run_follower import install_run_follower
+            self._projectEventUnsubscribes.append(install_run_follower(
+                app.facadeClient.session(), lambda: self))
         except Exception:       # noqa: BLE001 - no session, no commands
             logger.debug('no session to observe commands of')
 

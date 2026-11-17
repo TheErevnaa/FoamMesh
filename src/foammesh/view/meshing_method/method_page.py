@@ -23,6 +23,7 @@ from foammesh.view.workflow_controls.field_group_page import (
 from foammesh.view.workflow_controls.warning_text import format_warnings
 from foammesh.view.facade_client import FailedResult, query, submit
 from widgets import async_message_box as messages
+from widgets.async_dialog import openDialog
 
 
 #: Kept as the name this module has always exported; the definition moved to
@@ -666,7 +667,8 @@ class MeshingMethodPage(QWidget):
                 QDialogButtonBox.StandardButton.Close, parent=dialog)
             buttons.rejected.connect(dialog.reject)
             layout.addWidget(buttons)
-            dialog.exec()
+            # Plan 50 IP19: no nested event loop.
+            openDialog(dialog, lambda _result: dialog.deleteLater())
 
         self._track(_submit(
             self._client, 'workflow.effective_dictionaries', {}, show))
@@ -752,7 +754,7 @@ class MeshingMethodPage(QWidget):
             return False, message
         document = (preview.payload or {}).get('preview') or {}
         confirmation_required = bool(document.get('confirmation_required'))
-        if confirmation_required and not self._confirmMethodChange(document):
+        if confirmation_required and not await self._confirmMethodChange(document):
             self.refresh()
             return False, ''
         result = await self._run('mesh.engine.select', {
@@ -767,7 +769,7 @@ class MeshingMethodPage(QWidget):
         self.engineChanged.emit(engine_id)
         return True, ''
 
-    def _confirmMethodChange(self, preview) -> bool:
+    async def _confirmMethodChange(self, preview) -> bool:
         artifacts = preview.get('retained_artifacts') or []
         detail = '\n'.join(f'- {item}' for item in artifacts)
         prompt = self.tr(
@@ -775,7 +777,7 @@ class MeshingMethodPage(QWidget):
             'engine settings but mark its generated artifacts stale.')
         if detail:
             prompt += self.tr('\n\nAffected retained artifacts:\n') + detail
-        choice = messages.question(
+        choice = await messages.questionAsync(
             self, self.tr('Change meshing method'), prompt,
             QMessageBox.StandardButton.Yes |
             QMessageBox.StandardButton.Cancel,

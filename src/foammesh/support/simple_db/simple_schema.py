@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from collections.abc import Mapping
 from enum import Enum, auto
 
 from PySide6.QtCore import QObject
@@ -29,7 +30,23 @@ def generateData(schema):
     return configuration
 
 
+def _requireMapping(data, path):
+    """DP-6474. A group of named values that is stored as something else.
+
+    ``key in data`` of a text is a substring test, and of a number or None a
+    TypeError, so a point stored as ``abc`` had every leaf "absent" and, on
+    load, every leaf filled with its default: the project opened with a
+    different point and no word. A leaf absent from a mapping is still filled
+    (a field added within one configuration version); a value that is present
+    but is not a mapping is corrupt, and is refused as a wrong number is.
+    """
+    if not isinstance(data, Mapping):
+        raise ValidationError(
+            ErrorType.TypeError, field_complaint.group_clause(), None, path or '/')
+
+
 def validateData(data, schema, path='', fillWithDefault=False):
+    _requireMapping(data, path)
     configuration = {}
     for key in schema:
         subPath = f'{path}/{key}'
@@ -298,10 +315,15 @@ class SchemaList:
         return True
 
     def validate(self, value, name=None, fillWithDefault=False):
+        # DP-6474. The rows are a mapping of key to row; a text here was
+        # walked character by character, and None was a TypeError. Each row's
+        # path now carries its key, so a refusal names the row it is in.
+        _requireMapping(value, name)
         data = {}
 
         for key in value:
-            data[key] = validateData(value[key], self._schema, name, fillWithDefault=fillWithDefault)
+            data[key] = validateData(value[key], self._schema, f'{name or ""}/{key}',
+                                     fillWithDefault=fillWithDefault)
 
         return data
 

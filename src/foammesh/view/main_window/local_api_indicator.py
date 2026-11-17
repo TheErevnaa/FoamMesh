@@ -5,9 +5,9 @@ click turns the API off for the rest of this run.
 """
 from __future__ import annotations
 
-import asyncio
 
 from PySide6.QtWidgets import QToolButton
+from foammesh.support.tasks import spawn
 
 
 class LocalApiIndicator(QToolButton):
@@ -32,7 +32,7 @@ class LocalApiIndicator(QToolButton):
                     self._api.endpoint))
 
     def turnOff(self) -> None:
-        asyncio.ensure_future(self._api.stop())
+        spawn(self._api.stop(), what='Stopping the local API')
 
 
 def install(window, api) -> LocalApiIndicator:

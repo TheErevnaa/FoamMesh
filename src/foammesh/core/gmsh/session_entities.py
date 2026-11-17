@@ -181,6 +181,14 @@ class EntityPicker:
         self._on_abort: Callable | None = None
         self._listeners: list = []
         self._active = False
+        #: DP-6153: entities hidden from the viewport (Gmsh's ``h``); they are
+        #: neither drawn nor picked until shown again.
+        self.hidden: set = set()
+        #: DP-6159. What the last pick accepted, kept lit in the viewport
+        #: until the next pick begins (or ``preview`` shows something else).
+        self.last_accepted: tuple = ()
+        #: DP-6155: the last surface clicked and which parent volume it chose.
+        self._volume_turn: tuple = (None, 0)
 
     # -- state ------------------------------------------------------------- #
 
@@ -231,6 +239,7 @@ class EntityPicker:
             self.set_filter(filter_name)
         self._chosen = []
         self._hover = None
+        self.last_accepted = ()
         self._on_accept, self._on_abort = on_accept, on_abort
         self._active = True
         self._notify('begin')
@@ -245,14 +254,20 @@ class EntityPicker:
         if cell is None:
             return None
         found = self.map.entity_of_cell(int(cell))
-        if found is None:
+        if found is None or found in self.hidden:
             return None
         if found[0] == dim:
             return found
         if dim == 3 and found[0] == 2:
             record = self.map.records.get(found)
             if record is not None and record.up:
-                return (3, int(record.up[0]))
+                parents = [int(t) for t in record.up
+                           if (3, int(t)) not in self.hidden]
+                if not parents:
+                    return None
+                last, turn = self._volume_turn
+                return (3, parents[turn % len(parents)
+                                   if last == found else 0])
         return None
 
     def _nearest_point(self, world) -> Entity | None:
@@ -261,7 +276,7 @@ class EntityPicker:
         target = np.asarray(world, dtype=float)
         best, best_distance = None, None
         for key, record in self.map.records.items():
-            if key[0] != 0 or record.xyz is None:
+            if key[0] != 0 or record.xyz is None or key in self.hidden:
                 continue
             distance = float(np.linalg.norm(np.asarray(record.xyz) - target))
             if best_distance is None or distance < best_distance:
@@ -280,15 +295,20 @@ class EntityPicker:
         return found
 
     def click(self, cell: int | None = None, world=None, *,
-              shift: bool = False) -> Entity | None:
-        """A click replaces the pending list; shift-click extends it (and
-        removes the entity when it is already in the list)."""
+              shift: bool = False, toggle: bool = False) -> Entity | None:
+        """A click replaces the pending list; shift-click or ctrl-click extends
+        it (and removes the entity when it is already in the list). A plain
+        click on nothing clears the list (DP-6157)."""
         if not self._active:
             return None
+        self._turn_volume(cell)
         found = self.resolve(cell, world)
         if found is None:
+            if not (shift or toggle) and self._chosen:
+                self._chosen = []
+                self._notify('selection')
             return None
-        if shift:
+        if shift or toggle:
             if found in self._chosen:
                 self._chosen.remove(found)
             else:
@@ -297,6 +317,70 @@ class EntityPicker:
             self._chosen = [found]
         self._notify('selection')
         return found
+
+    def _turn_volume(self, cell) -> None:
+        """A second click on the same surface under the Volumes filter moves
+        to the next volume that surface bounds (DP-6155), so the inner of
+        two nested volumes can be picked; any other click starts over."""
+        if self._filter != 'Volumes' or cell is None:
+            return
+        face = self.map.entity_of_cell(int(cell))
+        last, turn = self._volume_turn
+        if face is not None and face == last:
+            record = self.map.records.get(face)
+            parents = [t for t in (record.up if record else ())
+                       if (3, int(t)) not in self.hidden]
+            self._volume_turn = (face, (turn + 1) % max(len(parents), 1))
+        else:
+            self._volume_turn = (face, 0)
+
+    def preview(self, entities) -> None:
+        """Light *entities* in the viewport without a pick (a row's stored
+        tags); an empty list clears it."""
+        self.last_accepted = tuple(tuple(e) for e in entities)
+        self._notify('selection')
+
+    def hide(self, entities=None) -> int:
+        """Hide the given entities (default: the pending picks); Gmsh's ``h``."""
+        targets = [tuple(e) for e in (self._chosen if entities is None
+                                      else entities)]
+        self.hidden.update(targets)
+        self._chosen = [e for e in self._chosen if e not in self.hidden]
+        self._hover = None
+        self._notify('hidden')
+        self._notify('selection')
+        return len(targets)
+
+    def show_all(self) -> None:
+        """Show everything again; Gmsh's ``Shift+h``."""
+        if self.hidden:
+            self.hidden.clear()
+            self._notify('hidden')
+
+    def undo(self) -> Entity | None:
+        """Drop the last entity picked (Gmsh's ``u``)."""
+        if not self._active or not self._chosen:
+            return None
+        gone = self._chosen.pop()
+        self._notify('selection')
+        return gone
+
+    def select_many(self, entities, *, remove: bool = False,
+                    extend: bool = False) -> int:
+        """A box selection (DP-6152): the entities of the filter's dimension
+        among ``entities`` replace the list, join it (``extend``) or leave it
+        (``remove``). Returns how many it touched."""
+        if not self._active or self._filter == CELLS:
+            return 0
+        dim = FILTERS[self._filter]
+        hit = [tuple(e) for e in entities if e[0] == dim]
+        if remove:
+            self._chosen = [e for e in self._chosen if e not in hit]
+        else:
+            base = list(self._chosen) if extend else []
+            self._chosen = base + [e for e in hit if e not in base]
+        self._notify('selection')
+        return len(hit)
 
     def hover_element(self, tag: int | None) -> Entity | None:
         """The mesh viewport's hover under the Cells filter."""
@@ -338,6 +422,7 @@ class EntityPicker:
         chosen = tuple(self._chosen)
         callback = self._on_accept
         self._finish()
+        self.last_accepted = chosen
         self._notify('accept')
         if callback is not None:
             callback(chosen)
@@ -359,7 +444,7 @@ class EntityPicker:
         self._on_accept = self._on_abort = None
 
     def key(self, key: str) -> bool:
-        """Gmsh's keys: ``e`` / Enter ends, ``q`` / Escape aborts."""
+        """Gmsh's keys: ``e`` / Enter ends, ``q`` / Escape aborts, ``u`` / Backspace undoes the last pick, ``h`` / ``x`` hides it, Shift+``h`` / Shift+``x`` shows all."""
         if not self._active:
             return False
         if key in ('e', 'E', 'Return', 'Enter'):
@@ -371,6 +456,16 @@ class EntityPicker:
         if key in ('q', 'Q', 'Escape'):
             self.abort()
             return True
+        if key in ('u', 'U', 'BackSpace'):
+            return self.undo() is not None
+        # Gmsh hides with h and shows with Shift+h; the plane handle owns H in
+        # this window, so x and Shift+x do the same.
+        if key in ('h', 'x'):
+            return self.hide() > 0
+        if key in ('H', 'X'):
+            had = bool(self.hidden)
+            self.show_all()
+            return had
         return False
 
 

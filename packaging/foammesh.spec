@@ -204,8 +204,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleDisplayName': 'FoamMesh',
             'CFBundleName': 'FoamMesh',
-            'CFBundleShortVersionString': '1.1.3',
-            'CFBundleVersion': '1.1.3',
+            'CFBundleShortVersionString': '1.1.8',
+            'CFBundleVersion': '1.1.8',
             'NSHighResolutionCapable': True,
         },
     )

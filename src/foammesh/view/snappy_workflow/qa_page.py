@@ -35,7 +35,7 @@ HELP_DETAIL = (
     'evidence, never the mesh. They are checkMesh\'s own command line, '
     'so re-running the check with a lower threshold re-judges the mesh '
     'you already have. Judging against the mesher\'s own limits writes '
-    'system/meshQualityDict from the mesher limits on Snap and Layers '
+    'system/meshQualityDict from the mesher limits on Refinement and Layers '
     'and needs the case dictionaries generated again before it takes '
     'effect. The '
     'failed sets are written into constant/polyMesh/sets, with the '

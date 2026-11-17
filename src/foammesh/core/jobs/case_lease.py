@@ -95,11 +95,15 @@ class LeaseHolder:
     host: str
     acquired_at: str
     run_id: str | None = None
+    #: Plan 50 IP5 (ST-5, DP-6207). When the holding process started
+    #: (``psutil.Process.create_time``), so a pid Windows has since given to
+    #: another process is not taken for the holder.
+    pid_started: float | None = None
 
     def to_dict(self) -> dict:
         return {'token': self.token, 'mode': self.mode, 'operation': self.operation,
                 'pid': self.pid, 'host': self.host, 'acquired_at': self.acquired_at,
-                'run_id': self.run_id}
+                'run_id': self.run_id, 'pid_started': self.pid_started}
 
     @classmethod
     def from_dict(cls, data: dict) -> 'LeaseHolder | None':
@@ -107,9 +111,11 @@ class LeaseHolder:
             mode = str(data['mode'])
             if mode not in MODES:
                 return None
+            started = data.get('pid_started')
             return cls(str(data['token']), mode, str(data.get('operation') or ''),
                        int(data['pid']), str(data.get('host') or ''),
-                       str(data.get('acquired_at') or ''), data.get('run_id'))
+                       str(data.get('acquired_at') or ''), data.get('run_id'),
+                       None if started is None else float(started))
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -145,12 +151,44 @@ def _host() -> str:
         return ''
 
 
+#: Two start times this close are the same process (``probe_writer`` uses
+#: the same tolerance for ``host_create_time``).
+START_TIME_TOLERANCE_SECONDS = 1.0
+
+
+def _process_started(pid: int) -> float | None:
+    """When process *pid* started, or ``None`` if that cannot be read."""
+    try:
+        import psutil
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:  # noqa: BLE001 - NoSuchProcess, AccessDenied and friends
+        return None
+
+
+_OWN_START: list = []
+
+
+def _own_start() -> float | None:
+    if not _OWN_START:
+        _OWN_START.append(_process_started(os.getpid()))
+    return _OWN_START[0]
+
+
 def _alive(holder: LeaseHolder) -> bool:
     if holder.host and holder.host != _host():
         # A holder on another machine (a shared drive) cannot be probed:
         # it is assumed alive rather than reclaimed from under it.
         return True
-    return is_running(holder.pid)
+    if not is_running(holder.pid):
+        return False
+    if holder.pid_started is None:
+        return True
+    # Plan 50 IP5 (ST-5, DP-6207). A pid is reused: the process now
+    # holding it is the holder only if it started when the holder did.
+    started = _process_started(holder.pid)
+    if started is None:
+        return True
+    return abs(started - holder.pid_started) <= START_TIME_TOLERANCE_SECONDS
 
 
 @contextlib.contextmanager
@@ -256,7 +294,7 @@ def _try_acquire(case_path, mode: str, operation: str, run_id: str | None):
                         _write_file(path, list(local.values()) + foreign)
                     return None, conflicts
                 holder = LeaseHolder(uuid4().hex, mode, operation, os.getpid(), _host(),
-                                     _now(), run_id)
+                                     _now(), run_id, _own_start())
                 local[holder.token] = holder
                 _write_file(path, list(local.values()) + foreign)
         except CaseBusyError:
@@ -271,7 +309,7 @@ def _try_acquire(case_path, mode: str, operation: str, run_id: str | None):
             if conflicts:
                 return None, conflicts
             holder = LeaseHolder(uuid4().hex, mode, operation, os.getpid(), _host(),
-                                 _now(), run_id)
+                                 _now(), run_id, _own_start())
             local[holder.token] = holder
         if reclaimed:
             logger.warning('reclaimed the case lease from dead holders: %s',

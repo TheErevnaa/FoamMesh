@@ -16,11 +16,14 @@ What this module deliberately does **not** do:
   encodes regions as ``cellZones`` -- see the writer's ``_write_cell_zones``.
   ``constant/<region>/polyMesh`` only arises for an imported external case,
   which Plan 23 §16.5 places outside v1 fidelity scope.
-* **Binary payloads.** Our own writer emits ASCII only, but snappyHexMesh
-  honours the case's ``writeFormat``. A binary file is refused by name
-  (``binary_format``) so a caller can normalise it through ``foamFormatConvert``
-  (§16.4). Guessing at binary would silently mis-parse it, which is worse than
-  refusing.
+* **Binary payloads** are decoded, not guessed at. Our own writer emits ASCII
+  only, but snappyHexMesh honours the working case's ``writeFormat``, which
+  Plan 50 IP15 (DP-6420) lets be ``binary``. Every list reader checks the
+  member's header first and hands a binary member (and any
+  ``faceCompactList``) to :mod:`poly_mesh_binary`, which infers the label and
+  scalar widths and refuses by name what it cannot be certain of
+  (``binary_width_ambiguous``, ``unsupported_encoding``). Before IP15 a
+  binary file was refused as ``binary_format``.
 * **Decomposed cases.** ``layout_expectation`` defaults to ``'reconstructed'``.
   A ``processor*/`` layout is refused rather than reading rank 0 and calling it
   the mesh.
@@ -339,8 +342,33 @@ def _numbers(text: bytes, dtype) -> np.ndarray:
         return np.fromiter(kept, dtype=dtype, count=len(kept))
 
 
+def _encoding(mesh: Path, name: str) -> tuple[Path | None, str, str]:
+    """``(file, format, class)`` of one member, from its head alone.
+
+    Plan 50 IP15 (DP-6420). The working case may be written ``binary``; every
+    list reader asks this first and hands a binary member to
+    :mod:`poly_mesh_binary`, which decodes what OpenFOAM 13 writes. ``(None,
+    'ascii', '')`` for a missing member or an unreadable head, so the ASCII
+    read below does the refusing exactly as before.
+    """
+    path = _member(mesh, name)
+    if path is None:
+        return None, 'ascii', ''
+    try:
+        head = _read_head(path)
+        header = _parse_header(head, path)
+    except (OSError, EOFError, PolyMeshReadError):
+        return path, 'ascii', ''
+    return (path, str(header.get('format', 'ascii')).strip(),
+            str(header.get('class', '')).strip())
+
+
 def _read_points(mesh: Path) -> np.ndarray:
     """``points`` as ``(n, 3)`` float64: vectorised, else token by token."""
+    path, fmt, _class = _encoding(mesh, 'points')
+    if fmt == 'binary':
+        from foammesh.core.mesh import poly_mesh_binary as _binary
+        return _binary.read_binary_points(path)[0]
     fast = _stream_numbers(mesh, 'points', 'scalar', width=3)
     if fast is None:
         return _read_points_tokens(mesh)
@@ -369,7 +397,11 @@ def _read_points_tokens(mesh: Path) -> np.ndarray:
 
 
 def _read_labels(mesh: Path, name: str) -> np.ndarray:
-    """A label list: vectorised, else token by token."""
+    """A label list: vectorised, else token by token; binary decoded."""
+    path, fmt, _class = _encoding(mesh, name)
+    if fmt == 'binary':
+        from foammesh.core.mesh import poly_mesh_binary as _binary
+        return _binary.read_binary_labels(path, name)[0]
     fast = _stream_numbers(mesh, name, 'label')
     if fast is None:
         return _read_labels_tokens(mesh, name)
@@ -400,8 +432,19 @@ def _read_faces(mesh: Path) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(flat vertices, offsets)`` for a ``faceList``.
 
     Vectorised when the list is written the way OpenFOAM writes one, else
-    token by token (:func:`_read_faces_tokens`).
+    token by token (:func:`_read_faces_tokens`). Plan 50 IP15 (DP-6420): a
+    binary ``faces`` -- always a ``faceCompactList`` -- and an ASCII
+    ``faceCompactList`` are decoded rather than refused.
     """
+    path, fmt, class_name = _encoding(mesh, 'faces')
+    if fmt == 'binary' or class_name == 'faceCompactList':
+        from foammesh.core.mesh import poly_mesh_binary as _binary
+        if fmt == 'binary':
+            flat, offsets, _width = _binary.read_binary_compact_faces(path)
+        else:
+            _header, payload = _open_member(mesh, 'faces')
+            flat, offsets = _binary.read_ascii_compact_faces(payload)
+        return flat, offsets
     fast = _stream_faces(mesh, 0)
     if fast is not None:
         return fast
@@ -698,21 +741,20 @@ def _faces_from_flat(flat: np.ndarray, count: int, *,
 
 
 def _read_boundary(mesh: Path, *,
-                   any_format: bool = False) -> tuple[BoundaryPatch, ...]:
-    """The patch table. ``any_format``: OpenFOAM writes ``boundary`` as text
-    even under a ``format binary`` header, so a reader that decodes binary
-    reads it regardless (Plan 37 UF10a)."""
-    if any_format:
-        path = _member(mesh, 'boundary')
-        if path is None:
-            raise PolyMeshReadError(
-                'incomplete_poly_mesh', f'{mesh} is missing boundary',
-                path=mesh)
-        raw = _read_bytes(path)
-        _parse_header(raw, path)
-        payload = _payload(raw, _FOAMFILE.search(raw).end())
-    else:
-        _header, payload = _open_member(mesh, 'boundary')
+                   any_format: bool = True) -> tuple[BoundaryPatch, ...]:
+    """The patch table. OpenFOAM writes ``boundary`` as text even under a
+    ``format binary`` header (Plan 37 UF10a, observed on v13: a
+    ``polyBoundaryMesh`` is a list of dictionaries, and dictionaries are
+    text). Plan 50 IP15 (DP-6420): so it is read regardless of the header by
+    every caller; ``any_format`` is kept for the callers that pass it."""
+    del any_format
+    path = _member(mesh, 'boundary')
+    if path is None:
+        raise PolyMeshReadError(
+            'incomplete_poly_mesh', f'{mesh} is missing boundary', path=mesh)
+    raw = _read_bytes(path)
+    _parse_header(raw, path)
+    payload = _payload(raw, _FOAMFILE.search(raw).end())
     try:
         count, open_at = _leading_count(payload, 'boundary')
     except PolyMeshReadError as error:
@@ -798,8 +840,13 @@ def _read_zones(mesh: Path, name: str) -> tuple[Zone, ...]:
     type of a ``cellZoneList``, and two lists in a faceZone body rather than
     one. Ours names the type explicitly and is read by the same code.
     """
-    if _member(mesh, name) is None:
+    path, fmt, _class = _encoding(mesh, name)
+    if path is None:
         return ()
+    if fmt == 'binary':
+        # Plan 50 IP15 (DP-6420): dictionary text with binary label blocks.
+        from foammesh.core.mesh import poly_mesh_binary as _binary
+        return _binary.read_binary_zones(path, name)
     _header, payload = _open_member(mesh, name)
     try:
         _count, open_at = _leading_count(payload, name)
@@ -1237,18 +1284,15 @@ def read_poly_mesh_boundary(path: str | Path, *,
     for name in ('points', 'faces', 'owner', 'neighbour'):
         member, header, payload = _head_member(mesh, name)
         fmt = header.get('format', 'ascii')
-        if fmt != 'ascii':
-            raise PolyMeshReadError(
-                'binary_format',
-                f'{member} is written as {fmt}; convert the case to ASCII '
-                'with foamFormatConvert before qualification',
-                path=member)
-        if name == 'faces' and header.get(
-                'class', 'faceList') == 'faceCompactList':
-            raise PolyMeshReadError(
-                'compact_face_list',
-                f'{mesh / "faces"} uses faceCompactList, which this reader does '
-                'not decode; rewrite the mesh with a faceList encoding')
+        compact = (name == 'faces' and header.get(
+            'class', 'faceList') == 'faceCompactList')
+        if fmt != 'ascii' or compact:
+            # Plan 50 IP15 (DP-6420). A binary working case, or a compact
+            # face list: ASCII's paren-counting skip has nothing to count, so
+            # read the whole mesh with the decoding readers and keep its
+            # boundary. Same arrays, same face ids, as the ASCII read.
+            return _boundary_of(read_poly_mesh(
+                mesh, layout_expectation='any'))
         headers[name] = _list_count(payload, name)
 
     # Refuse in the full reader's order -- points, then faces, then the
@@ -1295,6 +1339,27 @@ def read_poly_mesh_boundary(path: str | Path, *,
         patches=patches, face_base=face_base,
         total_face_count=int(face_count), point_ids=used.astype(np.int64),
         total_point_count=int(len(points)))
+
+
+def _boundary_of(full: PolyMesh) -> BoundaryPolyMesh:
+    """The :class:`BoundaryPolyMesh` :func:`read_poly_mesh_boundary` returns,
+    cut from a full read (Plan 50 IP15, DP-6420)."""
+    face_count = full.face_count
+    starts = [item.start_face for item in full.patches if item.n_faces]
+    face_base = int(max(0, min([full.internal_face_count, face_count]
+                               + starts)))
+    lo = int(full.face_offsets[face_base])
+    vertices = full.face_vertices[lo:]
+    offsets = full.face_offsets[face_base:] - lo
+    used = np.unique(vertices)
+    return BoundaryPolyMesh(
+        path=full.path,
+        points=np.ascontiguousarray(full.points[used]),
+        face_vertices=np.searchsorted(used, vertices).astype(np.int64),
+        face_offsets=np.asarray(offsets, dtype=np.int64),
+        patches=full.patches, face_base=face_base,
+        total_face_count=int(face_count), point_ids=used.astype(np.int64),
+        total_point_count=int(len(full.points)))
 
 
 @dataclass(frozen=True)

@@ -32,6 +32,7 @@ from foammesh.core.gmsh import option_catalogue as catalogue
 from foammesh.view.workflow_controls.length_box import (
     LengthItemDelegate, mark_length_item,
 )
+from widgets import async_dialog
 
 #: Plan 48 GM2. There is no row cut-off: every option of the build is a row,
 #: and the label says how many matched the search and the group.
@@ -466,18 +467,17 @@ class GmshOptionsPanel(QWidget):
         return True
 
     def _choose_open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
             self, self.tr('Open a Gmsh options file'), '',
-            self.tr('Gmsh options (*.opt)') + ';;' + self.tr('All files (*)'))
-        if path:
-            self.load_opt_file(path)
+            self.tr('Gmsh options (*.opt)') + ';;' + self.tr('All files (*)'),
+            then=lambda path, _filter: path and self.load_opt_file(path))
 
     def _choose_save(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
+        async_dialog.getSaveFileName(
             self, self.tr('Save the Gmsh options'), 'options.opt',
-            self.tr('Gmsh options (*.opt)'))
-        if path:
-            self.save_opt_file(path)
+            self.tr('Gmsh options (*.opt)'),
+            then=lambda path, _filter: path and self.save_opt_file(path))
 
     def save_as_defaults(self) -> bool:
         try:

@@ -44,6 +44,143 @@ class FaceTopology:
         return self.keys[self.counts > 2]
 
 
+@dataclass(frozen=True)
+class RowGroups:
+    """Equal rows of an integer key array, found by one sort (Plan 50 IP14).
+
+    ``order`` sorts the rows lexicographically (rows that are equal come in
+    no particular order among themselves); ``starts`` holds the sorted
+    positions where each group of equal rows begins, plus the total at the
+    end. Everything ``np.unique(keys, axis=0, ...)`` returns follows from the
+    two, and is equal to it element for element (see :func:`unique_rows`).
+    """
+
+    order: np.ndarray
+    starts: np.ndarray
+
+    @property
+    def counts(self) -> np.ndarray:
+        return np.diff(self.starts)
+
+    @property
+    def group_count(self) -> int:
+        return int(self.starts.size - 1)
+
+    def sorted_group(self) -> np.ndarray:
+        """Group number of each sorted position."""
+        counts = self.counts
+        return np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+
+    def inverse(self) -> np.ndarray:
+        """Group number of each row, in the rows' own order."""
+        inverse = np.empty(self.order.size, dtype=np.int64)
+        inverse[self.order] = self.sorted_group()
+        return inverse
+
+    def first(self) -> np.ndarray:
+        """The smallest row index of each group (``np.unique``'s index)."""
+        if not self.order.size:
+            return np.empty(0, dtype=np.int64)
+        return np.minimum.reduceat(self.order, self.starts[:-1])
+
+
+def _bits(value: int) -> int:
+    return max(int(value), 0).bit_length()
+
+
+def row_groups(keys: np.ndarray) -> RowGroups:
+    """Group the equal rows of *keys*, an ``(n, w)`` integer array.
+
+    Plan 50 IP14 (GM-1). ``np.unique(axis=0)`` sorts the rows as a
+    structured array, a comparison sort of ``n`` records several times
+    slower than sorting ``n`` integers. Here the columns are packed into one
+    unsigned 64-bit word each row, most significant column first, so the
+    word order is the lexicographic row order; when the next column no longer
+    fits, the word packed so far is replaced by its dense rank (which keeps
+    the order and needs only ``log2(n)`` bits) and packing carries on. A
+    column with one value throughout cannot change the order and is skipped
+    (the padding column of an all-triangle face list). Values must be at
+    least ``-1``.
+    """
+    keys = np.asarray(keys)
+    if keys.ndim != 2:
+        raise ValueError('row_groups takes a two-dimensional array')
+    count = keys.shape[0]
+    if count == 0:
+        return RowGroups(np.empty(0, dtype=np.int64),
+                         np.zeros(1, dtype=np.int64))
+    packed = None
+    packed_bits = 0
+    for column in range(keys.shape[1]):
+        values = keys[:, column]
+        low, high = int(values.min()), int(values.max())
+        if low == high:
+            continue
+        if low < -1:
+            raise ValueError('row_groups keys must be at least -1')
+        shifted = (values.astype(np.int64) + 1).astype(np.uint64)
+        width = _bits(high + 1)
+        if packed is None:
+            packed, packed_bits = shifted, width
+            continue
+        if packed_bits + width > 64:
+            packed, packed_bits = _dense_rank(packed)
+        if packed_bits + width > 64:
+            return _lexsorted_groups(keys)
+        packed = (packed << np.uint64(width)) | shifted
+        packed_bits += width
+    if packed is None:
+        # every row is the same row
+        return RowGroups(np.arange(count, dtype=np.int64),
+                         np.array([0, count], dtype=np.int64))
+    order = np.argsort(packed)
+    ordered = packed[order]
+    change = np.flatnonzero(ordered[1:] != ordered[:-1]) + 1
+    starts = np.concatenate(([0], change, [count])).astype(np.int64)
+    return RowGroups(order.astype(np.int64, copy=False), starts)
+
+
+def _lexsorted_groups(keys: np.ndarray) -> RowGroups:
+    """The general case: values too wide to pack beside a rank."""
+    order = np.lexsort(keys.T[::-1])
+    ordered = keys[order]
+    change = np.flatnonzero((ordered[1:] != ordered[:-1]).any(axis=1)) + 1
+    starts = np.concatenate(([0], change, [keys.shape[0]])).astype(np.int64)
+    return RowGroups(order.astype(np.int64, copy=False), starts)
+
+
+def _dense_rank(values: np.ndarray) -> tuple[np.ndarray, int]:
+    order = np.argsort(values)
+    ordered = values[order]
+    step = np.empty(values.size, dtype=np.uint64)
+    step[0] = 0
+    np.not_equal(ordered[1:], ordered[:-1], out=step[1:], casting='unsafe')
+    rank_sorted = np.cumsum(step, dtype=np.uint64)
+    ranks = np.empty(values.size, dtype=np.uint64)
+    ranks[order] = rank_sorted
+    return ranks, _bits(int(rank_sorted[-1]))
+
+
+def unique_rows(keys: np.ndarray, *, return_index=False, return_inverse=False,
+                return_counts=False):
+    """``np.unique(keys, axis=0, ...)``, through :func:`row_groups`.
+
+    The same unique rows in the same (lexicographic) order, the same first
+    indices, inverse and counts; only faster. Keys must be at least ``-1``.
+    """
+    keys = np.asarray(keys)
+    groups = row_groups(keys)
+    first = groups.first()
+    result = [keys[first] if first.size else keys[:0]]
+    if return_index:
+        result.append(first)
+    if return_inverse:
+        result.append(groups.inverse())
+    if return_counts:
+        result.append(groups.counts)
+    return result[0] if len(result) == 1 else tuple(result)
+
+
 def padded_face_keys(connectivity: np.ndarray, local_faces) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rows = []
     cell_ids = []
@@ -74,8 +211,9 @@ def build_face_topology(mesh: CanonicalMesh) -> FaceTopology:
         cell_ids.append(block_cells)
         face_ids.append(block_faces)
     combined = np.ascontiguousarray(np.concatenate(keys))
-    unique, first, inverse, counts = np.unique(
-        combined, axis=0, return_index=True, return_inverse=True, return_counts=True)
+    # Plan 50 IP14: np.unique(axis=0) results, from one integer sort.
+    unique, first, inverse, counts = unique_rows(
+        combined, return_index=True, return_inverse=True, return_counts=True)
     return FaceTopology(
         unique, counts, first, inverse,
         np.concatenate(block_ids), np.concatenate(cell_ids), np.concatenate(face_ids))
@@ -205,18 +343,20 @@ def straddling_faces(points: np.ndarray, cell_blocks,
     local_ids = np.concatenate(local_ids)
     centroid = np.concatenate(centroids)
 
-    _unique, inverse, counts = np.unique(
-        combined, axis=0, return_inverse=True, return_counts=True)
+    # Plan 50 IP14: the faces met twice, from one integer sort rather than
+    # np.unique(axis=0) and a second, stable sort of its inverse.
+    groups = row_groups(combined)
     del combined
-    inverse = np.asarray(inverse).ravel()
+    counts = groups.counts
     wanted = np.flatnonzero(counts == 2)
     if not wanted.size:
         return StraddleReport(0, 0, 0, 0)
 
-    # The two instances of a face are adjacent once sorted by unique index.
-    order = np.argsort(inverse, kind='stable')
-    first = np.searchsorted(inverse[order], np.arange(counts.size))
-    left, right = order[first[wanted]], order[first[wanted] + 1]
+    # The two instances of a face, the lower row index first.
+    one = groups.order[groups.starts[wanted]]
+    two = groups.order[groups.starts[wanted] + 1]
+    left, right = np.minimum(one, two), np.maximum(one, two)
+    del one, two
 
     same_side = np.zeros(wanted.size, dtype=bool)
     sides = np.zeros(wanted.size, dtype=np.int8)

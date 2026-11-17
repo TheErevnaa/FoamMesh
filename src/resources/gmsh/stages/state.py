@@ -191,6 +191,7 @@ class StageBase:
         # DP-6066. The lateral strips of such a pair, declared to Gmsh only
         # after the volume pass (``declare_periodic_strips``).
         self.periodic_strips_pending: list[tuple] = []
+        self.strips_to_snap: set[int] = set()
         # DP-6064. The internal-face and baffle sheets of an STL import, by
         # import tag, set aside from the shells and imprinted on the walls;
         # the tolerance that was done at; and ``{volume: pieces}`` embedded.

@@ -420,7 +420,9 @@ GROUP_METADATA: dict[str, dict] = {
                   'max_face_thickness_ratio': 'fraction',
                   'max_thickness_to_medial_ratio': 'fraction',
                   # Plan 37 UF15: read with ``unitDegrees``.
-                  'concave_angle': 'deg'},
+                  'concave_angle': 'deg',
+                  # Plan 50 IP27: written with ``relativeSizes false``.
+                  'first_layer_height': 'm'},
     },
     'snappyGeometry': {
         # Plan 31. These change what snappyHexMesh is told about the staged
@@ -842,9 +844,12 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'documentation': (
             'Gap between the geometry and the derived block, as a fraction of '
             'the largest span of the geometry, added on all six faces: 0.1 on a '
-            'part 2 m long puts each face 0.2 m out. 0 makes the block the '
-            'bounding box of the geometry. Not applied to a bounding Hex6 or to '
-            'blocks written by hand.'),
+            'part 2 m long puts each face 0.2 m out. At 0 the block is the '
+            'bounding box of the geometry, except that with a target cell '
+            'size and only closed geometry it keeps one base cell of clear '
+            'space on every side; open surfaces (a pipe whose ends the block '
+            'closes) keep the flush block. Not applied to a bounding Hex6 or '
+            'to blocks written by hand.'),
     },
     'meshing.base_grid.scale': {
         'unit': 'ratio',
@@ -1480,6 +1485,42 @@ FIELD_OVERRIDES: dict[str, dict] = {
             'merges them on every '
             'patch; Off never merges them, which keeps more, smaller faces.'),
     },
+    # Plan 50 IP27 (SN-9, DP-6393). The optional first-layer-height mode.
+    'meshing.layers.first_layer_mode': {
+        'title': 'Layer sizing',
+        'documentation': (
+            'relative sizes each layer group from its own values, which the '
+            'automatic sizing proposes as shares of the wall cell. '
+            'first_layer_height grows the same stack on every patch that '
+            'grows layers: the first layer in metres, the expansion ratio and '
+            'the number of layers below.'),
+    },
+    'meshing.layers.first_layer_height': {
+        'title': 'First layer height',
+        'documentation': (
+            'Thickness of the layer against the wall, in metres. Written as '
+            'firstLayerThickness with relativeSizes false. Read when Layer '
+            'sizing is first_layer_height only.'),
+        'applies_when': (
+            'meshing.layers.first_layer_mode == first_layer_height',),
+    },
+    'meshing.layers.first_layer_expansion_ratio': {
+        'title': 'Layer expansion ratio',
+        'documentation': (
+            'How much thicker each layer is than the one below it. Read when '
+            'Layer sizing is first_layer_height only.'),
+        'applies_when': (
+            'meshing.layers.first_layer_mode == first_layer_height',),
+    },
+    'meshing.layers.first_layer_count': {
+        'title': 'Number of layers',
+        'documentation': (
+            'Layers grown on every patch whose layer group grows layers. A '
+            'frozen or inherited patch is left as it is. Read when Layer '
+            'sizing is first_layer_height only.'),
+        'applies_when': (
+            'meshing.layers.first_layer_mode == first_layer_height',),
+    },
     'meshing.layers.n_smooth_normals': {
         'title': 'Interior normal smoothing iterations',
     },
@@ -1612,6 +1653,15 @@ FIELD_OVERRIDES: dict[str, dict] = {
         'read_only': True,
         'documentation': 'No run reads this: each mesher has one runtime, '
                          'and the run takes it from the meshing method.',
+    },
+    # DP-6477. Only Parallel mode reads the stored method; every other mode
+    # decomposes with scotch (DecompositionSettings.read, DP-593), and the
+    # Meshing resources page already greyed the row in Auto. The field said
+    # nothing of it, so a client that set PT-Scotch in Auto got scotch
+    # written without a word. The stored choice is kept and applies again
+    # when Parallel is chosen.
+    'mesh.execution.decomposition_method': {
+        'applies_when': ('mesh.execution.mode == parallel',),
     },
 
     # DP-163. The other name with its unit inside it. `Qualification

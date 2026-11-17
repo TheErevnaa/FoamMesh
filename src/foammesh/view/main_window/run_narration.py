@@ -96,19 +96,42 @@ def newest_log(payload) -> str:
     return log
 
 
+def cell_limit_warnings(payload) -> list[str]:
+    """The sentences saying snappyHexMesh stopped refining at a cell limit.
+
+    DP-6483. A stage run carries one (``cell_limit_warning``), a whole run
+    one per stage that met the limit (``cell_limit_warnings``).
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    found: list[str] = []
+    for item in (payload.get('cell_limit_warning'),
+                 *(payload.get('cell_limit_warnings') or ())):
+        text = str(item or '').strip()
+        if text and text not in found:
+            found.append(text)
+    return found
+
+
 def describe_result(payload, *, failed: bool = False) -> str:
     """One sentence for a run that has stopped, whichever way it stopped."""
     payload = payload if isinstance(payload, dict) else {}
     allocation = payload.get('allocation')
     clause = describe_workers(allocation)
-    run_id = str(payload.get('run_id') or '').strip()
-    named = f'Run {run_id}' if run_id else 'The run'
+    # DP-6494. The run id ("gmsh-1a2b...") is the case's internal name for
+    # the run folder; the user never named it and the status line does not
+    # show it. The Console and the run log still carry it.
+    named = 'The run'
     if failed:
         node = str(payload.get('failed_node') or '').strip()
         at = f' at {node}' if node else ''
         tail = f', {clause}' if clause else ''
         return f'{named} failed{at}{tail}.'
     tail = f' {clause}' if clause else ''
+    if cell_limit_warnings(payload):
+        # DP-6483. The warning sentence is long; the status line says there
+        # is one and the caller writes it, whole, to the Console.
+        return (f'{named} finished with a warning, having meshed{tail}. '
+                'See the Console.')
     return f'{named} finished, having meshed{tail}.'
 
 

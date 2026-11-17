@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import copy
+from collections.abc import Mapping
 
 import yaml
 
@@ -23,6 +24,70 @@ def elementToList(element, schema, keys):
         raise LookupError
 
     return [element[field] for field in keys]
+
+
+class ReadOnlyViewError(RuntimeError):
+    """A write was attempted through a read-only view of the configuration.
+
+    Plan 50 IP11 (DP-6341). :meth:`SimpleDB.view` shares the live document
+    instead of copying it, so a write through it would change the database
+    behind the history's back. Take a :meth:`SimpleDB.checkout` to edit.
+    """
+
+
+def _refuse(what):
+    raise ReadOnlyViewError(
+        f'{what}: this is a read-only view of the configuration; '
+        f'take a checkout() to edit it')
+
+
+class _FrozenMapping(Mapping):
+    """A dict seen through a read-only view: nested dicts frozen as read.
+
+    Lazy, so handing out ``view().data()`` costs nothing until something
+    walks it. ``copy.deepcopy`` of one gives back a plain, editable dict.
+    """
+
+    __slots__ = ('_data',)
+
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        return _frozen(self._data[key])
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, _FrozenMapping):
+            other = other._data
+        return self._data == other
+
+    __hash__ = None
+
+    def __setitem__(self, key, value):
+        _refuse('item assignment')
+
+    def __delitem__(self, key):
+        _refuse('item deletion')
+
+    def __deepcopy__(self, memo):
+        return copy.deepcopy(self._data, memo)
+
+    def __repr__(self):
+        return f'_FrozenMapping({self._data!r})'
+
+
+def _frozen(value):
+    if isinstance(value, dict):
+        return _FrozenMapping(value)
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
 
 
 class ConcurrentEditError(RuntimeError):
@@ -253,14 +318,27 @@ class SimpleDB(SimpleSchema):
         #: ``addElement`` handed it must be able to find its own element
         #: afterwards rather than whatever now occupies that number.
         self._remappedKeys = {}
+        #: Plan 50 IP11 (DP-6341). Set on what :meth:`view` hands out: the
+        #: content is the live document, shared, and every write refuses.
+        self._readOnly = False
+
+    def isReadOnly(self):
+        return self._readOnly
+
+    def _refuseIfView(self, what):
+        if self._readOnly:
+            _refuse(what)
 
     def isModified(self):
         return self._modified
 
     def createData(self):
+        self._refuseIfView('createData')
         self._content = self.generateData()
 
     def data(self):
+        if self._readOnly:
+            return _frozen(self._content)
         return self._content
 
     def snapshot(self):
@@ -284,15 +362,12 @@ class SimpleDB(SimpleSchema):
         second restore handing back a document the first one has since been
         edited through.
         """
+        self._refuseIfView('restore')
         self._content = copy.deepcopy(snapshot)
         self._modified = True
 
-    def checkout(self, path=''):
-        """ Creates and returns a SimpleDB replicated with the original's subdata.
-
-        :param path: The root path to clone.
-        :return: New SimpleDB based on specific path.
-        """
+    def _subtree(self, path):
+        """The schema and the content under ``path``, uncopied."""
         subSchema = self._schema
         subDB = self._content
         if path != self._base:
@@ -304,12 +379,46 @@ class SimpleDB(SimpleSchema):
                 subSchema = schema[field]
 
             subDB = content[field]
+        return subSchema, subDB
+
+    def checkout(self, path=''):
+        """ Creates and returns a SimpleDB replicated with the original's subdata.
+
+        :param path: The root path to clone.
+        :return: New SimpleDB based on specific path.
+        """
+        subSchema, subDB = self._subtree(path)
 
         subData = self._newDB(subSchema)
         subData._content = copy.deepcopy(subDB)
         subData._baseline = copy.deepcopy(subDB)
         subData._checkout_revision = self._revision
         subData._editable = True
+        subData._base = f'{self._base}/{path}' if self._base else path
+
+        return subData
+
+    def view(self, path=''):
+        """A read-only look at the document under ``path``, copying nothing.
+
+        Plan 50 IP11 (DP-6341). :meth:`checkout` deep-copies the subtree twice
+        (the working copy and its baseline), which is right for an edit and
+        pure waste for a read: the viewport took a whole checkout per surface
+        during a geometry load. A view shares the live content. Every write
+        method raises :class:`ReadOnlyViewError`, ``data()`` comes back frozen,
+        and a view can neither be committed nor take a commit.
+
+        It is a *live* read, not a snapshot: use it and drop it within one
+        synchronous stretch of GUI-thread code. Anything held across an
+        ``await`` or kept for later should be a checkout.
+        """
+        subSchema, subDB = self._subtree(path)
+
+        subData = self._newDB(subSchema)
+        subData._content = subDB
+        subData._revision = self._revision
+        subData._editable = False
+        subData._readOnly = True
         subData._base = f'{self._base}/{path}' if self._base else path
 
         return subData
@@ -363,6 +472,9 @@ class SimpleDB(SimpleSchema):
         :param data: SimpleDB based on the root path of the data to be replaced
         :return: what the merge renumbered, as ``remappedKeys`` reports it
         """
+        self._refuseIfView('commit into a view')
+        if getattr(data, '_readOnly', False):
+            _refuse('commit of a view')
         if not data._base.startswith(self._base):
             raise LookupError
 
@@ -580,6 +692,7 @@ class SimpleDB(SimpleSchema):
         return schema[field].toEnum(content[field])
 
     def setValue(self, path, value, name=None):
+        self._refuseIfView('setValue')
         if not self._editable:
             raise LookupError
 
@@ -611,6 +724,7 @@ class SimpleDB(SimpleSchema):
         return db
 
     def addElement(self, path, newdb, key=None):
+        self._refuseIfView('addElement')
         if not self._editable:
             raise LookupError
 
@@ -634,6 +748,7 @@ class SimpleDB(SimpleSchema):
         return key
 
     def addNewElement(self, path, key=None):
+        self._refuseIfView('addNewElement')
         if not self._editable:
             raise LookupError
 
@@ -691,6 +806,7 @@ class SimpleDB(SimpleSchema):
         return [key for key in content if filter_ is None or filter_(key, content[key])]
 
     def removeElement(self, path, key):
+        self._refuseIfView('removeElement')
         if not self._editable:
             raise LookupError
 
@@ -707,6 +823,7 @@ class SimpleDB(SimpleSchema):
         self._modified = True
 
     def removeElements(self, path, keys):
+        self._refuseIfView('removeElements')
         if not self._editable:
             raise LookupError
 
@@ -724,6 +841,7 @@ class SimpleDB(SimpleSchema):
         self._modified = True
 
     def removeElementsByFilter(self, path, function):
+        self._refuseIfView('removeElementsByFilter')
         if not self._editable:
             raise LookupError
 
@@ -738,6 +856,7 @@ class SimpleDB(SimpleSchema):
         self._modified = True
 
     def removeAllElements(self, path):
+        self._refuseIfView('removeAllElements')
         if not self._editable:
             raise LookupError
 
@@ -752,6 +871,7 @@ class SimpleDB(SimpleSchema):
         self._modified = True
 
     def updateElements(self, path, field, value, filter_=None, name=None):
+        self._refuseIfView('updateElements')
         schema, content = _getField(self._get(path))
         if not isinstance(schema, SchemaList):
             raise TypeError
@@ -807,10 +927,16 @@ class SimpleDB(SimpleSchema):
 
         return key in content
 
-    def toYaml(self):
+    def toYaml(self, *, fast: bool = False):
+        """The document as YAML. ``fast`` uses libyaml's emitter when it is
+        there (Plan 50, DP-6341): the same document, ten times sooner."""
+        if fast:
+            return yaml.dump(self._content,
+                             Dumper=getattr(yaml, 'CDumper', yaml.Dumper))
         return yaml.dump(self._content)
 
     def loadYaml(self, data, fillWithDefault=False):
+        self._refuseIfView('loadYaml')
         self._content = self.validateData(yaml.full_load(data), fillWithDefault=fillWithDefault)
 
     def _get(self, path):

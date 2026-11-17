@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
 )
+from widgets.async_dialog import popupMenu
 
 
 class RightAlignedDelegate(QStyledItemDelegate):
@@ -374,7 +375,8 @@ class SimpleExcelSheet(QTableWidget):
                 action.triggered.connect(slot)
                 action.setEnabled(rows > 0)
 
-        menu.exec(self.viewport().mapToGlobal(pos))
+        # Plan 50 IP19: no nested event loop.
+        popupMenu(menu, self.viewport().mapToGlobal(pos))
 
     def _insertRows(self):
         for row in self._selectedRows():

@@ -1,8 +1,9 @@
 """The small dialogs of the Gmsh File entries (Plan 48 GM11b).
 
-Each returns what the person chose, or ``None`` when they cancelled; the
-entries then run the same :class:`window_actions.WindowGmshActions` method the
-local API does, so a dialog adds no behaviour of its own.
+Each gives ``then`` what the person chose, or ``None`` when they cancelled;
+the entries then run the same :class:`window_actions.WindowGmshActions` method
+the local API does, so a dialog adds no behaviour of its own. Plan 50 IP19:
+each opens without a nested event loop.
 """
 from __future__ import annotations
 
@@ -12,10 +13,11 @@ from PySide6.QtWidgets import (
 )
 
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
+from widgets import async_dialog
 
 
-def ask_watch(parent, pattern: str = '', interval: float = 1.0):
-    """File > Watch pattern: ``(pattern, seconds)`` or ``None``."""
+def ask_watch(parent, pattern: str = '', interval: float = 1.0, *, then):
+    """File > Watch pattern: ``then((pattern, seconds))`` or ``then(None)``."""
     dialog = QDialog(parent)
     dialog.setObjectName('gmshWatchDialog')
     dialog.setWindowTitle(dialog.tr('Watch pattern'))
@@ -41,9 +43,9 @@ def ask_watch(parent, pattern: str = '', interval: float = 1.0):
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     form.addRow(buttons)
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return None
-    return edit.text().strip(), seconds.value()
+    async_dialog.openDialog(dialog, lambda result: then(
+        (edit.text().strip(), seconds.value())
+        if result == QDialog.DialogCode.Accepted else None))
 
 
 def picture_filter() -> str:
@@ -56,24 +58,29 @@ def picture_filter() -> str:
     return ';;'.join(entries)
 
 
-def ask_picture(parent):
-    """File > Save as picture: ``(path, format id)`` or ``None``."""
+def ask_picture(parent, *, then):
+    """File > Save as picture: ``then((path, format id))`` or ``then(None)``."""
     from foammesh.rendering import image_formats as images
 
-    name, chosen = QFileDialog.getSaveFileName(
-        parent, parent.tr('Save as picture'), 'view.png', picture_filter())
-    if not name:
-        return None
-    for row in images.listing():
-        if chosen.startswith(row['label'] + ' '):
-            return name, row['id']
-    suffix = name.rsplit('.', 1)[-1] if '.' in name else 'png'
-    return name, images.format_for(suffix).id
+    def chosen_file(name, chosen):
+        if not name:
+            then(None)
+            return
+        for row in images.listing():
+            if chosen.startswith(row['label'] + ' '):
+                then((name, row['id']))
+                return
+        suffix = name.rsplit('.', 1)[-1] if '.' in name else 'png'
+        then((name, images.format_for(suffix).id))
+
+    async_dialog.getSaveFileName(
+        parent, parent.tr('Save as picture'), 'view.png', picture_filter(),
+        then=chosen_file)
 
 
-def ask_movie(parent):
-    """File > Record: the MP4 path or ``None``."""
-    name, _chosen = QFileDialog.getSaveFileName(
+def ask_movie(parent, *, then):
+    """File > Record: ``then(the MP4 path)`` or ``then(None)``."""
+    async_dialog.getSaveFileName(
         parent, parent.tr('Record a movie'), 'view.mp4',
-        parent.tr('MP4 movie (*.mp4)'))
-    return name or None
+        parent.tr('MP4 movie (*.mp4)'),
+        then=lambda name, _chosen: then(name or None))

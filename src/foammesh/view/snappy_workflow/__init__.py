@@ -27,6 +27,7 @@ from .domain_regions_page import SnappyDomainRegionsPage
 from .layers_page import SnappyLayersPage
 from .qa_page import SnappyQaPage
 from .qualification_pages import SNAPPY_QUALIFICATION_PAGES
+from .refinement_page import SnappyRefinementPage
 from .snap_page import SnappySnapPage
 from .surface_features_page import SnappySurfaceFeaturesPage
 
@@ -37,7 +38,9 @@ SNAPPY_TASK_PAGES = {
     **SNAPPY_QUALIFICATION_PAGES,
     'snappy.domain_regions': SnappyDomainRegionsPage,
     'snappy.base_grid': SnappyBaseGridPage,
-    'snappy.surface_features': SnappySurfaceFeaturesPage,
+    # Plan 50 IP25 (DP-6381). The Refinement row's page carries the
+    # Castellation and Snap pages; the branch files them under their own ids.
+    'snappy.surface_features': SnappyRefinementPage,
     'snappy.castellation': SnappyCastellationPage,
     'snappy.snap': SnappySnapPage,
     'snappy.layers': SnappyLayersPage,
@@ -54,6 +57,7 @@ __all__ = [
     'SnappyExportPage',
     'SnappyLayersPage',
     'SnappyQaPage',
+    'SnappyRefinementPage',
     'SnappySnapPage',
     'SnappySurfaceFeaturesPage',
     'SnappyTaskPage',

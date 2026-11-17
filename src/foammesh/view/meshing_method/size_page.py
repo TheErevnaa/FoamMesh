@@ -153,6 +153,26 @@ class MeshSizePage(FieldGroupPage):
     def readoutText(self) -> str:
         return self._readout.text()
 
+    def presetState(self) -> dict:
+        """The physics preset row as shown (Plan 48 AG)."""
+        box = self._presetBox
+        return {'preset': box.currentData() or '',
+                'presets': {str(box.itemData(i) or ''): box.itemText(i)
+                            for i in range(box.count())},
+                'preset_result': self._presetResult.text(),
+                'preset_result_shown': not self._presetResult.isHidden()}
+
+    def choosePreset(self, key: str) -> None:
+        """Choose ``key`` in the preset box, as the reader does."""
+        index = self._presetBox.findData(str(key or ''))
+        if index < 0:
+            raise ValueError(f'{key} is not a physics preset')
+        self._presetBox.setCurrentIndex(index)
+
+    def pressApplyPreset(self) -> None:
+        """The *Apply preset* button."""
+        self._presetApply.click()
+
     def _refreshReadout(self) -> None:
         from foammesh.core.sizing import CUSTOM, readout_text
 

@@ -452,6 +452,7 @@ def configured_engine(app=None) -> str:
         if app is None:
             from foammesh.app import app as shared
             app = shared
-        return read_engine(app.db)
+        from foammesh.view.configuration_read import case_configuration
+        return read_engine(case_configuration(app))
     except Exception:                                        # noqa: BLE001
         return UNSELECTED

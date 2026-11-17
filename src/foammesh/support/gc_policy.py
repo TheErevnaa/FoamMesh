@@ -4,15 +4,25 @@ Plan 35, CR3 step 8 (F5, D5). The cyclic collector releases whatever is
 unreachable on whichever thread happened to trip the gen-0 threshold. For
 most objects that does not matter; for a VTK render object or a Qt object
 with events posted for it, running its destructor on a worker thread is the
-access violation behind the 28 Sep crash. So the collector is steered, never
-switched off (disabling it is interpreter-wide and would let cyclic
-garbage grow without bound):
+access violation behind the 28 Sep crash.
+
+Plan 50 IP20 (ST-2, DP-6370). CR3 only raised the gen-0 threshold, so an
+allocation on a worker thread could still trip an automatic collection there
+(one unexplained access violation on 1.1.7). After start-up automatic
+collection is now switched off, and a GUI-thread timer does every collection
+on a schedule that bounds growth, so cyclic garbage cannot grow without bound:
 
 * the start-up heap is frozen once, after the main window exists and before
   the first project opens, so every later collection skips it;
-* the gen-0 threshold is raised once, so an automatic collection is rare;
-* a GUI-thread timer runs a young collection once the event loop has been
-  idle for two seconds, so garbage is reaped where the render objects live;
+* the gen-0 threshold is raised before the heavy imports, so start-up itself
+  collects rarely, and ``gc.disable()`` follows the freeze;
+* a GUI-thread timer ticks every ``TICK_MS``: a young collection when the
+  young generation holds ``GEN0_THRESHOLD`` containers or ``IDLE_COLLECT_MS``
+  have passed, and a full one after ``FULL_AFTER_YOUNG`` young passes and at
+  least ``FULL_MIN_SECONDS`` (never while a mouse button is down, never
+  inside a nested event loop, which may be running inside a paint, a render
+  or a theme re-polish); a tick that finds collection switched back on
+  switches it off again;
 * a full collection runs on the GUI thread after every project close, the
   moment large cyclic structures become garbage; after a scene swap it runs
   once the window has been quiet for a moment (`collect_full_when_quiet`),
@@ -41,8 +51,26 @@ logger = logging.getLogger(__name__)
 #: timer does the routine work on the GUI thread.
 GEN0_THRESHOLD = 20_000
 
-#: Milliseconds of idle before the GUI-thread young collection runs.
+#: Milliseconds after which the GUI-thread young collection runs even when
+#: the young generation is below ``GEN0_THRESHOLD``.
 IDLE_COLLECT_MS = 2000
+
+#: Plan 50 IP20. Milliseconds between collector ticks. Between two ticks the
+#: young generation grows by the net container rate times this; the rate of
+#: a widget-heavy GUI workload is measured in
+#: ``test_plan50_ip20_collection_runs_only_on_the_gui_thread.py`` and this is
+#: chosen so one tick's growth stays well within ``GEN0_THRESHOLD``
+#: (MEASURED 11 November 2026: 76,000 containers/s, 7,600 per tick).
+TICK_MS = 100
+
+#: Young passes (gen 0 and 1) between two full passes: CPython's own gen-2
+#: threshold.
+FULL_AFTER_YOUNG = 10
+
+#: Seconds at least between two scheduled full passes. A full pass over a big
+#: session costs 100 ms or more (Plan 39 VI14b); project close, scene swaps
+#: and themes run their own full passes as before.
+FULL_MIN_SECONDS = 30.0
 
 _state = {
     'frozen': False,
@@ -50,7 +78,20 @@ _state = {
     'threshold_raised': False,
     'timer': None,
     'after_paint': None,
+    'disabled': False,
+    'clock': None,
+    'last_young': None,
+    'last_full': None,
+    'young_since_full': 0,
 }
+
+
+def _now():
+    clock = _state['clock']
+    if clock is not None:
+        return clock()
+    import time
+    return time.monotonic()
 
 
 def _on_main_thread():
@@ -99,7 +140,26 @@ def startup_complete(after_paint=None):
     raise_threshold()
     if after_paint is None or not freeze_after_first_paint(after_paint):
         freeze_startup()
+    disable_automatic()
     start_idle_collector()
+
+
+def disable_automatic():
+    """Plan 50 IP20 (DP-6370). Switch automatic collection off for good.
+
+    With it off, no allocation on any thread starts a collection; only the
+    calls in this module do, and they refuse off the GUI thread.
+    """
+    gc.disable()
+    _state['disabled'] = True
+    if _state['last_full'] is None:
+        _state['last_full'] = _now()
+    if _state['last_young'] is None:
+        _state['last_young'] = _now()
+
+
+def automatic_collection_disabled() -> bool:
+    return _state['disabled'] and not gc.isenabled()
 
 
 class _FreezeAfterPaint:
@@ -169,8 +229,8 @@ def start_idle_collector():
         return None
     timer = QTimer(application)
     timer.setObjectName('gc_policy.idle_collector')
-    timer.setInterval(IDLE_COLLECT_MS)
-    timer.timeout.connect(collect_young)
+    timer.setInterval(TICK_MS)
+    timer.timeout.connect(tick)
     timer.start()
     _state['timer'] = timer
     return timer
@@ -191,7 +251,63 @@ def collect_young():
     """Collect generations 0 and 1 on the GUI thread; elsewhere, skip."""
     if not _on_main_thread():
         return 0
+    _state['last_young'] = _now()
+    _state['young_since_full'] += 1
     return gc.collect(1)
+
+
+def _in_nested_loop() -> bool:
+    """True inside a nested Qt event loop (a modal, a menu, a drag)."""
+    try:
+        from PySide6.QtCore import QThread
+        return QThread.currentThread().loopLevel() > 1
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _mouse_down() -> bool:
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
+        if QGuiApplication.instance() is None:
+            return False
+        return QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def tick():
+    """Plan 50 IP20 (DP-6370). One step of the GUI-thread schedule.
+
+    Returns the generation collected, or None. Off the GUI thread, or inside
+    a nested event loop, it does nothing.
+    """
+    if not _on_main_thread():
+        return None
+    if _state['disabled'] and gc.isenabled():
+        logger.warning('gc_policy: automatic collection was switched back on; '
+                       'switching it off again')
+        gc.disable()
+    if _in_nested_loop():
+        return None
+    now = _now()
+    if _state['last_young'] is None:
+        _state['last_young'] = now
+    if _state['last_full'] is None:
+        _state['last_full'] = now
+    if (_state['young_since_full'] >= FULL_AFTER_YOUNG
+            and now - _state['last_full'] >= FULL_MIN_SECONDS
+            and not _mouse_down()):
+        _state['last_full'] = _state['last_young'] = now
+        _state['young_since_full'] = 0
+        gc.collect()
+        return 2
+    young = gc.get_count()[0]
+    if young >= GEN0_THRESHOLD or (
+            young and (now - _state['last_young']) * 1000.0 >= IDLE_COLLECT_MS):
+        collect_young()
+        return 1
+    return None
 
 
 def collect_full(reason=''):
@@ -204,6 +320,8 @@ def collect_full(reason=''):
         # is a full collection of its own; the window's start clears an empty
         # case (MEASURED live 18 October 2026: 0.05 s inside show()).
         return 0
+    _state['last_full'] = _state['last_young'] = _now()
+    _state['young_since_full'] = 0
     return gc.collect()
 
 
@@ -243,14 +361,11 @@ def collect_full_when_quiet(reason=''):
 
 
 def _quiet_collect():
-    try:
-        from PySide6.QtCore import Qt
-        from PySide6.QtGui import QGuiApplication
-        if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
-            _state['quiet_timer'].start(500)
-            return
-    except Exception:                                       # noqa: BLE001
-        pass
+    if _mouse_down() or _in_nested_loop():
+        _state['quiet_timer'].start(500)
+        return
+    _state['last_full'] = _state['last_young'] = _now()
+    _state['young_since_full'] = 0
     gc.collect()
 
 

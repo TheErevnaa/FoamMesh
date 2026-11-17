@@ -54,6 +54,32 @@ OPERATIONS = (
                 'button']},
             target={'type': ['string', 'integer']})),
     OperationDescriptor(
+        'window.footer', 'Footer buttons and drop-down', 'case',
+        ImpactClass.READ,
+        summary='The footer as shown: the Back and primary buttons (text, '
+                'enabled, tooltip) and the entries the drop-down of the '
+                'primary button offers on this page (object name, label, '
+                'tooltip). press chooses one entry by its object name, as '
+                'choosing it in the menu does.',
+        parameters_schema=_schema(press=_STRING)),
+    OperationDescriptor(
+        'window.viewport_pointer', 'Pointer over the 3-D view', 'case',
+        ImpactClass.READ,
+        summary='Rest the pointer on a point of the 3-D view (action '
+                'hover) or click there (action click; extend holds Ctrl, '
+                'whole holds Shift). x and y are fractions of the view '
+                'from its top-left corner. The view gets the mouse events '
+                'a hand gives it, on either route. Returns the point in '
+                'pixels, the part named under the pointer and the hover '
+                'read-out after the dwell, and for a click the part '
+                'picked.',
+        parameters_schema=_schema(
+            ('x', 'y'),
+            x={'type': 'number', 'minimum': 0, 'maximum': 1},
+            y={'type': 'number', 'minimum': 0, 'maximum': 1},
+            action={'type': 'string', 'enum': ['hover', 'click']},
+            extend=_BOOL, whole=_BOOL)),
+    OperationDescriptor(
         'window.rail', 'Viewport tool rail', 'case', ImpactClass.READ,
         summary='Read the viewport tool rail (tools, open and pinned '
                 'popovers, sizes, the ... overflow menu, Customise choices) '
@@ -244,6 +270,19 @@ def handlers():
         api = _api(session)
         return _done(session, command, _guard(lambda: api.rail(**p)))
 
+    async def footer(session, command):
+        p = _p(command)
+        api = _api(session)
+        return _done(session, command, _guard(
+            lambda: api.footer(p.get('press'))))
+
+    async def viewport_pointer(session, command):
+        p = _p(command)
+        api = _api(session)
+        return _done(session, command, await _aguard(api.viewport_pointer(
+            p.get('x'), p.get('y'), p.get('action', 'hover'),
+            bool(p.get('extend')), bool(p.get('whole')))))
+
     async def run_panel(session, command):
         api = _api(session)
         return _done(session, command, _guard(api.run_panel))
@@ -319,6 +358,8 @@ def handlers():
     return {
         'window.navigate': navigate,
         'window.rail': rail,
+        'window.footer': footer,
+        'window.viewport_pointer': viewport_pointer,
         'window.run_panel': run_panel,
         'window.sheet': sheet,
         'window.recovery': recovery,

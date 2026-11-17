@@ -104,7 +104,16 @@ def suggest_unit(raw_diagonal: float) -> UnitSuggestion:
     d = abs(raw_diagonal)
     if d == 0:
         return UnitSuggestion('m', False, 'Degenerate geometry (zero size).')
-    if 0.01 <= d <= 100:
+    if 10 < d <= 100:
+        # DP-6125. A raw diagonal of 55 is a 55 m part read as metres and a
+        # 55 mm part read as millimetres; the second is far the commoner
+        # CFD model (a 50 mm sector came out as "metres, a plausible size").
+        # Millimetres is proposed, and the user is asked to check.
+        return UnitSuggestion('mm', False,
+                              f'Diagonal {_length_text(d / 1000)} read as '
+                              f'millimetres; read as metres it would be '
+                              f'{_length_text(d)}.')
+    if 0.01 <= d <= 10:
         return UnitSuggestion('m', True,
                               f'Diagonal {_length_text(d)} read as metres: '
                               f'a plausible size.')

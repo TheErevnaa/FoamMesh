@@ -25,6 +25,7 @@ from foammesh.rendering.actor_info import (
 from foammesh.view.theming.metrics import (
     FORM_MARGIN, CompactDoubleSpinBox, unit_cell,
 )
+from widgets import async_dialog
 
 #: A 3x3 grid on a square: what the control changes, drawn as that.
 #: Plan 45 V9. 2.25 units of the 24 box is 1.5 px at the rail's 16 px, the
@@ -177,13 +178,17 @@ class MeshLinesPanel(QWidget):
     def _colorChosen(self, index):
         data = self._color.itemData(index)
         if data == 'custom':
-            chosen = QColorDialog.getColor(parent=self)
-            if not chosen.isValid():
-                self.syncFromStyle()
-                return
-            data = chosen.name()
-            self._customColor = data
+            # Plan 50 IP19: no nested event loop.
+            async_dialog.getColor(parent=self, then=self._customChosen)
+            return
         self._apply(color=data)
+
+    def _customChosen(self, chosen):
+        if not chosen.isValid():
+            self.syncFromStyle()
+            return
+        self._customColor = chosen.name()
+        self._apply(color=self._customColor)
 
     def _widthChanged(self, value):
         self._apply(width=value)

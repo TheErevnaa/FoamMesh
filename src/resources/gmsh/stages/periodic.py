@@ -98,7 +98,8 @@ class PeriodicStage:
         if left or any(other is None for _tag, other in pieces):
             raise MeshFailure(
                 f'periodic pair {pair["name"]!r}: the boundary layer rebuilt '
-                f'its sides into {len(masters)} piece(s) on the master side '
+                f'its sides into {len(masters)} '
+                f'{"piece" if len(masters) == 1 else "pieces"} on the master side '
                 f'and {len(slaves)} on the slave side, and they do not '
                 'correspond under its transform. Grow the same layers on the '
                 'walls around both sides, or turn layers off.')
@@ -110,10 +111,27 @@ class PeriodicStage:
         return pieces, [(one, other) for one, other in edges
                         if other is not None]
 
+    def widen_periodic_tolerance(self, floor=1e-6):
+        """Let Gmsh match periodic nodes as closely as an STL states them.
+
+        DP-6126. Gmsh finds a node's partner within ``Geometry.Tolerance`` times
+        the model's size, 1e-8 by default. An STL stores single-precision
+        vertices, good to about 6e-8 of the part, so a rotated copy of a face
+        misses its partner by more than that. MEASURED on a 30 degree sector
+        (50 mm): "No corresponding point 1 for periodic connection of surface 7
+        to 8 (min. distance = 8.86e-09, tolerance = 4.57e-10)". The stage
+        already reads a correspondence at ``model_reach`` (1e-6 of the model),
+        so Gmsh is held to no tighter a figure.
+        """
+        option = self.gmsh.option
+        if float(option.getNumber('Geometry.Tolerance')) < floor:
+            option.setNumber('Geometry.Tolerance', floor)
+
     def apply_periodic(self):
         pairs = (self.intent.get('periodic') or {}).get('pairs') or []
         if not pairs:
             return
+        self.widen_periodic_tolerance()
         applied = 0
         for pair in pairs:
             master = self.scope_surfaces.get(pair['masterScope'])
@@ -187,16 +205,27 @@ class PeriodicStage:
             affine = copy['affine']
             for master, slave in copy['pieces']:
                 mapping = self.land_nodes(master, slave, affine, reach)
-                if mapping is None:
+                if (mapping is None and int(slave) in laterals
+                        and self.strip_pairing(master, slave, affine) is not None):
+                    # DP-6129. The stacks are extruded along normals averaged
+                    # over each side's own wall triangles, which differ, so
+                    # the two strips sit a few microns apart. They are moved
+                    # onto each other once the volume pass has built the
+                    # stacks (`declare_periodic_strips`); moved now, Gmsh
+                    # could not find the vertices it extrudes.
+                    self.strips_to_snap.add(int(slave))
+                elif mapping is None:
                     if int(slave) in laterals:
                         raise MeshFailure(
                             f'periodic pair {copy["name"]!r}: the boundary '
-                            'layer was not extruded alike on its two sides, so '
-                            'the strips it stands on them do not correspond. '
-                            'Grow the same layers on the walls around both '
-                            'sides, or turn layers off.')
-                    self.copy_surface_mesh(master, slave, affine, reach,
-                                           copy['name'])
+                            f'layer was not extruded alike on its two sides (surface {int(master)} '
+                            f'against surface {int(slave)}), so the strips '
+                            'it stands on them do not correspond. Grow the '
+                            'same layers on the walls around both sides, or '
+                            'turn layers off.')
+                    self.copy_surface_mesh(
+                        master, slave, affine,
+                        max(reach, self.layer_slack()), copy['name'])
                 # The tags are renumbered after meshing, so the map is read
                 # again from the finished mesh (`copied_periodic_nodes`).
                 self.periodic_node_maps[int(slave)] = (int(master),
@@ -226,6 +255,8 @@ class PeriodicStage:
         pending, self.periodic_strips_pending = (
             list(self.periodic_strips_pending), [])
         for master, slave, affine in pending:
+            if int(slave) in self.strips_to_snap:
+                self.snap_strip(master, slave, affine)
             self.declare_copied_periodic(master, slave, affine)
 
     def declare_copied_periodic(self, master, slave, affine):
@@ -285,6 +316,51 @@ class PeriodicStage:
         if moved != self.surface_faces(int(master)):
             return None
         return mapping
+
+    def layer_slack(self):
+        """How far two layer stacks' nodes may sit apart and still be a pair.
+
+        DP-6129. MEASURED on a 30 degree sector with three layers on the walls
+        around the cyclic planes (STL, Gmsh 4.15.2): the stacks on the two
+        planes have the same nodes in number but sit 2 to 8 micron apart (the
+        first layer is 71 micron), where a match is asked within 46 nm. A
+        quarter of the first layer is far under the spacing of the nodes.
+        """
+        first = abs(float((self.intent.get('layers') or {}).get(
+            'firstHeight') or 0.0))
+        return 0.25 * first
+
+    def strip_pairing(self, master, slave, affine):
+        """``{slave node: master node}`` within the layer slack, or None."""
+        allowed = self.layer_slack()
+        theirs = self.surface_nodes(master)
+        mine = self.surface_nodes(slave)
+        if allowed <= 0 or len(theirs) != len(mine):
+            return None
+        grid = self.node_grid(mine, allowed)
+        pairing = {}
+        for node, point in theirs.items():
+            found = self.nearest_node(grid, self.carried(affine, point),
+                                      allowed)
+            if found is None or found in pairing:
+                return None
+            pairing[found] = node
+        return pairing
+
+    def snap_strip(self, master, slave, affine):
+        """Move a strip's nodes onto its master's image (DP-6129)."""
+        pairing = self.strip_pairing(master, slave, affine)
+        if pairing is None:
+            raise MeshFailure(
+                f'the boundary layer was not extruded alike on the two sides '
+                f'of a periodic pair (surface {int(master)} against '
+                f'surface {int(slave)}), so the strips it stands on them do '
+                'not correspond. Grow the same layers on the walls around '
+                'both sides, or turn layers off.')
+        theirs = self.surface_nodes(master)
+        for slave_node, master_node in pairing.items():
+            self.gmsh.model.mesh.setNode(
+                int(slave_node), self.carried(affine, theirs[master_node]), [])
 
     @staticmethod
     def node_grid(nodes, reach):

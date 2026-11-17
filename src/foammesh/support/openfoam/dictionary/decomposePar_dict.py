@@ -30,6 +30,7 @@ class MethodType(Enum):
     SIMPLE       = 'simple'
     HIERARCHICAL = 'hierarchical'
     KAHIP        = 'kahip'
+    PTSCOTCH     = 'ptscotch'
     METIS        = 'metis'
     SCOTCH       = 'scotch'
     STRUCTURED   = 'structured'

@@ -35,8 +35,78 @@ def parse_set_ids(text: str) -> list[int]:
     return [int(tok) for tok in re.findall(r'-?\d+', body)]
 
 
+def _binary_labels(path: Path) -> list[int] | None:
+    """The labels of a member written ``format binary``, else None.
+
+    Plan 50 IP15 (DP-6421). A set or ``owner`` in a binary working case is
+    ``N`` then ``(`` then raw little-endian labels: the text reads below took
+    the ASCII digits that happen to sit among those bytes as ids and
+    highlighted cells nothing named. A binary member is decoded here, and one
+    that does not decode as a plain label list gives ``[]`` -- no highlight
+    rather than a wrong one.
+    """
+    from foammesh.core.mesh import poly_mesh_binary as binary
+    from foammesh.core.mesh.poly_mesh_boundary import (
+        PolyMeshReadError, _FOAMFILE, _parse_header, _read_bytes)
+    try:
+        raw = _read_bytes(path)
+        if _FOAMFILE.search(raw[:65536]) is None:
+            return None
+        header = _parse_header(raw[:65536], path)
+    except (OSError, EOFError, PolyMeshReadError):
+        return None
+    if str(header.get('format', 'ascii')).strip() != 'binary':
+        return None
+    # DP-6486. OpenFOAM 13 writes a set under a ``format binary`` header with
+    # its labels as text, one a line (read off a live binary case). Decoding
+    # that as raw bytes failed -- every set read empty -- or, for a one-label
+    # set, "succeeded" with a cell id made of its digits. A body that is a
+    # whole text list of exactly the count it declares is read as text; raw
+    # labels can look like that only when every byte of every label is a
+    # digit or a space, which no label below 151 million is.
+    text = _text_labels(raw, path)
+    if text is not None:
+        return text
+    try:
+        return binary.read_binary_labels(path, path.name)[0].tolist()
+    except (OSError, PolyMeshReadError):
+        return []
+
+
+#: DP-6486. What lies between the parentheses of a label list written as text.
+_TEXT_BODY = re.compile(rb'[0-9\s]*')
+
+
+def _text_labels(raw: bytes, path: Path) -> list[int] | None:
+    """The labels of a list written as text, whatever its header says; None
+    when the body is not a whole text list of the count it declares."""
+    from foammesh.core.mesh.poly_mesh_boundary import (
+        PolyMeshReadError, _FOAMFILE, _leading_count, _numbers, _payload)
+    import numpy as np
+
+    found = _FOAMFILE.search(raw)
+    if found is None:
+        return None
+    payload = _payload(raw, found.end())
+    try:
+        count, open_at = _leading_count(payload, path.name)
+    except PolyMeshReadError:
+        return None
+    close = payload.rfind(b')')
+    if close < open_at or payload[close + 1:].strip():
+        return None
+    body = payload[open_at + 1:close]
+    if not _TEXT_BODY.fullmatch(body):
+        return None
+    values = _numbers(body, np.int64)
+    return values.tolist() if values.size == count else None
+
+
 def read_set_file(path) -> list[int]:
     path = Path(path)
+    decoded = _binary_labels(path)
+    if decoded is not None:
+        return decoded
     if path.suffix == '.gz':
         with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as source:
             return parse_set_ids(source.read())
@@ -60,48 +130,36 @@ def set_entity_kind(path) -> str:
     return match.group(1) if match else 'cellSet'
 
 
-def _read_label_list(path) -> list[int]:
-    """The label list of a polyMesh file, without a regex over millions of ids.
-
-    ``owner`` is the largest ASCII file in a case; the id regex the set reader
-    uses walks it token by token and is measurably slower than splitting the
-    one parenthesised block, which is all this needs.
-    """
-    path = Path(path)
-    if path.suffix == '.gz':
-        with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as source:
-            text = source.read()
-    else:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
-    text = re.sub(r'//[^\n]*', ' ', text)
-    text = re.sub(r'FoamFile\s*\{.*?\}', ' ', text, flags=re.S)
-    if '(' not in text or ')' not in text:
-        return []
-    body = text.split('(', 1)[1].rsplit(')', 1)[0]
-    labels = []
-    for token in body.split():
-        try:
-            labels.append(int(token))
-        except ValueError:
-            return []
-    return labels
-
-
 def face_owner_cells(case_path) -> list[int]:
     """Face id to owning cell id, read from ``constant/polyMesh/owner``.
 
     Plan 31 (``checkmesh.write_surfaces``). Returns an empty list when the
-    mesh is absent or is written in a form this cannot read -- binary, or a
-    non-numeric body -- because a partial map would mis-highlight cells, which
-    is worse than highlighting none.
+    mesh is absent or its owner does not read whole, because a partial map
+    would mis-highlight cells, which is worse than highlighting none. The
+    face-set lookup itself uses :func:`owner_array` (DP-6486).
     """
+    return owner_array(case_path).tolist()
+
+
+def owner_array(case_path):
+    """Face id to owning cell id as an int64 numpy array; empty when absent.
+
+    DP-6486. Read by the polyMesh reader (ASCII, ``.gz``, binary at either
+    label width, ``N{v}``), so a 150 M-face owner is never a Python list. A
+    list that does not read whole is empty: a partial map would highlight
+    the wrong cells.
+    """
+    import numpy as np
+
+    from foammesh.core.mesh.poly_mesh_boundary import _member, _read_labels
+
     directory = Path(case_path) / 'constant' / 'polyMesh'
-    for name in ('owner', 'owner.gz'):
-        candidate = directory / name
-        if candidate.is_file():
-            return _read_label_list(candidate)
-    return []
+    if _member(directory, 'owner') is None:
+        return np.empty(0, dtype=np.int64)
+    try:
+        return np.asarray(_read_labels(directory, 'owner'), dtype=np.int64)
+    except (OSError, EOFError, ValueError):
+        return np.empty(0, dtype=np.int64)
 
 
 def discover_cell_set_files(case_path) -> dict[str, list[int]]:
@@ -134,20 +192,24 @@ def discover_cell_set_files(case_path) -> dict[str, list[int]]:
     face_sets = [path for path in files if kinds[path] == 'faceSet']
     if not face_sets:
         return discovered
-    owner = face_owner_cells(case_path)
-    if not owner:
+    import numpy as np
+
+    # DP-6486. In numpy: the owner of a large mesh is not walked in Python.
+    owner = owner_array(case_path)
+    if not owner.size:
         return discovered
-    limit = len(owner)
+    limit = owner.size
     for path in face_sets:
         name = path.name.removesuffix('.gz')
         if name in discovered:
             # A cellSet of the same name is already the answer; a faceSet
             # cannot improve on it and must not silently replace it.
             continue
-        cells = {owner[face] for face in read_set_file(path)
-                 if 0 <= face < limit}
+        faces = np.asarray(read_set_file(path), dtype=np.int64)
+        faces = faces[(faces >= 0) & (faces < limit)]
+        cells = np.unique(owner[faces]).tolist()
         if cells:
-            discovered[name] = sorted(cells)
+            discovered[name] = cells
     return discovered
 
 

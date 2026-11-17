@@ -62,6 +62,8 @@ from session_plugins_v1 import SessionPluginsMixin
 from session_export_v1 import SessionExportMixin
 from session_fields_v1 import SessionFieldsMixin
 from session_cvt_v1 import SessionCvtMixin
+import gmsh_startup_v1
+import session_snapshot_v1
 # Plan 48 RR (DP-4009): the stage functions the batch runner also plays.
 from stages.session import SessionStageOperations
 
@@ -148,6 +150,29 @@ _op_deadline = {'when': None, 'op': None}
 _memory_cap_kb = 0
 _log_path = None
 _calls_path = None
+#: Plan 50 IP6 (DP-6251). The folder the session was started in; the
+#: session itself works in a private scratch folder (see ``main``).
+_origin = os.getcwd()
+#: The scratch folder the session works in, removed on every way out.
+_scratch_path = ''
+
+
+def _exit_now(code: int) -> None:
+    """``os._exit`` after removing the scratch folder (Plan 50 IP6).
+
+    The watchdog, an abort and the end of stdin leave by ``os._exit``, which
+    runs no ``finally``; the host closes stdin right after ``session.quit``,
+    so that is the usual way out, and the folder would otherwise be left for
+    the next start to sweep.
+    """
+    if _scratch_path:
+        import shutil
+        try:
+            os.chdir(_origin)
+        except OSError:
+            pass
+        shutil.rmtree(_scratch_path, ignore_errors=True)
+    os._exit(code)
 
 
 def emit(message: dict) -> None:
@@ -237,11 +262,11 @@ def _watchdog() -> None:
         if when is not None and time.monotonic() > when:
             emit({'event': 'fatal', 'reason': 'timeout',
                   'op': _op_deadline['op']})
-            os._exit(EXIT_TIMEOUT)
+            _exit_now(EXIT_TIMEOUT)
         if _memory_cap_kb and _rss_kb() > _memory_cap_kb:
             emit({'event': 'fatal', 'reason': 'memory',
                   'op': _op_deadline['op'], 'rss_kb': _rss_kb()})
-            os._exit(EXIT_MEMORY)
+            _exit_now(EXIT_MEMORY)
 
 
 def _stdin_reader(requests: 'queue.Queue') -> None:
@@ -257,9 +282,9 @@ def _stdin_reader(requests: 'queue.Queue') -> None:
             continue
         if request.get('op') == 'session.abort':
             emit({'event': 'fatal', 'reason': 'abort'})
-            os._exit(EXIT_ABORTED)
+            _exit_now(EXIT_ABORTED)
         requests.put(request)
-    os._exit(0)
+    _exit_now(0)
 
 
 # -- script recorder (Plan 41 GN19) ----------------------------------------- #
@@ -623,7 +648,7 @@ class Session(SessionOptionsMixin, SessionReadersMixin, SessionGeometryMixin,
     def set_log(self, path, **_):
         """Point the op log at *path* (an idle probe session joins a project)."""
         global _log_path, _calls_path
-        _log_path = path or None
+        _log_path = gmsh_startup_v1.absolute(path, _origin) if path else None
         _calls_path = _calls_for(_log_path)
         _truncate_calls()
         return {'log': _log_path}
@@ -899,20 +924,23 @@ class Session(SessionOptionsMixin, SessionReadersMixin, SessionGeometryMixin,
         return exporter.export(self.gmsh, path, **kwargs)
 
     def replay(self, path=None, **_):
-        """Run the op log on this session; the ops are not logged again."""
+        """Run the op log on this session; the ops are not logged again.
+
+        Plan 50 IP18 (DP-6323). A snapshot written after the last generate
+        that still matches the log is restored first (the log up to it run
+        without its mesh operations, the saved mesh put back), and only the
+        operations after it are run; ``snapshot`` says whether it was used
+        and, if not, why. ``replayed`` counts every operation of the log.
+        """
         path = path or _log_path
-        done = 0
         _truncate_calls()
-        if path and os.path.isfile(path):
-            with open(path, encoding='utf-8') as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    entry = json.loads(line)
-                    dispatch(self, dict(entry, replay=True))
-                    done += 1
-        return {'replayed': done}
+        lines = session_snapshot_v1.read_log_lines(path)
+        start, snapshot = session_snapshot_v1.restore(
+            self, sys.modules[__name__], lines,
+            gmsh_startup_v1.absolute(path, _origin) if path else None)
+        for line in lines[start:]:
+            dispatch(self, dict(json.loads(line), replay=True))
+        return {'replayed': len(lines), 'snapshot': snapshot}
 
     def _entity_extent(self, dim, tag):
         """The bounding box of an entity, also of one with no CAD extent.
@@ -1497,20 +1525,40 @@ def dispatch(session: Session, request: dict):
 
 
 def main(argv) -> int:
-    global _proto, _log_path, _calls_path, _memory_cap_kb
+    global _proto, _log_path, _calls_path, _memory_cap_kb, _origin
+    global _scratch_path
     options = {'--log': None, '--memory-mb': None}
     for flag in options:
         if flag in argv:
             options[flag] = argv[argv.index(flag) + 1]
-    _log_path = options['--log']
+    # Plan 50 IP6 (DP-6251). Gmsh writes debug files (`*.pos`, `_Cut.msh`,
+    # plugin side files) into the working folder, which was wherever FoamMesh
+    # had been started. The session works in a private folder instead,
+    # removed when it ends; paths it is given are fixed against the start.
+    scratch = gmsh_startup_v1.ScratchDirectory()
+    _origin = scratch.origin
+    _log_path = (gmsh_startup_v1.absolute(options['--log'], _origin)
+                 if options['--log'] else None)
     _calls_path = _calls_for(_log_path)
     _truncate_calls()
     if options['--memory-mb']:
         _memory_cap_kb = int(float(options['--memory-mb']) * 1024)
     _proto = os.fdopen(os.dup(1), 'w', buffering=1, encoding='utf-8')
     _capture_console()
+    scratch.enter()
+    _scratch_path = scratch.path
+    try:
+        return _serve()
+    finally:
+        _scratch_path = ''
+        scratch.leave()
+
+
+def _serve() -> int:
+    """The request loop of :func:`main`, run inside the scratch folder."""
     import gmsh
-    gmsh.initialize(['', '-noenv'], readConfigFiles=False, run=False)
+    # Plan 50 IP6 (DP-6250): one start for every Gmsh process FoamMesh runs.
+    gmsh_startup_v1.initialize(gmsh)
     gmsh.option.setNumber('General.Terminal', 1)
     gmsh.option.setNumber('General.Verbosity', 5)
     gmsh.model.add('foammesh')
@@ -1541,6 +1589,12 @@ def main(argv) -> int:
                         'error': '%s: %s' % (type(error).__name__, error),
                         'trace': traceback.format_exc(limit=6)}
         _op_deadline['when'] = None
+        if response['ok'] and not request.get('replay')                 and op in session_snapshot_v1.SNAPSHOT_AFTER:
+            # Plan 50 IP18 (DP-6323). The mesh just made, for a rebuild after
+            # a crash to put back instead of generating it again.
+            response['snapshot'] = session_snapshot_v1.write_snapshot(
+                gmsh, _log_path, _calls_path, rss_kb=_rss_kb(),
+                memory_cap_kb=_memory_cap_kb)
         response['seconds'] = round(time.monotonic() - started, 4)
         response['log'] = _drain_console(gmsh)[-200:]
         emit(response)

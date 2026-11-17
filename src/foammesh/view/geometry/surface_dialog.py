@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QComboBox, QDialog, QLabel
 from foammesh.support.simple_db.simple_schema import ValidationError
 from foammesh.core.facade.errors import FacadeError, ValidationFailedError
 from foammesh.view import inline_error
+from foammesh.view.combo_items import set_item_enabled
 from foammesh.view.widgets.commit_guard import (CONFLICT_ERRORS, commit_guard,
                                                 conflict_message)
 from widgets.async_message_box import AsyncMessageBox
@@ -233,6 +234,7 @@ class SurfaceDialog(QDialog):
                     await app.facadeClient.run('geometry.rename', {
                         'geometry_id': self._gIds[0],
                         'name': self._ui.name.text()})
+            self._autoNote.setText(self.tr('Pairing…'))
             await app.facadeClient.run('geometry.surface_intent.auto_pair', {
                 'surface_role': self._role(),
                 'geometry_ids': self._keys()})
@@ -243,6 +245,7 @@ class SurfaceDialog(QDialog):
         except FacadeError as error:
             inline_error.show(self, self.tr('Not paired: {0}').format(error))
             return
+        self.geometryRebuilt = True
         super().accept()
 
     def _connectSignalsSlots(self):
@@ -379,6 +382,11 @@ class SurfaceDialog(QDialog):
         #: The last preview the facade answered, for OK and the tests.
         self._autoPreview = None
         self._previewToken = 0
+        #: DP-6089. True once Automatic has paired: a conformal pairing cuts
+        #: the bodies into new surfaces and removes the ones this dialog was
+        #: opened on, so the page rebuilds the tree and the scene from the
+        #: database instead of re-reading these rows.
+        self.geometryRebuilt = False
 
     def _automatic(self):
         return (self._role() in intent.INTERFACE_ROLES
@@ -404,6 +412,9 @@ class SurfaceDialog(QDialog):
         token = self._previewToken
         self._autoNote.setText(self.tr('Looking for the walls this surface '
                                        'touches...'))
+        # OK stays off until this measure says what it would pair.
+        self._autoPreview = None
+        self._autoOk()
         try:
             result = await app.facadeClient.run(
                 'geometry.surface_intent.auto_pair', {
@@ -570,9 +581,9 @@ class SurfaceDialog(QDialog):
         # One surface is both sides only of a conformal interface.
         shared = self._ui.partner.findData(authoring.SHARED)
         if shared >= 0:
-            item = self._ui.partner.model().item(shared)
-            if item is not None:
-                item.setEnabled(role == intent.CONFORMAL)
+            # DP-6453 (DP-1447): no QStandardItem wrapper for the entry.
+            set_item_enabled(self._ui.partner, shared,
+                             role == intent.CONFORMAL)
 
     def _edit(self):
         """The edit the controls ask for; an untouched mixed control keeps."""

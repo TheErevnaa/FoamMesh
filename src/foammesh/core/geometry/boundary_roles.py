@@ -111,6 +111,13 @@ def _pair(entry) -> tuple[str, str]:
         if isinstance(intent, Mapping) and                 str(intent.get('state') or 'valid') == 'valid':
             category = role_category(category, intent.get('role'),
                                      intent.get('mesh_patch_type'))
+            # DP-6125. A face that is one side of a periodic pair is joined
+            # to its partner, not a wall: layers grown on it would stop at a
+            # cut the other side does not have.
+            if any(isinstance(item, Mapping)
+                   and str(item.get('kind') or '') == 'periodic'
+                   for item in intent.get('relations') or ()):
+                category = 'interface'
         return str(name).strip(), category
     if isinstance(entry, (tuple, list)) and entry:
         category = entry[1] if len(entry) > 1 else ''

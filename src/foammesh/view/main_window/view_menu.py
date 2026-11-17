@@ -46,7 +46,7 @@ from foammesh.view.theming.metrics import (
 SHEET_MODES = ('floating', 'pinned', 'minimised')
 SHEET_SIDES = ('left', 'right')
 SHEET_WIDTHS = (300, 360, 440)
-SHEET_WIDTH_RANGE = (280, 560)
+SHEET_WIDTH_RANGE = (280, 960)
 REVEALS = ('hover', 'click')
 RIBBON_LABELS = ('full', 'numbers')
 MODEL_BY = ('patches', 'quality', 'deviation')

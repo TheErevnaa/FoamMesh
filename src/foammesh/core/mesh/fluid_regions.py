@@ -273,7 +273,9 @@ def flush_sides(box, geometry_bounds, base_cell=None) -> list[str]:
             gap = float(box[index]) - float(geometry_bounds[index])
         if gap < -tiny:
             continue
-        if gap <= tiny or gap < cell:
+        # Plan 50 IP26 (DP-6425): a gap of exactly one cell -- the derived
+        # block's default clearance -- is clear, rounding aside.
+        if gap <= tiny or gap < cell - tiny:
             sides.append(name)
     return sides
 

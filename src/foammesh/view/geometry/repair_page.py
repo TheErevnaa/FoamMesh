@@ -42,6 +42,7 @@ from foammesh.view.widgets.segmented_control import SegmentedControl
 from foammesh.view.workflow_controls.field_widgets import LengthDoubleSpinBox
 from foammesh.view.widgets.justification_dialog import JustificationDialog
 from widgets import async_message_box as messages
+from widgets.async_dialog import openDialog
 
 #: Findings columns holding a number rather than a name (Count, Size).
 _NUMERIC_FINDING_COLUMNS = (2, 3)
@@ -1276,11 +1277,15 @@ class GeometryRepairPage(StepPage):
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
         dialog.resize(640, 480)
-        try:
-            dialog.exec()
-        finally:
+
+        def closed(_result):
+            # The tree goes home when the dialog closes (Plan 50 IP19: opened
+            # without a nested event loop).
             self._bodyTree.setParent(home)
             self._bodyTree.setVisible(False)
+            dialog.deleteLater()
+
+        openDialog(dialog, closed)
 
     def clearResult(self):
         """Throw away the geometry that was prepared from the old one.
@@ -1998,8 +2003,7 @@ class GeometryRepairPage(StepPage):
         if not writes:
             self.showProceedRefusal(effect)
             return
-        answer = await modal(
-            messages.question,
+        answer = await messages.questionAsync(
             self._widget, self.tr('Apply repair preview'),
             ' '.join(filter(None, (
                 self.tr('{0} previewed.').format(
@@ -2085,8 +2089,8 @@ class GeometryRepairPage(StepPage):
         preview = await self._estimateWrapCore()
         if not geometry_id or preview is None:
             return
-        answer = await modal(
-            messages.warning,
+        answer = await messages.askAsync(
+            QMessageBox.Icon.Warning,
             self._widget, self.tr('Apply wrap'),
             self._wrapAcceptanceSummary(preview),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -2146,18 +2150,20 @@ class GeometryRepairPage(StepPage):
         if not selection:
             return
         geometry_id, revision = selection
-        answer = messages.question(
+        def answered(answer):
+            if answer == QMessageBox.StandardButton.Yes:
+                # C31-12. The rollback is scheduled and the redraw is its
+                # continuation, so the page is redrawn after the rollback, as
+                # before -- not on the GUI thread while it runs.
+                submit(app.facadeClient, 'geometry.repair.rollback', {
+                    'geometry_id': geometry_id, 'target_revision': revision},
+                    then=lambda _result: self.refresh())
+
+        messages.askQuestion(
             self._widget, self.tr('Restore geometry revision'),
             self.tr('Make revision {0} current? Existing revisions are retained.').format(revision),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if answer == QMessageBox.StandardButton.Yes:
-            # C31-12. The rollback is scheduled and the redraw is its
-            # continuation, so the page is redrawn after the rollback, as
-            # before -- not on the GUI thread while it runs.
-            submit(app.facadeClient, 'geometry.repair.rollback', {
-                'geometry_id': geometry_id, 'target_revision': revision},
-                then=lambda _result: self.refresh())
+            QMessageBox.StandardButton.Cancel, then=answered)
 
     def _recordAsIs(self):
         # DP-126. Defence in depth for the disabled button: the facade
@@ -2189,10 +2195,14 @@ class GeometryRepairPage(StepPage):
         # R197. This asks for a justification a reviewer reads later
         # and offered a single-line box to write it in. Same prompt,
         # same dialog as the quality gate's `Accept anyway`.
-        reason = JustificationDialog.ask(
+        # Plan 50 IP19: the reason arrives once the dialog closes.
+        JustificationDialog.ask(
             self._widget, self.tr('Acknowledge geometry risk'),
             self.tr('Explain why this geometry should be used without '
-                    'preparation. This is recorded against the case.'))
+                    'preparation. This is recorded against the case.'),
+            then=self._recordAsIsWithReason)
+
+    def _recordAsIsWithReason(self, reason):
         if not reason:
             return
         parameters = {'decision': 'as_is', 'ack_reason': reason}

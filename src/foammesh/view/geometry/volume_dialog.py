@@ -339,6 +339,45 @@ class VolumeDialog(QDialog):
 
         return True
 
+    def _artifactIds(self):
+        """The artifact-store ids of this body and its surfaces.
+
+        By the ``geometryId`` each row carries, not by the name prefix the
+        surface dialog falls back on: a renamed body still finds its file.
+        """
+        db = app.facadeClient.checkout()
+        ids = []
+        for gId, element in db.getElements('geometry').items():
+            if str(gId) != str(self._gId) and (
+                    str(element.value('volume') or '') != str(self._gId)):
+                continue
+            geometryId = str(element.value('geometryId') or '')
+            if geometryId and geometryId not in ids:
+                ids.append(geometryId)
+        return ids
+
+    async def _transformArtifacts(self):
+        """DP-6097. Move the mesher's copy of the body too.
+
+        OK rewrote the polydata the window draws and nothing else: the
+        artifact store, which both meshers read, kept the body where it was,
+        so the mesh came out in the old place. ``geometry.transform`` moves
+        the artifact, as Edit surface does.
+        """
+        operations = self._transformWidget.operations()
+        if not operations:
+            return
+        for geometryId in self._artifactIds():
+            try:
+                await app.facadeClient.run('geometry.transform', {
+                    'geometry_id': geometryId, 'operations': operations})
+            except FacadeError as error:
+                await AsyncMessageBox().warning(
+                    self, self.tr('Transform'),
+                    self.tr("The mesher's copy of {0} was not transformed: "
+                            '{1}').format(self._ui.name.text(), error))
+                return
+
     def _updateHexData(self):
         if not self._validateHex():
             messages.warning(self, self.tr('Add geometry failed'), self.tr('Invalid coordinates.'))
@@ -482,6 +521,8 @@ class VolumeDialog(QDialog):
                     self._gId = db.remappedKey('geometry', self._gId)
                 else:
                     await app.facadeClient.commit_working_copy(self._dbElement, action='edit volume')
+                    if self._transformed:
+                        await self._transformArtifacts()
 
                 super().accept()
             except CONFLICT_ERRORS as error:

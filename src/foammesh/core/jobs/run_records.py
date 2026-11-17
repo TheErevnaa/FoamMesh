@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -308,6 +307,70 @@ def stop_writer(record: dict, *, timeout: float = 30) -> Liveness:
 
 # -- the gate -----------------------------------------------------------------
 
+#: Plan 50 CX3 (DP-6205). The act that clears a run the gate could not
+#: resolve, by code, in the words a refusal shows.
+CLEARING_ACTIONS = {
+    'stop_old_run': 'stop the old run (it is still running in WSL) or wait '
+                    'for it to finish, then try again',
+    'wait_for_wsl': 'make WSL reachable again (open a WSL terminal, or '
+                    'restart WSL), then try again',
+    'free_case_files': 'putting the previous mesh back failed on a file in '
+                       'use: close whatever has the case files open (a file '
+                       'browser, a viewer, another FoamMesh window), then '
+                       'try again',
+    'remove_record': 'its run record cannot be read: delete {record}, then '
+                     'try again',
+    'retry': 'try again; the run is resolved before the next run or unlock '
+             'starts',
+}
+
+#: DP-6487. The same acts as a refused run's sentence says them: why the run
+#: was not started, and what to do. ``remove_record`` ends with the record's
+#: path, which :meth:`GateVerdict.refusal` puts last.
+REFUSAL_WORDS = {
+    'stop_old_run': ('an earlier run is still running in WSL',
+                     'Stop it or wait for it to finish, then try again.'),
+    'wait_for_wsl': ('an earlier run could not be checked because WSL is '
+                     'not answering',
+                     'Make WSL reachable again (open a WSL terminal, or '
+                     'restart WSL), then try again.'),
+    'free_case_files': ('the mesh an earlier run changed could not be put '
+                        'back because a case file is in use',
+                        'Close whatever has the case files open, then try '
+                        'again.'),
+    'remove_record': ('an earlier run left a record that cannot be read',
+                      'To go on, delete this record and try again.'),
+    'retry': ('an earlier run has not been tidied up yet', 'Try again.'),
+}
+
+
+def held_run(record: dict, case_path=None) -> dict:
+    """What an unresolved run record holds, and the act that clears it."""
+    run_id = str(record.get('run_id') or '?')
+    path = (run_directory(case_path) / f'{run_id}.json'
+            if case_path is not None else Path(f'{run_id}.json'))
+    if record.get('unreadable'):
+        action = 'remove_record'
+    elif record.get('state') == 'restoring':
+        action = 'free_case_files'
+    elif record.get('writer') == 'alive':
+        action = 'stop_old_run'
+    elif record.get('writer') == 'unreachable':
+        action = 'wait_for_wsl'
+    else:
+        action = 'retry'
+    return {'run_id': run_id,
+            'operation': record.get('operation') or record.get('name'),
+            'state': record.get('state'),
+            'writer': record.get('writer'),
+            'writer_pids': list(record.get('writer_pids') or ()),
+            'ranks': record.get('ranks'),
+            'started_at': record.get('started_at'),
+            'record': str(path),
+            'action': action,
+            'clears_with': CLEARING_ACTIONS[action].format(record=str(path))}
+
+
 @dataclass
 class GateVerdict:
     """What the sweep found: may a new run start in this case?"""
@@ -317,6 +380,7 @@ class GateVerdict:
     records: list = field(default_factory=list)
     closed: list = field(default_factory=list)
     messages: list = field(default_factory=list)
+    case_path: Path | None = None
 
     @property
     def message(self) -> str:
@@ -330,27 +394,101 @@ class GateVerdict:
             text += ' — ' + '; '.join(self.messages)
         return text
 
+    def held(self) -> list[dict]:
+        """Plan 50 CX3. Each run still held, and the act that clears it."""
+        return [held_run(record, self.case_path) for record in self.records]
+
+    def actions(self) -> list[str]:
+        """The clearing acts of :meth:`held`, each once, in order."""
+        return list(dict.fromkeys(item['action'] for item in self.held()))
+
+    def advice(self) -> str:
+        """The held runs and their clearing acts, in one sentence each."""
+        return ' '.join(
+            f'Run {item["run_id"][:8]} ({item["operation"] or "run"}, '
+            f'{item["state"]}): {item["clears_with"]}.'
+            for item in self.held())
+
+    def refusal(self) -> str:
+        """DP-6487. The one sentence a refused run shows: that it was not
+        started, why, and what to do, each said once, with no internal run id
+        or state name, and a record's path last so a cut line loses only it.
+        """
+        if not self.blocked:
+            return ''
+        why, do, paths = [], [], []
+        for item in self.held():
+            reason, act = REFUSAL_WORDS[item['action']]
+            why.append(reason)
+            do.append(act)
+            if item['action'] == 'remove_record':
+                paths.append(item['record'])
+        why = list(dict.fromkeys(why))
+        do = list(dict.fromkeys(do))
+        if not why:
+            why = ['an earlier run of this case has not been resolved']
+            do = ['Try again.']
+        text = f'The run was not started: {"; ".join(why)}. {" ".join(do)}'
+        if paths:
+            text = text.rstrip('.') + ': ' + ', '.join(paths)
+        return text
+
     def to_dict(self) -> dict:
         return {'blocked': self.blocked, 'read_only': self.read_only,
                 'records': [record.get('run_id') for record in self.records],
                 'closed': list(self.closed), 'messages': list(self.messages),
-                'message': self.message}
+                'message': self.message, 'held': self.held(),
+                'actions': self.actions()}
+
+
+#: Beside the processor cases: the result waiting in them to be gathered, and
+#: which case-root mesh they were split from (DP-1230).
+PENDING_GATHER = ('foammesh', 'pending-gather.json')
+DECOMPOSITION_RECORD = ('foammesh', 'decomposition.json')
+
+
+def discard_decomposition(case_path) -> dict:
+    """Remove the processor cases of *case_path*; never raises.
+
+    Plan 50 CX1 (DP-6200). The pending-gather marker and the decomposition
+    record go first, so a set that is only half removed is never described
+    as a result to gather or a split to reuse; then the ``delete_me_*``
+    folders an *earlier* clean-up left (never those renamed here, which
+    their own background delete removes), then each ``processor*`` folder.
+    Meant for a worker thread; on a thread running an asyncio loop (the GUI
+    thread) it neither waits for a rename nor deletes anything itself.
+    ``{'removed': [...], 'held': [...]}``: *held* names the folders that
+    could not be removed yet. Nothing describes them any more, so the next
+    clean-up of the case -- the next run, an unlock, the recovery gate --
+    removes them.
+    """
+    from foammesh.support.utils import discard_tree, sweep_deferred_deletes
+    case = Path(case_path)
+    for parts in (PENDING_GATHER, DECOMPOSITION_RECORD):
+        try:
+            case.joinpath(*parts).unlink(missing_ok=True)
+        except OSError:
+            logger.warning('could not remove %s', case.joinpath(*parts),
+                           exc_info=True)
+    sweep_deferred_deletes(case)
+    removed, held = [], []
+    rename_seconds = None
+    for processor in sorted(case.glob('processor[0-9]*')):
+        if not processor.is_dir():
+            continue
+        if discard_tree(processor, rename_seconds=rename_seconds):
+            removed.append(processor.name)
+        else:
+            held.append(processor.name)
+            # One wait for Windows to let go is enough: the rest of a set a
+            # killed run still holds is not waited on folder by folder.
+            rename_seconds = 0
+    return {'removed': removed, 'held': held}
 
 
 def discard_processor_directories(case_path) -> list[str]:
     """Plan 35 D8: a failed parallel run's processor cases are deleted."""
-    case = Path(case_path)
-    removed = []
-    for processor in sorted(case.glob('processor[0-9]*')):
-        if processor.is_dir():
-            shutil.rmtree(processor, ignore_errors=True)
-            removed.append(processor.name)
-    marker = case / 'foammesh' / 'pending-gather.json'
-    try:
-        marker.unlink(missing_ok=True)
-    except OSError:
-        pass
-    return removed
+    return discard_decomposition(case_path)['removed']
 
 
 def mirror_confirms_dead(linux: dict) -> bool:
@@ -391,7 +529,8 @@ class RecoveryGate:
         """Read-only: is anything open?"""
         records = [record for record in self.store.open_records()
                    if record.get('run_id') not in set(active_run_ids)]
-        return GateVerdict(blocked=bool(records), records=records)
+        return GateVerdict(blocked=bool(records), records=records,
+                           case_path=self.case_path)
 
     def resolve(self, *, active_run_ids=(), wait_for_death: bool = False,
                 run_ids=None) -> GateVerdict:
@@ -399,7 +538,7 @@ class RecoveryGate:
 
         *run_ids*, when given, limits the sweep to those records.
         """
-        verdict = GateVerdict()
+        verdict = GateVerdict(case_path=self.case_path)
         active = set(active_run_ids)
         only = None if run_ids is None else {str(item) for item in run_ids}
         for record in self.store.open_records():
@@ -516,9 +655,16 @@ class RecoveryGate:
             # protecting; its own transaction discards the stage.
             notes.append('it ran on a staging copy; the case was not touched')
         elif int(record.get('ranks') or 1) > 1:
-            removed = discard_processor_directories(self.case_path)
-            if removed:
-                notes.append(f'{len(removed)} processor directories were removed')
+            outcome = discard_decomposition(self.case_path)
+            if outcome['removed']:
+                notes.append(
+                    f'{len(outcome["removed"])} processor directories were removed')
+            if outcome['held']:
+                # Plan 50 CX1. Named, not fatal: the run is resolved, and the
+                # next run or unlock removes what Windows still held.
+                notes.append(
+                    'still in use, removed by the next run or unlock: '
+                    + ', '.join(outcome['held']))
         self.store.transition(run_id, 'closed', resolution='restored', notes=notes)
         return 'closed'
 

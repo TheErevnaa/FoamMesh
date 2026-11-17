@@ -13,11 +13,14 @@ from PySide6.QtCore import QCoreApplication, Qt, Signal
 from widgets.progress_dialog import ProgressDialog
 
 from foammesh.app import app
+from foammesh.view.configuration_read import case_configuration
 from foammesh.core.mesh.msh_scene import MshSceneError, read_msh_scene
 from foammesh.core.mesh import handover_scene
 from foammesh.core.mesh.presentation import (
-    ENCLOSURE_OPACITY, VOLUME_DEPTH_BIAS, artifact_kind, display_mode_name,
-    enclosing_part_ids, hides_geometry, summary_text)
+    BASE_GRID_VOLUME_OPACITY, BASE_GRID_WALL_OPACITY, EMPTY, ENCLOSURE_OPACITY,
+    GRID_FADE_THROTTLE_MS, VOLUME_DEPTH_BIAS, artifact_kind,
+    display_mode_name, enclosing_part_ids, grid_cell_pixels, grid_line_fade,
+    hides_geometry, summary_text, world_per_pixel)
 from foammesh.core.mesh.mesh_preview import estimated_cells
 from foammesh.core.mesh.poly_mesh_reader import MeshPreviewLoader
 from foammesh.core.run_result import GMSH_MSH, GMSH_SURFACE_MSH, POLY_MESH
@@ -100,7 +103,7 @@ class _Cancellation:
 
 
 _SOURCE_FIELDS = ('_time', '_root', '_nativePath', '_surfaceOnly',
-                  '_artifactId', '_stage')
+                  '_section', '_artifactId', '_stage')
 
 
 def _sourceState(manager) -> dict:
@@ -409,6 +412,12 @@ class MeshManager(ActorManager):
         # each face is: the exterior wears the patches' colours and the
         # patches draw their edges only.
         self._skins: list[PatchSkin] = []
+        # Plan 50 IP1. Whether the mesh on screen is the base grid, and the
+        # camera watch that fades its lines (see `_applyBaseGrid`).
+        self._baseGrid = False
+        self._gridWalls: list[str] = []
+        self._gridCamera = None
+        self._gridFadeTimer = None
 
         # DP-96. What the user pressed to make this mesh, when a stage
         # page made it. A result loaded from a run has no stage and
@@ -419,6 +428,9 @@ class MeshManager(ActorManager):
         # property of the file: the same file read the other way is the
         # refusal `read_msh_scene` exists to make.
         self._surfaceOnly = False
+        # DP-6482. Whether that surface reading is a section's (its faces are
+        # its cells) rather than the surface pass of a volume run.
+        self._section = False
         self._summary = ''
         # Plan 35 CR3. The counts of the mesh behind a surface preview: with
         # no volume on screen, the cells and points come from the headers,
@@ -704,6 +716,13 @@ class MeshManager(ActorManager):
             await self.load(0, root=root, artifact_id=artifact_id)
             return ''
         if fmt == GMSH_MSH:
+            if getattr(handle, 'section', False):
+                # DP-6482. A run that asked for a 2D or axisymmetric section
+                # wrote faces and no volume; they are drawn as what they are,
+                # not refused as a volume that is missing.
+                return await self.loadNative(
+                    getattr(handle, 'artifact_path', ''),
+                    artifact_id=artifact_id, surface_only=True, section=True)
             return await self.loadNative(
                 getattr(handle, 'artifact_path', ''), artifact_id=artifact_id)
         if fmt == GMSH_SURFACE_MSH:
@@ -768,7 +787,8 @@ class MeshManager(ActorManager):
 
     @_countsLoad
     async def loadNative(self, path, artifact_id: str = '', stage: str = '',
-                         *, surface_only: bool = False) -> str:
+                         *, surface_only: bool = False,
+                         section: bool = False) -> str:
         """Draw a native Gmsh ``.msh`` directly, publishing nothing.
 
         The scene is built from the mesher's own file, so a refused candidate
@@ -804,6 +824,8 @@ class MeshManager(ActorManager):
         # pass re-read as a volume would refuse, and the mesh a user was
         # looking at would come off the screen on a reload.
         self._surfaceOnly = bool(surface_only)
+        # DP-6482. A section's faces are its cells; a surface pass has none.
+        self._section = bool(section)
         self._setPreview({})
 
         progressDialog = ProgressDialog(
@@ -863,12 +885,21 @@ class MeshManager(ActorManager):
             self._nativePatches = dict(scene.patches)
             self._nativeCurves = dict(getattr(scene, 'curves', None) or {})
             self._nativeStoreRoot = None
+            if self._section:
+                # DP-6482. The toolbar read "0 cells" over a 1,072-cell
+                # section: its count comes from the volume, and there is none.
+                self._previewCounts = {'cells': int(scene.cells)}
         if not await _swapInScene(
                 self, generation, _prepare,
                 getattr(self, '_buildSceneSteps', None), scene.vtk_mesh, hidden):
             return ''
 
         return ''
+
+    #: Plan 50 IP9. ``(load generation, request, files)`` of the load on
+    #: screen (see ``mesh_reload_guard``); a later load or a clear bumps the
+    #: generation, so a stale entry never matches.
+    _shownIdentity = None
 
     @_countsLoad
     async def load(self, time: int, root=None, artifact_id: str = '',
@@ -924,8 +955,20 @@ class MeshManager(ActorManager):
         self._root = Path(root) if root else Path(app.facadeClient.case_root)
         self._nativePath = None
         self._surfaceOnly = False
+        self._section = False
         self._artifactId = str(artifact_id or '')
         self._stage = str(stage or '')
+        # DP-711. Region points reach the loader only when there are any.
+        # Asked of the class: it needs no state of this manager.
+        seeds = MeshManager._regionSeeds()
+        # Plan 50 IP9 (DP-6271). What this load draws, named before the read
+        # starts: a file written while it reads makes the next reload differ.
+        from foammesh.view.main_window import mesh_reload_guard as guard
+        request = guard.case_request(self._root, time, self._artifactId,
+                                     self._stage, seeds)
+        files = await asyncio.to_thread(guard.case_files, self._root, time)
+        if generation != self._load_generation:
+            return
 
         # Plan 39 VI14d. Opening the strip is 25 to 32 ms of its own (the
         # strip, the status bar and the task list all answer it); the call
@@ -942,9 +985,6 @@ class MeshManager(ActorManager):
         await asyncio.sleep(SLICE_REST_SECONDS)
         cancellation = _Cancellation(progressDialog)
 
-        # DP-711. Region points reach the loader only when there are any.
-        # Asked of the class: it needs no state of this manager.
-        seeds = MeshManager._regionSeeds()
         options = {'regionSeeds': seeds} if seeds else {}
         if previewMode != 'auto':
             options['mode'] = previewMode
@@ -1014,6 +1054,7 @@ class MeshManager(ActorManager):
                 getattr(self, '_buildSceneSteps', None), vtkMesh, hidden, precomputed=preview['precomputed'],
                 outline=preview['outline']):
             return
+        self._shownIdentity = (generation, request, files)
         self.previewNoticeChanged.emit(self._previewNotice)
         self._startCaseFields(generation)
 
@@ -1121,6 +1162,10 @@ class MeshManager(ActorManager):
         if self._nativePath is not None:
             if not self._surfaceOnly:
                 return
+            if getattr(self, '_section', False):
+                # DP-6482. A section has no volume to load: its faces are
+                # the whole mesh, and they are on screen.
+                return
             path, artifact, stage = (self._nativePath, self._artifactId,
                                      self._stage)
             problem = await self.loadNative(path, artifact, stage,
@@ -1145,7 +1190,7 @@ class MeshManager(ActorManager):
         point, simply gives nothing to split by.
         """
         try:
-            regions = app.db.getElements('region')
+            regions = case_configuration(app).getElements('region')
         except Exception:                           # noqa: BLE001 - no case
             return []
         seeds = []
@@ -1264,6 +1309,8 @@ class MeshManager(ActorManager):
         self._layersGrown = None
         # DP-714. Nor any surface faded for a colouring it no longer has.
         self._qualityFaded = {}
+        # Plan 50 IP1. Nor the last mesh's base-grid drawing.
+        self._clearBaseGrid()
         patch_ids: list[str] = []
         zone_ids: list[str] = []
         region_part_ids: list[str] = []
@@ -1360,7 +1407,14 @@ class MeshManager(ActorManager):
                                    self.tr('Mesh outline')))
         self._assignPalettes()
         yield
-        self._fadeEnclosures(patch_bounds, volume_of)
+        # Plan 50 IP1 (DP-6224). Whether this is the base grid is read from
+        # the case's own records, not from what any page calls the stage.
+        self._baseGrid = self._baseGridOnScreen()
+        if self._baseGrid:
+            # The far walls are the drawing; the enclosure fade is not.
+            self._applyBaseGrid(patch_ids, set(volume_of.values()))
+        else:
+            self._fadeEnclosures(patch_bounds, volume_of)
         yield
         for key in set(hidden) & set(self._actorInfos):
             self._actorInfos[key].setVisible(False)
@@ -1414,19 +1468,28 @@ class MeshManager(ActorManager):
                 self._skins.remove(skin)
         super().remove(key)
 
-    def _resolveSkinPick(self, actor, x, y, renderer):
-        """A pick on a volume's exterior is the patch whose face it is."""
+    def _resolveSkinPick(self, actor, x, y, renderer, picker=None):
+        """A pick on a volume's exterior is the patch whose face it is.
+
+        Plan 50 IP12 (DP-6349). *picker* is the pick the viewport already
+        made: when it landed on this volume its cell is read, and the ray is
+        not cast a second time (that second cast had no locator, so on a
+        multi-million-cell volume it cost a linear walk of every cell).
+        """
         from vtkmodules.vtkRenderingCore import vtkCellPicker
 
         for skin in self._skins:
             if actor is not skin.volume().actor():
                 continue
-            picker = vtkCellPicker()
-            picker.SetTolerance(0.0005)
-            picker.PickFromListOn()
-            picker.AddPickList(actor)
-            if not picker.Pick(float(x), float(y), 0.0, renderer):
-                return actor
+            made = picker
+            if made is None or made.GetActor() is not actor:
+                made = vtkCellPicker()
+                made.SetTolerance(0.0005)
+                made.PickFromListOn()
+                made.AddPickList(actor)
+                if not made.Pick(float(x), float(y), 0.0, renderer):
+                    return actor
+            picker = made
             data = picker.GetDataSet()
             ids = data.GetCellData().GetArray('patchId') if data else None
             cell = int(picker.GetCellId())
@@ -1464,6 +1527,152 @@ class MeshManager(ActorManager):
                               if target is not None else None)
                 if actor_info is not None:
                     actor_info.setOpacity(ENCLOSURE_OPACITY)
+
+    # -- Plan 50 IP1: the base grid does not hide the model ----------------- #
+
+    def isBaseGrid(self) -> bool:
+        """Whether the mesh on screen is the base grid (blockMesh)."""
+        return bool(getattr(self, '_baseGrid', False))
+
+    def _baseGridOnScreen(self) -> bool:
+        """DP-6224. Whether the live ``constant/polyMesh`` just read is the
+        base grid, by the case's snapshot record and publications.
+
+        A native ``.msh`` (the Gmsh route) or a mesh with no case root is
+        never one.
+        """
+        if getattr(self, '_nativePath', None) is not None:
+            return False
+        if getattr(self, '_time', None) not in (None, 0, '0'):
+            # A later time folder's mesh is not the live constant/polyMesh
+            # the records describe.
+            return False
+        root = getattr(self, '_root', None)
+        if root is None:
+            return False
+        from foammesh.core.jobs.stage_snapshots import base_grid_is_live
+        return base_grid_is_live(root)
+
+    def _applyBaseGrid(self, wall_ids, volume_ids):
+        """Draw the base grid as its far walls, faint, the model in front.
+
+        DP-6221. Every wall solid, the box in front of the model covered it.
+        A wall turned towards the camera is now culled, so the model shows
+        through the near side and the grid reads on the far side behind it;
+        the faces are a tint (:data:`BASE_GRID_WALL_OPACITY`) and the lines
+        carry the grid. The region's ``internalMesh`` draws the same box
+        again, so it steps out (:data:`BASE_GRID_VOLUME_OPACITY`) and culls
+        the same way if the user brings it back.
+
+        The opacities go through ``setOpacity``, so Display Control shows
+        them and a user who sets another one has it. The geometry is not
+        touched: its opacity is the Surface opacity tool's.
+        """
+        walls = []
+        for actor_id in wall_ids:
+            actor = self._actorInfos.get(actor_id)
+            if not isinstance(actor, BoundaryActor):
+                continue
+            actor.setOpacity(BASE_GRID_WALL_OPACITY)
+            actor.setFarWalls(True)
+            walls.append(actor_id)
+        for actor_id in volume_ids:
+            actor = self._actorInfos.get(actor_id)
+            if not isinstance(actor, MeshActor):
+                continue
+            actor.setOpacity(BASE_GRID_VOLUME_OPACITY)
+            actor.setFarWalls(True)
+        self._gridWalls = walls
+        self._watchGridCamera()
+
+    def _clearBaseGrid(self):
+        """Stop watching the camera for the base grid; nothing else to undo.
+
+        The far walls and opacities belong to the actors of the scene that
+        had them, and every load builds new actors; the geometry is stepped
+        out of the way again by the next mesh that hides it.
+        """
+        self._baseGrid = False
+        self._gridWalls = []
+        camera = getattr(self, '_gridCamera', None)
+        self._gridCamera = None
+        if camera is not None:
+            camera_object, tag = camera
+            try:
+                camera_object.RemoveObserver(tag)
+            except Exception:                               # noqa: BLE001
+                pass
+        timer = getattr(self, '_gridFadeTimer', None)
+        if timer is not None:
+            timer.stop()
+
+    def _gridRenderer(self):
+        view = getattr(self._displayControl, 'view', None)
+        view = view() if callable(view) else None
+        renderer = getattr(view, 'renderer', None)
+        try:
+            return renderer() if callable(renderer) else None
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _watchGridCamera(self):
+        """DP-6222. Fade the lines again whenever the camera settles."""
+        renderer = self._gridRenderer()
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        if camera is not None:
+            tag = camera.AddObserver(
+                'ModifiedEvent', lambda *_ignored: self._gridCameraMoved())
+            self._gridCamera = (camera, tag)
+        self.updateGridLineFade()
+
+    def _gridCameraMoved(self):
+        """Throttled: an orbit modifies the camera every frame."""
+        timer = getattr(self, '_gridFadeTimer', None)
+        if timer is None:
+            from PySide6.QtCore import QTimer
+            # Held by the manager (no Qt parent): `_clearBaseGrid` stops it.
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.setInterval(GRID_FADE_THROTTLE_MS)
+            timer.timeout.connect(self.updateGridLineFade)
+            self._gridFadeTimer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def updateGridLineFade(self) -> bool:
+        """DP-6222. Fade each base-grid wall's lines by its cells' size on
+        screen; whether any wall changed.
+
+        The rule (``presentation.grid_line_fade``): a wall's typical face is
+        ``sqrt(area / faces)``; one screen pixel at the camera's focal point
+        is ``world_per_pixel``; at 2 px a cell or less the lines are gone, at
+        8 px or more they are full, linear between. Repaints only on a
+        change, so the repaint's own camera touch does not loop.
+        """
+        if not self._gridWalls:
+            return False
+        renderer = self._gridRenderer()
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        per_pixel = None
+        if camera is not None:
+            try:
+                height = renderer.GetSize()[1]
+            except Exception:                               # noqa: BLE001
+                height = 0
+            per_pixel = world_per_pixel(
+                camera.GetParallelProjection(), camera.GetParallelScale(),
+                camera.GetDistance(), camera.GetViewAngle(), height)
+        changed = False
+        for actor_id in self._gridWalls:
+            actor = self._actorInfos.get(actor_id)
+            if actor is None or not actor.farWalls():
+                continue
+            pixels = (grid_cell_pixels(actor.meanFaceSize(), per_pixel)
+                      if per_pixel is not None else None)
+            changed = actor.setGridLineFade(grid_line_fade(pixels)) or changed
+        if changed:
+            self._displayControl.refreshView()
+        return changed
 
     def meshSummary(self) -> str:
         """What the viewport is showing and how big it is (DP-96)."""
@@ -1563,11 +1772,18 @@ class MeshManager(ActorManager):
         yield
         self.meshSummaryChanged.emit(self._summary)
         yield
-        if hides_geometry(kind):
-            geometry = getattr(app.window, 'geometryManager', None)
+        baseGrid = bool(getattr(self, '_baseGrid', False))
+        geometry = getattr(app.window, 'geometryManager', None)
+        if hides_geometry(kind, base_grid=baseGrid):
             hide = getattr(geometry, 'hide', None)
             if hide is not None:
                 hide()
+        elif baseGrid and kind != EMPTY:
+            # Plan 50 IP1 (DP-6220). The model the box is built around stays
+            # in it -- brought back if a later stage's mesh had hidden it.
+            reveal = getattr(geometry, 'reveal', None)
+            if reveal is not None:
+                reveal()
 
     def dispose(self):
         """Release the whole scene for good -- a project closing (Plan 35 CR3).
@@ -1577,6 +1793,8 @@ class MeshManager(ActorManager):
         """
         self._load_generation += 1
         self._loader = None
+        # Plan 50 IP1. The camera outlives the scene; its watch does not.
+        self._clearBaseGrid()
         super().dispose()
 
     def unload(self):
@@ -1587,6 +1805,8 @@ class MeshManager(ActorManager):
         self._failedFaded = {}
         self._qualityFaded = {}
         self._qualityFilterOn = False
+        # Plan 50 IP1. Nor does the base grid's camera watch outlive it.
+        self._clearBaseGrid()
         self.hide()
         self._load_generation += 1
         self._time = None
@@ -1597,6 +1817,7 @@ class MeshManager(ActorManager):
         self._resultLabel = ''
         self._stage = ''
         self._surfaceOnly = False
+        self._section = False
         self._summary = ''
         self._setPreview({})
         self.meshSummaryChanged.emit('')
@@ -1607,20 +1828,69 @@ class MeshManager(ActorManager):
         # goes.
         self.cellCountChanged.emit(0, 0)
 
-    async def reload(self):
+    def _showing(self, request, files) -> bool:
+        """The load on screen drew *request* from exactly *files*."""
+        shown = self._shownIdentity
+        return (shown is not None and files is not None
+                and shown[0] == self._load_generation
+                and shown[1] == request and shown[2] == files)
+
+    async def reload(self, *, force: bool = False) -> bool:
+        """Draw what is on screen again from disk; whether a read started.
+
+        Plan 50 IP9 (DP-6271). Unless *force*, a reload whose request and
+        files (``mesh_reload_guard``) match the load on screen returns at
+        once: no progress dialog, no read, no scene swap. The files are
+        looked at on a worker thread. A job still writing the mesh, or
+        anything the guard cannot read, reloads as before.
+        """
+        from foammesh.view.main_window import mesh_reload_guard as guard
+
+        generation = self._load_generation
         if self._nativePath is not None:
             # A native result has no time directory and no case root to go
             # back to; it reloads from the file it was drawn from.
-            await self.loadNative(self._nativePath,
-                                  artifact_id=self._artifactId,
-                                  stage=self._stage,
-                                  surface_only=self._surfaceOnly)
-            return
+            path = self._nativePath
+            request = guard.native_request(
+                path, self._artifactId, self._stage, self._surfaceOnly)
+            files = await asyncio.to_thread(guard.native_files, path)
+            if generation != self._load_generation:
+                return False            # a newer load owns the screen
+            if not force and self._showing(request, files):
+                return False
+            # DP-6482. A section is re-read as a section, with its count.
+            options = ({'section': True}
+                       if getattr(self, '_section', False) else {})
+            problem = await self.loadNative(path,
+                                            artifact_id=self._artifactId,
+                                            stage=self._stage,
+                                            surface_only=self._surfaceOnly,
+                                            **options)
+            # loadNative records nothing itself; a read that finished
+            # un-superseded is what is on screen now.
+            if (not problem and self._load_generation == generation + 1
+                    and self._nativePath == path):
+                self._shownIdentity = (self._load_generation, request, files)
+            return True
         if self._time is None:
-            return
+            return False
 
+        if not force and not self._writerActive():
+            request = guard.case_request(
+                self._root, self._time, self._artifactId, self._stage,
+                MeshManager._regionSeeds())
+            shown = self._shownIdentity
+            if (shown is not None and shown[0] == generation
+                    and shown[1] == request):
+                files = await asyncio.to_thread(
+                    guard.case_files, self._root, self._time)
+                if generation != self._load_generation:
+                    return False        # a newer load owns the screen
+                if self._showing(request, files):
+                    return False
         await self.load(self._time, root=self._root,
                         artifact_id=self._artifactId, stage=self._stage)
+        return True
 
     @qasync.asyncSlot()
     async def show(self, time: int):

@@ -118,6 +118,16 @@ class MeshPreviewLoader(QObject):
                 'preview_failed',
                 self.tr('Preview not built: the worker refused the surface.'))
         if isinstance(result, dict) and self.shown == SURFACE and \
+                isinstance(self.notice, dict) and cells is not None and \
+                cells > limit and \
+                'load_volume' not in (self.notice.get('actions') or ()):
+            # DP-6083. A notice already standing (the GPU tier's, a retry's)
+            # kept the volume from being offered, so a volume mesh read as
+            # "a surface mesh, nothing to cut open". The way to load the
+            # volume is offered on whatever notice is up.
+            self.notice = {**self.notice, 'actions': [
+                *(self.notice.get('actions') or ()), 'load_volume']}
+        if isinstance(result, dict) and self.shown == SURFACE and \
                 self.notice is None and cells is not None and \
                 cells > limit:
             self.notice = {

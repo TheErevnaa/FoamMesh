@@ -14,12 +14,185 @@ focus and the region labels.
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+#: Plan 50 IP12 (DP-6346). How long the pointer rests before a hover casts
+#: its ray. Every move event used to cast one and rebuild the highlight; 0
+#: picks on the move, as before.
+HOVER_DWELL_MS = 40
+#: Plan 50 IP12 (DP-6345). Hover highlights kept, so hovering back and forth
+#: between neighbours does not walk their cells again.
+_HOVER_CACHE = 16
+
+_PICK_POOL = None
+_PICK_POOL_LOCK = threading.Lock()
+
+
+def _pick_pool() -> ThreadPoolExecutor:
+    global _PICK_POOL
+    with _PICK_POOL_LOCK:
+        if _PICK_POOL is None:
+            _PICK_POOL = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='foammesh-gmsh-pick')
+        return _PICK_POOL
+
+
+def pick_snapshot(data, entity_map, hidden) -> dict:
+    """What :func:`build_pick_structures` reads, taken on the GUI thread.
+
+    Plan 50 IP12 (DP-6347). Views of the model's own arrays (no copy); the
+    data set is held so they stay alive while the worker reads them. The
+    worker builds new VTK objects from them and touches nothing the
+    renderer holds.
+    """
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    points = data.GetPoints()
+    blocks = []
+    for getter in (data.GetVerts, data.GetLines, data.GetPolys,
+                   data.GetStrips):
+        cells = getter()
+        if cells is None or cells.GetNumberOfCells() == 0:
+            blocks.append(None)
+            continue
+        blocks.append((vtk_to_numpy(cells.GetOffsetsArray()),
+                       vtk_to_numpy(cells.GetConnectivityArray())))
+    return {
+        'source': data,
+        'points': (vtk_to_numpy(points.GetData())
+                   if points is not None and points.GetNumberOfPoints()
+                   else None),
+        'blocks': blocks,
+        'count': int(data.GetNumberOfCells()),
+        'cell_dim': np.asarray(entity_map.cell_dim),
+        'cell_tag': np.asarray(entity_map.cell_tag),
+        'hidden': tuple(tuple(int(v) for v in entity) for entity in hidden),
+    }
+
+
+def _subset(block, local):
+    """Offsets and connectivity of the cells *local* of one cell array."""
+    offsets, connectivity = block
+    starts = offsets[local]
+    lengths = offsets[local + 1] - starts
+    new_offsets = np.zeros(len(local) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=new_offsets[1:])
+    total = int(new_offsets[-1])
+    index = (np.repeat(starts - new_offsets[:-1], lengths)
+             + np.arange(total, dtype=np.int64))
+    return new_offsets, np.asarray(connectivity[index], dtype=np.int64)
+
+
+def _polydata_of(points, blocks, starts, chosen):
+    """A new polydata of the cells *chosen* (a mask over every cell), and
+    the original id of each of its cells in its own order."""
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+    from vtkmodules.vtkCommonCore import VTK_ID_TYPE
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+
+    poly = vtkPolyData()
+    poly.SetPoints(points)
+    order = []
+    for block, start, setter in zip(
+            blocks, starts, ('SetVerts', 'SetLines', 'SetPolys', 'SetStrips')):
+        if block is None:
+            continue
+        size = len(block[0]) - 1
+        local = np.flatnonzero(chosen[start:start + size])
+        if not len(local):
+            continue
+        offsets, connectivity = _subset(block, local)
+        cells = vtkCellArray()
+        cells.SetData(
+            numpy_to_vtk(offsets, deep=1, array_type=VTK_ID_TYPE),
+            numpy_to_vtk(connectivity, deep=1, array_type=VTK_ID_TYPE))
+        getattr(poly, setter)(cells)
+        order.append(local + start)
+    ids = np.concatenate(order) if order else np.zeros(0, dtype=np.int64)
+    return poly, ids
+
+
+def build_pick_structures(snapshot) -> dict:
+    """The pick ray's locators, built from :func:`pick_snapshot`.
+
+    Plan 50 IP12 (DP-6347): runs on a worker thread. Every VTK object made
+    here is new and is not in the renderer; the GUI thread adopts them. The
+    same structures as before: the visible curve cells and the visible
+    surface cells apart (DP-6154), the visible body (DP-6153) when anything
+    is hidden, and the whole model.
+    """
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellLocator
+
+    count = snapshot['count']
+    points = vtkPoints()
+    if snapshot['points'] is not None:
+        points.SetData(numpy_to_vtk(
+            np.ascontiguousarray(snapshot['points']), deep=1))
+    blocks = snapshot['blocks']
+    starts, start = [], 0
+    for block in blocks:
+        starts.append(start)
+        start += 0 if block is None else len(block[0]) - 1
+    dims = np.full(count, -1, dtype=np.int64)
+    tags = np.full(count, -1, dtype=np.int64)
+    known = min(count, len(snapshot['cell_dim']), len(snapshot['cell_tag']))
+    dims[:known] = snapshot['cell_dim'][:known]
+    tags[:known] = snapshot['cell_tag'][:known]
+    visible = np.ones(count, dtype=bool)
+    if snapshot['hidden']:
+        shift = np.int64(1) << np.int64(40)
+        hidden = np.array([d * shift + t for d, t in snapshot['hidden']],
+                          dtype=np.int64)
+        visible = ~np.isin(dims * shift + tags, hidden)
+    locators = {}
+    for dim in (1, 2):
+        chosen = visible & (dims == dim)
+        if not chosen.any():
+            continue
+        part, ids = _polydata_of(points, blocks, starts, chosen)
+        locator = vtkCellLocator()
+        locator.SetDataSet(part)
+        locator.BuildLocator()
+        locators[dim] = (locator, part, ids)
+    body = None
+    if not visible.all():
+        body, _ids = _polydata_of(points, blocks, starts, visible)
+    whole, _ids = _polydata_of(points, blocks, starts,
+                               np.ones(count, dtype=bool))
+    locator = vtkCellLocator()
+    locator.SetDataSet(whole)
+    locator.BuildLocator()
+    return {'locators': locators, 'whole': locator, 'body': body}
+
+
+def _qt_running() -> bool:
+    try:
+        from PySide6.QtCore import QCoreApplication
+    except Exception:                                       # noqa: BLE001
+        return False
+    return QCoreApplication.instance() is not None
+
+
+def _bridge_class():
+    from PySide6.QtCore import QObject, Signal
+
+    class _PickBridge(QObject):
+        """Carries "the worker is done" back to the GUI thread (a signal
+        emitted on another thread is queued to the receiver's)."""
+        ready = Signal(int)
+
+    return _PickBridge
+
 _PRIORITY = 1.5
+#: Pixels the pointer may move between press and release and still be a click.
+_CLICK_SLOP = 4
 _HOVER = (1.0, 0.78, 0.1)
 _CHOSEN = (0.15, 0.7, 1.0)
 _BODY = (0.62, 0.66, 0.72)
@@ -58,8 +231,16 @@ class GmshEntityView:
         self._hover_actor = None
         self._chosen_actors: list = []
         self._label_actors: list = []
+        self._order_actors: list = []
+        self._tip_actor = None
+        self._cursor = (0, 0)
         self._locator = None
+        #: dim -> (vtkCellLocator, original cell ids) for the curve cells and
+        #: the surface cells apart (DP-6154).
+        self._locators: dict = {}
         self._observers: list = []
+        self._press = None
+        self._band_actor = None
         self._labels_on = False
         #: Plan 48 GM11a. The values of the Gmsh ``Geometry.*`` options and
         #: the planes of ``Geometry.Clip``; ``None`` draws the legacy way.
@@ -71,6 +252,18 @@ class GmshEntityView:
         #: the route-wide value of the viewport rail's Surface opacity tool.
         self._surface_opacity = None
         self._route_subscribed = False
+        #: Plan 50 IP12. The one hover highlight and the one tip actor, kept
+        #: while out of the scene (``_hover_actor`` / ``_tip_actor`` are set
+        #: only while they are in it); hover data by entity; the dwell.
+        self._hover_spare = None
+        self._tip_spare = None
+        self._hover_data: dict = {}
+        self._hover_timer = None
+        self._hover_at = None
+        #: ``(generation, future)`` of the pick structures being built.
+        self._pick_future = None
+        self._pick_generation = 0
+        self._pick_bridge = None
         picker.subscribe(self._onPickerChange)
         self._follow_route()
 
@@ -105,10 +298,7 @@ class GmshEntityView:
         # The model's own cells are intersected with the pick ray, so the id
         # that comes back is a cell of ``geometry.vtp`` and nothing else
         # (labels, the section plane and the seed gizmo are never hit).
-        locator = vtkCellLocator()
-        locator.SetDataSet(data)
-        locator.BuildLocator()
-        self._locator = locator
+        self._rebuild_pick()
         bounds = data.GetBounds()
         diagonal = ((bounds[1] - bounds[0]) ** 2 + (bounds[3] - bounds[2]) ** 2
                     + (bounds[5] - bounds[4]) ** 2) ** 0.5
@@ -119,13 +309,162 @@ class GmshEntityView:
         self._view.refresh()
         return data.GetNumberOfCells()
 
+    def _rebuild_pick(self) -> None:
+        """The locators the pick ray is cast against: the visible curve cells
+        and the visible surface cells apart (DP-6154, so a curve under a
+        surface can be picked), plus the plain body without the hidden
+        entities (DP-6153).
+
+        Plan 50 IP12 (DP-6347). Built by :func:`build_pick_structures` on a
+        worker thread when a Qt application runs (the result comes back to
+        the GUI thread, which hands the body its new input); in place
+        otherwise. Until they land a hover uses the last structures (the
+        picker refuses what is hidden) or finds nothing, and a click waits.
+        """
+        data = self._polydata
+        if data is None:
+            return
+        self._pick_generation += 1
+        generation = self._pick_generation
+        snapshot = pick_snapshot(data, self._picker.map, self._picker.hidden)
+        if not _qt_running():
+            self._pick_future = None
+            self._adopt_pick(generation, build_pick_structures(snapshot))
+            return
+        bridge = self._bridge()
+        future = _pick_pool().submit(build_pick_structures, snapshot)
+        self._pick_future = (generation, future)
+
+        def done(_future, generation=generation):
+            try:
+                bridge.ready.emit(generation)
+            except RuntimeError:            # the view went first
+                pass
+
+        future.add_done_callback(done)
+
+    def _bridge(self):
+        if self._pick_bridge is None:
+            self._pick_bridge = _bridge_class()()
+            self._pick_bridge.ready.connect(self._pick_ready)
+        return self._pick_bridge
+
+    def _pick_ready(self, generation: int) -> None:
+        pending = self._pick_future
+        if pending is None or pending[0] != generation:
+            return
+        if self._collect_pick(wait=False):
+            self._view.refresh()
+
+    def _collect_pick(self, wait: bool) -> bool:
+        """Adopt the structures the worker built; True when they changed."""
+        pending = self._pick_future
+        if pending is None:
+            return False
+        generation, future = pending
+        if not wait and not future.done():
+            return False
+        self._pick_future = None
+        try:
+            built = future.result()
+        except Exception:                                   # noqa: BLE001
+            logger.exception('building the Gmsh pick structures failed')
+            return False
+        return self._adopt_pick(generation, built)
+
+    def _adopt_pick(self, generation: int, built: dict) -> bool:
+        """On the GUI thread: the locators, and the body's input."""
+        if generation != self._pick_generation or self._polydata is None:
+            return False                    # a newer build or a cleared model
+        self._locators = built['locators']
+        self._locator = built['whole']
+        if self._body is not None:
+            self._body.GetMapper().SetInputData(
+                built['body'] if built['body'] is not None
+                else self._polydata)
+        return True
+
+    def setHidden(self) -> None:
+        """Draw and pick again without the entities the picker hides."""
+        if self._polydata is None:
+            return
+        self._rebuild_pick()
+        if self._points_actor is not None:
+            self._view.removeActor(self._points_actor)
+            self._points_actor = None
+        self._drawPoints()
+        if self._settings is not None:
+            self._draw_geometry()
+        self._view.refresh()
+
+    def _show_tip(self, entity) -> None:
+        """DP-6160. The entity under the cursor, as ``Curve 12 (inlet)``,
+        beside the cursor. Plan 50 IP12 (DP-6345): one text actor, kept."""
+        from vtkmodules.vtkRenderingCore import vtkTextActor
+        from foammesh.core.gmsh.session_entities import chip_text
+
+        if entity is None:
+            if self._tip_actor is not None:
+                self._view.removeActor(self._tip_actor)
+                self._tip_actor = None
+            return
+        actor = self._tip_spare
+        if actor is None:
+            actor = vtkTextActor()
+            actor.SetObjectName('gmshEntityTip')
+            prop = actor.GetTextProperty()
+            prop.SetFontSize(_LABEL_FONT)
+            prop.SetColor(1.0, 1.0, 1.0)
+            prop.SetBackgroundColor(0.1, 0.12, 0.15)
+            prop.SetBackgroundOpacity(0.85)
+            actor.PickableOff()
+            self._tip_spare = actor
+        actor.SetInput(chip_text(entity, self._picker.map.name_of(entity)))
+        x, y = self._cursor
+        actor.SetPosition(x + 14, y + 14)
+        if self._tip_actor is None:
+            self._tip_actor = actor
+            self._view.addActor(actor)
+
+    def _number_picks(self) -> None:
+        """DP-6158. Number the picked entities 1, 2, 3 ... in the order they
+        were picked, which is the order a transfinite surface's corners and a
+        loop's curves are taken in."""
+        from vtkmodules.vtkRenderingCore import vtkTextActor
+
+        for actor in self._order_actors:
+            self._view.removeActor(actor)
+        self._order_actors = []
+        if self._polydata is None:
+            return
+        entity_map = self._picker.map
+        for number, entity in enumerate(self._picker.selection, start=1):
+            where = entity_map.anchor(entity)
+            if where is None:
+                continue
+            actor = vtkTextActor()
+            actor.SetInput(str(number))
+            actor.SetObjectName('gmshEntityOrder')
+            position = actor.GetPositionCoordinate()
+            position.SetCoordinateSystemToWorld()
+            position.SetValue(*where)
+            prop = actor.GetTextProperty()
+            prop.SetFontSize(_LABEL_FONT + 4)
+            prop.SetBold(True)
+            prop.SetColor(1.0, 0.95, 0.4)
+            prop.SetBackgroundColor(0.1, 0.12, 0.15)
+            prop.SetBackgroundOpacity(0.8)
+            prop.SetJustificationToCentered()
+            actor.PickableOff()
+            self._order_actors.append(actor)
+            self._view.addActor(actor)
+
     def _drawPoints(self) -> None:
         from vtkmodules.vtkCommonCore import vtkPoints
         from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
         from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 
-        records = [r for r in self._picker.map.records.values()
-                   if r.dim == 0 and r.xyz is not None]
+        records = self._point_records()
         if not records:
             return
         points, cells = vtkPoints(), vtkCellArray()
@@ -151,12 +490,23 @@ class GmshEntityView:
         self._detach()
         self._drop_geometry()
         for actor in (self._body, self._points_actor, self._hover_actor,
-                      *self._chosen_actors, *self._label_actors):
+                      *self._chosen_actors, *self._label_actors,
+                      *self._order_actors, self._tip_actor):
             if actor is not None:
                 self._view.removeActor(actor)
         self._body = self._points_actor = self._hover_actor = None
         self._chosen_actors, self._label_actors = [], []
+        self._order_actors, self._tip_actor = [], None
+        self._hover_spare = self._tip_spare = None
+        self._hover_data = {}
+        if self._hover_timer is not None:
+            self._hover_timer.stop()
+        self._hover_at = None
         self._polydata = None
+        self._locator, self._locators = None, {}
+        # A build still on the worker is for this model: drop what it brings.
+        self._pick_generation += 1
+        self._pick_future = None
         from foammesh.rendering import actor_info
 
         actor_info.setSourceTranslucent(self, False)
@@ -235,28 +585,103 @@ class GmshEntityView:
         self._place(actor)
         return actor
 
+    def _hover_dataset(self, entity):
+        """The cells (or the one point) the hover highlight draws for
+        *entity*, built once per entity and kept (DP-6345)."""
+        from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
+        from vtkmodules.vtkCommonDataModel import (
+            VTK_VERTEX, vtkUnstructuredGrid)
+
+        entity = tuple(entity)
+        grid = self._hover_data.get(entity)
+        if grid is not None:
+            return grid
+        if entity[0] == 0:
+            record = self._picker.map.records.get(entity)
+            if record is None or record.xyz is None:
+                return None
+            points = vtkPoints()
+            points.InsertNextPoint(*record.xyz)
+            grid = vtkUnstructuredGrid()
+            grid.SetPoints(points)
+            single = vtkIdList()
+            single.InsertNextId(0)
+            grid.InsertNextCell(VTK_VERTEX, single)
+        else:
+            ids = self.cellsFor(entity)
+            if not ids:
+                return None
+            grid = vtkUnstructuredGrid()
+            grid.SetPoints(self._polydata.GetPoints())
+            id_list = vtkIdList()
+            for cell in ids:
+                self._polydata.GetCellPoints(int(cell), id_list)
+                grid.InsertNextCell(self._polydata.GetCellType(int(cell)),
+                                    id_list)
+        if len(self._hover_data) >= _HOVER_CACHE:
+            self._hover_data.pop(next(iter(self._hover_data)))
+        self._hover_data[entity] = grid
+        return grid
+
+    def _show_hover(self, entity) -> bool:
+        """Light *entity* with the one hover actor; False if it has nothing
+        to draw. Plan 50 IP12 (DP-6345): the actor and its mapper are made
+        once and take each hovered entity as new input."""
+        from vtkmodules.vtkRenderingCore import vtkActor, vtkDataSetMapper
+
+        if self._polydata is None:
+            return False
+        grid = self._hover_dataset(entity)
+        if grid is None:
+            return False
+        actor = self._hover_spare
+        if actor is None:
+            mapper = vtkDataSetMapper()
+            mapper.ScalarVisibilityOff()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.SetObjectName('gmshEntityHover')
+            actor.PickableOff()
+            actor.GetProperty().SetColor(*_HOVER)
+            actor.GetProperty().SetRenderPointsAsSpheres(True)
+            self._hover_spare = actor
+        actor.GetMapper().SetInputData(grid)
+        prop = actor.GetProperty()
+        prop.SetLineWidth(self._select_width())
+        prop.SetPointSize(self._select_size())
+        self._place(actor)
+        if self._hover_actor is None:
+            self._hover_actor = actor
+            self._view.addActor(actor)
+        return True
+
     def _onPickerChange(self, what: str) -> None:
         if self._body is None:
+            return
+        if what == 'hidden':
+            self.setHidden()
             return
         if self._settings is not None and what in (
                 'begin', 'accept', 'abort', 'filter'):
             self._pick_aid()
         if what in ('hover', 'begin', 'accept', 'abort', 'filter',
                     'selection'):
-            if self._hover_actor is not None:
+            hovered = self._picker.hovered
+            self._show_tip(hovered)
+            shown = (hovered is not None
+                     and hovered not in self._picker.selection
+                     and self._show_hover(hovered))
+            if not shown and self._hover_actor is not None:
                 self._view.removeActor(self._hover_actor)
                 self._hover_actor = None
-            hovered = self._picker.hovered
-            if hovered is not None and hovered not in self._picker.selection:
-                self._hover_actor = self._highlight(hovered, _HOVER,
-                                                    'gmshEntityHover')
-                if self._hover_actor is not None:
-                    self._view.addActor(self._hover_actor)
         if what in ('selection', 'begin', 'accept', 'abort', 'filter'):
+            self._number_picks()
             for actor in self._chosen_actors:
                 self._view.removeActor(actor)
             self._chosen_actors = []
-            for entity in self._picker.selection:
+            lit = self._picker.selection or self._picker.last_accepted
+            for entity in lit:
                 actor = self._highlight(entity, self._chosen_colour(),
                                         'gmshEntityChosen')
                 if actor is not None:
@@ -569,8 +994,10 @@ class GmshEntityView:
     # -- points --------------------------------------------------------------- #
 
     def _point_records(self) -> list:
+        hidden = self._picker.hidden
         return [r for r in self._picker.map.records.values()
-                if r.dim == 0 and r.xyz is not None]
+                if r.dim == 0 and r.xyz is not None
+                and (0, r.tag) not in hidden]
 
     def _draw_points(self, report: dict) -> None:
         if not self._get('Geometry.Points'):
@@ -1110,11 +1537,22 @@ class GmshEntityView:
             return
         for event, callback in (('MouseMoveEvent', self._moved),
                                 ('LeftButtonPressEvent', self._pressed),
+                                ('LeftButtonReleaseEvent', self._released),
                                 ('KeyPressEvent', self._key)):
             self._observers.append((interactor, interactor.AddObserver(
                 event, callback, _PRIORITY)))
+        # Once the camera style takes a press it grabs the interactor's focus
+        # and the release never reaches the observer above; the style's own
+        # end-of-interaction event is how a click (no drag) is seen.
+        style = (interactor.GetInteractorStyle()
+                 if hasattr(interactor, 'GetInteractorStyle') else None)
+        if style is not None and hasattr(style, 'AddObserver'):
+            self._observers.append((style, style.AddObserver(
+                'EndInteractionEvent', self._released, _PRIORITY)))
 
     def _detach(self) -> None:
+        self._press = None
+        self._clear_band()
         for subject, tag in self._observers:
             try:
                 subject.RemoveObserver(tag)
@@ -1129,46 +1567,226 @@ class GmshEntityView:
                 if command is not None:
                     command.SetAbortFlag(1)
 
-    def pickAt(self, x: float, y: float):
-        """``(cell, world)`` under a display point, ``(None, None)`` if none."""
-        from vtkmodules.vtkCommonCore import mutable
-
+    def _renderer(self):
         renderer = getattr(self._view, 'renderer', None)
-        renderer = renderer() if callable(renderer) else None
-        if renderer is None or self._locator is None:
-            return None, None
+        return renderer() if callable(renderer) else None
+
+    def _world_ends(self, renderer, x, y) -> list:
         ends = []
         for depth in (0.0, 1.0):
             renderer.SetDisplayPoint(float(x), float(y), depth)
             renderer.DisplayToWorld()
             w = renderer.GetWorldPoint()
             ends.append([w[i] / (w[3] or 1.0) for i in range(3)])
-        # Lines are thin: widen the tolerance to a few pixels' worth.
-        span = sum((ends[1][i] - ends[0][i]) ** 2 for i in range(3)) ** 0.5
-        tolerance = (self._polydata.GetLength() * 0.004) if span else 0.0
+        return ends
+
+    def pickAt(self, x: float, y: float, dim: int | None = None,
+               wait: bool = True):
+        """``(cell, world)`` under a display point, ``(None, None)`` if none.
+
+        *dim* 1 casts the ray at the curve cells alone and *dim* 2 at the
+        surface cells alone, so a curve behind or under a surface can still be
+        picked (DP-6154). A curve has a tolerance of a few pixels, wherever
+        the model sits in the view.
+
+        Plan 50 IP12 (DP-6347). While the worker builds the structures, a
+        pick with *wait* waits for them (a click must name what is there);
+        without it (a hover) the last structures answer, or nothing."""
+        from vtkmodules.vtkCommonCore import mutable
+
+        self._collect_pick(wait=wait)
+        renderer = self._renderer()
+        if renderer is None or self._locator is None:
+            return None, None
+        near, far = self._world_ends(renderer, x, y)
+        side = self._world_ends(renderer, x + 1.0, y)[0]
+        pixel = sum((side[i] - near[i]) ** 2 for i in range(3)) ** 0.5
         t, point, pcoords = mutable(0.0), [0.0] * 3, [0.0] * 3
         sub, cell = mutable(0), mutable(0)
-        hit = self._locator.IntersectWithLine(
-            ends[0], ends[1], tolerance, t, point, pcoords, sub, cell)
+        if dim is None:
+            hit = self._locator.IntersectWithLine(
+                near, far, pixel * 4.0, t, point, pcoords, sub, cell)
+            return (int(cell), tuple(point)) if hit else (None, None)
+        if dim not in self._locators:
+            return None, None
+        locator, _part, cells = self._locators[dim]
+        hit = locator.IntersectWithLine(
+            near, far, pixel * (5.0 if dim == 1 else 1.0), t, point, pcoords,
+            sub, cell)
         if not hit:
             return None, None
-        return int(cell), tuple(point)
+        return int(cells[int(cell)]), tuple(point)
+
+    def _pick_target(self, x, y, wait: bool = True):
+        """``(cell, world)`` for the picker's current filter."""
+        from foammesh.core.gmsh.session_entities import FILTERS
+
+        dim = FILTERS.get(self._picker.filter)
+        if dim == 0:
+            return None, self._point_at(x, y)
+        if dim == 1:
+            return self.pickAt(x, y, 1, wait=wait)
+        if dim in (2, 3):
+            return self.pickAt(x, y, 2, wait=wait)
+        return self.pickAt(x, y, wait=wait)
+
+    def _point_at(self, x, y, pixels: float = 10.0):
+        """The nearest point entity within a few pixels of the cursor, in
+        screen space, so a corner behind a surface can still be picked
+        (DP-6154)."""
+        renderer = self._renderer()
+        if renderer is None:
+            return None
+        best, best_distance = None, pixels
+        for record in self._point_records():
+            renderer.SetWorldPoint(record.xyz[0], record.xyz[1], record.xyz[2],
+                                   1.0)
+            renderer.WorldToDisplay()
+            dx, dy, _ = renderer.GetDisplayPoint()
+            distance = ((dx - x) ** 2 + (dy - y) ** 2) ** 0.5
+            if distance <= best_distance:
+                best, best_distance = tuple(record.xyz), distance
+        return best
 
     def _moved(self, interactor, event) -> None:
         if not self._picker.active:
             return
         x, y = interactor.GetEventPosition()
-        cell, world = self.pickAt(x, y)
+        self._cursor = (x, y)
+        if self._press is not None and self._press[4]:
+            self._draw_band(self._press[0], self._press[1], x, y)
+            self._take(interactor)
+            return
+        if self._tip_actor is not None:
+            self._tip_actor.SetPosition(x + 14, y + 14)
+            self._view.refresh()
+        self._hover_at = (x, y)
+        timer = self._dwell_timer()
+        if timer is None:
+            self._hover_now()
+        else:
+            timer.start()                   # restarts: the pointer moved on
+
+    def _dwell_timer(self):
+        """Plan 50 IP12 (DP-6346). The single-shot dwell timer, or ``None``
+        to pick on the move (no dwell set, or no Qt event loop to wait in)."""
+        if HOVER_DWELL_MS <= 0 or not _qt_running():
+            return None
+        if self._hover_timer is None:
+            from PySide6.QtCore import QTimer
+
+            self._hover_timer = QTimer()
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.timeout.connect(self._hover_now)
+        self._hover_timer.setInterval(int(HOVER_DWELL_MS))
+        return self._hover_timer
+
+    def _hover_now(self) -> None:
+        """The hover pick where the pointer rested; never waits for the pick
+        structures (DP-6347)."""
+        where, self._hover_at = self._hover_at, None
+        if where is None or not self._picker.active or self._body is None:
+            return
+        if self._press is not None and self._press[4]:
+            return                          # a box selection is being drawn
+        cell, world = self._pick_target(where[0], where[1], wait=False)
         self._picker.hover(cell, world)
 
     def _pressed(self, interactor, event) -> None:
+        """Remember where the button went down. DP-6156: the selection changes
+        on release, and only when the pointer has not moved, so an orbit or pan
+        that starts over the model leaves the pick alone. Ctrl+drag is a box
+        selection (DP-6152), so the camera does not take it."""
         if not self._picker.active:
             return
         x, y = interactor.GetEventPosition()
-        cell, world = self.pickAt(x, y)
-        shift = bool(interactor.GetShiftKey())
-        if self._picker.click(cell, world, shift=shift) is not None:
+        box = bool(interactor.GetControlKey())
+        self._press = (x, y, bool(interactor.GetShiftKey()),
+                       bool(interactor.GetControlKey()), box)
+        if box:
             self._take(interactor)
+
+    def _released(self, caller, event) -> None:
+        interactor = self._interactor()
+        press, self._press = self._press, None
+        if press is None or interactor is None or not self._picker.active:
+            return
+        x0, y0, shift, ctrl, box = press
+        x, y = interactor.GetEventPosition()
+        moved = abs(x - x0) > _CLICK_SLOP or abs(y - y0) > _CLICK_SLOP
+        self._clear_band()
+        if box and moved:
+            entities = self._entities_in_rect(x0, y0, x, y)
+            # Gmsh: Ctrl+drag selects, Ctrl+Shift+drag unselects.
+            self._picker.select_many(entities, remove=shift, extend=True)
+            self._take(interactor)
+            return
+        if moved:
+            return
+        cell, world = self._pick_target(x0, y0)
+        if self._picker.click(cell, world, shift=shift, toggle=ctrl) is not None:
+            self._take(interactor)
+
+    def _entities_in_rect(self, x0, y0, x1, y1) -> list:
+        """Entities whose anchor projects inside the display rectangle."""
+        renderer = getattr(self._view, 'renderer', None)
+        renderer = renderer() if callable(renderer) else None
+        if renderer is None:
+            return []
+        lo_x, hi_x = sorted((x0, x1))
+        lo_y, hi_y = sorted((y0, y1))
+        found = []
+        entity_map = self._picker.map
+        for entity in entity_map.entities():
+            anchor = entity_map.anchor(entity)
+            if anchor is None:
+                continue
+            renderer.SetWorldPoint(anchor[0], anchor[1], anchor[2], 1.0)
+            renderer.WorldToDisplay()
+            dx, dy, _ = renderer.GetDisplayPoint()
+            if lo_x <= dx <= hi_x and lo_y <= dy <= hi_y:
+                found.append(entity)
+        return found
+
+    def _draw_band(self, x0, y0, x1, y1) -> None:
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+        from vtkmodules.vtkRenderingCore import vtkActor2D, vtkPolyDataMapper2D
+
+        renderer = getattr(self._view, 'renderer', None)
+        renderer = renderer() if callable(renderer) else None
+        if renderer is None:
+            return
+        self._clear_band()
+        points = vtkPoints()
+        for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            points.InsertNextPoint(px, py, 0.0)
+        lines = vtkCellArray()
+        lines.InsertNextCell(5)
+        for index in (0, 1, 2, 3, 0):
+            lines.InsertCellPoint(index)
+        data = vtkPolyData()
+        data.SetPoints(points)
+        data.SetLines(lines)
+        mapper = vtkPolyDataMapper2D()
+        mapper.SetInputData(data)
+        actor = vtkActor2D()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.1, 0.4, 0.9)
+        actor.GetProperty().SetLineWidth(1.5)
+        renderer.AddActor2D(actor)
+        self._band_actor = actor
+        self._view.refresh()
+
+    def _clear_band(self) -> None:
+        actor, self._band_actor = self._band_actor, None
+        if actor is None:
+            return
+        renderer = getattr(self._view, 'renderer', None)
+        renderer = renderer() if callable(renderer) else None
+        if renderer is not None:
+            renderer.RemoveActor2D(actor)
+        self._view.refresh()
 
     def _key(self, interactor, event) -> None:
         if not self._picker.active:
@@ -1180,3 +1798,10 @@ class GmshEntityView:
     def dispose(self) -> None:
         self.clear()
         self._unfollow_route()
+        timer, self._hover_timer = self._hover_timer, None
+        if timer is not None:
+            timer.stop()
+            try:
+                timer.timeout.disconnect(self._hover_now)
+            except (RuntimeError, TypeError):
+                pass

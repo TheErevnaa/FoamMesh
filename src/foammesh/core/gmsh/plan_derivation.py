@@ -163,6 +163,10 @@ EXPECTED_FAMILIES = {
 AUTOMATIC_STRUCTURING_FAMILIES: tuple = ((), ())
 QUALITY_MEASURE = {'sicn': 0, 'sige': 1, 'gamma': 2, 'disto': 3}
 CURVE_LAW = {'progression': 'Progression', 'bump': 'Bump', 'beta': 'Beta'}
+#: DP-6164. ``setTransfiniteSurface``'s arrangement words.
+SURFACE_ARRANGEMENT = {'left': 'Left', 'right': 'Right',
+                       'alternateleft': 'AlternateLeft',
+                       'alternateright': 'AlternateRight'}
 EXPORT_VERSION = 'gmsh.export.v1'
 #: ``Mesh.Format`` for Gmsh's own SU2 writer. Named once so the runner and the
 #: derivation cannot disagree about which code means what.
@@ -985,6 +989,7 @@ class CurveControl:
     #: to let it choose. Three or four tags; the runner checks they are on the
     #: face, because Gmsh does not and meshes something else instead.
     corner_points: tuple = ()
+    surface_arrangement: str = 'left'
 
     @property
     def nodes(self) -> int:
@@ -1006,6 +1011,7 @@ class CurveControl:
             'reverseGrading': self.reverse_grading,
             'transfiniteSurface': self.transfinite_surface,
             'cornerPoints': list(self.corner_points),
+            'surfaceArrangement': SURFACE_ARRANGEMENT[self.surface_arrangement],
             'order': self.order,
         }
 
@@ -1755,6 +1761,11 @@ def derive_curve_controls(rows) -> tuple[CurveControl, ...]:
                 f'curve control {name!r} sets a local size, so it must be positive')
         corners = derive_corner_points(
             row.get('cornerPoints', row.get('corner_points')), name)
+        arrangement = _enum(row.get('surfaceArrangement'), 'left')
+        if arrangement not in SURFACE_ARRANGEMENT:
+            raise PlanDerivationError(
+                f'unknown surface arrangement {arrangement!r}; expected one '
+                f'of {", ".join(sorted(SURFACE_ARRANGEMENT))}')
         structured_surface = (mode == 'transfinite' and bool(
             row.get('transfiniteSurface',
                     row.get('transfinite_surface', False))))
@@ -1771,7 +1782,7 @@ def derive_curve_controls(rows) -> tuple[CurveControl, ...]:
             reverse_grading=bool(row.get('reverseGrading',
                                          row.get('reverse_grading', False))),
             transfinite_surface=structured_surface,
-            corner_points=corners))
+            corner_points=corners, surface_arrangement=arrangement))
     return tuple(sorted(derived, key=lambda item: (-item.order, item.name)))
 
 

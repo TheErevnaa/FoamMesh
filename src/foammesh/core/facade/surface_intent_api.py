@@ -475,9 +475,16 @@ def read(document, keys=None) -> dict:
     section = document.get('surfaceIntent')
     section = section if isinstance(section, dict) else {}
     surfaces = []
+    # DP-6500. Each surface's verdict assessed a deep copy of the whole
+    # project: 500 surfaces were 500 copies, and the read held the GUI
+    # thread 85.9 s (MEASURED, Plan 50 window leg surfaces500). One
+    # assessed copy serves every surface.
+    from foammesh.core.engine.surface_capabilities import assessed_document
+    assessed = assessed_document(document) if keys else None
     for key in keys:
         payload = surface_payload(document, key)
-        payload['issues'] = issue_dicts(authoring.all_issues(document, [key]))
+        payload['issues'] = issue_dicts(
+            authoring.all_issues(document, [key], assessed))
         surfaces.append(payload)
     relations = [relation_payload(key, relation) for key, relation
                  in model._sorted_items(document.get('surfaceRelations'))

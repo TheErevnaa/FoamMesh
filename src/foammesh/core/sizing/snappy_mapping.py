@@ -39,8 +39,6 @@ LAYER_GROUPS = 'meshing.layers.groups'
 
 #: Never ask for a gradation below this; ln 2 / ln g explodes towards 1.
 MIN_GRADATION = 1.05
-#: snappy's limits are 2 x the estimate so it never truncates (Plan 41 4.8.3).
-LIMIT_FACTOR = 2.0
 #: Plan 41 4.8.3 boundary layers: first = 0.3 h_wall, final = h_wall.
 FIRST_LAYER_FRACTION = 0.3
 DEFAULT_EXPANSION = 1.2
@@ -140,12 +138,15 @@ def resolve_feature_angle(feature_angle: float) -> Proposal:
                     f'field: {value:g} deg')
 
 
-def cell_limits(estimated_cells: int) -> list[Proposal]:
-    """snappy's own counters: 2 x the estimate, never a FoamMesh cap."""
-    limit = int(math.ceil(max(estimated_cells, 1) * LIMIT_FACTOR))
-    badge = f'estimate {estimated_cells:,}, snappy limit {limit:,}'
-    return [Proposal(MAX_LOCAL, limit, '2 x the estimate', badge),
-            Proposal(MAX_GLOBAL, limit, '2 x the estimate', badge)]
+# Plan 50 IP3 (SN-2, DP-6231, D6). No proposal for maxGlobalCells or
+# maxLocalCells. Twice the estimate was a cell cap whenever the estimate came
+# out low, and snappy then wrote a coarser mesh without a word. Sizing them
+# from free RAM was not taken: a proposal is saved with the case and outlives
+# the memory reading it came from, and the WSL VM's figure is not reliably at
+# hand when proposals are made (the probe answers with Windows' own figures
+# until it has run). The schema defaults stand, the RAM gate refuses a run
+# that does not fit, and a run that reaches a limit says so in a task warning
+# (``core.mesh.run_progress.snappy_cell_limit_warning``).
 
 
 # -- surface refinement ------------------------------------------------------ #
@@ -412,6 +413,34 @@ SNAPPY_LAYERS = 3
 MAX_STACK_CELLS = 1.1
 #: A tenth of the wall cell, the minimum the measured runs used.
 MIN_RELATIVE_THICKNESS = 0.1
+
+
+#: Plan 50 IP27 (SN-9). The case-wide layer sizing that keeps the proposal.
+RELATIVE_LAYER_MODE = 'relative'
+
+
+def layer_proposals_wanted(mode) -> bool:
+    """Whether the field proposes the layer groups' relative stacks.
+
+    DP-6391. Only while the case sizes layers relatively (the default): with
+    the first-layer-height mode picked the person's metres are written for
+    every growing patch, and a relative proposal over the groups would be a
+    number nobody reads -- or, were the mode switched back, one they never
+    asked for.
+    """
+    value = getattr(mode, 'value', mode)
+    return value in (None, '', RELATIVE_LAYER_MODE)
+
+
+def case_wants_layer_proposals(db) -> bool:
+    """:func:`layer_proposals_wanted` for the mode the case stores."""
+    if db is None:
+        return True
+    try:
+        mode = db.getValue('addLayers/firstLayerMode')
+    except Exception:                                        # noqa: BLE001
+        return True
+    return layer_proposals_wanted(mode)
 
 
 def wall_cell(base_cell: float, stats: dict) -> float:

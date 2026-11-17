@@ -143,9 +143,16 @@ _SUPPLEMENTARY_COLLECTION_TASKS = {
 #: result was built from them. The farfield is one record both engines read
 #: (edited from the Geometry page), so after publish an edit to it went
 #: straight past the lock.
+#:
+#: DP-6484. The standoff and the three "Fine cells at" sides change the grid
+#: blockMesh builds, but the Base grid page carries them as extra fields, not
+#: as the task's declared ones (declaring them changes the workflow digest),
+#: so a locked Base grid accepted a new standoff while it refused the cell size.
 _SUPPLEMENTARY_PATH_TASKS = {
     'gmsh': {'gmsh/farfield': 'gmsh.describe_geometry'},
-    'snappy': {'gmsh/farfield': 'snappy.domain_regions'},
+    'snappy': {'gmsh/farfield': 'snappy.domain_regions',
+               'baseGrid/standoff': 'snappy.base_grid',
+               'baseGrid/gradingFine': 'snappy.base_grid'},
 }
 
 #: Plan 37 UF5 DP-1063. The geometry and region lists are no one page's
@@ -689,6 +696,49 @@ class FoamMeshFacade:
         self.register('geometry.delete', self._make_collection_remove('geometry.items'))
         self.domain.register_all(self.register)
 
+    def hold_while_opening(self):
+        """Hold the transport's case routes while a case is being opened.
+
+        DP-6480. The desktop opens a case partly on a worker now (its event
+        journal), so the event loop -- and the local API on it -- runs while
+        the case is still opening. A call that arrives then waits for the open
+        to settle, as it waited before behind the loop the open held, rather
+        than finding no case. Returns ``release()``; calling it twice is safe.
+        """
+        import asyncio
+        openings = self.__dict__.setdefault('_openings', set())
+        future = asyncio.get_event_loop().create_future()
+        openings.add(future)
+
+        def release():
+            openings.discard(future)
+            if not future.done():
+                future.set_result(None)
+        return release
+
+    #: The longest a call waits for a case open (DP-6480). An open that hangs
+    #: then lets the call through, which answers as it would with no case.
+    OPENING_WAIT_SECONDS = 300.0
+
+    async def opening_settled(self) -> None:
+        """Return once no case open is in progress (see ``hold_while_opening``),
+        or after ``OPENING_WAIT_SECONDS``."""
+        import asyncio
+        import logging
+        openings = self.__dict__.get('_openings')
+        if not openings:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.OPENING_WAIT_SECONDS
+        while openings:
+            left = deadline - loop.time()
+            if left <= 0:
+                logging.getLogger(__name__).warning(
+                    'A local-API call waited %.0f s for the case to open and goes on '
+                    'without it.', self.OPENING_WAIT_SECONDS)
+                return
+            await asyncio.wait(set(openings), timeout=left)
+
     def attach(self, session: CaseSession) -> CaseSession:
         self._cases[session.case_id] = session
         # The lock check behind every configuration edit reads the engine
@@ -699,6 +749,9 @@ class FoamMeshFacade:
         self._recover_interrupted_unlock(session)
         self._recover_interrupted_redistribute(session)
         self._resume_pipeline_gates(session)
+        # Plan 50 IP17. A stage a parallel run kept as processor cases is
+        # gathered on demand, also for readers outside the facade.
+        self.domain._register_kept_gatherer(session)
         return session
 
     def _resume_pipeline_gates(self, session: CaseSession) -> None:
@@ -842,6 +895,8 @@ class FoamMeshFacade:
     def detach(self, case_id: str, *, save: bool = True) -> None:
         session = self._cases.pop(case_id, None)
         if session is not None:
+            from foammesh.core.jobs import stage_snapshots
+            stage_snapshots.register_gatherer(session.case_path, None)
             session.close(save=save)
 
     def case(self, case_id: str) -> CaseSession:
@@ -1152,6 +1207,10 @@ class FoamMeshFacade:
             session.assert_revision(command.expected_revision)
             session.set_event_context(command)
             change_sets = len(getattr(session, 'change_sets', ()))
+            # DP-6454. Whoever sent it, a window hears the command start and
+            # end -- returned or raised -- and shows a run the same way.
+            session.notify_command_started(command)
+            ended = None
             try:
                 with session.monitor.measure(
                         'owner_loop_slice', context=command.operation):
@@ -1174,8 +1233,13 @@ class FoamMeshFacade:
                 # DP-2851. A window showing this case hears that a command
                 # it did not send has ended, and shows what it made.
                 session.notify_command(command, value)
+                ended = (value, None)
                 return value
+            except BaseException as error:
+                ended = (None, error)
+                raise
             finally:
+                session.notify_command_ended(command, *(ended or (None, None)))
                 session.clear_event_context()
 
         return await session.scheduler.submit(invoke, human_priority=command.is_human_gui_command)
@@ -1562,7 +1626,9 @@ class FoamMeshFacade:
             raise ValidationFailedError(
                 f'Minimum level ({int(minimum)}) cannot be above Maximum level '
                 f'({int(maximum)}): snappyHexMesh refines a surface between the '
-                'two, so the minimum must be 0 to the maximum',
+                'two, so the minimum must be 0 to the maximum. Raise the '
+                'Maximum level first, then the Minimum level, or send both '
+                'in one edit',
                 details={'collection': collection_id,
                          'field': 'surface_refinement.minimum_level',
                          'error': 'minimum_above_maximum',

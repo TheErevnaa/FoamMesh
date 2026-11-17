@@ -70,23 +70,24 @@ def install(console, ask_path=None) -> bool:
     if layout is None:
         return False
 
-    def choose() -> str:
-        if ask_path is not None:
-            return ask_path()
-        from PySide6.QtWidgets import QFileDialog
-
-        name, _filter = QFileDialog.getSaveFileName(
-            console, console.tr('Save the console'), 'console.log',
-            console.tr('Log files (*.log *.txt);;All files (*)'))
-        return name
-
-    def save() -> None:
-        name = choose()
+    def write(name) -> None:
         if name:
             try:
                 save_log(console, name)
             except ValueError:
                 pass
+
+    def save() -> None:
+        if ask_path is not None:
+            write(ask_path())
+            return
+        # Plan 50 IP19: no nested event loop; the log is written on answer.
+        from widgets.async_dialog import getSaveFileName
+
+        getSaveFileName(
+            console, console.tr('Save the console'), 'console.log',
+            console.tr('Log files (*.log *.txt);;All files (*)'),
+            then=lambda name, _filter: write(name))
 
     saveButton = QToolButton(bar)
     saveButton.setObjectName(SAVE_NAME)

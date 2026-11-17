@@ -13,11 +13,15 @@ published, and nothing there may be mistaken for a mesh to accept.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
 from pathlib import Path
 
 from foammesh.core.naming import EXACT_NAMES
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 DIRECTORY = ('foammesh', 'run-listing')
@@ -33,23 +37,91 @@ def _safe(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '-', name)[:80] or 'run'
 
 
-def write_entry(case_path, *, engine_id: str, kind: str, name: str,
-                status: str, started_at: str, ended_at: str,
-                message: str = '', run_id: str, **extra) -> Path:
-    root = directory(case_path)
-    root.mkdir(parents=True, exist_ok=True)
-    document = {
+def _document(*, engine_id: str, kind: str, name: str, status: str,
+              started_at: str, ended_at: str, message: str = '',
+              run_id: str, **extra) -> dict:
+    return {
         'schema_version': SCHEMA_VERSION, 'run_id': run_id,
         'engine_id': engine_id, 'kind': kind, 'name': name, 'status': status,
         'started_at': started_at, 'ended_at': ended_at, 'message': message,
         **extra}
-    target = root / f'{_safe(run_id)}.json'
+
+
+def _write(root: Path, document: dict) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f'{_safe(str(document["run_id"]))}.json'
     temporary = target.with_suffix('.tmp')
     temporary.write_text(json.dumps(document, indent=1, sort_keys=True),
                          encoding='utf-8')
     os.replace(temporary, target)
     _prune(root)
     return target
+
+
+def write_entry(case_path, *, engine_id: str, kind: str, name: str,
+                status: str, started_at: str, ended_at: str,
+                message: str = '', run_id: str, **extra) -> Path:
+    return _write(directory(case_path), _document(
+        engine_id=engine_id, kind=kind, name=name, status=status,
+        started_at=started_at, ended_at=ended_at, message=message,
+        run_id=run_id, **extra))
+
+
+# -- DP-6479: entries written by one writer thread, in order ------------------ #
+#
+# A Gmsh session action ends on the GUI thread (the panels call
+# ``ActionHandle.finish``), and writing its entry there held the window 24 s
+# on a busy disk (measured live). The entry is queued instead; one writer
+# thread writes the queue in order. Until an entry is on disk the listing
+# reads it from here, so a list read straight after the run still has it.
+# The writer is not a daemon, so the interpreter waits for it at exit, and
+# ``flush`` waits for it when a case closes.
+
+_queue: list[tuple[Path, dict]] = []
+_writing = threading.Condition()
+_writer: threading.Thread | None = None
+
+
+def write_entry_soon(case_path, **fields) -> None:
+    """Queue an entry for the writer thread; never touches the disk here."""
+    global _writer
+    item = (directory(case_path), _document(**fields))
+    with _writing:
+        _queue.append(item)
+        if _writer is None:
+            _writer = threading.Thread(target=_drain, daemon=False,
+                                       name='foammesh-run-listing')
+            _writer.start()
+
+
+def _drain() -> None:
+    global _writer
+    while True:
+        with _writing:
+            if not _queue:
+                _writer = None
+                _writing.notify_all()
+                return
+            root, document = _queue[0]
+        try:
+            _write(root, document)
+        except OSError:
+            logger.warning('a run-list entry could not be written in %s',
+                           root, exc_info=True)
+        with _writing:
+            _queue.pop(0)
+            _writing.notify_all()
+
+
+def flush(timeout: float | None = None) -> bool:
+    """Wait until every queued entry is on disk; whether it got there."""
+    with _writing:
+        return _writing.wait_for(lambda: not _queue, timeout)
+
+
+def _queued(root: Path) -> list[dict]:
+    with _writing:
+        return [dict(document) for where, document in _queue if where == root]
 
 
 def _prune(root: Path) -> None:
@@ -63,17 +135,20 @@ def _prune(root: Path) -> None:
 
 def list_entries(case_path) -> list[dict]:
     root = directory(case_path)
-    if not root.is_dir():
-        return []
+    # DP-6479. An entry still waiting for the writer is listed from memory.
+    queued = _queued(root)
+    waiting = {str(document.get('run_id')) for document in queued}
     entries = []
-    for path in root.glob('*.json'):
+    for path in (root.glob('*.json') if root.is_dir() else ()):
         try:
             document = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             continue
-        if isinstance(document, dict):
+        if (isinstance(document, dict)
+                and str(document.get('run_id')) not in waiting):
             entries.append(document)
-    return entries
+    latest = {str(document.get('run_id')): document for document in queued}
+    return entries + list(latest.values())
 
 
 #: DP-2855. What a run of each engine is called in the listing.

@@ -8,6 +8,8 @@ scalar configuration patch.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
@@ -20,7 +22,7 @@ from foammesh.core.facade.field_adapters import EntityAdapter
 from foammesh.core.facade.fields import REGISTRY, FieldType
 from foammesh.app import app
 from foammesh.core.selection import SelectionKind, SelectionStatus
-from foammesh.view.facade_client import submit
+from foammesh.view.facade_client import NoOpenCaseError, submit
 from foammesh.view.theming.metrics import GAP_TIGHT, MARGIN_TIGHT
 from foammesh.view.theming.status_colors import (
     style_tight_headings, style_tightest_headings)
@@ -30,6 +32,7 @@ from foammesh.core import display_unit
 from .field_widgets import FieldEditor, _is_length
 from .labels import humanise_option
 from widgets import async_message_box as messages
+from widgets.async_dialog import openDialog
 
 
 def collection_adapter(collection_id: str) -> EntityAdapter:
@@ -236,6 +239,21 @@ class _NumericFloorHeader(QHeaderView):
         painter.restore()
 
 
+def _as_metres(value):
+    """The stored number behind a length cell, or None when it is no number.
+
+    Text ("0.001") and the other number types a store hands back (numpy,
+    Decimal) count, not only int and float.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float('inf') else None
+
+
 class ChildControlPanel(QGroupBox):
     """Table of child items plus an editor form for the selected row."""
 
@@ -392,6 +410,14 @@ class ChildControlPanel(QGroupBox):
         # they keep their state across openings.
         self._form = QWidget(self)
         self._form.setVisible(False)
+        # DP-6517. A page builds its annotations with no parent (DP-312) and
+        # only the row editor's dialog adopted them: a page whose dialog was
+        # never opened left them as hidden top-level windows when it went (38
+        # widgets each time a Gmsh case was opened after a snappy one and
+        # back). They wait in the hidden editor host, as they do after a
+        # dialog gives them back, and are deleted with the panel.
+        for widget in self._annotations.values():
+            self._parkAnnotation(widget)
         for key, descriptor in self._descriptors.items():
             self._editors[key] = self._build_field_editor(key, descriptor)
             # FS-B. A new editor holds whatever its widget starts as, which
@@ -550,7 +576,18 @@ class ChildControlPanel(QGroupBox):
         if widget is None:
             return
         self._annotations[key] = widget
+        self._parkAnnotation(widget)
         self._discard_dialog()
+
+    def _parkAnnotation(self, widget) -> None:
+        """DP-6517. Give an unowned annotation the hidden editor host as its
+        parent, so it is never a window of its own and goes with the panel."""
+        try:
+            if widget.parent() is None:
+                widget.setParent(self._form)
+                widget.hide()
+        except RuntimeError:
+            pass
 
     def setCellDetail(self, key: str, detail) -> None:
         """Give *key*'s table cells a tooltip, ``detail(value) -> str``.
@@ -848,7 +885,20 @@ class ChildControlPanel(QGroupBox):
         # own. The dialog is reused, and one opened on a rotational pair would
         # otherwise still be showing rotation rows over a coincident one.
         dialog.applyRelevance()
+        self.refreshScopeChips()
         self._run_editor(dialog, self.add_child)
+
+    def refreshScopeChips(self) -> None:
+        """Say what each scope field now holds (DP-6125).
+
+        `set_value` blocks signals, so a chip under a picker kept naming the
+        value the field held before the row was reset: a new pair read
+        `bottom` under a target that said `A_channel_box_2`.
+        """
+        for widget in self._annotations.values():
+            show = getattr(widget, 'showChip', None)
+            if callable(show):
+                show()
 
     def fresh_value(self, key: str, descriptor):
         """The value a new row's *key* starts from (DP-595 hook)."""
@@ -862,6 +912,7 @@ class ChildControlPanel(QGroupBox):
         self._load_selected()
         dialog = self.editor_dialog()
         dialog.applyRelevance()
+        self.refreshScopeChips()
         self._run_editor(dialog, self.apply_selected)
 
     def _run_editor(self, dialog, accepted) -> None:
@@ -878,8 +929,10 @@ class ChildControlPanel(QGroupBox):
         if self._inline:
             self._run_inline(dialog, accepted)
             return
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            accepted()
+        # Plan 50 IP19 (DP-6360). Still modal, but opened without a nested
+        # event loop: *accepted* runs when the dialog closes on OK.
+        openDialog(dialog, lambda result: accepted()
+                   if result == QDialog.DialogCode.Accepted else None)
 
     # -- data -------------------------------------------------------------- #
 
@@ -893,7 +946,14 @@ class ChildControlPanel(QGroupBox):
         # rebuilt by position below, so the key selected before is re-selected
         # after, wherever it has moved to.
         selected = self.selected_key()
-        self._rows = self._read_rows()
+        try:
+            self._rows = self._read_rows()
+        except NoOpenCaseError:
+            # DP-6520. An answer that lands after File > Close (a page's
+            # default-group patch, a late status read) asks for a refresh
+            # with no case left to read: the panel keeps what it drew and the
+            # next case's open rebuilds it.
+            return
         self.table.setRowCount(len(self._rows))
         for index, row in enumerate(self._rows):
             scope_problem = self._scope_problem(row)
@@ -1168,11 +1228,13 @@ class ChildControlPanel(QGroupBox):
         if not text:
             return text, ''
         descriptor = self._descriptors.get(key)
-        if (descriptor is not None and _is_length(descriptor)
-                and isinstance(value, (int, float))
-                and not isinstance(value, bool)):
+        if descriptor is not None and _is_length(descriptor):
             # UXB3: a stored length is shown in the project display unit.
-            text = display_unit.format_length(value, unit=False)
+            # DP-6130. A length stored as text ("0.001") was left in metres
+            # under a millimetre heading.
+            metres = _as_metres(value)
+            if metres is not None:
+                text = display_unit.format_length(metres, unit=False)
         detail = self._cellDetails.get(key)
         if detail is not None:
             # DP-1251. A page-supplied tooltip, the level's cell size.
@@ -1195,14 +1257,14 @@ class ChildControlPanel(QGroupBox):
         return label, self.tr('Stable ID: %s') % text
 
     def _read_rows(self) -> list[dict]:
-        node = self._client.configuration()
+        node = _document(self._client)
         for segment in self._adapter.storage_path.split('/'):
-            if not isinstance(node, dict):
+            if not isinstance(node, Mapping):
                 return []
             node = node.get(segment)
             if node is None:
                 return []
-        if isinstance(node, dict):
+        if isinstance(node, Mapping):
             items = sorted(node.items(), key=_sort_key)
         else:
             items = list(enumerate(node or ()))
@@ -1222,11 +1284,11 @@ class ChildControlPanel(QGroupBox):
         for relative_id, field in self._adapter.fields.items():
             node = stored
             for part in field.relative_path.split('/'):
-                if not isinstance(node, dict) or part not in node:
+                if not isinstance(node, Mapping) or part not in node:
                     break
                 node = node[part]
             else:
-                row[relative_id] = node
+                row[relative_id] = _plain(node)
         return row
 
     def _selected_index(self) -> int:
@@ -1367,7 +1429,8 @@ class ChildControlPanel(QGroupBox):
             return
         values = self._validated_child_values()
         if values is not None:
-            self._run(f'{self.collection_id}.create', {'fields': values})
+            self._confirmChildValues(values, lambda values: self._run(
+                f'{self.collection_id}.create', {'fields': values}))
 
     def apply_selected(self) -> None:
         key = self.selected_key()
@@ -1377,8 +1440,17 @@ class ChildControlPanel(QGroupBox):
             return
         values = self._validated_child_values()
         if values is not None:
-            self._run(f'{self.collection_id}.patch',
-                      {'entity_id': str(key), 'fields': values})
+            self._confirmChildValues(values, lambda values: self._run(
+                f'{self.collection_id}.patch',
+                {'entity_id': str(key), 'fields': values}))
+
+    def _confirmChildValues(self, values, then) -> None:
+        """``then(values)`` once the row may be written (Plan 50 IP19).
+
+        A panel that asks first (a pair that does not touch, a transform that
+        does not map) overrides this and asks without a nested event loop.
+        """
+        then(values)
 
     def remove_selected(self) -> None:
         keys = self.selected_keys()
@@ -1394,15 +1466,16 @@ class ChildControlPanel(QGroupBox):
         if self._inline:
             self._askRemoval(keys, question)
             return
+        def answered(confirm):
+            if confirm == QMessageBox.Yes:
+                self._removeKeys(keys)
+
         if len(keys) == 1:
-            confirm = messages.question(
-                self, self.tr('Remove item'), question)
+            messages.askQuestion(
+                self, self.tr('Remove item'), question, then=answered)
         else:
-            confirm = messages.question(
-                self, self.tr('Remove items'), question)
-        if confirm != QMessageBox.Yes:
-            return
-        self._removeKeys(keys)
+            messages.askQuestion(
+                self, self.tr('Remove items'), question, then=answered)
 
     def _removeKeys(self, keys) -> None:
         for key in keys:
@@ -1570,6 +1643,28 @@ class ChildControlPanel(QGroupBox):
         if selected:
             app.selectionService.select(tuple(selected))
         return values
+
+
+def _document(client) -> Mapping:
+    """The case document read-only and uncopied, or the configuration.
+
+    Plan 50 (DP-6341). ``configuration()`` round-trips the whole document
+    through YAML once per revision: 2 s on the GUI thread with 500 surfaces
+    (live w16), and a table refreshes after every change made elsewhere.
+    """
+    view = getattr(client, 'view', None)
+    if callable(view):
+        return view().data()
+    return client.configuration()
+
+
+def _plain(value):
+    """A value read through the view as the plain dicts and lists it was."""
+    if isinstance(value, Mapping):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
 
 
 def _sort_key(item):

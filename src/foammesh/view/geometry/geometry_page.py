@@ -8,8 +8,7 @@ import shiboken6
 
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QHBoxLayout, QHeaderView, QLabel,
-                               QMessageBox, QMenu, QPushButton, QVBoxLayout,
-                               QWidget)
+                               QMessageBox, QMenu, QPushButton, QWidget)
 from PySide6.QtCore import QEvent, QObject, Signal
 
 from foammesh.app import app
@@ -26,7 +25,9 @@ from .split_dialog import SplitDialog
 from .stl_utility import StlImporter
 from .surface_dialog import SurfaceDialog
 from .volume_dialog import VolumeDialog
+from foammesh.view.configuration_read import configuration_view
 from widgets import async_message_box as messages
+from widgets.async_dialog import popupMenu
 
 
 class ContextMenu(QMenu):
@@ -270,10 +271,7 @@ class GeometryPage(StepPage):
         self._boundaries = None
         self._cad = None
         self._cadFolder = None
-        self._advanced = None
-        self._advancedFolder = None
         self._lockBanner = None
-        self._pairTouching = None
         #: Plan 44 MF20. The one row of secondary actions under Import / Add.
         self._toolLinks = None
         #: Plan 42 SG22 (Q1): Geometry > Convert CAD to surface.
@@ -300,7 +298,7 @@ class GeometryPage(StepPage):
         self._connectSignalsSlots()
 
     def isNextStepAvailable(self):
-        return app.facadeClient.checkout().elementCount('geometry') > 0
+        return configuration_view(app.facadeClient).elementCount('geometry') > 0
 
     def _pageLeft(self) -> None:
         """VA1. Draw again the mesh this page put aside.
@@ -364,7 +362,6 @@ class GeometryPage(StepPage):
         self._ensureBoundaryActions()
         self._ensureCadPanel()
         self._ensureInterfacePairPanel()
-        self._ensurePairTouchingButton()
         self._ensureFarfieldButton()
         self._ensureConstructButton()
         self._ensureModelSize()
@@ -466,6 +463,8 @@ class GeometryPage(StepPage):
             for index in range(item.childCount()):
                 walk(item.child(index))
 
+        if not hasattr(tree, 'topLevelItemCount'):
+            return found
         for index in range(tree.topLevelItemCount()):
             walk(tree.topLevelItem(index))
         return found
@@ -502,6 +501,10 @@ class GeometryPage(StepPage):
         else:
             layout.insertWidget(index + 1, self._boundaries)
         self._menu.setBoundaryActions(self._boundaries.boundaryActions())
+        # DP-6094. Split by angle is offered while the selection is one body.
+        self._ui.geometryList.itemSelectionChanged.connect(
+            self._boundaries.selectionChanged)
+        self._boundaries.setLocked(not self._ui.geometryButtons.isEnabled())
         self._boundaries.refresh()
 
     def _ensureLockBanner(self):
@@ -592,61 +595,41 @@ class GeometryPage(StepPage):
             return False
 
     def _editLockedGeometry(self):
-        """Press, from this page, the footer button that unlocks the step."""
+        """Press, from this page, the footer button that unlocks the step.
+
+        DP-6114. Since Plan 43 LY9 Proceed locks Geometry in the case
+        (``setup.geometry``), and the footer's unlock only cleared the
+        legacy pages: Yes discarded the prepared geometry and left the step
+        locked, refusing the edit it had just offered. A step the case holds
+        locked is unlocked by the banner link's route, which asks once,
+        naming what goes, and releases the lock.
+        """
+        manager = getattr(getattr(app, 'window', None), '_stepManager', None)
+        request = getattr(manager, 'requestStepUnlock', None)
+        if callable(request) and request('setup.geometry'):
+            return
         discarded = self._discardedResults()
         if len(discarded) == 1:
             what = discarded[0]
         else:
             what = self.tr('{0} and {1}').format(
                 ', '.join(discarded[:-1]), discarded[-1])
-        answer = messages.question(
+        def answered(answer):
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            # The same button the footer shows, so one route clears the later
+            # steps and re-opens this one: `StepManager._unlockCurrentStep`.
+            unlock = getattr(self._ui, 'unlock', None)
+            if unlock is not None:
+                unlock.click()
+
+        messages.askQuestion(
             self._widget, self.tr('Edit geometry'),
             self.tr('Editing the geometry discards {0}. Everything after this '
                     'step has to be made again from the edited geometry.\n\n'
                     'Edit it anyway?').format(what),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        # The same button the footer shows, so one route clears the later
-        # steps and re-opens this one: `StepManager._unlockCurrentStep`.
-        unlock = getattr(self._ui, 'unlock', None)
-        if unlock is not None:
-            unlock.click()
-
-    def _ensureAdvanced(self):
-        """The fold the CAD tessellation form lives under.
-
-        GEO-04. The tessellation form and the interface-pair table were
-        mounted open, under the list, so the page asked for more height than
-        the navigation column has and the list itself was pushed out of
-        sight. The tessellation is a setting a case touches once, so it is
-        shut until it is wanted. DP-497: the interface pairs are not under
-        here any more -- they are a section of their own.
-        """
-        if self._advanced is not None:
-            return self._advanced.layout()
-        layout = self._widget.layout()
-        if layout is None:
-            # Isolated widget tests do not build the generated page.
-            return None
-        from foammesh.view.widgets.folder_header import FolderHeader
-
-        self._advancedFolder = FolderHeader(self.tr('Advanced'), self._widget)
-        self._advancedFolder.setObjectName('geometryAdvancedFolder')
-        # Plan 33 section 1.1 keeps CAD tessellation folded on this page, and
-        # this box holds only that, so it opens closed with it. A fold opens open everywhere
-        # else in the tree (W-O2, `FolderHeader`), which is why the exception
-        # is written here rather than assumed.
-        self._advancedFolder.setChecked(False)
-        self._advanced = QWidget(self._widget)
-        self._advanced.setObjectName('geometryAdvancedSection')
-        inner = QVBoxLayout(self._advanced)
-        inner.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._advancedFolder)
-        layout.addWidget(self._advanced)
-        self._advancedFolder.setContents(self._advanced)
-        return inner
+            QMessageBox.StandardButton.No, then=answered)
 
     @staticmethod
     def _cadEntries():
@@ -678,24 +661,28 @@ class GeometryPage(StepPage):
         entries = self._cadEntries()
         self._ensureConvertCadButton(entries)
         if self._cad is None:
-            inner = self._ensureAdvanced()
-            if inner is None:
+            layout = self._widget.layout()
+            if layout is None:
                 # Isolated widget tests do not build the generated page.
                 return
             from foammesh.view.widgets.folder_header import FolderHeader
 
             from .cad_page import CadPanel
 
+            # DP-6104 (user, 2026-10-31). CAD tessellation was the one thing
+            # inside an Advanced fold, so a CAD case opened two folds to
+            # reach one form; it is mounted on the page, folded. GEO-04: it
+            # is a setting a case touches once, so it opens shut (Plan 33
+            # section 1.1), and DP-6091: it shows only with a solid model.
             self._cadFolder = FolderHeader(self.tr('CAD tessellation'),
-                                           self._advanced)
+                                           self._widget)
             self._cadFolder.setObjectName('geometryCadFolder')
-            # Section 1.1: one of the two folds that survive the rule.
             self._cadFolder.setChecked(False)
-            self._cad = CadPanel(self._advanced)
+            self._cad = CadPanel(self._widget)
             self._cad.setObjectName('geometryCadPanel')
             self._cad.retessellateRequested.connect(self._retessellateCad)
-            inner.addWidget(self._cadFolder)
-            inner.addWidget(self._cad)
+            layout.addWidget(self._cadFolder)
+            layout.addWidget(self._cad)
             self._cadFolder.setContents(self._cad)
         self._cad.setStoreEntries(entries)
         # The case says whether there is anything to re-facet; the fold says
@@ -765,7 +752,9 @@ class GeometryPage(StepPage):
         from foammesh.view.widgets.folder_header import FolderHeader
         from foammesh.view.geometry.interface_pair_panel import InterfacePairPanel
 
-        self._interfacePairsFolder = FolderHeader(self.tr('Interface pairs'),
+        # DP-6098. "Interface pairs" read, on a CHT case, as the place the
+        # region interfaces are; it holds periodic pairs only.
+        self._interfacePairsFolder = FolderHeader(self.tr('Periodic pairs'),
                                                   self._widget)
         self._interfacePairsFolder.setObjectName(
             'geometryInterfacePairsFolder')
@@ -804,8 +793,8 @@ class GeometryPage(StepPage):
             for column in range(1, table.columnCount()):
                 header.setSectionResizeMode(
                     column, QHeaderView.ResizeMode.ResizeToContents)
-        index = (layout.indexOf(self._advancedFolder)
-                 if self._advancedFolder is not None else -1)
+        index = (layout.indexOf(self._cadFolder)
+                 if self._cadFolder is not None else -1)
         if index < 0:
             layout.addWidget(self._interfacePairsFolder)
             layout.addWidget(self._interfacePairs)
@@ -851,9 +840,14 @@ class GeometryPage(StepPage):
         self._ui.import_.setText(self.tr('&Import file…'))
         self._ui.import_.setToolTip(self.tr(
             'Bring a CAD or mesh file into the case'))
-        self._ui.add.setText(self.tr('&Add shape…'))
+        # DP-6103 (user, 2026-10-31). "Add shape" and Construct both said
+        # they make boxes, cylinders and spheres. This one makes the shapes
+        # snappyHexMesh refines or zones cells with, which a Gmsh case does
+        # not read; Construct makes solids. Each is named for what it makes.
+        self._ui.add.setText(self.tr('&Refinement shape…'))
         self._ui.add.setToolTip(self.tr(
-            'Add a box, cylinder, sphere or plane to the case'))
+            'Add a box, cylinder, sphere or plane that snappyHexMesh refines '
+            'or zones cells with (a Gmsh case does not use it)'))
 
     def _doubleClicked(self, item, _column):
         """Open the editor for the row that was double-clicked.
@@ -890,8 +884,8 @@ class GeometryPage(StepPage):
             hit = None
         if isFarfield(hit):
             self._ui.geometryList.setCurrentItem(hit)
-            self._farfieldContextMenu().exec(
-                self._ui.geometryList.mapToGlobal(pos))
+            popupMenu(self._farfieldContextMenu(),
+                      self._ui.geometryList.mapToGlobal(pos))
             return
         if not self._list.selectedItems():
             return
@@ -901,7 +895,7 @@ class GeometryPage(StepPage):
         else:
             self._menu.enableEditActions()
 
-        self._menu.exec(self._ui.geometryList.mapToGlobal(pos))
+        popupMenu(self._menu, self._ui.geometryList.mapToGlobal(pos))
 
     def _selectedItemsChanged(self):
         """Tell the selection service what the tree now shows.
@@ -939,53 +933,6 @@ class GeometryPage(StepPage):
         finally:
             self._selectionEcho = False
 
-    def _ensurePairTouchingButton(self):
-        """Mount the link that pairs every pair of touching walls at once.
-
-        DP-6087 (user design, 2026-10-29). This row held Split interfaces,
-        a cut a person had to know to run before choosing an interface. The
-        pairing now lives with the interface role, in Edit surface
-        (Automatic or Manual); this link is the same Automatic for the whole
-        case: its menu asks conformal (the shared triangles cut into one
-        surface) or non-conformal (the two walls kept and paired).
-
-        Offered only while the case holds more than one body: one body has
-        no wall of another to touch.
-        """
-        button = getattr(getattr(self, '_ui', None), 'import_', None)
-        if button is None:
-            # Isolated widget tests do not build the generated page.
-            return
-        layout = button.parentWidget().layout()
-        if layout is None:
-            return
-        if self._pairTouching is None:
-            from foammesh.db import surface_intent as intent
-
-            self._pairTouching = QPushButton(
-                self.tr('Pair touching walls'), button.parentWidget())
-            self._pairTouching.setObjectName('geometryPairTouchingWalls')
-            self._pairTouching.setToolTip(self.tr(
-                'Find the walls of different bodies that touch and pair each '
-                'as a region interface'))
-            menu = QMenu(self._pairTouching)
-            menu.setObjectName('geometryPairTouchingMenu')
-            for role, text, name in (
-                    (intent.CONFORMAL, 'Conformal: one shared surface…',
-                     'geometryPairConformal'),
-                    (intent.NON_CONFORMAL,
-                     'Non-conformal: keep both walls…',
-                     'geometryPairNonConformal')):
-                action = QAction(self.tr(text), menu)
-                action.setObjectName(name)
-                action.triggered.connect(
-                    lambda _checked=False, role=role:
-                    self._pairTouchingWallsClicked(role))
-                menu.addAction(action)
-            self._pairTouching.setMenu(menu)
-            self._mountToolLink(button, self._pairTouching, 3)
-        self._pairTouching.setVisible(self._bodyCount() > 1)
-
     #: Plan 44 MF20. An empty list is one line, not a 180 px blank rectangle.
     EMPTY_LIST_HEIGHT = 48
 
@@ -1011,8 +958,30 @@ class GeometryPage(StepPage):
         for signal in (model.rowsInserted, model.rowsRemoved,
                        model.modelReset, model.layoutChanged,
                        tree.expanded, tree.collapsed):
-            signal.connect(self._syncListEmptyState)
+            signal.connect(self._scheduleListSync)
         self._syncListEmptyState()
+
+    def _scheduleListSync(self, *_args):
+        """DP-6499. One sizing pass per event-loop turn, not one per row.
+
+        MEASURED live (Plan 50 window leg ``surfaces500``): a 500-body import
+        inserts 500 rows, each insert re-walked every row to size the list,
+        and the GUI thread was held 36.8 s. The rows land, then the list is
+        sized once."""
+        timer = getattr(self, '_listSyncTimer', None)
+        if timer is None:
+            # DP-360. Model signals still fire while the page is torn down;
+            # a timer parented on a deleted widget raised from the slot.
+            if not shiboken6.isValid(self._widget):
+                return
+            from PySide6.QtCore import QTimer
+            timer = QTimer(self._widget)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(self._syncListEmptyState)
+            self._listSyncTimer = timer
+        if shiboken6.isValid(timer):
+            timer.start()
 
     def _syncListEmptyState(self, *_args):
         tree = self._ui.geometryList
@@ -1059,8 +1028,8 @@ class GeometryPage(StepPage):
     def _mountToolLink(self, importButton, link, rank):
         """Plan 44 MF20. Put a secondary Geometry action in the link row.
 
-        Import and Add are the page's two actions. Construct, Convert CAD,
-        Farfield and Pair touching walls sit in one 20 px row of text links under
+        Import and Add are the page's two actions. Construct, Convert CAD
+        and Farfield sit in one 20 px row of text links under
         them, so six buttons never share a row narrower than they are. The
         links are the same buttons, in the order *rank* gives.
         """
@@ -1216,6 +1185,26 @@ class GeometryPage(StepPage):
         add = getattr(self._ui, 'add', None)
         if add is not None:
             add.setVisible(True)
+        self._updateConstructEntry()
+
+    def _updateConstructEntry(self):
+        """DP-6103. Construct combines and makes solid models; on a case of
+        surface meshes it can only add a CAD solid, which makes the case
+        mixed CAD + STL, which Gmsh refuses. It says so and stays off."""
+        button = self._constructButton
+        if button is None:
+            return
+        entries = self._storeEntries()
+        meshes = [entry for entry in entries if not entry.get('cad_artifact')]
+        if not getattr(button, '_plainTip', None):
+            button._plainTip = button.toolTip()
+        button.setEnabled(not meshes)
+        button.setToolTip(self.tr(
+            'Construct works on solid models (STEP, IGES, BREP). This case '
+            'holds surface meshes ({0}), which cannot be combined, and a '
+            'solid added beside them makes a mixed case Gmsh refuses.').format(
+                ', '.join(str(entry.get('name') or '') for entry in meshes))
+            if meshes else button._plainTip)
 
     @staticmethod
     def _storeEntries():
@@ -1328,7 +1317,7 @@ class GeometryPage(StepPage):
         from .geometry_list import readFarfield
 
         try:
-            spec = readFarfield(app.facadeClient.checkout())
+            spec = readFarfield(configuration_view(app.facadeClient))
         except Exception:                                    # noqa: BLE001
             spec = None
         button.setText(self.tr('Edit farfield\u2026') if spec is not None
@@ -1489,75 +1478,6 @@ class GeometryPage(StepPage):
     def farfieldActors(self):
         return self._farfieldActors
 
-    @staticmethod
-    def _bodyCount() -> int:
-        """How many imported bodies the case holds."""
-        from foammesh.core.geometry import GeometryArtifactStore
-
-        project = getattr(app, 'project', None)
-        if project is None or getattr(project, 'path', None) is None:
-            return 0
-        try:
-            return len(GeometryArtifactStore(project.path).entries())
-        except (OSError, ValueError):
-            return 0
-
-    def _showPairTouchingMenu(self):
-        """Open the link's conformal / non-conformal menu (regions page)."""
-        self._ensurePairTouchingButton()
-        if self._pairTouching is not None and self._pairTouching.isVisible():
-            self._pairTouching.showMenu()
-
-    @qasync.asyncSlot()
-    async def _pairTouchingWallsClicked(self, role):
-        """Pair the touching walls, then show the case as the database holds it.
-
-        The preview comes first: a conformal pairing cuts every body it
-        touches into a new revision, and a person is entitled to know what
-        is about to happen to a model they spent an afternoon assembling.
-        Walls that touch but cannot be paired this way are listed with why.
-        """
-        from foammesh.core.facade.errors import FacadeError
-
-        title = self.tr('Pair touching walls')
-        try:
-            preview = await app.facadeClient.run(
-                'geometry.surface_intent.auto_pair',
-                {'surface_role': role, 'preview': True})
-        except FacadeError as ex:
-            await modal(messages.warning, self._widget,
-                        self.tr('Pairing failed'), str(ex))
-            return
-        found = preview.payload.get('contacts') or ()
-        skipped = preview.payload.get('skipped') or ()
-        notes = ''.join(
-            '\n\n' + self.tr('Not paired: {0}. {1}').format(
-                item.get('reason'), item.get('remedy')) for item in skipped)
-        if not found:
-            await AsyncMessageBox().information(
-                self._widget, title,
-                self.tr('No walls of different bodies touch in a way that '
-                        'can be paired like this. Nothing was changed.')
-                + notes)
-            return
-        listed = ', '.join(' / '.join(item.get('names') or ())
-                           for item in found)
-        confirmed = await AsyncMessageBox().confirm(
-            self._widget, title,
-            self.tr('{0}: {1}.').format(count_text(len(found), 'pair'),
-                                        listed) + notes + '\n\n'
-            + self.tr('Continue?'))
-        if not confirmed:
-            return
-        try:
-            await app.facadeClient.run('geometry.surface_intent.auto_pair',
-                                       {'surface_role': role})
-        except FacadeError as ex:
-            await modal(messages.warning, self._widget,
-                        self.tr('Pairing failed'), str(ex))
-            return
-        self._reloadFromDatabase()
-
     @qasync.asyncSlot()
     async def _importClicked(self):
         self._dialog = ImportDialog(self._widget)
@@ -1616,7 +1536,13 @@ class GeometryPage(StepPage):
             self._updateNextStepAvailable()
 
         def updateSurfaces():
-            self._surfacesEdited(self._dialog.gIds())
+            # DP-6089. Automatic pairing may have cut the bodies: the rows
+            # the dialog was opened on can be gone and the interface surfaces
+            # are new, so the whole page is rebuilt. Re-reading the old rows left the cut out of the viewport.
+            if getattr(self._dialog, 'geometryRebuilt', False):
+                self._reloadFromDatabase()
+            else:
+                self._surfacesEdited(self._dialog.gIds())
 
         items = self._list.selectedItems()
         if not items:
@@ -1641,7 +1567,8 @@ class GeometryPage(StepPage):
             for sId in self._list.childSurfaces(gId):
                 actorInfo = self._geometryManager.actorInfo(sId)
                 self._backupActor(actorInfo)
-                sources[sId] = actorInfo.dataSet()
+                if actorInfo is not None:
+                    sources[sId] = actorInfo.dataSet()
 
             self._dialog = self._newVolumeDialog()
             self._dialog.setupForEdit(gId, sources)
@@ -1658,7 +1585,8 @@ class GeometryPage(StepPage):
                 gId = str(items[0].gId())
                 actorInfo = self._geometryManager.actorInfo(gId)
                 self._backupActor(actorInfo)
-                sources[gId] = actorInfo.dataSet()
+                if actorInfo is not None:
+                    sources[gId] = actorInfo.dataSet()
 
             self._dialog = SurfaceDialog(self._widget, self._ui.renderingView)
             if not self._ui.geometryButtons.isEnabled():
@@ -1703,7 +1631,9 @@ class GeometryPage(StepPage):
 
         await app.facadeClient.commit_working_copy(db, action='update geometry')
 
-        self._updateNextStepAvailable()
+        # DP-6100. The boundary actions, the Construct table, the model size
+        # and the farfield all read what the removal changed: one rebuild.
+        self._reloadFromDatabase()
 
         self.geometryRemoved.emit()
 
@@ -2110,16 +2040,19 @@ class GeometryPage(StepPage):
         The single place an import refreshes what is on screen, so the tree,
         the actors and the database cannot disagree about what was imported.
         """
-        self._list.load()
+        # DP-6099. The scene first: each row's swatch and each body's show /
+        # hide button wire to the actors that exist when the row is built,
+        # and built first they wired to the actors this rebuild replaced.
         self._geometryManager.load()
+        self._list.load()
+        # DP-6100. The farfield is sized from the model's extent, which an
+        # import, a split or a removal has just changed.
+        if self._farfieldActors or self._widget.isVisible():
+            self._showFarfieldOverlay(True)
+        self._updateConstructEntry()
         # An import may have brought the first solid model into the case, and
         # the deflection controls exist only while there is one to re-facet.
         self._ensureCadPanel()
-        # CHT1. Pair touching walls is offered while the case holds more
-        # than one body, and that count was read only when the page loaded --
-        # on a new case, before anything was imported. MEASURED live: three
-        # bodies imported, the link hidden until the case was reopened.
-        self._ensurePairTouchingButton()
         # Plan 37 UF1 (DP-1024). The boundary operations match tree rows
         # against the patch manifest they read. Read only when the page
         # loaded, that list knew nothing of what an import, a split dialog or
@@ -2221,6 +2154,7 @@ class GeometryPage(StepPage):
             self._toolLinks.setEnabled(True)
         if self._boundaries is not None:
             self._boundaries.setEnabled(True)
+            self._boundaries.setLocked(False)
         # The farfield entry has a condition of its own (an engine chosen).
         self._updateFarfieldEntry()
         self._updateAddEntry()
@@ -2234,6 +2168,9 @@ class GeometryPage(StepPage):
             self._toolLinks.setEnabled(False)
         if self._boundaries is not None:
             self._boundaries.setEnabled(False)
+            # DP-6096. The actions are also on the list's right-click menu,
+            # which the disabled widget does not reach.
+            self._boundaries.setLocked(True)
         # DP-B3. The banner stays enabled while the step is locked: it is the
         # page saying it is locked, and the one control that unlocks it.
         if self._lockBanner is not None:
@@ -2252,6 +2189,10 @@ class GeometryPage(StepPage):
         return dialog
 
     def _backupActor(self, actorInfo):
+        # DP-6089. A row the scene does not draw (yet) has nothing to dim;
+        # the editor still opens on it.
+        if actorInfo is None:
+            return
         self._actorsBackup.append((actorInfo, actorInfo.properties().opacity))
         actorInfo.setOpacity(0.1)
 

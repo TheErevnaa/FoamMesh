@@ -259,6 +259,10 @@ def _colour_map(key: str):
     return colormaps[key]
 
 
+#: ``colours`` by (scale, flip, banded, count).
+_COLOURS: dict = {}
+
+
 def colours(standard: Standard, worst_is_high: bool = True) -> list:
     """The table's colours, low value first, as ``(r, g, b)``.
 
@@ -266,15 +270,23 @@ def colours(standard: Standard, worst_is_high: bool = True) -> list:
     strong end at the worst value. ``worst_is_high=False`` turns the table
     round, and *Reverse* turns it again.
     """
-    cmap = _colour_map(standard.scale)
     flip = (not worst_is_high) != bool(standard.reverse)
     count = standard.bands or SMOOTH_ENTRIES
+    # Plan 50 (DP-6341). Every actor asks for a table; the colours for one
+    # scale, direction and band count are the same each time (500 surfaces:
+    # 2 s of colour-map calls on the GUI thread).
+    key = (standard.scale, flip, bool(standard.bands), count)
+    cached = _COLOURS.get(key)
+    if cached is not None:
+        return list(cached)
+    cmap = _colour_map(standard.scale)
     out = []
     for i in range(count):
         x = (i + 0.5) / count if standard.bands else i / (count - 1)
         if flip:
             x = 1.0 - x
         out.append(tuple(cmap(x)[:3]))
+    _COLOURS[key] = tuple(out)
     return out
 
 

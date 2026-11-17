@@ -12,6 +12,7 @@ import logging
 import time
 from collections import deque
 from typing import Protocol
+from foammesh.support.tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,9 @@ class DesktopPresentationRenderer:
         self._writing = []
         #: Plan 48 PA1. A worst-cell ranking started by the last op.
         self._pendingRanking = None
+        #: Plan 48 AG. A Keep larger / smaller or a stage comparison the last
+        #: op pressed, still being worked out.
+        self._pendingSection = None
 
     async def settle(self) -> None:
         """DP-2741. Wait, without holding the event loop, for the files the
@@ -102,6 +106,44 @@ class DesktopPresentationRenderer:
         for thread in writing:
             await asyncio.to_thread(thread.join)
         await self._settleRanking()
+        await self._settleSection()
+
+    #: Plan 48 AG. The longest an op waits for Keep larger / smaller or a
+    #: stage comparison to finish.
+    SECTION_SETTLE_SECONDS = 600.0
+
+    async def _settleSection(self) -> None:
+        """Plan 48 AG. Fill in what Keep or Compare left to finish.
+
+        Keep larger / smaller works its sides out off the GUI thread (or in
+        the section worker) and Compare cuts the kept stages in the
+        background; the answer is the panel once they are done.
+        """
+        import asyncio
+
+        pending = getattr(self, '_pendingSection', None)
+        self._pendingSection = None
+        if pending is None:
+            return
+        waiters, answer, cut, panel = pending
+        for key, waiter in waiters.items():
+            try:
+                done = await asyncio.wait_for(asyncio.shield(waiter),
+                                              self.SECTION_SETTLE_SECONDS)
+            except asyncio.TimeoutError:
+                answer[key].update(outcome='pending', note=(
+                    'still being worked out; the panel shows it when done'))
+                continue
+            except Exception as error:                     # noqa: BLE001
+                answer[key].update(outcome='failed', note=str(error))
+                continue
+            if key == 'keep':
+                why = (done or {}).get('why', '')
+                answer[key].update(outcome='failed' if why else 'set',
+                                   **({'note': why} if why else {}))
+            else:
+                answer[key].update(outcome='done')
+        self._sectionAnswer(cut, panel, answer)
 
     #: Plan 48 PA1. The longest an op waits for a worst-cell ranking.
     RANKING_SETTLE_SECONDS = 600.0
@@ -294,10 +336,10 @@ class DesktopPresentationRenderer:
                     'the preview notice does not offer that', details={
                         'action': action, 'offered': offered})
             if action == 'build_anyway':
-                import asyncio
                 manager = getattr(window, '_meshManager', None)
                 overlay._noticeDismissed = None
-                asyncio.ensure_future(manager.buildPreviewAnyway())
+                spawn(manager.buildPreviewAnyway(),
+                      what='Building the preview')
             else:
                 overlay.pressPreviewNotice(action)
         return self._answer(preview_notice=overlay.previewNoticeState())
@@ -877,20 +919,58 @@ class DesktopPresentationRenderer:
             sync = getattr(cut, '_syncGizmos', None)
             if callable(sync):
                 sync()
-        self._sectionExtras(panel, asked)
+        answer = {}
+        waiters = self._sectionExtras(cut, panel, asked, answer)
+        self._sectionAnswer(cut, panel, answer)
+        if waiters:
+            self._pendingSection = (waiters, answer, cut, panel)
+        return self._answer(section=answer)
+
+    def _sectionAnswer(self, cut, panel, answer) -> dict:
+        """What the section panel shows, into ``answer`` (Plan 48 AG: also
+        the planes' sides after Keep, the comparison after Compare)."""
         plane = panel.activePlane()
-        return self._answer(section={
+        answer.update({
             'enabled': cut.isSectionActive(), 'mode': panel.mode().value,
             'origin': [float(v) for v in plane.origin],
             'normal': [float(v) for v in plane.normal],
             **self._sectionDetails(panel)})
+        if 'keep' in answer:
+            answer['keep']['sides'] = [
+                {'plane': index, 'normal': [float(v) for v in state.normal]}
+                for index, state in enumerate(panel.planes())
+                if state.enabled]
+        if 'compare' in answer:
+            answer['compare'].update(results=panel.compareResults(),
+                                     legend=panel.compareLegend())
+        return answer
 
-    def _sectionExtras(self, panel, asked) -> None:
+    def _sectionExtras(self, cut, panel, asked, answer) -> dict:
         """Plan 48 PA1. The section panel's other controls, in the order the
-        panel lists them: side, how planes combine, the cell rule, solo, the
-        gizmo, the step, the sheet, and the PgUp/PgDn nudge."""
+        panel lists them: the plane's tick and sheet (AG), side, how planes
+        combine, the cell rule, solo, the gizmo, the step, the sheet, the
+        PgUp/PgDn nudge, then the colour scale, Keep and Compare (AG).
+
+        Answers ``{key: awaitable}`` for a press still being worked out."""
         from foammesh.core.section.pieces import CellRule, Combine
 
+        index = panel.activeIndex()
+        if 'plane_enabled' in asked:
+            # The plane row's tick, as a click: ``_planeToggled`` runs.
+            box = panel._enableBoxes[index]
+            if box.isChecked() != asked['plane_enabled']:
+                box.setChecked(asked['plane_enabled'])
+            if panel.planes()[index].enabled != asked['plane_enabled']:
+                self._refused('the plane tick did not change', plane=index,
+                              enabled=panel.planes()[index].enabled)
+        if 'sheet_visible' in asked:
+            # The plane row's sheet button (``_sheetToggled``).
+            button = panel._sheetButtons[index]
+            if not button.isEnabled():
+                self._refused(button.toolTip() or 'Turn the plane on first',
+                              plane=index)
+            if button.isChecked() != asked['sheet_visible']:
+                button.setChecked(asked['sheet_visible'])
         if asked.get('flip'):
             panel.flipActive()
         if 'combine' in asked:
@@ -924,6 +1004,72 @@ class DesktopPresentationRenderer:
                         panel.sectionStatus() or 'the plane could not be '
                         'moved: it is off, or there is no step to take',
                         step=panel.currentStep()[0])
+        return self._sectionPresses(cut, panel, asked, answer)
+
+    def _sectionPresses(self, cut, panel, asked, answer) -> dict:
+        """Plan 48 AG. The Scale combo, Rescale to cut, Keep larger /
+        smaller and Compare / Clear, pressed as a person presses them."""
+        from foammesh.core.section.pieces import ScalePolicy
+
+        waiters = {}
+        if 'colour_scale' in asked:
+            # With its signals on, so ``_scalePicked`` reaches the cut tool
+            # (``setScalePolicy`` is the tool's echo and blocks them).
+            box = panel._scaleBox
+            box.setCurrentIndex(box.findData(ScalePolicy(asked['colour_scale'])))
+        if asked.get('rescale'):
+            button = panel._rescaleButton
+            if not button.isEnabled():
+                self._refused(button.toolTip() or 'Rescale is not available')
+            button.click()
+        if 'keep' in asked:
+            button = (panel._largerButton if asked['keep'] == 'larger'
+                      else panel._smallerButton)
+            if not button.isEnabled():
+                self._refused(button.toolTip(), keep=asked['keep'],
+                              mode=panel.mode().value,
+                              enabled=len(panel.enabledPlanes()))
+            before = [list(state.normal) for state in panel.planes()]
+            button.click()
+            waiter = cut.keepPending()
+            answer['keep'] = {'which': asked['keep']}
+            if waiter is not None:
+                waiters['keep'] = waiter
+                answer['keep']['outcome'] = 'running'
+            elif before != [list(state.normal) for state in panel.planes()]:
+                answer['keep']['outcome'] = 'set'
+            else:
+                self._refused(panel.sectionStatus() or 'the pieces could not '
+                              'be weighed: no volume is on screen and no mesh '
+                              'on disk to ask', keep=asked['keep'])
+        compare = asked.get('compare')
+        if compare:
+            offered = list(panel._compareBoxes)
+            stages = compare.get('stages')
+            if stages is not None:
+                unknown = [stage for stage in stages if stage not in offered]
+                if unknown:
+                    self._invalid('the Compare stages group offers no such '
+                                  'stage', unknown=unknown, allowed=offered)
+                panel.setCompareStages(stages)
+            button = (panel._compareButton if compare['action'] == 'compare'
+                      else panel._compareClearButton)
+            if not button.isEnabled():
+                self._refused(
+                    'a comparison is being cut' if compare['action'] == 'compare'
+                    else 'no comparison is shown to clear',
+                    action=compare['action'])
+            button.click()
+            answer['compare'] = {'action': compare['action'],
+                                 'stages': panel.compareStages()}
+            task = (cut.stageComparePending()
+                    if compare['action'] == 'compare' else None)
+            if task is not None:
+                waiters['compare'] = task
+                answer['compare']['outcome'] = 'running'
+            else:
+                answer['compare']['outcome'] = 'done'
+        return waiters
 
     @staticmethod
     def _sectionDetails(panel) -> dict:
@@ -1090,8 +1236,21 @@ class DesktopPresentationRenderer:
         """Plan 48 PA1. The Elements group's status line and cell-type note."""
         status = getattr(panel, 'status', None)
         note = getattr(panel, 'kindNote', None)
+        # Plan 48 AG. The colour legend drawn over the viewport: its rows
+        # (label and colour) and its title, the Colour by choice. Empty
+        # while no legend is drawn.
+        rows = getattr(panel, 'legendRows', None)
+        legend = []
+        if callable(rows) and getattr(panel, '_legend', None) is not None:
+            legend = [{'label': str(label),
+                       'colour': [int(value) for value in colour]}
+                      for label, colour in rows()]
+        colour = getattr(panel, '_colour', None)
         return {'status': status() if callable(status) else '',
-                'kind_note': note() if callable(note) else ''}
+                'kind_note': note() if callable(note) else '',
+                'legend': legend,
+                'legend_title': (colour.currentText()
+                                 if legend and colour is not None else '')}
 
     def _elementPick(self, panel, key, value):
         """The combo entry ``value`` names, matched as the combo shows it."""
@@ -1234,7 +1393,26 @@ class DesktopPresentationRenderer:
                 run = None
         return {'attached': True, 'status_line': self._statusLine(),
                 **self._status.read(after=after), 'notices': notices,
-                'run_status': run}
+                'run_status': run, 'local_task': self._localTask(window)}
+
+    @staticmethod
+    def _localTask(window):
+        """Plan 48 AG. The status bar's mirror of a running load or export
+        (``LocalTaskStatus``): its name and stage, the elapsed time and
+        whether its Cancel is offered. ``None`` before any such task."""
+        mirror = getattr(window, '_localTaskStatus', None)
+        if mirror is None:
+            return None
+        try:
+            mirror.refresh()               # what its one-second timer does
+            shown = not mirror.isHidden()
+            return {'shown': shown,
+                    'text': mirror._label.text() if shown else '',
+                    'elapsed': mirror._elapsed.text() if shown else '',
+                    'cancelable': shown and not mirror._cancel.isHidden()}
+        except (AttributeError, RuntimeError):
+            logger.debug('local task status unreadable', exc_info=True)
+            return None
 
 
 #: DP-2768. Every name the renderer reaches on the window's own controls,
@@ -1279,7 +1457,9 @@ WINDOW_CONTROLS = {
         '_displayWireframe',
         '_displaySurface', '_displayWireSurfaceWithEdges'),
     'foammesh.view.display_control.cut_tool:CutTool': (
-        'isSectionActive', 'panel', '_syncGizmos'),
+        'isSectionActive', 'panel', '_syncGizmos',
+        # Plan 48 AG.
+        'keepPending', 'stageComparePending'),
     'foammesh.view.display_control.section_panel:SectionPanel': (
         'mode', 'setMode', 'activeIndex', 'planes', 'activePlane',
         'setPlaneGeometry', '_emitChanged', '_clearClicked',
@@ -1287,12 +1467,19 @@ WINDOW_CONTROLS = {
         'soloIndex', 'enabledPlanes', 'setLocked', 'setDragAxisKey',
         'setHandleVisible', 'setStepChoice', 'setTypedStep',
         'setSheetOpacity', 'nudge', 'currentStep', 'sectionStatus',
-        'readState'),
+        'readState',
+        # Plan 48 AG.
+        '_enableBoxes', '_sheetButtons', '_scaleBox', '_rescaleButton',
+        '_largerButton', '_smallerButton', '_compareBoxes',
+        '_compareButton', '_compareClearButton', 'setCompareStages',
+        'compareStages', 'compareResults', 'compareLegend'),
     'foammesh.view.display_control.element_display_panel:ElementDisplayPanel': (
         'isShown', 'notice', '_show', '_flag', '_nodeSize', '_lineWidth',
         '_shrink', '_sampling', '_normals', '_tangents', '_subEdges',
         '_colour', '_labelType', '_nodeStyle', '_kindBoxes', '_lightLines',
-        'status', 'kindNote'),
+        'status', 'kindNote',
+        # Plan 48 AG.
+        'legendRows', '_legend'),
     'foammesh.view.display_control.mesh_quality_info:MeshQualityInfo': (
         'worstChoice', 'setWorstChoice', 'setLimit', 'limitFor',
         'limitIsSet', 'highlightWorst', 'isHighlighting', 'band',
@@ -1309,6 +1496,9 @@ WINDOW_CONTROLS = {
         'setViewPreset', 'rollCameraBy', 'canGoBack', 'canGoForward',
         'background1', 'background2', 'measureBetween', 'clearMeasure',
         'noticeStrip'),
+    # Plan 48 AG. The status bar's local-task mirror.
+    'widgets.progress_dialog:LocalTaskStatus': (
+        'refresh', '_label', '_elapsed', '_cancel'),
 }
 
 def _plain(value):

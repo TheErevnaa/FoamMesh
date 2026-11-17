@@ -30,6 +30,7 @@ from foammesh.view.theming.status_colors import (
 from foammesh.view.display_control import view_modes
 from foammesh.view.main_window.mesh_lines_control import MeshLinesButton
 from foammesh.view.length_readout import format_extent
+from widgets import async_dialog
 
 
 #: Matches the buttons the viewport toolbar already carries.
@@ -2108,8 +2109,12 @@ class RenderingTool(QObject):
     def _saveScreenshotDialog(self):
         """The plain file dialog for the six formats (kept for scripts)."""
         filters = ';;'.join(self.tr(text) for _fmt, text in self.IMAGE_FILTERS)
-        path, selected = QFileDialog.getSaveFileName(
-            app.window, self.tr('Save image as'), '', filters)
+        # Plan 50 IP19: no nested event loop; saved once answered.
+        async_dialog.getSaveFileName(
+            app.window, self.tr('Save image as'), '', filters,
+            then=self._saveScreenshotChosen)
+
+    def _saveScreenshotChosen(self, path, selected):
         if not path:
             return
         fmt = None

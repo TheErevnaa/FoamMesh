@@ -138,11 +138,11 @@ class SplitDialog(QDialog):
         self._stlImporter = StlImporter()
 
         self._ui.featureAngleSlider.setValue(angle)
-        self._ui.featureAngleText.setValidator(QIntValidator(0, 180))
+        self._ui.featureAngleText.setValidator(QIntValidator(0, 180, self._ui.featureAngleText))
         self._ui.featureAngleText.setText(str(angle))
 
         self._ui.minAreaSlider.setRange(0, 100)
-        self._ui.minAreaText.setValidator(QDoubleValidator(0, 100, -1))
+        self._ui.minAreaText.setValidator(QDoubleValidator(0, 100, -1, self._ui.minAreaText))
 
         # DP-198. Both groups named their unit in their own title --
         # `Feature angle (deg)`, `Area threshold (%)` -- which put it at the
@@ -213,17 +213,12 @@ class SplitDialog(QDialog):
 
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
-        self._stlImporter.load(files)
+        #: DP-6093. The split that is running in the worker, if any.
+        self._splitting: Optional[asyncio.Future] = None
+        self._framed = False
+        self._files = files
 
         self._apply()
-
-        # R109. The preview used to open looking straight down the model axis,
-        # so a venturi rendered as one flat red disk and the four coloured
-        # segments the dialog exists to show were all hidden behind it; neither
-        # the 2D toggle nor fit-to-view changed that, only dragging by hand
-        # did. An isometric view shows the split from the start (setViewPreset
-        # fits as part of the move).
-        self._view.setViewPreset('isometric')
 
         self._connectSignalsSlots()
         if app.themeManager is not None:
@@ -302,10 +297,49 @@ class SplitDialog(QDialog):
         self._view.refresh()
 
     def _apply(self):
+        """Split at the fields' angle and smallest piece, off the GUI thread.
+
+        DP-6093. Reading the files and cutting them ran in this slot, and a
+        large model froze the window for as long as it took. The work goes
+        to a worker; Apply and OK wait for it. With no event loop running
+        (a unit test building the dialog) it runs here, as it used to.
+        """
         angle = float(self._ui.featureAngleText.text())
         minArea = float(self._ui.minAreaText.text()) / 100
 
-        segments, regionedData, edges = self._stlImporter.split(angle, minArea)
+        def work():
+            if self._files is not None:
+                self._stlImporter.load(self._files)
+                self._files = None
+            return self._stlImporter.split(angle, minArea)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._showSplit(*work())
+            return
+        if self._splitting is not None and not self._splitting.done():
+            return
+        self._ui.apply.setEnabled(False)
+        self._ui.okButton.setEnabled(False)
+        self._ui.numSegments.setText(self.tr('Splitting…'))
+
+        async def run():
+            found = None
+            try:
+                found = await asyncio.to_thread(work)
+            finally:
+                if not self._disposed:
+                    self._ui.okButton.setEnabled(True)
+                    if found is None:
+                        # A failed split may be tried again as it is.
+                        self._ui.apply.setEnabled(True)
+            if not self._disposed:
+                self._showSplit(*found)
+
+        self._splitting = loop.create_task(run())
+
+    def _showSplit(self, segments, regionedData, edges):
         self._regionedData = regionedData
         self._segments = list(segments)
         self._ranks = rankSegments(self._segments, regionedData)
@@ -329,6 +363,16 @@ class SplitDialog(QDialog):
         # This segmentation is now on screen; there is nothing to redo until
         # the angle or the minimum area changes.
         self._ui.apply.setEnabled(False)
+
+        if not self._framed:
+            # R109. The preview used to open looking straight down the model
+            # axis, so a venturi rendered as one flat red disk and the four
+            # coloured segments the dialog exists to show were all hidden
+            # behind it; neither the 2D toggle nor fit-to-view changed that,
+            # only dragging by hand did. An isometric view shows the split
+            # from the start (setViewPreset fits as part of the move).
+            self._framed = True
+            self._view.setViewPreset('isometric')
 
         self._view.refresh()
 
@@ -410,6 +454,8 @@ class SplitDialog(QDialog):
         return self._future
 
     def _okClicked(self):
+        if self._splitting is not None and not self._splitting.done():
+            return
         self._settle()
         if self._future is not None and not self._future.done():
             volumes, surfaces = self._stlImporter.identifyVolumes()

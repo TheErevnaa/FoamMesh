@@ -35,6 +35,7 @@ from foammesh.view.workflow_controls.length_box import (
     ModelLengthBox, format_model_units, length_cell,
 )
 from widgets.fit_to_text import FlowLayout
+from widgets import async_dialog
 
 COLUMN_NAME, COLUMN_TYPE, COLUMN_BACKGROUND, COLUMN_ON = range(4)
 
@@ -612,12 +613,15 @@ class NativeFieldsPanel(QWidget):
         return cell
 
     def _browse(self, edit, row, option) -> None:
-        chosen, _filter = QFileDialog.getOpenFileName(
-            self, self.tr('Choose a file'), edit.text() or '')
-        if chosen:
-            edit.setText(chosen)
-            self._set(row, option, chosen)
-            self._build_form(row)
+        def picked(chosen, _filter=''):
+            if chosen:
+                edit.setText(chosen)
+                self._set(row, option, chosen)
+                self._build_form(row)
+
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
+            self, self.tr('Choose a file'), edit.text() or '', then=picked)
 
     def _set(self, row, option, raw) -> None:
         """Store what was typed; an empty control means "Gmsh's default"."""
@@ -1052,11 +1056,11 @@ class SizeDataDialog(QDialog):
             self.set_path(path)
 
     def _browse(self) -> None:
-        chosen, _filter = QFileDialog.getOpenFileName(
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
             self, self.tr('Choose a data file'), self._path.text() or '',
-            self.tr('Size data (*.pos *.msh)'))
-        if chosen:
-            self.set_path(chosen)
+            self.tr('Size data (*.pos *.msh)'),
+            then=lambda chosen, _filter: chosen and self.set_path(chosen))
 
     def set_path(self, path: str) -> None:
         self._path.setText(path)

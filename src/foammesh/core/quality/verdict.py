@@ -105,7 +105,7 @@ def verdict_tier_line(verdict) -> str:
         f'Judged at the {TIER_NAMES[TIER_REPORT]} tier (non-orthogonality '
         f'above {limit:g} deg). The {TIER_NAMES[TIER_STRICT].lower()} and the '
         f'{TIER_NAMES[TIER_RELAXED].lower()} are the limits of the mesher, set on '
-        'Snap and Layers; they decide nothing here.')
+        'Refinement and Layers; they decide nothing here.')
 
 
 def _report_source(report: Any) -> str:

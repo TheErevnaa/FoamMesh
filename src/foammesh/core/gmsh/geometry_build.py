@@ -774,7 +774,25 @@ def available(kernel: str) -> tuple:
 # --------------------------------------------------------------------------- #
 
 def _entity_list(op, spec, raw) -> list:
-    items = [tuple(e) for e in (raw or ())]
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        raw = [raw]
+    items = []
+    for entity in (raw or ()):
+        if isinstance(entity, (int, float)) and not isinstance(entity, bool):
+            # DP-6147. A bare tag is taken for a field of one dimension; a
+            # field of any dimension needs the pair, and says so.
+            if spec.dim is None:
+                raise BuildRefusal(
+                    '%s takes [dimension, tag] pairs, for example [[2, 1]] '
+                    'for surface 1; %r is a bare number'
+                    % (spec.title, entity))
+            entity = (spec.dim, entity)
+        try:
+            items.append(tuple(entity))
+        except TypeError:
+            raise BuildRefusal('%s takes [dimension, tag] pairs, for '
+                               'example [[2, 1]]; got %r'
+                               % (spec.title, entity)) from None
     if not items:
         raise BuildRefusal('%s: pick at least one entity in the viewport'
                            % spec.title)
@@ -1448,6 +1466,12 @@ class GeometryBuilder:
                 for entity in raw or ():
                     dim, tag = int(entity[0]), int(entity[1])
                     new = maps['entity'].get((dim, tag))
+                    if (new is None and step.op_id == 'delete'
+                            and (dim, tag) not in maps.setdefault(
+                                'made', set())):
+                        # the imported solid: no step made it, so it is
+                        # the same entity after the kernel change (DP-6149)
+                        new = tag
                     if new is None:
                         raise BuildRefusal(
                             '%s uses %s %d, which no step built again on '
@@ -1481,6 +1505,7 @@ class GeometryBuilder:
             after = [t for d, t in new.created if d == dim]
             for was, now in zip(before, after):
                 maps['entity'][(dim, int(was))] = int(now)
+                maps.setdefault('made', set()).add((dim, int(was)))
             if len(before) != len(after):
                 notes.append('%s made %d %s, %s now makes %d; the ones '
                              'beyond %d are not carried over'

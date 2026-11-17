@@ -51,8 +51,12 @@ def sample() -> dict:
     snap = resource_budget.quick_snapshot()
     out['free'] = int(snap.available)
     out['total'] = int(snap.total)
-    out['reserve'] = int(snap.reserve + snap.wsl_vm)
-    out['short'] = snap.available < snap.reserve + snap.wsl_vm
+    # DP-6455 (DP-6401). The budget module's figures, not a second copy of
+    # its arithmetic: "available" already leaves out the WSL VM's pages, so
+    # the VM is not subtracted again; short is the module's budget run out.
+    out['reserve'] = int(snap.reserve)
+    out['budget'] = int(snap.budget)
+    out['short'] = snap.budget <= 0
     return out
 
 

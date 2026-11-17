@@ -17,6 +17,8 @@ the same limits the Import panel's "Time limit" box sets:
 ``gmsh.model.reclassify`` / ``gmsh.model.create_topology``
     The Import panel's "Reclassify" and "Create topology" buttons, with the
     time limit of the call (``time_limit``) when you want a different one.
+    With a window open, the Import panel then shows what it shows after the
+    button (``ag_gmsh_routes.run_import_action``).
 """
 from __future__ import annotations
 
@@ -26,6 +28,9 @@ from foammesh.core.facade.errors import (
     PreconditionFailedError, ValidationFailedError,
 )
 from foammesh.core.facade.operations import OperationDescriptor
+from foammesh.core.facade.plan48.ag_gmsh_routes import (
+    run_import_action, tell_import_panel,
+)
 from foammesh.core.facade.policy import ImpactClass
 from foammesh.core.facade.results import OperationResult
 
@@ -169,7 +174,7 @@ async def _create_topology(session, command) -> OperationResult:
             parameters.get('export_discrete', True), time_limit=limit)
 
     try:
-        answer = await asyncio.to_thread(work)
+        answer = await run_import_action(session, 'topology', work)
     except ga.ActionRefusal as error:
         raise _refused(error, 'topology') from error
     except RuntimeError as error:
@@ -187,6 +192,8 @@ async def _reclassify(session, command) -> OperationResult:
     try:
         formats.reclassify_arguments(**parameters)
     except formats.ImportRefusal as error:
+        # the button shows this refusal on the panel's status line
+        await tell_import_panel(session, 'failed', str(error))
         raise ValidationFailedError(str(error)) from error
     controller = _controller(session)
 
@@ -194,7 +201,7 @@ async def _reclassify(session, command) -> OperationResult:
         return controller.reclassify(time_limit=limit, **parameters)
 
     try:
-        answer = await asyncio.to_thread(work)
+        answer = await run_import_action(session, 'reclassify', work)
     except ga.ActionRefusal as error:
         raise _refused(error, 'reclassify') from error
     except RuntimeError as error:

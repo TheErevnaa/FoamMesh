@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from foammesh.view.main_window import shortcut_registry as registry_module
 from foammesh.view.main_window.shortcut_registry import GROUPS
+from widgets.async_dialog import getSaveFileName
 
 
 class ShortcutsDialog(QDialog):
@@ -251,12 +252,15 @@ class ShortcutsDialog(QDialog):
         return True
 
     def saveSheetAsPdf(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(
+        # Plan 50 IP19: asked without a nested event loop; an answer given at
+        # once still comes back to the caller.
+        written = []
+        getSaveFileName(
             self, self.tr('Save the shortcut sheet'),
-            'foammesh-shortcuts.pdf', self.tr('PDF (*.pdf)'))
-        if not path:
-            return False
-        return self._registry.write_sheet_pdf(path)
+            'foammesh-shortcuts.pdf', self.tr('PDF (*.pdf)'),
+            then=lambda path, _filter: written.append(
+                bool(path) and self._registry.write_sheet_pdf(path)))
+        return bool(written and written[0])
 
 
 def show(window) -> ShortcutsDialog:

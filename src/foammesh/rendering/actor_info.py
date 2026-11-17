@@ -676,7 +676,16 @@ class ActorInfo(QObject):
         return self._properties
 
     def bounds(self):
-        return Bounds(*self._dataSet.GetBounds())
+        """The data's extent, or ``None`` when the actor holds no data set.
+
+        Plan 50 ST-10 (DP-6340). ``getDisplayedBounds`` asked an actor whose
+        data set was gone and raised ``AttributeError`` out of the cut tool;
+        an actor with nothing in it has no place, and ``_union`` skips None.
+        """
+        data = self._dataSet
+        if data is None:
+            return None
+        return Bounds(*data.GetBounds())
 
     def isVisible(self):
         return self._properties.visibility
@@ -726,6 +735,7 @@ class ActorInfo(QObject):
         dropped, since they described the old data.
         """
         self._dataSet = dataSet
+        self._meanFaceSize = False
         self._precomputedSurface = getattr(like, '_precomputedSurface', None)
         self._precomputedEdges = getattr(like, '_precomputedEdges', None)
         self._wirePrecomputed()
@@ -778,6 +788,98 @@ class ActorInfo(QObject):
             self._actor.GetProperty().SetOpacity(shown)
         self._silhouette.GetProperty().SetOpacity(shown)
         self.appearanceChanged.emit()
+
+    # -- Plan 50 IP1: a base-grid wall, drawn from behind ------------------- #
+
+    #: Whether this part is drawn as far walls only: a face turned towards
+    #: the camera is culled, so a box around the model shows its far side and
+    #: the model in front of it (DP-6221).
+    _farWalls = False
+    #: How strongly its mesh lines are drawn, 0 to 1 (DP-6222).
+    _gridLineFade = 1.0
+    #: The side of a typical face; ``False`` until first asked.
+    _meanFaceSize = False
+
+    def farWalls(self) -> bool:
+        return self._farWalls
+
+    def setFarWalls(self, on: bool) -> None:
+        """Draw only the faces turned away from the camera (or all again).
+
+        The opacity is left alone: it is the caller's, and Display Control's.
+        """
+        on = bool(on)
+        if on == self._farWalls:
+            return
+        self._farWalls = on
+        if not on:
+            self._gridLineFade = 1.0
+        self._applyFarWallCulling()
+        if self._properties.highlighted:
+            self._highlightOn()
+        else:
+            self._applyDisplayMode(self._properties.displayMode)
+        self.appearanceChanged.emit()
+
+    def _cullsNearWalls(self) -> bool:
+        return self._farWalls
+
+    def _applyFarWallCulling(self) -> None:
+        self._actor.GetProperty().SetFrontfaceCulling(
+            bool(self._cullsNearWalls()))
+
+    def gridLineFade(self) -> float:
+        return self._gridLineFade
+
+    def setGridLineFade(self, fade: float) -> bool:
+        """How strongly a far wall's lines are drawn; whether it changed."""
+        fade = min(max(float(fade), 0.0), 1.0)
+        if abs(fade - self._gridLineFade) < 1e-3:
+            return False
+        self._gridLineFade = fade
+        if (self._farWalls and not self._properties.highlighted
+                and self._properties.displayMode is DisplayMode.SURFACE_EDGE):
+            self._applySurfaceEdgeMode()
+        return True
+
+    def _edgeOpacity(self, style) -> float:
+        """How much of the line colour the edges carry in surface-with-edges."""
+        if not self._farWalls:
+            return style.opacity
+        from foammesh.core.mesh.presentation import grid_edge_mix
+        return grid_edge_mix(style.opacity, self._gridLineFade, EDGE_OPACITY)
+
+    def meanFaceSize(self):
+        """The side of a typical face of this part's data, or ``None``.
+
+        Worked out once per data set (``setDataSet`` forgets it).
+        """
+        if self._meanFaceSize is not False:
+            return self._meanFaceSize
+        size = None
+        data = self._dataSet
+        try:
+            count = data.GetNumberOfCells() if data is not None else 0
+            if count > 0:
+                from vtkmodules.vtkFiltersVerdict import vtkCellSizeFilter
+                from foammesh.core.mesh.presentation import typical_face_size
+                sizes = vtkCellSizeFilter()
+                sizes.SetInputData(data)
+                sizes.ComputeVertexCountOff()
+                sizes.ComputeLengthOff()
+                sizes.ComputeVolumeOff()
+                sizes.ComputeAreaOn()
+                sizes.ComputeSumOn()
+                sizes.Update()
+                total = sizes.GetOutput().GetFieldData().GetArray('Area')
+                if total is not None and total.GetNumberOfTuples() > 0:
+                    size = typical_face_size(total.GetValue(0), count)
+        except Exception:                                   # noqa: BLE001
+            logging.getLogger(__name__).debug(
+                'face size of %s not measured', self._id, exc_info=True)
+            size = None
+        self._meanFaceSize = size
+        return size
 
     def _applyDepthBias(self, units: float):
         self._mapper.SetResolveCoincidentTopologyToPolygonOffset()
@@ -1304,7 +1406,7 @@ class ActorInfo(QObject):
         self._actor.GetProperty().SetRepresentationToSurface()
         self._actor.GetProperty().EdgeVisibilityOn()
         self._actor.GetProperty().SetLineWidth(style.width)
-        self._setEdgeOpacity(style.opacity)
+        self._setEdgeOpacity(self._edgeOpacity(style))
         if not self._properties.highlighted:
             self._actor.GetProperty().SetEdgeColor(*rgb(self._meshLineColor()))
         self._silhouette.SetVisibility(self._properties.visibility)
@@ -1644,6 +1746,7 @@ class MeshActor(ActorInfo):
         surface = self._precomputedSurface
         props = self._properties
         if (surface is None or props is None or not props.visibility
+                or self._farWalls
                 or self.effectiveOpacity() < 1.0 or props.highlighted
                 or props.displayMode is DisplayMode.WIREFRAME
                 or not self._precomputedActive() or self.isCutting()
@@ -1725,6 +1828,11 @@ class MeshActor(ActorInfo):
         super()._applySurfaceEdgeMode()
         if self._skinOn:
             self._actor.GetProperty().EdgeVisibilityOff()
+
+    def _cullsNearWalls(self) -> bool:
+        # Plan 50 IP1. Only the uncut exterior is a box seen from outside: a
+        # section's cut faces point every way and would lose half of them.
+        return self._farWalls and self._precomputedActive()
 
     # -- Plan 39 VI2: cuts and bands over the volume, off the GUI thread ----- #
 
@@ -1926,6 +2034,8 @@ class MeshActor(ActorInfo):
         self._invalidateLevelOfDetail()
         for stage in reversed(old):
             stage.RemoveAllInputConnections(0)
+        if self._farWalls:
+            self._applyFarWallCulling()
         self.appearanceChanged.emit()
 
     def _applyCellState(self):
@@ -2351,7 +2461,9 @@ class BoundaryActor(ActorInfo):
             and props.displayMode is not DisplayMode.WIREFRAME
             and self._faceScalarName is None
             and self._precomputedActive()
-            and not any(self._actor.GetPosition()))
+            and not any(self._actor.GetPosition())
+            # Plan 50 IP1. A base-grid wall draws its own (far) faces.
+            and not self._farWalls)
 
     def skinColour(self) -> tuple:
         colour = self._currentSurfaceColor()
@@ -2534,6 +2646,33 @@ class ExcludeMarkerActor(RegionMarkerActor):
         return cls(source.GetOutput(), f'exclude:{point_id}', str(name))
 
 
+#: The opacity a model surface starts with: a little see-through.
+GEOMETRY_OPACITY = 0.9
+#: Plan 50 DP-6341 (user, 2026-11-12). Past this many surfaces the starting
+#: opacity is drawn solid. Each see-through surface and its outline is drawn
+#: in every depth-peeling pass, so 500 of them cost 350-550 ms a repaint and
+#: about 2 s for the first one. A fade, a Display Control opacity other than
+#: the starting one, and the route's Surface opacity still draw see-through.
+MANY_SURFACES = 100
+_geometryActors = weakref.WeakSet()
+
+
+def manySurfaces() -> bool:
+    return len(_geometryActors) > MANY_SURFACES
+
+
+def _surfaceCountChanged(wasMany: bool) -> None:
+    """Redraw every surface's opacity when the count crosses MANY_SURFACES."""
+    if manySurfaces() == wasMany:
+        return
+    for actor in list(_geometryActors):
+        try:
+            actor.applyRouteOpacity()
+        except RuntimeError:
+            pass                                   # a destroyed C++ object
+    refreshTranslucency()
+
+
 class GeometryActor(ActorInfo):
     #: Plan 48 OP. The model's own surfaces take the route's Surface opacity.
     ROUTE_OPACITY = True
@@ -2541,9 +2680,25 @@ class GeometryActor(ActorInfo):
     def __init__(self, dataSet, id_, name):
         super().__init__(dataSet, id_, name, ActorType.GEOMETRY)
 
-        self.setOpacity(0.9)
+        wasMany = manySurfaces()
+        _geometryActors.add(self)
+        self.setOpacity(GEOMETRY_OPACITY)
         self._silhouetteTask = None
         self._computeSilhouetteLater()
+        _surfaceCountChanged(wasMany)
+
+    def effectiveOpacity(self) -> float:
+        own = self._properties.opacity if self._properties is not None else None
+        if own == GEOMETRY_OPACITY and manySurfaces():
+            active = activeSurfaceOpacity()
+            return 1.0 if active is None else active
+        return super().effectiveOpacity()
+
+    def dispose(self, renderWindow=None):
+        wasMany = manySurfaces()
+        _geometryActors.discard(self)
+        super().dispose(renderWindow)
+        _surfaceCountChanged(wasMany)
 
     def setDataSet(self, dataSet, *, like=None):
         super().setDataSet(dataSet, like=like)

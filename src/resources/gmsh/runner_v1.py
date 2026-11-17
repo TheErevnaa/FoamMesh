@@ -41,6 +41,15 @@ import time
 import traceback
 from pathlib import Path
 
+# Plan 50 IP18 (DP-6320, GM-8). The whole-mesh measures read the mesh as
+# arrays. numpy is in the runtime distro's Python (the resident session has
+# always imported it); a runtime without it is refused before anything is
+# meshed, by :func:`require_numpy`, rather than failing after the mesh.
+try:
+    import numpy
+except ImportError:  # pragma: no cover - only a runtime without numpy
+    numpy = None
+
 # Shell classification lives next door because it is pure geometry: no Gmsh,
 # so it can be tested without a runtime. Running this file as a script already
 # puts its directory on the path; loading it as a module by file does not.
@@ -51,12 +60,14 @@ try:
     from layer_targets import (
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
+    from layer_scale import merge_spots, thin_spots
     import farfield_primitives
     import native_fields_v1
     import point_sizes_v1
     import entity_controls_v1
     import structure_v1
     import sizefield_consumer_v1
+    import gmsh_startup_v1
     from stages import (
         StageRun, InvalidSurfaceMesh, Ledger, LayerCollision, LayerFold,
         LayerLanding, MeshFailure, SurfaceCrossing, TESTED_RECOMBINERS,
@@ -69,12 +80,14 @@ except ImportError:  # pragma: no cover - exercised only by the module loader
     from layer_targets import (
         MODE_ALL_WALLS, eligible_wall_names, normalise_mode)
     from quantities import agreeing, count_text
+    from layer_scale import merge_spots, thin_spots
     import farfield_primitives
     import native_fields_v1
     import point_sizes_v1
     import entity_controls_v1
     import structure_v1
     import sizefield_consumer_v1
+    import gmsh_startup_v1
     from stages import (
         StageRun, InvalidSurfaceMesh, Ledger, LayerCollision, LayerFold,
         LayerLanding, MeshFailure, SurfaceCrossing, TESTED_RECOMBINERS,
@@ -121,6 +134,58 @@ RUNNER_VERSION = 'gmsh-runner-v1'
 
 class ContractFailure(RuntimeError):
     """The job does not satisfy the contract this runner implements."""
+
+
+#: Plan 50 IP18 (DP-6320). The text a runtime without numpy is refused with.
+NUMPY_MISSING = (
+    'numpy is not installed for the Python that runs Gmsh in this runtime, '
+    'and the runner measures the mesh with it. Install it in the runtime '
+    'distro (python3-numpy, or pip install numpy for that interpreter) and '
+    'run the mesh again.')
+
+
+def require_numpy():
+    """The numpy module, or a refusal that says how to install it.
+
+    A :class:`ContractFailure`, not a :class:`MeshFailure`: no retry rung can
+    cure a missing module, so none of them catches it.
+    """
+    if numpy is None:
+        raise ContractFailure(NUMPY_MISSING)
+    return numpy
+
+
+#: How many elements an array measure takes at once, so a 150 M-cell mesh is
+#: measured in slices rather than copied whole into a coordinate block.
+MEASURE_CHUNK = 1_000_000
+
+
+def node_table(mesh):
+    """``(lookup, xyz)`` for every node: ``xyz[lookup[tag]]`` is its place.
+
+    Plan 50 IP18 (DP-6320). One ``getNodes`` call replaces a ``getNode``
+    call per node. ``lookup`` is ``-1`` for a tag the mesh does not hold.
+    """
+    np = require_numpy()
+    tags, coords, _params = mesh.getNodes()
+    tags = np.asarray(tags, dtype=np.int64).ravel()
+    xyz = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+    if len(xyz) < len(tags):
+        raise MeshFailure('Gmsh returned fewer node coordinates than nodes')
+    lookup = np.full(int(tags.max()) + 1 if len(tags) else 1, -1,
+                     dtype=np.int64)
+    lookup[tags] = np.arange(len(tags), dtype=np.int64)
+    return lookup, xyz
+
+
+def element_points(lookup, xyz, connectivity):
+    """The coordinates of each element's nodes, ``(elements, nodes, 3)``."""
+    if len(connectivity) and int(connectivity.max()) >= len(lookup):
+        raise MeshFailure('an element names a node the mesh does not hold')
+    index = lookup[connectivity]
+    if len(index) and int(index.min()) < 0:
+        raise MeshFailure('an element names a node the mesh does not hold')
+    return xyz[index]
 
 
 
@@ -612,23 +677,59 @@ def gamma_or_sicn(mesh, tags):
     still reads at or below 0, so the gate's inverted count keeps its
     meaning)."""
     values = list(mesh.getElementQualities(tags, 'gamma'))
-    zero = [index for index, value in enumerate(values) if value == 0.0]
+    if numpy is not None:
+        zero = numpy.flatnonzero(
+            numpy.asarray(values, dtype=numpy.float64) == 0.0).tolist()
+    else:  # pragma: no cover - the run refuses a runtime without numpy
+        zero = [index for index, value in enumerate(values) if value == 0.0]
     if not zero:
         return values
-    names = {}
-    redo = []
-    for index in zero:
-        etype = mesh.getElement(int(tags[index]))[0]
-        if etype not in names:
-            names[etype] = mesh.getElementProperties(etype)[0]
-        if names[etype].startswith(GAMMA_UNDEFINED):
-            redo.append(index)
+    redo = _gamma_undefined_by_type(mesh, tags, zero)
+    if redo is None:
+        names = {}
+        redo = []
+        for index in zero:
+            etype = mesh.getElement(int(tags[index]))[0]
+            if etype not in names:
+                names[etype] = mesh.getElementProperties(etype)[0]
+            if names[etype].startswith(GAMMA_UNDEFINED):
+                redo.append(index)
     if redo:
         sicn = mesh.getElementQualities([tags[index] for index in redo],
                                         'minSICN')
         for index, value in zip(redo, sicn):
             values[index] = value
     return values
+
+
+#: Plan 50 IP18 (DP-6320). Below this many zero-gamma elements the type of
+#: each is asked one at a time; above it, once per element type.
+GAMMA_LOOKUP_BY_TYPE = 64
+
+
+def _gamma_undefined_by_type(mesh, tags, zero):
+    """The indices in *zero* whose element type has no gamma, or ``None``.
+
+    Plan 50 IP18 (DP-6320, GM-8). A hexahedral or pyramid mesh reads gamma 0
+    on every cell, and the type of each was asked with one ``getElement``
+    call per cell. The tags of each type are read once instead
+    (``getElementTypes`` / ``getElementsByType``). ``None`` when there are
+    few zeros, or the API offers no such call, and the caller asks per cell.
+    """
+    if (numpy is None or len(zero) < GAMMA_LOOKUP_BY_TYPE
+            or not hasattr(mesh, 'getElementTypes')
+            or not hasattr(mesh, 'getElementsByType')):
+        return None
+    undefined = []
+    for etype in mesh.getElementTypes():
+        if mesh.getElementProperties(etype)[0].startswith(GAMMA_UNDEFINED):
+            undefined.append(numpy.asarray(
+                mesh.getElementsByType(etype)[0], dtype=numpy.int64).ravel())
+    if not undefined:
+        return []
+    zero = numpy.asarray(zero, dtype=numpy.int64)
+    chosen = numpy.asarray(tags, dtype=numpy.int64).ravel()[zero]
+    return zero[numpy.isin(chosen, numpy.concatenate(undefined))].tolist()
 
 
 def element_qualities(mesh, tags, native):
@@ -677,6 +778,291 @@ class _Classification:
     def __init__(self, angle, reparametrize):
         self.angle = float(angle)
         self.reparametrize = bool(reparametrize)
+
+
+# -- Plan 50 IP18 (DP-6321): a retry re-enters after the import ------------ #
+#
+# A retry of the ladder below (a thinner layer, no layer, another surface
+# algorithm) changes nothing the import reads, yet each one imported, healed,
+# fused and cut the farfield again. The first run of a CAD job now leaves the
+# model as it stood after the import and the geometry build in a BRep in the
+# scratch folder, with its own state; a retry whose job differs only in what
+# comes after the import restores that and starts at the sizing. The restore
+# is checked entity by entity (tags and bounding boxes); a model that does not
+# come back the same is imported again, and the run says so.
+
+#: The job's ``intent`` keys no import stage reads. A retry that changes only
+#: these may re-enter after the import.
+POST_IMPORT_INTENT = ('layers', 'algorithms')
+
+#: The folder checkpoints are written in: the run's scratch folder, set by
+#: :func:`main`. ``None`` writes none.
+CHECKPOINT_FOLDER = None
+
+#: ``{import key: ImportCheckpoint}`` for this runner process.
+IMPORT_CHECKPOINTS: dict = {}
+
+#: Run attributes a checkpoint does not carry: the new run's own.
+CHECKPOINT_EXCLUDED = frozenset((
+    'gmsh', 'reporter', 'job', 'intent', 'logging', 'outcome', 'entered_at',
+    'entry_note', 'import_key'))
+
+#: Importer options a restore sets to neutral, so the BRep is read back
+#: exactly as it was written: no scaling or repair.
+RESTORE_NEUTRAL = (('Geometry.OCCScaling', 1.0),
+                   ('Geometry.OCCFixDegenerated', 0.0),
+                   ('Geometry.OCCFixSmallEdges', 0.0),
+                   ('Geometry.OCCFixSmallFaces', 0.0),
+                   ('Geometry.OCCSewFaces', 0.0),
+                   ('Geometry.OCCMakeSolids', 0.0),
+                   ('Geometry.OCCAutoFix', 0.0))
+
+#: Geometry options the import may have set, put back after a restore so the
+#: stages after it read what the first run's did.
+CHECKPOINT_OPTIONS = (
+    'Geometry.Tolerance', 'Geometry.ToleranceBoolean',
+    'Geometry.OCCTargetUnit', 'Geometry.OCCScaling',
+    'Geometry.OCCFixDegenerated', 'Geometry.OCCFixSmallEdges',
+    'Geometry.OCCFixSmallFaces', 'Geometry.OCCSewFaces',
+    'Geometry.OCCMakeSolids', 'Geometry.OCCAutoFix',
+    'Geometry.OCCImportLabels', 'Geometry.OCCParallel',
+    'Geometry.OCCBooleanPreserveNumbering',
+    'Geometry.MatchMeshTolerance')
+
+#: Plan 50 IP18 (DP-6322). One cap on every Gmsh run a job may make, across
+#: every rung of the retry ladder. The rungs nest (a layer refit inside a
+#: smaller-patch retry inside a surface-algorithm retry inside a layerless
+#: retry), so their own limits multiplied to well over a hundred runs. One
+#: whole surface rung -- the first run refitted three times, each patch size
+#: once, the facets refitted three times -- is 3 + 3 + 3 = 9; the cap leaves
+#: room for that and one more surface algorithm or the layerless run.
+RUN_ATTEMPT_CAP = 16
+
+
+class RetryCapReached(RuntimeError):
+    """The job used every run :data:`RUN_ATTEMPT_CAP` allows.
+
+    Not a :class:`MeshFailure`, so no rung catches it and tries again.
+    """
+
+
+# -- DP-6470: a job already run is not run again ---------------------------- #
+#
+# MEASURED (Plan 50 walk, STEP duct, 20 mm layer): six runs, the last three
+# the first three again outcome for outcome, because the "facets as supplied"
+# rung re-ran the layer fit on a CAD job, where that setting changes nothing.
+# Gmsh is deterministic for one job on one thread count, so a job this runner
+# already ran is answered with the outcome it had, not run again.
+
+#: ``intent.healing`` keys only the tessellated importer reads.
+FACET_ONLY_HEALING = ('keepTessellation', 'reparamMaxTriangles')
+
+#: ``[{'reason', 'sameAs', 'outcome'}]``: the repeats this runner process
+#: declined to run, for ``result['attempts']['skipped']``.
+SKIPPED_REPEATS: list = []
+
+
+def only_cad_sources(job) -> bool:
+    """True when every source of *job* is CAD (none is a triangulation)."""
+    sources = (job or {}).get('geometry') or ()
+    if isinstance(sources, str):
+        sources = [sources]
+    return bool(sources) and not any(
+        str(item).lower().endswith(('.stl', '.obj', '.ply'))
+        for item in sources)
+
+
+def attempt_key(job) -> str:
+    """What decides the outcome of a run of *job*, as comparable text.
+
+    The retry reason is not part of it, and on a job whose sources are all
+    CAD neither are the settings only the tessellated importer reads.
+    """
+    document = copy.deepcopy(job) if isinstance(job, dict) else {}
+    document.pop('retry', None)
+    if only_cad_sources(document):
+        healing = (document.get('intent') or {}).get('healing')
+        if isinstance(healing, dict):
+            for key in FACET_ONLY_HEALING:
+                healing.pop(key, None)
+    return json.dumps(document, sort_keys=True, default=str)
+
+
+def import_key(job) -> str:
+    """What the import of *job* depends on, as text two jobs can compare."""
+    document = copy.deepcopy(job) if isinstance(job, dict) else {}
+    document.pop('retry', None)
+    intent = document.get('intent')
+    if isinstance(intent, dict):
+        for key in POST_IMPORT_INTENT:
+            intent.pop(key, None)
+    return json.dumps(document, sort_keys=True, default=str)
+
+
+def mark_retry(document, reason):
+    """Say on a retry's job why it is being run; returns *document*."""
+    document['retry'] = {'reason': str(reason)}
+    return document
+
+
+def model_inventory(gmsh) -> dict:
+    """``{'d:t': bounding box}`` of every entity, rounded to the model size."""
+    entities = list(gmsh.model.getEntities())
+    try:
+        whole = gmsh.model.getBoundingBox(-1, -1)
+        scale = max(math.dist(whole[0:3], whole[3:6]), 1e-12)
+    except Exception:                                    # noqa: BLE001
+        scale = 1.0
+    inventory = {}
+    for dim, tag in entities:
+        try:
+            box = gmsh.model.getBoundingBox(int(dim), int(tag))
+        except Exception:                                # noqa: BLE001
+            box = ()
+        inventory[f'{int(dim)}:{int(tag)}'] = [
+            round(float(value) / scale, 7) for value in box]
+    return inventory
+
+
+def inventory_differences(before: dict, after: dict) -> list:
+    """What differs between two inventories, as sentences; ``[]`` if none."""
+    out = []
+    missing = sorted(set(before) - set(after))
+    extra = sorted(set(after) - set(before))
+    if missing:
+        out.append(f'{len(missing)} entities did not come back '
+                   f'(first {missing[0]})')
+    if extra:
+        out.append(f'{len(extra)} entities came back that were not saved '
+                   f'(first {extra[0]})')
+    moved = [key for key in sorted(set(before) & set(after))
+             if before[key] != after[key]]
+    if moved:
+        out.append(f'{len(moved)} entities came back somewhere else '
+                   f'(first {moved[0]})')
+    return out
+
+
+def _read_option(gmsh, name):
+    try:
+        return ('number', gmsh.option.getNumber(name))
+    except Exception:                                    # noqa: BLE001
+        pass
+    try:
+        return ('string', gmsh.option.getString(name))
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _write_option(gmsh, name, saved):
+    kind, value = saved
+    try:
+        if kind == 'number':
+            gmsh.option.setNumber(name, value)
+        else:
+            gmsh.option.setString(name, value)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+class ImportCheckpoint:
+    """The model after the import, its options and the run's state."""
+
+    __slots__ = ('path', 'inventory', 'options', 'state')
+
+    def __init__(self, path, inventory, options, state):
+        self.path = path
+        self.inventory = inventory
+        self.options = options
+        self.state = state
+
+
+def _short(error, limit=300) -> str:
+    text = f'{type(error).__name__}: {error}'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def attempt_report(attempts) -> dict:
+    """``result['attempts']``: every Gmsh run the job made, and why.
+
+    Plan 50 IP18 (DP-6322). ``count`` runs of at most ``cap``; each run says
+    where it entered (``import``, or ``after import`` when it restored the
+    first run's checkpoint), why it was run, and how it ended.
+    """
+    runs = []
+    for number, run in enumerate(attempts or (), 1):
+        job = getattr(run, 'job', None)
+        retry = job.get('retry') if isinstance(job, dict) else None
+        reason = retry.get('reason') if isinstance(retry, dict) else None
+        row = {'attempt': number,
+               'enteredAt': getattr(run, 'entered_at', 'import'),
+               'reason': reason or ('the first run' if number == 1
+                                    else 'a retry'),
+               'outcome': getattr(run, 'outcome', 'not finished')}
+        note = getattr(run, 'entry_note', '')
+        if note:
+            row['entryNote'] = note
+        runs.append(row)
+    report = {'count': len(runs), 'cap': RUN_ATTEMPT_CAP, 'runs': runs}
+    if SKIPPED_REPEATS:
+        # DP-6470. A retry that asked for a job already run, and was
+        # answered with that run's outcome instead of a run.
+        report['skipped'] = [dict(row) for row in SKIPPED_REPEATS]
+    return report
+
+
+def run_and_record_outcome(run):
+    """``run.execute()``, leaving on the run how it ended (DP-6322)."""
+    try:
+        document = run.execute()
+    except BaseException as error:
+        run.outcome = 'failed: ' + _short(error)
+        if isinstance(error, Exception):
+            # DP-6470. Kept so a later ask for the same job is answered
+            # with this outcome rather than run again.
+            run.error = error
+        raise
+    run.outcome = 'succeeded'
+    return document
+
+
+def refuse_a_repeat(attempts, job) -> None:
+    """Raise the outcome of an earlier run of the same job (DP-6470).
+
+    The same exception, so every rung above reacts to it exactly as it did
+    the first time, and goes on to a job that differs or ends the run.
+    """
+    if not attempts:
+        return
+    key = attempt_key(job)
+    for number, run in enumerate(attempts, 1):
+        error = getattr(run, 'error', None)
+        if error is None or attempt_key(getattr(run, 'job', None)) != key:
+            continue
+        retry = job.get('retry') if isinstance(job, dict) else None
+        SKIPPED_REPEATS.append({
+            'reason': (retry.get('reason') if isinstance(retry, dict)
+                       else '') or 'a retry',
+            'sameAs': number,
+            'outcome': getattr(run, 'outcome', '')})
+        raise error
+
+
+def ensure_attempt_allowed(attempts, job):
+    """Refuse another run once :data:`RUN_ATTEMPT_CAP` runs have been made,
+    and answer a job already run with its outcome (DP-6470)."""
+    if attempts is None or len(attempts) < RUN_ATTEMPT_CAP:
+        refuse_a_repeat(attempts, job)
+        return
+    tried = '; '.join(
+        f'{row["attempt"]}: {row["reason"]} ({row["outcome"]})'
+        for row in attempt_report(attempts)['runs'])
+    retry = job.get('retry') if isinstance(job, dict) else None
+    wanted = (retry.get('reason') if isinstance(retry, dict) else '') \
+        or 'another run'
+    raise RetryCapReached(
+        f'the job was run {len(attempts)} times, the most one job may be, '
+        f'and one more was wanted ({wanted}). The runs were: {tried}.')
 
 
 class GmshRun(StageRun):
@@ -728,8 +1114,13 @@ class GmshRun(StageRun):
     def initialise(self):
         import gmsh
 
+        # Plan 50 IP18 (DP-6320). Refused before Gmsh starts, not after the
+        # mesh is made and the first measure needs it.
+        require_numpy()
         self.gmsh = gmsh
-        gmsh.initialize()
+        # Plan 50 IP6 (DP-6250): Gmsh starts as the session starts it, with
+        # no environment and none of the user's config files.
+        gmsh_startup_v1.initialize(gmsh)
         gmsh.option.setNumber('General.Terminal', 0)
         # Plan 31 FC-B. Gmsh names the algorithm it meshed each surface with,
         # and that line is the only place the *actual* algorithm appears: when
@@ -1092,7 +1483,7 @@ class GmshRun(StageRun):
         'except Exception:\n'
         '    pass\n'
         'import gmsh\n'
-        'gmsh.initialize()\n'
+        + gmsh_startup_v1.INITIALIZE_SOURCE +
         'gmsh.option.setNumber("General.Terminal", 0)\n'
         'angle = float(sys.argv[1])\n'
         'reparametrize = int(sys.argv[2])\n'
@@ -2156,6 +2547,9 @@ class GmshRun(StageRun):
         for name, option, requested, effective in result['applied']:
             self.ledger.record(f'structure:{name}/{option}', requested,
                                effective)
+        # The curve rows join the curve controls' table, so the count each
+        # produced is checked against what it asked for.
+        self.transfinite_curves.update(result.get('curves') or {})
         self.statistics['structure'] = {'applied': result['count']}
 
     def measure_structure_rows(self):
@@ -2534,6 +2928,7 @@ class GmshRun(StageRun):
         worst = None
         folded = 0
         total = 0
+        spots = []
         for base, top in self.layer_columns:
             low = self.surface_facets(base, points)
             high = self.surface_facets(top, points)
@@ -2548,16 +2943,40 @@ class GmshRun(StageRun):
                     continue
                 if value <= 1.0:
                     folded += 1
+                    # Plan 50 IP28 (DP-6436). The fold parameter is a
+                    # fraction of the displacement this facet actually grew,
+                    # so what the wall carries here is that fraction of the
+                    # facet's own grown height -- right under a local fit too.
+                    grown = sum(math.sqrt(sum(
+                        (other[corner][axis] - one[corner][axis]) ** 2
+                        for axis in range(3))) for corner in range(3)) / 3.0
+                    spots.append([
+                        sum(point[axis] for point in one) / 3.0
+                        for axis in range(3)] + [value * grown, int(base)])
                 if worst is None or value < worst[0]:
                     worst = (value, base, tuple(
                         sum(point[axis] for point in one) / 3.0
                         for axis in range(3)))
-        self.record_layer_fit(asked, total, folded, worst)
+        names = {}
+        for spot in spots:
+            base = spot[4]
+            if base not in names:
+                names[base] = self.surface_patch_name(base)[0]
+            spot[4] = names[base]
+        self.record_layer_fit(asked, total, folded, worst, spots)
 
-    def record_layer_fit(self, asked, total, folded, worst):
+    def record_layer_fit(self, asked, total, folded, worst, spots=()):
         """Publish what the fit reading found, and refuse if it folded."""
         if worst is None:
             return
+        # Plan 50 IP28 (DP-6436). A fold confined to a few places is fitted
+        # there; one spread over more than a quarter of the layer is a stack
+        # too thick for the wall as a whole, and the whole stack is refitted.
+        spots = [list(item) for item in spots]
+        if total and len(spots) > LOCAL_FIT_SHARE * total:
+            spots = []
+        for spot in spots:
+            spot[3] *= LAYER_FIT_MARGIN
         carries = worst[0] * asked
         patch = self.surface_patch_name(worst[1])[0]
         place = tuple(round(value, 9) for value in worst[2])
@@ -2570,6 +2989,9 @@ class GmshRun(StageRun):
                 'foldedFacets': folded,
                 'limitPatch': patch,
                 'limitAt': list(place),
+                # Plan 50 IP28 (DP-6436): the folded places a local refit
+                # thins (0 when the whole stack is refitted).
+                'localSpots': len(spots),
             }
         if not folded:
             return
@@ -2590,7 +3012,7 @@ class GmshRun(StageRun):
             f'{patch} at ({place[0]:.6g}, {place[1]:.6g}, {place[2]:.6g}), '
             f'where the wall carries {carries:.6g} m.',
             carries=carries, asked=asked, folded=folded, patch=patch,
-            at=place)
+            at=place, spots=spots)
 
     def layer_cell_tags(self):
         """The cells the boundary-layer extrusion made, by element tag.
@@ -2751,24 +3173,30 @@ class GmshRun(StageRun):
             gmsh.model.mesh, all_tags, QUALITY_QUERY_NAME[measure])
 
         threshold = float(limit.get('minQuality', limit.get('minimum', 0.0)) or 0.0)
-        inverted = sum(1 for item in values if item <= 0)
+        # Plan 50 IP18 (DP-6320). Counted as arrays: these ran over every
+        # element of every job in Python.
+        np = require_numpy()
+        array = np.asarray(values, dtype=np.float64).ravel()
+        inverted = int((array <= 0).sum())
         judged, layer_block = self.split_off_the_layer(values, all_tags,
                                                        threshold)
-        below = [index for index in judged if values[index] < threshold]
+        judged = np.asarray(judged, dtype=np.int64).ravel()
+        kept = array[judged]
+        below = judged[kept < threshold]
         # Worst first, so the cap keeps the elements a user most wants to see.
-        below.sort(key=lambda index: values[index])
+        below = below[np.argsort(array[below], kind='stable')]
         offending = []
-        for index in below[:OFFENDER_CAP]:
+        for index in below[:OFFENDER_CAP].tolist():
             tag = int(all_tags[index])
             offending.append({
-                'tag': tag, 'value': float(values[index]), 'measure': measure,
+                'tag': tag, 'value': float(array[index]), 'measure': measure,
                 'centroid': self._element_centroid(tag),
             })
-        kept = [values[index] for index in judged]
         block = {
             'measure': measure,
-            'minimum': min(kept), 'mean': sum(kept) / len(kept),
-            'below_threshold': len(below), 'total': len(kept),
+            'minimum': float(kept.min()),
+            'mean': float(kept.sum()) / len(kept),
+            'below_threshold': int(len(below)), 'total': int(len(kept)),
             'inverted': inverted, 'offending': offending,
             'offendingTruncated': len(below) > OFFENDER_CAP,
         }
@@ -2804,25 +3232,27 @@ class GmshRun(StageRun):
         gmsh = self.gmsh
         if measure not in QUALITY_QUERY_NAME:
             return None
-        tags = []
+        np = require_numpy()
         _types, groups, _nodes = gmsh.model.mesh.getElements(2)
-        for group in groups:
-            tags.extend(int(item) for item in group)
-        if not tags:
+        tags = (np.concatenate([np.asarray(group, dtype=np.int64).ravel()
+                                for group in groups])
+                if len(groups) else np.zeros(0, dtype=np.int64))
+        if not len(tags):
             return None
-        values = list(element_qualities(
-            gmsh.model.mesh, tags, QUALITY_QUERY_NAME[measure]))
-        if not values:
+        values = np.asarray(element_qualities(
+            gmsh.model.mesh, tags, QUALITY_QUERY_NAME[measure]),
+            dtype=np.float64).ravel()
+        if not len(values):
             return None
         record = getattr(self, 'statistics', {}).get('classification')
         kept = bool(isinstance(record, dict)
                     and record.get('keptTessellation'))
         return {
             'measure': measure,
-            'total': len(values),
-            'minimum': float(min(values)),
-            'mean': float(sum(values) / len(values)),
-            'below_threshold': sum(1 for item in values if item < threshold),
+            'total': int(len(values)),
+            'minimum': float(values.min()),
+            'mean': float(values.sum()) / len(values),
+            'below_threshold': int((values < threshold).sum()),
             # True when the surface is the imported triangulation itself, in
             # which case repairing it means repairing the geometry.
             'keptTessellation': kept,
@@ -3125,6 +3555,8 @@ class GmshRun(StageRun):
         the numbers rather than of the shapes, so it is read from the element
         connectivity as it stands. Never fatal.
         """
+        # Plan 50 IP18 (DP-6320): the spread of each cell as an array.
+        np = require_numpy()
         try:
             _types, groups, nodes = self.gmsh.model.mesh.getElements(3)
         except Exception:                                    # noqa: BLE001
@@ -3135,11 +3567,12 @@ class GmshRun(StageRun):
                 per = self.gmsh.model.mesh.getElementProperties(etype)[3]
             except Exception:                                # noqa: BLE001
                 continue
-            flat = [int(item) for item in node_group]
-            for index in range(0, len(flat), per):
-                cell = flat[index:index + per]
-                if cell:
-                    widest = max(widest, max(cell) - min(cell))
+            cells = np.asarray(node_group, dtype=np.int64)
+            if not len(cells) or not per:
+                continue
+            cells = cells.reshape(-1, per)
+            widest = max(widest, int((cells.max(axis=1)
+                                      - cells.min(axis=1)).max()))
         return widest or None
 
     def meshed_nodes(self):
@@ -3154,15 +3587,22 @@ class GmshRun(StageRun):
         coincident and refused the merge over -- they reach no written file,
         and nothing can be collapsed into them.
         """
-        used = set()
+        return set(self.meshed_node_array().tolist())
+
+    def meshed_node_array(self):
+        """:meth:`meshed_nodes` as a sorted array (Plan 50 IP18, DP-6320)."""
+        np = require_numpy()
+        parts = []
         for dim in (1, 2, 3):
             try:
                 _types, _tags, nodes = self.gmsh.model.mesh.getElements(dim)
             except Exception:                                # noqa: BLE001
                 continue
-            for group in nodes:
-                used.update(int(item) for item in group)
-        return used
+            parts.extend(np.asarray(group, dtype=np.int64).ravel()
+                         for group in nodes)
+        if not parts:
+            return np.zeros(0, dtype=np.int64)
+        return np.unique(np.concatenate(parts))
 
     def _coincident_buckets(self, tolerance):
         """``{place: [node tags]}`` for every place holding more than one.
@@ -3172,22 +3612,35 @@ class GmshRun(StageRun):
         interesting because it is coincident, it is interesting because of
         what the node it is coincident *with* belongs to.
         """
+        # Plan 50 IP18 (DP-6320, GM-8). Bucketed as arrays: the places are
+        # rounded together and grouped by ``numpy.unique``, and only places
+        # holding more than one node become Python lists.
+        np = require_numpy()
         try:
             tags, coords, _p = self.gmsh.model.mesh.getNodes()
         except Exception:                                    # noqa: BLE001
             return {}
-        tags = [int(item) for item in tags]
-        if len(coords) < 3 * len(tags):
+        tags = np.asarray(tags, dtype=np.int64).ravel()
+        coords = np.asarray(coords, dtype=np.float64).ravel()
+        if len(coords) < 3 * len(tags) or not len(tags):
             return {}
-        used = self.meshed_nodes()
+        xyz = coords[:3 * len(tags)].reshape(-1, 3)
+        used = self.meshed_node_array()
+        if len(used):
+            keep = np.isin(tags, used, assume_unique=True)
+            tags, xyz = tags[keep], xyz[keep]
+        if not len(tags):
+            return {}
+        keys = np.rint(xyz / tolerance).astype(np.int64)
+        _unique, inverse, counts = np.unique(
+            keys, axis=0, return_inverse=True, return_counts=True)
+        inverse = np.asarray(inverse).ravel()
+        crowded = counts[inverse] > 1
         places: dict = {}
-        for index, tag in enumerate(tags):
-            if used and tag not in used:
-                continue
-            key = tuple(round(float(coords[3 * index + axis]) / tolerance)
-                        for axis in range(3))
+        for tag, key in zip(tags[crowded].tolist(),
+                            map(tuple, keys[crowded].tolist())):
             places.setdefault(key, []).append(tag)
-        return {key: group for key, group in places.items() if len(group) > 1}
+        return places
 
     def interface_coincidences(self, tolerance):
         """The coincident nodes that are a conformal interface.
@@ -4272,11 +4725,8 @@ class GmshRun(StageRun):
         self.renumber_nodes()
 
         types, tags, _nodes = gmsh.model.mesh.getElements(dimension)
-        census, all_tags = {}, []
-        for etype, group in zip(types, tags):
-            census[gmsh.model.mesh.getElementProperties(etype)[0]] = len(group)
-            all_tags.extend(int(item) for item in group)
-        if not all_tags:
+        census, all_tags = self.element_census(types, tags)
+        if not len(all_tags):
             raise MeshFailure(
                 'meshing finished with no volume elements; the geometry may '
                 'have imported as surfaces only'
@@ -4298,13 +4748,8 @@ class GmshRun(StageRun):
         # below the limit there is nothing to rescue, and if something is,
         # this is the last moment the mesh can still be changed.
         if self.repair_poor_elements(primary_block):
-            all_tags = []
             types, tags, _nodes = gmsh.model.mesh.getElements(3)
-            census = {}
-            for etype, group in zip(types, tags):
-                name = gmsh.model.mesh.getElementProperties(etype)[0]
-                census[name] = len(group)
-                all_tags.extend(int(item) for item in group)
+            census, all_tags = self.element_census(types, tags)
             metrics, primary_block, inverted = self.measure_limits(all_tags,
                                                                    limits)
 
@@ -4347,6 +4792,23 @@ class GmshRun(StageRun):
             f'{len(all_tags)} cells in {elapsed:.2f}s',
             {'cells': len(all_tags),
              'minQuality': round(primary_block['minimum'], 6)})
+
+    def element_census(self, types, tags):
+        """``({type name: count}, every tag as one array)``.
+
+        Plan 50 IP18 (DP-6320). The tags were gathered into a Python list one
+        int at a time; they are one array now.
+        """
+        np = require_numpy()
+        census, parts = {}, []
+        for etype, group in zip(types, tags):
+            group = np.asarray(group, dtype=np.int64).ravel()
+            census[self.gmsh.model.mesh.getElementProperties(etype)[0]] = int(
+                len(group))
+            parts.append(group)
+        every = (np.concatenate(parts) if parts
+                 else np.zeros(0, dtype=np.int64))
+        return census, every
 
     def measure_limits(self, all_tags, limits):
         """Measure every configured limit, and say which one is primary.
@@ -5457,79 +5919,78 @@ class GmshRun(StageRun):
         The extruded volume is deliberately not predicted from it: this run
         made a section and the publisher makes the cells, so the number
         measured here is the number this run is answerable for.
+
+        Plan 50 IP18 (DP-6320). Read as arrays: one ``getNodes`` and one
+        ``getElements``, not a ``getNode`` call per node.
         """
-        gmsh = self.gmsh
-        corners = {'Triangle': 3, 'Quadrangle': 4}
-        cache: dict[int, tuple] = {}
-
-        def point(tag):
-            if tag not in cache:
-                cache[tag] = gmsh.model.mesh.getNode(tag)[0]
-            return cache[tag]
-
+        np = require_numpy()
+        mesh = self.gmsh.model.mesh
+        # DP-6325. Gmsh names a quad "Quadrilateral 4"; the table said
+        # "Quadrangle", so a recombined section measured its triangles only.
+        corners = {'Triangle': 3, 'Quadrilateral': 4, 'Quadrangle': 4}
+        lookup, xyz = node_table(mesh)
         total = 0.0
-        types, tags, nodes = gmsh.model.mesh.getElements(2)
-        for etype, _group, node_group in zip(types, tags, nodes):
+        types, _tags, nodes = mesh.getElements(2)
+        for etype, node_group in zip(types, nodes):
             name, _dim, _order, per, *_rest = (
-                gmsh.model.mesh.getElementProperties(etype))
+                mesh.getElementProperties(etype))
             sides = next((count for shape, count in corners.items()
                           if shape in name), 0)
             if not sides:
                 continue
-            flat = list(node_group)
-            for index in range(0, len(flat), per):
+            cells = np.asarray(node_group, dtype=np.int64).reshape(-1, per)
+            for start in range(0, len(cells), MEASURE_CHUNK):
                 # A quadratic element carries its mid-side nodes after its
                 # corners, so the corners alone give the same polygon.
-                face = [point(tag) for tag in flat[index:index + sides]]
+                face = element_points(
+                    lookup, xyz, cells[start:start + MEASURE_CHUNK, :sides])
                 for k in range(1, sides - 1):
-                    u = [face[k][j] - face[0][j] for j in range(3)]
-                    v = [face[k + 1][j] - face[0][j] for j in range(3)]
-                    cross = (u[1] * v[2] - u[2] * v[1],
-                             u[2] * v[0] - u[0] * v[2],
-                             u[0] * v[1] - u[1] * v[0])
-                    total += math.sqrt(sum(item * item
-                                           for item in cross)) / 2.0
+                    cross = np.cross(face[:, k] - face[:, 0],
+                                     face[:, k + 1] - face[:, 0])
+                    total += float(np.sqrt((cross * cross).sum(axis=1)
+                                           ).sum()) / 2.0
         self.statistics['mesh']['area'] = total
 
+    #: The tetrahedra each cell shape is cut into to measure its volume.
+    VOLUME_SPLITS = {
+        'Tetrahedron': [(0, 1, 2, 3)],
+        'Prism': [(0, 1, 2, 3), (1, 4, 2, 3), (2, 4, 5, 3)],
+        'Hexahedron': [(0, 1, 3, 4), (1, 2, 3, 6), (1, 3, 4, 6),
+                       (1, 4, 5, 6), (3, 4, 6, 7)],
+        'Pyramid': [(0, 1, 2, 4), (0, 2, 3, 4)],
+    }
+
     def measure_volume(self):
-        """Sum the cell volumes, so an overlapping layer cannot pass unseen."""
+        """Sum the cell volumes, so an overlapping layer cannot pass unseen.
+
+        Plan 50 IP18 (DP-6320, GM-8). This ran on every job and called
+        ``getNode`` once per node of every cell, in Python. It now reads the
+        nodes once and the cells as arrays, in slices of
+        :data:`MEASURE_CHUNK` cells, and sums the same tetrahedra.
+        """
         if self.planar:
             return self.measure_area()
-        gmsh = self.gmsh
-        shapes = {
-            'Tetrahedron': [(0, 1, 2, 3)],
-            'Prism': [(0, 1, 2, 3), (1, 4, 2, 3), (2, 4, 5, 3)],
-            'Hexahedron': [(0, 1, 3, 4), (1, 2, 3, 6), (1, 3, 4, 6),
-                           (1, 4, 5, 6), (3, 4, 6, 7)],
-            'Pyramid': [(0, 1, 2, 4), (0, 2, 3, 4)],
-        }
-        cache: dict[int, tuple] = {}
-
-        def point(tag):
-            if tag not in cache:
-                cache[tag] = gmsh.model.mesh.getNode(tag)[0]
-            return cache[tag]
-
+        np = require_numpy()
+        mesh = self.gmsh.model.mesh
+        shapes = self.VOLUME_SPLITS
+        lookup, xyz = node_table(mesh)
         total = 0.0
-        types, tags, nodes = gmsh.model.mesh.getElements(3)
-        for etype, _group, node_group in zip(types, tags, nodes):
-            name, _dim, _order, per, *_rest = gmsh.model.mesh.getElementProperties(etype)
+        types, _tags, nodes = mesh.getElements(3)
+        for etype, node_group in zip(types, nodes):
+            name, _dim, _order, per, *_rest = mesh.getElementProperties(etype)
             key = next((item for item in shapes if item in name), None)
             if key is None:
                 continue
-            flat = list(node_group)
-            for index in range(0, len(flat), per):
-                cell = flat[index:index + per]
+            cells = np.asarray(node_group, dtype=np.int64).reshape(-1, per)
+            for start in range(0, len(cells), MEASURE_CHUNK):
+                points = element_points(lookup, xyz,
+                                        cells[start:start + MEASURE_CHUNK])
                 for a, b, c, d in shapes[key]:
-                    pa, pb, pc, pd = (point(cell[a]), point(cell[b]),
-                                      point(cell[c]), point(cell[d]))
-                    u = [pb[k] - pa[k] for k in range(3)]
-                    v = [pc[k] - pa[k] for k in range(3)]
-                    w = [pd[k] - pa[k] for k in range(3)]
-                    total += abs(
-                        u[0] * (v[1] * w[2] - v[2] * w[1])
-                        - u[1] * (v[0] * w[2] - v[2] * w[0])
-                        + u[2] * (v[0] * w[1] - v[1] * w[0])) / 6.0
+                    u = points[:, b] - points[:, a]
+                    v = points[:, c] - points[:, a]
+                    w = points[:, d] - points[:, a]
+                    total += float(np.abs(
+                        (u * np.cross(v, w)).sum(axis=1)).sum()) / 6.0
         self.statistics['mesh']['volume'] = total
 
     def apply_export_settings(self):
@@ -5701,7 +6162,7 @@ class GmshRun(StageRun):
     VERIFY_READER = (
         'import json, sys\n'
         'import gmsh\n'
-        'gmsh.initialize()\n'
+        + gmsh_startup_v1.INITIALIZE_SOURCE +
         'gmsh.option.setNumber("General.Terminal", 0)\n'
         'gmsh.merge(sys.argv[1])\n'
         'tags, _c, _p = gmsh.model.mesh.getNodes()\n'
@@ -5945,15 +6406,112 @@ class GmshRun(StageRun):
 
     # -- orchestration ----------------------------------------------------- #
 
+    # -- Plan 50 IP18 (DP-6321): the import checkpoint ---------------------- #
+
+    def save_import_checkpoint(self):
+        """Keep the model after the import, for a retry to start from.
+
+        Only an all-CAD model: a discrete (tessellated) surface cannot be
+        written to a BRep and read back with its tags. Never fatal: a
+        checkpoint that cannot be written leaves the retry to import again.
+        """
+        key = getattr(self, 'import_key', None)
+        if key is None or CHECKPOINT_FOLDER is None or key in \
+                IMPORT_CHECKPOINTS:
+            return None
+        gmsh = self.gmsh
+        try:
+            if self.tessellated:
+                return None
+            every = {(int(d), int(t)) for d, t in gmsh.model.getEntities()}
+            cad = {(int(d), int(t)) for d, t in gmsh.model.occ.getEntities()}
+            if not every or every != cad:
+                return None
+            # A physical group (a geometry build's named group) lives in the
+            # model, not in the BRep, so a restore would lose it.
+            if list(gmsh.model.getPhysicalGroups()):
+                return None
+            state = copy.deepcopy({
+                name: value for name, value in vars(self).items()
+                if name not in CHECKPOINT_EXCLUDED})
+            options = {}
+            for name in CHECKPOINT_OPTIONS + tuple(
+                    str(row.get('name')) for row in
+                    self.intent.get('options') or ()
+                    if str(row.get('name') or '').startswith('Geometry.')):
+                saved = _read_option(gmsh, name)
+                if saved is not None:
+                    options[name] = saved
+            path = str(Path(CHECKPOINT_FOLDER)
+                       / f'import-checkpoint-{len(IMPORT_CHECKPOINTS)}.brep')
+            gmsh.write(path)
+            checkpoint = ImportCheckpoint(path, model_inventory(gmsh),
+                                          options, state)
+        except Exception:                                    # noqa: BLE001
+            return None
+        IMPORT_CHECKPOINTS[key] = checkpoint
+        return checkpoint
+
+    def restore_import_checkpoint(self) -> bool:
+        """Start from the first run's checkpoint; ``False`` to import instead.
+
+        The BRep is read with every importer repair and scaling off, the
+        import's options are put back, and the model is compared with the
+        saved inventory. Anything different and the model is emptied, the
+        import runs as it always did, and ``entry_note`` says why.
+        """
+        checkpoint = IMPORT_CHECKPOINTS.get(getattr(self, 'import_key', None))
+        if checkpoint is None:
+            if 'retry' in self.job:
+                self.entry_note = ('imported again: the import this retry '
+                                   'needs has no checkpoint (it differs '
+                                   'from the first run\'s, or is '
+                                   'tessellated)')
+            return False
+        gmsh = self.gmsh
+        try:
+            for name, value in RESTORE_NEUTRAL:
+                _write_option(gmsh, name, ('number', value))
+            gmsh.model.occ.importShapes(checkpoint.path)
+            gmsh.model.occ.synchronize()
+            for name, saved in checkpoint.options.items():
+                _write_option(gmsh, name, saved)
+            problems = inventory_differences(checkpoint.inventory,
+                                             model_inventory(gmsh))
+        except Exception as error:                           # noqa: BLE001
+            problems = [_short(error)]
+        if problems:
+            self.entry_note = ('imported again: the checkpoint did not '
+                               'restore the model the import left ('
+                               + '; '.join(problems) + ')')
+            try:
+                gmsh.clear()
+            except Exception:                                # noqa: BLE001
+                pass
+            for name, saved in checkpoint.options.items():
+                _write_option(gmsh, name, saved)
+            return False
+        for name, value in copy.deepcopy(checkpoint.state).items():
+            setattr(self, name, value)
+        self.entered_at = 'after import'
+        self.reporter.emit('progress', 'import', 0.15,
+                           'started from the model the first run imported')
+        return True
+
     def execute(self) -> dict:
         self.reporter.emit('started', 'gmsh', 0.0, 'starting Gmsh')
+        # DP-6321. Read before a hook can rewrite the job's paths.
+        self.import_key = import_key(self.job)
+        self.entered_at = 'import'
         self.initialise()
         load_runner_parts()
         try:
-            run_stage_hooks('before_import', self)
-            self.import_geometry()
-            run_stage_hooks('after_import', self)
-            run_stage_hooks('geometry', self)
+            if not self.restore_import_checkpoint():
+                run_stage_hooks('before_import', self)
+                self.import_geometry()
+                run_stage_hooks('after_import', self)
+                run_stage_hooks('geometry', self)
+                self.save_import_checkpoint()
             self.apply_sizing()
             self.apply_size_fields()
             self.apply_native_fields()
@@ -6048,6 +6606,14 @@ LAYER_FIT_MARGIN = 0.7
 
 #: One measured refit, one halving after it, and then the run is refused.
 LAYER_FIT_ATTEMPTS = 3
+
+#: Plan 50 IP28 (DP-6436). A fold over more than this share of the layer's
+#: faces is refitted as a whole stack rather than place by place.
+LOCAL_FIT_SHARE = 0.25
+
+#: Plan 50 IP28 (DP-6436). How far a local thinning blends back to the full
+#: stack, in total thicknesses asked.
+LOCAL_FIT_RADIUS = 3.0
 
 
 def folded_like_a_layer(error) -> bool:
@@ -6150,6 +6716,21 @@ def refitted_job(job, factor):
     return document
 
 
+def locally_refitted_job(job, spots, radius):
+    """A copy of the job that thins its layer stack at *spots* only.
+
+    Plan 50 IP28 (DP-6436). ``intent.layers.localFit`` carries the places,
+    each ``[x, y, z, thickness, patch]``, and the radius the thinning blends
+    back over; the boundary-layer stage turns them into a scalar view.
+    """
+    document = copy.deepcopy(job)
+    layers = (document.get('intent') or {}).get('layers')
+    if isinstance(layers, dict):
+        layers['localFit'] = {'spots': [list(item) for item in spots],
+                              'radius': float(radius)}
+    return document
+
+
 def record_layer_refit(document, asked, first, factor, note):
     """Say in the receipt what was asked for and what was grown instead."""
     record = (document.get('statistics') or {}).get('layers')
@@ -6160,6 +6741,22 @@ def record_layer_refit(document, asked, first, factor, note):
         record['requestedFirstHeight'] = first
         record['fitScale'] = factor
     document.setdefault('warnings', []).insert(0, note)
+
+
+def finite_only(value):
+    """*value* with every NaN or infinity as ``None``.
+
+    A quality mean over elements the measure cannot read (a quad surface) is
+    NaN, which is not JSON: the host's answer to the run then failed to render
+    although the mesh was written.
+    """
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float('inf') else None
+    if isinstance(value, dict):
+        return {key: finite_only(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_only(item) for item in value]
+    return value
 
 
 def execute_with_layer_fit(job, reporter, attempts=None):
@@ -6183,14 +6780,51 @@ def execute_with_layer_fit(job, reporter, attempts=None):
     note = ''
     crossing = None
     current = job
+    # Plan 50 IP28 (DP-6436). The places a fold was fitted at, kept across
+    # attempts, and whether the next attempt thins only there.
+    spots = []
+    radius = LOCAL_FIT_RADIUS * asked
+    local = False
     for attempt in range(LAYER_FIT_ATTEMPTS):
+        # Plan 50 IP18 (DP-6322): one cap over every rung of the ladder.
+        ensure_attempt_allowed(attempts, current)
         run = GmshRun(current, reporter)
         if attempts is not None:
             attempts.append(run)
         tried.append(asked * factor)
         try:
-            document = run.execute()
+            document = run_and_record_outcome(run)
         except LayerFold as fold:
+            # A fold in a few places thins the stack there and nowhere else,
+            # once; a second fold, or one too widespread to place, falls
+            # back to refitting the whole stack (DP-74), still thinned at
+            # every place already found.
+            local = bool(fold.spots) and not spots \
+                and attempt + 2 < LAYER_FIT_ATTEMPTS
+            if fold.spots:
+                spots = merge_spots(spots, thin_spots(fold.spots, radius),
+                                    radius)
+            if local:
+                following = factor
+                thinnest = min(spot[3] for spot in fold.spots)
+                note = (
+                    f'the boundary layer asked for reaches {asked:.6g} m, '
+                    f'which this geometry cannot carry everywhere: '
+                    f'{fold.folded} of the faces it grew fold back through '
+                    f'themselves, first on {fold.patch} at '
+                    f'({fold.at[0]:.6g}, {fold.at[1]:.6g}, {fold.at[2]:.6g}). '
+                    f'The stack was thinned at {len(spots)} place(s) only, '
+                    f'to as little as {thinnest:.6g} m, blending back to the '
+                    f'full stack within {radius:.6g} m; the rest of the wall '
+                    f'keeps the thickness asked for.')
+                reporter.emit('progress', 'mesh', 0.3,
+                              'thinning the boundary layer where it folded')
+                current = mark_retry(
+                    locally_refitted_job(refitted_job(job, factor), spots,
+                                         radius),
+                    'the boundary layer was thinned where the run before '
+                    'found it folding')
+                continue
             following = fold.carries * LAYER_FIT_MARGIN / asked
             note = (
                 f'the boundary layer asked for reaches {asked:.6g} m, which '
@@ -6224,6 +6858,11 @@ def execute_with_layer_fit(job, reporter, attempts=None):
         else:
             if factor < 1.0:
                 record_layer_refit(document, asked, first, factor, note)
+            elif spots:
+                # Plan 50 IP28 (DP-6436): the stack asked for, grown
+                # everywhere it fits; `statistics.layers.localFit` says where
+                # it was thinned.
+                document.setdefault('warnings', []).insert(0, note)
             return document
         if following < 0.05 or attempt + 1 >= LAYER_FIT_ATTEMPTS:
             break
@@ -6234,7 +6873,13 @@ def execute_with_layer_fit(job, reporter, attempts=None):
         reporter.emit('progress', 'mesh', 0.3,
                       'refitting the boundary layer to '
                       f'{asked * factor:.4g} m')
-        current = refitted_job(job, factor)
+        following_job = refitted_job(job, factor)
+        if spots:
+            following_job = locally_refitted_job(following_job, spots, radius)
+        current = mark_retry(
+            following_job,
+            f'the boundary layer was regrown at {factor:.1%} of the '
+            f'{asked:.6g} m asked for: the run before refused it')
     detail = note.strip()
     if len(tried) > 1:
         detail += (' Thicknesses of '
@@ -6283,12 +6928,13 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
     """
     crossing = None
     unmeshable = None
+    failure = None
     try:
         return execute_with_layer_fit(job, reporter, attempts)
     except InvalidSurfaceMesh as error:
         unmeshable = error
     except SurfaceCrossing as error:
-        crossing = error
+        crossing = failure = error
     except LayerCollision:
         # DP-374. A collision is not a remesh that could not be meshed, and
         # this rung answers only that question. MEASURED on
@@ -6307,6 +6953,7 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
         # about it, so it is left to travel.
         raise
     except MeshFailure as error:
+        failure = error
         crossing = getattr(error, 'surface_crossing', None)
         if crossing is None:
             # DP-93. A crossing is one way the remesh fails and not the only
@@ -6323,6 +6970,12 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
             unmeshable = error
     if crossing is not None and not crossing.remeshed:
         raise crossing
+    if crossing is not None and only_cad_sources(job):
+        # DP-6470. A CAD import has no facets to mesh as supplied: the flag
+        # below is read only by the tessellated importer, so the rung re-ran
+        # the layer fit it had just finished, outcome for outcome (MEASURED:
+        # six runs, the last three the first three). The refusal stands.
+        raise failure
     if isinstance(unmeshable, InvalidSurfaceMesh):
         if not a_remesh_of_imported_facets(job):
             raise unmeshable
@@ -6333,7 +6986,12 @@ def execute_with_surface_fallback(job, reporter, attempts=None):
     reporter.emit('progress', 'mesh', 0.3,
                   'meshing the imported facets rather than a remesh of them')
     document = execute_with_layer_fit(
-        kept_tessellation_job(job), reporter, attempts)
+        mark_retry(kept_tessellation_job(job),
+                   'the remesh of the imported facets could not be meshed '
+                   '(' + _short(crossing if crossing is not None
+                                else unmeshable, 160)
+                   + '), so the facets are meshed as supplied'),
+        reporter, attempts)
     document.setdefault('warnings', []).insert(0, (
         f'the remesh Gmsh built from its own parametrisation of this '
         f'geometry could not be meshed — {unmeshable} — so the imported '
@@ -6397,7 +7055,12 @@ def execute_with_smaller_patches(job, reporter, attempts, invalid):
                       + ' came out invalid')
         try:
             document = execute_with_layer_fit(
-                smaller_patches_job(job, limit), reporter, attempts)
+                mark_retry(smaller_patches_job(job, limit),
+                           'invalid surface elements on '
+                           + ', '.join(invalid.patches or ('a patch',))
+                           + f'; the surface is remeshed in patches of at '
+                             f'most {limit} triangles'),
+                reporter, attempts)
         except LayerCollision:
             raise
         except MeshFailure:
@@ -6493,8 +7156,11 @@ def execute_with_another_surface_algorithm(job, reporter, attempts=None):
                       f'column did not grow on the {asked_name} surface mesh')
         try:
             document = execute_with_surface_fallback(
-                another_surface_algorithm_job(job, name, code), reporter,
-                attempts)
+                mark_retry(another_surface_algorithm_job(job, name, code),
+                           f'a boundary-layer column did not grow on the '
+                           f'{asked_name} surface mesh; the surface is '
+                           f'meshed with {label}'),
+                reporter, attempts)
         except LayerCollision as collision:
             if not collision.stalled:
                 raise
@@ -6511,6 +7177,37 @@ def execute_with_another_surface_algorithm(job, reporter, attempts=None):
         f'every one left a column that did not grow.',
         nodes=first.nodes, coincident=first.coincident,
         patches=first.patches, at=first.at, stalled=True) from first
+
+
+def requested_layer_patches(job, run=None) -> dict:
+    """The patches a dropped layer had been asked for, and its layer count.
+
+    Plan 50 IP7 (DP-6252). Read from the run that tried to grow it when it
+    recorded them (its ``statistics.layers``: every patch it extruded,
+    whatever the patch mode), else from the job's own selection. ``patches``
+    is empty when neither names one, as an "every wall" job whose run never
+    reached the layer stage.
+    """
+    layers = (job.get('intent') or {}).get('layers') or {}
+    record = ((getattr(run, 'statistics', None) or {}).get('layers')
+              if run is not None else None)
+    record = record if isinstance(record, dict) else {}
+    by_patch = record.get('requestedByPatch')
+    by_patch = dict(by_patch) if isinstance(by_patch, dict) else {}
+    names = [str(name) for name in (record.get('patches') or by_patch)]
+    if not names:
+        names = [str(name).strip() for name in (layers.get('patches') or ())]
+        names += [str(row.get('patch')).strip()
+                  for row in (layers.get('stacks') or ())
+                  if isinstance(row, dict) and row.get('patch')]
+    try:
+        count = int(record.get('requestedLayers') or layers.get('layerCount')
+                    or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return {'patches': sorted({name for name in names if name}),
+            'requestedLayers': count,
+            'requestedByPatch': by_patch}
 
 
 def execute_without_a_layer_that_will_not_land(job, reporter, attempts=None):
@@ -6537,9 +7234,14 @@ def execute_without_a_layer_that_will_not_land(job, reporter, attempts=None):
     layer was dropped and why -- which is what :func:`execute_with_surface_fallback`
     already does for a remesh that crosses itself.
     """
+    attempts = [] if attempts is None else attempts
     try:
         return execute_with_another_surface_algorithm(job, reporter, attempts)
     except LayerLanding as landing:
+        # Plan 50 IP7 (DP-6252). Which patches went without, read from the
+        # run that tried before the layerless one replaces it.
+        wanted = requested_layer_patches(
+            job, attempts[-1] if attempts else None)
         asked = landing.asked or landing.thickness
         share = (f'{landing.thickness / asked:.1%} of the {asked:.6g} m '
                  f'asked for' if asked else 'all this wall would carry')
@@ -6548,7 +7250,10 @@ def execute_without_a_layer_that_will_not_land(job, reporter, attempts=None):
                       'geometry cannot carry at a thickness the mesh above '
                       'it can rest on')
         document = execute_with_surface_fallback(
-            layerless_job(job), reporter, attempts)
+            mark_retry(layerless_job(job),
+                       'the boundary layer cannot land on this geometry, so '
+                       'the job is meshed without it'),
+            reporter, attempts)
         # MEASURED: a run that grew no layer publishes no `layers` block at
         # all, so writing into the one that is there would have dropped this
         # reading on exactly the runs it describes.
@@ -6563,6 +7268,11 @@ def execute_without_a_layer_that_will_not_land(job, reporter, attempts=None):
             'degenerateCells': landing.cells,
             'worst': landing.worst,
             'measure': 'gamma',
+            # Plan 50 IP7 (DP-6252): what the coverage record says was not
+            # grown, so the quality verdict hears of it.
+            'patches': wanted['patches'],
+            'requestedLayers': wanted['requestedLayers'],
+            'requestedByPatch': wanted['requestedByPatch'],
         }
         document.setdefault('warnings', []).insert(0, (
             f'the boundary layer asked for was not grown: this wall carries '
@@ -6606,6 +7316,31 @@ def peak_resources() -> dict:
     return {}
 
 
+def absolute_job_paths(job: dict, origin) -> dict:
+    """The job with every file path it names made absolute against *origin*.
+
+    Plan 50 IP6 (DP-6251). The runner no longer works in the folder it was
+    started in (the case), so a path the job wrote relative to it would now
+    resolve inside the scratch folder. The host writes absolute runtime paths;
+    this keeps a relative one meaning what it always meant.
+    """
+    def fix(value):
+        return gmsh_startup_v1.absolute(value, origin) if value else value
+
+    sources = job.get('geometry')
+    if isinstance(sources, str):
+        job['geometry'] = fix(sources)
+    elif isinstance(sources, (list, tuple)):
+        job['geometry'] = [fix(item) for item in sources]
+    if isinstance(job.get('output'), dict):
+        job['output'] = {key: fix(value)
+                         for key, value in job['output'].items()}
+    for key in ('surfaceOutput', 'resultPath'):
+        if job.get(key):
+            job[key] = fix(job[key])
+    return job
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='FoamMesh Gmsh runner')
     parser.add_argument('job')
@@ -6613,12 +7348,32 @@ def main(argv=None) -> int:
     parser.add_argument('--progress')
     arguments = parser.parse_args(argv)
 
-    reporter = Reporter(arguments.progress)
+    # Plan 50 IP6 (DP-6251). Every path from the command line is fixed
+    # against the folder the runner was started in before it leaves it.
+    scratch = gmsh_startup_v1.ScratchDirectory()
+    origin = scratch.origin
+    job_path = Path(gmsh_startup_v1.absolute(arguments.job, origin))
+    given_result = (gmsh_startup_v1.absolute(arguments.result, origin)
+                    if arguments.result else None)
+    progress = (gmsh_startup_v1.absolute(arguments.progress, origin)
+                if arguments.progress else None)
+    fallback_result = job_path.with_name('result.json')
+
+    reporter = Reporter(progress)
     attempts: list = []
+    global CHECKPOINT_FOLDER
+    IMPORT_CHECKPOINTS.clear()
+    SKIPPED_REPEATS.clear()
     try:
-        job = load_job(Path(arguments.job))
-        result_path = Path(arguments.result or job.get('resultPath')
-                           or Path(arguments.job).with_name('result.json'))
+        job = absolute_job_paths(load_job(job_path), origin)
+        result_path = Path(given_result or job.get('resultPath')
+                           or fallback_result)
+        # Gmsh's debug files (`*.pos`, `_Cut.msh`, plugin side files) land
+        # in the working folder: a private one, removed when the run ends.
+        scratch.enter()
+        # Plan 50 IP18 (DP-6321). The import checkpoint a retry restores
+        # lives in the scratch folder and goes with it.
+        CHECKPOINT_FOLDER = scratch.path
         # DP-74. One call, one or more runs: a boundary layer the geometry
         # cannot carry is refitted and the job re-run, and it is the last of
         # those runs that has to report if the refit does not land either.
@@ -6635,13 +7390,16 @@ def main(argv=None) -> int:
             'controls': [], 'warnings': [], 'finished_at': utc_now(),
         })
         document['traceback'] = traceback.format_exc()[-4000:]
-        try:
-            result_path = Path(arguments.result
-                               or Path(arguments.job).with_name('result.json'))
-        except Exception:
-            result_path = Path('result.json')
+        result_path = Path(given_result or fallback_result)
         status = 1
+    finally:
+        CHECKPOINT_FOLDER = None
+        IMPORT_CHECKPOINTS.clear()
+        scratch.leave()
 
+    # Plan 50 IP18 (DP-6322). Every Gmsh run the job made, where each one
+    # entered and why it was run, whatever the outcome.
+    document['attempts'] = attempt_report(attempts)
     # Plan 48 FIX3 (DP-4406). The mesher runs here, inside the WSL distro,
     # outside any Windows job object, so nobody else can measure it: this
     # process is the only one that sees its own peak resident set.
@@ -6650,7 +7408,8 @@ def main(argv=None) -> int:
         document['resources'] = resources
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(
-        json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+        json.dumps(finite_only(document), indent=2, sort_keys=True) + '\n',
+        encoding='utf-8')
     return status
 
 

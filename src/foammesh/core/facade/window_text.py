@@ -60,13 +60,15 @@ def console(session, *, after_line=0, limit=500, min_level='info') -> dict:
 
 def status(session, *, after=0) -> dict:
     """The status line now, the messages it showed after ``after``, the
-    notices over the viewport and the run status strip."""
+    notices over the viewport, the run status strip and (Plan 48 AG) the
+    status bar's local-task mirror: ``local_task`` {shown, text, elapsed,
+    cancelable}."""
     after = _int(after, 'after', 0, 1 << 62)
     reader = getattr(session.presentation_renderer, 'status', None)
     if session.presentation is None or not callable(reader):
         return {'attached': False, 'status_line': '', 'messages': [],
                 'next_sequence': after, 'notices': [], 'run_status': None,
-                'reason': NO_WINDOW}
+                'local_task': None, 'reason': NO_WINDOW}
     return reader(after=after)
 
 

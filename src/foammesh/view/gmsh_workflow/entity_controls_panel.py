@@ -457,7 +457,9 @@ class EntityControlsApi:
     def state(self) -> dict:
         def read():
             panel = self._panel
-            return {'rows': panel.rows(), 'dirty': panel.is_dirty,
+            rows = panel.rows()
+            return {'rows': rows, 'dirty': panel.is_dirty,
+                    'what': [catalogue.describe(row) for row in rows],
                     'summary': panel.summaryText(),
                     'problem': panel.problemText(), 'help': panel.helpText(),
                     'current_row': panel.currentRow(),

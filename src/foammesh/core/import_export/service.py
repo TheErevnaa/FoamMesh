@@ -71,9 +71,27 @@ NO_ACCEPTED_RUN = (
 SU2_GMSH_ONLY = 'SU2 is exported only on the Gmsh route'
 SU2_MESH_WITH_GMSH = 'Mesh the case with Gmsh to export SU2.'
 
-#: What the run manifests and the case sidecar call each meshing route.
-_ROUTE_NAMES = {'snappy': 'snappyHexMesh', 'reconstructPar': 'snappyHexMesh',
-                'gmsh': 'Gmsh'}
+#: The producers the run manifests and the case sidecar record, by the
+#: engine that meshed: a parallel snappyHexMesh run ends in reconstructPar.
+def _route_engine(producer) -> str:
+    """The engine id behind a recorded producer, or ``''`` if unknown."""
+    producer = str(producer)
+    if producer == 'reconstructPar':
+        return 'snappy'
+    return producer if producer in ('snappy', 'gmsh') else ''
+
+
+def _route_name(producer) -> str:
+    """The mesher's name for a recorded producer, or ``''`` if unknown.
+
+    DP-6452 (DP-226). The name comes from the one naming rule, not from a
+    second table here.
+    """
+    engine = _route_engine(producer)
+    if not engine:
+        return ''
+    from foammesh.core.naming import humanise_option
+    return humanise_option(engine)
 
 
 def _su2_refusal(clause: str) -> str:
@@ -427,7 +445,7 @@ class ImportExportService:
                 'a constant/polyMesh here came from Gmsh')
         engine = kept['engine_id']
         if engine != 'gmsh':
-            name = _ROUTE_NAMES.get(engine, engine)
+            name = _route_name(engine) or engine
             return _su2_refusal(
                 f'this case\'s mesh comes from a {name} run '
                 f'({kept["run_id"]})')
@@ -438,10 +456,10 @@ class ImportExportService:
             return _su2_refusal(
                 'the mesh in constant/polyMesh was imported, not meshed by '
                 'Gmsh')
-        if _ROUTE_NAMES.get(producer, 'Gmsh') != 'Gmsh':
+        if _route_engine(producer) not in ('', 'gmsh'):
             return _su2_refusal(
                 f'the mesh in constant/polyMesh was written by '
-                f'{_ROUTE_NAMES[producer]}, not by Gmsh run {kept["run_id"]}')
+                f'{_route_name(producer)}, not by Gmsh run {kept["run_id"]}')
         return ''
 
     @staticmethod
@@ -594,6 +612,16 @@ class ImportExportService:
         report = validate_case(source_path)
         if not report.ok:
             raise ValueError('; '.join(report.errors))
+        # Plan 50 IP15 (DP-6424). This route copies the case byte for byte
+        # and has no OpenFOAM runtime to convert with; a binary working case
+        # copied here would leave the exported mesh binary, which no export
+        # has ever written. Refused with the route that converts it.
+        from foammesh.openfoam.working_format import binary_meshes
+        if binary_meshes(source_path / 'constant'):
+            raise ValueError(
+                'the mesh is written in binary and this export copies the '
+                'case as it is; use the OpenFOAM case export '
+                '(case.export.authored), which converts it to ASCII')
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         staging = destination_path.with_name(f'.{destination_path.name}.foammesh-export-{uuid.uuid4().hex}')
         try:
@@ -618,7 +646,9 @@ class ImportExportService:
     def export_vtu(self, case_path: str | Path, destination: str | Path) -> ExportOutcome:
         case = Path(case_path).resolve()
         target = self._prepare_file_destination(destination, '.vtu')
-        dataset = load_case_dataset(case)
+        dataset, source = self._native_msh_dataset(case)
+        if dataset is None:
+            dataset = load_case_dataset(case)
         expected = (dataset.GetNumberOfPoints(), dataset.GetNumberOfCells())
         with self._staged(target) as staging:
             write_vtu(dataset, staging)
@@ -628,10 +658,36 @@ class ImportExportService:
                     f'VTU validation failed: wrote {expected} points/cells '
                     f'but read back {actual}')
         outcome = ExportOutcome(ExportFormat.VTK.value, case, target, path_bytes(target))
+        details = {'points': actual[0], 'cells': actual[1]}
+        if source:
+            details['source'] = source
         record_export_event(case, entry_id=outcome.entry_id, destination=target,
-                            total_bytes=outcome.total_bytes,
-                            details={'points': actual[0], 'cells': actual[1]})
+                            total_bytes=outcome.total_bytes, details=details)
         return outcome
+
+    def _native_msh_dataset(self, case: Path):
+        """``(volume grid, path)`` read from the accepted run's ``mesh.msh``
+        when the case has no published polyMesh, else ``(None, '')``.
+
+        DP-6473. MEASURED (walk ``g-su2``): an SU2-target Gmsh run publishes
+        no polyMesh (Plan 28), and the VTU export, which read only the
+        polyMesh, was refused. The run's own mesh is written instead. A case
+        with a polyMesh (every OpenFOAM target) is read as before.
+        """
+        mesh = case / 'constant' / 'polyMesh'
+        if (mesh / 'points').exists() or (mesh / 'faces').exists():
+            return None, ''
+        artifact = self.native_msh_artifact(case)
+        if artifact is None:
+            return None, ''
+        from foammesh.core.gmsh.manifest import artifact_provenance_error
+        problem = artifact_provenance_error(artifact)
+        if problem:
+            raise ValueError(problem)
+        from foammesh.core.mesh.msh_scene import read_msh_scene
+        path = str(artifact.get('path') or '')
+        grid = read_msh_scene(path).vtk_mesh['']['internalMesh']
+        return grid, path
 
     @staticmethod
     def _identity_problems(census, *, nodes=None, cells=None, names=(),

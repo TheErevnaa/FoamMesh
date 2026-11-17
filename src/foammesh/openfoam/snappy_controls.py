@@ -288,6 +288,23 @@ CONTROLS = _register(
     SnappyControl('addLayers/additionalReporting', WRITER, LAYERS,
                   'additionalReporting',
                   note='left unwritten while it is DEFAULT'),
+    # Plan 50 IP27 (SN-9). The first-layer-height mode: written as each
+    # growing group's nSurfaceLayers, firstLayerThickness, expansionRatio and
+    # minThickness, with relativeSizes false -- under those keywords, so these
+    # four are derivations.
+    SnappyControl(
+        'addLayers/firstLayerMode', DERIVATION,
+        note='relative (the default) leaves the layer groups as they are; '
+             'first_layer_height writes every growing group from the three '
+             'values below with relativeSizes false'),
+    SnappyControl(
+        'addLayers/firstLayerHeight', DERIVATION,
+        note='written as firstLayerThickness, in metres, and half of it as '
+             'minThickness'),
+    SnappyControl('addLayers/firstLayerExpansionRatio', DERIVATION,
+                  note='written as expansionRatio'),
+    SnappyControl('addLayers/firstLayerCount', DERIVATION,
+                  note='written as nSurfaceLayers on every growing patch'),
     # Plan 37 UF15. Both read by layerParameters.C (129-131 and 117-126).
     SnappyControl('addLayers/concaveAngle', WRITER, LAYERS, 'concaveAngle',
                   note='left unwritten while it is unset; v13 then uses 90 '

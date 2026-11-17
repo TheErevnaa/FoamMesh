@@ -211,6 +211,10 @@ class PeriodicArrowView(QWidget):
     def canvas(self):
         return self._canvas
 
+    def noteText(self) -> str:
+        """The sentence under the arrow."""
+        return self._note.text()
+
     def showRow(self, row, source_centre=None, target_centre=None) -> None:
         if not row:
             self._info = {'problem': ''}

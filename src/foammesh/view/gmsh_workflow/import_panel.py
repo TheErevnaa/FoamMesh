@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, unit_cell
 from foammesh.core.gmsh import import_formats as formats
+from widgets import async_dialog
 
 
 class _Bridge(QObject):
@@ -182,6 +183,23 @@ class GmshImportPanel(QWidget):
         self._status.setObjectName('gmshImportStatus')
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
+        # The local API reaches this panel through the case session.
+        self._api = GmshImportApi(self)
+        self.registerApi()
+
+    # -- the local API ------------------------------------------------------ #
+
+    def api(self):
+        return self._api
+
+    def registerApi(self) -> bool:
+        """Tell the case session this panel is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import ag_gmsh_routes
+        return ag_gmsh_routes.attach(
+            self, ag_gmsh_routes.IMPORT_ATTRIBUTE, self._api)
+
+    def path(self) -> str:
+        return self._path.text()
 
     # -- state -------------------------------------------------------------- #
 
@@ -217,6 +235,7 @@ class GmshImportPanel(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self.registerApi()
         try:
             controller = self._controller or self._provider()
             limits = getattr(controller, 'time_limits', None)
@@ -243,11 +262,11 @@ class GmshImportPanel(QWidget):
         return 'merge' if self._merge.isChecked() else 'open'
 
     def _chooseFile(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
             self, self.tr('Open or merge a file'), '',
-            formats.file_filter(self.mode()))
-        if path:
-            self._path.setText(path)
+            formats.file_filter(self.mode()),
+            then=lambda path, _filter: path and self._path.setText(path))
 
     def reclassifyValues(self) -> dict:
         return {'angle': self._angle.value(),
@@ -339,6 +358,15 @@ class GmshImportPanel(QWidget):
 
     def _onDone(self, what: str, result) -> None:
         self._worker = None
+        self.showOutcome(what, result)
+
+    def _onFailed(self, message: str) -> None:
+        self._worker = None
+        self.showFailure(message)
+
+    def showOutcome(self, what: str, result) -> None:
+        """What follows a finished action, from a click or a local-API route:
+        the status line, ``opened`` and the Entity panel redraw."""
         result = result or {}
         after = result.get('after') or result.get('entities') or {}
         if what == 'open':
@@ -358,6 +386,38 @@ class GmshImportPanel(QWidget):
         if self._entityPanel is not None:
             self._entityPanel.showModel()
 
-    def _onFailed(self, message: str) -> None:
-        self._worker = None
+    def showFailure(self, message: str) -> None:
+        """What follows a refused action, from a click or a route."""
         self._say(message)
+
+
+class GmshImportApi:
+    """What the Import panel shows, for the local API.
+
+    ``core/facade/plan48/ag_gmsh_routes.py`` calls it; it reads on the GUI
+    thread. The buttons' actions are routes of their own on the project's
+    Gmsh session (``gmsh.model.*``).
+    """
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def state(self) -> dict:
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+
+        def read():
+            panel = self._panel
+            return {'status': panel.status(), 'mode': panel.mode(),
+                    'path': panel.path(),
+                    'reclassify': panel.reclassifyValues(),
+                    'time_limit': panel.timeLimit(), 'busy': panel.busy()}
+        return on_gui(read)
+
+    def finished(self, what: str, result) -> None:
+        """A route ran an action of this panel: show what a click shows."""
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+        on_gui(self._panel.showOutcome, what, result)
+
+    def failed(self, message: str) -> None:
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+        on_gui(self._panel.showFailure, str(message))

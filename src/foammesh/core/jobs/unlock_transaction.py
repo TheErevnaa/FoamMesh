@@ -25,6 +25,16 @@ explicit, durable two-phase operation under ``foammesh/workflow/pending``::
                            imported, repaired and prepared surfaces)
         surfaces/          the project's in-memory geometry surfaces, as the
                            caller's ``capture_surfaces`` wrote them
+        pipeline-resume.json  where a stopped Run to end could carry on from
+                           (absent = none)
+
+Plan 50 CX2 (DP-6203). The committed unlock also clears the decomposition,
+as a stage reset (DP-1230) and a stage replay (UF20) do: the processor
+folders, the pending-gather marker, the decomposition record and the
+pipeline-resume record. The processor folders are not copied for undo; the
+caller gathers a complete pending result into the case root first, so the
+root mesh this transaction copies is the mesh the run made, and the next
+parallel run decomposes it again.
 
 ``foammesh/workflow/undo.json`` names the committed operation that undo
 restores. There is at most one: a new unlock replaces it only after its own
@@ -58,6 +68,9 @@ SCHEMA_VERSION = 1
 #: Free space kept in reserve beyond the copy itself.
 DISK_RESERVE_BYTES = 64 * 1024 * 1024
 UNLOCK_OPERATION = 'mesh.workflow.unlock'
+#: Plan 50 CX2. Where a stopped Run to end could carry on from; cleared by an
+#: unlock, put back by its undo.
+PIPELINE_RESUME = ('foammesh', 'pipeline-resume.json')
 UNDO_OPERATION = 'mesh.workflow.undo_unlock'
 
 
@@ -107,6 +120,109 @@ def remove_results(case_path) -> dict:
             _remove(folder)
             removed[key] = not folder.exists()
     return removed
+
+
+def clear_decomposition(case_path) -> dict:
+    """Clear the decomposition an unlock supersedes (Plan 50 CX2, DP-6203).
+
+    The processor folders, the pending-gather marker and the decomposition
+    record (:func:`run_records.discard_decomposition`, which never raises),
+    and the pipeline-resume record. Returns ``{'removed', 'held'}``; *held*
+    names a processor folder Windows did not let go of yet, which nothing
+    describes any more and the next run or unlock removes.
+    """
+    from .run_records import discard_decomposition
+    outcome = discard_decomposition(case_path)
+    try:
+        Path(case_path).joinpath(*PIPELINE_RESUME).unlink(missing_ok=True)
+    except OSError:
+        logger.warning('could not remove the pipeline-resume record',
+                       exc_info=True)
+    return outcome
+
+
+#: Plan 50 CX2 (review follow-up). Where an unlock sets aside a complete
+#: decomposition it could not gather, inside its own undo folder.
+SET_ASIDE = 'decomposition'
+
+
+def _decomposition_items(case_path: Path) -> list[Path]:
+    from .run_records import DECOMPOSITION_RECORD, PENDING_GATHER
+    items = sorted(case_path.glob('processor[0-9]*'))
+    for parts in (PENDING_GATHER, DECOMPOSITION_RECORD):
+        item = case_path.joinpath(*parts)
+        if item.exists():
+            items.append(item)
+    return items
+
+
+def set_aside_decomposition(case_path, folder: Path) -> dict:
+    """Move the decomposition into the undo *folder* instead of deleting it.
+
+    Plan 50 CX2 (review follow-up, DP-6204). When the gather of a complete
+    set failed, that set is the published result of its stage and the case
+    root still holds the mesh before it: the undo copy is of that root. The
+    set leaves the case like any decomposition an unlock supersedes, but by
+    rename on the same volume into ``<folder>/decomposition`` -- an undo
+    moves it back, so the case it restores matches the task states it
+    restores. A rename Windows refuses falls back to
+    :func:`clear_decomposition` for what is left; ``kept`` then is False.
+    The pipeline-resume record is cleared as by any unlock (the undo copy
+    holds it). Returns ``{'removed', 'held', 'set_aside', 'kept'}``.
+    """
+    from foammesh.support.utils import rename_retrying
+    case_path = Path(case_path)
+    destination = Path(folder) / SET_ASIDE
+    moved, kept = [], True
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in _decomposition_items(case_path):
+            relative = item.relative_to(case_path)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            rename_retrying(item, target)
+            moved.append(relative.as_posix())
+    except OSError:
+        logger.warning('could not set the decomposition aside for undo; it is '
+                       'cleared instead', exc_info=True)
+        kept = False
+    outcome = clear_decomposition(case_path)
+    return dict(outcome, set_aside=[name for name in moved
+                                    if name.startswith('processor')],
+                kept=kept)
+
+
+def _restore_decomposition(case_path: Path, folder: Path, manifest: dict) -> bool:
+    """Move a set-aside decomposition back; idempotent (Plan 50 CX2).
+
+    A processor folder in the case that is not one of the set aside is not
+    what the restored task states describe and is discarded (nothing runs
+    while the case is held exclusively); one of the set already moved back
+    by an interrupted undo is kept.
+    """
+    source = folder / SET_ASIDE
+    if not source.is_dir():
+        return False
+    from foammesh.support.utils import discard_tree, rename_retrying
+    names = set((manifest.get('decomposition') or {}).get('set_aside') or ())
+    names.update(item.name for item in source.glob('processor[0-9]*'))
+    for item in case_path.glob('processor[0-9]*'):
+        if item.name not in names:
+            discard_tree(item)
+    moves = []
+    for item in sorted(source.iterdir()):
+        if item.is_dir() and not item.name.startswith('processor'):
+            moves.extend((entry, case_path / item.name / entry.name)
+                         for entry in sorted(item.iterdir()))
+        else:
+            moves.append((item, case_path / item.name))
+    for item, target in moves:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            _remove(target)
+        rename_retrying(item, target)
+    _remove(source)
+    return True
 
 
 def _now() -> str:
@@ -253,6 +369,19 @@ def preview_unlock(case_path, store, task_id: str) -> dict:
         artifacts.append({'path': 'foammesh/quality', 'bytes': quality_bytes,
                           'becomes': 'deleted; a copy is kept so undo '
                                      'restores it'})
+    processors = sorted(path for path in Path(case_path).glob('processor[0-9]*')
+                        if path.is_dir())
+    if processors:
+        # Plan 50 CX2. The decomposition goes with the mesh it was split
+        # from; it is not copied (a complete pending result is gathered into
+        # the case root first, and that copy is what undo restores).
+        artifacts.append({
+            'path': (processors[0].name if len(processors) == 1 else
+                     f'processor0..{len(processors) - 1} '
+                     f'({len(processors)} folders)'),
+            'bytes': sum(tree_bytes(path) for path in processors),
+            'becomes': 'deleted; not copied — undo restores the case-root '
+                       'mesh, and the next parallel run splits it again'})
     if geometry_bytes:
         artifacts.append({'path': 'foammesh/geometry', 'bytes': geometry_bytes,
                           'becomes': 'kept as it is; a copy is kept so undo '
@@ -272,6 +401,7 @@ def preview_unlock(case_path, store, task_id: str) -> dict:
         'titles': [store.step_title(item) for item in scope],
         'deletes_mesh': mesh.is_dir(),
         'deletes_quality': quality.is_dir(),
+        'deletes_decomposition': [path.name for path in processors],
         'resets_values': task_id == GEOMETRY_STEP,
         'completion_locked': [item for item in scope
                               if item in store.completion_locked_steps()],
@@ -350,7 +480,8 @@ def preview_undo(case_path, db) -> dict:
     return dict(undo_available(case_path),
                 discarded_settings=settings_changes(db, text),
                 restores_mesh=(folder / 'mesh').is_dir(),
-                restores_geometry=(folder / 'geometry').is_dir())
+                restores_geometry=(folder / 'geometry').is_dir(),
+                restores_decomposition=(folder / SET_ASIDE).is_dir())
 
 
 # --------------------------------------------------------------------------- #
@@ -358,18 +489,31 @@ def preview_undo(case_path, db) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _preflight(case_path, operation: str, recovery=None) -> None:
+    """Resolve earlier runs of the case, or refuse saying what holds it.
+
+    Plan 50 CX3. DP-6206: this only looked (``RecoveryGate.check``), so a
+    run the gate could close on the spot -- its writer gone, a restore that
+    succeeds now -- refused every unlock until a mesher run resolved it.
+    The caller holds the case exclusively, so no run of this case is active
+    and the gate resolves here as it does before a mesher run. DP-6205:
+    what is still held is named, with the act that clears it.
+    """
     from .run_records import RecoveryGate
-    verdict = RecoveryGate(case_path, recovery=recovery).check()
+    verdict = RecoveryGate(case_path, recovery=recovery).resolve()
     if verdict.blocked:
         raise UnlockError(
             f'{operation} was not started: an earlier run of this case is '
-            'not resolved yet', code='case_busy',
-            details={'records': [record.get('run_id') for record in verdict.records]})
+            f'not resolved yet. {verdict.advice()}'.strip(), code='case_busy',
+            details={'records': [record.get('run_id') for record in verdict.records],
+                     'held': verdict.held(), 'actions': verdict.actions(),
+                     'read_only': verdict.read_only,
+                     'messages': list(verdict.messages)})
 
 
 def unlock(case_path, store, task_id: str, *, settings_text: str,
            expected_revision: int | None = None, recovery=None,
-           disk_usage=shutil.disk_usage, capture_surfaces=None) -> dict:
+           disk_usage=shutil.disk_usage, capture_surfaces=None,
+           keep_decomposition: bool = False) -> dict:
     """Reopen *task_id* and its dependants, keeping one complete undo.
 
     Refuses -- changing nothing -- when the task is not locked, the
@@ -379,6 +523,10 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
 
     ``capture_surfaces(directory)`` writes the project's in-memory geometry
     surfaces (which live in the configuration, not on disk) for undo.
+
+    ``keep_decomposition``: the processor folders hold a complete result
+    that could not be gathered (Plan 50 CX2); they are moved into the undo
+    folder rather than deleted (:func:`set_aside_decomposition`).
     """
     case_path = Path(case_path)
     with _exclusive(case_path, UNLOCK_OPERATION):
@@ -424,6 +572,7 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
             'created_at': _now(), 'publication_revision': revision,
             'mesh_bytes': mesh_bytes, 'geometry_bytes': geometry_bytes,
             'quality_bytes': quality_bytes, 'results_removed': False,
+            'keep_decomposition': bool(keep_decomposition),
         }
         try:
             folder.mkdir(parents=True)
@@ -451,6 +600,10 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
             if capture_surfaces is not None:
                 capture_surfaces(folder / 'surfaces')
                 manifest['surfaces'] = True
+            resume = case_path.joinpath(*PIPELINE_RESUME)
+            if resume.is_file():
+                _write_text(folder / 'pipeline-resume.json',
+                            resume.read_text(encoding='utf-8'))
             # The manifest is written last: a folder without one is a copy
             # that never became an operation, and recovery deletes it.
             _write_durably(folder / 'manifest.json', manifest)
@@ -482,11 +635,19 @@ def unlock(case_path, store, task_id: str, *, settings_text: str,
         # this line is finished by `recover` (the manifest says they are
         # still to go).
         removed = remove_results(case_path)
-        manifest.update(results_removed=True)
+        decomposition = _supersede_decomposition(case_path, folder, manifest)
+        manifest.update(results_removed=True, decomposition=decomposition)
         _write_durably(folder / 'manifest.json', manifest)
         return dict(result, operation_id=operation_id,
                     undo=undo_available(case_path), staled_exports=staled,
-                    removed=removed)
+                    removed=removed, decomposition=decomposition)
+
+
+def _supersede_decomposition(case_path: Path, folder: Path,
+                              manifest: dict) -> dict:
+    if manifest.get('keep_decomposition'):
+        return set_aside_decomposition(case_path, folder)
+    return clear_decomposition(case_path)
 
 
 def _adopt(case_path: Path, operation_id: str) -> None:
@@ -578,6 +739,12 @@ def _finish_undo(case_path: Path, store, folder: Path, manifest: dict,
     restored_mesh = _swap_in(folder / 'mesh', _mesh_dir(case_path))
     restored_geometry = _swap_in(folder / 'geometry', _geometry_dir(case_path))
     restored_quality = _swap_in(folder / 'quality', _quality_dir(case_path))
+    restored_decomposition = _restore_decomposition(case_path, folder, manifest)
+    resume = folder / 'pipeline-resume.json'
+    restored_resume = resume.is_file()
+    if restored_resume:
+        _write_text(case_path.joinpath(*PIPELINE_RESUME),
+                    resume.read_text(encoding='utf-8'))
     if restore_surfaces is not None and (folder / 'surfaces').is_dir():
         restore_surfaces(folder / 'surfaces')
     settings_text = (folder / 'settings.yaml').read_text(encoding='utf-8')
@@ -602,6 +769,8 @@ def _finish_undo(case_path: Path, store, folder: Path, manifest: dict,
             'restored_mesh': restored_mesh,
             'restored_geometry': restored_geometry,
             'restored_quality': restored_quality,
+            'restored_resume': restored_resume,
+            'restored_decomposition': restored_decomposition,
             'locked': store.locked_tasks()}
 
 
@@ -687,6 +856,8 @@ def recover(case_path, store=None, *, restore_settings=None,
             # Plan 43 LY9. A crash between the commit and the deletion: the
             # steps are unlocked, so the mesh has to go with them.
             remove_results(case_path)
+            manifest['decomposition'] = _supersede_decomposition(
+                case_path, folder, manifest)
             manifest['results_removed'] = True
             _write_durably(folder / 'manifest.json', manifest)
     if committed:

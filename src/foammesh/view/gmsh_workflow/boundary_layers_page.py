@@ -374,20 +374,20 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             return
         editor = self._editors.get(self.PATCH_MODE_FIELD)
         if editor is not None:
-            editor.valueChanged.connect(self._onPatchModeChanged)
+            editor.connectOnce(self._onPatchModeChanged)  # DP-6343
             self.describeModeChoices(editor)
         self.updatePatchSelector()
-        # The editors are rebuilt on every refresh, so the live hook is
-        # reconnected here rather than once at construction.
+        # A refresh that changes the field set builds new editors, so the
+        # live hook is connected here, once per editor (DP-6343).
         for field_id in self._STACK_FIELDS.values():
             editor = self._editors.get(field_id)
             if editor is not None:
-                editor.valueChanged.connect(self._onStackFieldChanged)
+                editor.connectOnce(self._onStackFieldChanged)  # DP-6343
         self.updateStackNote()
         self.updateAssemblyNote()
         switch = self._editors.get(self.SWITCH_FIELD)
         if switch is not None:
-            switch.valueChanged.connect(self.followLayerSwitch)
+            switch.connectOnce(self.followLayerSwitch)  # DP-6343
         self.followLayerSwitch()
 
     SWITCH_FIELD = 'gmsh.boundary_layers.enabled'
@@ -647,7 +647,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             return
         editor = self._editors.get(self.PATCH_FIELD)
         if editor is not None:
-            editor.valueChanged.connect(self._onPatchFieldEdited)
+            editor.connectOnce(self._onPatchFieldEdited)  # DP-6343
         patches = self.preparedPatches()
         regions = self.preparedRegions()
         selected = self.selectedPatches()
@@ -768,7 +768,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             return
         self._storingProposal = True
         try:
-            self.apply()
+            self.apply(proposal=True)
         finally:
             self._storingProposal = False
 
@@ -1232,15 +1232,18 @@ class GmshBoundaryLayersPage(GmshTaskPage):
         """What an assembly means for the selection that is on screen now."""
         head = str(self.tr(
             'This geometry holds %d volumes. Boundary layers are supported on '
-            'an assembly, but every ticked patch has to bound one and the same '
-            'volume: the layer is carved out of that volume, and the others '
-            'are meshed exactly as they were imported.')) % volumes
+            'an assembly: the layer is carved out of each volume a ticked '
+            'patch bounds, and the others are meshed exactly as they were '
+            'imported.')) % volumes
         selected = self.selectedPatches()
         if not selected:
+            # Plan 50 IP28 (DP-6437). Ticks that are the answer and name
+            # nothing were refused above (Plan 37 F3d); here no tick means
+            # every eligible wall, grown volume by volume.
             return head + ' ' + str(self.tr(
-                'Nothing is ticked, so no layer would grow on any of the %d '
-                'volumes and the run will be refused. Tick the patches of '
-                'one volume.')) % volumes
+                'No patch is named, so the layer grows on every eligible wall '
+                'of the %d volumes. A wall two of them share grows no '
+                'layer.')) % volumes
         owners = self.regionsByPatch(regions)
         state, common = self.gradeSelection(selected, owners)
         if state == 'ungraded':
@@ -1267,9 +1270,12 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             '%s bounds %s' % (name, ', '.join(sorted(owners.get(name, ())))
                               or str(self.tr('no recorded volume')))
             for name in selected)
+        # Plan 50 IP28 (DP-6437). Grown volume by volume; a patch two layered
+        # volumes share grows none and is named in the run's warnings.
         return head + ' ' + str(self.tr(
-            'The ticked patches span more than one volume (%s), and the run '
-            'will be refused. Untick everything outside one volume.')) % spread
+            'The ticked patches span more than one volume (%s), so the layer '
+            'grows into each of them. A patch shared by two of them grows no '
+            'layer.')) % spread
 
     def updateAssemblyNote(self) -> None:
         """Say what this geometry's volumes mean for the layer selection.
@@ -1304,8 +1310,10 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             self._assemblyNote.setVisible(False)
             return
         regions = self.preparedRegions()
-        spanning = self.spanningSelection(selected)
-        if refusal and not (regions and selected and not spanning):
+        # Plan 50 IP28 (DP-6437). A selection over several volumes, a patch
+        # covering shells of two of them included, is grown volume by volume
+        # now, so it is no longer a refusal the note has to explain.
+        if refusal and not (regions and selected):
             # DP-123. With a graded selection on screen the note below says
             # which patch bounds which volume and what to untick, which is
             # more than the refusal's own sentence can. Without one -- an
@@ -1317,9 +1325,7 @@ class GmshBoundaryLayersPage(GmshTaskPage):
             # so, because that grading holds one set of volumes per patch
             # name; the refusal is right and the prose would not be, so the
             # refusal is said and the patch is named.
-            self._assemblyNote.setText(
-                self.spanningNoteText(refusal, spanning) if spanning
-                else refusal)
+            self._assemblyNote.setText(refusal)
             self._assemblyNote.setVisible(True)
             return
         topology = self.preparedTopology()

@@ -13,6 +13,9 @@ and ``client()`` the project's field client.
 """
 from __future__ import annotations
 
+import weakref
+
+from foammesh.support.weak_slot import weak_slot
 from foammesh.view.gmsh_tools import bounding_boxes
 from foammesh.view.gmsh_tools import overlays
 from foammesh.view.gmsh_tools import point_placement
@@ -223,16 +226,22 @@ class GmshToolDock:
         Each panel is connected once; the number newly connected is returned.
         """
         count = 0
+        # DP-6407. Held weakly: the dock lives with the window, so a strong
+        # list kept every closed case's structure and geometry-build panels,
+        # and through them their Gmsh pages, alive after File > Close.
+        self._connected = [ref for ref in self._connected if ref() is not None]
         for panel in panels:
-            if panel is None or any(panel is held for held in self._connected):
+            if panel is None or any(ref() is panel for ref in self._connected):
                 continue
             if hasattr(panel, 'sweepPreview'):
-                panel.sweepPreview.connect(self.show_sweep)
+                # DP-6407. A plain function: PySide keeps a reference for
+                # good for each signal connected to a non-QObject's method.
+                panel.sweepPreview.connect(weak_slot(self.show_sweep))
                 count += 1
             if hasattr(panel, 'qualificationChanged'):
-                panel.qualificationChanged.connect(self.show_qualification)
+                panel.qualificationChanged.connect(weak_slot(self.show_qualification))
                 count += 1
-            self._connected.append(panel)
+            self._connected.append(weakref.ref(panel))
         return count
 
     def show_sweep(self, segments) -> int:

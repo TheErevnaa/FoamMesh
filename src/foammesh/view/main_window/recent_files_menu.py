@@ -62,6 +62,9 @@ class RecentFilesMenu(QObject):
         existing = self._actions.get(path)
         if existing:
             self._root.removeAction(existing)
+            if existing is self._recentest:
+                self._recentest = None
+            existing.deleteLater()
         action = self._newAction(path)
         if self._recentest is None:
             self._root.addAction(action)
@@ -107,7 +110,10 @@ class RecentFilesMenu(QObject):
         return label.replace('&', '&&')
 
     def _newAction(self, path, display_name=None):
-        action = QAction(self.entryLabel(path, display_name))
+        # DP-6407. Owned by the menu, so `clear()` deletes it; a parentless
+        # action was kept by PySide after the menu let go (about one a
+        # project opened in the live soak).
+        action = QAction(self.entryLabel(path, display_name), self._root)
         action.setData(path)
         action.setToolTip(str(path))
         action.setStatusTip(str(path))

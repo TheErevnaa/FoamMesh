@@ -28,6 +28,13 @@ def apply_geometry_build(run, **_context):
     if not steps:
         return
     builder = _builder()
+    if run.job.get('builder_seed'):
+        # DP-6151. A model made only on the Edit geometry page was given a
+        # throw-away solid to import; the build starts from nothing.
+        gmsh = run.gmsh
+        gmsh.model.occ.remove(gmsh.model.getEntities(3), True)
+        gmsh.model.occ.remove(gmsh.model.getEntities(2), True)
+        gmsh.model.occ.synchronize()
     # DP-5716. The names and scopes the import resolved follow the build:
     # an entity it took away loses its name, a new one is named from the
     # build's groups, and no name is carried by a reused tag.

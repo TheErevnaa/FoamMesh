@@ -525,7 +525,10 @@ class GmshSession:
             self.start()
             replayed = self.call('session.replay',
                                  self.runtime_path(self.log_path))
+            # Plan 50 IP18 (DP-6323): whether the last generate's mesh was
+            # put back from its snapshot, or the whole log was run, and why.
             return {'replayed': replayed.get('replayed', 0),
+                    'snapshot': replayed.get('snapshot'),
                     'state': self.state(), 'hello': self.hello}
 
     def close(self) -> None:

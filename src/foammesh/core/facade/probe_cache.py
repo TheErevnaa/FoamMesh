@@ -104,7 +104,11 @@ class ProbeCache:
 
         task = self._inflight.get(key)
         if task is None or task.done():
-            task = asyncio.ensure_future(asyncio.to_thread(factory))
+            # DP-6456. A runtime probe ends in wsl.exe, so it runs on the WSL
+            # executor (DP-6403), not the loop's shared default executor that
+            # a wedged VM could otherwise fill.
+            from foammesh.support import wsl_executor
+            task = asyncio.ensure_future(wsl_executor.run_wsl(factory))
             self._inflight[key] = task
 
             def _remember(finished, key=key):

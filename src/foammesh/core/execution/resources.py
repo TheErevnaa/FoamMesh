@@ -527,9 +527,12 @@ def meshing_host(*, wait: bool = False, refresh: bool = False) -> MeshingHost:
 
 
 async def warm_meshing_host() -> MeshingHost:
-    """:func:`meshing_host`, probed on a worker thread if it is not fresh."""
-    import asyncio
-    return await asyncio.to_thread(meshing_host, wait=True)
+    """:func:`meshing_host`, probed on a worker thread if it is not fresh.
+
+    Plan 50 IP22 (DP-6403): on the WSL executor, never the loop's default
+    one, so a wedged VM cannot hold the window's background workers."""
+    from foammesh.support.wsl_executor import run_wsl
+    return await run_wsl(meshing_host, wait=True)
 
 
 def remember_meshing_host(host: MeshingHost | None) -> None:

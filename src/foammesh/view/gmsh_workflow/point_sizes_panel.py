@@ -99,6 +99,25 @@ class PointSizesPanel(QWidget):
         if entity_panel is not None:
             entity_panel.pickAccepted.connect(self._onPicked)
         self.reload()
+        # The local API reaches this panel through the case session.
+        self._api = PointSizesApi(self)
+        self.registerApi()
+
+    # -- the local API ------------------------------------------------------ #
+
+    def api(self):
+        return self._api
+
+    def registerApi(self) -> bool:
+        """Tell the case session this panel is in a window (idempotent)."""
+        from foammesh.core.facade.plan48 import ag_gmsh_routes
+        return ag_gmsh_routes.attach(
+            self, ag_gmsh_routes.POINT_SIZES_ATTRIBUTE, self._api,
+            self._client)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.registerApi()
 
     # -- state -------------------------------------------------------------- #
 
@@ -278,3 +297,23 @@ class PointSizesPanel(QWidget):
         if added:
             self._say(count_text(added, self.tr('point'))
                       + self.tr(' added.'))
+
+
+class PointSizesApi:
+    """What the Size at points panel shows, for the local API.
+
+    ``core/facade/plan48/ag_gmsh_routes.py`` calls it; it reads on the GUI
+    thread.
+    """
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def state(self) -> dict:
+        from foammesh.core.facade.plan48.ag_gmsh_routes import on_gui
+
+        def read():
+            panel = self._panel
+            return {'rows': panel.rows(), 'status': panel.status(),
+                    'dirty': panel.is_dirty}
+        return on_gui(read)

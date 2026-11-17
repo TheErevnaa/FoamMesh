@@ -219,6 +219,65 @@ def lowered_surface_intent(db, prepared_geometry) -> dict:
             'relations': relations}
 
 
+def window_surface_names(db, prepared_geometry) -> dict:
+    """The name the window shows a surface by -> the name the run imports.
+
+    DP-6472. MEASURED live (two STL cubes, split): the geometry tree and the
+    surface-roles list call the surfaces ``left_surface`` and
+    ``right_surface``; the prepared groups, the Gmsh job, the published
+    polyMesh and the hand-off manifest call them ``left`` and ``right``. The
+    tree cannot take ``left`` -- its names are unique across volume and
+    surface rows, and the volume row already has it -- so a setting made on
+    the name a person can pick is mapped here to the surface it stands for.
+
+    A row is joined to a prepared group the way ``prepared_surface_intent``
+    joins it: by the patch uuid it was stamped with, then by its artifact and
+    name; and (DP-636) a single-boundary artifact with a single surface row
+    is that row's whether the names agree or not. Only names that differ are
+    listed, and a row name that is itself the imported name of another
+    surface is left out rather than guessed at.
+    """
+    groups = _groups(prepared_geometry)
+    content = getattr(db, 'data', None)
+    if not groups or not callable(content):
+        return {}
+    try:
+        geometry = (content() or {}).get('geometry') or {}
+    except Exception:  # noqa: BLE001 - a db with no document has no rows
+        return {}
+    rows = [row for row in geometry.values() if isinstance(row, dict)
+            and _text(row.get('gType')) == 'surface' and _text(row.get('name'))]
+    by_uuid, by_artifact_name, by_artifact = {}, {}, {}
+    for row in rows:
+        token = _text(row.get('patchUuid'))
+        artifact = _text(row.get('geometryId'))
+        if token:
+            by_uuid.setdefault(token, row)
+        by_artifact_name.setdefault((artifact, _text(row.get('name'))), row)
+        if artifact:
+            by_artifact.setdefault(artifact, []).append(row)
+    groups_of: dict = {}
+    for group in groups:
+        groups_of.setdefault(_text(group.get('geometry_id')), []).append(group)
+    imported = {_solver_name(group) for group in groups}
+    names = {}
+    for group in groups:
+        artifact = _text(group.get('geometry_id'))
+        row = by_uuid.get(_text(group.get('patch_uuid')))
+        if row is None:
+            row = by_artifact_name.get(
+                (artifact, _text(group.get('display_name') or group.get('name'))))
+        if (row is None and artifact and len(groups_of.get(artifact, ())) == 1
+                and len(by_artifact.get(artifact, ())) == 1):
+            row = by_artifact[artifact][0]
+        if row is None:
+            continue
+        shown, solver = _text(row.get('name')), _solver_name(group)
+        if shown and solver and shown != solver and shown not in imported:
+            names.setdefault(shown, solver)
+    return names
+
+
 def _valid_pair_relations(block, kind) -> list[dict]:
     return [relation for relation in (block or {}).get('relations') or ()
             if relation.get('kind') == kind
@@ -466,4 +525,5 @@ __all__ = ('SURFACE_INTENT_VERSION', 'lowered_surface_intent',
            'project_relations',
            'relation_interface_pairs', 'periodic_relation_rows',
            'affine_periodic_refusal',
-           'surface_intent_refusal', 'unresolved_warnings')
+           'surface_intent_refusal', 'unresolved_warnings',
+           'window_surface_names')

@@ -58,7 +58,9 @@ CARD_WIDTH_SHARE = 0.6
 CARD_MAX_WIDTH = 420
 CARD_MIN_WIDTH = 220
 
-_RUN_ID = re.compile(r'^[a-z][a-z0-9]*-[0-9a-f]{8,}$')
+# DP-6490. snappy's run ids are a bare 32-character hex string; only the
+# Gmsh ``gmsh-<hex>`` shape was known, so the bare one reached the card.
+_RUN_ID = re.compile(r'^(?:[a-z][a-z0-9]*-[0-9a-f]{8,}|[0-9a-f]{16,})$')
 _CELL_COUNT = re.compile(r'^[\d,]+ cells?$')
 
 
@@ -245,13 +247,17 @@ class PartRow(QWidget):
         layout.setContentsMargins(MARGIN_TIGHT, 0, MARGIN_TIGHT, 0)
         layout.setSpacing(GAP_TIGHT)
 
-        self._swatch = QLabel()
+        # Plan 50 (DP-6508). Every child is made with its parent: the role
+        # label was shown while it had none, and a shown widget without a
+        # parent is a top-level native window on Windows -- 18 ms to make,
+        # more to take down again in addWidget, per row (500 rows: 15 s).
+        self._swatch = QLabel(self)
         self._swatch.setPixmap(_swatch(color))
-        self._name = QLabel(name)
+        self._name = QLabel(name, self)
         self._name.setToolTip(name)
         # Plan 44 F1 (MF21). The mockup's small role text after the name;
         # hidden when the part has no role.
-        self._role = QLabel(role or '')
+        self._role = QLabel(role or '', self)
         self._role.setObjectName('overlayPartRole')
         role_font = QFont(self._role.font())
         if role_font.pointSizeF() > 0:
@@ -261,7 +267,7 @@ class PartRow(QWidget):
 
         # The bulb pair already in the icon set is this app's existing idiom
         # for "this thing is drawn / this thing is not".
-        self._eye = QToolButton()
+        self._eye = QToolButton(self)
         self._eye.setObjectName('overlayPartEye')
         self._eye.setCheckable(True)
         self._eye.setChecked(True)
@@ -275,7 +281,7 @@ class PartRow(QWidget):
         # change: tinted once, from the palette of the moment, the isolate
         # glyph kept the dark theme's pale ink on the light popover (and the
         # eye kept it until it was next pressed).
-        self._solo = QToolButton()
+        self._solo = QToolButton(self)
         self._solo.setObjectName('overlayPartSolo')
         apply_tinted_icon(self._solo, ':/graphicsIcons/isolate.svg',
                           ROW_ICON, ROW_GLYPH_STROKE_PX)
@@ -875,6 +881,25 @@ class ViewportOverlay(QFrame):
             # invisible); this line keeps what only it says, the cell count.
             base = self._cellsText
         self._chip.setText(base)
+        self._showWhenItSaysSomething()
+
+    def _showWhenItSaysSomething(self):
+        """DP-6490. The card is up only while one of its lines is.
+
+        MEASURED live (Plan 50, s2-base-grid): in rail mode the arrow is
+        hidden and the one line carries only the cell count, so with no mesh
+        and no run the card was a small empty white box over the picture.
+        """
+        if not hasattr(self, '_result') or not self.testAttribute(
+                Qt.WidgetAttribute.WA_WState_ExplicitShowHide):
+            return          # being built, or not yet shown by its window
+        inside = (lambda widget: widget.parentWidget() is self
+                  and not widget.isHidden())
+        says = (bool(self._chip.fullText()) or not self._toggle.isHidden()
+                or not self._result.isHidden() or inside(self._mesh)
+                or inside(self._notice) or not self._body.isHidden())
+        if says == self.isHidden():
+            self.setVisible(says)
 
     def event(self, event):
         # UXB5. The card is Fixed and sized by hand, so a line that grows
@@ -1028,6 +1053,7 @@ class ViewportOverlay(QFrame):
         self._result.setText(shown)
         self._result.setTip(text)
         self._result.setVisible(bool(shown))
+        self._showWhenItSaysSomething()
         self.adjustSize()
 
     def resultText(self) -> str:
@@ -1071,6 +1097,7 @@ class ViewportOverlay(QFrame):
         self._notice.setVisible(bool(text))
         self._notice.updateGeometry()
         self._updateSceneEmpty()
+        self._showWhenItSaysSomething()
         self.adjustSize()
 
     def dismissPreviewNotice(self):
@@ -1233,9 +1260,13 @@ class ViewportOverlay(QFrame):
                 row.setVisibleState(visible)
                 self._partsLayout.addWidget(row)
                 self._rows[key] = row
+        # DP-6501. No `setParent(None)`: a row taken off its parent is made a
+        # window and re-polished with the style sheet, and closing a 500-body
+        # case held the GUI thread 15.5 s doing that (MEASURED, Plan 50 window
+        # leg surfaces500). Out of the layout and hidden, it is gone from
+        # view; deleteLater frees it.
         for widget in list(kept_rows.values()) + list(kept_labels.values()):
             widget.hide()
-            widget.setParent(None)
             widget.deleteLater()
         self._partsHost.setUpdatesEnabled(True)
 

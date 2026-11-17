@@ -111,6 +111,10 @@ class Scene:
     #: DP-6083. The mesh has a volume that is not loaded yet: the viewport
     #: shows its boundary surface and offers Load full volume.
     volume_deferred: bool = False
+    #: Plan 50 IP1 (DP-6220). The mesh on screen is the base grid: its volume
+    #: is drawn by the far walls (the volume itself steps out so it does not
+    #: cover the model), and the model stays in the box.
+    base_grid: bool = False
 
     def mesh_parts(self) -> tuple[str, ...]:
         return tuple(self.patches) + tuple(self.volume) + tuple(self.zones)
@@ -190,9 +194,14 @@ def plan(mode_id: str, scene: Scene) -> ViewPlan:
             return ViewPlan(mode_id, unavailable=(
                 _VOLUME_DEFERRED if scene.volume_deferred else _NO_VOLUME))
         wanted = tuple(scene.volume) + tuple(scene.zones)
+        summary = count_text(len(wanted), 'volume part')
+        if scene.base_grid:
+            # DP-6220. On the base grid the volume alone drew nothing: the
+            # far walls are its drawing and the model sits inside them.
+            wanted += tuple(scene.patches) + scene.parts()
         visible, hidden = _split(scene, wanted)
         return ViewPlan(mode_id, visible, hidden, SURFACE_EDGE,
-                        summary=count_text(len(visible), 'volume part'))
+                        summary=summary)
 
     if mode_id == SLICE:
         if not scene.mesh_parts():

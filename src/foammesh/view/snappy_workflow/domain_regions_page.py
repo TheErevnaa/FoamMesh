@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
     QToolButton, QVBoxLayout, QWidget)
 
+from foammesh.view.configuration_read import configuration_view
 from foammesh.app import app
 from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
 from foammesh.core import display_unit
@@ -1098,6 +1099,25 @@ class RegionSeedPanel(ChildControlPanel):
             self._restorePlacement()
         return False
 
+    def setFloatingEditorShown(self, shown: bool) -> None:
+        """DP-6113. A floating editor goes away with its page and comes back.
+
+        Docked, the editor is inside the page and hides with it. Floating, it
+        is a window of its own and stayed over the next step, where its OK
+        still wrote this step's region. The edit is kept, as docked.
+        """
+        dialog = self._openDialog
+        if dialog is None:
+            return
+        try:
+            if dialog.isDocked():
+                return
+            dialog.setVisible(shown)
+            if shown:
+                dialog.raise_()
+        except RuntimeError:
+            pass                                  # gone with the page
+
     def revertDrag(self) -> None:
         """The page was left: a drag not yet placed goes back (RP13 #8).
 
@@ -1935,7 +1955,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         'parts answers "neither" — and refinement regions and cell zones '
         'built on it are then dropped with a note in the log. Declare the '
         'surfaces closed to override that. Narrow gaps and the surface '
-        'search are set on Castellation. '
+        'search are set on Refinement. '
         'Detect (Alt+T) finds the spaces the surfaces close off and places '
         'a region in each one you keep; one Undo takes them all back. A '
         'seed can be dragged in the view, nudged with Alt and an arrow key '
@@ -1998,14 +2018,14 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         self.splitPromptText.setWordWrap(True)
         set_status(self.splitPromptText, 'warning')
         prompt.addWidget(self.splitPromptText)
-        # DP-6087: the cut is no longer a Geometry action of its own; this
-        # opens the Geometry step's Pair touching walls.
+        # DP-6092: pairing lives in one place, Edit surface > Region
+        # interface on the Geometry step; this only takes the user there.
         self.splitButton = QPushButton(
-            self.tr('Pair touching walls…'), self.splitPrompt)
-        self.splitButton.setObjectName('regionPairTouchingWalls')
+            self.tr('Go to geometry'), self.splitPrompt)
+        self.splitButton.setObjectName('regionGoToGeometry')
         self.splitButton.setToolTip(self.tr(
-            'Open the Geometry step and pair each wall two bodies share as an '
-            'interface that couples their regions'))
+            'Open the Geometry step, where a shared wall is paired as a region '
+            'interface'))
         self.splitButton.clicked.connect(self._openSplitInterfaces)
         prompt.addWidget(self.splitButton, 0, Qt.AlignmentFlag.AlignLeft)
         self.splitPrompt.hide()
@@ -2178,7 +2198,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         from foammesh.core.mesh import snappy_farfield
 
         try:
-            text = snappy_farfield.support_text(self._client.checkout())
+            text = snappy_farfield.support_text(configuration_view(self._client))
         except Exception:  # noqa: BLE001 - no case open yet
             text = ''
         if text:
@@ -2212,7 +2232,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         from foammesh.db.configurations_schema import CFDType
 
         try:
-            db = self._client.checkout()
+            db = configuration_view(self._client)
             interfaces = db.elementCount(
                 'geometry', lambda i, e: e['cfdType'] == CFDType.INTERFACE.value
                 and e['interRegion'])
@@ -2238,9 +2258,9 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             # interface is made by cutting the shared walls.
             return self.tr(
                 'No inter-region interface is configured, and these regions '
-                'may share a boundary that nothing couples. Pair touching '
-                'walls on the Geometry step makes each wall two bodies share '
-                'an interface that couples them.')
+                'may share a boundary that nothing couples. On the Geometry '
+                'step, double-click a shared wall and choose Region interface '
+                '(Pairing Automatic) to couple them.')
         return self.tr(
             'Only one region point is configured while an inter-region '
             'interface is configured on the Geometry step.')
@@ -2284,7 +2304,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         from foammesh.core.mesh.zone_names import cell_zone_word
 
         try:
-            volumes = self._client.checkout().getElements(
+            volumes = configuration_view(self._client).getElements(
                 'geometry', lambda _key, item: item.get('gType') == 'volume'
                 and item.get('cfdType') == CFDType.CELL_ZONE.value)
         except Exception:  # noqa: BLE001 - no case open yet
@@ -2391,9 +2411,10 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             self.splitPromptText.setText(self.tr(
                 'The imported bodies share {0}: {1}. Seeded as they are, '
                 'each region is meshed on its own and nothing couples them '
-                'across those walls. Pair touching walls makes each shared '
-                'wall an interface between the two regions. Nothing is '
-                'paired until you do.').format(
+                'across those walls. On the Geometry step, double-click a '
+                'shared wall and choose Region interface (Pairing Automatic) '
+                'to couple the two regions. Nothing is paired until you '
+                'do.').format(
                     count_text(len(names), 'wall'), ', '.join(names)))
         prompt.setVisible(bool(names))
         self._sayInterface()
@@ -2416,13 +2437,11 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         return self.splitPromptText.text()
 
     def _openSplitInterfaces(self) -> None:
-        """Go to the Geometry step and open its Pair touching walls.
+        """Go to the Geometry step, where a shared wall is paired.
 
-        The pairing is the Geometry step's own action, with its own preview
-        and confirmation; nothing is paired from here. A Geometry step locked by
-        Proceed is unlocked through its own question first (editing the
-        geometry discards what was made after it), and the cut starts once
-        the step is open again.
+        DP-6092: nothing is paired from here. A Geometry step locked by
+        Proceed asks its own unlock question (editing the geometry discards
+        what was made after it).
         """
         window = app.window
         navigation = getattr(window, '_navigationView', None)
@@ -2433,21 +2452,6 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
         navigation.setCurrentStep(Step.GEOMETRY)
         if getattr(page, '_locked', False):
             page._editLockedGeometry()
-            self._splitWhenUnlocked(page, attempts=40)
-            return
-        page._showPairTouchingMenu()
-
-    def _splitWhenUnlocked(self, page, attempts: int) -> None:
-        """Start the cut once the step manager has unlocked the page."""
-        from PySide6.QtCore import QTimer
-
-        if not getattr(page, '_locked', False):
-            page._showPairTouchingMenu()
-            return
-        if attempts <= 0:
-            return            # the user kept the geometry: nothing to cut
-        QTimer.singleShot(
-            50, lambda: self._splitWhenUnlocked(page, attempts - 1))
 
     def showEvent(self, event) -> None:
         """DP-818. The seed glyphs are drawn while this page is up."""
@@ -2457,6 +2461,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             self._showDomainBox(True)
             # DP-925. The saved regions carry their labels on this page.
             self.panel.setRegionLabelsShown(True)
+            self.panel.setFloatingEditorShown(True)
             self._offerDetection()
             # DP-2636. Bodies sharing walls are offered the cut, here.
             self._checkSharedWalls()
@@ -2480,6 +2485,7 @@ class SnappyDomainRegionsPage(SnappyTaskPage):
             # Plan 36 RP13 #8. The editor stays docked for the way back; a
             # drag it had not placed yet goes back to where it started.
             self.panel.revertDrag()
+            self.panel.setFloatingEditorShown(False)
             self.panel.cancelDetection()
             self._showSeedMarkers(False)
             self._showDomainBox(False)

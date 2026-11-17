@@ -48,12 +48,48 @@ RUN_DIR_VARIABLE = 'FOAMMESH_RUN_DIR'
 #: TERM grace before KILL on transport loss, seconds.
 TERM_GRACE_SECONDS = 10
 HEARTBEAT_SECONDS = 2
+#: DP-6457. Where Open MPI's session folder goes: 4.x reads ``orte_tmpdir_base``,
+#: 5.x ``prte_tmpdir_base``.
+#:
+#: DP-6476. A killed ``mpirun`` cannot remove what it made, and ``/dev/shm`` is
+#: memory nothing sweeps: a cancelled 4-rank Snap left its session folder
+#: (``ompi.<host>.<uid>/pid.<mpirun pid>``) and four 4 MiB
+#: ``vader_segment.<host>.<uid>.<jobid>.<rank>`` files (Open MPI 4.1's shared
+#: memory, put in ``btl_vader_backing_directory``, ``/dev/shm`` by default).
+#: Each run now has a folder of its own, ``run.<wrapper pid>``, holding both,
+#: so one removal clears the run and touches nothing of anyone else's. Before
+#: it is made, a run folder whose wrapper is gone and whose every ``mpirun``
+#: (the ``pid.<n>`` folders inside it) is gone too is swept: that is a run the
+#: whole WSL side was killed under. ``fmrun`` is empty when there is no run
+#: folder, and then nothing is ever removed.
+MPI_SESSION_BASE = (
+    'fmtmp="/dev/shm/foammesh-$(id -u)"; fmrun=""; '
+    'if mkdir -p "$fmtmp" 2>/dev/null && [ -w "$fmtmp" ]; then '
+    'for d in "$fmtmp"/run.*; do [ -d "$d" ] || continue; n="${d##*/run.}"; '
+    'case "$n" in ""|*[!0-9]*) continue;; esac; '
+    '[ "$n" != "$$" ] && kill -0 "$n" 2>/dev/null && continue; '
+    'held=""; for p in "$d"/ompi.*/pid.*; do [ -e "$p" ] || continue; '
+    'kill -0 "${p##*/pid.}" 2>/dev/null && held=1; done; '
+    '[ -n "$held" ] || rm -rf "$d" 2>/dev/null; done; '
+    'if mkdir "$fmtmp/run.$$" 2>/dev/null; then fmrun="$fmtmp/run.$$"; '
+    'export OMPI_MCA_btl_vader_backing_directory="$fmrun"; fmtmp="$fmrun"; fi; '
+    'export OMPI_MCA_orte_tmpdir_base="$fmtmp" '
+    'PRTE_MCA_prte_tmpdir_base="$fmtmp"; fi')
+#: DP-6459. hwloc lists PCI devices by reading each one's ``config`` file under
+#: ``/sys/bus/pci/devices``. A mesher needs the processors, not the devices, so
+#: the three components that read them are left out (``pci`` is libpciaccess,
+#: ``linuxio`` is hwloc 2's sysfs reader, ``linuxpci`` hwloc 1's). A value the
+#: user set is kept.
+HWLOC_WITHOUT_PCI = (
+    'export HWLOC_COMPONENTS='
+    '"${HWLOC_COMPONENTS:--pci,-linuxio,-linuxpci}"')
 
-# The watcher, run as ``setsid bash -c WATCHER fm-watch <pgid> <record> <rid>``
+# The watcher, run as ``setsid bash -c WATCHER fm-watch <pgid> <record> <rid>
+# <run folder>`` (DP-6476: the folder is removed once the run is dead)
 # with the lifetime pipe as its stdin. ``cat`` returns on EOF only.
 _WATCHER = r'''
 cat >/dev/null
-pg="$1"; rec="$2"; rid="$3"
+pg="$1"; rec="$2"; rid="$3"; run="$4"
 alive() { kill -0 -- "-$pg" 2>/dev/null || pgrep -s "$pg" >/dev/null 2>&1; }
 alive || exit 0
 note() {
@@ -68,7 +104,7 @@ i=0
 while [ "$i" -lt GRACE ] && alive; do sleep 1; i=$((i+1)); done
 kill -KILL -- "-$pg" 2>/dev/null; pkill -KILL -s "$pg" 2>/dev/null
 sleep 1
-if alive; then note false; else note true; fi
+if alive; then note false; else note true; [ -n "$run" ] && rm -rf "$run" 2>/dev/null; fi
 '''.replace('GRACE', str(TERM_GRACE_SECONDS))
 
 
@@ -100,10 +136,26 @@ def wrapped_script(*, prelude: str, runtime_cwd: str, run: str,
         'child=""',
         'peak=""; pmeasure=""; preason=""',
         'export FM_TIME_FILE="${rdir:-/tmp}/.foammesh-$rid.time"',
+        # DP-6457. Open MPI keeps its session folder under /tmp, and a distro
+        # with systemd empties /tmp while it boots (tmpfiles `D /tmp`). A run
+        # started into a distro that was still booting lost that folder and
+        # every rank failed in MPI_Init. /dev/shm is mounted before any
+        # command runs and is not emptied afterwards, so the session folder
+        # goes there; a distro without a writable /dev/shm keeps the default.
+        MPI_SESSION_BASE,
+        # DP-6459. MEASURED 2026-11-11 in a WSL 2 VM: `mpirun -np 4
+        # snappyHexMesh` sat at 90 % of a processor for 13 minutes before it
+        # started a rank, its one open file a virtual PCI device's `config`
+        # (hwloc listing devices); with the PCI components left out the same
+        # `mpirun` started 2, 4 and 8 ranks in 45 to 51 ms.
+        HWLOC_WITHOUT_PCI,
         # A record only ever says `exited` when nothing of the run is left.
         'fm_exit() { rc=$?; '
         'if [ -n "$child" ] && { kill -0 -- "-$child" 2>/dev/null '
         '|| pgrep -s "$child" >/dev/null 2>&1; }; then exit "$rc"; fi; '
+        # DP-6476. Nothing of the run is left, so neither is its MPI folder
+        # (session folder and shared-memory segments, finished or killed).
+        '[ -n "$fmrun" ] && rm -rf "$fmrun" 2>/dev/null; '
         '[ -n "$rec" ] && printf \'{"run_id":"%s","pgid":%s,"sid":%s,'
         '"state":"exited","rc":%s,"peak_kb":%s,"peak_measure":"%s",'
         '"at":"%s"}\\n\' "$rid" "${child:-null}" '
@@ -131,7 +183,7 @@ def wrapped_script(*, prelude: str, runtime_cwd: str, run: str,
         'watch=""; '
         f'if [ -n "${{{RUN_ID_VARIABLE}:-}}" ]; then '
         f'env -u {RUN_ID_VARIABLE} setsid bash -c {watcher} fm-watch '
-        '"$child" "$rec" "$rid" <&3 >/dev/null 2>&1 & watch=$!; fi; '
+        '"$child" "$rec" "$rid" "$fmrun" <&3 >/dev/null 2>&1 & watch=$!; fi; '
         'exec 3<&-; '
         '( while kill -0 "$child" 2>/dev/null; do '
         f'echo "FOAMMESH_HB $rid" >&2; sleep {HEARTBEAT_SECONDS}; done ) & hb=$!; '

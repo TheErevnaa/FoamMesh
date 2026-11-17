@@ -115,11 +115,13 @@ class GmshGlobalSizingPage(GmshTaskPage):
         editor.editor.setToolTip(tip)
         editor.label.setToolTip(tip)
 
-    def meshSetupThreads(self) -> int:
+    def meshSetupThreads(self, requested: int = 0) -> int:
         """The thread count Mesh setup gives a Gmsh run (Plan 40 UXB8, #29).
 
         Asked of ``resolve_parallel_threads`` with the execution policy the
-        Mesh setup page stores, which is what the job asks too.
+        Mesh setup page stores, which is what the job asks too. *requested*
+        is a count typed in the Threads box; it is clamped by the same
+        ceiling the job clamps it by (DP-6469).
         """
         from foammesh.core.gmsh.plan_derivation import resolve_parallel_threads
 
@@ -143,7 +145,8 @@ class GmshGlobalSizingPage(GmshTaskPage):
             'max_cpu_cores': number('mesh.execution.max_cpu_cores') or None,
             'max_memory_bytes':
                 number('mesh.execution.max_memory_bytes') or None}
-        return resolve_parallel_threads(policy)
+        return resolve_parallel_threads(
+            policy, requested=requested if requested > 1 else 0)
 
     def _showMeshSetupThreads(self) -> None:
         """Threads reads the Mesh setup value until someone overrides it.
@@ -195,20 +198,41 @@ class GmshGlobalSizingPage(GmshTaskPage):
                      'gmsh.global_sizing.surface_threads',
                      'gmsh.global_sizing.volume_threads')
 
+    def stageThreadsInEffect(self) -> int | None:
+        """The count a stage at Auto runs with: one when Reproducible is
+        ticked, else the Threads box's override, else Mesh setup's count."""
+        if self.reproducibleOn():
+            return 1
+        editor = self._editors.get('gmsh.global_sizing.threads')
+        try:
+            typed = int(editor.editor.value()) if editor is not None else 0
+        except (AttributeError, TypeError, ValueError):
+            typed = 0
+        try:
+            # DP-6469. A typed count is clamped by the Mesh setup ceiling,
+            # as the job clamps it, so the page never says more than runs.
+            return int(self.meshSetupThreads(typed if typed > 1 else 0))
+        except Exception:                                    # noqa: BLE001
+            return None
+
     def _showStageThreadsAuto(self) -> None:
-        """Each stage's thread box reads "Auto" at 0, its floor: Gmsh's own
-        0, as many threads as the Threads box gives."""
+        """Each stage's thread box reads "Auto (N)" at 0, its floor: Gmsh's
+        own 0, as many threads as the Threads box gives. The number is said
+        with it (Plan 40 U3: an Auto carries its value; DP-6458)."""
         from foammesh.view.workflow_controls.field_widgets import (
             fit_special_text)
 
+        count = self.stageThreadsInEffect()
+        text = (self.tr('Auto ({0})').format(count) if count
+                else self.tr('Auto (same as threads)'))
         for field_id in self.STAGE_THREADS:
             editor = self._editors.get(field_id)
             widget = getattr(editor, 'editor', None)
             special = getattr(widget, 'setSpecialValueText', None)
             if special is None or widget.minimum() != 0:
                 continue
-            if widget.specialValueText() != self.tr('Auto'):
-                special(self.tr('Auto'))
+            if widget.specialValueText() != text:
+                special(text)
                 fit_special_text(widget)
             tip = self.tr('Auto (0) uses the Threads count.')
             widget.setToolTip(tip)
@@ -308,6 +332,11 @@ class GlobalSizingApi:
 
         def read():
             page = self._page
+            # DP-6469. The Threads box text was set when the page last
+            # refreshed; a Mesh setup ceiling changed since left it saying
+            # "Mesh setup (15 threads)" beside a count of 4.
+            page._showMeshSetupThreads()                # noqa: SLF001
+            page._showStageThreadsAuto()                # noqa: SLF001
             page._updateThreadNote()                    # noqa: SLF001
             page._updateSurfaceNote()                   # noqa: SLF001
 

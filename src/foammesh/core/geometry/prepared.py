@@ -756,6 +756,10 @@ class PreparedGeometryStore:
                  reserved: set | None = None) -> tuple[PreparedRegion, ...]:
         regions = []
         for entry in _ordered_sources(entries):
+            if entry.get('interface_of'):
+                # DP-6121. A wall two bodies share is a surface of both; it
+                # encloses nothing, so it is no region of its own.
+                continue
             source_regions = entry.get('regions') or ({
                 'region_uuid': (
                     'region-' + hashlib.sha256(

@@ -111,6 +111,137 @@ class MeshRecoveryService:
             raise
         return MeshRecoveryPoint(recovery_id, root, backup, manifest)
 
+    def snapshot_reference(self, case_path: str | Path, *, operation: str,
+                           revision: str, stage: str) -> MeshRecoveryPoint | None:
+        """A recovery point that reads a kept stage snapshot (Plan 50 IP16).
+
+        DP-6300. The mesh a stage starts from is, in a staged run, the
+        previous stage's kept snapshot: an immutable, hashed copy under
+        ``foammesh/stages``. Copying and hashing it again into
+        ``foammesh/recovery`` kept the same mesh twice. This point names that
+        snapshot instead -- no copy, no hash -- and :meth:`restore` reads it
+        from there (verified against the snapshot's own manifest first).
+        ``None`` when the snapshot is not a whole, gathered mesh.
+        """
+        from foammesh.core.jobs import stage_snapshots
+        case = Path(case_path)
+        kept = stage_snapshots.read_manifest(case, stage, revision)
+        mesh = stage_snapshots.stage_mesh_path(case, stage, revision)
+        if kept is None or mesh is None or not kept.get('digest'):
+            return None
+        recovery_id = uuid4().hex
+        root = case / 'foammesh' / 'recovery' / recovery_id
+        root.mkdir(parents=True)
+        manifest = root / 'manifest.json'
+        try:
+            _write_json_durably(manifest, {
+                'schema_version': 1, 'operation': operation, 'state': 'prepared',
+                'created_at': _utc_now(), 'mesh_path': 'constant/polyMesh',
+                'source': {'kind': 'stage_snapshot', 'revision': str(revision),
+                           'stage': str(stage), 'digest': kept['digest']}})
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        return MeshRecoveryPoint(recovery_id, root, mesh, manifest)
+
+    @staticmethod
+    def _source(manifest: Path) -> dict | None:
+        """The kept stage a reference point reads, or ``None`` for a copy."""
+        try:
+            payload = json.loads(manifest.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return None
+        source = payload.get('source') if isinstance(payload, dict) else None
+        return source if isinstance(source, dict) and source.get(
+            'kind') == 'stage_snapshot' else None
+
+    @classmethod
+    def _point_at(cls, case: Path, root: Path) -> MeshRecoveryPoint | None:
+        manifest = root / 'manifest.json'
+        if not manifest.is_file():
+            return None
+        source = cls._source(manifest)
+        if source is None:
+            backup = root / 'polyMesh'
+            return (MeshRecoveryPoint(root.name, root, backup, manifest)
+                    if backup.is_dir() else None)
+        from foammesh.core.jobs import stage_snapshots
+        mesh = (stage_snapshots.stages_root(case) / str(source.get('revision'))
+                / str(source.get('stage')) / 'constant' / 'polyMesh')
+        return MeshRecoveryPoint(root.name, root, mesh, manifest)
+
+    @staticmethod
+    def _reference_intact(case: Path, source: dict) -> bool:
+        """Cheap: the kept stage is still the snapshot the point names."""
+        from foammesh.core.jobs import stage_snapshots
+        kept = stage_snapshots.read_manifest(
+            case, str(source.get('stage')), str(source.get('revision')))
+        return bool(kept and kept.get('digest') == source.get('digest')
+                    and stage_snapshots.stage_mesh_path(
+                        case, str(source.get('stage')),
+                        str(source.get('revision'))) is not None)
+
+    @staticmethod
+    def _case_of(point: MeshRecoveryPoint) -> Path:
+        # <case>/foammesh/recovery/<id>
+        return point.root.parent.parent.parent
+
+    def referenced_stages(self, case_path) -> set[tuple[str, str]]:
+        """``(revision, stage)`` of every kept stage a recovery point reads."""
+        root = Path(case_path) / 'foammesh' / 'recovery'
+        pairs = set()
+        if not root.is_dir():
+            return pairs
+        for item in root.iterdir():
+            source = self._source(item / 'manifest.json')
+            if source is not None:
+                pairs.add((str(source.get('revision')), str(source.get('stage'))))
+        return pairs
+
+    def prune(self, case_path: str | Path, *, keep=()) -> list[str]:
+        """Remove recovery points no one can use any more; the ids removed.
+
+        Plan 50 IP16 (DP-6301). Points were never removed. Kept: the newest
+        ``available`` point (what *Restore previous mesh* restores), every
+        point an open run record names (the recovery gate restores it after
+        a crash), and *keep*. Everything else -- older available points,
+        restored ones, prepared points of runs that are long resolved -- is
+        removed. Nothing is removed while a restore is half done or while an
+        open run record cannot be read (it may name any point).
+        """
+        case = Path(case_path)
+        root = case / 'foammesh' / 'recovery'
+        if not root.is_dir() or self.restore_in_progress(case):
+            return []
+        from foammesh.core.jobs.run_records import RunRecordStore
+        wanted = {str(item) for item in keep if item}
+        for record in RunRecordStore(case).open_records():
+            if record.get('unreadable'):
+                return []
+            if record.get('recovery_id'):
+                wanted.add(str(record['recovery_id']))
+        newest, newest_at = None, ''
+        for item in root.iterdir():
+            payload = {}
+            try:
+                payload = json.loads((item / 'manifest.json').read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get('state') == 'available':
+                created = str(payload.get('created_at') or '')
+                if newest is None or created >= newest_at:
+                    newest, newest_at = item.name, created
+        if newest:
+            wanted.add(newest)
+        removed = []
+        for item in sorted(root.iterdir()):
+            if item.name in wanted or not item.is_dir():
+                continue
+            shutil.rmtree(item, ignore_errors=True)
+            if not item.exists():
+                removed.append(item.name)
+        return removed
+
     #: Plan 35 CR5 step 7. The restore stages here and swaps in by rename.
     STAGING_NAME = 'polyMesh.restoring'
     #: Written beside the staging directory once its copy is complete and
@@ -135,9 +266,9 @@ class MeshRecoveryService:
         displaced = mesh.with_name(f'.polyMesh.displaced-{point.recovery_id}')
         if not point.mesh_backup.is_dir():
             raise FileNotFoundError(f'recovery mesh is missing: {point.mesh_backup}')
-        expected = self._backup_fingerprint(point)
         if not self.verify(point):
             raise ValueError(f'recovery mesh failed fingerprint verification: {point.recovery_id}')
+        expected = self._backup_fingerprint(point)
         staged = self._staged_for(marker, point, expected)
         if staged and not staging.is_dir():
             # The swap happened; only the tidying was interrupted.
@@ -177,13 +308,19 @@ class MeshRecoveryService:
         return ((constant / MeshRecoveryService.STAGING_NAME).exists()
                 or (constant / MeshRecoveryService.STAGING_MARKER).exists())
 
-    @staticmethod
-    def _backup_fingerprint(point: MeshRecoveryPoint) -> str:
+    @classmethod
+    def _backup_fingerprint(cls, point: MeshRecoveryPoint) -> str:
         try:
             payload = json.loads(point.manifest.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             return ''
-        return str(payload.get('backup_fingerprint') or '') if isinstance(payload, dict) else ''
+        if not isinstance(payload, dict):
+            return ''
+        if cls._source(point.manifest) is not None:
+            # DP-6300. A reference point hashed nothing when it was made;
+            # the kept stage it reads is fingerprinted when it is restored.
+            return cls._fingerprint_or_none(point.mesh_backup) or ''
+        return str(payload.get('backup_fingerprint') or '')
 
     @staticmethod
     def _fingerprint_or_none(path: Path) -> str | None:
@@ -210,20 +347,19 @@ class MeshRecoveryService:
             return ()
         points = []
         for item in sorted(root.iterdir()):
-            manifest = item / 'manifest.json'
-            backup = item / 'polyMesh'
-            if manifest.is_file() and backup.is_dir():
-                points.append(MeshRecoveryPoint(item.name, item, backup, manifest))
+            point = self._point_at(Path(case_path), item)
+            if point is not None and point.mesh_backup.is_dir():
+                points.append(point)
         return tuple(points)
 
-    @staticmethod
-    def point_for(case_path: str | Path, recovery_id: str) -> MeshRecoveryPoint | None:
+    @classmethod
+    def point_for(cls, case_path: str | Path, recovery_id: str) -> MeshRecoveryPoint | None:
         """The recovery point a run record names, if it is still on disk."""
         if not recovery_id or '/' in recovery_id or '\\' in recovery_id:
             return None
         root = Path(case_path) / 'foammesh' / 'recovery' / recovery_id
-        point = MeshRecoveryPoint(recovery_id, root, root / 'polyMesh', root / 'manifest.json')
-        return point if point.manifest.is_file() and point.mesh_backup.is_dir() else None
+        point = cls._point_at(Path(case_path), root)
+        return point if point is not None and point.mesh_backup.is_dir() else None
 
     def manifest_payload(self, point: MeshRecoveryPoint) -> dict:
         """Return the manifest content, or an empty dict when unreadable."""
@@ -305,6 +441,19 @@ class MeshRecoveryService:
             before_fingerprint=before, after_fingerprint=after.digest)
 
     def verify(self, point: MeshRecoveryPoint) -> bool:
+        source = self._source(point.manifest)
+        if source is not None:
+            # A reference point is as good as the kept stage it reads: still
+            # the same snapshot, and every file of it matching its hash.
+            from foammesh.core.jobs import stage_snapshots
+            case = self._case_of(point)
+            if not self._reference_intact(case, source):
+                return False
+            try:
+                return bool(stage_snapshots.verify(
+                    case, str(source['stage']), str(source['revision'])).get('ok'))
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
         try:
             payload = json.loads(point.manifest.read_text(encoding='utf-8'))
             expected = payload.get('backup_fingerprint')
@@ -313,6 +462,16 @@ class MeshRecoveryService:
             return False
 
     def mark_available(self, point: MeshRecoveryPoint):
+        source = self._source(point.manifest)
+        if source is not None:
+            # DP-6300. The kept stage was hashed and verified when it was
+            # captured, and is verified again before it is restored; reading
+            # it whole here once more would be the third hash of one mesh.
+            if not self._reference_intact(self._case_of(point), source):
+                raise ValueError(
+                    f'the kept stage this recovery point reads is gone: {point.recovery_id}')
+            self._mark(point.manifest, 'available')
+            return
         if not self.verify(point):
             raise ValueError(f'recovery mesh failed fingerprint verification: {point.recovery_id}')
         self._mark(point.manifest, 'available')

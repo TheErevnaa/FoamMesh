@@ -129,6 +129,16 @@ class DesktopFacadeClient:
         """
         return self.session().state.checkout(path)
 
+    def view(self, path: str = ''):
+        """Return a read-only look at the case configuration, copying nothing.
+
+        Plan 50 IP11 (DP-6341). :meth:`checkout` deep-copies the document
+        twice; a read that never writes takes this instead. Every write
+        through it raises ``ReadOnlyViewError``. It is a live read: use it
+        within one synchronous stretch, never across an ``await``.
+        """
+        return self.session().state.view(path)
+
     async def commit_working_copy(self, working_copy, *, action: str,
                                   reason: str | None = None, target: str | None = None
                                   ) -> OperationResult:
@@ -318,13 +328,36 @@ class DesktopFacadeClient:
         return FIELD_REGISTRY.get(field_id)
 
     def field_value(self, field_id: str):
-        descriptor = FIELD_REGISTRY.get(field_id)
-        return read_value(self.configuration(), descriptor.storage_path)
+        return self.field_values((field_id,))[field_id]
 
     def field_values(self, field_ids) -> dict:
-        configuration = self.configuration()
-        return {field_id: read_value(configuration, FIELD_REGISTRY.get(field_id).storage_path)
-                for field_id in field_ids}
+        """Plan 50 (DP-6341). Each value is read through the read-only view;
+        building the whole configuration took 5 s on the GUI thread after a
+        500-surface import (a 1 MB document dumped and parsed) to read a
+        page's few fields. A path the view cannot answer with one value
+        falls back to the configuration, as before."""
+        values, missed = {}, []
+        try:
+            view = self.view()
+        except Exception:                                   # noqa: BLE001
+            view = None
+        for field_id in field_ids:
+            path = FIELD_REGISTRY.get(field_id).storage_path
+            try:
+                value = view.getValue(path)
+            except Exception:                               # noqa: BLE001
+                missed.append(field_id)
+                continue
+            if isinstance(value, (dict, list)):
+                missed.append(field_id)
+                continue
+            values[field_id] = value
+        if missed:
+            configuration = self.configuration()
+            for field_id in missed:
+                values[field_id] = read_value(
+                    configuration, FIELD_REGISTRY.get(field_id).storage_path)
+        return {field_id: values[field_id] for field_id in field_ids}
 
     def revisions(self) -> dict:
         return self.session().revisions.to_dict()

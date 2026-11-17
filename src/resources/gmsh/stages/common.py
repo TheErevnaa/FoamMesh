@@ -60,13 +60,18 @@ class LayerFold(MeshFailure):
     """
 
     def __init__(self, message, carries=0.0, asked=0.0, folded=0,
-                 patch='', at=()):
+                 patch='', at=(), spots=()):
         super().__init__(message)
         self.carries = float(carries)
         self.asked = float(asked)
         self.folded = int(folded)
         self.patch = str(patch)
         self.at = tuple(at)
+        # Plan 50 IP28 (DP-6436): every place that folded, as
+        # ``[x, y, z, thickness the wall carries there, patch]``, so the next
+        # attempt thins the stack there only. Empty where the fold is too
+        # widespread for a local fit to mean anything.
+        self.spots = [list(item) for item in spots]
 
 
 class LayerLanding(MeshFailure):

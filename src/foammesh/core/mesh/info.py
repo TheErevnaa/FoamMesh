@@ -197,6 +197,7 @@ class MeshInfoService:
             texts[_logical_name(name)] = text
             metadata.append(_metadata(path, text))
 
+        decoded = _decoded_binary(root, texts)
         point_count = _declared_count(texts.get('points'))
         face_count = _declared_count(texts.get('faces'))
         internal_faces = _declared_count(texts.get('neighbour'))
@@ -205,6 +206,8 @@ class MeshInfoService:
         labels = owner_labels + neighbour_labels
         cells = max(labels) + 1 if labels else None
         points = _point_values(texts.get('points'))
+        if decoded is not None:
+            point_count, face_count, internal_faces, cells, points = decoded
         if point_count is None:
             warnings.append('point count could not be read')
         if face_count is None:
@@ -218,7 +221,10 @@ class MeshInfoService:
         patches = _parse_named_blocks(texts.get('boundary'), boundary=True)
         zones = []
         for kind in ('cellZones', 'faceZones', 'pointZones'):
-            zones.extend(_parse_zones(texts.get(kind), kind))
+            if _header(texts.get(kind)).get('format', 'ascii').lower() == 'binary':
+                zones.extend(_binary_zones(root, kind, warnings))
+            else:
+                zones.extend(_parse_zones(texts.get(kind), kind))
 
         try:
             relative = root.relative_to(classification.path).as_posix()
@@ -248,6 +254,46 @@ class MeshInfoService:
             raise ValueError('mesh report destination must end in .json or .csv')
         path.write_text(text, encoding='utf-8', newline='')
         return path
+
+
+_LISTS = ('points', 'faces', 'owner', 'neighbour')
+
+
+def _decoded_binary(root: Path, texts: dict):
+    """``(points, faces, internal faces, cells, point tuples)`` of a mesh any
+    of whose lists is binary or a ``faceCompactList``, else None.
+
+    Plan 50 IP15 (DP-6423). The text read above counts a binary
+    ``faceCompactList``'s offsets list -- one longer than the faces -- and
+    gives no cells or bounds for binary at all. A binary working case is
+    read with the decoding reader instead, so every count is the mesh's own.
+    """
+    headers = {name: _header(texts.get(name)) for name in _LISTS}
+    if not any(header.get('format', 'ascii').lower() == 'binary'
+               or header.get('class') == 'faceCompactList'
+               for header in headers.values()):
+        return None
+    from foammesh.core.mesh.poly_mesh_boundary import (
+        PolyMeshReadError, read_poly_mesh)
+    try:
+        mesh = read_poly_mesh(root, layout_expectation='any')
+    except (PolyMeshReadError, OSError):
+        return None      # the text read's unknowns and warnings stand
+    points = [tuple(float(value) for value in row) for row in mesh.points]
+    return (int(mesh.points.shape[0]), mesh.face_count,
+            mesh.internal_face_count, mesh.cell_count or None, points)
+
+
+def _binary_zones(root: Path, kind: str, warnings: list[str]) -> list:
+    """The zones of a binary zone file, through the decoding reader."""
+    from foammesh.core.mesh.poly_mesh_boundary import (
+        PolyMeshReadError, _read_zones)
+    try:
+        zones = _read_zones(root, kind)
+    except (PolyMeshReadError, OSError) as error:
+        warnings.append(f'{kind}: {error}')
+        return []
+    return [MeshZone(zone.name, kind, int(zone.labels.size)) for zone in zones]
 
 
 def _logical_name(name: str) -> str:
@@ -346,7 +392,10 @@ def _parse_named_blocks(text: str | None, *, boundary=False) -> list[BoundaryPat
 def _parse_zones(text: str | None, kind: str) -> list[MeshZone]:
     zones = []
     for name, content in re.findall(r'(?m)^\s*([^\s(){}]+)\s*\{([^{}]*)\}', _list_content(text), re.S):
-        size_match = re.search(r'\b(?:cellLabels|faceLabels|pointLabels|labels)\s+(\d+)\s*\(', content)
+        # DP-6423: OpenFOAM writes ``cellLabels List<label> 2(0 1);``.
+        size_match = re.search(
+            r'\b(?:cellLabels|faceLabels|pointLabels|labels)\s+'
+            r'(?:List<\w+>\s*)?(\d+)\s*\(', content)
         zones.append(MeshZone(name, kind, int(size_match.group(1)) if size_match else None))
     return zones
 

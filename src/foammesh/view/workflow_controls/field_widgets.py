@@ -31,6 +31,7 @@ from foammesh.view.combo_items import set_item_enabled
 from foammesh.view import inline_error
 from foammesh.view.workflow_controls import effective_values
 from foammesh.view.workflow_controls.labels import humanise_option
+from widgets.async_dialog import popupMenu
 
 
 #: Widened bounds used when the schema leaves a side unconstrained. Qt spin
@@ -962,8 +963,9 @@ class FieldEditor(QWidget):
         action.setObjectName('fieldResetToDefault')
         action.setEnabled(self.canReset())
         action.triggered.connect(self.resetToDefault)
-        menu.exec(host.mapToGlobal(position))
-        menu.deleteLater()
+        # Plan 50 IP19: no nested event loop.
+        popupMenu(menu, host.mapToGlobal(position),
+                  then=lambda _action: menu.deleteLater())
 
     def setTierHidden(self, hidden: bool) -> None:
         """Take the row away (or give it back) for its tier."""
@@ -1164,6 +1166,22 @@ class FieldEditor(QWidget):
     def _emit(self, *_args) -> None:
         self._refresh_marker()
         self.valueChanged.emit(self.field_id, self.value())
+
+    def connectOnce(self, slot) -> None:
+        """Connect ``slot`` to ``valueChanged`` unless it already is.
+
+        Plan 50 IP10 (DP-6343). Pages hooked their editors after every
+        ``refresh`` because a refresh built the editors anew. A refresh now
+        keeps them when the form is unchanged, and a plain ``connect`` there
+        would call the slot once more per refresh.
+        """
+        connected = self.__dict__.setdefault('_onceSlots', set())
+        key = (getattr(slot, '__func__', slot),
+               id(getattr(slot, '__self__', None)))
+        if key in connected:
+            return
+        connected.add(key)
+        self.valueChanged.connect(slot)
 
 
 def _tooltip(descriptor) -> str:

@@ -16,8 +16,68 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
+
+
+class ElementChunk(NamedTuple):
+    """Plan 50 IP14 (GM-1). A run of element rows of one type and one node
+    count, in file order: ``physical`` is ``(n,)``, ``nodes`` ``(n, k)``
+    (node tags, as written in the file)."""
+
+    element_type: int
+    physical: np.ndarray
+    nodes: np.ndarray
+
+
+def chunks_from_rows(rows) -> list:
+    """``(type, physical, node tags)`` rows as :class:`ElementChunk` runs,
+    keeping the file order (consecutive rows of one type and node count
+    share a chunk)."""
+    chunks = []
+    run_key, physical, nodes = None, [], []
+
+    def close():
+        if run_key is not None:
+            chunks.append(ElementChunk(
+                run_key[0], np.asarray(physical, dtype=np.int64),
+                np.asarray(nodes, dtype=np.int64).reshape(len(nodes),
+                                                          run_key[1])))
+
+    for element_type, tag, tags in rows:
+        key = (int(element_type), len(tags))
+        if key != run_key:
+            close()
+            run_key, physical, nodes = key, [], []
+        physical.append(tag)
+        nodes.append(tags)
+    close()
+    return chunks
+
+
+def merge_chunks(chunks) -> list:
+    """Join neighbouring chunks of one type and node count (a block reader
+    cuts runs at its block edges)."""
+    merged: list = []
+    pending: list = []
+    for chunk in chunks:
+        if pending and (chunk.element_type != pending[0].element_type
+                        or chunk.nodes.shape[1] != pending[0].nodes.shape[1]):
+            merged.append(_joined(pending))
+            pending = []
+        pending.append(chunk)
+    if pending:
+        merged.append(_joined(pending))
+    return merged
+
+
+def _joined(chunks) -> ElementChunk:
+    if len(chunks) == 1:
+        return chunks[0]
+    return ElementChunk(chunks[0].element_type,
+                        np.concatenate([item.physical for item in chunks]),
+                        np.concatenate([item.nodes for item in chunks]))
 
 #: Nodes per element type of Gmsh 4.15.2 (``getElementProperties``).
 NODES_PER_TYPE = {

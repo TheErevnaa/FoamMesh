@@ -35,6 +35,7 @@ from foammesh.core.gmsh import cvt_remesh
 from foammesh.core.quantities import count_text
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, CompactSpinBox
 from foammesh.view.workflow_controls.length_box import ModelLengthBox
+from widgets import async_dialog
 
 COLUMNS = ('', 'Before', 'After')
 
@@ -216,6 +217,9 @@ class CvtRemeshPanel(QWidget):
             self.destroyed.connect(
                 lambda *_a, s=session, a=self._api: pa3_routes.unregister_panel(
                     s, 'cvt', a))
+        # Plan 50 IP4: the tool dock connects this panel now, not by a poll.
+        from foammesh.view.gmsh_tools import panel_events
+        panel_events.announce(self)
 
     # -- small helpers ------------------------------------------------------ #
 
@@ -545,8 +549,13 @@ class CvtRemeshPanel(QWidget):
         if controller is None or not self._last:
             return {}
         if path is None:
-            path, _filter = QFileDialog.getSaveFileName(
-                self, self.tr('Export remeshed surface'), '', 'STL (*.stl)')
+            # Plan 50 IP19: no nested event loop; exports once answered.
+            result = []
+            async_dialog.getSaveFileName(
+                self, self.tr('Export remeshed surface'), '', 'STL (*.stl)',
+                then=lambda chosen, _filter: chosen and result.append(
+                    self.exportResult(chosen)))
+            return result[0] if result else {}
         if not path:
             return {}
         try:

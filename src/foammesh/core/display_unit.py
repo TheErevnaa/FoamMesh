@@ -93,6 +93,10 @@ def _apply(name: str) -> None:
 
 def subscribe(callback: Callable[[], None]) -> None:
     """Call *callback* when the unit changes (held weakly)."""
+    # DP-6407. Dead references were dropped only when the unit changed, so
+    # every closed page's editors left one behind (~24 a round in the live
+    # soak); drop them whenever a new listener arrives.
+    _listeners[:] = [held for held in _listeners if held() is not None]
     try:
         ref = weakref.WeakMethod(callback)
     except TypeError:

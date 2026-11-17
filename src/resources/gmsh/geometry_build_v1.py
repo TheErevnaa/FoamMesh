@@ -1117,8 +1117,23 @@ def _geo_extrude(gmsh, p):
 
 
 def _geo_delete(gmsh, p):
-    selection = _geo_selection(gmsh, p)
-    gmsh.model.geo.remove(selection, bool(p.get('recursive')))
+    """Delete on the built-in kernel. The imported solid every case holds is
+    OpenCASCADE's, and a model built by hand starts by deleting it (the run
+    refuses a case with nothing imported), so a selection OpenCASCADE built
+    is removed by OpenCASCADE and the rest by the built-in kernel; without
+    this the twist, which only the built-in kernel has, could not be reached
+    (DP-6149)."""
+    selection = _dimtags(p.get('entities'))
+    recursive = bool(p.get('recursive'))
+    imported = [(d, t) for d, t in selection
+                if d >= 0 and entity_kernel(gmsh, d, t) == 'occ']
+    own = [e for e in selection if e not in imported]
+    if imported:
+        _require_occ(gmsh)
+        gmsh.model.occ.remove(imported, recursive)
+        gmsh.model.occ.synchronize()
+    if own:
+        gmsh.model.geo.remove(own, recursive)
     return _done_geo(gmsh, [], deleted=_created(selection))
 
 

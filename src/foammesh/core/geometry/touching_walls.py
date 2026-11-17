@@ -142,7 +142,7 @@ def touching(walls: list[Wall]) -> list[Contact]:
     """Every pair of surfaces of different bodies that touch."""
     import numpy as np
 
-    from .interface_contact import _distances
+    from .interface_contact import within
 
     walls = [wall for wall in walls if len(wall.triangles)]
     if len(walls) < 2:
@@ -163,9 +163,8 @@ def touching(walls: list[Wall]) -> list[Contact]:
             if np.any(small.low > large.high + tolerance) \
                     or np.any(large.low > small.high + tolerance):
                 continue
-            distances = _distances(small.triangles.mean(axis=1),
-                                   large.triangles)
-            on = distances <= tolerance
+            on = within(small.triangles.mean(axis=1), large.triangles,
+                        tolerance)
             if not on.any():
                 continue
             share = float(on.mean())

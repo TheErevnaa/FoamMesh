@@ -144,7 +144,7 @@ class NotificationPanel(QFrame):
                 item.widget().deleteLater()
         entries = self._log.entries()
         if not entries:
-            empty = QLabel(self.tr('Nothing to report.'))
+            empty = QLabel(self.emptyText())
             empty.setObjectName('notificationEmpty')
             self._rows.addWidget(empty)
         for entry in reversed(entries):
@@ -158,9 +158,7 @@ class NotificationPanel(QFrame):
         row.setProperty('severity', entry.severity)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(MARGIN_TIGHT, MARGIN_TIGHT, MARGIN_TIGHT, MARGIN_TIGHT)
-        stamp = time.strftime('%H:%M:%S', time.localtime(entry.when))
-        text = entry.text + (f'  (x{entry.count})' if entry.count > 1 else '')
-        label = QLabel(f'{stamp}  {text}')
+        label = QLabel(self.rowText(entry))
         label.setWordWrap(True)
         label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -177,6 +175,27 @@ class NotificationPanel(QFrame):
     def _go(self, entry: Notification) -> None:
         self.hide()
         self._goTo(entry)
+
+    @staticmethod
+    def rowText(entry: Notification) -> str:
+        """The words a row shows: the time, the sentence, the repeat count."""
+        stamp = time.strftime('%H:%M:%S', time.localtime(entry.when))
+        text = entry.text + (f'  (x{entry.count})' if entry.count > 1 else '')
+        return f'{stamp}  {text}'
+
+    def emptyText(self) -> str:
+        """What the panel says when there is nothing in it."""
+        return self.tr('Nothing to report.')
+
+    def goTo(self, entry_id: int) -> None:
+        """Press the *Go to* of the row for entry ``entry_id``."""
+        entry = next((e for e in self._log.entries()
+                      if e.id == int(entry_id)), None)
+        if entry is None:
+            raise ValueError(f'there is no notification {entry_id}')
+        if entry.target is None:
+            raise ValueError('that notification has nowhere to go to')
+        self._go(entry)
 
 
 class StatusRunBar(QProgressBar):

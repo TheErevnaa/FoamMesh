@@ -42,6 +42,9 @@ _COMPONENT = re.compile(r'^(?P<base>.+?)[._](?P<axis>[xyz])$')
 #: rather than growing a dialog that cannot be fully seen.
 _SCROLL_AFTER_ROWS = 12
 
+#: The most height a docked, scrolling form claims for itself, in pixels.
+_DOCKED_FORM_HEIGHT = 420
+
 
 #: Plan 30 WP12 (F-43). The size-field branches come from the Gmsh control
 #: register, so the form and the runner cannot disagree about which parameter
@@ -440,6 +443,8 @@ class ChildEditorDialog(QDialog):
                 form_host.sizeHint().width()
                 + area.verticalScrollBar().sizeHint().width()
                 + 2 * area.frameWidth())
+            self._area = area
+            self._areaWidth = area.minimumWidth()
             outer.addWidget(area, 1)
         else:
             outer.addWidget(form_host, 1)
@@ -536,6 +541,31 @@ class ChildEditorDialog(QDialog):
                      else QBoxLayout.Direction.LeftToRight)
         for row in self._vectorRows:
             row.setDirection(direction)
+        # DP-6130. MEASURED live 2026-11-01 (Gmsh Sizing, Surface sizing,
+        # Add): beside a 78 px label the `Use selected in viewport` button
+        # ends past the 205 px the settings column leaves, and OK, in the
+        # row below, was cut with it. Docked, each label sits over its field.
+        if self._form is not None:
+            self._form.setRowWrapPolicy(
+                QFormLayout.RowWrapPolicy.WrapAllRows if compact
+                else QFormLayout.RowWrapPolicy.DontWrapRows)
+        # DP-6125. A long form is in a scroll area whose width was fixed from
+        # the form laid out side by side (X, Y, Z in one row, every row
+        # shown): 686 px. Docked, that was the width the 205 px column was
+        # asked to give, and the form was cut at the right edge. Docked it
+        # takes the column's width, and the area scrolls down only.
+        area = getattr(self, '_area', None)
+        if area is not None:
+            area.setMinimumWidth(0 if compact else self._areaWidth)
+            # DP-6150. MEASURED live 2026-11-03 (Sizing, Edge/curve
+            # controls, Add): docked in a page that scrolls, the area was
+            # given no height and settled at about 40 px, one row of a
+            # 14-row form (name, scope, mode, segments, law, coefficient ...).
+            # The page scrolls; the form must not shrink to a slit inside it.
+            host = area.widget()
+            wanted = (host.sizeHint().height() if host is not None else 0)
+            area.setMinimumHeight(
+                min(max(wanted, 0), _DOCKED_FORM_HEIGHT) if compact else 0)
         self._compact = bool(compact)
 
     def isCompact(self) -> bool:
@@ -710,6 +740,8 @@ class ChildEditorDialog(QDialog):
             row.addWidget(pair, 0)
             unit = unit or (editor.descriptor.unit or '')
         if unit and pair is not None:
-            pair.layout().addWidget(QLabel(unit, pair))
+            # DP-6111. The editor's own unit label, which reads the project
+            # display unit (mm) and follows it, not the stored metres.
+            pair.layout().addWidget(editor.unit_label)
         self._vectorRows.append(row)
         return host

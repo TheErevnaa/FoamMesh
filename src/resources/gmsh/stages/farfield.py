@@ -17,6 +17,7 @@ from quantities import agreeing, count_text
 import farfield_primitives
 
 from .common import (MeshFailure, _successors_of, _cavities)
+from . import face_history
 
 
 class FarfieldStage:
@@ -84,14 +85,21 @@ class FarfieldStage:
                       for _dim, tag in gmsh.model.getEntities(2)}
 
         tool = self.add_farfield_primitive(primitive)
-        try:
-            gmsh.model.occ.cut([(3, tool)], list(bodies),
-                               removeObject=True, removeTool=True)
-            gmsh.model.occ.synchronize()
-        except Exception as error:
-            raise MeshFailure(
-                f'the farfield {shape} could not be cut against the '
-                f'geometry: {error}') from error
+        # Plan 50 IP29 (DP-6324). The body faces' children, read from the
+        # kernel's map; ``None`` when the plain cut was used.
+        mapped, history_note = None, ''
+        if face_history.FACE_HISTORY_BOOLEANS:
+            mapped, history_note = self.cut_with_face_history(
+                tool, bodies, shape)
+        if mapped is None:
+            try:
+                gmsh.model.occ.cut([(3, tool)], list(bodies),
+                                   removeObject=True, removeTool=True)
+                gmsh.model.occ.synchronize()
+            except Exception as error:
+                raise MeshFailure(
+                    f'the farfield {shape} could not be cut against the '
+                    f'geometry: {error}') from error
         volumes = gmsh.model.getEntities(3)
         if not volumes:
             raise MeshFailure(
@@ -135,16 +143,35 @@ class FarfieldStage:
         volumes = self.apply_cavity_policy(domain, sealed, sealed_policy)
 
         # The body faces, matched back to the tags their names are keyed on.
+        # Plan 50 IP29 (DP-6324): by the cut's own map where it has one (a
+        # face split in two gives its name to both halves), by centre and
+        # area where it does not.
         self.import_surface_tags = list(signatures)
+        parents = {}
+        for parent, children in sorted((mapped or {}).items()):
+            for child in children:
+                parents.setdefault(child, parent)
         inherited, box_faces = 0, []
+        by_map = by_fallback = 0
         for _dim, tag in gmsh.model.getEntities(2):
             centre, area = self.surface_signature(tag)
-            source = self.matching_surface(centre, area, signatures, diagonal)
+            source = parents.get(int(tag))
+            if source is not None:
+                by_map += 1
+            else:
+                source = self.matching_surface(centre, area, signatures,
+                                               diagonal)
+                if source is not None:
+                    by_fallback += 1
             if source is None:
                 box_faces.append((tag, centre))
             else:
                 self.surface_origin[tag] = source
                 inherited += 1
+        face_history.record(
+            self.statistics, 'farfield-cut', by_map=by_map,
+            by_fallback=by_fallback, unmatched=len(box_faces),
+            map_used=mapped is not None, note=history_note)
         # C31-04. The cut is a topology change of the strongest kind: the body
         # faces survive under new tags and every imported *volume* is consumed
         # -- the one volume that remains is the fluid around the bodies, which
@@ -399,6 +426,48 @@ class FarfieldStage:
                            len(sealed), len(sealed),
                            note='sealed internal cavities discarded')
         return self.gmsh.model.getEntities(3)
+
+    def cut_with_face_history(self, tool, bodies, shape):
+        """Cut *bodies* out of the primitive *tool*, following the faces.
+
+        Plan 50 IP29 (DP-6324). A fragment of the primitive with the bodies
+        and the bodies' own faces, then every piece inside a body removed:
+        the volume ``occ.cut`` leaves, with ``{body face: [faces it became]}``
+        from the kernel's map. Returns ``(map, '')``, or ``(None, why)`` when
+        the fragment itself was refused, leaving the model untouched for the
+        plain cut.
+        """
+        gmsh = self.gmsh
+        bodies = [(3, int(tag)) for _dim, tag in bodies]
+        try:
+            faces = face_history.boundary_faces(gmsh, bodies)
+            inputs = [(3, int(tool))] + bodies + [(2, f) for f in faces]
+            _out, out_map = gmsh.model.occ.fragment(inputs[:1], inputs[1:])
+        except Exception as error:                       # noqa: BLE001
+            return None, (f'the face-following fragment was refused '
+                          f'({error}); the plain cut was used and every '
+                          'face matched by centre and area')
+        try:
+            inside = set()
+            for (dim, piece), children in zip(inputs, out_map or ()):
+                if (int(dim), int(piece)) in bodies:
+                    inside.update((3, int(t)) for d, t in children
+                                  if int(d) == 3)
+            if inside:
+                gmsh.model.occ.remove(sorted(inside), recursive=True)
+            gmsh.model.occ.synchronize()
+        except Exception as error:
+            raise MeshFailure(
+                f'the farfield {shape} could not be cut against the '
+                f'geometry: {error}') from error
+        present = {int(t) for _d, t in gmsh.model.getEntities(2)}
+        mapped = {}
+        for parent, children in face_history.children_by_input(
+                out_map, inputs, 2).items():
+            kept = [child for child in children if child in present]
+            if kept:
+                mapped[parent] = kept
+        return mapped, ''
 
     def surface_signature(self, tag):
         """``(centre of mass, area)``: what a face still is after a cut."""

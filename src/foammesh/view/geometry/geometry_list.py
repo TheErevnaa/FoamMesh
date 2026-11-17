@@ -4,18 +4,27 @@
 from enum import IntEnum, auto
 
 from PySide6.QtWidgets import (QColorDialog, QHBoxLayout, QHeaderView, QLabel,
-                               QTreeWidget, QTreeWidgetItem, QWidget)
-from PySide6.QtCore import Qt, Signal, QObject, QCoreApplication
+                               QToolButton, QTreeWidget, QTreeWidgetItem,
+                               QWidget)
+from PySide6.QtCore import Qt, Signal, QObject, QCoreApplication, QSize
 
 from foammesh.app import app
 from foammesh.core.geometry.patches.ops import (
     BOUNDARY_CATEGORIES, boundary_category_for_name)
 from foammesh.db.configurations_schema import CFDType, GeometryType
 from foammesh.view.theming.metrics import MARGIN_TIGHT
+from foammesh.view.theming.icons import apply_tinted_icon
 from foammesh.view.theming.status_colors import apply_color_swatch
 from widgets.themed_icon import load_themed_icon
+from widgets import async_dialog as dialogs
 
 VOLUME_ICON_FILE = ':/graphicsIcons/volume.svg'
+#: DP-6090. The show/hide glyphs of the viewport's Parts list, so a body's
+#: row says "drawn / not drawn" the way every other part row does.
+SHOWN_ICON_FILE = ':/graphicsIcons/bulb-on.svg'
+HIDDEN_ICON_FILE = ':/graphicsIcons/bulb-off.svg'
+EYE_ICON = QSize(14, 14)
+EYE_STROKE_PX = 1.25
 SURFACE_ICON_FILE = ':/graphicsIcons/face.svg'
 
 def cfdTypeToText(cfdType):
@@ -50,15 +59,22 @@ def _surfaceRole(geometry):
     return str(role) if role else None
 
 
-def defaultBoundaryCategory():
+#: DP-6497. Set while `GeometryList.load` builds every row from one read of
+#: the case, so a row does not copy the whole case again to learn it.
+_loadingDefaultCategory = None
+
+
+def defaultBoundaryCategory(db=None):
     """The category a patch adopts when its name announces none.
 
     Read from the project rather than assumed so the list agrees with what the
     publication step will actually write. Any failure to read it falls back to
     the schema default, which is ``wall``.
     """
+    if db is None and _loadingDefaultCategory is not None:
+        return _loadingDefaultCategory
     try:
-        value = app.facadeClient.checkout().getValue(
+        value = (db if db is not None else app.facadeClient.checkout()).getValue(
             'geometryPreparation/defaultBoundaryCategory')
     except Exception:
         return 'wall'
@@ -251,6 +267,13 @@ class GeometryList(QObject):
         self._tree = tree
         self._items = None
         self._swatches = {}
+        self._eyes = {}
+        #: DP-6497. Each body's surface ids, read from the case once and
+        #: kept until the rows change; ``None`` means read it again.
+        self._bodies = None
+        #: DP-6506. Rows made during a load and not yet in the tree.
+        self._pending = None
+        self._watchedControl = None
         self._farfield = None
         self._setupColourColumn()
         self._applyTheme()
@@ -317,6 +340,8 @@ class GeometryList(QObject):
         # it is asked for again here or it keeps the old theme's palette.
         for gId in list(self._swatches):
             self._repaintSwatch(gId)
+        for gId in list(self._eyes):
+            self._paintEye(gId)
 
     # -- the colour column ------------------------------------------------- #
 
@@ -333,6 +358,17 @@ class GeometryList(QObject):
 
     def _mountSwatch(self, gId, item):
         gId = str(gId)
+        cell = QWidget(self._tree)
+        row = QHBoxLayout(cell)
+        row.setContentsMargins(MARGIN_TIGHT, 0, MARGIN_TIGHT, 0)
+        self._tree.setItemWidget(item, int(Column.COLOUR_COLUMN), cell)
+        if item.isVolume():
+            # DP-6099. A body is drawn as its surfaces (the scene has no
+            # actor for a volume), so a swatch on its row did nothing; the
+            # row carries its show / hide button only.
+            row.addWidget(self._mountEye(gId, cell, item))
+            row.addStretch(1)
+            return
         swatch = ColorSwatch(self._tree)
         swatch.setObjectName(f'geometrySwatch_{gId}')
         swatch.setAccessibleName(
@@ -341,11 +377,7 @@ class GeometryList(QObject):
             'GeometryPage', 'The colour this surface is drawn in. '
                             'Click to change it.'))
         swatch.clicked.connect(lambda key=gId: self._pickColour(key))
-        cell = QWidget(self._tree)
-        row = QHBoxLayout(cell)
-        row.setContentsMargins(MARGIN_TIGHT, 0, MARGIN_TIGHT, 0)
         row.addWidget(swatch)
-        self._tree.setItemWidget(item, int(Column.COLOUR_COLUMN), cell)
         self._swatches[gId] = swatch
         actorInfo = self._actorInfo(gId)
         if actorInfo is not None:
@@ -369,13 +401,144 @@ class GeometryList(QObject):
         actorInfo = self._actorInfo(gId)
         if actorInfo is None:
             return
-        colour = QColorDialog.getColor(
+        def chosen(colour):
+            if colour is None or not colour.isValid():
+                return
+            actorInfo.setColor(colour)
+            self._repaintSwatch(gId)
+
+        # Plan 50 IP19: no nested event loop.
+        dialogs.getColor(
             actorInfo.color(), self._tree,
-            QCoreApplication.translate('GeometryPage', 'Boundary colour'))
-        if colour is None or not colour.isValid():
+            QCoreApplication.translate('GeometryPage', 'Boundary colour'),
+            then=chosen)
+
+    # -- a body's show / hide (DP-6090) ------------------------------------ #
+
+    def _displayControl(self):
+        window = getattr(app, 'window', None)
+        try:
+            return getattr(window, 'displayControl', None)
+        except (AttributeError, RuntimeError):
+            return None
+
+    def _mountEye(self, gId, parent, item=None):
+        """Hide or show every surface of one body with one click.
+
+        DP-6090 (user, 2026-10-31, the CHT tubes). Three coaxial bodies hide
+        each other; the only way to look inside was a right-click Hide on
+        each face in the viewport. The button sits on the body's row and
+        goes through Display control, so the Parts list, the region picker
+        and Show all agree with it.
+        """
+        displayToggle = QToolButton(parent)
+        displayToggle.setObjectName(f'geometryEye_{gId}')
+        displayToggle.setCheckable(True)
+        displayToggle.setAutoRaise(True)
+        displayToggle.setIconSize(EYE_ICON)
+        name = self._items_name(gId, item)
+        displayToggle.setToolTip(QCoreApplication.translate(
+            'GeometryPage', 'Show or hide {0}').format(name))
+        displayToggle.setAccessibleName(displayToggle.toolTip())
+        self._eyes[gId] = displayToggle
+        displayToggle.setChecked(self._bodyShown(gId))
+        displayToggle.toggled.connect(
+            lambda checked, key=gId: self._showBody(key, checked))
+        self._paintEye(gId)
+        self._watchVisibility()
+        return displayToggle
+
+    def _items_name(self, gId, item=None):
+        # DP-6497. The row's own record first: a checkout copies the whole
+        # case, and one per row made a 500-body import hold the GUI thread
+        # for minutes.
+        if item is None:
+            item = (self._items or {}).get(str(gId))
+        geometry = getattr(item, '_geometry', None) if item is not None else None
+        try:
+            if geometry is not None and geometry.value('name'):
+                return geometry.value('name')
+            return app.facadeClient.checkout().getElement(
+                'geometry', gId).value('name')
+        except (AttributeError, KeyError, RuntimeError, TypeError):
+            return str(gId)
+
+    def _bodyIndex(self, rows=None):
+        """Every body's surface ids, from the case (the tree may be
+        half-built while it loads), read once until the rows change."""
+        if rows is None and self._bodies is not None:
+            return self._bodies
+        if rows is None:
+            try:
+                rows = app.facadeClient.checkout().getElements('geometry')
+            except (AttributeError, RuntimeError):
+                return {}
+        bodies = {}
+        for key, row in rows.items():
+            volume = str(row.value('volume') or '')
+            if volume:
+                bodies.setdefault(volume, []).append(str(key))
+        self._bodies = bodies
+        return bodies
+
+    def _bodySurfaces(self, gId):
+        """The surface ids of one body."""
+        return list(self._bodyIndex().get(str(gId), ()))
+
+    def _bodyShown(self, gId):
+        """Shown while any of its surfaces is drawn."""
+        shown = None
+        for key in self._bodySurfaces(gId):
+            actorInfo = self._actorInfo(key)
+            if actorInfo is None:
+                continue
+            try:
+                if actorInfo.isVisible():
+                    return True
+            except (AttributeError, RuntimeError):
+                continue
+            shown = False
+        return shown is None
+
+    def _showBody(self, gId, visible):
+        control = self._displayControl()
+        if control is not None:
+            control.setVisibilities(
+                {key: visible for key in self._bodySurfaces(gId)})
+        self._paintEye(gId)
+
+    def _paintEye(self, gId):
+        eye = self._eyes.get(str(gId))
+        if eye is None:
             return
-        actorInfo.setColor(colour)
-        self._repaintSwatch(gId)
+        try:
+            apply_tinted_icon(eye, SHOWN_ICON_FILE if eye.isChecked()
+                              else HIDDEN_ICON_FILE, EYE_ICON, EYE_STROKE_PX)
+        except RuntimeError:
+            self._eyes.pop(str(gId), None)
+
+    def _watchVisibility(self):
+        """Follow a Hide, Isolate or Show all made anywhere else."""
+        control = self._displayControl()
+        if control is None or control is self._watchedControl:
+            return
+        self._watchedControl = control
+        control.visibilityChanged.connect(lambda *_args: self.syncEyes())
+
+    def syncEyes(self):
+        for gId, eye in list(self._eyes.items()):
+            try:
+                eye.blockSignals(True)
+                eye.setChecked(self._bodyShown(gId))
+                eye.blockSignals(False)
+            except RuntimeError:
+                self._eyes.pop(gId, None)
+                continue
+            self._paintEye(gId)
+
+    def eyeFor(self, gId):
+        """The show / hide button of one body's row, or None."""
+        return self._eyes.get(str(gId))
 
     def swatchFor(self, gId):
         """The colour swatch of one row, keyed by geometry id and not by row."""
@@ -385,6 +548,7 @@ class GeometryList(QObject):
         self._tree.clear()
         self._items = {}
         self._swatches = {}
+        self._eyes = {}
 
         # R171. In the order the case made them, not alphabetical. Sorting by
         # name was applied on every rebuild, and a rename rebuilds -- so
@@ -398,13 +562,44 @@ class GeometryList(QObject):
         self._farfield = None
         db = app.facadeClient.checkout()
         geometries = db.getElements('geometry')
-        for gId, geometry in sorted(geometries.items(),
-                                    key=lambda item: int(item[0])):
-            if gId not in self._items:
-                volume = geometry.value('volume')
-                if volume and volume not in self._items:
-                    self.add(volume, geometries[volume])
-                self.add(gId, geometry)
+        self._bodyIndex(geometries)
+        global _loadingDefaultCategory
+        _loadingDefaultCategory = defaultBoundaryCategory(db)
+        # DP-6504. One scroll and one repaint for the whole load: each row's
+        # own scrollToBottom laid the whole tree out again, and a 500-body
+        # import held the GUI thread 34.4 s (watchdog, `surfaces500`).
+        # DP-6506. The rows are made first and put in the tree in one
+        # insert; each addTopLevelItem re-placed every row widget already in
+        # the tree and ran the tree's row slots, 80 s for a 500-body import
+        # (watchdog, `surfaces500`, rerun on 645499f2).
+        added = False
+        self._bulk = True
+        self._pending = []
+        self._tree.setUpdatesEnabled(False)
+        try:
+            for gId, geometry in sorted(geometries.items(),
+                                        key=lambda item: int(item[0])):
+                if gId not in self._items:
+                    volume = geometry.value('volume')
+                    if volume and volume not in self._items:
+                        self.add(volume, geometries[volume])
+                    self.add(gId, geometry)
+                    added = True
+            pending, self._pending = self._pending, None
+            tops = [item for item, _gId in pending if item.parent() is None]
+            if tops:
+                self._tree.addTopLevelItems(tops)
+            for item, gId in pending:
+                if item.parent() is None:
+                    item.setExpanded(True)
+                self._mountSwatch(gId, item)
+        finally:
+            _loadingDefaultCategory = None
+            self._bulk = False
+            self._pending = None
+            self._tree.setUpdatesEnabled(True)
+        if added:
+            self._tree.scrollToBottom()
         self._showFarfield(readFarfield(db))
 
     # -- the farfield row -------------------------------------------------- #
@@ -437,21 +632,34 @@ class GeometryList(QObject):
 
     def add(self, gId, geometry):
         item = GeometryItem(gId, geometry)
+        volume = str(geometry.value('volume') or '')
+        if volume and self._bodies is not None:
+            members = self._bodies.setdefault(volume, [])
+            if str(gId) not in members:
+                members.append(str(gId))
 
+        pending = getattr(self, '_pending', None)
         if geometry.value('volume'):
             self._items[geometry.value('volume')].addChild(item)
-        else:
+        elif pending is None:
             self._tree.addTopLevelItem(item)
             item.setExpanded(True)
 
         item.setIcon(Column.NAME_COLUMN,
                      self.volumeIcon if geometry.value('gType') == GeometryType.VOLUME.value else self.surfaceIcon)
-        self._mountSwatch(gId, item)
-        self._tree.scrollToBottom()
+        if pending is not None:
+            # DP-6506. A load puts its rows in the tree at once, then mounts
+            # their swatches (a row widget needs its row in the tree).
+            pending.append((item, gId))
+        else:
+            self._mountSwatch(gId, item)
+        if not getattr(self, '_bulk', False):
+            self._tree.scrollToBottom()
 
         self._items[gId] = item
 
     def update(self, gId, geometry):
+        self._bodies = None
         self._items[gId].setGeometry(geometry)
 
     def remove(self, gId):
@@ -461,6 +669,7 @@ class GeometryList(QObject):
                 index = i
                 break
 
+        self._bodies = None
         if index > -1:
             item = self._tree.takeTopLevelItem(index)
             while item.childCount():
@@ -471,12 +680,15 @@ class GeometryList(QObject):
 
             del self._items[str(gId)]
             self._swatches.pop(str(gId), None)
+            self._eyes.pop(str(gId), None)
             del item
 
     def clear(self):
         self._tree.clear()
+        self._bodies = None
         self._items = {}
         self._swatches = {}
+        self._eyes = {}
         self._farfield = None
 
     def selectedIDs(self):

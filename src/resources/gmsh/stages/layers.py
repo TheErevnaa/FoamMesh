@@ -73,6 +73,10 @@ class LayersStage:
             self.statistics['layersDropped'] = {
                 'reason': 'geometry_build_replaced_patches',
                 'patches': list(self.layer_patches_replaced),
+                # Plan 50 IP7 (DP-6252): the walls that go without, and
+                # how many layers they were asked for.
+                'requestedPatches': list(self.layer_patches_replaced),
+                'requestedLayers': count,
                 'note': note}
             return
         thin = self.one_cell_thick_build()
@@ -91,7 +95,13 @@ class LayersStage:
                                applied=False, note=note)
             self.statistics['layersDropped'] = {
                 'reason': 'geometry_build_one_cell_thick',
-                'patches': list(thin), 'note': note}
+                'patches': list(thin), 'note': note,
+                # Plan 50 IP7 (DP-6252): `patches` are the faces that make
+                # the build one cell thick; these are the ticked walls that
+                # go without.
+                'requestedPatches': sorted({
+                    self.surface_patch_name(tag)[0] for tag in selected}),
+                'requestedLayers': count}
             return
         if selected and getattr(self, 'layer_patches_replaced', None):
             self.warnings.append(
@@ -149,6 +159,8 @@ class LayersStage:
         # the faceting of the two cylinders. What cannot be done is a
         # selection that spans volumes: only one core is rebuilt.
         carved = list(volumes)
+        self.layer_narrowed = []
+        cores_by_base = {}
         if len(volumes) > 1:
             core, candidates = self.volume_the_layer_grows_into(volumes,
                                                                 selected)
@@ -160,20 +172,74 @@ class LayersStage:
                     'on. Name a patch that bounds only the volume the layer '
                     'is for as well.')
             if core is None:
-                raise MeshFailure(
-                    f'boundary layers are not supported on a {len(volumes)}'
-                    '-volume assembly unless every patch they grow on bounds '
-                    'one and the same volume: the layer is carved out of a '
-                    'single core, and a selection spanning more than one '
-                    'leaves neither side closed. Name the patches of one '
-                    'volume, mesh this geometry without layers, or split it '
-                    'into one job per volume.')
-            carved = [core]
-            surfaces = self.volume_surfaces(core)
-            chosen = set(int(tag) for tag in selected)
-            skipped = [tag for tag in surfaces if int(tag) not in chosen]
-            selected, skipped = self.keep_shared_surfaces(volumes, selected,
-                                                          skipped)
+                # Plan 50 IP28 (DP-6437). Layers per volume: every volume a
+                # base bounds alone is carved and rebuilt.
+                carved, selected, cores_by_base = self.layer_cores(
+                    volumes, selected)
+                surfaces = sorted({int(tag) for volume in carved
+                                   for tag in self.volume_surfaces(volume)})
+                chosen = set(int(tag) for tag in selected)
+                skipped = [tag for tag in surfaces if int(tag) not in chosen]
+                # A face shared with a volume that is not carved is grown on,
+                # into the carved side, as on a single core (DP-398); one two
+                # carved volumes share is rebuilt once, for both.
+                owners = self.surface_owners(volumes)
+                outside = [tag for tag in skipped
+                           if owners.get(int(tag), set()) - set(carved)]
+                inside = [tag for tag in skipped if tag not in outside]
+                selected, outside = self.keep_shared_surfaces(
+                    volumes, selected, outside)
+                for tag in selected:
+                    if int(tag) not in cores_by_base:
+                        cores_by_base[int(tag)] = sorted(
+                            owners.get(int(tag), set()) & set(carved))[0]
+                skipped = sorted(inside + list(outside))
+            else:
+                carved = [core]
+                surfaces = self.volume_surfaces(core)
+                chosen = set(int(tag) for tag in selected)
+                skipped = [tag for tag in surfaces if int(tag) not in chosen]
+                selected, skipped = self.keep_shared_surfaces(
+                    volumes, selected, skipped)
+        many = len(carved) > 1 and len(volumes) > 1
+        # Plan 50 IP28 (DP-6439). A curved patch left bare beside a layer
+        # leaves its shell without one, named; the other shells keep theirs.
+        before = {int(tag) for tag in selected}
+        selected, skipped = self.walls_beside_curved_bare_patches(
+            selected, skipped,
+            ([sorted(self._core_surfaces[int(volume)]) for volume in carved]
+             if many else self.boundary_shells(surfaces)))
+        if many and {int(tag) for tag in selected} != before:
+            lost = sorted({self.volume_label(volume) for volume in carved
+                           if not any(cores_by_base.get(int(tag)) == volume
+                                      for tag in selected)})
+            raise MeshFailure(
+                'boundary layers were asked for in '
+                f'{len(carved)} volumes at once, and in '
+                + ', '.join(lost) + ' the layer would end on a curved patch '
+                'that grows none, which can only be closed with a flat face. '
+                'Grow the layer on that patch too, or name the patches of '
+                'the other volumes alone.')
+        if not selected:
+            # Every asked-for wall's layer would end on a curved bare patch:
+            # the mesh is built without a layer, said and recorded, as a
+            # layer the geometry build replaced is (DP-5716).
+            names = sorted({item['patch'] for item in self.layer_narrowed})
+            note = ('no boundary layer was grown: the layer on '
+                    + ', '.join(names) + ' would end on a curved patch that '
+                    'grows none, and the opening a layer leaves can only be '
+                    'closed with a flat face')
+            self.ledger.record('gmsh/boundaryLayers/layerCount', count, 0,
+                               applied=False, note=note)
+            self.statistics['layersDropped'] = {
+                'reason': 'ends_on_curved_patch',
+                'patches': sorted({
+                    name for item in self.layer_narrowed
+                    for name in [item['patch']]}),
+                'requestedPatches': names,
+                'requestedLayers': count,
+                'note': note}
+            return
         # The bounding curves have to be read while the surface still exists;
         # they are what ties the faces that replace it back to its patch name.
         # The boxes are read here for the same reason, and check that what the
@@ -199,8 +265,24 @@ class LayersStage:
         # topology ran. It does not run on the CAD route, which arrives here
         # with nothing meshed at all, so the boundary is split into shells and
         # the enclosed ones handed to `layer_height_groups` as well.
-        shells = self.boundary_shells(surfaces)
-        internal = self.internal_shells(shells)
+        if many:
+            # Plan 50 IP28 (DP-6437). Each carved volume is rebuilt from its
+            # own layer tops, so each must be bounded by one shell: a volume
+            # with a hole in it keeps the single-core path.
+            for volume in carved:
+                own = self.volume_surfaces(volume)
+                if len(self.boundary_shells(own)) > 1:
+                    raise MeshFailure(
+                        f'boundary layers were asked for in {len(carved)} '
+                        f'volumes at once, and {self.volume_label(volume)} '
+                        'has a hole in it (its boundary is more than one '
+                        'shell): layers are grown in several volumes at once '
+                        'only where each is bounded by one shell. Name the '
+                        'patches of that volume alone, or of the others '
+                        'alone.')
+        shells = (self.boundary_shells(surfaces) if not many
+                  else [list(surfaces)])
+        internal = self.internal_shells(shells) if not many else []
         # DP-124. A shell of the core the layer never touches needs no
         # rebuild at all. MEASURED on `two_solid_block.stl`, a box inside a
         # box: the farfield is one volume bounded by two disjoint shells, the
@@ -210,13 +292,15 @@ class LayersStage:
         # found no rim to stand in for it and refused the run. It is already
         # closed, already meshed and already named; it just has to be handed
         # to `addVolume` as the hole it is.
-        kept_shells = self.shells_kept_whole(shells, selected, internal)
+        kept_shells = (self.shells_kept_whole(shells, selected, internal)
+                       if not many else [])
         # DP-127. The mirror of the same reading. On `turbine_cascade` the
         # layer is on the blades and the farfield around them carries none,
         # so the shell the layer never reached is the enclosing one. It needs
         # no rim either; it is the exterior the fluid is bounded by, and the
         # layer tops are the holes in it.
-        outer_shell = self.shell_kept_as_exterior(shells, selected, internal)
+        outer_shell = (self.shell_kept_as_exterior(shells, selected, internal)
+                       if not many else ())
         retained = {tag for group in kept_shells for tag in group}
         retained.update(int(tag) for tag in outer_shell)
         if retained:
@@ -229,9 +313,26 @@ class LayersStage:
         # DP-71. Nesting says a surface bounds a hole; it does not say which
         # way that surface faces, and the flip needs both. `outward_normals`
         # asks the solid directly, while it is still in the model.
-        outward = ({} if self.surface_winding
-                   else self.outward_normals(selected, carved))
+        if self.surface_winding:
+            outward = {}
+        elif many:
+            # Plan 50 IP28 (DP-6437): each base asked against its own volume,
+            # so a base grows into the volume it was chosen for.
+            outward = {}
+            for volume in carved:
+                outward.update(self.outward_normals(
+                    [tag for tag in selected
+                     if cores_by_base.get(int(tag)) == volume], [volume]))
+        else:
+            outward = self.outward_normals(selected, carved)
         carried = self.sheets_to_carry(carved, surfaces)
+        if many and carried:
+            raise MeshFailure(
+                'boundary layers were asked for in '
+                f'{len(carved)} volumes at once, and an embedded sheet '
+                '(a baffle or internal face) lies inside one of them: layers '
+                'are grown in several volumes at once only where none holds '
+                'a sheet. Name the patches of one volume.')
         self.remove_entities([(3, tag) for tag in carved])
 
         # Plan 41 GN10 (M-34). Every stack is its own set of calls: the
@@ -247,11 +348,32 @@ class LayersStage:
                 'count': int(row['layerCount']),
                 'elements': int(row.get('elementsPerLayer') or 1),
                 'quads': bool(row.get('quads', True)), 'name': row['patch']}
+        # Plan 50 IP28 (DP-6438). Unlike stacks that share an edge used to be
+        # refused: two calls extrude that edge twice. MEASURED on Gmsh 4.15.2
+        # (scripts/probe_gmsh_layers_unlike_stacks.py, duct): two calls fail
+        # with "Could not find extruded node", with `second` they hang, and
+        # ONE call with a scalar view scaling one patch to half the thickness
+        # meshes, minSICN equal to the same-stack run's. So stacks that touch
+        # go in one call. A call carries one layer count and one spacing:
+        # the stated rule is the stack with the most layers gives the count
+        # and spacing, and every patch keeps its own total thickness through
+        # the view. Stacks that do not touch keep calls of their own.
+        contacts = self.stacks_that_meet(selected, stack_of, stacks)
+        lead_of = self.touching_stack_leads(contacts, stack_of, stacks)
+
+        def lead(tag):
+            number = stack_of.get(int(tag), 0)
+            return lead_of.get(number, number)
+        local_fit = layers.get('localFit') or {}
+        spots = [list(item) for item in (local_fit.get('spots') or ())]
+        radius = float(local_fit.get('radius') or 0.0)
         calls, inward, refusal = [], [], ''
-        for number in sorted({stack_of.get(int(tag), 0) for tag in selected}):
-            members = [tag for tag in selected
-                       if stack_of.get(int(tag), 0) == number]
+        for number in sorted({lead(tag) for tag in selected}):
+            members = [tag for tag in selected if lead(tag) == number]
             stack = stacks[number]
+            scales = {int(tag): abs(stacks[stack_of.get(int(tag), 0)]
+                                    ['heights'][-1]) / abs(stack['heights'][-1])
+                      for tag in members}
             groups = self.layer_height_groups(
                 members, stack['heights'], internal=internal,
                 outward=outward)
@@ -271,25 +393,24 @@ class LayersStage:
                 refusal = refusal or self.opposed_directions_refusal(
                     members, groups, meetings, skipped)
                 groups = self.one_call_for_both_directions(groups)
-            calls.extend((stack, signed, tags) for signed, tags, _flipped
-                         in groups)
-        # MEASURED on Gmsh 4.15.2 (duct.step, wall_y0 five layers of two
-        # cells beside three walls of three layers): the run fails in the
-        # volume pass with "Could not find extruded node ... in surface N",
-        # a sentence that names a coordinate and no patch. The same row equal
-        # to the list's stack meshes, so the cause is the unlike stacks on one
-        # edge, and it is said here, before anything is built.
-        contacts = self.stacks_that_meet(selected, stack_of, stacks)
-        if contacts:
-            raise MeshFailure(self.stack_contact_refusal(contacts))
+            calls.extend((stack, signed, tags, scales)
+                         for signed, tags, _flipped in groups)
+        self.layer_scale_views = []
         try:
             extruded = []
             columns = []
-            for stack, signed, tags in calls:
+            column_volumes = []
+            for stack, signed, tags, scales in calls:
+                view = self.layer_scale_view(tags, scales, abs(signed[-1]),
+                                             spots, radius)
+                arguments = [[(2, tag) for tag in tags],
+                             [stack['elements']] * stack['count'], signed,
+                             stack['quads']]
+                if view >= 0:
+                    # Plan 50 IP28: the view scales the stack node by node.
+                    arguments += [False, view]
                 produced = list(gmsh.model.geo.extrudeBoundaryLayer(
-                    [(2, tag) for tag in tags],
-                    [stack['elements']] * stack['count'], signed,
-                    stack['quads']))
+                    *arguments))
                 extruded.extend(produced)
                 # DP-74. The inner face of each stack, paired with the wall it
                 # grew from. The pairing only holds within one call: the two
@@ -300,6 +421,13 @@ class LayersStage:
                 # What is paired with the stack is the surface, not the sense.
                 columns.extend(zip([abs(int(tag)) for tag in tags], [
                     produced[index - 1][1]
+                    for index in range(1, len(produced))
+                    if produced[index][0] == 3
+                    and produced[index - 1][0] == 2]))
+                # Plan 50 IP28 (DP-6437): which prism volume stands on which
+                # base, so each carved volume is replaced by its own.
+                column_volumes.extend(zip([abs(int(tag)) for tag in tags], [
+                    produced[index][1]
                     for index in range(1, len(produced))
                     if produced[index][0] == 3
                     and produced[index - 1][0] == 2]))
@@ -323,9 +451,15 @@ class LayersStage:
         laterals = list(dict.fromkeys(
             tag for dim, tag in extruded
             if dim == 2 and tag not in set(top_tags)))
-        rebuilt_loops = (self.rebuild_unextruded(skipped, top_tags,
-                                                 skipped_boxes, columns)
-                         if skipped else {})
+        core_planes = {}
+        if many:
+            rebuilt_loops = self.rebuild_each_core(
+                carved, skipped, skipped_boxes, columns, cores_by_base,
+                core_planes)
+        else:
+            rebuilt_loops = (self.rebuild_unextruded(skipped, top_tags,
+                                                     skipped_boxes, columns)
+                             if skipped else {})
         rebuilt = list(rebuilt_loops)
         if outer_shell:
             # DP-127. The layer is inside, on bodies the kept shell encloses.
@@ -336,6 +470,8 @@ class LayersStage:
             loops.extend(gmsh.model.geo.addSurfaceLoop(group)
                          for group in self.layer_tops_by_shell(shells,
                                                                columns))
+        elif many:
+            loops = []
         else:
             loops = [gmsh.model.geo.addSurfaceLoop(top_tags + rebuilt)]
         # DP-124. Every kept shell is enclosed by the one the layer grew on --
@@ -345,7 +481,19 @@ class LayersStage:
         # with, above.
         loops.extend(gmsh.model.geo.addSurfaceLoop(list(group))
                      for group in kept_shells)
-        core_volume = gmsh.model.geo.addVolume(loops)
+        if many:
+            core_volumes = {}
+            for volume in carved:
+                tops_here = [int(top) for base, top in columns
+                             if cores_by_base.get(int(base)) == int(volume)]
+                loop = gmsh.model.geo.addSurfaceLoop(
+                    tops_here + list(core_planes.get(int(volume), ())))
+                core_volumes[int(volume)] = int(
+                    gmsh.model.geo.addVolume([loop]))
+            core_volume = None
+        else:
+            core_volume = gmsh.model.geo.addVolume(loops)
+            core_volumes = {int(carved[0]): int(core_volume)}
         gmsh.model.geo.synchronize()
         if carried:
             gmsh.model.mesh.embed(2, carried, 3, int(core_volume))
@@ -367,9 +515,18 @@ class LayersStage:
         # its two layer volumes by tag reuse and its core published as
         # `volume_4`, and on the wrapped single-solid route 17 of the 18
         # volumes published as `volume_N`.
-        self.volume_replacements = {
-            int(tag): [int(core_volume)] + list(self.layer_volumes)
-            for tag in carved}
+        if many:
+            # Plan 50 IP28 (DP-6437): each carved volume became its own
+            # core and the prisms standing on its own bases.
+            self.volume_replacements = {
+                int(tag): [core_volumes[int(tag)]] + [
+                    int(volume) for base, volume in column_volumes
+                    if cores_by_base.get(int(base)) == int(tag)]
+                for tag in carved}
+        else:
+            self.volume_replacements = {
+                int(tag): [int(core_volume)] + list(self.layer_volumes)
+                for tag in carved}
         self.layer_laterals = [int(tag) for tag in laterals]
         self.statistics['layers'] = {
             'requestedLayers': count,
@@ -415,6 +572,13 @@ class LayersStage:
                 int(tag) for tag in volumes if int(tag) not in
                 {int(item) for item in carved}),
         }
+        if many:
+            self.statistics['layers']['coreVolumes'] = sorted(
+                int(tag) for tag in carved)
+        self.record_narrowed(stacks, stack_of)
+        self.record_stack_groups(selected, stack_of, stacks, lead_of)
+        if spots:
+            self.record_local_fit(spots, radius)
         note = f'extruded off {count_text(len(selected), "surface")}'
         if inward:
             note += (f', {len(inward)} of them bounding a hole and grown the '
@@ -557,6 +721,351 @@ class LayersStage:
                         and curves[tag] & curves[mate]):
                     meetings.append((tag, mate))
         return meetings
+
+    def volume_label(self, volume):
+        """``volume <name>`` or ``volume <tag>`` for a sentence."""
+        try:
+            name = self.region_name(volume)
+        except Exception:                                    # noqa: BLE001
+            name = ''
+        return f'volume {name}' if name else f'volume {int(volume)}'
+
+    def narrow(self, tag, reason, note):
+        """Leave one asked-for patch without a layer, said and recorded.
+
+        Plan 50 IP28. The narrowest refusal: the patch is named with the
+        reason, and every other patch keeps its layer.
+        """
+        name = self.surface_patch_name(tag)[0]
+        self.layer_narrowed.append({'patch': name, 'tag': int(tag),
+                                    'reason': reason, 'note': note})
+        self.warnings.append(f'no boundary layer on {name}: {note}')
+        self.ledger.record(f'layerPatch:{name}', True, False, applied=False,
+                           note=note)
+
+    def layer_cores(self, volumes, selected):
+        """The volumes a selection spanning an assembly grows into.
+
+        Plan 50 IP28 (DP-6437). Every volume a selected patch bounds alone is
+        carved. A selected face two volumes share:
+
+        - grows into the one carved volume it bounds, as on a single core
+          (DP-398, ``annulus_shell``);
+        - grows on neither side when both of its volumes are carved: the
+          shared wall is left bare and rebuilt as one plane both cores share.
+          MEASURED on Gmsh 4.15.2 (scripts/probe_gmsh_layers_two_volumes.py,
+          two pipes end to end): the outer walls of both in one call with
+          the shared disc bare meshes conformal (0 open faces, 0 bad cells,
+          volume -0.35%), while a shared wall layered on both sides, or on
+          one side with the other volume carved too, is "PLC Error: A
+          segment and a facet intersect at point" in all four arrangements;
+        - is left bare when neither of its volumes is carved: nothing says
+          which side it is for.
+
+        Returns ``(carved volumes, bases kept, {base: volume})``.
+        """
+        owners = self.surface_owners(volumes)
+        cores, by_base = set(), {}
+        for tag in selected:
+            own = owners.get(int(tag), set())
+            if len(own) == 1:
+                cores.add(next(iter(own)))
+                by_base[int(tag)] = next(iter(own))
+        kept = []
+        for tag in selected:
+            own = owners.get(int(tag), set())
+            if len(own) == 1:
+                kept.append(tag)
+                continue
+            inside = sorted(own & cores)
+            if len(inside) == 1:
+                kept.append(tag)
+                by_base[int(tag)] = inside[0]
+            elif inside:
+                self.narrow(tag, 'shared_by_two_layered_volumes', (
+                    'it is the wall between '
+                    + ' and '.join(self.volume_label(v) for v in inside)
+                    + ', which both grow layers on their other walls; Gmsh '
+                    'cannot grow a layer on a wall two layered volumes '
+                    'share, so it is rebuilt as one face for both'))
+            else:
+                self.narrow(tag, 'interface_side_unknown', (
+                    'it lies between two volumes and no other ticked wall '
+                    'of either says which side the layer is for'))
+        self._core_surfaces = {
+            int(volume): {int(tag) for tag in self.volume_surfaces(volume)}
+            for volume in cores}
+        return sorted(cores), kept, by_base
+
+    def rebuild_each_core(self, carved, skipped, boxes, columns, by_base,
+                          planes_out):
+        """Close every carved volume across its own un-layered patches.
+
+        Plan 50 IP28 (DP-6437). The rim is read per volume, from that
+        volume's own layer tops -- read across all tops, the edge where two
+        volumes' layers meet at a shared bare face is owned by two tops and
+        is no rim at all. A plane two volumes leave the same rim for is
+        built once (``_plane_cache``). Fills *planes_out* with each volume's
+        planes and returns ``{plane: curves}`` for the naming pass.
+        """
+        self._plane_cache = {}
+        rebuilt = {}
+        try:
+            for volume in carved:
+                own = self._core_surfaces.get(int(volume), set())
+                here = [tag for tag in skipped if int(tag) in own]
+                planes_out[int(volume)] = []
+                if not here:
+                    continue
+                pairs = [(base, top) for base, top in columns
+                         if by_base.get(int(base)) == int(volume)]
+                made = self.rebuild_unextruded(
+                    here, [int(top) for _base, top in pairs],
+                    {tag: boxes[tag] for tag in here}, pairs, remove=False)
+                planes_out[int(volume)] = list(made)
+                rebuilt.update(made)
+        finally:
+            self._plane_cache = None
+        if skipped:
+            self.remove_unextruded(skipped)
+        return rebuilt
+
+    def walls_beside_curved_bare_patches(self, selected, skipped, shells):
+        """Leave bare every wall whose shell has a curved bare patch.
+
+        Plan 50 IP28 (DP-6439). The opening a layer leaves on a patch that
+        grows none is closed with a plane, so a curved patch cannot be left
+        bare beside a layer. Gmsh 4.15.2 offers no other closure: MEASURED
+        (scripts/probe_gmsh_layers_curved_open_patch.py, a plenum with both
+        discs layered and the curved side bare) handing the original curved
+        side to the core is "PLC Error: A segment and a facet intersect at
+        point", and filling the band between the two rims with
+        ``geo.addSurfaceFilling`` is "Cannot interpolate ruled surface with
+        discrete bounding curves". DP-90 refused the whole run.
+
+        Leaving a neighbouring wall bare does not help: the bare region then
+        holds the curved patch and the wall, and its rim is no flatter. What
+        can be closed is a shell with no layer at all -- it is kept whole
+        (DP-124, DP-127). So every wall of a shell whose bare region touching
+        the layer holds a curved patch is left bare and named, and the walls
+        of every other shell keep their layers.
+        """
+        if not skipped:
+            return selected, skipped
+        bare = {int(tag) for tag in skipped}
+        chosen = {int(tag) for tag in selected}
+        curved = []
+        for tag in skipped:
+            try:
+                box = self.gmsh.model.getBoundingBox(2, tag)
+            except Exception:                    # noqa: BLE001 - cannot ask
+                continue
+            if not self.patch_lies_in_a_plane(tag, box):
+                curved.append(tag)
+        if not curved:
+            return selected, skipped
+        curves = {}
+        for shell in shells:
+            for tag in shell:
+                curves[int(tag)] = set(abs(int(c))
+                                       for c in self.surface_curves(tag))
+        dropped = set()
+        for shell in shells:
+            members = {int(tag) for tag in shell}
+            bent = [int(tag) for tag in curved if int(tag) in members]
+            if not bent or not members & chosen:
+                continue
+            # The bare region each curved patch lies in, and whether a
+            # layered wall borders it.
+            region, todo = set(bent), list(bent)
+            while todo:
+                tag = todo.pop()
+                for other in members & bare:
+                    if other not in region and curves[tag] & curves[other]:
+                        region.add(other)
+                        todo.append(other)
+            touching = [tag for tag in members & chosen
+                        if any(curves[tag] & curves[item]
+                               for item in region)]
+            if not touching:
+                continue
+            names = sorted({self.surface_patch_name(tag)[0] for tag in bent})
+            for tag in sorted(members & chosen):
+                self.narrow(tag, 'ends_on_curved_patch', (
+                    'its layer would end on ' + ', '.join(names) + ', which '
+                    'grows no layer and is not flat; the opening a layer '
+                    'leaves can only be closed with a flat face, so the '
+                    'walls of that boundary are meshed without a layer'))
+                dropped.add(tag)
+        if not dropped:
+            return selected, skipped
+        return ([tag for tag in selected if int(tag) not in dropped],
+                list(skipped) + [tag for tag in selected
+                                 if int(tag) in dropped])
+
+    def record_narrowed(self, stacks, stack_of):
+        """Publish the patches asked for and left without a layer.
+
+        Plan 50 IP28. Adds ``statistics.layers.notGrownByPatch``:
+        ``{patch: {reason, requestedLayers, note}}``. The coverage document
+        turns each into a ``not grown`` row.
+        """
+        if not self.layer_narrowed:
+            return
+        self.statistics['layers']['notGrownByPatch'] = {
+            item['patch']: {
+                'reason': item['reason'],
+                'requestedLayers': stacks[stack_of.get(item['tag'], 0)][
+                    'count'],
+                'note': item['note']}
+            for item in self.layer_narrowed}
+
+    def touching_stack_leads(self, meetings, stack_of, stacks):
+        """For every stack that touches another, the stack its call follows.
+
+        Plan 50 IP28 (DP-6438). Stacks joined by a shared edge, directly or
+        through a third, are one group and one call. The group's lead -- whose
+        layer count, spacing, elements per layer and cell shape the call
+        carries -- is the stack with the most layers, then the most elements
+        per layer, then the lowest number (the list's stack is 0). Returns
+        ``{stack number: lead number}`` for grouped stacks only.
+        """
+        parent = {}
+
+        def root(number):
+            while parent.get(number, number) != number:
+                number = parent[number]
+            return number
+        for tag, mate in meetings:
+            one = root(stack_of.get(int(tag), 0))
+            other = root(stack_of.get(int(mate), 0))
+            if one != other:
+                parent[max(one, other)] = min(one, other)
+        groups = {}
+        for number in {stack_of.get(int(tag), 0)
+                       for pair in meetings for tag in pair}:
+            groups.setdefault(root(number), set()).add(number)
+        leads = {}
+        for members in groups.values():
+            chosen = min(members, key=lambda number: (
+                -stacks[number]['count'], -stacks[number]['elements'], number))
+            for number in members:
+                leads[number] = chosen
+        return leads
+
+    def layer_scale_view(self, tags, scales, total, spots, radius):
+        """A scalar view that scales one call's stack node by node, or -1.
+
+        Plan 50 IP28. *scales* is each base's total thickness over the
+        call's; *spots* are ``[x, y, z, thickness, patch]`` places where an
+        earlier attempt folded and the stack is cut to *thickness*. MEASURED
+        (scripts/probe_gmsh_layers_local_thickness.py): the view must cover
+        every base node, so it is an octree over the whole model.
+        """
+        from layer_scale import ScaleField, list_data, octree_leaves
+        uniform = all(abs(scales.get(abs(int(tag)), 1.0) - 1.0) < 1e-12
+                      for tag in tags)
+        if uniform and not spots:
+            return -1
+        gmsh = self.gmsh
+        samples = []
+        if not uniform:
+            for tag in tags:
+                value = scales.get(abs(int(tag)), 1.0)
+                _nodes, coords, _params = gmsh.model.mesh.getNodes(
+                    2, abs(int(tag)), includeBoundary=True)
+                samples.extend((coords[index], coords[index + 1],
+                                coords[index + 2], value)
+                               for index in range(0, len(coords) - 2, 3))
+        caps = [(float(spot[0]), float(spot[1]), float(spot[2]),
+                 min(1.0, float(spot[3]) / total)) for spot in spots]
+        if caps and radius <= 0.0:
+            radius = 3.0 * total
+        thinnest = min(scales.get(abs(int(tag)), 1.0) for tag in tags) * total
+        candidates = []
+        if caps:
+            # A quarter radius: the cut's plateau is half a radius wide.
+            candidates.append(radius / 4.0)
+        if not uniform:
+            candidates.append(2.0 * thinnest)
+        finest = min(candidates)
+        field = ScaleField(samples, caps, radius, spacing=finest)
+        if field.trivial:
+            return -1
+        box = gmsh.model.getBoundingBox(-1, -1)
+        count, data = list_data(octree_leaves(field, box, finest))
+        view = gmsh.view.add('foammesh-layer-scale')
+        gmsh.view.addListData(view, 'SH', count, data)
+        self.layer_scale_views.append(view)
+        return int(gmsh.view.getIndex(view))
+
+    def record_stack_groups(self, selected, stack_of, stacks, leads):
+        """Say what each patch was grown with where stacks shared a call.
+
+        Plan 50 IP28 (DP-6438). Adds ``grownByPatch`` (the layer count,
+        elements per layer, first height and total thickness each patch was
+        grown with) and ``stackGroups`` (the stacks that shared a call, their
+        patches and the lead whose count and spacing the call carried).
+        ``requestedByPatch`` keeps what was asked.
+        """
+        record = self.statistics['layers']
+        grown = {}
+        for tag in selected:
+            own = stacks[stack_of.get(int(tag), 0)]
+            number = stack_of.get(int(tag), 0)
+            led = stacks[leads.get(number, number)]
+            scale = abs(own['heights'][-1]) / abs(led['heights'][-1])
+            grown[self.surface_patch_name(tag)[0]] = {
+                'stack': leads.get(number, number),
+                'layers': led['count'],
+                'elementsPerLayer': led['elements'],
+                'firstHeight': abs(led['heights'][0]) * scale,
+                'totalThickness': abs(own['heights'][-1]),
+                'quads': led['quads']}
+        record['grownByPatch'] = grown
+        groups = {}
+        for number, chosen in leads.items():
+            groups.setdefault(chosen, set()).add(number)
+        record['stackGroups'] = [
+            {'lead': chosen, 'stacks': sorted(members),
+             'layers': stacks[chosen]['count'],
+             'rule': 'most_layers',
+             'patches': sorted({self.surface_patch_name(tag)[0]
+                                for tag in selected
+                                if stack_of.get(int(tag), 0) in members})}
+            for chosen, members in sorted(groups.items())]
+        for group in record['stackGroups']:
+            changed = sorted(
+                name for name in group['patches']
+                if record['requestedByPatch'].get(name, {}).get('layers')
+                != grown[name]['layers']
+                or record['requestedByPatch'].get(name, {}).get(
+                    'elementsPerLayer') != grown[name]['elementsPerLayer'])
+            note = ('the layer stacks on ' + ', '.join(group['patches'])
+                    + ' share an edge and were grown in one extrusion, each '
+                    'to its own total thickness')
+            if changed:
+                note += (f', with the {group["layers"]}-layer count and '
+                         'spacing of the deepest stack; '
+                         + ', '.join(changed) + ' therefore carry '
+                         f'{group["layers"]} layers rather than the count '
+                         'asked for')
+            self.warnings.append(note)
+
+    def record_local_fit(self, spots, radius):
+        """Say where the stack was thinned to fit, patch by patch.
+
+        Plan 50 IP28 (DP-6436). Adds ``localFit``: the places thinned, the
+        blend radius and, per patch, the thinnest stack it carries.
+        """
+        thinnest = {}
+        for spot in spots:
+            patch = str(spot[4]) if len(spot) > 4 else ''
+            thinnest[patch] = min(thinnest.get(patch, float('inf')),
+                                  float(spot[3]))
+        self.statistics['layers']['localFit'] = {
+            'spots': len(spots), 'radius': radius,
+            'thinnestByPatch': thinnest}
 
     def stack_contact_refusal(self, meetings):
         names = sorted({self.surface_patch_name(tag)[0]
@@ -1754,7 +2263,7 @@ class LayersStage:
         return all(abs(sum(first[axis] * other[axis] for axis in range(3)))
                    >= 1.0 - 1e-4 for other in normals[1:])
 
-    def rebuild_unextruded(self, skipped, tops, boxes, columns):
+    def rebuild_unextruded(self, skipped, tops, boxes, columns, remove=True):
         """Close the core volume across the surfaces that grew no layer.
 
         R118. The core is rebuilt from the extrusion's *top* surfaces, and with
@@ -1843,10 +2352,22 @@ class LayersStage:
             flat = self._flat_axis(boxes[owner])
             members.sort(reverse=True, key=lambda ring: self._rim_rank(
                 ring, owners, bases, flat))
+            # Plan 50 IP28 (DP-6437). Rebuilt one carved volume at a time, a
+            # face two of them share leaves the same rim in both, and one
+            # plane serves both: the interface stays one surface.
+            cache = getattr(self, '_plane_cache', None)
+            key = frozenset(abs(int(curve)) for ring in members
+                            for curve in ring)
+            if cache is not None and key in cache:
+                rebuilt[cache[key]] = [curve for ring in members
+                                       for curve in ring]
+                continue
             try:
                 loops = [gmsh.model.geo.addCurveLoop(ring, reorient=True)
                          for ring in members]
                 surface = gmsh.model.geo.addPlaneSurface(loops)
+                if cache is not None:
+                    cache[key] = surface
             except Exception as error:
                 raise MeshFailure(
                     'the patches left without a boundary layer could not be '
@@ -1858,13 +2379,18 @@ class LayersStage:
                 'the boundary layer left no rim to rebuild the un-layered '
                 'patches from, so the core volume cannot be closed')
         gmsh.model.geo.synchronize()
+        if remove:
+            self.remove_unextruded(skipped)
+        return rebuilt
+
+    def remove_unextruded(self, skipped):
+        """Delete the patches the rebuild stood in for."""
         # The originals still carry their triangles; clearing the mesh first is
         # what keeps them out of the z=0 plane when the kernel is discrete.
-        gmsh.model.mesh.clear([(2, tag) for tag in skipped])
+        self.gmsh.model.mesh.clear([(2, tag) for tag in skipped])
         self.remove_entities([(2, tag) for tag in skipped])
         for tag in skipped:
             self.layer_replacements.setdefault(tag, [])
-        return rebuilt
 
     def _loop_points(self, curves):
         """Coordinates of the points bounding a set of curves.

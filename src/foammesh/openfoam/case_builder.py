@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import difflib
 import json
+import logging
 import math
 import os
 import re
@@ -26,12 +27,14 @@ from . import background_mesh
 from .dict_format import format_dictionary_file
 from foammesh.core.layer_patterns import (
     PatternError, matching_patches, quoted_key)
-from foammesh.core.quantities import agreeing, count_text
+from foammesh.core.quantities import agreeing, count_text, format_group
 from foammesh.core.mesh.zone_names import cell_zone_word  # noqa: F401 - CHT2: one rule, re-exported
 from .snappy_controls import (
     BACKGROUND_PATCH_GROUP, BOUNDARY_FACES, DEBUG_FLAGS, WRITE_FLAGS)
 from .target import FoamTarget, DEFAULT_TARGET, mesh_quality_controls
 from .surface_roles import SurfaceRoleRefusal
+
+logger = logging.getLogger(__name__)
 
 
 #: CHT1. The characters ``word::valid`` refuses (OpenFOAM ``word.H``).
@@ -190,6 +193,9 @@ class CaseBuilder:
         #: Plan 37 UF19. The case the dictionaries are for, once a caller has
         #: named one. A relative ``addFeaturesFile`` resolves against it.
         self.case_dir: Path | None = None
+        #: Plan 50 IP3. Where the last written ``maxGlobalCells`` came from:
+        #: ``'user'``, ``'memory'`` or ``'safe_maximum'`` (see _cell_limits).
+        self.cell_limit_source: str | None = None
 
     # -- generation warnings ------------------------------------------------
     def warn(self, code: str, message: str, *, field_id: str = '',
@@ -225,6 +231,22 @@ class CaseBuilder:
         except Exception:
             return default
 
+    def _required(self, path):
+        """A value the configuration must hold: its schema gives every new
+        case one, so a missing one is a real failure, named by its path
+        (Plan 50 IP8, DP-6232). The writer keeps no value of its own."""
+        try:
+            value = self.db.getValue(path)
+        except (KeyError, LookupError) as error:
+            raise ValueError(
+                f'The configuration holds no value for {path}, so the '
+                'mesh dictionaries cannot be written.') from error
+        if value is None or str(getattr(value, 'value', value)).strip() == '':
+            raise ValueError(
+                f'The configuration holds no value for {path}, so the '
+                'mesh dictionaries cannot be written.')
+        return value
+
     def _int(self, path, default: int) -> int:
         value = self._v(path, default)
         try:
@@ -233,10 +255,24 @@ class CaseBuilder:
             return int(default)
 
     def _elements(self, path) -> dict:
+        """The configuration collection *path*, or ``{}`` when it holds none.
+
+        Plan 50 IP23 (ST-6, DP-6235). Only a collection the configuration
+        does not hold is "none". Any other failure used to read as "none" as
+        well, so a corrupt row dropped its whole collection from the
+        dictionaries without a word; it now fails them, named.
+        """
         try:
             return dict(self.db.getElements(path))
-        except Exception:
+        except LookupError:
             return {}
+        except Exception as error:  # noqa: BLE001 - reported, then raised
+            logger.warning('configuration collection %s could not be read',
+                           path, exc_info=True)
+            raise ValueError(
+                f'The configuration collection {path} could not be read '
+                f'({type(error).__name__}: {error}), so the mesh '
+                f'dictionaries cannot be written.') from error
 
     @staticmethod
     def _enum_value(value):
@@ -357,10 +393,23 @@ class CaseBuilder:
         # before UXA2 stale -- a saved case migrates it to true -- and the
         # walls group being made staled castellation a second time.
         castellation.pop('defaulted', None)
+        # Plan 50 IP27 (DP-6390). The first-layer-height values reach the
+        # dictionary only while their mode is picked; in relative mode they
+        # are left out, so every layers and snappyHexMesh fingerprint already
+        # recorded stays current.
+        add_layers = dict(document.get('addLayers', {}) or {})
+        if not self._first_layer_height_mode():
+            for key in self.FIRST_LAYER_KEYS:
+                add_layers.pop(key, None)
+        block_mesh = {'baseGrid': document.get('baseGrid', {})}
+        # Plan 50 IP26 (DP-6425). The derived block's default clearance
+        # depends on whether the geometry is closed, which baseGrid does not
+        # say; it is hashed only where it applies, so every other project
+        # keeps the fingerprint it recorded.
+        if self._default_clearance_in_force():
+            block_mesh['defaultClearanceCells'] = self.DEFAULT_CLEARANCE_CELLS
         payloads = {
-            'blockMesh': {
-                'baseGrid': document.get('baseGrid', {}),
-            },
+            'blockMesh': block_mesh,
             'surfaceFeatures': {
                 # Plan 37 UF20. Only what surfaceFeaturesDict reads from a
                 # refinement row: its includedAngle. The whole row used to go
@@ -383,7 +432,7 @@ class CaseBuilder:
             'snappyHexMesh': {
                 'castellation': castellation,
                 'snap': snap_section,
-                'addLayers': document.get('addLayers', {}),
+                'addLayers': add_layers,
                 'meshQuality': document.get('meshQuality', {}),
                 'geometry': layer_geometry,
                 'region': document.get('region', {}),
@@ -394,7 +443,7 @@ class CaseBuilder:
                 'surfaces': self.surfaces,
             },
             'layers': {
-                'addLayers': document.get('addLayers', {}),
+                'addLayers': add_layers,
                 'meshQuality': document.get('meshQuality', {}),
                 'geometry': layer_geometry,
                 'surfaces': self.surfaces,
@@ -898,9 +947,9 @@ class CaseBuilder:
         source = 'hex6' if self._bounding_hex6_key() is not None else (
             'farfield' if self.farfield_plan(self._stood_off_bbox())
             else 'geometry')
-        b = self._effective_bbox()
+        b, counts = self._derived_block()
         bounds = self._bbox_tuple(b)
-        counts = tuple(int(value) for value in self._background_cell_counts(b))
+        counts = tuple(int(value) for value in counts)
         cells = counts[0] * counts[1] * counts[2]
         return dict(empty, source=source, block=bounds, counts=counts,
                     cell=max((bounds[2 * axis + 1] - bounds[2 * axis])
@@ -1209,20 +1258,41 @@ class CaseBuilder:
     #: DP-587: fewer background cells than this on an axis is warned.
     _FEW_BACKGROUND_CELLS = 3
 
-    def _background_cell_counts(self, b) -> tuple[int, int, int]:
-        mode = self._enum_value(self._v('baseGrid/sizingMode', 'counts'))
-        if mode == 'target_size':
-            stored = self._v('baseGrid/targetCellSize')
-            if stored is None or str(stored).strip() == '':
-                target = self._auto_target_cell_size(b)
-            else:
-                target = float(stored)
-            if not math.isfinite(target) or target <= 0:
-                raise ValueError('base-grid target cell size must be positive')
+    #: Plan 50 IP26 (DP-6234). Level-0 cells whose longest edge is more than
+    #: this times their shortest are warned about: snappyHexMesh splits each
+    #: cell into eight, so the shape stays at every refinement level.
+    LEVEL0_ASPECT_LIMIT = 1.2
+
+    def _target_mode(self) -> bool:
+        return self._enum_value(
+            self._v('baseGrid/sizingMode', 'counts')) == 'target_size'
+
+    def _target_cell_size(self, b) -> float:
+        """The target-size mode's base cell: typed, or Auto from *b*."""
+        stored = self._v('baseGrid/targetCellSize')
+        if stored is None or str(stored).strip() == '':
+            target = self._auto_target_cell_size(b)
+        else:
+            target = float(stored)
+        if not math.isfinite(target) or target <= 0:
+            raise ValueError('base-grid target cell size must be positive')
+        return target
+
+    def _background_cell_counts(self, b, target=None) -> tuple[int, int, int]:
+        if self._target_mode():
+            if target is None:
+                target = self._target_cell_size(b)
+            # A box already padded to whole cells divides exactly; the
+            # tolerance keeps a rounding error from adding a cell. It is
+            # float32's: surface bounds read through VTK put a 0.24 m part
+            # at 0.24000000357 m, which is 24 cells of 0.01 m, not 25.
             counts = (
-                max(1, math.ceil((float(b.xmax) - float(b.xmin)) / target)),
-                max(1, math.ceil((float(b.ymax) - float(b.ymin)) / target)),
-                max(1, math.ceil((float(b.zmax) - float(b.zmin)) / target)))
+                max(1, math.ceil((float(b.xmax) - float(b.xmin)) / target
+                                 - 1e-6)),
+                max(1, math.ceil((float(b.ymax) - float(b.ymin)) / target
+                                 - 1e-6)),
+                max(1, math.ceil((float(b.zmax) - float(b.zmin)) / target
+                                 - 1e-6)))
             # DP-587 (field audit 0924 shared-and-harness D-SH-08). The size
             # defaults to 1 m whatever the part, so switching to target size
             # on a 0.3 m elbow wrote one cell across it without a word.
@@ -1239,6 +1309,221 @@ class CaseBuilder:
         return (self._int('baseGrid/numCellsX', 10),
                 self._int('baseGrid/numCellsY', 10),
                 self._int('baseGrid/numCellsZ', 10))
+
+    def _derived_block(self):
+        """The single block's box and counts, its level-0 cells checked.
+
+        Plan 50 IP26 (SN-7, DP-6234). In target-size mode the block derived
+        from the geometry is padded to whole cubic cells of the target, the
+        padding split evenly on both sides of each axis so the geometry stays
+        centred inside. A bounding hex6 the user typed is written as typed;
+        whatever the source, level-0 cells out of shape by more than
+        :attr:`LEVEL0_ASPECT_LIMIT` are warned about.
+        """
+        b = self._effective_bbox()
+        coarse = self._farfield_coarsening()
+        if coarse is not None:
+            # Plan 37 #7: already snapped to whole coarse cells.
+            return b, self._coarse_counts(coarse)
+        typed_box = self._bounding_hex6_key() is not None
+        if self._target_mode():
+            target = self._target_cell_size(b)
+            if not typed_box:
+                b = self._with_default_clearance(b, target)
+            counts = self._background_cell_counts(b, target)
+            if not typed_box:
+                b = self._padded_to_cells(b, counts, target)
+        else:
+            counts = self._background_cell_counts(b)
+        self._check_level0_shape(b, counts, typed_box)
+        return b, counts
+
+    def cubic_bounds(self, b, standoff=None):
+        """*b*, a derived block, as :meth:`_derived_block` writes it: in
+        target-size mode given its default clearance and padded to whole
+        cubic target cells, else unchanged.
+
+        Plan 50 IP26. The one rule for every reader of the derived box
+        (``core.mesh.domain_box``: the drawn box and the launch gate), so the
+        box they check is the block written. *standoff* is the standoff the
+        reader applied to *b*, when it is not the stored one (a page showing
+        an unsaved value).
+        """
+        if not self._target_mode():
+            return b
+        target = self._target_cell_size(b)
+        b = self._with_default_clearance(b, target, standoff)
+        return self._padded_to_cells(
+            b, self._background_cell_counts(b, target), target)
+
+    #: Plan 50 IP26 (DP-6425). How many level-0 cells of clear space a
+    #: derived target-size block keeps round closed geometry when the
+    #: standoff is left at 0.
+    DEFAULT_CLEARANCE_CELLS = 1
+
+    def default_clearance(self, target, standoff=None) -> float:
+        """The length the derived block is pushed out by when the standoff is
+        left at 0, or 0.0 when none applies.
+
+        Plan 50 IP26 (DP-6425). With standoff 0 the derived block was the
+        geometry's bounding box, so the geometry touched the block on every
+        side and snappy split each surface there between its own patch and
+        the leftover background patch (the flush-box warning). In target-size
+        mode the block now keeps :attr:`DEFAULT_CLEARANCE_CELLS` level-0 cell
+        (the target) of clear space on every side, before the cubic padding.
+
+        Only round closed geometry. An open surface -- a pipe or duct with
+        open ends -- relies on the block faces flush with its ends to close
+        the fluid space; pushing them out would join the inside to the
+        outside, so a case with any open surface keeps the flush block it
+        has always had. A typed standoff above 0, a farfield (which brings
+        its own clearance), counts mode, a bounding Hex6 and hand-written
+        blocks are all left as they were. The target is computed from the
+        geometry's own box, so an Auto cell size is not changed by it.
+        """
+        if standoff is None:
+            try:
+                standoff = float(self._v('baseGrid/standoff', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                standoff = 0.0
+        if standoff > 0 or self.db is None:
+            return 0.0
+        try:
+            if not math.isfinite(float(target)) or float(target) <= 0:
+                return 0.0
+            from foammesh.core.mesh import snappy_farfield
+            if snappy_farfield.active(self.db) is not None:
+                return 0.0
+            if not self._geometry_is_closed():
+                return 0.0
+        except Exception:  # noqa: BLE001 - the writer reports the record
+            return 0.0
+        return self.DEFAULT_CLEARANCE_CELLS * float(target)
+
+    def _default_clearance_in_force(self) -> bool:
+        """Whether the written block carries :meth:`default_clearance`."""
+        try:
+            if (not self._target_mode()
+                    or self._bounding_hex6_key() is not None
+                    or self._authored_background() is not None):
+                return False
+        except Exception:  # noqa: BLE001 - the writer reports the record
+            return False
+        return self.default_clearance(1.0) > 0
+
+    def _with_default_clearance(self, b, target, standoff=None):
+        margin = self.default_clearance(target, standoff)
+        if margin <= 0:
+            return b
+        from foammesh.core.geometry import BBox
+
+        return BBox(float(b.xmin) - margin, float(b.xmax) + margin,
+                    float(b.ymin) - margin, float(b.ymax) + margin,
+                    float(b.zmin) - margin, float(b.zmax) + margin)
+
+    def _geometry_is_closed(self) -> bool:
+        """Whether every geometry row bounds a closed volume.
+
+        The import makes a volume row of each closed body and leaves an open
+        one as bare surface rows (``identifyVolumes``), so a surface row with
+        no owning volume -- an open STL or CAD shell, or a plane, disk or
+        plate -- is open geometry. ``False`` with no geometry at all.
+        """
+        rows = self._elements('geometry')
+        bodies = 0
+        for row in rows.values():
+            kind = self._item_value(row, 'gType')
+            shape = self._item_value(row, 'shape')
+            if kind == 'volume':
+                if shape != 'hex6':
+                    bodies += 1
+                continue
+            if self._owning_volume(row) is None:
+                return False
+        return bodies > 0
+
+    @staticmethod
+    def _padded_to_cells(b, counts, target):
+        """*b* grown to ``counts * target`` on each axis, centred on itself."""
+        from foammesh.core.geometry import BBox
+
+        bounds = []
+        for axis, (low, high) in enumerate(((b.xmin, b.xmax),
+                                            (b.ymin, b.ymax),
+                                            (b.zmin, b.zmax))):
+            low, high = float(low), float(high)
+            pad = (counts[axis] * target - (high - low)) / 2.0
+            if pad <= 1e-6 * target:        # whole cells already (above)
+                bounds.extend((low, high))
+                continue
+            bounds.extend((float(f'{low - pad:.12g}'),
+                           float(f'{low - pad + counts[axis] * target:.12g}')))
+        return BBox(*bounds)
+
+    def _level0_gradings(self):
+        """Each axis's grading spec, or ``None`` when one cannot be read
+        (the dictionary writer says why)."""
+        specs = []
+        for axis in 'xyz':
+            try:
+                specs.append(background_mesh.preset_grading(
+                    self._v(f'baseGrid/gradingFine/{axis}', None)
+                    or background_mesh.FINE_START,
+                    self._number(f'baseGrid/grading/{axis}', 1)))
+            except (ValueError, TypeError):
+                return None
+        return specs
+
+    def _check_level0_shape(self, b, counts, typed_box: bool) -> None:
+        """Warn when the level-0 cells are far from cubes (Plan 50 IP26)."""
+        from foammesh.core.mesh.face_clearance import axis_faces
+
+        specs = self._level0_gradings()
+        if specs is None:
+            return
+        spans = (float(b.xmax) - float(b.xmin), float(b.ymax) - float(b.ymin),
+                 float(b.zmax) - float(b.zmin))
+        if min(spans) <= 0:
+            return
+        widths = []
+        for axis in range(3):
+            faces = axis_faces(int(counts[axis]), specs[axis])
+            edges = [spans[axis] * (faces[i + 1] - faces[i])
+                     for i in range(len(faces) - 1)]
+            widths.append((min(edges), max(edges)))
+        shortest = min(low for low, _high in widths)
+        longest = max(high for _low, high in widths)
+        if shortest <= 0:
+            return
+        aspect = longest / shortest
+        if aspect <= self.LEVEL0_ASPECT_LIMIT + 1e-9:
+            return
+        graded = [name for name, (low, high), span
+                  in zip('xyz', widths, spans) if high - low > 1e-9 * span]
+        if graded:
+            cause = (f'the grading on {", ".join(graded)} stretches them; '
+                     f'lower the grading ratio, or set the counts so the '
+                     f'graded cells stay near cubes')
+            field_id = f'meshing.base_grid.grading.{graded[0]}'
+        elif typed_box:
+            cause = ('the bounding hex6 is written as typed and does not '
+                     'divide into cubes at these counts; size the box or the '
+                     'cell to suit each other')
+            field_id = 'meshing.base_grid.bounding_hex6'
+        else:
+            # DP-165: one measurement, one precision, one unit.
+            sizes = format_group(high for _low, high in widths)
+            worst = max(range(3), key=lambda axis: widths[axis][1])
+            cause = (f'they are {sizes}; set the cell counts in proportion '
+                     f'to the box, or use a target cell size')
+            field_id = f'meshing.base_grid.cells.{"xyz"[worst]}'
+        self.warn(
+            'base_grid.aspect_ratio',
+            f'the level-0 background cells are {aspect:.3g} times longer on '
+            f'their longest edge than on their shortest, and snappyHexMesh '
+            f'keeps that shape at every refinement level: {cause}.',
+            field_id=field_id, requested=[int(item) for item in counts],
+            applied=round(aspect, 3))
 
     def _size_divisor(self) -> float:
         """Plan 40 UXA1: the divisor the Mesh size choice gives an Auto cell."""
@@ -1320,14 +1605,10 @@ class CaseBuilder:
         authored = self._authored_background()
         if authored is None:
             scale = self._block_scale()
-            b = self._effective_bbox()
             # Plan 37 #7. A coarsened far field is written at its coarse
             # cell; the box around the bodies is refined back to the target.
-            coarse = self._farfield_coarsening()
-            if coarse is not None:
-                nx, ny, nz = self._coarse_counts(coarse)
-            else:
-                nx, ny, nz = self._background_cell_counts(b)
+            # Plan 50 IP26: a target-size block is padded to whole cubes.
+            b, (nx, ny, nz) = self._derived_block()
             # The background block used to be written with these three things
             # hard-coded: unit scale, uniform grading, and every face a plain
             # patch. Grading and the faces are controls, and each still
@@ -2181,16 +2462,14 @@ class CaseBuilder:
         relations -- conformal, non-conformal and periodic (``cyclic``) --
         each with its regions, state and transform. The scope tokens are the
         prepared ``patch_uuid`` values, which is what the readers join on.
-        Never raises: a relation the route cannot build is refused when the
-        dictionaries are written, after this manifest says what was asked.
+        A relation the route cannot build is refused when the dictionaries
+        are written, after this manifest says what was asked. Relations that
+        cannot be read at all fail the build, named (Plan 50 IP23).
         """
         from foammesh.db import surface_intent as model
         from .surface_roles import relation_label, relation_transform
 
-        try:
-            intent = self._surface_intent()
-        except Exception:  # noqa: BLE001 - a manifest is written regardless
-            return []
+        intent = self._read_surface_intent()
         uuids = self._bound_patch_uuids()
         coupling = {model.CONFORMAL: 'conformal',
                     model.NON_CONFORMAL: 'non_conformal',
@@ -2227,11 +2506,49 @@ class CaseBuilder:
             })
         return pairs
 
+    def _read_surface_intent(self):
+        """:meth:`_surface_intent` for the hand-off manifest (Plan 50 IP23).
+
+        A project with no relations has an empty model, which is not an
+        error; a model that cannot be read is, and the manifest would
+        otherwise go out without its couplings.
+        """
+        try:
+            return self._surface_intent()
+        except Exception as error:  # noqa: BLE001 - reported, then raised
+            logger.warning('surface relations could not be read',
+                           exc_info=True)
+            raise ValueError(
+                f'The surface relations could not be read for the hand-off '
+                f'manifest ({type(error).__name__}: {error}), so the mesh '
+                f'dictionaries cannot be written.') from error
+
+    def _manifest_binding_keys(self) -> dict[str, str] | None:
+        """The group bindings for the manifest, or ``None`` when the writer
+        refuses them (Plan 50 IP23).
+
+        The ambiguous-binding refusal is a ``ValueError`` the dictionary
+        writers raise themselves, by name; the manifest lists nothing bound
+        for it. Anything else is a failure to read, and fails the build.
+        """
+        try:
+            return self._group_geometry_binding_keys()
+        except ValueError as refusal:
+            logger.info('hand-off manifest binds no surface group: %s',
+                        refusal)
+            return None
+        except Exception as error:  # noqa: BLE001 - reported, then raised
+            logger.warning('surface groups could not be bound',
+                           exc_info=True)
+            raise ValueError(
+                f'The prepared surface groups could not be bound to the '
+                f'configuration ({type(error).__name__}: {error}), so the '
+                f'mesh dictionaries cannot be written.') from error
+
     def _bound_patch_uuids(self) -> dict[str, str]:
         """``{geometry row key: prepared patch uuid}`` of the bound groups."""
-        try:
-            keys = self._group_geometry_binding_keys()
-        except Exception:  # noqa: BLE001 - an unbindable project binds none
+        keys = self._manifest_binding_keys()
+        if keys is None:
             return {}
         by_name = {group['solver_name']: group
                    for group in self._prepared_groups()}
@@ -2256,10 +2573,9 @@ class CaseBuilder:
         from foammesh.db import surface_intent as model
         from .surface_roles import relation_label
 
-        try:
-            intent = self._surface_intent()
-            keys = self._group_geometry_binding_keys()
-        except Exception:  # noqa: BLE001
+        intent = self._read_surface_intent()
+        keys = self._manifest_binding_keys()
+        if keys is None:
             return []
         names = {key: name for name, key in keys.items()}
         result = []
@@ -2404,13 +2720,22 @@ class CaseBuilder:
         wins over any value cached in the generation manifest; otherwise a
         stage rerun would silently keep seeding the mesh at the old points.
         """
-        try:
-            regions = list(self.db.getElements('region').values())
-            seeds = tuple(tuple(region.vector('point')) for region in regions)
-            if seeds:
-                return seeds
-        except Exception:
-            pass
+        # Plan 50 IP23 (DP-6235). No region rows is "no region"; a region
+        # whose point cannot be read is not, or the mesh is seeded at the
+        # import's suggestion while the user's point is ignored.
+        seeds = []
+        for key, region in self._elements('region').items():
+            try:
+                seeds.append(tuple(region.vector('point')))
+            except Exception as error:  # noqa: BLE001 - reported, raised
+                logger.warning('region %s material point could not be read',
+                               key, exc_info=True)
+                raise ValueError(
+                    f'The material point of region {key} could not be read '
+                    f'({type(error).__name__}: {error}), so the mesh '
+                    f'dictionaries cannot be written.') from error
+        if seeds:
+            return tuple(seeds)
         if self.prepared_geometry is not None:
             seed = self.prepared_geometry.manifest.get('fluid_seed')
             if seed is not None:
@@ -3762,6 +4087,12 @@ class CaseBuilder:
             return None
         if policy == 'freeze':
             return {'nSurfaceLayers': 0}
+        if self._first_layer_height_mode():
+            # Plan 50 IP27 (SN-9, DP-6390). One stack for every growing
+            # patch, in metres; a group asking for no layers stays frozen.
+            if int(self._item_value(layer, 'nSurfaceLayers', 1)) < 1:
+                return {'nSurfaceLayers': 0}
+            return self._first_layer_height_values()
         model = str(self._item_value(
             layer, 'thicknessModel', 'finalAndExpansion'))
         count = int(self._item_value(layer, 'nSurfaceLayers', 1))
@@ -3814,6 +4145,125 @@ class CaseBuilder:
             'relativeSizes': bool(
                 self._item_value(layer, 'relativeSizes', True)),
         }
+
+    #: Plan 50 IP27. The minimum stack kept, as a share of the first layer
+    #: (``snappy_mapping.MIN_THICKNESS_FRACTION``, DP-2864).
+    FIRST_LAYER_MIN_FRACTION = 0.5
+    #: The schema keys of the mode, hashed only while it is picked.
+    FIRST_LAYER_KEYS = ('firstLayerMode', 'firstLayerHeight',
+                        'firstLayerExpansionRatio', 'firstLayerCount')
+
+    def _first_layer_height_mode(self) -> bool:
+        """Whether the case sizes snappy layers by a first-layer height."""
+        return self._enum_value(self._v(
+            'addLayers/firstLayerMode', 'relative')) == 'first_layer_height'
+
+    def _first_layer_height_values(self) -> dict:
+        """The layer entry the first-layer-height mode writes (IP27).
+
+        Foundation 13 reads ``relativeSizes`` once for all of
+        ``addLayersControls`` and the first-layer thickness plus expansion
+        pair per patch (``layerParameters.C``), so absolute metres are
+        ``relativeSizes false`` with ``firstLayerThickness`` and
+        ``expansionRatio``. ``minThickness`` is then in metres too: half the
+        first layer, the share the relative proposal keeps (DP-2864).
+        """
+        first = float(self._v('addLayers/firstLayerHeight', 0.001))
+        ratio = float(self._v('addLayers/firstLayerExpansionRatio', 1.2))
+        count = int(self._v('addLayers/firstLayerCount', 5))
+        if count < 1:
+            raise ValueError('the number of layers must be at least 1')
+        minimum = first * self.FIRST_LAYER_MIN_FRACTION
+        for name, value in (('first layer height', first),
+                            ('layer expansion ratio', ratio)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f'the {name} must be positive and finite')
+        return {'nSurfaceLayers': count, 'firstLayerThickness': first,
+                'expansionRatio': ratio, 'minThickness': minimum,
+                'relativeSizes': False}
+
+    def _warn_first_layer_stack(self, d: dict) -> None:
+        """Warn where a first-layer-height stack is deeper than its wall cell.
+
+        Plan 50 IP27 (DP-6392). snappyHexMesh grows layers into the cell at
+        the wall (DP-2877), so a stack deeper than that cell is shrunk or
+        dropped there. The cell is the block's base cell halved once per
+        surface level, and is known only for a patch whose surface level is
+        written; where it is not, nothing is guessed. A warning, not a
+        refusal: the person may mean it, and the run says what grew.
+        """
+        if not self._first_layer_height_mode():
+            return
+        layers = (d.get('addLayersControls') or {}).get('layers') or {}
+        try:
+            b, counts = self._derived_block()
+            base = min((float(b.xmax) - float(b.xmin)) / counts[0],
+                       (float(b.ymax) - float(b.ymin)) / counts[1],
+                       (float(b.zmax) - float(b.zmin)) / counts[2])
+        except Exception:                                    # noqa: BLE001
+            return
+        if not math.isfinite(base) or base <= 0:
+            return
+        levels: dict[str, int] = {}
+
+        def top(entry):
+            level = entry.get('level') if isinstance(entry, dict) else None
+            if isinstance(level, (list, tuple)) and len(level) == 2:
+                return int(level[1])
+            return None
+
+        surfaces = ((d.get('castellatedMeshControls') or {})
+                    .get('refinementSurfaces') or {})
+        for name, entry in surfaces.items():
+            if top(entry) is not None:
+                levels[str(name)] = top(entry)
+            for region, sub in ((entry or {}).get('regions') or {}).items():
+                if top(sub) is not None:
+                    levels[str(region)] = top(sub)
+        # DP-6485. A patch is named by the geometry block's region rename
+        # (``regions { <source> { name <patch>; } }``), while the surface is
+        # keyed by its own name and its ``regions`` by the source region. A
+        # patch takes its source region's level, else its surface's.
+        for name, entry in (d.get('geometry') or {}).items():
+            renames = (entry.get('regions') or {}) \
+                if isinstance(entry, dict) else {}
+            surface = surfaces.get(name) or {}
+            for region, sub in renames.items():
+                patch = sub.get('name') if isinstance(sub, dict) else None
+                level = top(((surface.get('regions') or {}).get(region)))
+                if level is None:
+                    level = top(surface)
+                if patch and level is not None:
+                    levels[str(patch)] = level
+        patterns = dict(getattr(self, '_layer_pattern_patches', {}) or {})
+        deep = []
+        for key, values in layers.items():
+            if 'firstLayerThickness' not in values:
+                continue
+            first = float(values['firstLayerThickness'])
+            ratio = float(values['expansionRatio'])
+            stack = sum(first * ratio ** i
+                        for i in range(int(values['nSurfaceLayers'])))
+            for name in patterns.get(key, (key,)):
+                level = levels.get(str(name))
+                if level is None:
+                    continue
+                cell = base / 2 ** level
+                if stack > cell:
+                    deep.append((str(name), stack, cell))
+        if not deep:
+            return
+        names = ', '.join(name for name, _stack, _cell in deep)
+        _name, stack, cell = deep[0]
+        self.warn(
+            'layers.first_layer_stack_thicker_than_cell',
+            f'the layer stack is {stack:.4g} m deep and the cell it grows '
+            f'into is {cell:.4g} m on {names}; snappyHexMesh grows layers '
+            f'inside the wall cell, so it may grow fewer layers there or '
+            f'none; lower the first layer height, the expansion ratio or the '
+            f'number of layers, or refine the surface',
+            field_id='meshing.layers.first_layer_height',
+            requested=round(stack, 12), applied=round(cell, 12))
 
     @staticmethod
     def _expansion_from_first_total(
@@ -4545,6 +4995,57 @@ class CaseBuilder:
                 wanted[key] = mode
         return wanted
 
+    def _cell_limits(self) -> tuple[int, int]:
+        """``(maxLocalCells, maxGlobalCells)`` as written for this run.
+
+        Plan 50 IP3 (DP-6231): no fixed cell cap. The schema default of
+        ``castellation/maxGlobalCells`` is :data:`SAFE_MAX_CELLS`
+        (2,000,000,000), and that stored value means "from memory": the
+        writer replaces it with the cells the free memory holds by the RAM
+        gate's own reading and per-cell figure
+        (``resource_budget.mesher_cell_capacity('snappy')``), or writes
+        2,000,000,000 itself when the machine gives no memory figure. Any
+        other stored value is the user's and is written as typed. A
+        configuration does not record who wrote a value (the schema default
+        is written into it, and sizing proposals use the same paths), so the
+        default is the one value that cannot be told from a typed one; it is
+        the 32-bit-label ceiling, so reading it as "from memory" never lowers
+        what the user asked for below a count OpenFOAM could hold.
+
+        ``maxLocalCells`` keeps its 10,000,000 default: in OpenFOAM
+        Foundation 13 it only decides when a parallel run rebalances,
+        ``snappyRefineDriver.C:148``
+        ``(mesh.nCells() >= refineParams.maxLocalCells()),`` inside the
+        ``returnReduce(..., orOp<bool>())`` that calls
+        ``meshRefiner_.balanceAndRefine``; it never stops refinement. When a
+        memory-derived global limit falls to or below it, it is written as
+        half the global one, so a parallel run keeps local below global.
+        """
+        from foammesh.support.resource_budget import (
+            SAFE_MAX_CELLS, mesher_cell_capacity)
+
+        local = self._int('castellation/maxLocalCells', 10000000)
+        stored = self._int('castellation/maxGlobalCells', SAFE_MAX_CELLS)
+        if stored != SAFE_MAX_CELLS:
+            self.cell_limit_source = 'user'
+            return local, stored
+        # Read once per builder: free memory moves between two reads, and a
+        # case whose dictionary is written twice (or read back for the run's
+        # report) must say one limit, not two a few hundred cells apart.
+        if not hasattr(self, '_memory_cell_capacity'):
+            self._memory_cell_capacity = mesher_cell_capacity('snappy')
+        capacity = self._memory_cell_capacity
+        if capacity is None:
+            self.cell_limit_source = 'safe_maximum'
+            total = SAFE_MAX_CELLS
+        else:
+            self.cell_limit_source = (
+                'safe_maximum' if capacity >= SAFE_MAX_CELLS else 'memory')
+            total = max(2, capacity)
+        if local >= total:
+            local = max(1, total // 2)
+        return local, total
+
     def _warn_local_cells_above_global(self, castellated: dict) -> None:
         """DP-585 (field audit 0924 snappy-front D12).
 
@@ -4650,9 +5151,10 @@ class CaseBuilder:
                 'the legacy castellatedBufferLayer snap mode is not available '
                 'in OpenFOAM Foundation 13; use boundary layers or disable the '
                 'Snap buffer-layer control')
+        local_cells, global_cells = self._cell_limits()
         castellated = {
-            'maxLocalCells': self._int('castellation/maxLocalCells', 10000000),
-            'maxGlobalCells': self._int('castellation/maxGlobalCells', 100000000),
+            'maxLocalCells': local_cells,
+            'maxGlobalCells': global_cells,
             'minRefinementCells': self._int('castellation/minRefinementCells', 0),
             'maxLoadUnbalance': self._v('castellation/maxLoadUnbalance', 0.5),
             'nCellsBetweenLevels':
@@ -4801,27 +5303,27 @@ class CaseBuilder:
             'firstLayerThickness': default_first,
             'expansionRatio': default_ratio,
             'minThickness': default_minimum,
-            'featureAngle': self._v('addLayers/featureAngle', '60'),
-            'slipFeatureAngle': self._v('addLayers/slipFeatureAngle', '30'),
-            'nGrow': self._v('addLayers/nGrow', '0'),
-            'nRelaxIter': self._v('addLayers/nRelaxIter', '10'),
+            'featureAngle': self._required('addLayers/featureAngle'),
+            'slipFeatureAngle': self._required('addLayers/slipFeatureAngle'),
+            'nGrow': self._required('addLayers/nGrow'),
+            'nRelaxIter': self._required('addLayers/nRelaxIter'),
             'maxFaceThicknessRatio':
-                self._v('addLayers/maxFaceThicknessRatio', '0.5'),
+                self._required('addLayers/maxFaceThicknessRatio'),
             'nSmoothSurfaceNormals':
-                self._v('addLayers/nSmoothSurfaceNormals', '1'),
-            'nSmoothThickness': self._v('addLayers/nSmoothThickness', '10'),
+                self._required('addLayers/nSmoothSurfaceNormals'),
+            'nSmoothThickness': self._required('addLayers/nSmoothThickness'),
             # F-18. Both the schema path and the written key are OpenFOAM 13's
             # own spelling now; the misspelt path is renamed on load by
             # ``migrateDocument``, so there is nothing left to fall back to.
-            'minMedialAxisAngle': self._v('addLayers/minMedialAxisAngle', '90'),
+            'minMedialAxisAngle': self._required('addLayers/minMedialAxisAngle'),
             'maxThicknessToMedialRatio':
-                self._v('addLayers/maxThicknessToMedialRatio', '0.3'),
-            'nSmoothNormals': self._v('addLayers/nSmoothNormals', '3'),
+                self._required('addLayers/maxThicknessToMedialRatio'),
+            'nSmoothNormals': self._required('addLayers/nSmoothNormals'),
             'nBufferCellsNoExtrude':
-                self._v('addLayers/nBufferCellsNoExtrude', '0'),
-            'nLayerIter': self._v('addLayers/nLayerIter', '50'),
-            'nRelaxedIter': self._v('addLayers/nRelaxedIter', '20'),
-            'meshShrinker': self._v('addLayers/meshShrinker', 'displacementMedialAxis'),
+                self._required('addLayers/nBufferCellsNoExtrude'),
+            'nLayerIter': self._required('addLayers/nLayerIter'),
+            'nRelaxedIter': self._required('addLayers/nRelaxedIter'),
+            'meshShrinker': self._required('addLayers/meshShrinker'),
         }
         # Plan 37 UF15: concaveAngle and mergeFaces join the optional keys,
         # so a case that never set them writes the block it always wrote.
@@ -4844,6 +5346,8 @@ class CaseBuilder:
             'mergeTolerance': self._v('meshQuality/mergeTolerance', '1e-6'),
         }
         self._refine_coarse_farfield(d)
+        if layers:
+            self._warn_first_layer_stack(d)
         # C31-11. ``snappyHexMesh.C:715`` reads ``keepPatches`` off the top
         # level; with it on, a patch that ended the run with no faces survives
         # into ``constant/polyMesh/boundary`` instead of being deleted at
@@ -4981,7 +5485,12 @@ class CaseBuilder:
         return tuple(names)
 
     def control_dict(self) -> str:
-        """Minimal utility case control required by all OpenFOAM executables."""
+        """Minimal utility case control required by all OpenFOAM executables.
+
+        Plan 50 IP15 (DP-6420). The write format and precision come from the
+        one setting in :mod:`foammesh.openfoam.working_format`.
+        """
+        from foammesh.openfoam.working_format import control_entries
         return format_dictionary_file('controlDict', {
             'application': 'snappyHexMesh',
             'startFrom': 'startTime',
@@ -4992,9 +5501,7 @@ class CaseBuilder:
             'writeControl': 'timeStep',
             'writeInterval': 1,
             'purgeWrite': 0,
-            'writeFormat': 'ascii',
-            'writePrecision': 8,
-            'writeCompression': 'off',
+            **control_entries(),
             'timeFormat': 'general',
             'timePrecision': 6,
             'runTimeModifiable': True,

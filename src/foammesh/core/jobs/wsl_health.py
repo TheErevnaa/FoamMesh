@@ -20,8 +20,11 @@ Two signals feed it, so the time to notice a lost runtime is bounded:
   transport, every ``IDLE_PROBE_SECONDS`` while no job runs, and on the next
   user action once the last probe is that old.
 
-Every ``wsl.exe`` call here runs in ``asyncio.to_thread`` with a timeout; the
-GUI reads :attr:`WslHealthMonitor.state` and never waits on the runtime.
+Every ``wsl.exe`` call here runs on the WSL executor
+(``support.wsl_executor.run_wsl``, Plan 50 IP22 DP-6403: its own few workers,
+never the loop's default executor) with a timeout, and the reads after a
+timeout's kill are bounded (DP-6404); the GUI reads
+:attr:`WslHealthMonitor.state` and never waits on the runtime.
 """
 from __future__ import annotations
 
@@ -32,6 +35,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Callable
+
+from foammesh.support.wsl_executor import run_bounded, run_wsl
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,12 @@ LAUNCH_GRACE_SECONDS = 60.0
 #: The idle cadence, and how old the last probe must be for a user action to
 #: trigger another one.
 IDLE_PROBE_SECONDS = 60.0
+#: Plan 50 IP19 (DP-6362). A cadence task that ended while the hub is enabled
+#: is started again after this pause (a pause, so a probe that fails at once
+#: cannot spin). One still pending but with no probe for STALL_FACTOR idle
+#: periods while no job runs has lost a step and is replaced.
+IDLE_RESTART_SECONDS = 5.0
+STALL_FACTOR = 3
 #: A run skips its pre-run probe when the runtime answered this recently.
 FRESH_SECONDS = 10.0
 #: The silent-transport verdict is due this much before the 15 s bound, so
@@ -61,6 +72,15 @@ FRESH_SECONDS = 10.0
 DEADLINE_MARGIN_SECONDS = 0.25
 #: ``wsl --terminate`` / ``wsl --shutdown`` may take a while; never forever.
 RESTART_TIMEOUT_SECONDS = 60.0
+#: DP-6463. WSL stops a distribution nothing is using, and starting it again
+#: on a busy machine takes longer than one probe: MEASURED live, two 5 s
+#: probes 49 s apart got no answer and the run was refused, and the same
+#: command answered in 0.2 s moments later. When someone is waiting for the
+#: answer (a run, Retry connection), "not reachable" is said only after one
+#: probe that waits this long: what the job wrapper already allows a start.
+START_WAIT_SECONDS = LAUNCH_GRACE_SECONDS
+#: The causes someone is waiting behind.
+WAITED_FOR = ('run', 'reconnect')
 
 
 @dataclass(frozen=True)
@@ -91,13 +111,14 @@ def _hidden():
 def wsl_call(argv, timeout: float) -> ProbeResult:
     """Run one ``wsl.exe`` command to completion or *timeout*. Blocking.
 
-    Only ever called through ``asyncio.to_thread`` (the tests assert it).
+    Only ever called on the WSL executor (the tests assert it). DP-6404:
+    after a timeout the child is killed and its pipes are read for at most
+    ``wsl_executor.READ_GRACE_SECONDS``, so a relay that keeps them open
+    cannot hold the worker.
     """
     started = time.monotonic()
     try:
-        completed = subprocess.run(
-            list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=timeout, check=False, **_hidden())
+        completed = run_bounded(argv, timeout=timeout, **_hidden())
     except subprocess.TimeoutExpired:
         return ProbeResult(False, time.monotonic() - started, True,
                            f'no answer within {timeout:g} s')
@@ -129,6 +150,10 @@ class WslHealthMonitor:
         #: Scaled down by the tests; the plan's numbers otherwise.
         self.silence_seconds = SILENCE_SECONDS
         self.launch_grace_seconds = LAUNCH_GRACE_SECONDS
+        self.start_wait_seconds = START_WAIT_SECONDS
+        #: DP-6463. True while the long probe is out: the banner says so.
+        self.waiting_for_start = False
+        self._waiting: asyncio.Future | None = None
         self.state = UNKNOWN
         self.reason = ''
         self.changed_at = self._clock()
@@ -173,7 +198,9 @@ class WslHealthMonitor:
                 'reason': self.reason, 'changed_at': self.changed_at,
                 'last_probe_at': self.last_probe_at,
                 'last_alive_at': self.last_alive_at,
-                'jobs_running': self.jobs_running}
+                'jobs_running': self.jobs_running,
+                'waiting_for_start': self.waiting_for_start,
+                'start_wait_seconds': self.start_wait_seconds}
 
     @property
     def reachable(self) -> bool:
@@ -202,7 +229,8 @@ class WslHealthMonitor:
                 try:
                     outcome = callback(self)
                     if inspect.isawaitable(outcome):
-                        asyncio.ensure_future(outcome)
+                        from foammesh.support.tasks import spawn
+                        spawn(outcome, what='WSL recovery')
                 except Exception:  # noqa: BLE001
                     logger.exception('WSL recovery callback failed')
 
@@ -210,7 +238,7 @@ class WslHealthMonitor:
 
     async def _probe_once(self) -> ProbeResult:
         argv = probe_argv(self.executable, self.distribution)
-        return await asyncio.to_thread(self._call, argv, self.probe_timeout)
+        return await run_wsl(self._call, argv, self.probe_timeout)
 
     def _shared_task(self):
         # Concurrent askers share one wsl.exe process.
@@ -231,6 +259,11 @@ class WslHealthMonitor:
 
         *within* bounds the wait: past it the probe counts as timed out even
         if ``wsl.exe`` has not been reaped yet, so a deadline is a deadline.
+
+        DP-6463. For a cause someone waits behind (``run``, ``reconnect``), a
+        probe that got no answer and would make the runtime ``unreachable``
+        is followed by one that waits ``start_wait_seconds``; that answer
+        decides.
         """
         task = self._shared_task()
         try:
@@ -250,8 +283,40 @@ class WslHealthMonitor:
                                  f'no answer within {self.probe_timeout:g} s')
         except Exception as error:  # noqa: BLE001 - a probe never raises out
             result = ProbeResult(False, 0.0, False, f'the probe failed: {error}')
+        if self._worth_waiting(result, cause):
+            result = await self._wait_for_start()
+        elif (self.waiting_for_start and not result.ok
+              and cause not in WAITED_FOR and cause != 'transport'):
+            # The long probe is out and will decide; a background probe
+            # that got no answer meanwhile says nothing new.
+            return self.state
         self.apply(result, cause)
         return self.state
+
+    def _worth_waiting(self, result: ProbeResult, cause: str) -> bool:
+        """No answer, someone waiting, and the next word would be unreachable."""
+        if result.ok or not result.timed_out or cause not in WAITED_FOR:
+            return False
+        return (cause == 'reconnect' or self._timeouts >= 1
+                or self.state in (UNREACHABLE, RECOVERING))
+
+    async def _wait_for_start(self) -> ProbeResult:
+        """One probe with the start allowance; askers share it."""
+        if self._waiting is None or self._waiting.done():
+            self._waiting = asyncio.ensure_future(run_wsl(
+                self._call, probe_argv(self.executable, self.distribution),
+                self.start_wait_seconds))
+        self.waiting_for_start = True
+        self._set(RECOVERING, 'the runtime is slow to answer and may be '
+                              f'starting; waiting up to '
+                              f'{self.start_wait_seconds:g} s for it')
+        try:
+            return await asyncio.shield(self._waiting)
+        except Exception as error:  # noqa: BLE001 - a probe never raises out
+            return ProbeResult(False, 0.0, False, f'the probe failed: {error}')
+        finally:
+            if self._waiting is None or self._waiting.done():
+                self.waiting_for_start = False
 
     def apply(self, result: ProbeResult, cause: str = 'idle') -> str:
         """Fold one probe answer into the state (pure: tested with fakes)."""
@@ -356,7 +421,7 @@ class WslHealthMonitor:
         banner says so before the user chooses it.
         """
         self._set(RECOVERING, f'restarting {self.distribution}')
-        result = await asyncio.to_thread(
+        result = await run_wsl(
             self._call, [self.executable, '--terminate', self.distribution],
             RESTART_TIMEOUT_SECONDS)
         if not result.ok:
@@ -366,7 +431,7 @@ class WslHealthMonitor:
     async def shutdown_all(self) -> str:
         """``wsl --shutdown``: every distribution stops. Diagnostics dialog only."""
         self._set(RECOVERING, 'shutting WSL down')
-        result = await asyncio.to_thread(
+        result = await run_wsl(
             self._call, [self.executable, '--shutdown'], RESTART_TIMEOUT_SECONDS)
         if not result.ok:
             logger.warning('wsl --shutdown: %s', result.detail)
@@ -470,7 +535,52 @@ class WslHealth:
                 await monitor.probe('start')
                 await monitor.run_idle()
             self._idle_task = loop.create_task(cadence())
+            self._idle_task.add_done_callback(self._cadenceEnded)
         return self._idle_task
+
+    def _cadenceEnded(self, task: asyncio.Task) -> None:
+        """Plan 50 IP19 (DP-6362): a cadence lost while enabled comes back."""
+        if task is not self._idle_task or not self.enabled:
+            return              # stopped, reconfigured or already replaced
+        error = None if task.cancelled() else task.exception()
+        if error is not None:
+            logger.error('The WSL health poll stopped: %s', error,
+                         exc_info=(type(error), error, error.__traceback__))
+        else:
+            logger.warning('The WSL health poll ended unexpectedly; '
+                           'starting it again')
+        self._idle_task = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.call_later(IDLE_RESTART_SECONDS, self._restartCadence)
+
+    def _restartCadence(self) -> None:
+        if self.enabled and (self._idle_task is None or self._idle_task.done()):
+            self.start()
+
+    def ensure_alive(self) -> bool:
+        """Replace a cadence that is pending but no longer probing.
+
+        True when it was replaced. A step asyncio dropped leaves the task
+        waiting forever with no exception to see; the sign is that no probe
+        landed for ``STALL_FACTOR`` idle periods while no job was running.
+        """
+        task = self._idle_task
+        monitor = self.current
+        if not self.enabled or task is None or task.done() or monitor is None:
+            return False
+        probing = monitor._probing
+        if monitor.jobs_running or (probing is not None and not probing.done()):
+            return False
+        if monitor._age(monitor.last_probe_at) < IDLE_PROBE_SECONDS * (1 + STALL_FACTOR):
+            return False
+        logger.warning('The WSL health poll stopped probing; starting it again')
+        self._idle_task = None
+        task.cancel()
+        self.start()
+        return True
 
     def stop(self) -> None:
         self.enabled = False
@@ -484,6 +594,7 @@ class WslHealth:
 
         Never awaited by the caller; returns the scheduled task, if any.
         """
+        self.ensure_alive()     # Plan 50 IP19: the poll may have been lost
         monitor = self.current
         if not self.enabled or monitor is None or not monitor.probe_due():
             return None

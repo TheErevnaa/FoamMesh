@@ -286,6 +286,9 @@ class Console(QWidget):
         close.clicked.connect(self.hideSearch)
         for widget in (self._searchEdit, self._searchCount, previous, following, close):
             row.addWidget(widget)
+        #: The bar's three buttons, for `pressSearchButton` (Plan 48 AG).
+        self._searchButtons = {'previous': previous, 'next': following,
+                               'close': close}
         row.setStretch(0, 1)
         escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self._searchBar)
         escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -558,6 +561,48 @@ class Console(QWidget):
     def currentMatch(self):
         cursor = self._view.textCursor()
         return cursor.selectedText() if cursor.hasSelection() else ''
+
+    # ------------------------------------------- the controls, pressed (AG)
+    def chooseLevel(self, level):
+        """Choose ``level`` in the level box, as the reader does."""
+        index = self._levelBox.findData(int(level))
+        if index < 0:
+            raise ValueError(f'{level} is not a level of the console')
+        self._levelBox.setCurrentIndex(index)
+
+    def pressFold(self, folded):
+        """Set the *Fold stages* button, as a click does."""
+        if self._foldButton.isChecked() != bool(folded):
+            self._foldButton.setChecked(bool(folded))
+
+    def pressFind(self):
+        """The *Find* button: open the search bar."""
+        self._findButton.click()
+
+    def typeSearch(self, text):
+        """Type ``text`` into the search box (its ``textChanged`` searches)."""
+        self._searchEdit.setText(str(text))
+
+    def pressSearchButton(self, name):
+        """Press the search bar's ``previous``, ``next`` or ``close``."""
+        button = self._searchButtons.get(str(name))
+        if button is None:
+            raise ValueError(f'{name} is not a button of the search bar')
+        button.click()
+
+    def readout(self):
+        """What the console's controls show now."""
+        self.flush()
+        return {
+            'level': self._levelBox.currentData(),
+            'level_text': self._levelBox.currentText(),
+            'folded': self._foldButton.isChecked(),
+            'search_open': not self._searchBar.isHidden(),
+            'search_text': self._searchEdit.text(),
+            'search_count': self._searchCount.text(),
+            'current_match': self.currentMatch(),
+            'visible_lines': self.visibleLineCount(),
+        }
 
     # ---------------------------------------------------------------- links
     def setNameResolver(self, resolver):

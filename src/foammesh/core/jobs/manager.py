@@ -868,7 +868,11 @@ class JobManager:
                         if kind == 'control':
                             if log_file:
                                 log_file.write(decoded)
-                            self._on_control(records, job_id, transport)
+                            # DP-6481. The run record is fsynced; MEASURED
+                            # live 7.2 s on the GUI thread. Awaited, so the
+                            # next line is read after it, as before.
+                            await asyncio.to_thread(
+                                self._on_control, records, job_id, transport)
                         continue
                     if transport.idle_announced:
                         self._clear_idle(job_id, transport, 'resumed')
@@ -1024,8 +1028,9 @@ class JobManager:
                 confirmed = (acknowledged if wrapped else True) or (
                     returncode == 0 and transport_state == 'ok')
                 run_state = 'exited' if confirmed else 'recovery_pending'
-                self._record(
-                    records, job_id, run_state,
+                # DP-6481. Fsynced: off the loop, awaited in place.
+                await asyncio.to_thread(
+                    self._record, records, job_id, run_state,
                     outcome='ok' if status is JobStatus.DONE else 'failed',
                     rc=returncode, linux_rc=transport.exit_rc,
                     peak_memory=peak_memory,

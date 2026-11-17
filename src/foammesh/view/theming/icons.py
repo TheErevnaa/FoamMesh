@@ -19,12 +19,10 @@ _ICON_CACHE: dict[tuple[str, int, int, float, tuple[str, ...]], QIcon] = {}
 def clear_icon_cache() -> None:
     _PIXMAP_CACHE.clear()
     _ICON_CACHE.clear()
+    _TINT_CACHE.clear()
 
 
 def load_themed_icon(path: str, size: QSize = QSize(256, 256)) -> QIcon:
-    data = _read_all(path)
-    if data is None or b'<svg' not in data:
-        return QIcon(path)
     palette = QGuiApplication.palette()
     colors = (
         palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText).name(),
@@ -37,6 +35,11 @@ def load_themed_icon(path: str, size: QSize = QSize(256, 256)) -> QIcon:
     key = (path, size.width(), size.height(), dpr, colors)
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
+    # DP-6508. Read after the cache is asked: every field's reset button read
+    # its SVG again (MEASURED in the live hold stacks).
+    data = _read_all(path)
+    if data is None or b'<svg' not in data:
+        return QIcon(path)
 
     icon = QIcon()
     # Plan 45 V1. Active is the mode a raised tool button draws under the
@@ -108,7 +111,15 @@ _FALLBACK = {'foreground.strong': '#e6e8eb', 'foreground.primary': '#d4d8de',
              'disabled.foreground': '#6b727c', 'overlay.edge': '#202328',
              'selection.background': '#2f5ca8', 'accent.soft': '#22406f',
              'accent.default': '#5b93f0', 'background.raised': '#262a31'}
-_TINTED: 'list[tuple]' = []
+#: The buttons holding a token icon, by ``id(button)``: (ref, path, size,
+#: stroke). DP-6508: a list, rebuilt on every `apply_tinted_icon` to drop the
+#: button's old entry, made building N rows quadratic in every tinted button
+#: the window had ever made (automatic collection is off, DP-6370, so dead
+#: rows' wrappers stay). 500 overlay part rows held the GUI thread ~20 s live.
+_TINTED: 'dict[int, tuple]' = {}
+#: DP-6508. A finished token icon, until the theme changes (cleared with the
+#: pixmaps): every row's eye and isolate glyph re-read and re-tinted its SVG.
+_TINT_CACHE: 'dict[tuple, QIcon]' = {}
 _hooked = False
 
 
@@ -147,6 +158,15 @@ def tinted_icon(path: str, size: QSize = QSize(16, 16),
     is black on a dark ground. Off, On, hover and disabled are all supplied.
     *min_stroke_px* widens any stroke thinner than that on screen.
     """
+    screen = QGuiApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    key = (path, size.width(), size.height(), dpr, float(min_stroke_px),
+           theme_colour('overlay.edge'), theme_colour('accent.soft'),
+           theme_colour(_NORMAL_TOKEN), theme_colour(_CHECKED_TOKEN),
+           theme_colour(_DISABLED_TOKEN))
+    cached = _TINT_CACHE.get(key)
+    if cached is not None:
+        return QIcon(cached)
     data = _read_all(path)
     if data is None or b'<svg' not in data:
         return QIcon(path)
@@ -155,8 +175,6 @@ def tinted_icon(path: str, size: QSize = QSize(16, 16),
         data = _thicken(data.decode('utf-8'), size, min_stroke_px).encode(
             'utf-8')
         tag = '|s%g' % min_stroke_px
-    screen = QGuiApplication.primaryScreen()
-    dpr = screen.devicePixelRatio() if screen is not None else 1.0
     icon = QIcon()
     off_ground = theme_colour('overlay.edge')
     on_ground = theme_colour('accent.soft')
@@ -176,7 +194,8 @@ def tinted_icon(path: str, size: QSize = QSize(16, 16),
         text = re.sub(r'#fff(?:fff)?\b', ground, text, flags=re.I)
         icon.addPixmap(_render(text.encode('utf-8'), path + '|' + ground + tag,
                                size, dpr, mode, state, colour), mode, state)
-    return icon
+    _TINT_CACHE[key] = icon
+    return QIcon(icon)
 
 
 def apply_tinted_icon(button, path: str, size: QSize = QSize(16, 16),
@@ -185,17 +204,25 @@ def apply_tinted_icon(button, path: str, size: QSize = QSize(16, 16),
     theme (the icon is drawn again whenever the theme changes)."""
     button.setIconSize(size)
     button.setIcon(tinted_icon(path, size, min_stroke_px))
-    _TINTED[:] = [r for r in _TINTED if r[0]() is not None
-                  and r[0]() is not button]
-    _TINTED.append((weakref.ref(button), path, QSize(size), min_stroke_px))
+    key = id(button)
+
+    def forget(ref, key=key):
+        # DP-6407. Rows were dropped only when the theme changed, so every
+        # closed page's buttons left one (~11 a round in the live soak).
+        row = _TINTED.get(key)
+        if row is not None and row[0] is ref:
+            del _TINTED[key]
+
+    _TINTED[key] = (weakref.ref(button, forget), path, QSize(size),
+                    min_stroke_px)
     _hook_theme()
 
 
 def retint_icons() -> int:
     """Draw every token icon again from the current tokens."""
     clear_icon_cache()
-    live = []
-    for ref, path, size, stroke in _TINTED:
+    live = {}
+    for key, (ref, path, size, stroke) in list(_TINTED.items()):
         button = ref()
         if button is None:
             continue
@@ -203,8 +230,9 @@ def retint_icons() -> int:
             button.setIcon(tinted_icon(path, size, stroke))
         except RuntimeError:                 # the C++ button is already gone
             continue
-        live.append((ref, path, size, stroke))
-    _TINTED[:] = live
+        live[key] = (ref, path, size, stroke)
+    _TINTED.clear()
+    _TINTED.update(live)
     return len(live)
 
 

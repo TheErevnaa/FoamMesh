@@ -216,7 +216,8 @@ class SeedClassifier:
         return OUTSIDE
 
 
-def seed_components(surfaces, geometries=None, *, bounding_hex6=None):
+def seed_components(surfaces, geometries=None, *, bounding_hex6=None,
+                    relations=None):
     """The closed parts a seed is judged against, with a cache key.
 
     Plan 36 RP5. The one surface choice shared by the viewport's classifier
@@ -229,6 +230,13 @@ def seed_components(surfaces, geometries=None, *, bounding_hex6=None):
     an imported file counts as one part. Left out: the bounding box (its
     inside is the whole domain, not the fluid), open planes, disks and plates,
     and refinement-only surfaces unless nothing else is left.
+
+    DP-6110. *relations* are the ``surfaceRelations`` rows. A conformal
+    interface is one surface both its regions are bounded by, but its tree
+    row hangs off one volume only: MEASURED live on the CHT tubes, the
+    ``pipe_solid`` group held just its two end annuli, never closed, and its
+    seed -- inside the pipe wall -- was called "outside the geometry". A
+    shared surface is now a member of both regions' groups.
 
     Returns ``(components, key)``: one polydata per part, in group order, and
     a tuple that changes whenever a chosen surface is added, removed or
@@ -247,6 +255,7 @@ def seed_components(surfaces, geometries=None, *, bounding_hex6=None):
         except (KeyError, LookupError, TypeError, AttributeError):
             return None
 
+    shared = _shared_regions(relations, value)
     groups, refinement = {}, {}
     for gId, data in surfaces.items():
         if data is None or data.GetNumberOfCells() <= 0:
@@ -261,10 +270,20 @@ def seed_components(surfaces, geometries=None, *, bounding_hex6=None):
             continue
         group = str(parentId) if parentId is not None else str(gId)
         none = CFDType.NONE.value
-        target = (refinement if none in (value(geometry, 'cfdType'),
-                                          value(parent, 'cfdType'))
+        # DP-6110. A volume typed None is how every imported body starts,
+        # not a refinement shape: only a modelled primitive (box, cylinder,
+        # sphere) typed None is one. Reading the parent's type for an
+        # imported body dropped the whole of ``pipe_solid`` from the CHT
+        # tubes as soon as the cut made its neighbours cell zones.
+        primitive = value(parent, 'shape') not in (
+            None, Shape.TRI_SURFACE_MESH.value)
+        target = (refinement if value(geometry, 'cfdType') == none
+                  or (primitive and value(parent, 'cfdType') == none)
                   else groups)
         target.setdefault(group, []).append((str(gId), data))
+        for other in shared.get(str(gId), ()):
+            if other != group and other in geometries:
+                target.setdefault(other, []).append((str(gId), data))
     chosen = groups or refinement
     key = tuple(sorted(
         (group, gId, id(data), int(data.GetMTime()))
@@ -282,3 +301,26 @@ def seed_components(surfaces, geometries=None, *, bounding_hex6=None):
         append.Update()
         components.append(append.GetOutput())
     return components, key
+
+
+def _shared_regions(relations, value) -> dict:
+    """Surface key -> the volume keys a shared interface surface bounds."""
+    from foammesh.db.surface_intent import region_key
+
+    rows = relations.values() if isinstance(relations, dict) else (
+        relations or ())
+    shared: dict = {}
+    for row in rows:
+        read = (row.get if isinstance(row, dict)
+                else lambda key, row=row: value(row, key))
+        flag = read('sharedSurface')
+        if not (flag is True or str(flag).strip().lower() in ('true', '1')):
+            continue
+        surface = read('ownerSurface')
+        if surface is None:
+            continue
+        for side in ('ownerRegion', 'neighbourRegion'):
+            volume = region_key(read(side))
+            if volume is not None:
+                shared.setdefault(str(surface), set()).add(str(volume))
+    return shared

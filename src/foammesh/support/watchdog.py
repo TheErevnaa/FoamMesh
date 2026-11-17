@@ -39,6 +39,14 @@ also fired while the GUI thread was busy *in Python*, and its walk of a
 changing frame chain crashed the process in python311.dll about half the
 time (CR8's K8f child).
 
+Plan 50 IP8 (DP-6405): ``watchdog.log`` rotates by size. Past
+:data:`LOG_MAX_BYTES` it rolls over into ``watchdog.log.1`` .. ``.N``
+(:data:`LOG_KEEP` kept). Only the monitor thread touches the file -- it
+writes every line, rotates, and re-arms faulthandler on the new file -- and
+the GUI thread hands it lines through a lock-free queue, so no lock is shared
+with the GUI thread: a monitor stuck writing while the GUI thread is stalled
+never makes the GUI thread wait, and a rotation never races a write.
+
 Deviation from the plan's wording, deliberately: the stall *report* comes from
 the tick that ends the stall, not from a separate Python thread. A Python
 thread cannot run while the GUI thread holds the GIL -- the case that matters
@@ -47,6 +55,7 @@ that need no GIL (faulthandler's, and the helper process).
 """
 from __future__ import annotations
 
+import collections
 import datetime
 import faulthandler
 import logging
@@ -69,6 +78,14 @@ STALL_SECONDS = 2.0
 HELPER_CHECK_TICKS = 40
 MONITOR_SECONDS = 0.1
 MAX_FRAMES = 100
+#: DP-6405. ``watchdog.log`` rolls over past this size ...
+LOG_MAX_BYTES = 2 * 1024 * 1024
+#: ... and this many old files are kept (``watchdog.log.1`` is the newest).
+LOG_KEEP = 3
+#: A rotation the OS refused (the file open elsewhere) is retried after this.
+ROTATE_RETRY_SECONDS = 60.0
+#: DP-6407. The stalls kept in memory (newest last); the log keeps them all.
+STALLS_KEPT = 200
 
 
 def _now() -> str:
@@ -146,7 +163,10 @@ class Watchdog(QObject):
         self._file = None
         self._last = None
         self._ticks = 0
-        self._lock = threading.Lock()
+        #: DP-6405. Lines for the monitor thread to write; ``deque.append``
+        #: and ``popleft`` are atomic, so the GUI thread takes no lock.
+        self._pending: collections.deque = collections.deque()
+        self._rotate_retry_at = 0.0
         self._gui_ident: int | None = None
         self._beat_at: float | None = None     # real monotonic, for the monitor
         self._dumped_for: float | None = None  # the beat whose stall has stacks
@@ -167,7 +187,8 @@ class Watchdog(QObject):
         if self._file is None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             # Kept open: faulthandler writes to the descriptor from its own
-            # thread and cannot open a file.
+            # thread and cannot open a file. Only the monitor thread writes
+            # to it, rotates it and re-arms faulthandler on it (DP-6405).
             self._file = open(self.log_path, 'a', encoding='utf-8')
             self._write(f'--- watchdog for pid={os.getpid()} started {_now()} '
                         f'(stacks after {self._stall_seconds:.1f} s) ---')
@@ -193,6 +214,8 @@ class Watchdog(QObject):
             faulthandler.cancel_dump_traceback_later()
         except Exception:                                  # noqa: BLE001
             pass
+        if monitor is None or not monitor.is_alive():
+            self._drain()           # the monitor has ended: nothing races it
         if self._file is not None:
             try:
                 self._file.close()
@@ -201,32 +224,100 @@ class Watchdog(QObject):
             self._file = None
 
     def _write(self, text: str) -> None:
-        with self._lock:
-            if self._file is None:
+        """Queue ``text`` for the monitor thread. Any thread; never blocks."""
+        if self._file is None:
+            return
+        self._pending.append(text)
+
+    def _drain(self) -> None:
+        """Write the queued lines, rotating by size. Monitor thread only
+        (or :meth:`stop`, once the monitor has ended)."""
+        wrote = False
+        while self._pending:
+            handle = self._file
+            if handle is None:
+                self._pending.clear()
                 return
+            text = self._pending.popleft() + '\n'
             try:
-                self._file.write(text + '\n')
+                if (handle.tell() > 0
+                        and handle.tell() + len(text) > LOG_MAX_BYTES
+                        and time.monotonic() >= self._rotate_retry_at):
+                    self._rotate()
+                    handle = self._file
+                    if handle is None:
+                        return
+                handle.write(text)
+                wrote = True
+            except (OSError, ValueError):
+                pass
+        if wrote and self._file is not None:
+            try:
                 self._file.flush()
             except (OSError, ValueError):
                 pass
 
+    def _rotate(self) -> None:
+        """``watchdog.log`` -> ``.1`` -> ... -> ``.LOG_KEEP``; a fresh log.
+
+        faulthandler holds the old descriptor, so its timer is cancelled
+        before the file closes and re-armed on the new one. If the rename is
+        refused (another process has the file open), the log is reopened and
+        kept, and the next line tries again."""
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:                                  # noqa: BLE001
+            pass
+        old, self._file = self._file, None
+        try:
+            if old is not None:
+                old.flush()
+                old.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            base = str(self.log_path)
+            oldest = Path(f'{base}.{LOG_KEEP}')
+            if oldest.exists():
+                oldest.unlink()
+            for index in range(LOG_KEEP - 1, 0, -1):
+                source = Path(f'{base}.{index}')
+                if source.exists():
+                    os.replace(source, f'{base}.{index + 1}')
+            if LOG_KEEP > 0:
+                os.replace(self.log_path, f'{base}.1')
+            else:
+                self.log_path.unlink()
+            mode = 'w'
+        except OSError as error:
+            logger.debug('watchdog.log not rotated: %s', error)
+            self._rotate_retry_at = time.monotonic() + ROTATE_RETRY_SECONDS
+            mode = 'a'
+        try:
+            self._file = open(self.log_path, mode, encoding='utf-8')
+        except OSError:
+            self._file = None
+            return
+        self._arm()
+
     def _arm(self) -> None:
         """Re-arm the GIL-less dump; only the monitor thread calls this."""
-        with self._lock:
-            if self._file is None:
-                return
-            try:
-                faulthandler.dump_traceback_later(
-                    self._stall_seconds, repeat=False, file=self._file,
-                    exit=False)
-            except (OSError, ValueError, RuntimeError):
-                pass
+        if self._file is None:
+            return
+        try:
+            faulthandler.dump_traceback_later(
+                self._stall_seconds, repeat=False, file=self._file,
+                exit=False)
+        except (OSError, ValueError, RuntimeError):
+            pass
 
     def _run_monitor(self) -> None:
         own = threading.get_ident()
         armed_at = time.monotonic()
+        self._drain()
         self._arm()
         while not self._monitor_stop.wait(MONITOR_SECONDS):
+            self._drain()
             now = time.monotonic()
             beat = self._beat_at
             if now - armed_at >= self._stall_seconds:
@@ -251,6 +342,7 @@ class Watchdog(QObject):
                 text = (f'{_timeout_header(self._stall_seconds)}\n'
                         f'(the stacks could not be read: {error!r})')
             self._write(text)
+            self._drain()
             self.python_dumps += 1
 
     @staticmethod
@@ -284,6 +376,7 @@ class Watchdog(QObject):
         else:
             operation = self._last_op()
         self.stalls.append((seconds, operation))
+        del self.stalls[:-STALLS_KEPT]
         self._write(f'[{_now()}] the GUI thread was unresponsive for '
                     f'{seconds:.1f} s; last operation: {operation or "none"}')
         logger.warning('The GUI thread was unresponsive for %.1f s (last '

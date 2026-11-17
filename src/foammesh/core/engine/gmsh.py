@@ -417,6 +417,7 @@ class GmshMeshingEngine:
     #: solid: detection answers from the solids and accepting types them.
     regions_are_solids = True
     publishes_native_mesh_file = True
+    in_process_stages = ('publish',)
 
     def __init__(self, *, profile=None, runtime_probe=None):
         self._profile = profile
@@ -443,10 +444,16 @@ class GmshMeshingEngine:
         # which is also where the run refuses it.
         from foammesh.core.engine.interface_intent import intent_refusal
         from foammesh.core.engine.registry import configured_target_solver
-        from foammesh.core.gmsh.execution import interface_pair_rows
+        from foammesh.core.gmsh.execution import (
+            ExecutionError, interface_pair_rows,
+        )
 
-        refusal = intent_refusal('gmsh', configured_target_solver(db),
-                                 interface_pair_rows(db))
+        try:
+            refusal = intent_refusal('gmsh', configured_target_solver(db),
+                                     interface_pair_rows(db))
+        except ExecutionError as error:
+            # Plan 50 IP23 (DP-6253). Said on the page the run refuses it on.
+            refusal = str(error)
         notes = [text for text in (refusal, self._added_shape_note(db)) if text]
         if notes:
             warnings = {key: list(value) for key, value in warnings.items()}

@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from foammesh.support.simple_db.simple_db import SimpleDB
+from foammesh.support.simple_db.simple_schema import ValidationError
 
 from .configurations_schema import (
     CONFIGURATIONS_VERSION_KEY,
@@ -49,6 +50,38 @@ class ConfigurationVersionError(ValueError):
         super().__init__(message)
 
 
+class ConfigurationReadError(ValidationError):
+    """DP-6475. A project file holds a value this build cannot read.
+
+    The validator's own error names a field path and a clause ("must be a
+    number"), which is not a sentence a person can act on, and ``str()`` of it
+    was the clause alone -- what the local API's open answered. This one is
+    the whole sentence: the case folder, the field path and what is wrong
+    with it. It is still a ``ValidationError`` (and so a ``ValueError``), so
+    every caller that refused one goes on refusing this.
+    """
+
+    def __init__(self, configFile, error: ValidationError):
+        super().__init__(error.type, error.message, error.name, error.path)
+        configFile = Path(configFile)
+        storage = configFile.parent
+        self.casePath = storage.parent if storage.name == 'foammesh' else storage
+        self.configFile = configFile
+        where = (error.path or '').strip('/') or error.name or ''
+        self.fieldPath = where
+        self.sentence = (
+            f'The case in {self.casePath} cannot be opened: its project file '
+            f'({configFile.name}) holds a value FoamMesh cannot read. The value '
+            f'at "{where}" {error.message}. Restore the case from a copy, or '
+            f're-import the geometry into a new case.')
+
+    def toMessage(self):
+        return self.sentence
+
+    def __str__(self):
+        return self.sentence
+
+
 class Configurations(SimpleDB):
     _geometryNextKey = 0
 
@@ -68,11 +101,13 @@ class Configurations(SimpleDB):
         self.loadNotes = []
 
     def create(self, path):
+        self._refuseIfView('create')
         self._path = path / FILE_NAME
         self.createData()
         self._save()
 
     def load(self, path):
+        self._refuseIfView('load')
         self._path = path / FILE_NAME
         data, files, maxIds = readConfigurations(self._path)
         document = yaml.full_load(data)
@@ -89,14 +124,20 @@ class Configurations(SimpleDB):
         # DP-5712. What the migration had to read differently, for the
         # window to print in the Console once the project is open.
         notes = []
-        self._content = self.validateData(
-            migrateDocument(document, notes), fillWithDefault=True)
+        try:
+            content = self.validateData(
+                migrateDocument(document, notes), fillWithDefault=True)
+        except ValidationError as error:
+            # DP-6475. Said in a sentence that names the case and the field.
+            raise ConfigurationReadError(self._path, error) from error
+        self._content = content
         self.loadNotes = notes
         self._files = files
         Configurations._geometryNextKey = maxIds[FileGroup.GEOMETRY_POLY_DATA.value]
         self.savedSeq = readSavedSeq(self._path)
 
     def save(self):
+        self._refuseIfView('save')
         # A change set that left the document as it was still has a seq the
         # file must cover, or it would be offered back after a crash.
         autosave = self._ownAutosave()
@@ -105,10 +146,12 @@ class Configurations(SimpleDB):
             self._save()
 
     def saveAs(self, path):
+        self._refuseIfView('saveAs')
         self._path = path / FILE_NAME
         self._save()
 
     def addGeometryPolyData(self, pd):
+        self._refuseIfView('addGeometryPolyData')
         Configurations._geometryNextKey += 1
         key = f'Geometry{Configurations._geometryNextKey}'
 
@@ -118,6 +161,7 @@ class Configurations(SimpleDB):
         return key
 
     def removeGeometryPolyData(self, key):
+        self._refuseIfView('removeGeometryPolyData')
         # Plan 37 UF20. A primitive's surfaces have no file (``path`` is
         # None); removing one used to store a ``None`` key beside the string
         # ones, and every later sort of the store -- the copy an unlock keeps
@@ -131,6 +175,7 @@ class Configurations(SimpleDB):
         return self._files['geometry'][key]
 
     def updateGeometryPolyData(self, key, pd):
+        self._refuseIfView('updateGeometryPolyData')
         self._files['geometry'][key] = pd
         self._modified = True
 
@@ -150,6 +195,18 @@ class Configurations(SimpleDB):
             working._files.setdefault(group, {}).update(entries)
         return working
 
+    def view(self, path: str = ''):
+        """A read-only look at the document *and* the file store, uncopied.
+
+        Plan 50 IP11 (DP-6341). The store is shared, not merged into a fresh
+        mapping: ``view().geometryPolyData(key)`` answers the very VTK object
+        the database holds, and every store write refuses the way the
+        document writes do (``SimpleDB.view``).
+        """
+        viewed = super().view(path)
+        viewed._files = self._files
+        return viewed
+
     def idReferences(self):
         """The project schema's own map of where list keys are quoted.
 
@@ -168,6 +225,10 @@ class Configurations(SimpleDB):
         return POSITION_ADDRESSED_LISTS
 
     def commit(self, data):
+        # Plan 50 IP11 (DP-6341). Refused before the file store is touched.
+        self._refuseIfView('commit into a view')
+        if data.isReadOnly():
+            super().commit(data)            # raises ReadOnlyViewError
         for key in data._files:
             self._files[key].update(data._files[key])
 

@@ -53,9 +53,29 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
     app = FastAPI(title=title, docs_url=None, redoc_url=None)
 
     def path_allowed(path) -> bool:
+        if not allowed_roots:
+            return True     # DP-6467: nothing to compare with, nothing read
         candidate = Path(path).resolve()
-        return not allowed_roots or any(
+        return any(
             candidate == root or root in candidate.parents for root in allowed_roots)
+
+    #: DP-6467. ``Path.resolve`` reads the disk, and this app is served on the
+    #: thread that runs the window: resolving the open case's folder on every
+    #: request held the GUI for up to 12.5 s on a busy disk (measured live).
+    #: A session's folder does not move while it is open, so it is judged
+    #: once. A path a client *sends* (create, open) is judged every time.
+    session_verdicts: dict = {}
+
+    def session_allowed(session) -> bool:
+        if not allowed_roots:
+            return True
+        key = (getattr(session, 'session_id', None), str(session.case_path))
+        verdict = session_verdicts.get(key)
+        if verdict is None:
+            if len(session_verdicts) >= 256:
+                session_verdicts.clear()
+            verdict = session_verdicts[key] = path_allowed(session.case_path)
+        return verdict
 
     def _bearer(authorization):
         if authorization is None or not authorization.startswith('Bearer '):
@@ -73,6 +93,11 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
     async def authenticate(authorization: str | None = Header(default=None)) -> None:
         value = _bearer(authorization)
         if _granted(value):
+            # DP-6480. A case the desktop is opening is waited for, so a call
+            # sent right after start-up finds the case the window opens.
+            settled = getattr(facade, 'opening_settled', None)
+            if settled is not None:
+                await settled()
             return
         if client_trust is not None and bearer_token is not None and _is_token(value):
             raise HTTPException(status_code=403, detail={
@@ -88,7 +113,7 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
 
     def guard(case_id: str):
         session = facade.case(case_id)
-        if not path_allowed(session.case_path):
+        if not session_allowed(session):
             raise SecurityPolicyError('case is outside the configured roots')
         return session
 
@@ -206,7 +231,7 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
         return {'sessions': [
             {'case_id': cid, 'session_id': s.session_id, 'case_path': str(s.case_path),
              'read_only': s.read_only, 'revisions': s.revisions.to_dict()}
-            for cid, s in facade._cases.items() if path_allowed(s.case_path)]}
+            for cid, s in facade._cases.items() if session_allowed(s)]}
 
     # ---- application scope ----------------------------------------------- #
 
@@ -308,15 +333,18 @@ def create_facade_app(facade: FoamMeshFacade, *, token: str | None = None,
     async def artifacts(case_id: str, limit: int = Query(200, ge=1, le=5000),
                         _auth=Depends(authenticate)):
         guard(case_id)
-        return facade.artifacts(case_id, limit=limit)
+        # DP-6467: up to 10,000 journal rows, read off the serving thread.
+        return await asyncio.to_thread(facade.artifacts, case_id, limit=limit)
 
     # ---- events (replayable + WS) ---------------------------------------- #
 
     @app.get('/api/v1/cases/{case_id}/events')
     async def events(case_id: str, after_sequence: int = Query(0, ge=0),
                      limit: int = Query(1000, ge=1, le=1000), _auth=Depends(authenticate)):
-        guard(case_id)
-        return {'events': facade.case(case_id).events_after(after_sequence, limit=limit)}
+        session = guard(case_id)
+        # DP-6467: the journal is read off the serving thread.
+        return {'events': await asyncio.to_thread(
+            session.events_after, after_sequence, limit=limit)}
 
     # ---- plans ----------------------------------------------------------- #
 
@@ -428,5 +456,7 @@ async def serve(facade: FoamMeshFacade, *, host: str = '127.0.0.1', port: int = 
     app = create_facade_app(facade, token=token, allowed_case_roots=allowed_case_roots,
                             lifecycle=True, title='FoamMesh headless API v1',
                             client_trust=ClientTrust.erevnaa())
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level='warning'))
+    # DP-6495: no log_config, so uvicorn leaves the process's log handlers open.
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level='warning',
+                                           log_config=None))
     await server.serve()

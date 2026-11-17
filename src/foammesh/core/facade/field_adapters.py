@@ -227,7 +227,9 @@ class EntityAdapter:
         unknown = sorted(set(patch) - set(self.fields))
         if unknown:
             raise ValidationFailedError('unknown entity field', details={
-                'collection': self.collection_id, 'fields': unknown})
+                'collection': self.collection_id, 'fields': unknown,
+                'closest': self._closest(unknown),
+                'valid_fields': sorted(self.fields)})
         normalized = {}
         for relative_id, value in patch.items():
             element_field = self.fields[relative_id]
@@ -241,6 +243,12 @@ class EntityAdapter:
                     'error': error.message}) from error
             normalized[element_field.relative_path] = value
         return normalized
+
+    def _closest(self, unknown) -> dict:
+        """Live finding D8: a wrong field id named nothing to use instead."""
+        import difflib
+        return {name: difflib.get_close_matches(
+            name, sorted(self.fields), n=3, cutoff=0.4) for name in unknown}
 
     def _primitive(self, relative_path: str) -> PrimitiveType:
         node = self.collection.element_schema

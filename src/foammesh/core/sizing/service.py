@@ -74,6 +74,9 @@ def stored_inputs(db) -> dict:
                                           False)),
         'feature_angle': angle_rules.normalise(_get(db, 'mesh/featureAngle')),
         'threads': int(_get(db, 'gmsh/parallel/threads', 4) or 4),
+        # Plan 50 IP27 (DP-6391). Not a field input: what is proposed.
+        'snappy_layer_proposals': snappy_mapping.case_wants_layer_proposals(
+            db),
     }
 
 
@@ -85,16 +88,82 @@ def resolve_inputs(db, bounds, overrides=None) -> SizeFieldInputs:
     # Whether the field is the Gmsh background changes what is proposed, not
     # the field: it is no input of the tool and no part of the reuse key.
     rest = {k: v for k, v in stored.items()
-            if k not in ('hmin', 'hmax', 'hbulk', 'use_as_background')}
+            if k not in ('hmin', 'hmax', 'hbulk', 'use_as_background',
+                         'snappy_layer_proposals')}
     typed.update({k: v for k, v in (overrides or {}).items()
                   if v not in (None, '')})
     return default_inputs(bounds, typed=typed, **rest)
 
 
+STAGED_MARKER = 'staged.json'
+
+
+def _staged_again(out_dir: Path, fingerprint: str):
+    """DP-6503. The surfaces already staged for this prepared revision, or
+    None. ``sizing.field.status`` is a read the page makes after every field
+    commit; restaging rewrote every STL each time (about 100 ms on the
+    1.6 M-cell elbow case, on the GUI thread; MEASURED, window leg ``large``)."""
+    import json
+    if not fingerprint:
+        return None
+    try:
+        marker = json.loads((out_dir / STAGED_MARKER).read_text('utf-8'))
+    except (OSError, ValueError):
+        return None
+    if marker.get('prepared_fingerprint') != fingerprint:
+        return None
+    staged = []
+    for item in marker.get('surfaces') or ():
+        path = out_dir / str(item.get('file'))
+        try:
+            if path.stat().st_size != item.get('bytes'):
+                return None
+        except OSError:
+            return None
+        staged.append(StagedSurface(str(item['name']), path,
+                                    int(item['triangles'])))
+    bounds = marker.get('bounds')
+    if not staged or not isinstance(bounds, list) or len(bounds) != 6:
+        return None
+    return staged, tuple(float(x) for x in bounds)
+
+
+def _mark_staged(out_dir: Path, fingerprint: str, staged, bounds) -> None:
+    import json
+    if not fingerprint:
+        return
+    try:
+        (out_dir / STAGED_MARKER).write_text(json.dumps({
+            'prepared_fingerprint': fingerprint,
+            'surfaces': [{'name': s.name, 'file': Path(s.path).name,
+                          'triangles': s.triangles,
+                          'bytes': Path(s.path).stat().st_size}
+                         for s in staged],
+            'bounds': list(bounds)}), 'utf-8')
+    except OSError:
+        pass
+
+
 def stage_case(case_path):
     """``(staged surfaces, prepared fingerprint, bounds)`` of the case."""
     sources, fingerprint = prepared_sources(case_path)
-    staged = stage_sources(sources, field_runner.staged_dir(case_path))
+    out_dir = Path(field_runner.staged_dir(case_path))
+    again = _staged_again(out_dir, fingerprint)
+    if again is not None:
+        return again[0], fingerprint, again[1]
+    marker = out_dir / STAGED_MARKER
+    if marker.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    staged = stage_sources(sources, out_dir)
+    bounds = _bounds_of(staged)
+    _mark_staged(out_dir, fingerprint, staged, bounds)
+    return staged, fingerprint, bounds
+
+
+def _bounds_of(staged):
     low = np.full(3, np.inf)
     high = np.full(3, -np.inf)
     for item in staged:
@@ -103,7 +172,7 @@ def stage_case(case_path):
             low = np.minimum(low, flat.min(axis=0))
             high = np.maximum(high, flat.max(axis=0))
     bounds = (low[0], high[0], low[1], high[1], low[2], high[2])
-    return staged, fingerprint, tuple(float(x) for x in bounds)
+    return tuple(float(x) for x in bounds)
 
 
 # -- proposals --------------------------------------------------------------- #
@@ -144,7 +213,6 @@ def snappy_proposals(field, staged, bounds, settings: dict,
     angle = settings['feature_angle']
     out.append(snappy_mapping.castellation_between_levels(settings['gradation']))
     out.append(snappy_mapping.resolve_feature_angle(angle))
-    out += snappy_mapping.cell_limits(field.estimated_hex_cells())
     out += snappy_mapping.surface_levels(field, base)
     geometry = _surface_geometry(staged)
     total_edges = 0
@@ -175,11 +243,13 @@ def snappy_proposals(field, staged, bounds, settings: dict,
     out += snappy_mapping.snap_features(total_edges)
     out.append(snappy_mapping.layer_feature_angle(angle))
     # DP-2877. The stack is sized from the cell snappy puts on the wall.
-    walls = {name: snappy_mapping.wall_cell(base, row)
-             for name, row in stats.items()}
-    out += snappy_mapping.boundary_layers(
-        field, walls, gaps=snappy_mapping.wall_gaps(
-            field, settings.get('nodes_per_gap', 0)))
+    # Plan 50 IP27 (DP-6391): only while the case sizes layers relatively.
+    if settings.get('snappy_layer_proposals', True):
+        walls = {name: snappy_mapping.wall_cell(base, row)
+                 for name, row in stats.items()}
+        out += snappy_mapping.boundary_layers(
+            field, walls, gaps=snappy_mapping.wall_gaps(
+                field, settings.get('nodes_per_gap', 0)))
     return out
 
 

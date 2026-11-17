@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 from foammesh.core.naming import humanise_option
 
 __all__ = ['is_mesher_job', 'RunProgress', 'RefineStep', 'SnapStep', 'LayerPatch', 'Stage',
-           'SNAPPY_STAGES', 'PROGRESS_PREFIX']
+           'SNAPPY_STAGES', 'PROGRESS_PREFIX', 'snappy_cell_limit_warning',
+           'snappy_job_limit_warning', 'cell_limit_source']
 
 PROGRESS_PREFIX = 'FOAMMESH_PROGRESS '
 
@@ -53,6 +54,114 @@ _ADDED_CELLS = re.compile(r'^Added (\d+) out of (\d+) cells \(([\d.]+)%\)')
 _LAYER_ROW = re.compile(
     r'^(?P<patch>\S+)\s+(?P<faces>\d+)\s+(?P<layers>[\d.]+)\s+'
     r'(?P<thickness>[\d.eE+-]+)\s+(?P<percent>[\d.]+)\s*$')
+#: Plan 50 IP3 (SN-2, DP-6231). snappyHexMesh stopped refining at a cell
+#: limit. The wording is OpenFOAM Foundation v13's own,
+#: ``src/mesh/snappyHexMesh/meshRefinement/meshRefinementRefine.C``:
+#: ``refineCandidates`` prints the first when the mesh already holds
+#: ``maxGlobalCells``; the ``mark*Refinement`` routines print the second when
+#: a processor's share of the refinement ran out. (In v13 ``maxLocalCells``
+#: only decides when to rebalance; it never stops refinement.)
+_GLOBAL_LIMIT = re.compile(
+    r'^No cells marked for refinement since reached limit (\d+)\.?\s*$')
+_REFINEMENT_LIMIT = 'Reached refinement limit.'
+
+def cell_limit_source(stored_global, limit: int | None = None
+                      ) -> str | None:
+    """Where the ``maxGlobalCells`` a run wrote came from (Plan 50 IP3):
+    ``'user'`` for a number the user typed, ``'memory'`` for the limit the
+    writer derived from free RAM, ``'safe_maximum'`` for the 32-bit-label
+    ceiling written when the memory held more or gave no figure; ``None``
+    when the stored value is unreadable. *stored_global* is the stored
+    ``castellation/maxGlobalCells``; *limit* the one the log reported."""
+    from foammesh.support.resource_budget import SAFE_MAX_CELLS
+
+    try:
+        stored = int(float(stored_global))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if stored != SAFE_MAX_CELLS:
+        return 'user'
+    if limit is not None and limit >= SAFE_MAX_CELLS:
+        return 'safe_maximum'
+    return 'memory'
+
+
+def _limit_text(limit: int | None, source: str | None = None) -> str:
+    if limit and source == 'user':
+        reached = ('snappyHexMesh stopped refining because the mesh reached '
+                   'the Max global cells you set (maxGlobalCells {0:,})'
+                   .format(limit))
+        what = ('Raise Max global cells on the Refinement page if the '
+                'memory allows it, and run again.')
+    elif limit and source == 'memory':
+        reached = ('snappyHexMesh stopped refining because the mesh reached '
+                   'the cell limit FoamMesh set from the free memory '
+                   '(maxGlobalCells {0:,}, what the RAM free at the start '
+                   'of the run holds)'.format(limit))
+        what = ('Free memory and run again, or type a larger Max global '
+                'cells on the Refinement page.')
+    elif limit and source == 'safe_maximum':
+        reached = ('snappyHexMesh stopped refining because the mesh reached '
+                   'the largest cell count FoamMesh writes '
+                   '(maxGlobalCells {0:,}, under the 32-bit cell numbering '
+                   'of OpenFOAM)'.format(limit))
+        what = 'Coarsen the refinement and run again.'
+    elif limit:
+        reached = ('snappyHexMesh stopped refining because the mesh reached '
+                   'its cell limit (maxGlobalCells {0:,})'.format(limit))
+        what = ('Raise Max global cells on the Refinement page if the '
+                'memory allows it, and run again.')
+    else:
+        reached = 'snappyHexMesh stopped refining at its cell limit'
+        what = ('Raise the cell limits on the Refinement page if the '
+                'memory allows it, and run again.')
+    return (reached + ', so the mesh is coarser than the refinement asked '
+            'for. ' + what)
+
+
+def snappy_cell_limit_warning(lines, stored_global=None) -> str | None:
+    """The task warning for a snappyHexMesh log that hit a cell limit, or
+    ``None`` (Plan 50 IP3, DP-6231). *stored_global* is the stored
+    ``castellation/maxGlobalCells``, which says whether the limit was the
+    user's or derived from memory (:func:`cell_limit_source`)."""
+    reached = False
+    limit = None
+    for line in lines:
+        text = str(line).strip()
+        if not text or text[0] not in 'NR':
+            continue
+        match = _GLOBAL_LIMIT.match(text)
+        if match:
+            reached, limit = True, int(match[1])
+        elif text == _REFINEMENT_LIMIT:
+            reached = True
+    if not reached:
+        return None
+    source = (cell_limit_source(stored_global, limit)
+              if stored_global is not None else None)
+    return _limit_text(limit, source)
+
+
+def snappy_job_limit_warning(job, stored_global=None) -> str | None:
+    """:func:`snappy_cell_limit_warning` for a finished job.
+
+    The in-memory output keeps only the tail of a long run, and the limit is
+    reached during castellation, near the start: when the output was cut the
+    log the job kept is read instead, line by line.
+    """
+    if 'snappyHexMesh' not in ' '.join(
+            str(part) for part in (getattr(job, 'argv', None) or ())):
+        return None
+    log_path = getattr(job, 'log_path', None)
+    if getattr(job, 'output_truncated', False) and log_path:
+        try:
+            with open(log_path, encoding='utf-8', errors='replace') as stream:
+                return snappy_cell_limit_warning(stream, stored_global)
+        except OSError:
+            pass                # the log is gone: the output is all there is
+    return snappy_cell_limit_warning(
+        str(getattr(job, 'output', '') or '').splitlines(), stored_global)
+
 
 def is_mesher_job(argv) -> bool:
     """True for a job that runs snappyHexMesh, the Gmsh runner or a Gmsh
@@ -134,6 +243,9 @@ class RunProgress:
         self.layer_patches: list[LayerPatch] = []
         self.layer_cells_percent: float | None = None
         self.final_cells: int | None = None
+        #: Plan 50 IP3. snappy stopped refining at a cell limit: the
+        #: ``maxGlobalCells`` it named, or 0 when the log gave no number.
+        self.cell_limit: int | None = None
         # Gmsh
         self.fraction = 0.0
         self.message = ''
@@ -454,6 +566,9 @@ class RunProgress:
                 self._enter('castellated', now)
                 self._refine_row('final', line)
                 self._finish_phase(now)
+            elif line.strip() == _REFINEMENT_LIMIT and not self.cell_limit:
+                self.cell_limit = 0
+                self._bump()
             return
         if head == 'L':
             match = _LAYER_ITERATION.match(line)
@@ -473,6 +588,11 @@ class RunProgress:
         if head == 'N':
             if line.startswith('No layers to generate'):
                 self._enter('layers', now)
+                return
+            match = _GLOBAL_LIMIT.match(line.strip())
+            if match:
+                self.cell_limit = int(match[1])
+                self._bump()
             return
         if head == 'E':
             match = _EXTRUDING.match(line)

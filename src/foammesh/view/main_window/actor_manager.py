@@ -205,7 +205,10 @@ class ActorManager(QObject):
             setOffset = getattr(actorInfo, 'setExplodeOffset', None)
             if setOffset is None:
                 continue
-            own = actorInfo.bounds().center()
+            ownBounds = actorInfo.bounds()
+            if ownBounds is None:                           # DP-6340
+                continue
+            own = ownBounds.center()
             setOffset([(own[axis] - centre[axis]) * factor for axis in range(3)])
 
         self._displayControl.refreshView()
@@ -249,6 +252,24 @@ class ActorManager(QObject):
 
         self.applyToDisplay()
         self._visibility = False
+
+    def reveal(self) -> bool:
+        """Undo `hide` without re-feeding every actor its data (Plan 50 IP1).
+
+        Whether anything came back. A display control with no ``reveal``
+        gets the whole `_show`.
+        """
+        reveal = getattr(self._displayControl, 'reveal', None)
+        if reveal is None:
+            self._show()
+            return True
+        changed = False
+        for actorInfo in self._actorInfos.values():
+            changed = bool(reveal(actorInfo)) or changed
+        if changed:
+            self.applyToDisplay()
+        self._visibility = True
+        return changed
 
     def clip(self, planes):
         for actorInfo in self._actorInfos.values():

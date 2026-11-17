@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from foammesh.view.theming.metrics import CompactDoubleSpinBox
 from foammesh.core.gmsh import checkpoints
 from foammesh.core.gmsh import script_export as export
+from widgets import async_dialog
 
 PYTHON, GEO = 'python', 'geo'
 NO_SESSION = ('There is no Gmsh session yet; generate or build something on '
@@ -338,17 +339,21 @@ class GmshScriptPanel(QWidget):
         self._background('remove_last', work)
 
     def saveScript(self, path: str | None = None) -> str:
-        """Write the view to a file; the path (empty when cancelled)."""
+        """Write the view to a file; the path (empty when cancelled, and
+        while the dialog is open: Plan 50 IP19 asks without a nested event
+        loop and writes once answered)."""
         geo = self.language() == GEO
         if not path:
             case = self.casePath()
             start = str((case / 'exports') if case else Path.home())
-            path, _filter = QFileDialog.getSaveFileName(
+            result = []
+            async_dialog.getSaveFileName(
                 self, self.tr('Save script'), start,
                 self.tr('Gmsh script (*.geo)') if geo
-                else self.tr('Python (*.py)'))
-        if not path:
-            return ''
+                else self.tr('Python (*.py)'),
+                then=lambda chosen, _filter: chosen and result.append(
+                    self.saveScript(chosen)))
+            return result[0] if result else ''
         export.save_text(path, self.scriptText())
         self._result.setText(self.tr('Saved {0}.').format(path))
         return path
@@ -370,11 +375,11 @@ class GmshScriptPanel(QWidget):
 
     def chooseGeo(self) -> None:
         case = self.casePath()
-        path, _filter = QFileDialog.getOpenFileName(
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
             self, self.tr('Open .geo'), str(case or Path.home()),
-            self.tr('Gmsh script (*.geo)'))
-        if path:
-            self.openGeo(path)
+            self.tr('Gmsh script (*.geo)'),
+            then=lambda path, _filter: path and self.openGeo(path))
 
     def openGeo(self, path: str, values: dict | None = None) -> None:
         """Replace the model with the script *path* (ONELAB values optional)."""

@@ -13,7 +13,7 @@ region B -- is now a *sheet*:
   Plan 40 UXC3), beside the viewport on the chosen side, so it narrows the
   viewport.
 
-Either way it is 300, 360 or 440 px wide, or any width from 280 to 560 px set
+Either way it is 300, 360 or 440 px wide, or any width from 280 to 960 px set
 by dragging its grip; the width is remembered per page, and a table page
 (Sizing, Periodic) opens at 440 px by itself. *Minimised* (Ctrl+\\) leaves a
 32 px tab with the step's name at the edge.
@@ -51,6 +51,7 @@ from foammesh.view.theming import motion
 from foammesh.view.theming.metrics import RADIUS_FLOAT, RADIUS_SHEET
 from .dock_layout import OUTLINE_DOCK, SETTINGS_DOCK, VIEWPORT_DOCK
 from .sheet_header import SheetHeader
+from widgets.async_dialog import popupMenu
 
 #: The three widths on offer in View > Settings sheet.
 PRESETS = (300, 360, 440)
@@ -270,7 +271,7 @@ class SheetGrip(QWidget):
         super().__init__(parent)
         self.setObjectName('settingsSheetGrip')
         self.setAccessibleName('Resize the settings sheet')
-        self.setToolTip('Drag to resize the settings sheet (280 to 560 px). '
+        self.setToolTip('Drag to resize the settings sheet (280 to 960 px). '
                         'Right-click for pin, side and width.')
         self.setFixedWidth(GRIP_WIDTH)
         self.setCursor(Qt.CursorShape.SplitHCursor)
@@ -630,6 +631,10 @@ class SettingsSheet(QObject):
 
     def _page(self):
         return self._stack.currentWidget()
+
+    def page(self):
+        """The page the sheet shows now."""
+        return self._page()
 
     def current_key(self) -> str:
         return page_key(self._page())
@@ -1230,7 +1235,7 @@ class SettingsSheet(QObject):
     def _popup_menu(self, where: QPoint) -> None:
         menu = QMenu(self._frame)
         self._fill_popup(menu)
-        menu.exec(where)
+        popupMenu(menu, where)      # Plan 50 IP19: no nested event loop
 
     def _fill_popup(self, menu: QMenu) -> None:
         menu.addAction('Pin (dock the settings)',

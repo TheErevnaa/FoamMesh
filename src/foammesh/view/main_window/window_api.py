@@ -11,6 +11,9 @@ route and the control cannot differ.
 """
 from __future__ import annotations
 
+from foammesh.view.main_window.window_controls_api import (
+    WindowControlsMixin)
+
 ATTRIBUTE = 'pa5_window'
 
 #: Link buttons of the Gmsh tools tab that ``window.navigate`` may press.
@@ -25,7 +28,7 @@ def _visible_first(widgets):
     return widgets[0] if widgets else None
 
 
-class WindowApi:
+class WindowApi(WindowControlsMixin):
     """The window, as the local API drives it."""
 
     def __init__(self, window):
@@ -72,12 +75,39 @@ class WindowApi:
                 raise ValueError(f'the step {step.name} is not open yet')
         elif kind == 'branch':
             tokens = window._navigationView.routeTokens()
+            # Plan 50 IP25 (DP-6380). A row that was folded into another
+            # (Castellation and Snap into Refinement) still opens: its old
+            # token names the row that holds its settings now.
+            from .meshing_method_branch import LEGACY_TOKEN_ALIASES
+            target = LEGACY_TOKEN_ALIASES.get(str(target), target)
             if str(target) not in tokens:
                 raise ValueError(f'{target} is not a route; routes are: '
                                  + ', '.join(sorted(tokens)))
             window._navigationView.requestBranch(str(target))
+            self._refuse_shut_route(str(target))
         elif kind == 'task':
-            window.openLikelyStep(str(target))
+            # DP-6489. A task id opens as its branch form does, or is
+            # refused: it used to be routed unchecked, and a task the tree
+            # does not have, or holds locked, answered accepted in silence.
+            from .meshing_method_branch import (
+                LEGACY_TOKEN_ALIASES, TASK_TOKEN_PREFIX)
+            task = str(target)
+            token = LEGACY_TOKEN_ALIASES.get(TASK_TOKEN_PREFIX + task,
+                                             TASK_TOKEN_PREFIX + task)
+            tokens = window._navigationView.routeTokens()
+            if task not in ('setup.geometry', 'setup.preparation') and \
+                    token not in tokens:
+                tasks = sorted(t[len(TASK_TOKEN_PREFIX):] for t in tokens
+                               if t.startswith(TASK_TOKEN_PREFIX))
+                raise ValueError(
+                    f'{task} is not a task of the step tree; tasks are: '
+                    + ', '.join(['setup.geometry', 'setup.preparation']
+                                + tasks)
+                    + '. Use kind branch with a route, or kind step with a '
+                    'step name.')
+            window.openLikelyStep(task)
+            if token in tokens:
+                self._refuse_shut_route(token)
         elif kind == 'rail':
             self._open_tool(str(target))
         elif kind == 'output_tab':
@@ -113,6 +143,30 @@ class WindowApi:
                 'kind is step, branch, task, rail, output_tab, action or '
                 'button')
         return self.where()
+
+    def _refuse_shut_route(self, token: str) -> None:
+        """DP-6489. Raise the tree's own reason when it refused ``token``.
+
+        The tree refuses a locked or shut row on the status bar
+        (`MeshingMethodBranch.route`), which an API answer never showed: a
+        refused press answered accepted. The same two questions are asked
+        here, after the press, so the answer carries the same sentence.
+        """
+        branch = getattr(getattr(self.window, '_stepManager', None),
+                         '_methodBranch', None)
+        if branch is None or getattr(branch, 'lockBypass', False):
+            return
+        resolved = branch.resolveToken(token)
+        if resolved is None:
+            return
+        if branch.isLocked(resolved):
+            raise ValueError(branch.lockRefusal(resolved)
+                             or f'{token} is not open yet')
+        if branch._rowIsShut(resolved):
+            raise ValueError(
+                branch.lockRefusal(resolved)
+                or f'{token} cannot be opened yet: complete the steps '
+                   'before it first.')
 
     def where(self) -> dict:
         window = self.window
@@ -275,6 +329,9 @@ class WindowApi:
             page.setScriptShown(bool(values.get('shown')))
         elif action is not None:
             raise ValueError('action is change_target or script')
+        # DP-6271. A page off screen re-reads its status when it opens; this
+        # read answers as the page would show now.
+        page.refresh_status()
         result = page.readouts()
         result['script_panel'] = page.scriptState()
         return result
@@ -348,6 +405,107 @@ class WindowApi:
             values['target_yplus'], values['velocity'], values['density'],
             values['viscosity'], values['length'],
             apply=bool(values.get('apply')))
+
+    # -- the footer --------------------------------------------------------- #
+
+    def footer(self, press: str | None = None) -> dict:
+        """The footer's Back and primary buttons and the entries of the
+        primary button's drop-down, as shown; *press* chooses one entry by
+        its object name, as choosing it in the menu does."""
+        window = self.window
+        manager = getattr(window, '_stepManager', None)
+        ui = getattr(window, '_ui', None)
+        if manager is None or not hasattr(ui, 'wizardProceedButton'):
+            raise LookupError('the window has no footer')
+
+        def button(widget):
+            return {'text': widget.text().replace('&&', '&'),
+                    'enabled': widget.isEnabled(),
+                    'visible': not widget.isHidden(),
+                    'tooltip': widget.toolTip()}
+
+        def entries():
+            return list(manager.footerMenuActions())
+
+        pressed = None
+        if press is not None:
+            offered = entries()
+            match = next((row for row in offered if row[0] == press), None)
+            if match is None:
+                names = ', '.join(row[0] for row in offered) or 'none'
+                raise ValueError(
+                    f'{press!r} is not in the drop-down now; it offers: '
+                    f'{names}')
+            match[3]()
+            pressed = press
+        state = {'back': button(ui.wizardBackButton),
+                 'proceed': button(ui.wizardProceedButton),
+                 'entries': [{'name': name, 'label': label,
+                              'tooltip': str(tooltip or '')}
+                             for name, label, tooltip, _run in entries()]}
+        more = getattr(ui, 'wizardProceedMore', None)
+        if more is not None:
+            state['more'] = {'enabled': more.isEnabled(),
+                             'visible': not more.isHidden()}
+        if pressed is not None:
+            state['pressed'] = pressed
+        return state
+
+    # -- the pointer over the 3-D view -------------------------------------- #
+
+    async def viewport_pointer(self, x, y, action: str = 'hover',
+                               extend: bool = False,
+                               whole: bool = False) -> dict:
+        """Rest the pointer on a point of the 3-D view, or click there.
+
+        The view gets the mouse events a hand gives it, so the hover
+        read-out and the pick are the window's own. ``x``, ``y`` are
+        fractions of the view from its top-left corner; *extend* holds Ctrl
+        and *whole* holds Shift during a click. Answers what the view names
+        under the pointer after the dwell, and for a click the part it
+        picked; the selection itself is read where the window shows it."""
+        import asyncio
+
+        from widgets.rendering.rendering_widget import HOVER_DWELL_TIME
+        if action not in ('hover', 'click'):
+            raise ValueError('action is hover or click')
+        # DP-6523. Missing or non-numeric coordinates were answered with
+        # Python's own float() text; name the parameter instead.
+        for name, value in (('x', x), ('y', y)):
+            if value is None:
+                raise ValueError(f"missing parameter '{name}'")
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f'{name} must be a number from 0 to 1') from None
+            if not 0.0 <= number <= 1.0:
+                raise ValueError(f'{name} must be a number from 0 to 1')
+        view = getattr(self.window, 'renderingView', None)
+        if view is None or not hasattr(view, 'pointerAt'):
+            raise LookupError('the window has no 3-D view')
+        if not view.isVisible():
+            raise LookupError('the 3-D view is not shown')
+        picked = []
+
+        def note(actor, *_keys):
+            picked.append(actor.GetObjectName() if actor is not None else '')
+
+        skipped = view.hoverPicksSkipped
+        view.actorPicked.connect(note)
+        try:
+            where = view.pointerAt(float(x), float(y),
+                                   click=action == 'click',
+                                   ctrl=bool(extend), shift=bool(whole))
+            await asyncio.sleep((HOVER_DWELL_TIME + 120) / 1000)
+        finally:
+            view.actorPicked.disconnect(note)
+        state = dict(where, action=action,
+                     hovered=view.hoveredName(),
+                     readout=view.hoverReadoutText(),
+                     hover_skipped=view.hoverPicksSkipped > skipped)
+        if action == 'click':
+            state['picked'] = picked[-1] if picked else None
+        return state
 
     async def block_grading(self, entity_id, axis, fine=None, ratio=None,
                             text=None, vertices=None, apply=True) -> dict:

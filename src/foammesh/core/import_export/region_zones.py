@@ -28,6 +28,7 @@ the reason, rather than passed on to fail with a line number.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -358,6 +359,17 @@ def complete_region_zones(mesh, seeds) -> dict[str, np.ndarray] | None:
     return zones
 
 
+_HASH_SUFFIX = re.compile(r"_[0-9a-f]{8}$")
+
+
+def _typed_name(zone: str, wanted) -> str:
+    """The typed region a zone belongs to, or the zone's own name."""
+    if zone in wanted:
+        return zone
+    stem = _HASH_SUFFIX.sub("", zone)
+    return stem if stem in wanted else zone
+
+
 def require_solid_zones(poly_mesh: Path, names) -> None:
     """DP-6058. Refuse a Gmsh mesh whose cell zones are not its solids.
 
@@ -373,8 +385,12 @@ def require_solid_zones(poly_mesh: Path, names) -> None:
         return
     if mesh.cell_count == 0:
         return
-    zones = [zone.name for zone in mesh.cell_zones]
     wanted = [str(name) for name in names]
+    # Live finding D9: Gmsh keeps surface and volume names in one namespace,
+    # so a region sharing its name with a patch publishes as ``name_<8 hex>``.
+    # That zone still is the typed region; it is matched by the name it was
+    # given, not refused as an unknown zone.
+    zones = [_typed_name(zone.name, wanted) for zone in mesh.cell_zones]
     missing = [name for name in wanted if name not in zones]
     extra = [name for name in zones if name not in wanted]
     if missing or extra:

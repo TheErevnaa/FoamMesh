@@ -144,6 +144,29 @@ def applied_edits(change_sets) -> list[dict]:
     return applied
 
 
+def _plain_copy(value):
+    """The configuration DTO: the document copied, every dict's keys sorted.
+
+    Plan 50 (DP-6341). This was a YAML round trip (``yaml.dump`` sorts keys,
+    the safe loader rebuilds plain values). The document holds only plain
+    YAML values -- the safe loader refused anything else -- so a sorted copy
+    gives the same DTO: with 500 surfaces (1 MB) the round trip held the GUI
+    thread 2 to 2.6 s (live w16-w18) for every caller after a change.
+    """
+    if isinstance(value, dict):
+        return {key: _plain_copy(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_plain_copy(item) for item in value]
+    return value
+
+
+#: DP-6407. ``{session_id: (actor, source, correlation_id)}`` for the sessions
+#: whose commands are raising events in this context. One variable for every
+#: session; the mapping is replaced, never changed in place.
+_EVENT_CONTEXT: ContextVar[dict] = ContextVar('foammesh_event_context', default={})
+_NO_EVENT_IDENTITY = (None, None, None)
+
+
 @dataclass
 class CaseSession:
     case_path: Path
@@ -182,6 +205,10 @@ class CaseSession:
         #: not send (a local API run) has finished, so it can show what the
         #: command made the way it does for its own.
         self._command_observers: list = []
+        #: DP-6454. ``(started, ended)`` pairs: ``started(command)`` when a
+        #: queued command begins, ``ended(command, result, error)`` when it
+        #: returns (``error`` None) or raises (``result`` None).
+        self._lifecycle_observers: list = []
         self._configuration_cache: tuple[int, dict] | None = None
         # CR4 (F4). The in-memory event list is a bounded window, not a
         # history: it held every line of solver output for the life of the
@@ -192,9 +219,6 @@ class CaseSession:
         self._events_dropped_through = 0
         self._idempotency: dict[str, tuple[str, object]] = {}
         self._closed = False
-        self._event_context: ContextVar[tuple[dict | None, str | None, str | None]] = (
-            ContextVar(f'foammesh_event_context_{self.session_id}',
-                       default=(None, None, None)))
         self._lock: FileLock | None = None
         self._unsubscribers = [self.state.bus.subscribe(event, self._on_project_event) for event in (
             Event.TRANSACTION_APPLIED, Event.UNDONE, Event.REDONE,
@@ -288,9 +312,8 @@ class CaseSession:
         cached = self._configuration_cache
         if cached is not None and cached[0] == self.authored_revision:
             return cached[1]
-        import yaml
         with self.monitor.measure('snapshot_build'):
-            configuration = yaml.safe_load(self.state.db.toYaml())
+            configuration = _plain_copy(self.state.db.data())
         self._configuration_cache = (self.authored_revision, configuration)
         return configuration
 
@@ -317,10 +340,9 @@ class CaseSession:
         cached = self._configuration_cache
         if cached is not None and cached[0] == self.authored_revision:
             return
-        import yaml
         revision = self.authored_revision
         configuration = await asyncio.to_thread(
-            lambda: yaml.safe_load(self.state.db.toYaml()))
+            _plain_copy, self.state.db.data())
         if self.authored_revision == revision:
             self._configuration_cache = (revision, configuration)
 
@@ -358,6 +380,41 @@ class CaseSession:
             except ValueError:
                 pass
         return forget
+
+    def observe_command_lifecycle(self, started, ended):
+        """DP-6454. Hear every queued command start and end; returns the undo.
+
+        Unlike :meth:`observe_commands`, the end is heard whether the command
+        returned or raised, so a window showing a run started elsewhere is
+        never left showing it running.
+        """
+        pair = (started, ended)
+        self._lifecycle_observers.append(pair)
+
+        def forget():
+            try:
+                self._lifecycle_observers.remove(pair)
+            except ValueError:
+                pass
+        return forget
+
+    def notify_command_started(self, command) -> None:
+        """DP-6454. A queued command is starting; a failing observer is logged."""
+        for started, _ended in list(self._lifecycle_observers):
+            try:
+                started(command)
+            except Exception:                               # noqa: BLE001
+                logger.exception('lifecycle observer failed for %s',
+                                 getattr(command, 'operation', '?'))
+
+    def notify_command_ended(self, command, result=None, error=None) -> None:
+        """DP-6454. A queued command returned or raised."""
+        for _started, ended in list(self._lifecycle_observers):
+            try:
+                ended(command, result, error)
+            except Exception:                               # noqa: BLE001
+                logger.exception('lifecycle observer failed for %s',
+                                 getattr(command, 'operation', '?'))
 
     def notify_command(self, command, result) -> None:
         """Tell the observers a command ended; one that fails is logged."""
@@ -405,8 +462,26 @@ class CaseSession:
         if key:
             self._idempotency[key] = (fingerprint, result)
 
+    def _event_identity(self) -> tuple[dict | None, str | None, str | None]:
+        return _EVENT_CONTEXT.get().get(self.session_id, _NO_EVENT_IDENTITY)
+
+    def _set_event_identity(self, identity: tuple):
+        """DP-6407. Set this session's identity in the one shared variable.
+
+        A ContextVar made per session stayed a key of every long-lived context
+        it was set in (the window's loop, the command threads) after the
+        session closed: one node a project opened. The shared variable holds
+        only the sessions that have an identity set now.
+        """
+        held = dict(_EVENT_CONTEXT.get())
+        if identity == _NO_EVENT_IDENTITY:
+            held.pop(self.session_id, None)
+        else:
+            held[self.session_id] = identity
+        return _EVENT_CONTEXT.set(held)
+
     def set_event_context(self, command) -> None:
-        self._event_context.set((
+        self._set_event_identity((
             {'id': command.actor.id, 'kind': command.actor.kind.value},
             command.source.value, command.correlation_id or command.command_id))
 
@@ -416,19 +491,19 @@ class CaseSession:
         DP-2730. 'rest' while a local API command runs, so a window can tell
         a change it made itself from one made over the API.
         """
-        return self._event_context.get()[1]
+        return self._event_identity()[1]
 
     def clear_event_context(self) -> None:
-        self._event_context.set((None, None, None))
+        self._set_event_identity(_NO_EVENT_IDENTITY)
 
     def emit_as(self, event: str, *, actor: dict | None, source: str | None,
                 correlation_id: str | None, **payload) -> None:
         """Emit a background fact with its captured initiating identity."""
-        token = self._event_context.set((actor, source, correlation_id))
+        token = self._set_event_identity((actor, source, correlation_id))
         try:
             self._emit(event, **payload)
         finally:
-            self._event_context.reset(token)
+            _EVENT_CONTEXT.reset(token)
 
     def events_after(self, sequence: int, *, limit: int = 1_000) -> list[dict]:
         if self.journal is None:
@@ -565,20 +640,42 @@ class CaseSession:
 
         DP-2714. MEASURED: the journal's first set-up (WAL switch and table
         create) held the GUI thread 3.84 s of a case create on a loaded disk.
+
+        DP-6480. Opening a case held it 20.2 s here (measured live). The
+        journal's last event, which the session continues the numbering
+        from, is read here as well, so attaching reads nothing. Nothing else
+        writes the journal between this and the attach: the session that
+        would is the one being attached, and the case lock is held.
         """
-        return EventJournal(Path(storage_path) / JOURNAL_FILE_NAME)
+        journal = EventJournal(Path(storage_path) / JOURNAL_FILE_NAME)
+        latest = journal.latest_sequence()
+        last = journal.after(latest - 1, limit=1) if latest else []
+        journal.opened_tail = (latest, last[0]['revisions'] if last else None)
+        return journal
 
     def _start_journal(self, journal: EventJournal | None = None) -> None:
-        if journal is not None and journal.path.resolve() == (
-                self.storage_path / JOURNAL_FILE_NAME).resolve():
+        tail = None
+        target = self.storage_path / JOURNAL_FILE_NAME
+        # DP-6480. The same path needs no resolve (a disk read) to be judged.
+        if journal is not None and (journal.path == target or (
+                journal.path.resolve() == target.resolve())):
             journal.monitor = self.monitor
             self.journal = journal
+            tail = getattr(journal, 'opened_tail', None)
+            journal.opened_tail = None
         else:
             self.journal = EventJournal(self.storage_path / JOURNAL_FILE_NAME, monitor=self.monitor)
         self._start_autosave()
-        self.event_sequence = self.journal.latest_sequence()
-        if self.event_sequence:
-            previous = self.journal.after(self.event_sequence - 1, limit=1)[0]['revisions']
+        if tail is not None:
+            # DP-6480. Read off the GUI thread by prepare_journal.
+            self.event_sequence, previous = tail
+        else:
+            self.event_sequence = self.journal.latest_sequence()
+            previous = None
+            if self.event_sequence:
+                previous = self.journal.after(
+                    self.event_sequence - 1, limit=1)[0]['revisions']
+        if self.event_sequence and previous is not None:
             self.authored_revision = int(previous['authored_revision'])
             self.artifact_sequence = int(previous['artifact_sequence'])
             self.presentation_sequence = int(previous['presentation_sequence'])
@@ -616,7 +713,7 @@ class CaseSession:
             temporary.unlink(missing_ok=True)
 
     def _record_change_set(self, kind: str, payload: dict) -> None:
-        actor, source, correlation_id = self._event_context.get()
+        actor, source, correlation_id = self._event_identity()
         transaction = payload.get('transaction')
         # Plan 35 CR9. seq is assigned here, on the thread that applied the
         # change and at the moment it applied, so seq order is apply order.
@@ -652,7 +749,7 @@ class CaseSession:
 
     def _emit(self, event: str, *, durable: bool = True, **payload) -> None:
         self.event_sequence += 1
-        actor, source, correlation_id = self._event_context.get()
+        actor, source, correlation_id = self._event_identity()
         envelope = build_event(sequence=self.event_sequence, event=event,
                                session_id=self.session_id, case_id=self.case_id,
                                revisions=self.revisions, payload=payload,

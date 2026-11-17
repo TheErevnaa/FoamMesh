@@ -31,8 +31,17 @@ def _alive() -> list:
     return live
 
 
+def _listener(entry):
+    return entry() if isinstance(entry, weakref.WeakMethod) else entry
+
+
 def _notify() -> None:
-    for listener in list(_LISTENERS):
+    for entry in list(_LISTENERS):
+        listener = _listener(entry)
+        if listener is None:
+            if entry in _LISTENERS:
+                _LISTENERS.remove(entry)
+            continue
         try:
             listener()
         except RuntimeError:               # a Qt object that is already gone
@@ -76,10 +85,24 @@ def mesh_on_screen(host=None) -> bool:
 
 
 def subscribe(listener) -> None:
-    if listener not in _LISTENERS:
+    """Call *listener* when the mesh on screen changes.
+
+    DP-6407. A bound method is held weakly: this list lives as long as the
+    app, so a strong one kept every closed case's Gmsh entity panel -- and its
+    whole geometry page -- alive after File > Close."""
+    # Dead entries go here too, not only when the mesh changes (two dead
+    # entity-panel entries every ten rounds in the live soak, trace-20a).
+    _LISTENERS[:] = [entry for entry in _LISTENERS if _listener(entry) is not None]
+    if any(_listener(entry) == listener for entry in _LISTENERS):
+        return
+    if getattr(listener, '__self__', None) is not None and hasattr(listener, '__func__'):
+        _LISTENERS.append(weakref.WeakMethod(listener))
+    else:
         _LISTENERS.append(listener)
 
 
 def unsubscribe(listener) -> None:
-    if listener in _LISTENERS:
-        _LISTENERS.remove(listener)
+    for entry in list(_LISTENERS):
+        found = _listener(entry)
+        if found is None or found == listener:
+            _LISTENERS.remove(entry)

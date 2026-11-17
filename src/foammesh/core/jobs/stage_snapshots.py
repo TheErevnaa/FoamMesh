@@ -655,6 +655,253 @@ def capture(case_path, stage: str, *, engine_id: str = 'snappy',
                 pruned=pruned)
 
 
+#: Plan 50 IP17 (DP-6303). A stage kept as the processor cases a parallel run
+#: left, not gathered: the case files ``reconstructPar -case <snapshot>``
+#: needs beside them, so the snapshot folder can be gathered where it lies.
+DECOMPOSED = 'decomposed'
+_GATHER_CASE_FILES = ('system/controlDict', 'system/decomposeParDict')
+
+
+def _owner_cells(poly_mesh: Path) -> int | None:
+    """``nCells`` from the note OpenFOAM writes in ``owner`` (header only)."""
+    import re
+    for name in ('owner', 'owner.gz'):
+        path = poly_mesh / name
+        if not path.is_file():
+            continue
+        try:
+            if name.endswith('.gz'):
+                import gzip
+                with gzip.open(path, 'rt', encoding='utf-8',
+                               errors='replace') as handle:
+                    head = handle.read(4096)
+            else:
+                with path.open(encoding='utf-8', errors='replace') as handle:
+                    head = handle.read(4096)
+        except OSError:
+            return None
+        found = re.search(r'nCells\s*:\s*(\d+)', head)
+        return int(found.group(1)) if found else None
+    return None
+
+
+def decomposed_sources(case_path, ranks: int) -> dict[str, Path]:
+    """What a parallel stage produced, as the processor cases hold it.
+
+    ``{case-relative posix path: file}``: every ``processor<N>/constant/
+    polyMesh`` file and level field, and the two dictionaries a gather reads.
+    Empty when a rank is missing its mesh.
+    """
+    case = Path(case_path)
+    sources: dict[str, Path] = {}
+    for rank in range(int(ranks)):
+        processor = case / f'processor{rank}'
+        mesh = processor / 'constant' / 'polyMesh'
+        if not (mesh / 'boundary').is_file() and not (
+                mesh / 'boundary.gz').is_file():
+            return {}
+        for path in sorted(mesh.rglob('*')):
+            if path.is_file():
+                sources[path.relative_to(case).as_posix()] = path
+        for name in LEVEL_FIELDS:
+            for candidate in (processor / '0' / name,
+                              processor / '0' / f'{name}.gz'):
+                if candidate.is_file():
+                    sources[candidate.relative_to(case).as_posix()] = candidate
+    for name in _GATHER_CASE_FILES:
+        path = case / name
+        if path.is_file():
+            sources[name] = path
+    return sources
+
+
+def is_decomposed(case_path, stage: str, revision: str | None = None) -> bool:
+    """Whether that kept stage is still the processor cases (not gathered)."""
+    manifest = read_manifest(case_path, stage, revision)
+    return bool(manifest and manifest.get('layout') == DECOMPOSED)
+
+
+def capture_decomposed(case_path, stage: str, *, ranks: int,
+                       engine_id: str = 'snappy', runtime: dict | None = None,
+                       policy: AdmissionPolicy | None = None, disk_usage=None,
+                       cancel=None, clock=time.monotonic) -> dict:
+    """Keep a parallel stage as its processor cases, without gathering it.
+
+    Plan 50 IP17 (DP-6303). A parallel Run to end used to gather after
+    Castellation and after Snap only so each could be kept, which cost two
+    ``reconstructPar`` runs on every run. The processor meshes are copied
+    instead -- the same bytes a gather would write, give or take the
+    processor patches -- and gathered only when something reads the stage
+    (:func:`gather_if_needed`). ``active.json`` is not written: the case root
+    is not this stage's result.
+    """
+    case = Path(case_path)
+    recover(case)
+    base = {'stage': stage, 'engine_id': engine_id,
+            'task_id': STAGE_TASKS.get(stage), 'at': _now(),
+            'layout': DECOMPOSED}
+    sources = decomposed_sources(case, ranks)
+    if not sources:
+        return dict(base, captured=False, skipped=True, reason='no_mesh')
+    cells = 0
+    for rank in range(int(ranks)):
+        counted = _owner_cells(case / f'processor{rank}' / 'constant'
+                               / 'polyMesh')
+        if counted is None:
+            cells = None
+            break
+        cells += counted
+    incoming = sum(path.stat().st_size for path in sources.values())
+    verdict = admit(case, incoming, policy=policy, disk_usage=disk_usage)
+    if not verdict['admitted']:
+        entry = dict(base, reason=verdict['reason'], bytes=incoming,
+                     consequence=_skip_consequence(case, stage))
+        _record_skip(case, entry)
+        return dict(entry, captured=False, skipped=True, admission=verdict)
+    folder, is_new, inherits = _target_revision(case, stage)
+    resolved_before = resolve(case)
+    predecessor = PREDECESSOR.get(stage)
+    input_ref = None
+    if predecessor and predecessor in (inherits or resolved_before):
+        holder = (inherits or resolved_before)[predecessor]
+        manifest = read_manifest(case, predecessor, holder)
+        input_ref = {'stage': predecessor, 'revision': holder,
+                     'digest': (manifest or {}).get('digest')}
+    if is_new:
+        folder.mkdir(parents=True, exist_ok=True)
+        _write_json(folder / 'revision.json', {
+            'schema_version': SCHEMA_VERSION, 'revision': folder.name,
+            'inherits': inherits, 'created_at': _now()})
+    target = folder / stage
+    if target.exists():
+        raise SnapshotError(f'{folder.name}/{stage} is already kept and is '
+                            'never rewritten', code='snapshot_exists')
+    staging = folder / f'.{stage}.partial-{uuid.uuid4().hex[:12]}'
+    started = clock()
+    try:
+        files = {}
+        for name, path in sources.items():
+            size, digest = _copy_hashing(path, staging / name, cancel)
+            files[name] = [size, digest]
+        copied = clock()
+        (staging / 'constant').mkdir(parents=True, exist_ok=True)
+        manifest = {
+            'schema_version': SCHEMA_VERSION, 'revision': folder.name,
+            'stage': stage, 'task_id': STAGE_TASKS.get(stage),
+            'engine_id': engine_id, 'runtime': dict(runtime or {}),
+            'input': input_ref,
+            'settings_fingerprint': settings_fingerprint(case, stage),
+            'decomposition': decomposition_state(case),
+            'layout': DECOMPOSED, 'ranks': int(ranks), 'cells': cells,
+            'files': files, 'bytes': incoming, 'digest': files_digest(files),
+            'mesh_identity': None,
+            'captured_at': _now(),
+            'copy_seconds': round(copied - started, 3),
+            # Hashed while copied; the copy is not read back a second time.
+            'verify_seconds': 0.0,
+        }
+        _write_json(staging / 'manifest.json', manifest)
+        (staging / 'case.foam').write_bytes(b'')
+        os.replace(staging, target)
+    except BaseException:
+        _remove(staging)
+        raise
+    try:
+        pruned = prune(case)
+    except Exception:  # noqa: BLE001 - pruning never fails a capture
+        logger.exception('could not prune superseded stage snapshots')
+        pruned = []
+    return dict(manifest, captured=True, skipped=False, path=str(target),
+                pruned=pruned)
+
+
+def adopt_gathered(case_path, stage: str, revision: str) -> dict:
+    """Make a decomposed snapshot the gathered one ``reconstructPar`` wrote.
+
+    Plan 50 IP17 (DP-6303). Called once ``reconstructPar -constant -case
+    <snapshot>`` has written ``constant/polyMesh`` in the snapshot folder. The
+    gathered mesh must hold every cell the processor cases did; then it is
+    hashed into a new manifest (written atomically) and the processor copies
+    go. On a refusal the gathered files go instead and the snapshot stays
+    decomposed. Returns the new manifest.
+    """
+    case = Path(case_path)
+    folder = stages_root(case) / revision / stage
+    manifest = read_manifest(case, stage, revision)
+    if manifest is None:
+        raise SnapshotError(f'the kept {stage} snapshot is missing',
+                            code='snapshot_missing')
+    if manifest.get('layout') != DECOMPOSED:
+        return manifest
+    mesh = folder / 'constant' / 'polyMesh'
+    gathered = _owner_cells(mesh) if mesh.is_dir() else None
+    expected = manifest.get('cells')
+    if (not mesh.is_dir() or not ((mesh / 'owner').is_file()
+                                  or (mesh / 'owner.gz').is_file())
+            or (expected is not None and gathered is not None
+                and int(gathered) != int(expected))):
+        _remove(mesh)
+        raise SnapshotError(
+            f'the gathered {stage} mesh does not hold the {expected} cells '
+            'the processor cases do', code='gather_incomplete',
+            details={'gathered_cells': gathered, 'processor_cells': expected})
+    files = {}
+    sources = {path.relative_to(folder).as_posix(): path
+               for path in sorted(mesh.rglob('*')) if path.is_file()}
+    zero = folder / '0'
+    for name in LEVEL_FIELDS:
+        for candidate in (zero / name, zero / f'{name}.gz'):
+            if candidate.is_file():
+                sources[candidate.relative_to(folder).as_posix()] = candidate
+    for name, path in sources.items():
+        files[name] = [path.stat().st_size, _hash_file(path)]
+    adopted = dict(manifest, layout='reconstructed', files=files,
+                   bytes=sum(size for size, _digest in files.values()),
+                   digest=files_digest(files),
+                   decomposed_digest=manifest.get('digest'),
+                   gathered_at=_now())
+    partial = folder / 'manifest.json.partial'
+    _write_json(partial, adopted)
+    os.replace(partial, folder / 'manifest.json')
+    for processor in sorted(folder.glob('processor[0-9]*')):
+        _remove(processor)
+    return adopted
+
+
+#: Plan 50 IP17. ``{case key: async gatherer(stage, revision)}``: who gathers
+#: a decomposed kept stage for this case (the facade, which runs OpenFOAM).
+_GATHERERS: dict[str, object] = {}
+
+
+def register_gatherer(case_path, gatherer) -> None:
+    """Name the coroutine function that gathers a kept stage of this case."""
+    if gatherer is None:
+        _GATHERERS.pop(_case_key(case_path), None)
+    else:
+        _GATHERERS[_case_key(case_path)] = gatherer
+
+
+async def gather_if_needed(case_path, stage: str,
+                           revision: str | None = None) -> bool:
+    """Gather that kept stage first if it is still decomposed (IP17).
+
+    ``True`` when a gather ran. Raises :class:`SnapshotError`
+    (``not_gathered``) when it is decomposed and nothing in this process can
+    gather it, and whatever the gatherer raises when the gather fails.
+    """
+    holder = revision or resolve(case_path).get(stage)
+    if not holder or not is_decomposed(case_path, stage, holder):
+        return False
+    gatherer = _GATHERERS.get(_case_key(case_path))
+    if gatherer is None:
+        raise SnapshotError(
+            f'the kept {stage} mesh is still split across processors and '
+            'cannot be gathered here', code='not_gathered',
+            details={'stage': stage, 'revision': holder})
+    await gatherer(stage, holder)
+    return True
+
+
 #: How many superseded copies of a stage :func:`prune` leaves (DP-1204):
 #: the one the newest copy replaced, so a re-run can be compared with it.
 SUPERSEDED_KEPT = 1
@@ -695,6 +942,13 @@ def _referenced(case_path) -> set[tuple[str, str]]:
     record = active(case)
     if record and record.get('revision') and record.get('stage'):
         keep.add((str(record['revision']), str(record['stage'])))
+    # Plan 50 IP16 (DP-6300). A recovery point that reads a kept stage
+    # instead of copying it holds that stage for as long as it is kept.
+    try:
+        from foammesh.core.mesh.recovery import MeshRecoveryService
+        keep.update(MeshRecoveryService().referenced_stages(case))
+    except OSError:
+        logger.debug('recovery references unreadable', exc_info=True)
     return keep
 
 
@@ -772,6 +1026,7 @@ def list_stages(case_path, revision: str | None = None) -> list[dict]:
         manifest = read_manifest(case_path, stage, holder) or {}
         listed.append({'stage': stage, 'revision': holder, 'path': str(folder),
                        'mesh_path': str(folder / 'constant' / 'polyMesh'),
+                       'layout': manifest.get('layout') or 'reconstructed',
                        'bytes': manifest.get('bytes'),
                        'captured_at': manifest.get('captured_at'),
                        'input': manifest.get('input'),
@@ -811,6 +1066,51 @@ def verify(case_path, stage: str, revision: str | None = None, *,
 def active(case_path) -> dict | None:
     document = _read_json(stages_root(case_path) / 'active.json')
     return document if isinstance(document, dict) else None
+
+
+def base_grid_is_live(case_path) -> bool:
+    """Plan 50 IP1 (DP-6224). Whether ``constant/polyMesh`` is the base grid.
+
+    Read from this case's own records -- ``active.json`` and the snappy
+    publications -- by :func:`foammesh.core.mesh.presentation.base_grid_on_screen`;
+    see there for the rule. Cheap: five ``stat`` calls and two small files.
+    Any failure answers ``False`` (the mesh is drawn as every other stage's).
+    """
+    from foammesh.core.mesh.presentation import base_grid_on_screen
+    try:
+        case = Path(case_path)
+        live = _live_identity(case)
+        if not live:
+            return False
+        document = _read_json(
+            case / 'foammesh' / 'workflow' / 'snappy-publications.json')
+        publications = (document.get('publications')
+                        if isinstance(document, dict) else None)
+        return base_grid_on_screen(live, active(case), publications)
+    except Exception:                                       # noqa: BLE001
+        logger.debug('base grid not decided for %s', case_path, exc_info=True)
+        return False
+
+
+def live_kept_stage(case_path) -> tuple[str, str] | None:
+    """``(revision, stage)`` of the kept snapshot the live mesh is a copy of.
+
+    Plan 50 IP16 (DP-6300). Read from ``active.json`` and the cheap mesh
+    identity (names, sizes, mtimes): a write to the live mesh since the copy
+    -- a patch rename, a transform -- answers ``None``. A snapshot whose mesh
+    is not gathered (kept decomposed) answers ``None`` too.
+    """
+    record = active(case_path)
+    if not record or not record.get('stage') or not record.get('revision'):
+        return None
+    stage, revision = str(record['stage']), str(record['revision'])
+    if not live_mesh_is(case_path, stage, revision):
+        return None
+    manifest = read_manifest(case_path, stage, revision)
+    if (manifest is None or manifest.get('digest') != record.get('digest')
+            or stage_mesh_path(case_path, stage, revision) is None):
+        return None
+    return revision, stage
 
 
 def live_mesh_is(case_path, stage: str, revision: str) -> bool:
@@ -863,6 +1163,12 @@ def restore(case_path, stage: str, revision: str, *, cancel=None,
     the copy moves in -- the one boundary :func:`recover` must roll back.
     """
     case = Path(case_path)
+    if is_decomposed(case, stage, revision):
+        # Plan 50 IP17. Gathered first, by :func:`gather_if_needed`.
+        raise SnapshotError(
+            f'the kept {stage} mesh is still split across processors; it is '
+            'gathered before it is put back', code='not_gathered',
+            details={'stage': stage, 'revision': revision})
     checked = verify(case, stage, revision, cancel=cancel)
     if not checked['ok']:
         raise SnapshotError(f'the kept {stage} snapshot is damaged',

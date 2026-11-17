@@ -155,13 +155,19 @@ SNAPPY_WORKFLOW = WorkflowDescriptor(
         # built. Renaming it costs a workflow-digest change, which resets
         # saved task progress with a notice -- cheaper than a standing lie in
         # the outline.
+        #
+        # Plan 50 IP25 (DP-6380). That cost is gone: `WorkflowDescriptor.
+        # digest` drops the prose keys (title, description), so a title moves
+        # without touching saved progress. The task is now the head of the
+        # one outline row, *Refinement*, that also settles Castellation, Snap
+        # and the snap fidelity (`ROW_TASKS`); the row is named by this title.
         WorkflowTask(
-            'snappy.surface_features', 'Surface features', 30,
+            'snappy.surface_features', 'Refinement', 30,
             depends_on=('snappy.base_grid',), engine_stage='surfaceFeatures',
             capabilities=(CapabilityRequirement('surfaceFeatures'),),
-            description='Extract feature edges from the prepared surfaces at '
-                        'the included angle. Refinement levels and regions '
-                        'are set on Castellation.',
+            description='Extract feature edges at the included angle, refine '
+                        'the background grid at the surfaces and regions '
+                        '(castellation), then snap it onto the surfaces.',
             artifacts=(_FEATURE_EDGES,), run_gated=True),
         WorkflowTask(
             'snappy.castellation', 'Castellation', 40,
@@ -398,6 +404,7 @@ class SnappyMeshingEngine:
     #: Plan 36 RP11. A snappy region is the space a seed point picks out.
     regions_are_solids = False
     publishes_native_mesh_file = False
+    in_process_stages = ()
 
     @property
     def descriptor(self) -> EngineDescriptor:
@@ -679,30 +686,15 @@ class SnappyMeshingEngine:
         guard tells the user to re-run an upstream stage, and doing so was what
         broke the case.
 
-        The first time a phase runs, the mesh it inherits is copied aside; every
-        later run of that phase restores the copy first, so a re-run is always
-        the same computation as the first run. Running a phase invalidates the
-        copies belonging to the phases after it, and ``blockMesh`` -- which
-        builds the background mesh from nothing -- discards all of them.
+        This used to copy each phase's input aside (``foammesh/mesh-snapshots``)
+        and restore it on a re-run. Plan 50 IP16 (DP-6302): that input is the
+        previous stage's kept snapshot (Plan 37 UF5), which the facade's
+        replay already puts back before the stage runs
+        (``_replay_stage_input``), regenerating it from the nearest kept
+        stage when it is missing. The second copy is no longer made, so
+        there is nothing left to prepare here.
         """
-        case = Path(case_path)
-        root = case / 'foammesh' / 'mesh-snapshots'
-        mesh = case / 'constant' / 'polyMesh'
-        key = self._snapshot_key(stage)
-        if key not in self.MESH_STAGE_ORDER:
-            if stage == 'blockMesh' and root.is_dir():
-                shutil.rmtree(root, ignore_errors=True)
-            return
-        for later in self.MESH_STAGE_ORDER[
-                self.MESH_STAGE_ORDER.index(key) + 1:]:
-            shutil.rmtree(root / later, ignore_errors=True)
-        snapshot = root / key
-        if snapshot.is_dir():
-            shutil.rmtree(mesh, ignore_errors=True)
-            shutil.copytree(snapshot, mesh)
-        elif mesh.is_dir():
-            root.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(mesh, snapshot)
+        return None
 
     async def run(self, request):
         """One whole snappy mesh: blockMesh through checkMesh (Plan 30 F-03).
@@ -731,10 +723,11 @@ class SnappyMeshingEngine:
     def snapshot(self, case_path, target: str = '') -> dict:
         """Keep the current mesh as *target*'s input, so a re-run is honest.
 
-        The same copy :meth:`prepare_stage_input_mesh` makes on a stage's first
-        run, taken on demand -- which is what a user asking to keep a mesh
-        before trying something else is asking for.
+        Plan 50 IP16 (DP-6302). Kept as the stage *target* reads from, in the
+        one place stages are kept (``foammesh/stages``), which a re-run of
+        *target* replays from -- not in a second folder of input copies.
         """
+        from foammesh.core.jobs import stage_snapshots
         case = Path(case_path)
         key = self._snapshot_key(target or self.MESH_STAGE_ORDER[0])
         if key not in self.MESH_STAGE_ORDER:
@@ -742,15 +735,16 @@ class SnappyMeshingEngine:
         mesh = case / 'constant' / 'polyMesh'
         if not (mesh / 'boundary').exists():
             raise ValueError('there is no mesh in the case to keep')
-        kept = case / 'foammesh' / 'mesh-snapshots' / key
-        shutil.rmtree(kept, ignore_errors=True)
-        kept.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(mesh, kept)
+        source = stage_snapshots.PREDECESSOR[key]
+        kept = stage_snapshots.capture(case, source, engine_id=self.engine_id)
+        if not kept.get('captured'):
+            raise ValueError(
+                f'the mesh could not be kept: {kept.get("reason") or "skipped"}')
         return {
             'engine_id': self.engine_id,
             'target': key,
-            'path': str(kept),
-            'saved': sorted(item.name for item in kept.iterdir()),
+            'path': str(kept.get('path') or ''),
+            'saved': sorted(Path(name).name for name in kept.get('files') or ()),
             # One shape across the seam (CP-05 item 6): a snapshot says what
             # it could not keep. A snappy stage snapshot is the mesh in the
             # case root and nothing else, so there is never anything to leave
@@ -845,22 +839,13 @@ class SnappyMeshingEngine:
         forgotten = builder.clear_stage_runs(case, stage)
 
         mesh = case / 'constant' / 'polyMesh'
-        snapshots = case / 'foammesh' / 'mesh-snapshots'
         restored = None
         if stage == 'blockMesh':
-            for target in (mesh, snapshots):
-                shutil.rmtree(target, ignore_errors=True)
+            shutil.rmtree(mesh, ignore_errors=True)
             for processor in case.glob('processor*'):
                 shutil.rmtree(processor, ignore_errors=True)
         else:
-            snapshot = snapshots / self._snapshot_key(stage)
-            if snapshot.is_dir():
-                shutil.rmtree(mesh, ignore_errors=True)
-                shutil.copytree(snapshot, mesh)
-                restored = str(snapshot)
-            for later in CaseBuilder.STAGE_ORDER[
-                    CaseBuilder.STAGE_ORDER.index(stage):]:
-                shutil.rmtree(snapshots / later, ignore_errors=True)
+            restored = self._restore_kept_input(case, stage)
 
         return {
             'stage': stage,
@@ -868,6 +853,32 @@ class SnappyMeshingEngine:
             'restored_from': restored,
             'has_mesh': (mesh / 'boundary').exists(),
         }
+
+    @staticmethod
+    def _restore_kept_input(case: Path, stage: str) -> str | None:
+        """Plan 50 IP16 (DP-6302). Put back the kept stage *stage* reads.
+
+        Reset restored the R84 input copy; the one copy of that mesh is now
+        the previous stage's kept snapshot. ``None`` when it is not kept (or
+        is kept decomposed and not gathered yet): the mesh is left, and the
+        next run of *stage* replays its input as it always does.
+        """
+        from foammesh.core.jobs import stage_snapshots
+        predecessor = stage_snapshots.PREDECESSOR.get(stage)
+        holder = (stage_snapshots.resolve(case).get(predecessor)
+                  if predecessor else None)
+        if not holder:
+            return None
+        folder = stage_snapshots.stages_root(case) / holder / predecessor
+        if not stage_snapshots.live_mesh_is(case, predecessor, holder):
+            try:
+                stage_snapshots.restore(case, predecessor, holder)
+            except (stage_snapshots.SnapshotError, OSError):
+                __import__('logging').getLogger(__name__).warning(
+                    'the kept %s was not restored by the reset',
+                    predecessor, exc_info=True)
+                return None
+        return str(folder)
 
     def run_stage(self, stage: str, *, db, case_path, executable: str) -> StageRun:
         definition = self.validate(stage)

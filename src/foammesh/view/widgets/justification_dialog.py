@@ -70,13 +70,28 @@ class JustificationDialog(QDialog):
         return self._editor.toPlainText().strip()
 
     @classmethod
-    def ask(cls, parent, title: str, prompt: str) -> str:
-        """The written reason, or '' when the user backed out.
+    def ask(cls, parent, title: str, prompt: str, then=None) -> str:
+        """``then(reason)``: the written reason, or '' when the user backed out.
 
         Empty is never a reason, so the two cases collapse into one and every
         caller reads the same way: ask, and act only on a non-empty answer.
+
+        Plan 50 IP19 (DP-6360). The dialog opens without a nested event loop,
+        so the answer arrives through *then* once the person closes it. The
+        return value is the answer when it came at once (a test answering
+        ``exec``) and '' while the dialog is still open.
         """
+        from widgets.async_dialog import openDialog
+
         dialog = cls(parent, title, prompt)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return ''
-        return dialog.justification()
+        answer = []
+
+        def finished(result):
+            reason = (dialog.justification()
+                      if result == QDialog.DialogCode.Accepted else '')
+            answer.append(reason)
+            if then is not None:
+                then(reason)
+
+        openDialog(dialog, finished)
+        return answer[0] if answer else ''

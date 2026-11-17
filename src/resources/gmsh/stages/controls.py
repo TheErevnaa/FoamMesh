@@ -336,6 +336,7 @@ class ControlsStage:
                                True, False, applied=False, note=reason)
             return 0
         corners = [int(item) for item in row.get('cornerPoints') or ()]
+        arrangement = str(row.get('surfaceArrangement') or 'Left')
         accepted = 0
         for tag in surfaces:
             refusal = self.structured_surface_refusal(int(tag), corners)
@@ -353,10 +354,14 @@ class ControlsStage:
                     # the same four corners scrambled produced the same 32
                     # triangles -- so they go in as the user wrote them.
                     self.gmsh.model.mesh.setTransfiniteSurface(
-                        int(tag), 'Left', list(corners))
+                        int(tag), arrangement, list(corners))
                     sides = self.side_nodes(int(tag), corners)
                 else:
-                    self.gmsh.model.mesh.setTransfiniteSurface(int(tag))
+                    if arrangement == 'Left':
+                        self.gmsh.model.mesh.setTransfiniteSurface(int(tag))
+                    else:
+                        self.gmsh.model.mesh.setTransfiniteSurface(
+                            int(tag), arrangement)
                     sides = sorted(
                         self.transfinite_curves[abs(int(curve))]['nodes']
                         for _d, curve in self.gmsh.model.getBoundary(

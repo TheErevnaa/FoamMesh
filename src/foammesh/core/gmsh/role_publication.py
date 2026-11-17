@@ -129,12 +129,40 @@ def _region_name(mesh, region_id) -> str:
                       or f'region_{region_id}')
 
 
-def internal_face_zones(mesh, document, names) -> list[dict]:
+def internal_face_keys(mesh, document, names) -> set:
+    """Sorted vertex rows of every mesh face the *names* surfaces hold.
+
+    DP-6131. The writer merges edge cells and must not remove a face a role
+    labels, so it is told which faces those are before it builds the topology.
+    """
+    from foammesh.core.gmsh.publish import SURFACE_TYPES
+
+    wanted = {int(tag) for (dim, tag), name in document.physical_names.items()
+              if dim == 2 and str(name) in set(names)}
+    if not wanted:
+        return set()
+    position = {tuple(point): index
+                for index, point in enumerate(mesh.points.tolist())}
+    keys = set()
+    # Plan 50 IP14: the surface rows only, not a row for every cell.
+    for element_type, physical, nodes in document.iter_elements(SURFACE_TYPES):
+        if int(physical) not in wanted:
+            continue
+        _kind, size = SURFACE_TYPES[element_type]
+        rows = [position.get(tuple(document.points[
+            document.node_index[node]].tolist())) for node in nodes[:size]]
+        if None not in rows:
+            keys.add(tuple(sorted(rows)))
+    return keys
+
+
+def internal_face_zones(mesh, document, names, topology=None) -> list[dict]:
     """``[{'name', 'labels', 'flips'}]``: each internal face's mesh faces.
 
     The faces are found by their points in the interior faces of the
     writer's own topology (the one ``FoamPolyMeshWriter`` numbered the faces
-    file with), so the labels are the written face labels.
+    file with), so the labels are the written face labels. Pass the
+    *topology* the writer will use when it is not the plain one.
     """
     from foammesh.core.export.poly_mesh_writer import _foam_topology
     from foammesh.core.gmsh.publish import SURFACE_TYPES
@@ -146,7 +174,8 @@ def internal_face_zones(mesh, document, names) -> list[dict]:
         return []
     position = {tuple(point): index
                 for index, point in enumerate(mesh.points.tolist())}
-    topology = _foam_topology(mesh)
+    if topology is None:
+        topology = _foam_topology(mesh)
     internal = int(topology.internal_count)
     keys = {}
     for label in range(internal):
@@ -156,8 +185,9 @@ def internal_face_zones(mesh, document, names) -> list[dict]:
     found: dict[str, dict] = {name: {'labels': [], 'flips': [], 'missed': 0}
                               for name in wanted.values()}
     points = mesh.points
-    for element_type, physical, nodes in document.elements:
-        if element_type not in SURFACE_TYPES or int(physical) not in wanted:
+    # Plan 50 IP14: the surface rows only, not a row for every cell.
+    for element_type, physical, nodes in document.iter_elements(SURFACE_TYPES):
+        if int(physical) not in wanted:
             continue
         _kind, size = SURFACE_TYPES[element_type]
         rows = [position.get(tuple(document.points[
@@ -231,7 +261,7 @@ def write_face_zones(poly_mesh: Path, zones) -> None:
 # Non-conformal interfaces -> the regions they join
 # --------------------------------------------------------------------------- #
 
-def non_conformal_couplings(mesh, pairs) -> list[dict]:
+def non_conformal_couplings(mesh, pairs, topology=None) -> list[dict]:
     """The post-split couplings for *pairs*, each naming its two regions.
 
     ``pairs`` are ``{'name', 'masterSolverName', 'slaveSolverName'}``. A side
@@ -242,7 +272,6 @@ def non_conformal_couplings(mesh, pairs) -> list[dict]:
         return []
     from foammesh.core.export.poly_mesh_writer import _foam_name
 
-    regions = _cell_regions(mesh)
     names_by_id = {}
     for block in mesh.boundary_blocks:
         for patch_id in np.unique(block.patch_ids):
@@ -252,7 +281,10 @@ def non_conformal_couplings(mesh, pairs) -> list[dict]:
                 or f'patch_{int(patch_id)}')
     from foammesh.core.export.poly_mesh_writer import _foam_topology
 
-    topology = _foam_topology(mesh)
+    if topology is None:
+        topology = _foam_topology(mesh)
+    regions = (topology.cell_regions if topology.cell_regions is not None
+               else _cell_regions(mesh))
     internal = int(topology.internal_count)
     owners = topology.owner[internal:]
     patch_ids = topology.patch_ids
@@ -338,6 +370,7 @@ def recorded_couplings(case_path) -> list[dict]:
 
 
 __all__ = ('RolePublication', 'RolePublicationError', 'apply_role_metadata',
-           'couplings_path', 'internal_face_zones', 'non_conformal_couplings',
+           'couplings_path', 'internal_face_keys', 'internal_face_zones',
+           'non_conformal_couplings',
            'record_couplings', 'recorded_couplings', 'role_publication',
            'write_face_zones')

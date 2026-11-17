@@ -51,7 +51,9 @@ class StageDefinition:
     expected_artifacts: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
     mutation: bool = True
-    timeout_seconds: int = 3600
+    # Plan 50 IP2 (DP-6230): a mesher stage has no time limit unless the
+    # caller sends one (Preferences > Stage time limit).
+    timeout_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,12 @@ class MeshingEngine(Protocol):
     #: file (SU2 route, second order) and no polyMesh, so the result strip
     #: counts that file. Gmsh does; snappy always publishes a polyMesh.
     publishes_native_mesh_file: bool = False
+
+    #: The stages this engine runs inside the application's own process, so
+    #: they name no program to find or launch (Gmsh publishes a polyMesh from
+    #: the run's own mesh file). The facade asks this rather than the
+    #: engine's name (F-14).
+    in_process_stages: tuple = ()
 
     #: What one whole-mesh run of this engine performs, in order.
     ATOMIC_RUN_TASKS: tuple = ()

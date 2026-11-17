@@ -363,6 +363,9 @@ class DecompositionMethod(Enum):
     SIMPLE = 'simple'
     METIS = 'metis'
     KAHIP = 'kahip'
+    #: Plan 50 IP17 (DP-6304). Offered only when the runtime reports
+    #: ``libptscotchDecomp.so``; never the default.
+    PTSCOTCH = 'ptscotch'
 
 
 class GmshQualityMeasure(Enum):
@@ -544,6 +547,16 @@ class GmshTransfiniteLaw(Enum):
     PROGRESSION = 'progression'
     BUMP = 'bump'
     BETA = 'beta'
+
+
+class GmshSurfaceArrangement(Enum):
+    """How a transfinite surface's triangles lie when it is not recombined
+    (Gmsh's ``setTransfiniteSurface`` arrangement)."""
+
+    LEFT = 'left'
+    RIGHT = 'right'
+    ALTERNATE_LEFT = 'alternateleft'
+    ALTERNATE_RIGHT = 'alternateright'
 
 
 class GmshLayerMode(Enum):
@@ -854,6 +867,19 @@ class ThicknessModel(Enum):
     FINAL_AND_EXPANSION = 'finalAndExpansion'
     OVERALL_AND_EXPANSION = 'overallAndExpansion'
     FIRST_AND_RELATIVE_FINAL = 'firstAndRelativeFinal'
+
+
+class FirstLayerMode(Enum):
+    """How snappy's layer stack is sized (Plan 50 IP27, SN-9).
+
+    ``RELATIVE`` writes each layer group's own values, which the sizing
+    proposal fills relative to the wall cell -- what every case wrote before.
+    ``FIRST_LAYER_HEIGHT`` writes one stack for every growing patch: the
+    first layer in metres, an expansion ratio and a count, ``relativeSizes
+    false``.
+    """
+    RELATIVE = 'relative'
+    FIRST_LAYER_HEIGHT = 'first_layer_height'
 
 
 class FeatureSnapType(Enum):
@@ -1503,6 +1529,10 @@ gmshCurveControl = {
     # structured surface as well, which needs a CAD surface with three or four
     # corners -- a tessellated import has none, and the run says so.
     'transfiniteSurface': BoolType(False),
+    # DP-6164. The arrangement the structured surface is built with; Left is
+    # Gmsh's default and what every row used before this field existed.
+    'surfaceArrangement': EnumType(GmshSurfaceArrangement).setDefault(
+        GmshSurfaceArrangement.LEFT),
     # Plan 31 FC-C. Which corners Gmsh should interpolate between, as point
     # tags, blank to let it choose. It only matters on a face with more than
     # four candidate corners, and there it is the whole difference between a
@@ -2272,7 +2302,10 @@ schema = {
         # patch, and then offered nothing to act on: the span was six
         # read-only labels and the only remedy on the page was to model a
         # bounding Hex6 by hand. Zero is the block the page has always
-        # derived, so a project that never touches this writes what it wrote.
+        # derived -- except, Plan 50 IP26 (DP-6425), in target-size mode
+        # round closed geometry, where the writer keeps one base cell of
+        # clear space (`CaseBuilder.default_clearance`); open surfaces keep
+        # the flush block their open ends rely on.
         'standoff': FloatType().setLowLimit(0).setDefault(0),
         # Per-axis ``simpleGrading``.  One means uniform, which is what the
         # background block was hard-coded to before these existed. Plan 37
@@ -2347,7 +2380,10 @@ schema = {
         # refinement group, made once so a group the user removes stays
         # removed. The mesher never reads it.
         'defaulted': BoolType(False),
-        'maxGlobalCells': IntType().setLowLimit(1).setDefault('1e8'),
+        # Plan 50 IP3 (DP-6231): 2,000,000,000 (resource_budget.SAFE_MAX_CELLS)
+        # means "from memory": the writer derives the limit from free RAM
+        # (CaseBuilder._cell_limits). Any other value is written as typed.
+        'maxGlobalCells': IntType().setLowLimit(1).setDefault('2000000000'),
         'maxLocalCells': IntType().setLowLimit(1).setDefault('1e7'),
         'minRefinementCells': IntType().setLowLimit(0).setDefault(0),
         'maxLoadUnbalance': FloatType().setRange(0, 1).setDefault('0.5'),
@@ -2433,6 +2469,16 @@ schema = {
         # group left an empty list the next refresh filled again. Not a mesh
         # input: nothing the writer reads, so writing it stales nothing.
         'defaulted': BoolType(False),
+        # Plan 50 IP27 (SN-9, DP-6390). An optional case-wide first-layer
+        # height. Off (`relative`) the groups' own values are written, as
+        # before; on, every growing group is written with these four.
+        'firstLayerMode': EnumType(FirstLayerMode).setDefault(
+            FirstLayerMode.RELATIVE),
+        'firstLayerHeight': FloatType().setLowLimit(0, False).setDefault(
+            0.001),
+        'firstLayerExpansionRatio': FloatType().setLowLimit(0, False)
+        .setDefault(1.2),
+        'firstLayerCount': IntType().setLowLimit(1).setDefault(5),
         'nGrow': IntType().setLowLimit(0).setDefault(0),
         # Plan 40 U1 (DEF, 2026-10-11). The six layer defaults below marked
         # "U1" were measured on the footer-only defaults walks (layer stage

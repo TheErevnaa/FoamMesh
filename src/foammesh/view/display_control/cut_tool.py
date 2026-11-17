@@ -65,6 +65,7 @@ from foammesh.view.main_window.shortcut_registry import adopt as adoptShortcut
 from . import section_case_fields as case_fields
 from .section_panel import (
     MAX_PLANES, CutType, SectionPanel, SectionPlaneState, _modeFor)
+from foammesh.support.tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -1275,7 +1276,7 @@ class CutTool(QObject):
             if close is not None:
                 close()
             return
-        asyncio.ensure_future(work)
+        spawn(work, what='Drawing the cut')
 
     # -- Plan 37 UF8: a large drag ------------------------------------------ #
 
@@ -1479,7 +1480,7 @@ class CutTool(QObject):
             self._recolour()
             self._view.refresh()
 
-        asyncio.ensure_future(_compute())
+        spawn(_compute(), what='Colouring the cut')
 
     def _volumeActors(self):
         manager = getattr(app.window, 'meshManager', None)
@@ -1766,7 +1767,7 @@ class CutTool(QObject):
                     self._recolour()
                     self._view.refresh()
 
-            loop.create_task(run())
+            spawn(run(), what='Colouring the cut')
         return kept[1] if kept is not None else None
 
     def _gmshFieldState(self, key, wanted):
@@ -1828,7 +1829,7 @@ class CutTool(QObject):
                 self._recolour()
                 self._view.refresh()
 
-        asyncio.ensure_future(_read())
+        spawn(_read(), what='Reading the cut field')
 
     def _readCaseField(self, meshDir, key):
         """Read *key* from *meshDir*: off the GUI thread when an event
@@ -1860,7 +1861,7 @@ class CutTool(QObject):
                 self._recolour()
                 self._view.refresh()
 
-        asyncio.ensure_future(_read())
+        spawn(_read(), what='Reading the cut field')
 
     # -- Plan 37 UF10: the section worker ------------------------------- #
 
@@ -2130,15 +2131,22 @@ class CutTool(QObject):
                 return True
 
             async def run():
-                self._takeSides(await asyncio.to_thread(work))
+                try:
+                    keeps = await asyncio.to_thread(work)
+                except Exception as error:                  # noqa: BLE001
+                    self._keepDone(None, str(error))
+                    raise
+                self._takeSides(keeps)
 
-            asyncio.ensure_future(run())
+            self._keepStarted()
+            spawn(run(), what='Keeping the chosen sides')
             return True
         case, _why = self._workerTarget()
         if case is None or self._jobs is None:
             return False
         self._prefer = prefer.value
         self._cellsCase = case
+        self._keepStarted()
         self._submitWorker(self._workerRequest(case))
         return True
 
@@ -2146,6 +2154,36 @@ class CutTool(QObject):
         """Put the chosen keep sides ``{plane index: +-1}`` on the planes."""
         if keeps:
             self._panel.setKeeps(keeps)
+        self._keepDone(keeps)
+
+    # Plan 48 AG. Keep larger / smaller finishes off the GUI thread (or in the
+    # section worker); the local API waits for the sides as a person does.
+    _keepWaiter = None
+
+    def _keepStarted(self):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._keepWaiter = None
+            return
+        self._keepDone(None, 'superseded by another Keep press')
+        self._keepWaiter = loop.create_future()
+
+    def _keepDone(self, keeps, why=''):
+        waiter, self._keepWaiter = self._keepWaiter, None
+        if waiter is not None and not waiter.done():
+            waiter.set_result({'keeps': dict(keeps or {}), 'why': why})
+
+    def keepPending(self):
+        """Plan 48 AG. The Keep larger / smaller still working out its
+        sides: a future of ``{keeps, why}``, or ``None``."""
+        waiter = self._keepWaiter
+        return waiter if waiter is not None and not waiter.done() else None
+
+    def stageComparePending(self):
+        """Plan 48 AG. The stage comparison still being cut, or ``None``."""
+        task = self._compareTask
+        return task if task is not None and not task.done() else None
 
     def colourScale(self) -> ScalePolicy:
         return self._colourRange.policy()
@@ -2270,8 +2308,12 @@ class CutTool(QObject):
             self._workerState = WORKER_REFUSED
             self._workerMessage = completion.message or completion.reason
             self._publishStatus()
+            if completion.request.prefer:
+                self._keepDone(None, self._workerMessage)
             return
         chosen = completion.manifest.get('resolved_keeps')
+        if completion.request.prefer and not chosen:
+            self._keepDone(None, 'the section worker chose no sides')
         if completion.request.prefer and chosen:
             # VI10b. The sides were asked for, not a cut: take them and cut
             # again with them (the answer is not drawn).
@@ -2279,7 +2321,7 @@ class CutTool(QObject):
             self._takeSides({int(index): keep
                              for index, keep in chosen.items()})
             return
-        asyncio.ensure_future(self._drawDelivered(completion))
+        spawn(self._drawDelivered(completion), what='Drawing the cut')
 
     async def _drawDelivered(self, completion):
         manifest = completion.manifest

@@ -9,7 +9,7 @@ Generated from the option catalogue by `scripts/generate_gmsh_help_docs.py`; do 
 | Structure and volume controls | 18 |
 | Layers | 2 |
 | Periodic | 3 |
-| Generate mesh | 50 |
+| Generate mesh | 56 |
 | Mesh quality | 9 |
 | Export | 82 |
 | Display | 117 |
@@ -186,11 +186,15 @@ Advanced section of the Generate row; the Options panel there lists every option
 | Option | Default | Unit | Choices | Help |
 |---|---|---|---|---|
 | `Mesh.ElementOrder` | 1.0 |  |  | Element order (1: first order elements) |
+| `Mesh.HighOrderAdaptBlobDistFactor` | 2.0 |  |  | Distance adaptation factor (adaptive strategy) |
+| `Mesh.HighOrderAdaptBlobLayerFactor` | 2.0 |  |  | Number of layer adaptation factor (adaptive strategy) |
 | `Mesh.HighOrderCurveOuterBL` | 0.0 |  |  | Curve also the outer surface of the boundary layer in the fast curving algorithm (0 = do not curve, 1 = curve according to boundary, 2 = curve without breaking outer elements) |
 | `Mesh.HighOrderDistCAD` | off |  |  | Try to optimize distance to CAD in high-order optimizer? |
+| `Mesh.HighOrderDistanceFactor` | 12.0 |  |  | High-order optimization distance factor (patch size) |
 | `Mesh.HighOrderFastCurvingNewAlgo` | off |  |  | Curve boundary layer with new "fast curving" algorithm (experimental) |
 | `Mesh.HighOrderFixBoundaryNodes` | 0.0 |  | (0, 'no'), (1, 'all'), (2, 'periodic') | Fix all (1) or periodic (2) boundary nodes during high-order optimization? |
 | `Mesh.HighOrderIterMax` | 100.0 |  |  | Maximum number of iterations in high-order optimization pass |
+| `Mesh.HighOrderMaxAdaptBlob` | 2.0 |  |  | Maximum number of patch adaptation iterations (adaptive strategy) |
 | `Mesh.HighOrderMaxAngle` | 0.1745329277777778 |  |  | Maximum angle between layers of BL elements for the detection of columns in the fast curving algorithm |
 | `Mesh.HighOrderMaxInnerAngle` | 0.5235987833333333 |  |  | Maximum angle between edges/faces within layers of BL triangles/tets for the detection of columns in the fast curving algorithm |
 | `Mesh.HighOrderMaxRho` | 0.3 |  |  | Maximum min/max ratio of edge/face size for the detection of BL element columns in the fast curving algorithm |
@@ -200,8 +204,10 @@ Advanced section of the Generate row; the Options panel there lists every option
 | `Mesh.HighOrderPoissonRatio` | 0.33 |  |  | Poisson ratio of the material used in the elastic smoother for high-order meshes (between -1.0 and 0.5, excluded) |
 | `Mesh.HighOrderPrimSurfMesh` | off |  |  | Try to fix flipped surface mesh elements in high-order optimizer? |
 | `Mesh.HighOrderSkipQualityCheck` | 0.0 |  |  | Skip element quality check after high-order mesh generation |
+| `Mesh.HighOrderStrategy` | 0.0 |  | (0, 'Disjoint strong'), (1, 'Adaptive one-by-one'), (2, 'Disjoint weak') | High-order optimization patch strategy |
 | `Mesh.HighOrderThresholdMax` | 2.0 |  |  | Maximum threshold for high-order element optimization |
 | `Mesh.HighOrderThresholdMin` | 0.1 |  |  | Minimum threshold for high-order element optimization |
+| `Mesh.HighOrderWeight` | 1.0 |  |  | High-order optimization weight on node displacement |
 | `Mesh.MeshOnlyEmpty` | 0.0 |  |  | Mesh only entities that have no existing mesh |
 | `Mesh.MeshOnlyVisible` | 0.0 |  |  | Mesh only visible entities (experimental) |
 | `Mesh.MetisAlgorithm` | 1.0 |  | (1, 'Recursive'), (2, 'K-way') | METIS partitioning algorithm 'ptype' (1: Recursive, 2: K-way) |
@@ -269,7 +275,7 @@ Advanced section of the Export row.
 | `Mesh.CreateTopologyMsh2` | 0.0 |  |  | Attempt to (re)create the model topology when reading MSH2 files |
 | `Mesh.FirstElementTag` | 1.0 |  |  | First tag (>= 1) of mesh elements when generating or renumbering a mesh |
 | `Mesh.FirstNodeTag` | 1.0 |  |  | First tag (>= 1) of mesh nodes when generating or renumbering a mesh |
-| `Mesh.Format` | 10.0 |  | (1, 'msh'), (2, 'unv'), (10, 'auto'), (16, 'vtk'), (19, 'vrml'), (21, 'mail'), (26, 'pos stat'), (27, 'stl'), (28, 'p3d'), (30, 'mesh'), (31, 'bdf'), (32, 'cgns'), (33, 'med'), (34, 'diff'), (38, 'ir3'), (39, 'inp'), (40, 'ply2'), (41, 'celum'), (42, 'su2'), (47, 'tochnog'), (49, 'neu'), (50, 'matlab') | Mesh output format (1: msh, 2: unv, 10: auto, 16: vtk, 19: vrml, 21: mail, 26: pos stat, 27: stl, 28: p3d, 30: mesh, 31: bdf, 32: cgns, 33: med, 34: diff, 38: ir3, 39: inp, 40: ply2, 41: celum, 42: su2, 47: tochnog, 49: neu, 50: matlab) |
+| `Mesh.Format` | 10.0 |  | (1, 'msh'), (2, 'unv'), (10, 'auto'), (16, 'vtk'), (19, 'vrml'), (21, 'mail'), (26, 'pos stat'), (27, 'stl'), (28, 'p3d'), (31, 'bdf'), (32, 'cgns'), (33, 'med'), (34, 'diff'), (38, 'ir3'), (39, 'inp'), (40, 'ply2'), (41, 'celum'), (42, 'su2'), (47, 'tochnog'), (49, 'neu'), (50, 'matlab') | Mesh output format (1: msh, 2: unv, 10: auto, 16: vtk, 19: vrml, 21: mail, 26: pos stat, 27: stl, 28: p3d, 31: bdf, 32: cgns, 33: med, 34: diff, 38: ir3, 39: inp, 40: ply2, 41: celum, 42: su2, 47: tochnog, 49: neu, 50: matlab) |
 | `Mesh.IgnoreUnknownSections` | 0.0 |  |  | Skip unknown sections when reading meshes in the MSH4 format (otherwise the contents of these sections are stored as model attributes) |
 | `Mesh.MedFileMinorVersion` | -1.0 |  |  | Minor version of the MED file format to use (-1: use minor version of the MED library) |
 | `Mesh.MedImportGroupsOfNodes` | 0.0 |  | (0, 'no'), (1, 'create geometrical point for each node') | Import groups of nodes (0: no; 1: create geometrical point for each node)? |

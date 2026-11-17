@@ -27,6 +27,7 @@ from .walls_default import apply_project_angle, ensure_walls_group
 from foammesh.view.theming.metrics import (
     CompactDoubleSpinBox, apply_form_metrics, unit_cell,
 )
+from widgets import async_dialog
 
 #: What ``surfaceFeatures`` extracts with when no group says otherwise
 #: (``case_builder._surface_angle``, and the schema's own default).
@@ -252,9 +253,12 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         project = included_angle(project_angle(self._configuration()))
         # The widest configured angle keeps the most edges, so showing it is
         # the reading that cannot understate what extraction will produce.
-        self._angle.blockSignals(True)
-        self._angle.setValue(angles[-1] if angles else project)
-        self._angle.blockSignals(False)
+        # Plan 50 (DP-6343/6344). A refresh while the box is being typed in
+        # leaves what was typed, and the cursor, alone.
+        if not _being_typed_in(self._angle):
+            self._angle.blockSignals(True)
+            self._angle.setValue(angles[-1] if angles else project)
+            self._angle.blockSignals(False)
         self._angle.setEnabled(True)
         described = self.tr(INCLUDED_ANGLE_HELP)
         self._angle.setToolTip(described)
@@ -283,6 +287,8 @@ class SnappySurfaceFeaturesPage(EngineTaskPage):
         refinement group's included angle); see ``walls_default``.
         """
         value = float(self._angle.value())
+        # Written now: what the store answers may be shown again.
+        self._angle.lineEdit().setModified(False)
 
         def written(outcome) -> None:
             if outcome is True:
@@ -448,14 +454,17 @@ class _FeatureFilterGroup(FieldGroupPage):
         self._browse = button
 
     def _browse_added_features(self, editor) -> None:
-        path, _selected = QFileDialog.getOpenFileName(
+        def chosen(path, _selected=''):
+            if path:
+                editor.set_value(path)
+                editor.valueChanged.emit(editor.field_id, editor.value())
+
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getOpenFileName(
             self, self.tr('Added feature edges'), str(editor.value() or ''),
             self.tr('Extended feature edge mesh '
                     '(*.extendedFeatureEdgeMesh *.extendedFeatureEdgeMesh.gz)'
-                    ';;All files (*)'))
-        if path:
-            editor.set_value(path)
-            editor.valueChanged.emit(editor.field_id, editor.value())
+                    ';;All files (*)'), then=chosen)
 
 
 class _FeatureDiagnosticsGroup(FieldGroupPage):
@@ -486,3 +495,11 @@ class _FeatureDiagnosticsGroup(FieldGroupPage):
         'Surface curvature is deliberately absent: on OpenFOAM 13 it was '
         'measured to crash surfaceFeatures outright, on a clean sphere, so '
         'there is nothing here to switch it on with.')
+
+
+def _being_typed_in(spin) -> bool:
+    """True while *spin* has focus and holds text typed since it was set."""
+    try:
+        return bool(spin.hasFocus() and spin.lineEdit().isModified())
+    except RuntimeError:
+        return False

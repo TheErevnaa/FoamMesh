@@ -645,6 +645,10 @@ CONTROLS = _register(
                 'mesh.setTransfiniteSurface', native_kind=API,
                 note='CAD only: a tessellated surface has no corner points '
                      'for Gmsh to interpolate between'),
+    GmshControl('gmsh/curveControls/{id}/surfaceArrangement', RUNNER,
+                'mesh.setTransfiniteSurface.arrangement', native_kind=API,
+                note='Left, Right, AlternateLeft or AlternateRight; how the '
+                     'triangles of an unrecombined structured surface lie'),
     GmshControl('gmsh/curveControls/{id}/cornerPoints', DERIVATION,
                 'mesh.setTransfiniteSurface.cornerTags', 'gmsh.curves.v3',
                 native_kind=API,

@@ -29,6 +29,7 @@ from foammesh.view.theming import elevation, fonts
 from foammesh.view.theming.metrics import (
     FORM_LABEL_SPACING, FRAME_WIDTH, GAP, GAP_TIGHT)
 from foammesh.view.widget_factory import make
+from widgets import async_dialog
 
 #: Plan 44 MF22 (mockup ``.snap``): the panel is 330 px wide, the label column
 #: 78 px, padding 10 12 12, gap 8, and it sits at clear-left + 16, top 56.
@@ -478,12 +479,16 @@ class SnapshotPopover(QFrame):
 
     def _chooseFolder(self) -> None:
         # A popover closes when a dialog takes focus; reopen it afterwards.
-        chosen = QFileDialog.getExistingDirectory(
-            self.window(), self.tr('Save the snapshot in'), self._directory or '')
-        if chosen:
-            self._directory = chosen
-            self._showFolder()
-        self.show()
+        def chosen(folder):
+            if folder:
+                self._directory = folder
+                self._showFolder()
+            self.show()
+
+        # Plan 50 IP19: no nested event loop.
+        async_dialog.getExistingDirectory(
+            self.window(), self.tr('Save the snapshot in'), self._directory or '',
+            then=chosen)
 
     def _useCaseFolder(self) -> None:
         self._directory = None

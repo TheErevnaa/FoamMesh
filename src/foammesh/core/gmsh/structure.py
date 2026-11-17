@@ -6,6 +6,7 @@ picking and the arrangement the API takes:
 ====================  ==========================================  =========
 kind                  Gmsh call                                   entities
 ====================  ==========================================  =========
+transfiniteCurve      ``mesh.setTransfiniteCurve(tag, n, law, c)`` curves
 transfiniteSurface    ``mesh.setTransfiniteSurface(tag, arr, c)``  surfaces
 transfiniteVolume     ``mesh.setTransfiniteVolume(tag, c)``        volumes
 transfiniteAutomatic  ``mesh.setTransfiniteAutomatic(d, a, r)``    surfaces / volumes / all
@@ -86,7 +87,30 @@ _CURVE_ELEMENTS = Param(
     '(setTransfiniteCurve). 0: the edges are set elsewhere, on the Curve '
     'controls step.', low=0, high=10000)
 
+#: ``setTransfiniteCurve`` meshTypes, in the order the parameter counts.
+LAWS = ((0, 'Progression'), (1, 'Bump'), (2, 'Beta'))
+LAW_NAMES = tuple(name for _n, name in LAWS)
+
 KINDS = {k.id: k for k in (
+    Kind('transfiniteCurve', 'Transfinite curve',
+         'mesh.setTransfiniteCurve', (1,),
+         'Give each of these curves its own number of elements and spacing '
+         '(Gmsh: Mesh → Define → Transfinite → Curve). It overrides a Curve '
+         'control or the edge count of a surface row on the same curve. Opposite '
+         'sides of a structured surface need the same count.',
+         (Param('elements', 'int', 10, 'Elements along each curve.',
+                low=1, high=10000),
+          Param('law', 'enum', 0,
+                'Progression: each element is the coefficient times the last. '
+                'Bump: the coefficient below 1 clusters elements at both '
+                'ends, above 1 in the middle. Beta: the beta law of Gmsh.',
+                choices=LAWS),
+          Param('coefficient', 'float', 1.0,
+                'Ratio for Progression, strength for Bump and Beta; 1 is '
+                'uniform for Progression.', low=0.001, high=1000.0),
+          Param('reverse', 'bool', False,
+                'Grade from the other end of the curve (Progression and '
+                'Beta; a Bump is symmetric).'))),
     Kind('transfiniteSurface', 'Transfinite surface',
          'mesh.setTransfiniteSurface', (2,),
          'Mesh these surfaces as a structured grid between their corner '
@@ -344,7 +368,8 @@ def validate(rows) -> Structure:
             if other != op.name:
                 raise StructureRefusal(
                     f'structure {other!r} and {op.name!r} both make '
-                    f'{("surface", "volume")[op.dim - 2]} {tag} transfinite; '
+                    f'{("point", "curve", "surface", "volume")[op.dim]} {tag} '
+                    'transfinite; '
                     'keep one')
     return Structure(ops=tuple(ops), warnings=tuple(warnings))
 
@@ -468,7 +493,8 @@ def precheck_on_session(call, dim, tags, corners=()) -> dict:
 def precheck_row_on_session(call, row: dict) -> dict:
     """The pre-check of one stored row (its tags and picked corners)."""
     kind = KINDS.get(row.get('kind'))
-    if kind is None or row.get('kind') == 'transfiniteAutomatic':
+    if kind is None or row.get('kind') in ('transfiniteAutomatic',
+                                            'transfiniteCurve'):
         raise StructureRefusal('only a transfinite surface or volume row '
                                'has a corner pre-check')
     dim = 2 if row['kind'] == 'transfiniteSurface' else 3

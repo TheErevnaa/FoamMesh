@@ -57,11 +57,18 @@ MAX_GLOBAL_PATH = 'castellation/maxGlobalCells'
 
 
 def max_global_cells(db) -> int | None:
-    """The case's ``maxGlobalCells`` (DP-2401), or ``None``."""
+    """The case's ``maxGlobalCells`` (DP-2401), or ``None``.
+
+    ``None`` too for the stored default, which means "from memory" (Plan 50
+    IP3): the limit a run gets is then what the free RAM holds, not a number
+    to compare the background against."""
+    from foammesh.support.resource_budget import SAFE_MAX_CELLS
+
     try:
-        return int(float(db.getValue(MAX_GLOBAL_PATH)))
+        value = int(float(db.getValue(MAX_GLOBAL_PATH)))
     except Exception:                                       # noqa: BLE001
         return None
+    return None if value == SAFE_MAX_CELLS else value
 
 
 def current(client=None, pending=None, db=None, want_budget=False):
@@ -95,6 +102,28 @@ def prepare(label: QLabel, object_name: str) -> QLabel:
     return label
 
 
+def folded_summary(text: str) -> str:
+    """The one line a folded estimate shows: each warning, its first sentence.
+
+    DP-6483. The whole warning line was the summary, and the budget line
+    opens with its numbers ("maxGlobalCells is 30,000 and the background
+    alone is about 70,640 cells. Warning: ..."), so at the settings column's
+    width the fold cut it before the warning. The line now starts at the
+    word Warning; the whole text is still one click (or the tooltip) away.
+    """
+    import re
+
+    found = []
+    for line in str(text or '').splitlines():
+        at = line.find('Warning')
+        if at < 0:
+            continue
+        rest = line[at:]
+        end = re.search(r'\.(\s|$)', rest)
+        found.append(rest[:end.start() + 1] if end else rest)
+    return ' '.join(found)
+
+
 def show(label, client=None, pending=None, db=None, *, budget=False):
     """Fill ``label`` and return the estimate it shows.
 
@@ -117,8 +146,7 @@ def show(label, client=None, pending=None, db=None, *, budget=False):
     if callable(summary):
         # Plan 44 FX2. A folded estimate (Castellation) keeps any warning on
         # its one line; with none it is the estimate itself on one line.
-        warnings = [line for line in text.splitlines() if 'Warning' in line]
-        summary(' '.join(warnings))
+        summary(folded_summary(text))
     label.setVisible(found is not None)
     label.setProperty('warning', bool(found is not None and found.over_ram))
     return found

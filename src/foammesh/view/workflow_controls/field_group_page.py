@@ -40,6 +40,7 @@ from .page_action import PageAction
 from .page_filter import make_filter_box
 from .tiers import expert_visibility, make_expert_toggle
 from widgets import async_message_box as messages
+from foammesh.support.tasks import spawn
 
 
 class FieldGroupPage(QWidget):
@@ -401,6 +402,10 @@ class FieldGroupPage(QWidget):
     def _on_filter_text(self, _text: str = '') -> None:
         self.setFilterText(self._filter.text())
 
+    def filterBox(self):
+        """The page's own filter box (shown while the page stands alone)."""
+        return self._filter
+
     def visibleFieldIds(self) -> tuple:
         return tuple(field_id for field_id, editor in self._editors.items()
                      if editor.isRowShown())
@@ -725,13 +730,16 @@ class ExecutionPreferencesPage(FieldGroupPage):
         # Only snappy decomposes; a Gmsh case has no processor cases.
         button.setVisible(engine_holds(self._engine_id, *WHEN_SNAPPY))
 
-    def _askTarget(self, current: int) -> int | None:
-        from PySide6.QtWidgets import QInputDialog
-        value, accepted = QInputDialog.getInt(
+    def _askTarget(self, current: int, then) -> None:
+        """``then(count)``, or ``then(None)`` when cancelled (Plan 50 IP19:
+        asked without a nested event loop)."""
+        from widgets import async_dialog
+        async_dialog.getInt(
             self, self.tr('Change core count'),
             self.tr('Spread the decomposed mesh over (cores)'),
-            self.redistributeDefault(current), 2, 4096, 1)
-        return int(value) if accepted else None
+            self.redistributeDefault(current), 2, 4096, 1,
+            then=lambda value, accepted: then(
+                int(value) if accepted else None))
 
     def redistributeDefault(self, current: int = 0) -> int:
         """The count the redistribute dialog opens on.
@@ -755,12 +763,13 @@ class ExecutionPreferencesPage(FieldGroupPage):
             current = self._snappyCount(policy, host)[0]
         return max(int(current), 2)
 
-    def _confirm(self, text: str) -> bool:
-        answer = messages.question(
+    def _confirm(self, text: str, then) -> None:
+        """``then(True)`` when the person chose Yes (Plan 50 IP19)."""
+        messages.askQuestion(
             self, self.tr('Change core count'), text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Yes
+            QMessageBox.StandardButton.Cancel,
+            then=lambda answer: then(answer == QMessageBox.StandardButton.Yes))
 
     def _tell(self, text: str, warning: bool = False) -> None:
         box = messages.warning if warning else messages.information
@@ -803,9 +812,11 @@ class ExecutionPreferencesPage(FieldGroupPage):
                 current = int(self._currentValue('mesh.execution.max_cpu_cores') or 0)
             except (TypeError, ValueError):
                 current = 0
-            target = self._askTarget(current)
-            if target is None:
-                return None
+            # Plan 50 IP19: the count arrives once the dialog closes.
+            result = []
+            self._askTarget(current, lambda chosen: result.append(
+                None if chosen is None else self.redistribute(chosen)))
+            return result[0] if result else None
         # Plan 37 UF20, MEASURED live: the preview's handler awaits (it
         # settles an interrupted change and counts the processor cases in a
         # worker), so the synchronous ``query`` refused it on every click with
@@ -848,8 +859,13 @@ class ExecutionPreferencesPage(FieldGroupPage):
         if refusal:
             self._tell(str(refusal.get('reason') or refusal.get('code')))
             return None
-        if not self._confirm(self.redistributeSummary(report)):
-            return None
+        result = []
+        self._confirm(self.redistributeSummary(report), lambda yes: result.append(
+            ExecutionPreferencesPage._runRedistribute(self, report, target)
+            if yes else None))
+        return result[0] if result else None
+
+    def _runRedistribute(self, report: dict, target: int):
         button = self._redistribute_button
         button.setEnabled(False)
 
@@ -1228,7 +1244,7 @@ class ExecutionPreferencesPage(FieldGroupPage):
             except RuntimeError:
                 pass                    # the page was closed meanwhile
 
-        loop.create_task(warm())
+        spawn(warm(), what='Preparing the meshing host')
 
     def _on_changed(self, field_id: str, value) -> None:
         super()._on_changed(field_id, value)

@@ -305,6 +305,21 @@ def read_points_bounds(case) -> tuple | None:
     high = np.full(3, -np.inf)
     for root in roots:
         mesh = root / 'constant' / 'polyMesh'
+        # Plan 50 IP15 (DP-6422). A binary ``points`` was tokenised as text
+        # here: raw doubles hold the odd parseable digit run, so the outline
+        # could come back from bytes rather than coordinates. It is decoded.
+        from foammesh.core.mesh.poly_mesh_boundary import _encoding
+        path, fmt, _class = _encoding(mesh, 'points')
+        if fmt == 'binary':
+            from foammesh.core.mesh import poly_mesh_binary as _binary
+            try:
+                points = _binary.read_binary_points(path)[0]
+            except (PolyMeshReadError, OSError, ValueError):
+                return None
+            if points.size:
+                low = np.minimum(low, points.min(axis=0))
+                high = np.maximum(high, points.max(axis=0))
+            continue
         try:
             buffer, stream, open_at, count = _raw_member(mesh, 'points')
         except (PolyMeshReadError, OSError, ValueError):

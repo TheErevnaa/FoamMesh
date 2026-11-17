@@ -26,6 +26,7 @@ from __future__ import annotations
 #: Gmsh 4.15.2's own spellings of the triangle arrangement
 #: (``setTransfiniteSurface`` docstring).
 ARRANGEMENTS = ('Left', 'Right', 'AlternateLeft', 'AlternateRight')
+LAW_NAMES = ('Progression', 'Bump', 'Beta')
 
 #: Gmsh element type numbers.
 TRIANGLE, QUADRANGLE, TETRAHEDRON, HEXAHEDRON, PRISM, PYRAMID = 2, 3, 4, 5, 6, 7
@@ -134,6 +135,34 @@ def apply(gmsh, ops, *, skip_curves=()) -> dict:
     mesh = gmsh.model.mesh
     applied: list = []
     done = {int(c) for c in skip_curves}
+    curves_set: dict = {}
+    # A curve row is explicit: it wins over a Curve control and over any
+    # surface row's curve_elements, so it is applied first and its curves
+    # are marked done.
+    for op in ops:
+        if op.get('enabled', True) and op['kind'] == 'transfiniteCurve':
+            params = _params(op)
+            law = LAW_NAMES[int(params['law'])]
+            nodes = int(params['elements']) + 1
+            coefficient = float(params['coefficient'])
+            if int(params.get('reverse', 0)) and law != 'Bump':
+                coefficient = -coefficient
+            for tag in (int(t) for t in op['tags']):
+                try:
+                    mesh.setTransfiniteCurve(tag, nodes, law, coefficient)
+                except Exception as error:                  # noqa: BLE001
+                    raise BuildError(
+                        f'structure {op["name"]!r} (transfiniteCurve): Gmsh '
+                        f'refused curve {tag}: {error}') from error
+                done.add(tag)
+                curves_set[tag] = {'control': op['name'], 'nodes': nodes,
+                                   'law': law,
+                                   'coefficient': abs(coefficient)}
+            applied.append((
+                op['name'], 'transfiniteCurve',
+                f'curves {op["tags"]} {int(params["elements"])} elements, '
+                f'{law} {coefficient:g}',
+                'set (Gmsh has no getter; proved on the mesh)'))
     for op in ops:
         if not op.get('enabled', True):
             continue
@@ -142,6 +171,8 @@ def apply(gmsh, ops, *, skip_curves=()) -> dict:
         corners = [int(t) for t in op.get('corners') or ()]
         params = _params(op)
         try:
+            if kind == 'transfiniteCurve':
+                continue                                  # applied above
             if kind == 'transfiniteSurface':
                 arrangement = ARRANGEMENTS[int(params['arrangement'])]
                 elements = int(params.get('curve_elements', 0))
@@ -199,7 +230,7 @@ def apply(gmsh, ops, *, skip_curves=()) -> dict:
             raise BuildError(
                 f'structure {name!r} ({kind}): Gmsh refused: {error}'
             ) from error
-    return {'applied': applied,
+    return {'applied': applied, 'curves': curves_set,
             'count': len([o for o in ops if o.get('enabled', True)])}
 
 

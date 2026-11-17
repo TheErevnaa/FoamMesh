@@ -37,8 +37,11 @@ from widgets.async_message_box import AsyncMessageBox
 from foammesh.view.facade_client import FailedResult, NoOpenCaseError, query, submit
 from foammesh.view.outside_task import say
 
-from .run_narration import describe_start
+from .run_narration import cell_limit_warnings, describe_start
+from .run_follower import refused_before_start
 from widgets import async_message_box as messages
+from foammesh.support.tasks import spawn
+from foammesh.view.configuration_read import configuration_view
 
 
 logger = logging.getLogger(__name__)
@@ -408,7 +411,7 @@ class StepManager(QObject):
         neither the banner nor the wizard walk may act on that.
         """
         try:
-            return read_engine(app.facadeClient.checkout())
+            return read_engine(configuration_view(app.facadeClient))
         except Exception:                                    # noqa: BLE001
             # No case, no engine question -- and never block on a probe that
             # could not answer.
@@ -422,6 +425,11 @@ class StepManager(QObject):
         if link.startswith('#unlock:'):
             branch = self._methodBranch.branch
             step_id = link[len('#unlock:'):]
+            if step_id in StepManager._SETUP_STEP_IDS.values():
+                # DP-6114. Released by `refreshStepLocks` once it lands.
+                self._pendingSetupUnlocks = (
+                    getattr(self, '_pendingSetupUnlocks', frozenset())
+                    | {step_id})
             if branch is not None:
                 branch.requestUnlock(step_id)
             else:
@@ -528,6 +536,7 @@ class StepManager(QObject):
         except Exception:                                    # noqa: BLE001
             logger.debug('the step locks could not be read', exc_info=True)
         self._lockedStepIds = frozenset(ids)
+        self._releaseUnlockedSetupSteps()
         steps, tokens = set(), set()
         by_task = {task: step for step, task in self._SNAPPY_STEP_TASKS.items()}
         by_setup = {value: key for key, value in self._SETUP_STEP_IDS.items()}
@@ -540,12 +549,88 @@ class StepManager(QObject):
                 tokens.add(TASK_TOKEN_PREFIX + step_id)
                 if step_id in by_task:
                     steps.add(by_task[step_id])
+        tokens = self._wholeRowTokens(tokens)
         setter = getattr(self._navigation, 'setLockedRows', None)
         if callable(setter):
             setter(steps=steps, tokens=tokens)
 
+    def _wholeRowTokens(self, tokens: set) -> set:
+        """Keep a row's padlock only when every task of the row is settled.
+
+        Plan 50 IP25 (DP-6382). Proceed locks the row's own task; the tasks
+        the same press settled are accepted (and result-locked) rather than
+        locked. With Surface features, Castellation and Snap on one row, a
+        case whose features were locked and whose castellation never ran
+        drew the Refinement row padlocked over work still to do. A required
+        member counts when it is locked or accepted; an optional one nobody
+        used does not hold the padlock back.
+        """
+        branch = getattr(getattr(self, '_methodBranch', None), 'branch', None)
+        accepted = getattr(branch, 'is_accepted', None)
+        if not callable(accepted):
+            return tokens
+        engine_id = str(getattr(branch, 'engine_id', '') or '')
+        optional = {
+            str(task.get('task_id') or '')
+            for task in (getattr(branch, 'workflow_tasks', ()) or ())
+            if task.get('optional')}
+        kept = set()
+        for token in tokens:
+            task_id = (token[len(TASK_TOKEN_PREFIX):]
+                       if token.startswith(TASK_TOKEN_PREFIX) else '')
+            members = row_tasks(engine_id, task_id) if task_id else ()
+            try:
+                whole = all(
+                    member in self._lockedStepIds or member in optional
+                    or accepted(member) for member in members[1:])
+            except Exception:                                # noqa: BLE001
+                whole = True
+            if whole:
+                kept.add(token)
+        return kept
+
+    def _releaseUnlockedSetupSteps(self) -> None:
+        """Move the walk back to a setup step whose case lock was released.
+
+        DP-6114. The page had two locks: the case's (``setup.geometry``) and
+        the walk's (a step before the working step stays shut). Unlocking
+        released the first only, so Geometry still read Locked, with the
+        footer's Unlock under it, after "Edit geometry…" Yes. Everything
+        after the step went back to not done in the case; the walk follows.
+        """
+        pending = getattr(self, '_pendingSetupUnlocks', frozenset())
+        released = {step_id for step_id in pending
+                    if step_id not in self._lockedStepIds}
+        if not released:
+            return
+        self._pendingSetupUnlocks = pending - released
+        by_setup = {value: key
+                    for key, value in StepManager._SETUP_STEP_IDS.items()}
+        step = min(by_setup[step_id] for step_id in released)
+        if getattr(self, '_externalMeshMode', False) or step >= self._workingStep:
+            return
+        try:
+            for later in range(step + 1, self._workingStep + 1):
+                self._navigation.disableStep(later)
+                self._pages[Step(later)].clearResult()
+        except PermissionError:
+            logger.warning('a later step could not be cleared', exc_info=True)
+        self._setWorkingStep(step)
+        self._updateControlButtons(self._navigation.currentStep())
+
     def stepIsLocked(self, step_id: str) -> bool:
         return step_id in self._lockedStepIds
+
+    def requestStepUnlock(self, step_id: str) -> bool:
+        """Unlock a locked setup step by the route its banner link takes.
+
+        DP-6114. Returns False, doing nothing, when the case holds no lock on
+        ``step_id``, so a caller can fall back to the footer's unlock.
+        """
+        if step_id not in self._lockedStepIds:
+            return False
+        self._onBannerLink(f'#unlock:{step_id}')
+        return True
 
     async def _lockStep(self, step_id: str) -> bool:
         """Proceed finished ``step_id``: lock it (section 2).
@@ -595,21 +680,12 @@ class StepManager(QObject):
             return False
         titles = list(preview.get('titles') or ())
         name = titles[0] if titles else step_id
-        if preview.get('resets_values'):
-            text = self.tr('Unlocking "{0}" deletes the mesh and the quality '
-                           'results, and every later step starts over, as '
-                           'for new geometry:').format(name)
-        else:
-            text = self.tr('Unlocking "{0}" deletes the mesh and the quality '
-                           'results. Later steps keep their values but go '
-                           'back to not done:').format(name)
-        text = '\n'.join([text, *(f'  • {item}' for item in titles)])
-        answer = messages.question(
-            app.window, self.tr('Unlock and discard later results'), text,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
+        # DP-6124: the same words as the engine branch's confirmation.
+        from foammesh.view.workflow_controls.lock_chip import (
+            unlock_summary_lines)
+        from .engine_branch import EngineBranchView
+        text ='\n'.join(unlock_summary_lines(preview, name,
+                                              EngineBranchView._bytes))
 
         def landed(_result) -> None:
             self.refreshStepLocks()
@@ -620,11 +696,24 @@ class StepManager(QObject):
             if callable(discard):
                 discard()
 
-        submit(app.facadeClient, 'mesh.workflow.unlock', {
-            'engine_id': engine, 'task_id': step_id,
-            'expected_revision': preview.get('publication_revision')},
-            then=landed)
-        return True
+        def answered(answer) -> bool:
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            submit(app.facadeClient, 'mesh.workflow.unlock', {
+                'engine_id': engine, 'task_id': step_id,
+                'expected_revision': preview.get('publication_revision')},
+                then=landed)
+            return True
+
+        # Plan 50 IP19: asked without a nested event loop. The return is the
+        # answer when it came at once, else True (the question is open).
+        result = []
+        messages.askQuestion(
+            app.window, self.tr('Unlock and discard later results'), text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+            then=lambda answer: result.append(answered(answer)))
+        return result[0] if result else True
 
     def _setCaseOpen(self, isOpen: bool):
         """Enable or disable the controls that need a case (UXA8, #27)."""
@@ -668,6 +757,39 @@ class StepManager(QObject):
             await self._wizardProceed()
         return (self._contentStack.currentWidget()
                 is getattr(self._methodBranch, 'methodPage', None))
+
+    @staticmethod
+    def _strayTimes(case_root, output_time) -> list[str]:
+        """The time directories past the last step's output time."""
+        # DP-2731. A case opened from an empty folder has no case/ until
+        # something is written there; listing it raised FileNotFoundError,
+        # which the window reported as the folder having been deleted.
+        try:
+            if not case_root.is_dir():
+                return []
+            return [path.name for path in case_root.iterdir()
+                    if path.is_dir()
+                    and path.name.replace('.', '', 1).isdigit()
+                    and float(path.name) > output_time]
+        except OSError:
+            logger.debug('the case time directories could not be listed',
+                         exc_info=True)
+            return []
+
+    @staticmethod
+    def _submitStrayTimeClears(client, times) -> None:
+        for value in times:
+            # C31-12. Scheduled, not blocking. `load()` runs on every applied
+            # transaction, so a blocking clear here charged every commit one
+            # facade round trip per stray time directory.
+            submit(client, 'artifact.stage.clear',
+                   {'output_time': int(float(value))})
+
+    async def _clearStrayTimes(self, client, output_time) -> None:
+        # DP-6481. Listed on a worker; the clears are scheduled from the loop.
+        times = await asyncio.to_thread(
+            StepManager._strayTimes, client.case_root, output_time)
+        StepManager._submitStrayTimeClears(client, times)
 
     def load(self, *, preserveCurrentPage: bool = False):
         self._setCaseOpen(True)
@@ -714,8 +836,13 @@ class StepManager(QObject):
 
         # The engine branch needs an open case, so it is built here rather than
         # in __init__. A failure to build it must not block the Snappy journey.
+        # DP-6271. An existing branch re-reads its task states in this load;
+        # the refresh the page resets ask for below then has nothing new to
+        # read (a reset repaints, it writes no state).
+        branchFresh = False
         try:
-            self._methodBranch.load()
+            hadBranch = getattr(self._methodBranch, 'branch', None) is not None
+            branchFresh = bool(self._methodBranch.load()) and hadBranch
             method_page = getattr(self._methodBranch, 'methodPage', None)
             if (not self._methodProceedConnected
                     and method_page is not None):
@@ -729,7 +856,7 @@ class StepManager(QObject):
         except Exception:
             logger.exception('failed to build the meshing-method branch')
 
-        savedStep = app.facadeClient.checkout().getEnum('step')
+        savedStep = configuration_view(app.facadeClient).getEnum('step')
         self.refreshStepLocks()
 
         step = Step.GEOMETRY
@@ -737,34 +864,43 @@ class StepManager(QObject):
             self._navigation.enableStep(step)
             step += 1
 
-        for s in range(step + 1, Step.LAST_STEP + 1):
-            self._navigation.disableStep(s)
-            page = self._pages[Step(s)]
-            # Plan 43 LY9 (DP-1431). A reload is a repaint: the result a
-            # locked step holds is what its lock protects, and only the
-            # unlock removes it.
-            if self._SETUP_STEP_IDS.get(Step(s)) in self._lockedStepIds:
-                continue
-            if self._SNAPPY_STEP_TASKS.get(Step(s)) in self._lockedStepIds:
-                continue
-            # A stand-in page (the shell harnesses use some) has only the
-            # unlock reset.
-            getattr(page, 'resetForRefresh', page.clearResult)()
+        # DP-6271. Each page's reset says `stepReset`, and each of those used
+        # to refresh the whole engine branch: two more passes over every task
+        # page on every field commit (MEASURED live, window leg `large`,
+        # 2026-11-12). The resets ask once, after the last of them.
+        self._branchRefreshHeld = True
+        try:
+            for s in range(step + 1, Step.LAST_STEP + 1):
+                self._navigation.disableStep(s)
+                page = self._pages[Step(s)]
+                # Plan 43 LY9 (DP-1431). A reload is a repaint: the result a
+                # locked step holds is what its lock protects, and only the
+                # unlock removes it.
+                if self._SETUP_STEP_IDS.get(Step(s)) in self._lockedStepIds:
+                    continue
+                if self._SNAPPY_STEP_TASKS.get(Step(s)) in self._lockedStepIds:
+                    continue
+                # A stand-in page (the shell harnesses use some) has only the
+                # unlock reset.
+                getattr(page, 'resetForRefresh', page.clearResult)()
+        finally:
+            self._branchRefreshHeld = False
+            if self.__dict__.pop('_branchRefreshOwed', False):
+                self._refreshBranch(states=not branchFresh)
 
-        case_root = app.facadeClient.case_root
-        # DP-2731. A case opened from an empty folder has no case/ until
-        # something is written there; listing it raised FileNotFoundError,
-        # which the window reported as the folder having been deleted.
-        times = [path.name for path in case_root.iterdir()
-                 if path.is_dir() and path.name.replace('.', '', 1).isdigit()
-                 ] if case_root.is_dir() else []
-        for value in times:
-            if float(value) > self._pages[Step.LAST_STEP].OUTPUT_TIME:
-                # C31-12. Scheduled, not blocking. `load()` runs on every
-                # applied transaction, so a blocking clear here charged every
-                # commit one facade round trip per stray time directory.
-                submit(app.facadeClient, 'artifact.stage.clear',
-                       {'output_time': int(float(value))})
+        # DP-6481. The stray time directories are listed on a worker: the
+        # listing held the window 4.4 s on a busy disk (MEASURED live), and
+        # `load()` runs on every applied transaction.
+        try:
+            spawn(self._clearStrayTimes(app.facadeClient,
+                                        self._pages[Step.LAST_STEP].OUTPUT_TIME),
+                  what='Clearing stray time directories')
+        except RuntimeError:
+            # No event loop (a headless caller): list them here, as before.
+            self._submitStrayTimeClears(
+                app.facadeClient, StepManager._strayTimes(
+                    app.facadeClient.case_root,
+                    self._pages[Step.LAST_STEP].OUTPUT_TIME))
 
         # R8/R12/R56/R96/R132/R149. `load()` runs on every TRANSACTION_APPLIED,
         # and it used to finish by opening a numeric step unconditionally.
@@ -819,7 +955,7 @@ class StepManager(QObject):
         if self._externalMeshMode or app.facadeClient is None:
             return
         try:
-            engine = read_engine(app.facadeClient.checkout())
+            engine = read_engine(configuration_view(app.facadeClient))
             records = (
                 (Step.GEOMETRY, self._pages[Step.GEOMETRY].isNextStepAvailable()),
                 (Step.GEOMETRY_REPAIR,
@@ -906,6 +1042,15 @@ class StepManager(QObject):
         self._branchWidget = None
         for page in self._pages.values():
             page.unload()
+        # DP-6125. A closed case kept its locks: the page said "Locked" over
+        # "No case open" and the ribbon kept its padlocks until a restart.
+        self._lockedStepIds = frozenset()
+        banner = getattr(self, '_prerequisiteBanner', None)
+        if banner is not None:
+            banner.setVisible(False)
+        setter = getattr(self._navigation, 'setLockedRows', None)
+        if callable(setter):
+            setter(steps=(), tokens=())
         self._setCaseOpen(False)
         self._updateWizardActions()
 
@@ -1163,14 +1308,17 @@ class StepManager(QObject):
     def _startAuthoredWorkflow(self):
         # The retained mesh is snapshotted by the transition service before
         # authored navigation becomes available.
-        confirmation = messages.question(
+        # Plan 50 IP19: asked without a nested event loop.
+        messages.askQuestion(
             app.window, self.tr('Start meshing workflow'),
             self.tr('The external mesh will be retained as a recovery copy. '
                     'A future generated-mesh run may replace the current mesh. Continue?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if confirmation != QMessageBox.StandardButton.Yes:
-            return
+            QMessageBox.StandardButton.Cancel,
+            then=lambda answer: answer == QMessageBox.StandardButton.Yes
+            and StepManager._startAuthoredWorkflowConfirmed(self))
+
+    def _startAuthoredWorkflowConfirmed(self):
 
         # C31-12. Scheduled: this copies the external polyMesh aside before it
         # answers, so it was one of the longer freezes in the window. The
@@ -1186,13 +1334,15 @@ class StepManager(QObject):
         submit(app.facadeClient, 'workflow.start_authored', {}, then=started)
 
     def _returnExternalMesh(self):
-        confirmation = messages.question(
+        messages.askQuestion(
             app.window, self.tr('Return to external mesh'),
             self.tr('Restore the retained external polyMesh and suspend authored navigation?'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if confirmation != QMessageBox.StandardButton.Yes:
-            return
+            QMessageBox.StandardButton.Cancel,
+            then=lambda answer: answer == QMessageBox.StandardButton.Yes
+            and StepManager._returnExternalMeshConfirmed(self))
+
+    def _returnExternalMeshConfirmed(self):
 
         # C31-12. Scheduled for the same reason as the transition above: it
         # restores a retained polyMesh from disk before it answers.
@@ -1216,12 +1366,14 @@ class StepManager(QObject):
         self._navigation.setWorkingStep(step)
         self._workingStep = step
 
-        db = app.facadeClient.checkout()
         # Only write when the step actually moves. An unconditional commit is a
         # closed loop: the window refreshes on TRANSACTION_APPLIED, its refresh
         # calls load(), and load() lands here -- so re-recording the step the
         # case is already on re-entered the same refresh many times a second.
-        if int(db.getEnum('step')) != int(step):
+        # Plan 50 (DP-6341): asked through the view; the working copy is only
+        # taken for a write (a 500-surface case copied 0.14 s every refresh).
+        if int(configuration_view(app.facadeClient).getEnum('step')) != int(step):
+            db = app.facadeClient.checkout()
             db.setValue('step', step)
             # C31-12. Scheduled. This is reached from `load()`, which runs on
             # every applied transaction, so a blocking commit here put a
@@ -2017,17 +2169,19 @@ class StepManager(QObject):
             return
         token, label = blocked
 
+        def answered(answer) -> None:
+            if answer == QMessageBox.StandardButton.Open and token:
+                self._navigation.requestBranch(token)
+
         def offer() -> None:
-            answer = messages.question(
+            messages.askQuestion(
                 app.window, self.tr('Nothing to proceed to'),
                 self.tr('"{0}" is still locked, so there is no next task to '
                         'open.\n\nOpen it anyway to see what it is waiting '
                         'for?').format(label),
                 QMessageBox.StandardButton.Open
                 | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Open)
-            if answer == QMessageBox.StandardButton.Open and token:
-                self._navigation.requestBranch(token)
+                QMessageBox.StandardButton.Open, then=answered)
 
         # Plan 37 UF20 follow-up: Proceed's task is current here, and a box
         # opened inside it has asyncio refuse (and drop) the tasks its nested
@@ -2055,14 +2209,16 @@ class StepManager(QObject):
                           else (titles.get(dep, dep) for dep in blocking))
 
         def offer() -> None:
-            answer = messages.question(
+            messages.askQuestion(
                 app.window, self.tr('Earlier task unfinished'),
                 self.tr('"{0}" is waiting on {1}.\n\nOpen the first one now?')
                 .format(visible([task_id])[0] if callable(visible)
                         else titles.get(task_id, task_id), names),
                 QMessageBox.StandardButton.Open
                 | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Open)
+                QMessageBox.StandardButton.Open, then=answered)
+
+        def answered(answer) -> None:
             if answer == QMessageBox.StandardButton.Open:
                 first = self._firstOpenable(branch, blocking[0])
                 if first not in HOSTED_TASKS:
@@ -2572,9 +2728,12 @@ class StepManager(QObject):
             # about, so accepting it does not have to re-mesh to find one.
             show(dict(verdict, run_id=str((payload or {}).get('run_id') or '')))
 
-    def _refreshBranch(self) -> None:
+    def _refreshBranch(self, *_signal, states: bool = True) -> None:
+        if getattr(self, '_branchRefreshHeld', False):
+            self._branchRefreshOwed = True       # DP-6271: once, after load's resets
+            return
         branch = self._methodBranch.branch
-        if branch is not None and hasattr(branch, 'refresh_states'):
+        if states and branch is not None and hasattr(branch, 'refresh_states'):
             branch.refresh_states()
         self._methodBranch._syncChildren()
         self._updateWizardActions()
@@ -2631,7 +2790,7 @@ class StepManager(QObject):
         where the walk goes.
         """
         self._methodBranch._syncChildren()
-        asyncio.ensure_future(self._openAfterMethodAccepted())
+        spawn(self._openAfterMethodAccepted(), what='Opening the next step')
 
     async def _openAfterMethodAccepted(self) -> None:
         page = self._pages.get(Step.GEOMETRY_REPAIR)
@@ -2700,7 +2859,7 @@ class StepManager(QObject):
         if cancelled and self._caseMeshUntouched(payload):
             pass
         elif built or handle.run_id:
-            await self._drawFinishedMesh(handle)
+            await self._drawFinishedMesh(handle, cancelled=cancelled)
         return handle, built, cancelled
 
     async def showApiRunResult(self, result) -> None:
@@ -2789,6 +2948,9 @@ class StepManager(QObject):
                     self.tr('{0} mesh was built but not published').format(
                         name),
                     unpublished)
+            elif result.status == 'accepted' and cell_limit_warnings(payload):
+                await self._reportPipelineWarning(
+                    name, cell_limit_warnings(payload))
             elif result.status == 'accepted':
                 await AsyncMessageBox().information(
                     self._contentStack, self.tr('Process completed'),
@@ -2801,7 +2963,8 @@ class StepManager(QObject):
                     name, str(payload.get('reason') or ''), built=built,
                     log=str(payload.get('log') or ''),
                     details=str(payload.get('details') or ''),
-                    resume=payload.get('resume'))
+                    resume=payload.get('resume'),
+                    refused=refused_before_start(payload))
         except Exception as error:
             if resume and self._resumeUnavailable(error):
                 await self._reportResumeUnavailable(
@@ -2952,7 +3115,8 @@ class StepManager(QObject):
             payload, status=getattr(result, 'status', ''),
             case_path=app.facadeClient.case_root, engine=engine)
 
-    async def _drawFinishedMesh(self, handle: RunResultHandle) -> None:
+    async def _drawFinishedMesh(self, handle: RunResultHandle, *,
+                                cancelled: bool = False) -> None:
         """Draw the artifact *this* run produced, and name it.
 
         A mesh that cannot be drawn does not turn a finished run into a failed
@@ -2974,7 +3138,7 @@ class StepManager(QObject):
         if loadResult is None:
             return
         if not handle.drawable:
-            self._clearAndOfferPrevious(manager, handle)
+            self._clearAndOfferPrevious(manager, handle, cancelled=cancelled)
             return
         try:
             problem = await loadResult(handle)
@@ -2992,8 +3156,7 @@ class StepManager(QObject):
                 % problem, 10000)
             status = getattr(app.window, 'showRunStatus', None)
             if status is not None:
-                status(self.tr('%s · could not be drawn: %s')
-                       % (handle.run_id or handle.engine, problem),
+                status(self.tr('The mesh could not be drawn: %s') % problem,
                        failed=True)
             return
         # DP-133. Last, and only when the volume mesh is actually on screen:
@@ -3004,7 +3167,8 @@ class StepManager(QObject):
         if offer is not None:
             offer(handle)
 
-    def _clearAndOfferPrevious(self, manager, handle) -> None:
+    def _clearAndOfferPrevious(self, manager, handle, *,
+                               cancelled: bool = False) -> None:
         """Take the failed run down, and name what the case still has.
 
         CP-02 item 6. Clearing is not optional: leaving the previous mesh up
@@ -3012,16 +3176,30 @@ class StepManager(QObject):
         still a real result the user may want back, so it is offered by name
         and drawn only if asked for -- never restored silently, and never
         presented as this run's own.
+
+        DP-6462. A run the user cancelled is not a run that failed. MEASURED
+        live (Plan 50, walk ``fin5-cancel-layers-c2``): a Run to end sent over
+        the local API and cancelled while the layers grew ended with the
+        status strip in its failed state reading "No mesh for this run:
+        snappy-ae53... left nothing this viewport can read", written over the
+        "was cancelled" sentence the run had just been given. So a cancelled
+        run says it was cancelled, in the plain state, and names no run id.
         """
         from foammesh.core.run_result import accepted_result
 
         unload = getattr(manager, 'unload', None)
         if unload is not None:
             unload()
-        message = (self.tr('No mesh for this run: %s left nothing this '
-                           'viewport can read, so the viewport was cleared '
-                           'rather than left showing an earlier run.')
-                   % (handle.run_id or handle.engine))
+        if cancelled:
+            message = self.tr('The run was cancelled before it finished. It '
+                              'left no mesh, so the viewport was cleared '
+                              'rather than left showing an earlier run.')
+        else:
+            # DP-6494. No internal run id on the status line.
+            message = self.tr('No mesh for this run: it left nothing this '
+                              'viewport can read, so the viewport was '
+                              'cleared rather than left showing an earlier '
+                              'run.')
         self._ui.statusbar.showMessage(message, 10000)
         previous = None
         try:
@@ -3031,7 +3209,7 @@ class StepManager(QObject):
             logger.debug('earlier results could not be read', exc_info=True)
         offer = getattr(app.window, 'offerPreviousResult', None)
         if offer is not None:
-            offer(message, previous)
+            offer(message, previous, failed=not cancelled)
 
     @staticmethod
     def _userCancelled(payload: dict) -> bool:
@@ -3094,10 +3272,26 @@ class StepManager(QObject):
             self._contentStack, headline, detail)
         return False
 
+    async def _reportPipelineWarning(self, name: str, limits) -> None:
+        """DP-6483. A run that stopped refining at Max global cells says so
+        in the Console, the status bar and the box, each sentence whole."""
+        console = app.consoleView
+        for warning in limits:
+            if console is not None:
+                console.append(self.tr('Refinement: %s') % warning)
+        done = self.tr('The %s pipeline completed with a warning.') % name
+        self._ui.statusbar.showMessage(
+            done + ' ' + self.tr('See the Console.'), 10000)
+        # DP-172: a warning icon never shares its title with the plain
+        # "Process completed" notice.
+        await AsyncMessageBox().warning(
+            self._contentStack, self.tr('Completed with a warning'),
+            '\n\n'.join([done] + list(limits)))
+
     async def _reportPipelineFailure(self, engine: str, reason: str,
                                      *, built: bool = False, log: str = '',
                                      details: str = '',
-                                     resume=None) -> bool:
+                                     resume=None, refused=False) -> bool:
         """Say a run did not finish, where the user is already looking (R204).
 
         MEASURED on tee_gmsh_r2: Compute Mesh refused because no prepared
@@ -3146,7 +3340,10 @@ class StepManager(QObject):
         status = getattr(window, 'showRunStatus', None)
         if callable(status) and getattr(strip, 'state', 'running') in (
                 'running', 'cancelling'):
-            status('{0}: {1}'.format(headline, detail), failed=True, log=log)
+            # DP-6487. A run the recovery gate refused says "not started"
+            # once, in its own sentence, not under "did not run".
+            status(detail if refused else '{0}: {1}'.format(headline, detail),
+                   failed=True, log=log)
         # DP-1262. A failed Run to end keeps the stages that finished before
         # the failure; offer to resume from them once the cause is fixed.
         offer = self._resumeOffer(resume)

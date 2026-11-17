@@ -342,6 +342,10 @@ class EngineTaskPage(QWidget):
     #: tick on "settings exist" is the R94 defect over again. A page that has
     #: been filled in but not settled is CONFIGURED, and says so.
     configureRequested = Signal(str)
+    #: DP-6118. The page stored a proposal of its own, which a user did not
+    #: save: the branch records it like ``updateRequested`` but does not tell
+    #: anyone their settings were saved when the task is still locked.
+    proposalStored = Signal(str)
     revertRequested = Signal(str)
     runRequested = Signal(str)
     #: ``(task_id, stage)`` -- run this one stage.
@@ -380,6 +384,17 @@ class EngineTaskPage(QWidget):
         #: a refresh does not undo it.
         self._advancedTouched = False
         self._pending: dict[str, object] = {}
+        #: Plan 50 IP10 (DP-6343). What the form on screen was built from --
+        #: per field its id, descriptor, tier box, form and choices, in order
+        #: -- so a refresh that asks for the same form writes values into it
+        #: instead of building it again. ``None``: nothing built yet.
+        self._field_signature = None
+        self._calculated_signature = None
+        #: Plan 50 IP10 (DP-6344). Fields whose editor ``reload_values``
+        #: leaves alone: a value typed while this page's own commit was on
+        #: its way, which ``refresh_keeping_edits`` keeps.
+        self._keep_editor_values: frozenset = frozenset()
+        self._editors_fresh = False
         #: `FieldGroupPage` panels this page has adopted (DP-157). Their
         #: edits are this page's edits: they have no commit control left.
         self._panels: list = []
@@ -1095,7 +1110,15 @@ class EngineTaskPage(QWidget):
         """
         pending = dict(self._pending)
         focused = _focused_field(self)
+        # Plan 50 IP10 (DP-6344). The editors holding a typed value are not
+        # written at all: rewriting them with the stored value and then with
+        # the typed one again put the cursor at the end of the text and
+        # reset a spin box's selection under the user's fingers.
+        # (Not in a try: DP-471's gate reads the refresh call sites by their
+        # indentation; ``reload_values`` uses the set once and drops it.)
+        self._keep_editor_values = frozenset(pending)
         self.refresh()
+        self._keep_editor_values = frozenset()
         if not pending:
             _refocus(self, focused)
             return
@@ -1103,7 +1126,8 @@ class EngineTaskPage(QWidget):
             editor = self._editors.get(field_id)
             if editor is None:
                 continue
-            editor.set_value(value)
+            if not _same_value(editor.value(), value):
+                editor.set_value(value)
             self._pending[field_id] = value
         self._inactive_fields = refresh_applicability(
             self._client, self._editors, self._pending)
@@ -1502,23 +1526,16 @@ class EngineTaskPage(QWidget):
         for field_id, editor in self._editors.items():
             editor.set_effective(effective.get(field_id))
 
-    def _populate_fields(self, fields) -> None:
-        for layout in (self._guided.layout(), self._advanced.layout(),
-                       self._expert.layout(), *self.field_forms()):
-            while layout.count():
-                item = layout.takeAt(0)
-                if item.widget() is not None:
-                    item.widget().deleteLater()
-            # A QFormLayout emptied item by item keeps its row structure: the
-            # rows are still there, now blank, and the next addRow lands below
-            # them. Left alone, a page whose fields land in a form of its own
-            # grew a row of blank space per refresh.
-            if isinstance(layout, (QFormLayout, SheetForm)):
-                while layout.rowCount():
-                    layout.removeRow(0)
-        self._editors.clear()
-        self._advanced_fields.clear()
-        self._expert_fields.clear()
+    def _field_layout_plan(self, fields) -> list:
+        """What the form for ``fields`` holds, in order, without building it.
+
+        Plan 50 IP10 (DP-6343). One entry per row ``_populate_fields`` would
+        draw: ``(field id, descriptor or None for an unbacked notice, box,
+        form, choices)``. The descriptor carries the kind, the unit, the
+        range and the enum; the box is the tier the field sits in; the form
+        is a page's own layout claiming the field. Two plans that compare
+        equal draw the same widgets in the same places.
+        """
         # A page with no Essential field has nothing for a fold to sit under:
         # its Common settings are the form, and are drawn as such.
         has_essential = any(
@@ -1526,6 +1543,7 @@ class EngineTaskPage(QWidget):
             if '{id}' not in item['field_id']
             and item['field_id'] not in FIELD_REGISTRY.collections
             and self.renders_field(item['field_id']))
+        plan = []
         for field in fields:
             field_id = field['field_id']
             # Repeatable child definitions carry an "/{id}/" template segment;
@@ -1547,25 +1565,93 @@ class EngineTaskPage(QWidget):
                 # A published task field with no registry descriptor would be a
                 # no-op control, which gate 10 forbids. Surface it instead of
                 # silently rendering something the schema cannot back.
-                self._add_unbacked_notice(field_id)
+                plan.append((field_id, None, None, None, None))
                 continue
-            editor = FieldEditor(descriptor, self,
-                                 choices=self.field_choices(field_id))
-            editor.valueChanged.connect(self._on_field_changed)
             classification = _classification(field.get('classification'))
             # Plan 40 UXD4. The registry's tier, not the classification,
             # decides where a field sits: Essential in the form, Common
             # behind the fold, Expert behind the switch.
-            tier = editor.tier
+            tier = tier_of(field_id)
             if tier == EXPERT:
-                box = self._expert
-                self._expert_fields.append(field_id)
+                box = 'expert'
             elif tier == COMMON and has_essential:
-                box = self._advanced
-                self._advanced_fields.append(field_id)
+                box = 'advanced'
             else:
-                box = self._guided
-            form = self.field_form(field_id, classification)
+                box = 'guided'
+            plan.append((field_id, descriptor, box,
+                         self.field_form(field_id, classification),
+                         self.field_choices(field_id)))
+        return plan
+
+    @staticmethod
+    def _plan_signature(plan) -> tuple:
+        # Forms compare by identity: a page that swaps one of its own forms
+        # for a new one wants the rows built into the new one.
+        return tuple((field_id, descriptor, box,
+                      None if form is None else id(form), choices)
+                     for field_id, descriptor, box, form, choices in plan)
+
+    def _form_is_built_from(self, signature) -> bool:
+        """Whether the editors on screen are the ones ``signature`` asks for."""
+        if self._field_signature is None or self._field_signature != signature:
+            return False
+        wanted = [entry[0] for entry in signature if entry[1] is not None]
+        if list(self._editors) != wanted:
+            return False
+        for editor in self._editors.values():
+            try:
+                editor.objectName()              # still a live C++ object
+            except RuntimeError:
+                return False
+        return True
+
+    def _populate_fields(self, fields) -> None:
+        plan = self._field_layout_plan(fields)
+        signature = self._plan_signature(plan)
+        if self._form_is_built_from(signature):
+            # Plan 50 IP10 (DP-6343). The same form: new values into the
+            # editors that are there. Nothing is deleted, so the focus, the
+            # cursor, the selection and the scroll position stay put.
+            self.reload_values()
+            text = self.filterText()
+            for editor in self._editors.values():
+                editor.setFilterText(text)
+            self._filter.setVisible(bool(self._editors or self._panels))
+            self._apply_tiers()
+            return
+        self._build_fields(plan)
+        self._field_signature = signature
+
+    def _build_fields(self, plan) -> None:
+        for layout in (self._guided.layout(), self._advanced.layout(),
+                       self._expert.layout(), *self.field_forms()):
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            # A QFormLayout emptied item by item keeps its row structure: the
+            # rows are still there, now blank, and the next addRow lands below
+            # them. Left alone, a page whose fields land in a form of its own
+            # grew a row of blank space per refresh.
+            if isinstance(layout, (QFormLayout, SheetForm)):
+                while layout.rowCount():
+                    layout.removeRow(0)
+        self._editors.clear()
+        self._advanced_fields.clear()
+        self._expert_fields.clear()
+        boxes = {'guided': self._guided, 'advanced': self._advanced,
+                 'expert': self._expert}
+        for field_id, descriptor, box_name, form, choices in plan:
+            if descriptor is None:
+                self._add_unbacked_notice(field_id)
+                continue
+            editor = FieldEditor(descriptor, self, choices=choices)
+            editor.valueChanged.connect(self._on_field_changed)
+            box = boxes[box_name]
+            if box_name == 'expert':
+                self._expert_fields.append(field_id)
+            elif box_name == 'advanced':
+                self._advanced_fields.append(field_id)
             parent = box
             if form is None:
                 form = box.layout()
@@ -1590,7 +1676,11 @@ class EngineTaskPage(QWidget):
             # the three widgets alone leaves `QFormLayout` holding the line.
             editor.setRow(form, container)
             self._editors[field_id] = editor
-        self.reload_values()
+        self._editors_fresh = True
+        try:
+            self.reload_values()
+        finally:
+            self._editors_fresh = False
         # Plan 40 UXD3. A rebuild keeps what the reader typed in the filter.
         text = self.filterText()
         for editor in self._editors.values():
@@ -1664,9 +1754,23 @@ class EngineTaskPage(QWidget):
     def reload_values(self) -> None:
         if self._editors:
             values = self._client.field_values(tuple(self._editors))
+            # Used once: a refresh that raised cannot leave it behind.
+            keep, self._keep_editor_values = (self._keep_editor_values,
+                                              frozenset())
+            # Editors built a moment ago get every value, as they always did.
+            fresh = self._editors_fresh
             for field_id, editor in self._editors.items():
-                editor.set_value(
-                    values.get(field_id, editor.descriptor.default))
+                # Plan 50 IP10 (DP-6344). A typed value its own commit did
+                # not carry stays exactly as it is, cursor included.
+                if field_id in keep:
+                    continue
+                value = values.get(field_id, editor.descriptor.default)
+                # DP-6343. Only a value that changed is written: a write
+                # moves a line edit's cursor to the end and reselects a spin
+                # box, and the editor being typed in is usually unchanged.
+                if not fresh and _same_value(editor.value(), value):
+                    continue
+                editor.set_value(value)
             self._pending.clear()
             # CP-09 item 4. After the values, because what a field's condition
             # reads may be one of the values just written.
@@ -1936,6 +2040,12 @@ class EngineTaskPage(QWidget):
         return dict(getattr(self, '_inactive_fields', {}) or {})
 
     def _populate_calculated(self, fields) -> None:
+        # Plan 50 IP10 (DP-6343). The table describes the task's declared
+        # fields, which a refresh almost never changes: rebuilt only then.
+        signature = [dict(field) for field in fields]
+        if signature == self._calculated_signature:
+            return
+        self._calculated_signature = signature
         self._calculated.setRowCount(len(fields))
         # DP-158. Every id in this table belongs to this one task, so every
         # id begins with the same twelve to twenty characters. Spending the
@@ -2055,7 +2165,8 @@ class EngineTaskPage(QWidget):
         self._preview_note.clear()
         self._preview_note.setVisible(False)
 
-    def _patch_accepted(self, result, carried=None) -> bool:
+    def _patch_accepted(self, result, carried=None, *,
+                        proposal: bool = False) -> bool:
         """Take an accepted patch, and say whether it was accepted.
 
         ``carried`` is the patch that was sent. DP-1220: only the edits it
@@ -2088,7 +2199,8 @@ class EngineTaskPage(QWidget):
         # anyway staled a finished mesh that the settings still describe,
         # and Proceed then meshed it again for no reason.
         if not payload.get('no_op'):
-            self.updateRequested.emit(self._configured_task(payload))
+            signal = self.proposalStored if proposal else self.updateRequested
+            signal.emit(self._configured_task(payload))
         # DP-1220. What the patch did not carry is still on the page.
         if self._pending:
             self.refresh_keeping_edits()
@@ -2139,7 +2251,7 @@ class EngineTaskPage(QWidget):
                 settled = False
         return settled
 
-    def apply(self):
+    def apply(self, *, proposal: bool = False):
         if not self.is_dirty:
             return None
         import asyncio
@@ -2156,7 +2268,8 @@ class EngineTaskPage(QWidget):
 
         def applied(result):
             try:
-                if not self._patch_accepted(result, carried):
+                if not self._patch_accepted(result, carried,
+                                            proposal=proposal):
                     self.tellFailure(
                         self.tr('Update failed'),
                         str(getattr(result, 'message', '')

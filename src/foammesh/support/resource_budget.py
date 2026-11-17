@@ -7,9 +7,12 @@ and this module decides, *before* that worker is started, whether the machine
 can afford it:
 
 * **The budget** is the physical memory Windows says is available
-  (``GlobalMemoryStatusEx``), minus the working set of the WSL VM (``vmmem`` /
-  ``vmmemWSL``, best effort -- the VM's claim is invisible to "available" until
-  it has already taken the memory), minus a reserve kept for the GUI itself.
+  (``GlobalMemoryStatusEx``), minus a reserve kept for the GUI itself. The
+  working set of the WSL VM (``vmmem`` / ``vmmemWSL``) is reported beside it
+  but not subtracted: the pages the VM holds are in use, so "available"
+  already leaves them out (DP-6401, Plan 50 IP21). A mesher, which runs
+  *inside* the VM, is admitted on the VM's own figures instead
+  (:func:`mesher_budget`, DP-6400).
 * **The estimate** comes from the list counts in the polyMesh headers
   (:func:`foammesh.core.mesh.poly_mesh_boundary.read_counts`), times a factor
   per operation recorded next to :data:`PEAK_FACTORS`.
@@ -151,7 +154,7 @@ HEAVY_OPERATIONS = frozenset({
     'mesh.preview', 'mesh.volume', 'mesh.section',
 })
 #: DP-5714 / DP-5715. Operations whose worker runs under the free RAM
-#: (:attr:`MemorySnapshot.budget`: available - WSL VM - GUI reserve), not under
+#: (:attr:`MemorySnapshot.budget`: available - GUI reserve, DP-6401), not under
 #: 1.5x its estimate. "Load full volume" on a 2.12 M-cell snappy mesh was
 #: granted 1.7 GB (1.5x a ~1.1 GB estimate) and stopped there, whatever RAM
 #: was free: the rows are calibrated on hex boxes and a large polyhedral mesh
@@ -330,7 +333,9 @@ def snapshot() -> MemorySnapshot:
         return MemorySnapshot(total, available, 0, GUI_RESERVE_BYTES,
                               forced, forced=True)
     vm = wsl_vm_working_set()
-    budget = max(0, available - vm - GUI_RESERVE_BYTES)
+    # DP-6401: "available" already leaves out the pages the VM holds; the
+    # VM's working set is reported, not subtracted a second time.
+    budget = max(0, available - GUI_RESERVE_BYTES)
     return MemorySnapshot(total, available, vm, GUI_RESERVE_BYTES, budget)
 
 
@@ -361,8 +366,9 @@ def quick_snapshot() -> MemorySnapshot:
         return snapshot()
     total, available = physical_memory()
     vm = int(_vm_cache[1]) if _vm_cache is not None else 0
+    # DP-6401: the VM's pages are already out of "available".
     return MemorySnapshot(total, available, vm, GUI_RESERVE_BYTES,
-                          max(0, available - vm - GUI_RESERVE_BYTES))
+                          max(0, available - GUI_RESERVE_BYTES))
 
 
 def memory_refusal(what: str, needed: int,
@@ -384,8 +390,13 @@ def memory_refusal(what: str, needed: int,
                 format_bytes(measured.reserve))
 
 
-#: What a mesher in WSL holds at its peak, per cell (snappy) or element
-#: (Gmsh). Replaces the fixed 50 M-element / 50 M-cell refusals (2026-10-01).
+# --------------------------------------------------------------------------- #
+# The mesher: what it costs per cell, and what the WSL VM can give it
+# --------------------------------------------------------------------------- #
+
+#: THE ONE PLACE the mesher's per-cell cost is set. What a mesher in WSL holds
+#: at its peak, per cell (snappy) or element (Gmsh). Replaces the fixed
+#: 50 M-element / 50 M-cell refusals (2026-10-01).
 #: gmsh: MEASURED 2026-10-01 on this machine, a unit box meshed by Gmsh
 #: 4.15.2 in WSL: Delaunay (the default) 2.37 M elements peaked at 1.30 GB
 #: and 5.44 M at 2.82 GB (520-560 bytes an element, 495 at the margin); HXT
@@ -394,9 +405,26 @@ def memory_refusal(what: str, needed: int,
 #: 751,060-cell background filled at 40 mm peaked at 911 MB maximum RSS
 #: (1,242 bytes a background cell); a 94,987-cell coarse far field refined to
 #: 285,105 cells peaked at 452 MB. Rounded to 1,200 bytes a cell.
-MESHER_BYTES_PER_CELL = {'gmsh': 600.0, 'snappy': 1200.0}
+#: Plan 50 IP21 (DP-6402): both figures come from meshes of 0.75 M and 5.4 M
+#: cells, castellation only. snappy RE-MEASURED 2026-11-14 (Plan 50 Step 6,
+#: DP-6402): the elbow at a 0.9 mm base cell, 3 wall layers, 4 cores, 22.5 M
+#: cells after layers (15.4 M before). The largest castellation rank peaked at
+#: 10.2 GB, taken x4 (the ranks' sum, an upper estimate) = 39 GiB, 1,846 bytes
+#: a final cell; the serial reconstructPar peaked at 21.4 GB (950 a cell).
+#: x1.1 margin -> 2,050. Gmsh is not re-measured at 20 M+ yet.
+#: ``python scripts/measure_mesher_bytes_per_cell.py --run <logs folder>``
+#: reads a finished run's logs and prints the replacement for this line.
+#: Change the numbers here and nowhere else.
+MESHER_BYTES_PER_CELL = {'gmsh': 600.0, 'snappy': 2050.0}
 #: What a mesher costs before its cells: the process and the geometry.
 MESHER_FIXED_BYTES = 256 * MIB
+
+#: How long the gate waits for the WSL VM's figures before it uses the
+#: Windows figure (DP-6400). The default reader answers from a cache.
+VM_READ_TIMEOUT_SECONDS = 1.0
+#: A ``vmmem`` reading younger than this that found no VM process means the
+#: VM is stopped, so its configured limit applies.
+VM_STOPPED_EVIDENCE_SECONDS = 60.0
 
 
 def mesher_memory_needed(engine: str, cells: int | float) -> int:
@@ -406,21 +434,270 @@ def mesher_memory_needed(engine: str, cells: int | float) -> int:
     return int(MESHER_FIXED_BYTES + per_cell * max(0.0, float(cells)))
 
 
+@dataclass(frozen=True)
+class WslVmMemory:
+    """The WSL 2 VM's memory, as the mesher inside it sees it (DP-6400).
+
+    ``total`` is the VM's ``MemTotal`` when it runs, else the limit it will
+    start with (``.wslconfig`` ``memory=``, by default half the host's RAM);
+    ``available`` is its ``MemAvailable``, or the whole limit when stopped.
+    ``source`` is ``meminfo``, ``wslconfig`` or ``default``.
+    """
+
+    total: int
+    available: int
+    running: bool
+    source: str
+
+
+_SIZE_UNITS = (('TIB', 1024 ** 4), ('GIB', GIB), ('MIB', MIB), ('KIB', 1024),
+               ('TB', 1024 ** 4), ('GB', GIB), ('MB', MIB), ('KB', 1024),
+               ('T', 1024 ** 4), ('G', GIB), ('M', MIB), ('K', 1024),
+               ('B', 1))
+
+
+def parse_wslconfig_memory(text: str) -> int | None:
+    """Bytes of ``memory=`` in the ``[wsl2]`` section of a ``.wslconfig``."""
+    section = ''
+    for raw in str(text or '').splitlines():
+        line = raw.split('#', 1)[0].split(';', 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1].strip().lower()
+            continue
+        key, separator, value = line.partition('=')
+        if section != 'wsl2' or not separator or key.strip().lower() != 'memory':
+            continue
+        value = value.strip().strip('"').replace(' ', '').upper()
+        scale = 1
+        for suffix, factor in _SIZE_UNITS:
+            if value.endswith(suffix):
+                value, scale = value[:-len(suffix)], factor
+                break
+        try:
+            return int(float(value) * scale) or None
+        except ValueError:
+            return None
+    return None
+
+
+def wsl_vm_limit() -> tuple[int, str] | None:
+    """``(bytes, source)`` the VM may grow to: ``.wslconfig`` ``memory=``,
+    else WSL's default of half the host's physical memory."""
+    profile = os.environ.get('USERPROFILE') or os.path.expanduser('~')
+    try:
+        with open(os.path.join(profile, '.wslconfig'), encoding='utf-8',
+                  errors='replace') as handle:
+            configured = parse_wslconfig_memory(handle.read())
+    except OSError:
+        configured = None
+    if configured:
+        return configured, 'wslconfig'
+    total, _available = physical_memory()
+    return (total // 2, 'default') if total > 0 else None
+
+
+def default_wsl_vm_memory() -> WslVmMemory | None:
+    """The VM's figures without calling ``wsl.exe``. Never blocks.
+
+    The last probe of the meshing distro
+    (``core.execution.resources.meshing_host``, which reads its
+    ``/proc/meminfo``) while it is fresh; the configured or default limit when
+    a recent ``vmmem`` reading found no VM running; else ``None`` (then the
+    gate uses the Windows figure and says so)."""
+    if os.name != 'nt':
+        return None
+    from foammesh.core.execution import resources
+
+    host = resources.meshing_host()
+    fresh = (time.monotonic() - float(host.probed_at or 0.0)
+             < resources.HOST_FACTS_TTL_SECONDS)
+    if (str(host.source).startswith('wsl') and fresh
+            and host.memory_total_bytes and host.memory_available_bytes):
+        return WslVmMemory(int(host.memory_total_bytes),
+                           int(host.memory_available_bytes), True, 'meminfo')
+    cache = _vm_cache
+    if (cache is not None and int(cache[1]) == 0
+            and time.monotonic() - cache[0] < VM_STOPPED_EVIDENCE_SECONDS):
+        limit = wsl_vm_limit()
+        if limit is not None:
+            return WslVmMemory(limit[0], limit[0], False, limit[1])
+    return None
+
+
+#: The seam the gate reads the VM through: ``() -> WslVmMemory | None``.
+#: Tests replace it (or pass ``vm_reader=``) so they need no WSL.
+wsl_vm_memory_reader = default_wsl_vm_memory
+
+
+@dataclass(frozen=True)
+class MesherBudget:
+    """What a mesher in the WSL VM may use now, and why (DP-6400)."""
+
+    budget: int
+    windows: MemorySnapshot
+    vm: WslVmMemory | None = None
+    windows_room: int = 0
+    vm_room: int | None = None
+    limited_by: str = 'windows'
+    fallback: bool = False
+    fallback_reason: str = ''
+
+    def describe(self) -> str:
+        windows = self.windows
+        if windows.forced:
+            return 'forced budget'
+        if self.fallback or self.vm is None:
+            return ('{0} available on Windows, {1} kept for the window; '
+                    'WSL VM memory could not be read ({2}), so the Windows '
+                    'figure is used').format(
+                        format_bytes(windows.available),
+                        format_bytes(windows.reserve),
+                        self.fallback_reason or 'no reading')
+        vm = self.vm
+        if vm.running:
+            vm_text = 'the WSL VM has {0} available of {1}'.format(
+                format_bytes(vm.available), format_bytes(vm.total))
+        else:
+            vm_text = 'the WSL VM is stopped and may grow to {0} ({1})'.format(
+                format_bytes(vm.total),
+                '.wslconfig' if vm.source == 'wslconfig'
+                else 'half the RAM, the WSL default')
+        return ('{0}; Windows can give it {1} ({2} available, {3} kept for '
+                'the window)').format(
+                    vm_text, format_bytes(self.windows_room),
+                    format_bytes(windows.available),
+                    format_bytes(windows.reserve))
+
+
+def mesher_budget(windows: MemorySnapshot, vm: WslVmMemory | None, *,
+                  fallback_reason: str = '') -> MesherBudget:
+    """The mesher's budget from fixed readings. Pure arithmetic (DP-6400).
+
+    * Windows' side: what Windows can still give the VM -- its available
+      memory less the window's reserve -- plus what the VM already holds on
+      the host (``vmmem``) but has free inside it (held minus in use). The
+      VM's working set is not taken off "available": it is not in it
+      (DP-6401).
+    * The VM's side: its ``MemAvailable`` when running, its limit when not.
+
+    The budget is the smaller. With no VM figure it is the Windows figure.
+    """
+    windows_room = max(0, int(windows.available) - int(windows.reserve))
+    if windows.forced:
+        return MesherBudget(int(windows.budget), windows, vm,
+                            int(windows.budget), None, 'forced')
+    if vm is None:
+        return MesherBudget(windows_room, windows, None, windows_room, None,
+                            'windows', True, fallback_reason or 'no reading')
+    if vm.running:
+        in_use = max(0, int(vm.total) - int(vm.available))
+        windows_room += max(0, int(windows.wsl_vm) - in_use)
+    vm_room = max(0, int(vm.available))
+    if vm_room < windows_room:
+        return MesherBudget(vm_room, windows, vm, windows_room, vm_room, 'wsl')
+    return MesherBudget(windows_room, windows, vm, windows_room, vm_room,
+                        'windows')
+
+
+def _read_vm(reader, timeout: float) -> tuple[WslVmMemory | None, str]:
+    """``reader()`` under ``timeout`` seconds on a daemon thread, so a wedged
+    read never holds the caller; ``(None, why)`` when it gives no figure."""
+    import threading
+
+    box: dict = {}
+
+    def work():
+        try:
+            box['value'] = reader()
+        except Exception as error:                          # noqa: BLE001
+            box['error'] = error
+
+    thread = threading.Thread(target=work, name='foammesh-vm-memory',
+                              daemon=True)
+    thread.start()
+    thread.join(max(0.0, float(timeout)))
+    if thread.is_alive():
+        logger.warning('WSL VM memory read did not answer in %.1f s; the '
+                       'Windows figure is used', timeout)
+        return None, f'the read did not answer in {timeout:g} s'
+    if 'error' in box:
+        logger.warning('WSL VM memory read failed: %s; the Windows figure is '
+                       'used', box['error'])
+        return None, f'the read failed: {box["error"]}'
+    value = box.get('value')
+    if value is None:
+        return None, ('the mesher runs on this machine' if os.name != 'nt'
+                      else 'the VM is running and has not been probed yet')
+    return value, ''
+
+
+def mesher_budget_now(snapshot_: MemorySnapshot | None = None, *,
+                      vm_reader=None,
+                      timeout: float = VM_READ_TIMEOUT_SECONDS
+                      ) -> MesherBudget:
+    """:func:`mesher_budget` from the current readings (or the given Windows
+    one). ``vm_reader`` defaults to :data:`wsl_vm_memory_reader`."""
+    windows = snapshot_ if snapshot_ is not None else quick_snapshot()
+    if windows.forced:
+        return mesher_budget(windows, None)
+    vm, why = _read_vm(vm_reader or wsl_vm_memory_reader, timeout)
+    return mesher_budget(windows, vm, fallback_reason=why)
+
+
 def mesher_memory_refusal(engine: str, cells: int | float,
-                          snapshot_: MemorySnapshot | None = None
-                          ) -> str | None:
+                          snapshot_: MemorySnapshot | None = None, *,
+                          vm_reader=None) -> str | None:
     """Why the machine cannot mesh ``cells`` cells with ``engine`` now, or
-    ``None``. The mesher runs in WSL, whose VM grows into the host's free
-    memory, so the VM's current working set is not counted against it."""
-    measured = snapshot_ if snapshot_ is not None else quick_snapshot()
-    if not measured.forced:
-        measured = dataclasses.replace(
-            measured, wsl_vm=0,
-            budget=max(0, measured.available - measured.reserve))
-    return memory_refusal(
-        'a mesh of about {0:,} {1}'.format(
-            int(cells), 'elements' if engine == 'gmsh' else 'cells'),
-        mesher_memory_needed(engine, cells), measured)
+    ``None``. The mesher runs inside the WSL VM, so it is measured against
+    the VM's own figures as well as what Windows can give the VM
+    (:func:`mesher_budget`, DP-6400)."""
+    windows = snapshot_ if snapshot_ is not None else quick_snapshot()
+    if not windows.forced and windows.total <= 0:
+        return None             # the memory could not be read: no refusal
+    budget = mesher_budget_now(windows, vm_reader=vm_reader)
+    needed = mesher_memory_needed(engine, cells)
+    if needed <= budget.budget:
+        return None
+    return ('a mesh of about {0:,} {1} needs about {2} of RAM and {3} is free '
+            '({4})').format(int(cells),
+                            'elements' if engine == 'gmsh' else 'cells',
+                            format_bytes(needed), format_bytes(budget.budget),
+                            budget.describe())
+
+
+#: Plan 50 IP3 (DP-6231). The largest cell count FoamMesh writes as a mesher
+#: limit. OpenFOAM counts cells in a ``label``; FoamMesh's runtime is
+#: OpenFOAM Foundation 13 built with the default ``WM_LABEL_SIZE=32`` (nothing
+#: in FoamMesh assumes a 64-bit label), so a count must stay below 2^31 - 1 =
+#: 2,147,483,647. 2,000,000,000 leaves room for the cells snappyHexMesh adds
+#: in the refinement iteration that crosses its limit.
+SAFE_MAX_CELLS = 2_000_000_000
+
+
+def mesher_cell_capacity(engine: str,
+                         snapshot_: MemorySnapshot | None = None, *,
+                         vm_reader=None) -> int | None:
+    """How many cells (snappy) or elements (Gmsh) the free memory holds now,
+    by the same budget and per-cell figure :func:`mesher_memory_refusal`
+    refuses with (the WSL VM's figures, DP-6400), at most
+    :data:`SAFE_MAX_CELLS`; ``None`` when the machine gives no memory figure.
+    Plan 50 IP3: what a mesher limit the user did not type is derived from,
+    so it is a RAM limit and never a fixed count."""
+    try:
+        measured = snapshot_ if snapshot_ is not None else quick_snapshot()
+    except Exception:                                       # noqa: BLE001
+        logger.warning('No memory reading for the mesher cell limit',
+                       exc_info=True)
+        return None
+    if not measured.forced and measured.total <= 0 and measured.available <= 0:
+        return None
+    budget = mesher_budget_now(measured, vm_reader=vm_reader).budget
+    per_cell = MESHER_BYTES_PER_CELL.get(engine,
+                                         max(MESHER_BYTES_PER_CELL.values()))
+    cells = int(max(0, budget - MESHER_FIXED_BYTES) // per_cell)
+    return min(SAFE_MAX_CELLS, cells)
 
 
 # --------------------------------------------------------------------------- #
@@ -622,12 +899,12 @@ def cap_for(estimate: Estimate, snapshot_: MemorySnapshot,
 
 
 def free_ram(snapshot_: MemorySnapshot) -> int:
-    """The RAM free for a worker: available - WSL VM - GUI reserve (or the
+    """The RAM free for a worker: available - GUI reserve (or the
     forced budget). "Build anyway" raises ``budget``; this is the real one."""
     if snapshot_.forced:
         return int(snapshot_.budget)
-    return max(0, int(snapshot_.available) - int(snapshot_.wsl_vm)
-               - int(snapshot_.reserve))
+    # DP-6401: the VM's pages are already out of "available".
+    return max(0, int(snapshot_.available) - int(snapshot_.reserve))
 
 
 def ran_out_text(cap_bytes: int, snapshot_: MemorySnapshot | None) -> str:

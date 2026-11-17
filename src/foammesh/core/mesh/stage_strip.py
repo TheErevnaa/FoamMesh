@@ -17,7 +17,7 @@ import os
 import re
 from pathlib import Path
 
-__all__ = ['mesh_counts', 'native_counts', 'record', 'load', 'headline', 'detail', 'change',
+__all__ = ['mesh_counts', 'native_counts', 'record', 'forget', 'load', 'headline', 'detail', 'change',
            'tooltip', 'short_cells']
 
 _NOTE = re.compile(r'(nPoints|nCells|nFaces|nInternalFaces)\s*:\s*(\d+)')
@@ -133,6 +133,23 @@ def record(case_path, engine_id: str, task_id: str, counts: dict,
             entry['seconds'] = round(float(seconds), 2)
         steps[task_id] = entry
         path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + f'.{os.getpid()}.tmp')
+        temporary.write_text(
+            json.dumps({'schema_version': 1, 'steps': steps}, indent=2,
+                       sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temporary, path)
+    except OSError:
+        return
+
+
+def forget(case_path, engine_id: str, task_id: str) -> None:
+    """Drop *task_id*'s strip, so an earlier run's counts are not shown for
+    a run whose mesh cannot be read yet (DP-6116). Never raises."""
+    path = _path(case_path, engine_id)
+    try:
+        steps = load(case_path, engine_id)
+        if steps.pop(str(task_id), None) is None:
+            return
         temporary = path.with_name(path.name + f'.{os.getpid()}.tmp')
         temporary.write_text(
             json.dumps({'schema_version': 1, 'steps': steps}, indent=2,

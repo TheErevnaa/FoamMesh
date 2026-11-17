@@ -25,7 +25,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal, QSignalBlocker
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout,
-                               QHeaderView, QInputDialog, QLabel, QMenu,
+                               QHeaderView, QInputDialog, QLabel,
                                QMessageBox, QPushButton, QSizePolicy,
                                QTableWidget,
                                QTableWidgetItem, QToolButton, QVBoxLayout,
@@ -36,9 +36,12 @@ from foammesh.core.facade.errors import FacadeError
 from foammesh.core.geometry.features.manifest import DEFAULT_FEATURE_ANGLE_DEG
 from foammesh.db.configurations_schema import GeometryType
 from foammesh.view.facade_client import FailedResult, query, submit
-from foammesh.view.geometry.feature_angle_panel import seed_from_project
+from foammesh.view.geometry.feature_angle_panel import (project_feature_angle,
+                                                     seed_from_project)
 from foammesh.view.theming.metrics import CompactDoubleSpinBox, UnitLabel
+from foammesh.view.configuration_read import configuration_view
 from widgets.fit_to_text import FlowLayout, fit_to_text
+from widgets import async_dialog as dialogs
 from widgets import async_message_box as messages
 
 # DP-185. One sentence per control, written once: the action row and the
@@ -78,8 +81,9 @@ class BoundaryOperations:
     one table. They are the same four routes whatever holds the selection, so
     the host supplies it: `_selectedPatches()` says which boundaries are
     chosen, `_say()` where a refusal is written, `_featureAngleDegrees()` what
-    angle to cut at, and `refresh()` how the host re-reads the manifest after
-    a write. The host is a QWidget, so it is also the parent every dialog
+    angle to cut at (``None`` when the person cancelled), `_splitTarget()`
+    which geometry a split by angle cuts, and `refresh()` how the host
+    re-reads the manifest after a write. The host is a QWidget, so it is also the parent every dialog
     opens on.
     """
 
@@ -89,8 +93,20 @@ class BoundaryOperations:
     def _say(self, text):
         raise NotImplementedError
 
-    def _featureAngleDegrees(self):
-        return float(DEFAULT_FEATURE_ANGLE_DEG)
+    def _featureAngleDegrees(self, then):
+        """``then(angle)``, or ``then(None)`` when cancelled (Plan 50 IP19:
+        asked without a nested event loop)."""
+        then(float(DEFAULT_FEATURE_ANGLE_DEG))
+
+    def _splitTarget(self):
+        """``(geometry_id or None, what it is called or None, refusal)``.
+
+        The geometry of the first selected boundary; with none selected the
+        facade takes the case's only geometry or refuses.
+        """
+        selected = [item.get('geometry_id') for item in self._selectedPatches()
+                    if item.get('geometry_id')]
+        return (selected[0] if selected else None), None, None
 
     def refresh(self):
         raise NotImplementedError
@@ -125,11 +141,24 @@ class BoundaryOperations:
 
     def _splitByFeatureAngle(self):
         """Preview the cut, say what it makes, and apply it when told to."""
-        selected = [item.get('geometry_id') for item in self._selectedPatches()
-                    if item.get('geometry_id')]
-        parameters = {'angle_deg': float(self._featureAngleDegrees())}
-        if selected:
-            parameters['geometry_id'] = selected[0]
+        geometryId, label, why = self._splitTarget()
+        if why:
+            self._say(why)
+            return False
+        # Plan 50 IP19. The angle and the question are asked without a nested
+        # loop; an answer given at once (a test's seam) still reaches the
+        # caller as before, and one given later reaches the panel.
+        result = []
+        self._featureAngleDegrees(
+            lambda angle: result.append(self._splitAtAngle(angle, geometryId, label)))
+        return result[0] if result else None
+
+    def _splitAtAngle(self, angle, geometryId, label):
+        if angle is None:
+            return None
+        parameters = {'angle_deg': float(angle)}
+        if geometryId:
+            parameters['geometry_id'] = geometryId
         outcome = None
 
         # C31-12. Both trips through the facade are scheduled: the preview
@@ -149,20 +178,24 @@ class BoundaryOperations:
                     'No feature edge sharper than {0:g}°: the surface stays one '
                     'boundary. Try a smaller angle.').format(parameters['angle_deg']))
                 return
-            answer = messages.question(
+            def answered(answer):
+                nonlocal outcome
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                parameters['geometry_id'] = (preview.get('geometry_id')
+                                             or parameters.get('geometry_id'))
+                outcome = self._runPatchEdit('geometry.patches.split_by_angle',
+                                             parameters)
+
+            messages.askQuestion(
                 self, self.tr('Split by feature angle'),
-                self.tr('Split the surface into {0} boundaries at {1:g}°?\n\n'
+                self.tr('Split {2} into {0} boundaries at {1:g}°?\n\n'
                         'This writes a new geometry revision; the current one stays '
                         'recoverable from the Revisions strip.').format(
-                            count, parameters['angle_deg']),
+                            count, parameters['angle_deg'],
+                            label or self.tr('the surface')),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes)
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            parameters['geometry_id'] = (preview.get('geometry_id')
-                                         or parameters.get('geometry_id'))
-            outcome = self._runPatchEdit('geometry.patches.split_by_angle',
-                                         parameters)
+                QMessageBox.StandardButton.Yes, then=answered)
 
         submit(app.facadeClient, 'geometry.patches.split_by_angle',
                {**parameters, 'preview': True}, then=previewed)
@@ -226,15 +259,20 @@ class BoundaryOperations:
         if len(chosen) < 2:
             self._say(self.tr('Select two or more boundaries to merge.'))
             return None
-        name, accepted = QInputDialog.getText(
+        result = []
+
+        def answered(name, accepted):
+            if not accepted or not name.strip():
+                return
+            result.append(self._runPatchEdit('geometry.patches.merge', {
+                'patch_uuids': [item.get('patch_uuid') for item in chosen],
+                'name': name.strip()}))
+
+        dialogs.getText(
             self, self.tr('Merge boundaries'),
             self.tr('Name for the merged boundary'),
-            text=chosen[0].get('name') or '')
-        if not accepted or not name.strip():
-            return None
-        return self._runPatchEdit('geometry.patches.merge', {
-            'patch_uuids': [item.get('patch_uuid') for item in chosen],
-            'name': name.strip()})
+            text=chosen[0].get('name') or '', then=answered)
+        return result[0] if result else None
 
     def _splitSelectedPatch(self):
         chosen = self._selectedPatches()
@@ -292,65 +330,25 @@ class BoundaryActions(QWidget, BoundaryOperations):
         self._angleAction.setToolTip(self.tr(SPLIT_BY_ANGLE_TOOLTIP))
         self._angleAction.triggered.connect(self._splitByFeatureAngle)
 
-        # R51/R128. Four controls that each refuse to shrink below their own
-        # label add up to more width than this column has, and a QHBoxLayout
-        # answered by overdrawing them. The row wraps to a second line.
+        # R51/R128. Controls that each refuse to shrink below their own label
+        # add up to more width than this column has; the row wraps.
         #
-        # DP-511. Five buttons and a spin box over two rows, plus a two-line
-        # note, were more of the page than the list they act on. Rename,
-        # merge and split are edits of the selected rows -- the list's
-        # context menu already carries them -- so they share one `Edit`
-        # menu button, and the row is: Edit, Feature angle, Split by angle.
+        # DP-6102 (user, 2026-10-31). Rename, merge and split merged are edits
+        # of the selected rows and live on the list's right-click menu (and
+        # Rename in Edit surface, by double-click); the `Edit boundaries`
+        # menu button repeated them. DP-6101. The feature angle box beside
+        # Split by angle read as a page setting and fed that one button: the
+        # angle is now asked when Split by angle opens. The row is the one
+        # button that makes boundaries out of a surface that has none.
         row = FlowLayout()
-        self._editMenu = QMenu(self)
-        self._editMenu.setObjectName('geometryBoundaryEditMenu')
-        for action in (self._renameAction, self._mergeAction,
-                       self._splitAction):
-            self._editMenu.addAction(action)
-        self._editButton = QToolButton(self)
-        self._editButton.setObjectName('editBoundaryMenu')
-        self._editButton.setText(self.tr('Edit boundaries'))
-        self._editButton.setToolTip(self.tr(
-            'Rename, merge or split the selected boundaries'))
-        self._editButton.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self._editButton.setPopupMode(
-            QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._editButton.setMenu(self._editMenu)
-        fit_to_text(self._editButton, padding=24)
-        row.addWidget(self._editButton)
-
-        angleLabel = QLabel(self.tr('Feature angle'), self)
-        self._featureAngle = CompactDoubleSpinBox(self)
-        self._featureAngle.setObjectName('featureSplitAngle')
-        self._featureAngle.setAccessibleName(self.tr('Feature angle in degrees'))
-        self._featureAngle.setRange(1.0, 179.0)
-        self._featureAngle.setDecimals(1)
-        self._featureAngle.setSingleStep(5.0)
-        seed_from_project(self._featureAngle)
-        self._featureAngleTyped = False
-        self._featureAngle.valueChanged.connect(self._markAngleTyped)
-        self._featureAngle.setToolTip(self.tr(FEATURE_ANGLE_TOOLTIP))
-        angleLabel.setBuddy(self._featureAngle)
-        fit_to_text(angleLabel, padding=4)
-        # The label names the spin box beside it, so the two wrap as one item
-        # or not at all: split across lines, `Feature angle` would read as a
-        # heading for whatever button followed it.
-        self._featureAngleBox = QWidget(self)
-        self._featureAngleBox.setObjectName('featureSplitAngleBox')
-        angleRow = QHBoxLayout(self._featureAngleBox)
-        angleRow.setContentsMargins(0, 0, 0, 0)
-        angleRow.addWidget(angleLabel)
-        angleRow.addWidget(self._featureAngle)
-        # DP-164. The degree sign used to be a Qt suffix inside the box,
-        # which made it part of the number: one of seven spellings of this
-        # unit across the app, and the only one that moved as the value was
-        # typed. `deg` in a `UnitLabel` beside the box is what every
-        # registry-built row does.
-        angleRow.addWidget(UnitLabel('deg'))
-        row.addWidget(self._featureAngleBox)
         row.addWidget(self._buttonFor(self._angleAction))
         layout.addLayout(row)
+        #: DP-6096. The step's lock; the actions are shared with the list's
+        #: right-click menu, which a disabled widget does not reach.
+        self._locked = False
+        self._builtReason = ''
+        #: The project angle the last split was asked at, offered next time.
+        self._lastAngle = None
 
         self._note = QLabel(self)
         self._note.setObjectName('geometryBoundaryNote')
@@ -390,8 +388,107 @@ class BoundaryActions(QWidget, BoundaryOperations):
         return (self._renameAction, self._mergeAction, self._splitAction,
                 self._angleAction)
 
-    def _featureAngleDegrees(self):
-        return float(self._featureAngle.value())
+    def _featureAngleDegrees(self, then):
+        """The angle to cut at, asked now; ``then(None)`` when cancelled.
+
+        DP-6101. Asked by Split by angle itself, starting from the project
+        angle (or the one asked last), instead of a box on the page that
+        read as a page setting.
+        """
+        start = (self._lastAngle if self._lastAngle is not None
+                 else project_feature_angle())
+
+        def answered(angle, accepted):
+            if not accepted:
+                then(None)
+                return
+            self._lastAngle = float(angle)
+            then(float(angle))
+
+        dialogs.getDouble(
+            self, self.tr('Split by angle'),
+            # DP-6451. The prompt is one literal at the call so the label
+            # census (DP-208) can read it, and it ends with its unit
+            # (DP-223); it repeats the tooltip's words.
+            self.tr('Two triangles stay on one boundary while their '
+                    'normals differ by less than this feature angle (deg)'),
+            float(start), 1.0, 179.0, 1, then=answered)
+
+    def _splitTarget(self):
+        """``(geometry_id or None, body name or None, refusal or None)``.
+
+        DP-6094. On a case of several bodies Split by angle sent no geometry
+        unless a surface row was selected, and the facade's refusal ("a
+        geometry_id is required") reached only this one-line note; with a
+        surface selected it re-split the whole file while asking about "the
+        surface". The body is now the one the selection belongs to -- a body
+        row or any of its surfaces -- and the question names it.
+        """
+        keys = [str(key) for key in self._selectedIds()]
+        rows = self._treeRows(keys)
+        byPatch = {str(patch.get('patch_uuid')): str(patch['geometry_id'])
+                   for patch in self._patches if patch.get('geometry_id')}
+        chosen = set()
+        for row in rows.values():
+            # A row without its geometryId still names its boundary.
+            geometryId = row.get('geometryId') or byPatch.get(
+                str(row.get('patchUuid')))
+            if geometryId:
+                chosen.add(str(geometryId))
+        if keys and not chosen:
+            chosen = {str(patch['geometry_id'])
+                      for patch in self._selectedPatches()
+                      if patch.get('geometry_id')}
+        if not keys:
+            chosen = {str(patch['geometry_id']) for patch in self._patches
+                      if patch.get('geometry_id')}
+            if len(chosen) > 1:
+                return None, None, self.tr(
+                    'Select the body to split by angle (or one of its '
+                    'surfaces).')
+        elif len(chosen) != 1:
+            return None, None, self.tr(
+                'Split by angle cuts one body: select one body, or surfaces '
+                'of one body only.')
+        geometryId = next(iter(chosen)) if chosen else None
+        return geometryId, self._bodyName(geometryId), None
+
+    @staticmethod
+    def _bodyName(geometryId):
+        """The name of the body row standing for this imported file."""
+        if (not geometryId or app.facadeClient is None
+                or not app.facadeClient.has_case()):
+            return None
+        try:
+            db = configuration_view(app.facadeClient)
+            for key, element in db.getElements('geometry').items():
+                if (str(element.value('geometryId') or '') == geometryId
+                        and element.value('gType')
+                        == GeometryType.VOLUME.value):
+                    return str(element.value('name'))
+        except (FacadeError, KeyError, LookupError, TypeError, ValueError):
+            return None
+        return None
+
+    def setLocked(self, locked):
+        """DP-6096. The step's lock reaches the shared menu actions too."""
+        self._locked = bool(locked)
+        self.selectionChanged()
+
+    def selectionChanged(self):
+        """Enable each action for the lock, the built model and the rows
+        selected now; Split by angle needs one body to cut."""
+        off = self._locked or bool(self._builtReason)
+        for action in self.boundaryActions():
+            if not hasattr(action, '_plainTip'):
+                action._plainTip = action.toolTip()
+            action.setEnabled(not off)
+            action.setToolTip(self._builtReason or action._plainTip)
+        if not off:
+            why = self._splitTarget()[2]
+            self._angleAction.setEnabled(why is None)
+            if why:
+                self._angleAction.setToolTip(why)
 
     def _say(self, text, detail=None):
         self._note.setText(text)
@@ -476,17 +573,7 @@ class BoundaryActions(QWidget, BoundaryOperations):
             return out
         return out
 
-    def _markAngleTyped(self, _value=None):
-        """A box the user changed is theirs; a project change does not move it."""
-        self._featureAngleTyped = True
-
-    def _seedAngleFromProject(self):
-        """Plan 42 SG5. Start from the project angle until the user types."""
-        if not getattr(self, '_featureAngleTyped', False):
-            seed_from_project(self._featureAngle)
-
     def refresh(self):
-        self._seedAngleFromProject()
         try:
             payload = query(app.facadeClient, 'geometry.patches.list').payload
         except (FacadeError, OSError, RuntimeError, ValueError) as error:
@@ -500,13 +587,7 @@ class BoundaryActions(QWidget, BoundaryOperations):
         built = payload.get('built_model') or {}
         reason = built_model_reason(self.tr, built) if built else ''
         self._builtReason = reason
-        for action in self.boundaryActions():
-            if not hasattr(action, '_plainTip'):
-                action._plainTip = action.toolTip()
-            action.setEnabled(not built)
-            action.setToolTip(reason or action._plainTip)
-        self._editButton.setEnabled(not built)
-        self._featureAngle.setEnabled(not built)
+        self.selectionChanged()
         if built:
             self._say(reason)
         elif payload.get('single_boundary'):
@@ -577,12 +658,16 @@ class BoundaryActions(QWidget, BoundaryOperations):
         if patch is None:
             messages.information(self, self.tr('Rename'), why)
             return None
-        name, accepted = QInputDialog.getText(
+        result = []
+
+        def answered(name, accepted):
+            if accepted and name.strip():
+                result.append(self._renameTo(patch, name.strip()))
+
+        dialogs.getText(
             self, self.tr('Rename boundary'), self.tr('Boundary name'),
-            text=str(patch.get('name') or ''))
-        if not accepted or not name.strip():
-            return None
-        return self._renameTo(patch, name.strip())
+            text=str(patch.get('name') or ''), then=answered)
+        return result[0] if result else None
 
 
 class BoundaryPanel(QWidget, BoundaryOperations):
@@ -627,6 +712,7 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         self._patchTable.itemChanged.connect(self._renamePatch)
         self._patchTable.itemSelectionChanged.connect(self._highlightPatches)
         layout.addWidget(self._patchTable, 1)
+        self.fitPatchTable()
 
         self._patchNote = QLabel(self)
         self._patchNote.setObjectName('boundaryPatchNote')
@@ -652,10 +738,12 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         # above have nothing to work on. This is where its sub-surfaces come
         # from: cut along the edges sharper than the angle, one boundary per
         # smooth piece, on both engines.
-        angleLabel = QLabel(self.tr('Feature angle'), self)
+        # DP-6125. The page also has the project's `Feature angle` (feature
+        # edges); this one is the cut angle of the split, named for it.
+        angleLabel = QLabel(self.tr('Split angle'), self)
         self._featureAngle = CompactDoubleSpinBox(self)
         self._featureAngle.setObjectName('featureSplitAngle')
-        self._featureAngle.setAccessibleName(self.tr('Feature angle in degrees'))
+        self._featureAngle.setAccessibleName(self.tr('Split angle in degrees'))
         self._featureAngle.setRange(1.0, 179.0)
         self._featureAngle.setDecimals(1)
         self._featureAngle.setSingleStep(5.0)
@@ -699,8 +787,8 @@ class BoundaryPanel(QWidget, BoundaryOperations):
     def _say(self, text):
         self._patchNote.setText(text)
 
-    def _featureAngleDegrees(self):
-        return float(self._featureAngle.value())
+    def _featureAngleDegrees(self, then):
+        then(float(self._featureAngle.value()))
 
     # -- the list ---------------------------------------------------------- #
 
@@ -742,6 +830,7 @@ class BoundaryPanel(QWidget, BoundaryOperations):
                     item = QTableWidgetItem(value)
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     self._patchTable.setItem(row, column, item)
+        self.fitPatchTable()
         if payload.get('single_boundary'):
             self._patchNote.setText(self.tr(
                 'The whole surface is one boundary, so no inlet or outlet can '
@@ -749,6 +838,26 @@ class BoundaryPanel(QWidget, BoundaryOperations):
         else:
             self._patchNote.setText(self.tr('{0} boundaries.').format(
                 payload.get('count', len(rows))))
+
+    def fitPatchTable(self) -> None:
+        """Give the patch table the height of its rows (DP-6125).
+
+        Inside the page's scroll area the table's stretch has nothing to
+        take, so it was drawn two rows high with the names behind a scroll
+        bar. It asks for its rows, up to eight.
+
+        Plan 50 (the Preparation rule, Plan 44): never for rows it does not
+        have. A three-row floor drew blank area under an empty or short
+        table, so an empty table asks for nothing.
+        """
+        table = self._patchTable
+        rows = min(table.rowCount(), 8)
+        if rows == 0:
+            table.setMinimumHeight(0)
+            return
+        table.setMinimumHeight(table.horizontalHeader().height()
+                               + rows * table.verticalHeader().defaultSectionSize()
+                               + 2 * table.frameWidth())
 
     def _showBuiltModel(self, built):
         """DP-5717. The boundaries of the model a geometry build made.
@@ -775,6 +884,7 @@ class BoundaryPanel(QWidget, BoundaryOperations):
                                      {**dict(patch), 'built': True})
                         item.setToolTip(str(patch.get('category') or ''))
                     self._patchTable.setItem(row, column, item)
+        self.fitPatchTable()
         self._patchNote.setText(built_model_reason(self.tr, built))
 
     def _highlightPatches(self):

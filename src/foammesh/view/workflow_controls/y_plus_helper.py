@@ -14,6 +14,7 @@ from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QInputDialog, QPushButton
 
 from foammesh.core.mesh.sizing import first_layer_height
+from widgets import async_dialog as dialogs
 
 #: Stable context so the sentences translate the same on every surface.
 _CONTEXT = 'YPlusHelper'
@@ -35,16 +36,40 @@ def prompts() -> tuple:
         (_tr('Reference length (m)'), 1.0))
 
 
-def ask_first_layer_height(parent):
-    """Ask the five questions; the height in metres, or ``None`` on cancel."""
+def ask_first_layer_height(parent, then=None):
+    """Ask the five questions; ``then(height in metres)``, or ``then(None)``
+    on cancel.
+
+    Plan 50 IP19 (DP-6360). Each question opens without a nested event loop
+    and the next one follows its answer. The return value is the height when
+    every answer came at once (a test answering the dialog), else ``None``.
+    """
     values = []
-    for label, default in prompts():
-        value, accepted = QInputDialog.getDouble(
-            parent, _tr('y+ helper'), label, default, 1e-12, 1e12, 8)
+    result = []
+
+    def finish(height):
+        result.append(height)
+        if then is not None:
+            then(height)
+
+    def askNext():
+        label, default = prompts()[len(values)]
+        dialogs.getDouble(
+            parent, _tr('y+ helper'), label, default, 1e-12, 1e12, 8,
+            then=answered)
+
+    def answered(value, accepted):
         if not accepted:
-            return None
+            finish(None)
+            return
         values.append(value)
-    return first_layer_height(*values)
+        if len(values) < len(prompts()):
+            askNext()
+        else:
+            finish(first_layer_height(*values))
+
+    askNext()
+    return result[0] if result else None
 
 
 def fill_editor(editor, metres: float) -> None:
@@ -72,7 +97,9 @@ class YPlusButton(QPushButton):
         self.clicked.connect(self._pressed)
 
     def _pressed(self, *_args) -> None:
-        height = ask_first_layer_height(self.window() or self)
+        ask_first_layer_height(self.window() or self, then=self._answered)
+
+    def _answered(self, height) -> None:
         if height is None:
             return
         self.last_height = height

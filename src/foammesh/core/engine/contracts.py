@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
+from functools import cached_property
 from typing import Iterable, Mapping
 
 
@@ -333,7 +334,7 @@ class WorkflowDescriptor:
             'tasks': [task.to_dict() for task in self.ordered_tasks()],
         }
 
-    @property
+    @cached_property
     def digest(self) -> str:
         """The structural identity of this workflow, wording excluded.
 
@@ -348,6 +349,9 @@ class WorkflowDescriptor:
         already recognised for *dynamic* text, which is why task warnings
         ride beside the descriptor rather than inside it (WP2.1); this is the
         static half of it.
+
+        Plan 50 (DP-6271): worked out once per descriptor -- it is frozen --
+        instead of on every stage-state read (31 times a field commit).
         """
         payload = json.dumps(
             _structural(self.to_dict()), sort_keys=True,

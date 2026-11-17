@@ -747,8 +747,10 @@ def _route(source_case, identity) -> str:
             engine = kept['engine_id'] if kept else ''
         except Exception:  # noqa: BLE001
             engine = ''
-    return {'gmsh': 'gmsh', 'snappy': 'snappy',
-            'reconstructPar': 'snappy'}.get(str(engine), 'unknown')
+    # DP-6452. These are the manifest's route values (FoamFlow reads them),
+    # not display names: a parallel snappy run is recorded as reconstructPar.
+    engine = 'snappy' if str(engine) == 'reconstructPar' else str(engine)
+    return engine if engine in ('gmsh', 'snappy') else 'unknown'
 
 
 def build_openfoam_document(case_root, *, source_case=None, db=None,

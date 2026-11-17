@@ -333,6 +333,88 @@ def _distances(points, triangles):
     return best
 
 
+def within(points, triangles, tolerance):
+    """Which *points* lie within *tolerance* of one of *triangles*.
+
+    DP-6089. Exact, like :func:`_distances`, but only the triangles whose
+    box, grown by *tolerance*, holds a point are compared with it. The
+    nearest-centroid bound of :func:`_distances` grows with the longest
+    triangle: on the coaxial CHT tubes (triangles longer than the tube's
+    radius) it compared nearly every point with every triangle, 4.1 s for
+    one wall pair and 21 s for one Automatic pairing, all on the GUI thread.
+    """
+    import numpy as np
+
+    points = np.asarray(points, dtype=float)
+    triangles = np.asarray(triangles, dtype=float)
+    inside = np.zeros(len(points), dtype=bool)
+    if len(points) == 0 or len(triangles) == 0:
+        return inside
+    if len(points) * len(triangles) <= _ALL_AGAINST_ALL:
+        return _all_against_all(points, triangles) <= tolerance
+    low = triangles.min(axis=1) - tolerance
+    high = triangles.max(axis=1) + tolerance
+    origin = low.min(axis=0)
+    # Flat, long triangles (a tube's wall) have boxes far longer than they
+    # are wide; a cell as long as the box puts a whole ring of them in each
+    # cell. The cell follows the boxes' middle side, at least a sixteenth of
+    # their longest, and grows only while the grid would be too large.
+    # MEASURED on the CHT tubes: 0.4 s a wall pair, against 8.4 s for
+    # cells as long as the triangles.
+    extents = np.sort(high - low, axis=1)
+    cell = max(float(np.median(extents[:, 1])),
+               float(np.median(extents[:, 2])) / 16, 1e-12)
+    while True:
+        first = np.floor((low - origin) / cell).astype(np.int64)
+        last = np.floor((high - origin) / cell).astype(np.int64)
+        span = last - first + 1
+        if int(np.prod(span, axis=1).sum()) <= 10 * _ALL_AGAINST_ALL:
+            break
+        cell *= 2
+    shape = last.max(axis=0) + 1
+
+    def key(index):
+        return (index[:, 0] * shape[1] + index[:, 1]) * shape[2] + index[:, 2]
+
+    keys, owners = [], []
+    for dx in range(int(span[:, 0].max())):
+        for dy in range(int(span[:, 1].max())):
+            for dz in range(int(span[:, 2].max())):
+                offset = np.array([dx, dy, dz])
+                rows = np.flatnonzero(np.all(span > offset, axis=1))
+                keys.append(key(first[rows] + offset))
+                owners.append(rows)
+    keys = np.concatenate(keys)
+    owners = np.concatenate(owners)
+    order = np.argsort(keys, kind='stable')
+    keys, owners = keys[order], owners[order]
+
+    where = np.floor((points - origin) / cell).astype(np.int64)
+    inside_grid = np.all((where >= 0) & (where < shape), axis=1)
+    candidates = np.flatnonzero(inside_grid)
+    point_keys = key(where[candidates])
+    begin = np.searchsorted(keys, point_keys, side='left')
+    end = np.searchsorted(keys, point_keys, side='right')
+    counts = end - begin
+    pair_owner = np.repeat(candidates, counts)
+    starts = np.repeat(begin - np.concatenate(([0], np.cumsum(counts)[:-1])),
+                       counts)
+    pair_triangle = owners[starts + np.arange(int(counts.sum()))]
+    step = _ALL_AGAINST_ALL
+    for start in range(0, len(pair_owner), step):
+        rows = pair_owner[start:start + step]
+        which = pair_triangle[start:start + step]
+        # A cell is coarser than a triangle's box: the box itself first.
+        boxed = np.all((points[rows] >= low[which])
+                       & (points[rows] <= high[which]), axis=1)
+        rows, which = rows[boxed], which[boxed]
+        chosen = triangles[which]
+        near = _point_triangle(points[rows], chosen[:, 0], chosen[:, 1],
+                               chosen[:, 2]) <= tolerance
+        inside[rows[near]] = True
+    return inside
+
+
 #: Point-triangle pairs compared in one numpy pass.
 _ALL_AGAINST_ALL = 2_000_000
 

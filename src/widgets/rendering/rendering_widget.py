@@ -36,6 +36,7 @@ from vtkmodules.vtkRenderingCore import (
 from foammesh.support import disposal, heartbeat, lifecycle, safe_mode
 from foammesh.support.vtk_threads import isRenderingHold
 from foammesh.rendering.pick_alone import pick_prop
+from foammesh.rendering.culled_pick import past_culled_faces
 
 from foammesh.rendering import hover_readout, label_pass, label_style, measure
 from foammesh.rendering import (
@@ -212,6 +213,94 @@ def _sameModel(old, new) -> bool:
 #: Dwell before the part under the cursor is named. Long enough that crossing
 #: the mesh does not make the readout flicker, short enough to feel immediate.
 HOVER_DWELL_TIME = 180
+
+_PICK_POOL = None
+_PICK_POOL_LOCK = threading.Lock()
+
+
+def _pickPool():
+    """Plan 50 IP12 (DP-6348). One worker builds pick locators."""
+    global _PICK_POOL
+    with _PICK_POOL_LOCK:
+        if _PICK_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _PICK_POOL = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='foammesh-pick-locator')
+        return _PICK_POOL
+
+
+def build_pick_locator(copy):
+    """A cell locator over *copy*, on the worker thread (DP-6348).
+
+    *copy* is a shallow copy of a data set the renderer holds: it shares the
+    arrays (only read here) and owns its cell links and bounds, which the
+    build fills in, so nothing the GUI thread reads is written. The locator's
+    search structure keeps reading *copy*, so whoever holds the locator holds
+    *copy* too.
+    """
+    from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
+
+    locator = vtkStaticCellLocator()
+    locator.SetDataSet(copy)
+    locator.BuildLocator()
+    return locator
+
+
+def _startPickLocator(data):
+    """Start building *data*'s locator on the worker; the future."""
+    # Bounds are cached on first ask: ask here, so the worker only reads them.
+    data.GetBounds()
+    points = data.GetPoints() if hasattr(data, 'GetPoints') else None
+    if points is not None:
+        points.GetBounds()
+    copy = data.NewInstance()
+    copy.ShallowCopy(data)
+    return _pickPool().submit(build_pick_locator, copy), copy
+
+
+def _pickableBesides(renderer, skipped) -> list:
+    """Every shown, pickable prop of the renderer but *skipped*."""
+    getProps = getattr(renderer, 'GetViewProps', None)
+    props = getProps() if callable(getProps) else None
+    if props is None:
+        return []
+    left = []
+    props.InitTraversal()
+    for _ in range(props.GetNumberOfItems()):
+        prop = props.GetNextProp()
+        if (prop is None or not prop.GetVisibility()
+                or not prop.GetPickable()
+                or any(prop is other for other in skipped)):
+            continue
+        left.append(prop)
+    return left
+
+
+def _takesPicker(resolver) -> bool:
+    """Whether a pick resolver takes the pick made (``picker=``)."""
+    import inspect
+
+    try:
+        return 'picker' in inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _adoptPickLocator(future, data):
+    """The worker's locator pointed at the scene's own *data*, or ``None``.
+    The cache entry holding it must hold the copy it was built on as well.
+
+    The vtkCellPicker matches a locator to a prop by its data set, so the
+    locator built on the copy is handed the original and told to keep the
+    search structure it has (the cells and their ids are the same)."""
+    try:
+        locator = future.result()
+    except Exception:                                       # noqa: BLE001
+        logger.exception('building a pick locator failed')
+        return None
+    locator.SetDataSet(data)
+    locator.UseExistingSearchStructureOn()
+    return locator
 
 #: VTK's own interactive frame rate (the interactor's default). It is no
 #: longer asked for: at 15 the style and every 3D widget made
@@ -2022,6 +2111,9 @@ class RenderingWidget(QWidget):
     #: volume's exterior is picked as the exterior, and the click is the
     #: patch's. None leaves every pick as it is.
     _pickResolver = None
+    #: Plan 50 IP12 (DP-6348). Set while a hover picks: no locator is built
+    #: on the GUI thread for it.
+    _pickForHover = False
 
     def setPickResolver(self, resolver) -> None:
         self._pickResolver = resolver
@@ -2045,15 +2137,43 @@ class RenderingWidget(QWidget):
         nothing, cannot reach that code, and (with the locators above) costs
         a fraction of a millisecond on any mesh size.
         """
-        picker = vtkCellPicker()
-        picker.SetTolerance(0.0005)
-        for locator in self._pickLocators():
-            picker.AddLocator(locator)
+        locators = self._pickLocators()
+        # Plan 50 IP12 (DP-6348). A hover over a big mesh whose locator is
+        # still on the worker leaves that mesh out rather than ray-casting
+        # its cells one by one (442 ms at 3.9 M) or waiting for the build.
+        skipped = list(getattr(self, '_pickSkipped', None) or ())
+        among = (_pickableBesides(getattr(self, '_renderer', None), skipped)
+                 if skipped else None)
+
+        def newPicker():
+            made = vtkCellPicker()
+            made.SetTolerance(0.0005)
+            for locator in locators:
+                made.AddLocator(locator)
+            if among is not None:
+                made.PickFromListOn()
+                for prop in among:
+                    made.AddPickList(prop)
+            return made
+
+        picker = newPicker()
         if not picker.Pick(float(x), float(y), 0.0, self._renderer):
             return None
-        return picker
+        # Plan 50 IP1 (DP-6223). A ray cast knows nothing of face culling: a
+        # base-grid wall turned to the camera is not drawn, and the click is
+        # on what is drawn behind it.
+        return past_culled_faces(picker, x, y, self._renderer, newPicker)
 
     def _pickLocators(self) -> list:
+        """The locators of the big meshes in the scene.
+
+        Plan 50 IP12 (DP-6348). A hover (``_pickForHover``) never builds one
+        on the GUI thread: it starts the build on a worker and leaves the
+        mesh out of that pick (``_pickSkipped``); a later pick adopts it once
+        built. Any other pick (a click, Measure) waits for a build already
+        under way, or builds in place as before.
+        """
+        self._pickSkipped = []
         renderer = getattr(self, '_renderer', None)
         if renderer is None:
             return []
@@ -2062,8 +2182,10 @@ class RenderingWidget(QWidget):
         getProps = getattr(renderer, 'GetViewProps', None)
         if not callable(getProps):
             return []
+        hover = bool(getattr(self, '_pickForHover', False))
         cache = self.__dict__.get('_pickLocatorCache', {})
-        live = {}
+        pending = self.__dict__.get('_pickLocatorPending', {})
+        live, building, skipped = {}, {}, []
         props = getProps()
         if props is None:
             return []
@@ -2081,23 +2203,49 @@ class RenderingWidget(QWidget):
                     or data.GetNumberOfCells() < self.PICK_LOCATOR_MIN_CELLS):
                 continue
             key = id(data)
+            mtime = data.GetMTime()
             entry = cache.get(key)
-            if (entry is None or entry[0] is not data
-                    or entry[1] != data.GetMTime()):
-                locator = vtkStaticCellLocator()
-                locator.SetDataSet(data)
-                locator.BuildLocator()
-                entry = (data, data.GetMTime(), locator)
-            live[key] = entry
+            if (entry is not None and entry[0] is data
+                    and entry[1] == mtime):
+                live[key] = entry
+                continue
+            job = pending.get(key)
+            if job is not None and (job[0] is not data or job[1] != mtime):
+                job = None                  # built for data since replaced
+            if job is not None and (job[2].done() or not hover):
+                locator = _adoptPickLocator(job[2], data)
+                if locator is not None:
+                    # The copy the locator was built on stays with it.
+                    live[key] = (data, mtime, locator, job[3])
+                    continue
+                job = None
+            if hover:
+                if job is None:
+                    job = (data, mtime, *_startPickLocator(data))
+                building[key] = job
+                skipped.append(prop)
+                continue
+            locator = vtkStaticCellLocator()
+            locator.SetDataSet(data)
+            locator.BuildLocator()
+            live[key] = (data, mtime, locator)
         # Only what is in the scene now is held: a replaced mesh lets go.
         self._pickLocatorCache = live
+        self._pickLocatorPending = building
+        self._pickSkipped = skipped
         return [entry[2] for entry in live.values()]
 
     def _resolvedActor(self, picker, x, y):
         actor = picker.GetActor() if picker is not None else None
         resolver = self._pickResolver
         if actor is not None and resolver is not None:
-            actor = resolver(actor, x, y, self._renderer) or actor
+            # Plan 50 IP12 (DP-6349): a resolver that can read the pick
+            # already made is handed it, so the ray is cast once.
+            if _takesPicker(resolver):
+                actor = resolver(actor, x, y, self._renderer,
+                                 picker=picker) or actor
+            else:
+                actor = resolver(actor, x, y, self._renderer) or actor
         return actor
 
     def cellPickedActor(self, x, y):
@@ -3965,7 +4113,12 @@ class RenderingWidget(QWidget):
         # VI14 (LIVEV) named the part by the pick that reads its cell; since
         # DP-2713 / DP-2749 that one CPU pick is the only pick, and the
         # readout is built from it rather than casting the ray again.
-        picker = self._cellPick(x, y)
+        # Plan 50 IP12 (DP-6348): as a hover, it builds no locator here.
+        self._pickForHover = True
+        try:
+            picker = self._cellPick(x, y)
+        finally:
+            self._pickForHover = False
         actor = self._resolvedActor(picker, x, y)
         name = actor.GetObjectName() if actor is not None else ''
         if name != self._hoveredName:
@@ -3993,6 +4146,49 @@ class RenderingWidget(QWidget):
 
     def hoverReadoutText(self) -> str:
         return self._readoutText
+
+    def hoveredName(self) -> str:
+        """The part the last hover pick named ('' for none)."""
+        return self._hoveredName
+
+    def pointerAt(self, fx: float, fy: float, click: bool = False,
+                  ctrl: bool = False, shift: bool = False) -> dict:
+        """Put the pointer at a point of the 3-D view, and press there.
+
+        ``fx``, ``fy`` are fractions of the view from its top-left corner.
+        The view gets the mouse events a hand gives it (move; with *click*
+        press and release of the left button, with Ctrl or Shift held), so
+        the hover dwell, the pick and the selection run as they do for a
+        person. The real pointer is not moved. Returns the point in pixels
+        and the size of the view."""
+        widget = self._widget
+        if widget is None or self.isViewportSuspended():
+            raise LookupError('the 3-D view is not drawing')
+        if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+            raise ValueError('x and y are fractions of the view, 0 to 1')
+        from PySide6.QtCore import QEvent, QPointF
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QApplication
+        width, height = widget.width(), widget.height()
+        local = QPointF(min(fx * width, width - 1), min(fy * height, height - 1))
+        world = QPointF(widget.mapToGlobal(local.toPoint()))
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        none, left = Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton
+
+        def send(kind, button, buttons):
+            QApplication.sendEvent(widget, QMouseEvent(
+                kind, local, world, button, buttons, mods))
+
+        send(QEvent.Type.MouseMove, none, none)
+        if click:
+            send(QEvent.Type.MouseButtonPress, left, left)
+            send(QEvent.Type.MouseButtonRelease, left, none)
+        return {'at': [round(local.x()), round(local.y())],
+                'size': [width, height]}
 
     def _clearReadout(self) -> None:
         if self._readoutText:
